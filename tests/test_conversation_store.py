@@ -135,6 +135,27 @@ class TestConversationStore:
         assert results == []
         self._cleanup(store, path)
 
+    def test_search_apostrophe_query_does_not_crash(self):
+        store, path = self._make_store()
+        store.append("s1", "user", "I don't like mondays")
+        results = store.search("don't")
+        assert len(results) == 1
+        assert results[0].content == "I don't like mondays"
+        self._cleanup(store, path)
+
+    def test_search_unbalanced_quote_returns_empty(self):
+        store, path = self._make_store()
+        store.append("s1", "user", "plain text body")
+        results = store.search('something "unbalanced')
+        assert results == []
+        self._cleanup(store, path)
+
+    def test_search_whitespace_query_returns_empty(self):
+        store, path = self._make_store()
+        store.append("s1", "user", "Hello")
+        assert store.search("   ") == []
+        self._cleanup(store, path)
+
     def test_list_conversations(self):
         store, path = self._make_store()
         store.append("s1", "user", "Hello")

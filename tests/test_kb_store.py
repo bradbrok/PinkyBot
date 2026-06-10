@@ -1,5 +1,7 @@
 """Tests for KB store — raw source CRUD operations."""
 
+import sqlite3
+
 import pytest
 
 from pinky_daemon.kb_store import KBStore, _parse_frontmatter
@@ -148,3 +150,66 @@ class TestCountRaw:
         kb.ingest(title="A", content="a", tags=["python"])
         kb.ingest(title="B", content="b", tags=["rust"])
         assert kb.count_raw(tag="python") == 1
+
+
+class TestCheckDuplicate:
+    def test_url_duplicate(self, kb):
+        kb.ingest(title="A", content="x", source_url="https://example.com/a")
+        dup = kb.check_duplicate(source_url="https://example.com/a")
+        assert dup is not None
+
+    def test_content_duplicate_matches_ingested_content(self, kb):
+        content = "substantial body " * 10
+        source = kb.ingest(title="Some Note", content=content)
+        dup = kb.check_duplicate(content=content)
+        assert dup is not None
+        assert dup.id == source.id
+
+    def test_short_content_not_deduped(self, kb):
+        kb.ingest(title="Tiny", content="short")
+        assert kb.check_duplicate(content="short") is None
+
+
+class TestSearchRobustness:
+    def test_apostrophe_query_does_not_crash(self, kb):
+        kb.ingest(title="Mondays", content="I don't like mondays at all")
+        results = kb.search("don't")
+        assert len(results) == 1
+
+    def test_unbalanced_quote_returns_no_error(self, kb):
+        kb.ingest(title="Q", content="some plain text body")
+        assert kb.search('something "unbalanced') == []
+
+    def test_whitespace_query_returns_empty(self, kb):
+        kb.ingest(title="Q", content="some plain text body")
+        assert kb.search("   ") == []
+
+
+class TestIngestFailureCleanup:
+    def test_duplicate_url_insert_cleans_up_file(self, kb):
+        kb.ingest(title="First", content="body one", source_url="https://example.com/dup")
+        files_before = sorted(p.name for p in kb.raw_dir.glob("*.md"))
+        with pytest.raises(sqlite3.IntegrityError):
+            kb.ingest(title="Second", content="body two", source_url="https://example.com/dup")
+        files_after = sorted(p.name for p in kb.raw_dir.glob("*.md"))
+        assert files_after == files_before
+
+
+class TestReindex:
+    def test_reindex_preserves_space_joined_tags(self, kb):
+        source = kb.ingest(title="Tagged", content="body text here", tags=["alpha", "beta"])
+        kb.reindex()
+        conn = sqlite3.connect(str(kb.db_path))
+        try:
+            row = conn.execute(
+                "SELECT tags FROM fts_content WHERE ref_id = ? AND kind = 'raw'",
+                (source.id,),
+            ).fetchone()
+        finally:
+            conn.close()
+        assert row[0] == "alpha beta"
+
+    def test_reindex_keeps_search_working(self, kb):
+        kb.ingest(title="Searchable", content="unique keyword xyzzy")
+        kb.reindex()
+        assert len(kb.search("xyzzy")) == 1

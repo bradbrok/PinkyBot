@@ -65,6 +65,11 @@ def _content_preview(content: str) -> str:
 _FRONTMATTER_RE = re.compile(r"^---\s*\n(.*?)\n---\s*\n?(.*)", re.DOTALL)
 
 
+def _fts5_phrase(query: str) -> str:
+    """Escape a user query as quoted FTS5 phrase tokens (no operator syntax)."""
+    return " ".join('"' + token.replace('"', '""') + '"' for token in query.split())
+
+
 def _parse_frontmatter(text: str) -> tuple[dict, str]:
     """Parse YAML frontmatter and body from a markdown file.
 
@@ -327,7 +332,9 @@ class KBStore:
         full_path.write_text(full_content, encoding="utf-8")
 
         c_hash = _content_hash(full_content)
-        c_preview = _content_preview(full_content)
+        # Preview is computed from the bare content so check_duplicate(content=...)
+        # lookups match what is stored here.
+        c_preview = _content_preview(content)
 
         # Index in SQLite
         conn = self._conn()
@@ -350,6 +357,9 @@ class KBStore:
             )
 
             conn.commit()
+        except Exception:
+            full_path.unlink(missing_ok=True)
+            raise
         finally:
             conn.close()
 
@@ -475,7 +485,7 @@ class KBStore:
         full_path.write_text(full_content, encoding="utf-8")
 
         c_hash = _content_hash(full_content)
-        c_preview = _content_preview(full_content)
+        c_preview = _content_preview(body)
 
         # Update DB
         new_tags = fm.get("tags", source.tags)
@@ -590,23 +600,31 @@ class KBStore:
         conn = self._conn()
         try:
             kind_filter = ""
-            params: list = [query]
 
             if scope == "raw":
                 kind_filter = " AND kind = 'raw'"
             elif scope == "wiki":
                 kind_filter = " AND kind = 'wiki'"
 
-            rows = conn.execute(
-                f"""SELECT ref_id, kind, title,
+            sql = f"""SELECT ref_id, kind, title,
                            snippet(fts_content, 3, '<mark>', '</mark>', '...', 40) as snippet,
                            rank
                     FROM fts_content
                     WHERE fts_content MATCH ?{kind_filter}
                     ORDER BY rank
-                    LIMIT ?""",
-                params + [limit],
-            ).fetchall()
+                    LIMIT ?"""
+            try:
+                rows = conn.execute(sql, [query, limit]).fetchall()
+            except sqlite3.OperationalError:
+                # Invalid FTS5 syntax (apostrophes, stray operators) -- retry
+                # with the query escaped as plain phrase tokens.
+                escaped = _fts5_phrase(query)
+                if not escaped:
+                    return []
+                try:
+                    rows = conn.execute(sql, [escaped, limit]).fetchall()
+                except sqlite3.OperationalError:
+                    return []
 
             return [
                 {
@@ -826,14 +844,12 @@ class KBStore:
                 full_path = self.kb_dir / row["file_path"]
                 if full_path.exists():
                     content = full_path.read_text(encoding="utf-8")
-                    body = _content_preview(content)  # Use preview for FTS body
-                    # Actually use full body after frontmatter
                     match = _FRONTMATTER_RE.match(content)
                     body = match.group(2) if match else content
                     conn.execute(
                         "INSERT INTO fts_content (ref_id, kind, title, body, tags) "
                         "VALUES (?, ?, ?, ?, ?)",
-                        (row["id"], "raw", row["title"], body, row["tags"]),
+                        (row["id"], "raw", row["title"], body, " ".join(json.loads(row["tags"]))),
                     )
                     indexed_raw += 1
 

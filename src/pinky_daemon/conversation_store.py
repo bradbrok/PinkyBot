@@ -18,6 +18,11 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 
+def _fts5_phrase(query: str) -> str:
+    """Escape a user query as quoted FTS5 phrase tokens (no operator syntax)."""
+    return " ".join('"' + token.replace('"', '""') + '"' for token in query.split())
+
+
 @dataclass
 class StoredMessage:
     """A message persisted in the conversation store."""
@@ -248,14 +253,24 @@ class ConversationStore:
         where = " AND ".join(conditions)
         params.append(limit)
 
-        rows = self._conn.execute(
-            f"""SELECT m.* FROM messages m
+        sql = f"""SELECT m.* FROM messages m
                 JOIN messages_fts ON m.id = messages_fts.rowid
                 WHERE {where}
                 ORDER BY m.timestamp DESC
-                LIMIT ?""",
-            params,
-        ).fetchall()
+                LIMIT ?"""
+        try:
+            rows = self._conn.execute(sql, params).fetchall()
+        except sqlite3.OperationalError:
+            # Invalid FTS5 syntax (apostrophes, stray operators) -- retry
+            # with the query escaped as plain phrase tokens.
+            escaped = _fts5_phrase(query)
+            if not escaped:
+                return []
+            params[0] = escaped
+            try:
+                rows = self._conn.execute(sql, params).fetchall()
+            except sqlite3.OperationalError:
+                return []
 
         return [self._row_to_message(r) for r in rows]
 

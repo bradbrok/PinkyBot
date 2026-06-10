@@ -367,9 +367,17 @@ class TaskStore:
         return self.get(task_id)
 
     def delete(self, task_id: int) -> bool:
-        """Delete a task and its subtasks."""
-        # Delete subtasks first
-        self._db.execute("DELETE FROM tasks WHERE parent_id=?", (task_id,))
+        """Delete a task and all its descendant subtasks."""
+        # Delete descendants first (any depth)
+        self._db.execute(
+            """WITH RECURSIVE descendants(id) AS (
+                   SELECT id FROM tasks WHERE parent_id=?
+                   UNION
+                   SELECT t.id FROM tasks t JOIN descendants d ON t.parent_id=d.id
+               )
+               DELETE FROM tasks WHERE id IN (SELECT id FROM descendants)""",
+            (task_id,),
+        )
         cursor = self._db.execute("DELETE FROM tasks WHERE id=?", (task_id,))
         self._db.commit()
         return cursor.rowcount > 0
@@ -414,6 +422,12 @@ class TaskStore:
             conditions.append("parent_id=?")
             params.append(parent_id)
 
+        if tag:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM json_each(tasks.tags) WHERE json_each.value = ?)"
+            )
+            params.append(tag)
+
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
 
@@ -427,13 +441,7 @@ class TaskStore:
             params,
         ).fetchall()
 
-        tasks = [self._row_to_task(r) for r in rows]
-
-        # Filter by tag in Python (JSON array)
-        if tag:
-            tasks = [t for t in tasks if tag in t.tags]
-
-        return tasks
+        return [self._row_to_task(r) for r in rows]
 
     def get_subtasks(self, parent_id: int) -> list[Task]:
         """Get all subtasks of a task."""

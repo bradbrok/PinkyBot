@@ -16,6 +16,8 @@ import sqlite3
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
+import pytest
+
 from pinky_daemon.analytics_store import AnalyticsStore
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
@@ -341,3 +343,53 @@ class TestTurnClassification:
             store._classify_turn(["mcp__pinky-messaging__send_video"], [])
             == "messaging"
         )
+
+
+class TestGetCategoriesAgentFilter:
+    def test_agent_filter_does_not_crash_and_scopes_turns(self, tmp_path):
+        store = _store(tmp_path)
+        _seed_session(store, session_id="s1", agent="barsik")
+        _seed_session(store, session_id="s2", agent="murka")
+        now = _iso(datetime.now(UTC))
+        store.log_turn_usage(
+            session_id="s1", agent_name="barsik", turn_seq=1,
+            provider="anthropic", model="claude-sonnet-4",
+            input_tokens=100, output_tokens=50, cached_input_tokens=0,
+            ts=now,
+        )
+        store.start_tool_call(
+            session_id="s1", agent_name="barsik", turn_seq=1,
+            tool_call_key="k1", tool_name="Bash",
+            metadata={"command": "pytest tests/"}, ts=now,
+        )
+        store.log_turn_usage(
+            session_id="s2", agent_name="murka", turn_seq=1,
+            provider="anthropic", model="claude-sonnet-4",
+            input_tokens=10, output_tokens=5, cached_input_tokens=0,
+            ts=now,
+        )
+        result = store.get_categories(range_name="7d", agent_name="barsik")
+        assert sum(c["turns"] for c in result["categories"]) == 1
+        assert sum(c["input_tokens"] for c in result["categories"]) == 100
+
+
+class TestPricingLookup:
+    def test_overview_costs_use_seeded_pricing(self, tmp_path):
+        store = _store(tmp_path)
+        _seed_session(store)
+        store.log_turn_usage(
+            session_id="sess1", agent_name="barsik", turn_seq=1,
+            provider="anthropic", model="claude-sonnet-4",
+            input_tokens=1_000_000, output_tokens=0, cached_input_tokens=0,
+        )
+        overview = store.get_overview(range_name="7d")
+        # claude-sonnet-4 seeded at 3.00 USD per MTok input
+        assert overview["totals"]["cost_usd"] == pytest.approx(3.0)
+
+    def test_lookup_pricing_resolves_aliases(self, tmp_path):
+        store = _store(tmp_path)
+        ts = _iso(datetime.now(UTC))
+        row = store._lookup_pricing(provider="claude_code", model="Claude-Sonnet-4", ts=ts)
+        assert row is not None
+        assert row["input_usd_per_mtok"] == 3.00
+        assert store._lookup_pricing(provider="anthropic", model="no-such-model", ts=ts) is None

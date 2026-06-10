@@ -412,17 +412,18 @@ class PresentationStore:
         if research_topic_id is not None:
             conditions.append("research_topic_id=?")
             params.append(research_topic_id)
+        if tag:
+            conditions.append(
+                "EXISTS (SELECT 1 FROM json_each(presentations.tags) WHERE json_each.value = ?)"
+            )
+            params.append(tag)
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         rows = self._db.execute(
             f"SELECT {self._P_COLS} FROM presentations {where} "
             f"ORDER BY updated_at DESC LIMIT ? OFFSET ?",
             [*params, limit, offset],
         ).fetchall()
-        results = [self._row_to_presentation(r) for r in rows]
-        # Filter by tag in Python (tags stored as JSON array)
-        if tag:
-            results = [p for p in results if tag in p.tags]
-        return results
+        return [self._row_to_presentation(r) for r in rows]
 
     # ── Update ────────────────────────────────────────────────
 
@@ -440,7 +441,13 @@ class PresentationStore:
         if not pres:
             return None
         now = time.time()
-        new_version = pres.current_version + 1
+        # MAX(version) rather than current_version + 1: restore_version() can
+        # rewind current_version below already-existing version rows.
+        new_version = self._db.execute(
+            "SELECT COALESCE(MAX(version), 0) + 1 FROM presentation_versions "
+            "WHERE presentation_id=?",
+            (presentation_id,),
+        ).fetchone()[0]
 
         self._db.execute(
             """INSERT INTO presentation_versions
