@@ -46,7 +46,7 @@
             ]);
             statusText = `v${root.version}`;
             authenticated = !!auth.authenticated;
-            if (Array.isArray(agentsResp)) agents = agentsResp;
+            agents = Array.isArray(agentsResp?.agents) ? agentsResp.agents : [];
 
             // First-run: redirect to onboarding if no agents and not yet completed
             if (authenticated) {
@@ -140,7 +140,7 @@
                             class="sidebar-nav-item sidebar-agent"
                             on:click={closeSidebar}
                         >
-                            <span class="agent-dot" class:alive={agent.status === 'running'} class:idle={agent.status !== 'running'}></span>
+                            <span class="agent-dot" class:alive={agent.streaming} class:idle={!agent.streaming}></span>
                             <span>{agent.name}</span>
                         </a>
                     {/each}

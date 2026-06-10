@@ -127,9 +127,9 @@
             params.set('offset', currentOffset);
             if (filterType) params.set('type', filterType);
             if (filterProject) params.set('project', filterProject);
-            if (filterSalience === 'high') params.set('min_salience', 4);
-            else if (filterSalience) { params.set('min_salience', filterSalience); params.set('max_salience', filterSalience); }
-            if (filterSort) params.set('sort', filterSort);
+            if (filterSalience === 'high') params.set('salience_min', 4);
+            else if (filterSalience) { params.set('salience_min', filterSalience); params.set('salience_max', filterSalience); }
+            if (filterSort) params.set('sort_by', filterSort);
             if (activeOnly) params.set('active', 'true');
 
             const data = await api('GET', `/agents/${currentAgent}/memories?${params}`);

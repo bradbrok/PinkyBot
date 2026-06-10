@@ -96,24 +96,6 @@
     let updateInfo = null;
     let updateLoading = false;
     let updateApplying = false;
-    let channelSwitching = false;
-
-    async function switchChannel(newChannel) {
-        if (channelSwitching) return;
-        if (!confirm(`Switch to ${newChannel} channel? This will change which branch updates pull from.`)) return;
-        channelSwitching = true;
-        try {
-            await api('POST', `/admin/channel?channel=${newChannel}`);
-            serverInfo = { ...serverInfo, channel: newChannel };
-            toast(`Switched to ${newChannel} channel`);
-            // Auto-check for updates on the new channel
-            await checkForUpdates();
-        } catch (e) {
-            toast('Failed to switch channel', 'error');
-        } finally {
-            channelSwitching = false;
-        }
-    }
 
     async function loadServerInfo() {
         serverInfo = await api('GET', '/api');
@@ -608,6 +590,7 @@
     let provFormPreset = 'custom';
     let provFormUrl = '';
     let provFormKey = '';
+    let provFormKeySet = false;
     let provFormModel = '';
 
     // Provider presets and helpers moved to ProviderConfig component
@@ -643,6 +626,7 @@
         provFormPreset = 'custom';
         provFormUrl = '';
         provFormKey = '';
+        provFormKeySet = false;
         provFormModel = '';
         providerFormVisible = true;
     }
@@ -651,7 +635,10 @@
         editingProvider = p;
         provFormName = p.name;
         provFormUrl = p.provider_url;
-        provFormKey = p.provider_key;
+        // Keys are write-only: the API reports provider_key_set instead of the
+        // plaintext key. Leave the field blank; blank on save means "keep".
+        provFormKey = '';
+        provFormKeySet = !!(p.provider_key_set ?? p.provider_key);
         provFormModel = p.provider_model;
         provFormPreset = p.preset || detectProvFormPreset(p.provider_url);
         providerFormVisible = true;
@@ -669,9 +656,9 @@
             name: provFormName.trim(),
             preset: provFormPreset,
             provider_url: provFormUrl.trim(),
-            provider_key: provFormKey.trim(),
             provider_model: provFormModel.trim(),
         };
+        if (provFormKey.trim()) body.provider_key = provFormKey.trim();
         try {
             if (editingProvider) {
                 await api('PUT', `/providers/${editingProvider.id}`, body);
@@ -715,6 +702,7 @@
         loadServerInfo();
         loadCalendarStatus();
         loadProviders();
+        refreshSkills();
     });
 
     onDestroy(() => {
@@ -800,20 +788,7 @@
                 </div>
                 <div>
                     <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">Release Channel</div>
-                    <div style="display:flex;gap:0.4rem;margin-top:0.35rem">
-                        <button
-                            class="btn btn-sm"
-                            style={serverInfo.channel === 'stable' ? 'background:var(--accent);color:white;border-color:var(--accent)' : ''}
-                            on:click={() => switchChannel('stable')}
-                            disabled={channelSwitching || serverInfo.channel === 'stable'}
-                        >stable</button>
-                        <button
-                            class="btn btn-sm"
-                            style={serverInfo.channel === 'beta' ? 'background:var(--accent);color:white;border-color:var(--accent)' : ''}
-                            on:click={() => switchChannel('beta')}
-                            disabled={channelSwitching || serverInfo.channel === 'beta'}
-                        >beta</button>
-                    </div>
+                    <div style="font-size:0.9rem;margin-top:0.25rem;font-family:var(--font-grotesk)">{serverInfo.channel || 'stable'}</div>
                 </div>
             </div>
             <div class="form-inline" style="margin-bottom:1rem">
@@ -1781,6 +1756,9 @@
                 bind:providerPreset={provFormPreset}
                 bind:providerName={provFormName}
             />
+            {#if editingProvider && provFormKeySet && !provFormKey}
+                <div style="padding:0 1.5rem 0.5rem;background:var(--surface-2);font-size:0.75rem;color:var(--gray-mid)">API key (saved) - leave blank to keep it</div>
+            {/if}
             <div style="padding:0 1.5rem 1rem;background:var(--surface-2);border-radius:0 0 var(--radius-lg) var(--radius-lg);display:flex;gap:0.5rem">
                 <button class="btn btn-primary" on:click={saveProvider}>{$_('common.save')}</button>
                 <button class="btn" on:click={cancelProviderForm}>{$_('common.cancel')}</button>
@@ -1810,7 +1788,7 @@
                                 <td><StatusBadge variant="model" label={p.preset || 'custom'} /></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title={p.provider_url}>{p.provider_url || '—'}</td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk)">{p.provider_model || '—'}</td>
-                                <td><StatusBadge status={p.provider_key ? 'on' : 'off'} label={p.provider_key ? $_('settings.prov_key_set') : $_('settings.prov_key_none')} /></td>
+                                <td><StatusBadge status={(p.provider_key_set ?? p.provider_key) ? 'on' : 'off'} label={(p.provider_key_set ?? p.provider_key) ? $_('settings.prov_key_set') : $_('settings.prov_key_none')} /></td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem">
                                         <button class="btn btn-sm" on:click={() => openEditProvider(p)}>{$_('common.edit')}</button>
