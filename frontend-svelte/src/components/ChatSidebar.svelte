@@ -61,7 +61,7 @@
             </div>
             {#each aSessions as s}
                 {@const isMain = (s.session_type || '') === 'main'}
-                {@const label = s.id.replace(new RegExp(`^${agent.name}-`), '').replace(/-?main$/, '') || 'main'}
+                {@const label = s._streaming_label || s.id.replace(new RegExp(`^${agent.name}-`), '') || 'main'}
                 {@const isRenaming = renamingSession && renamingSession.agentName === agent.name && renamingSession.label === label}
                 <div
                     class="session-item"
