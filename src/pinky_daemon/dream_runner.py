@@ -26,6 +26,7 @@ import numpy as np
 
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
+from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 
 
 def _log(msg: str) -> None:
@@ -162,6 +163,30 @@ class DreamRunner:
             )
             self._db.commit()
 
+    def _resolve_dream_transport(self) -> str:
+        """Which transport runs the dream: ``sdk`` (default) or ``tmux`` (#707).
+
+        Resolution: ``PINKY_DREAM_TRANSPORT`` in system_settings (via the
+        injected setting_provider — daemon env does NOT carry settings, same
+        trap as the API key / #685), then process env, then ``sdk``.
+        """
+        import os
+
+        val = ""
+        if self._setting_provider:
+            try:
+                val = (self._setting_provider("PINKY_DREAM_TRANSPORT") or "").strip()
+            except Exception:
+                val = ""
+        if not val:
+            val = os.environ.get("PINKY_DREAM_TRANSPORT", "").strip()
+        val = val.lower()
+        if val not in ("sdk", "tmux"):
+            if val:
+                _log(f"dream-runner: unknown PINKY_DREAM_TRANSPORT={val!r} — using sdk")
+            return "sdk"
+        return val
+
     # ── Public API ────────────────────────────────────────────
 
     def should_dream(self, agent_name: str, agent_config) -> bool:
@@ -232,16 +257,30 @@ class DreamRunner:
         dream_model = getattr(agent_config, "dream_model", "") or ""
         model = dream_model or getattr(agent_config, "model", None) or None
 
-        config = SDKRunnerConfig(
-            working_dir=work_dir,
-            model=model,
-            allowed_tools=_DREAM_ALLOWED_TOOLS,
-            permission_mode="bypassPermissions",
-            system_prompt=system_prompt,
-            max_turns=50,
-        )
-
-        runner = SDKRunner(config, agent_name=agent_name)
+        transport = self._resolve_dream_transport()
+        if transport == "tmux":
+            # #707: interactive tmux session on Max-account billing. The
+            # system prompt travels inside the prompt file, not as an option.
+            runner = TmuxDreamRunner(
+                TmuxDreamConfig(
+                    working_dir=work_dir,
+                    model=model,
+                    system_prompt=system_prompt,
+                ),
+                agent_name=agent_name,
+            )
+            _log(f"dream-runner: transport=tmux for '{agent_name}' "
+                 f"(session pinky-dream-{agent_name})")
+        else:
+            config = SDKRunnerConfig(
+                working_dir=work_dir,
+                model=model,
+                allowed_tools=_DREAM_ALLOWED_TOOLS,
+                permission_mode="bypassPermissions",
+                system_prompt=system_prompt,
+                max_turns=50,
+            )
+            runner = SDKRunner(config, agent_name=agent_name)
 
         # Build the user prompt with conversation history injected
         history_block = "\n".join(history_lines)
