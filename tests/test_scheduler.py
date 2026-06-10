@@ -802,4 +802,57 @@ class TestDreamNonBlocking:
         await asyncio.wait_for(scheduler._check_librarian(time.time()), timeout=2)
         await asyncio.wait_for(started.wait(), timeout=2)
         release.set()
-        await asyncio.wait_for(scheduler._librarian_tasks["ivan"], timeout=2)
+        await asyncio.wait_for(
+            scheduler._librarian_tasks[AgentScheduler.LIBRARIAN_GLOBAL_KEY], timeout=2
+        )
+
+    @pytest.mark.asyncio
+    async def test_librarian_guard_is_global_across_agents(self, registry):
+        """The librarian curates one shared KBStore: two librarian-enabled
+        agents due in the same minute must NOT run concurrently — the second
+        fire is skipped while the first is in flight (global slot, not
+        per-agent). The old inline await serialized these; per-agent tasks
+        would race the shared raw/wiki store.
+        """
+        registry.register(
+            "ivan",
+            model="opus",
+            librarian_enabled=True,
+            librarian_schedule="* * * * *",
+        )
+        registry.register(
+            "petr",
+            model="opus",
+            librarian_enabled=True,
+            librarian_schedule="* * * * *",
+        )
+        starts = []
+        release = asyncio.Event()
+
+        async def lib_cb(agent_name, agent):
+            starts.append(agent_name)
+            await release.wait()
+
+        scheduler = AgentScheduler(registry, librarian_callback=lib_cb)
+        # Both agents match the same cron minute in one check pass
+        await asyncio.wait_for(scheduler._check_librarian(time.time()), timeout=2)
+        await asyncio.sleep(0)  # let the background task start
+        # Bypass the (date, minute) dedup to simulate later cron minutes too
+        scheduler._last_librarian_check.clear()
+        await asyncio.wait_for(scheduler._check_librarian(time.time()), timeout=2)
+        await asyncio.sleep(0)
+        # Only ONE shared-KB run started, fleet-wide
+        assert len(starts) == 1
+        release.set()
+        await asyncio.wait_for(
+            scheduler._librarian_tasks[AgentScheduler.LIBRARIAN_GLOBAL_KEY], timeout=2
+        )
+        # Once the in-flight run finishes, a later fire can start again
+        scheduler._last_librarian_check.clear()
+        await asyncio.wait_for(scheduler._check_librarian(time.time()), timeout=2)
+        await asyncio.sleep(0)
+        assert len(starts) == 2
+        release.set()
+        await asyncio.wait_for(
+            scheduler._librarian_tasks[AgentScheduler.LIBRARIAN_GLOBAL_KEY], timeout=2
+        )
