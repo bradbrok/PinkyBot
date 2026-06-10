@@ -669,6 +669,94 @@ class TestHeartbeatResurrection:
         assert latest.metadata["last_seen_at"] == pytest.approx(now - 10)
 
 
+# ── Non-blocking idle/auto-sleep fires (#702 class) ────────────────────────
+
+
+class _FakeIdleSession:
+    """Streaming-session stand-in for idle/auto-sleep scheduling tests."""
+
+    def __init__(self, *, idle_timeout: int = 60) -> None:
+        from types import SimpleNamespace
+
+        from pinky_daemon.transport_state import SessionState
+
+        self.state = SessionState.CONNECTED
+        self.last_active = 0.0
+        self._config = SimpleNamespace(idle_timeout=idle_timeout)
+        self.sleep_calls = 0
+        self.started = asyncio.Event()
+        self.release = asyncio.Event()
+
+    async def idle_sleep(self) -> bool:
+        self.sleep_calls += 1
+        self.started.set()
+        await self.release.wait()
+        return True
+
+
+class TestIdleSleepNonBlocking:
+    """idle_sleep() waits up to a minute for the pre-sleep memory-save turn,
+    so the tick must spawn it as a background task. N idle agents awaited
+    serially would stall every cron minute, heartbeat, and wake in the
+    window — the same class of freeze #702 fixed for dreams.
+    """
+
+    @pytest.mark.asyncio
+    async def test_idle_check_does_not_block_on_slow_idle_sleep(self, registry):
+        ss = _FakeIdleSession()
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        # Before the fix this await would hang until idle_sleep finished.
+        await asyncio.wait_for(scheduler._check_idle_sessions(time.time()), timeout=2)
+        await asyncio.wait_for(ss.started.wait(), timeout=2)
+        task = scheduler._sleep_tasks[("ivan", "main")]
+        assert not task.done()
+        ss.release.set()
+        await asyncio.wait_for(task, timeout=2)
+        assert ss.sleep_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_idle_sleep_overlap_guard_skips_refire(self, registry):
+        ss = _FakeIdleSession()
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await scheduler._check_idle_sessions(time.time())
+        await asyncio.sleep(0)
+        # Session still CONNECTED mid-save: the next tick must not fire a
+        # second idle_sleep (second save prompt) for the same (agent, label).
+        await scheduler._check_idle_sessions(time.time())
+        await asyncio.sleep(0)
+        assert ss.sleep_calls == 1
+        ss.release.set()
+        await asyncio.wait_for(scheduler._sleep_tasks[("ivan", "main")], timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_auto_sleep_fallback_does_not_block_tick(self, registry):
+        registry.register("ivan", model="opus", auto_sleep_hours=1)
+        ss = _FakeIdleSession(idle_timeout=0)
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await asyncio.wait_for(scheduler._check_auto_sleep(time.time()), timeout=2)
+        await asyncio.wait_for(ss.started.wait(), timeout=2)
+        assert ss.sleep_calls == 1
+        ss.release.set()
+        await asyncio.wait_for(scheduler._sleep_tasks[("ivan", "main")], timeout=2)
+
+    @pytest.mark.asyncio
+    async def test_stop_cancels_inflight_idle_sleep(self, registry):
+        ss = _FakeIdleSession()
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await scheduler._check_idle_sessions(time.time())
+        await asyncio.sleep(0)
+        await scheduler.stop()
+        assert scheduler._sleep_tasks == {}
+
+
 # ── Non-blocking dream/librarian fires (issue #702) ────────────────────────
 
 

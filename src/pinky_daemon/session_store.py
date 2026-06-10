@@ -48,6 +48,10 @@ class SessionRecord:
     agent_name: str = ""
     disallowed_tools: list[str] = field(default_factory=list)
     provider_url: str = ""
+    # Stored as plaintext, like the other secrets in the data/ SQLite stores.
+    # At-rest protection is the owner-only 0600 file mode applied by the
+    # startup permission sweep (db_security.sweep_db_permissions, #673).
+    # Never log or echo this field.
     provider_key: str = ""
 
 

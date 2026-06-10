@@ -221,6 +221,11 @@ class AgentScheduler:
         # lock on the ingest-debounce path), so scheduled runs must not execute
         # concurrently across agents either: single global slot, not per-agent.
         self._librarian_tasks: dict[str, asyncio.Task] = {}  # LIBRARIAN_GLOBAL_KEY -> running librarian
+        # In-flight idle/auto-sleep runs. idle_sleep() waits up to a minute
+        # for the pre-sleep memory-save turn, so it must never be awaited
+        # inline in the tick (same #702 class as dreams): one slot per
+        # (agent_name, label) so a sleep spanning several ticks isn't refired.
+        self._sleep_tasks: dict[tuple[str, str], asyncio.Task] = {}
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -244,9 +249,10 @@ class AgentScheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
-        # Cancel in-flight dream/librarian runs. Before #702 these ran inside
-        # the loop task, so stop() cancelled them implicitly — keep that contract.
-        for task_map in (self._dream_tasks, self._librarian_tasks):
+        # Cancel in-flight dream/librarian/sleep runs. Before #702 these ran
+        # inside the loop task, so stop() cancelled them implicitly — keep
+        # that contract.
+        for task_map in (self._dream_tasks, self._librarian_tasks, self._sleep_tasks):
             for task in task_map.values():
                 if not task.done():
                     task.cancel()
@@ -570,10 +576,28 @@ class AgentScheduler:
                             self._activity.log(name, "agent_sleep", f"{name} auto-slept (idle timeout)")
                         except Exception:
                             pass
-                    try:
-                        await ss.idle_sleep()
-                    except Exception as e:
-                        _log(f"scheduler: idle sleep failed for {name}/{label}: {e}")
+                    self._spawn_idle_sleep(name, label, ss)
+
+    def _spawn_idle_sleep(self, name: str, label: str, ss) -> None:
+        """Fire idle_sleep as a background task — never inline in the tick.
+
+        idle_sleep() gives the pre-sleep memory-save turn up to a minute to
+        complete; N idle agents awaited serially would stall the tick loop
+        N minutes, skipping every cron minute / heartbeat / wake in the
+        window (#702 class). Mirrors ``_spawn_agent_callback``.
+        """
+        key = (name, label)
+        existing = self._sleep_tasks.get(key)
+        if existing and not existing.done():
+            return
+
+        async def _run() -> None:
+            try:
+                await ss.idle_sleep()
+            except Exception as e:
+                _log(f"scheduler: idle sleep failed for {name}/{label}: {e}")
+
+        self._sleep_tasks[key] = asyncio.create_task(_run())
 
     def _cleanup_expired_messages(self) -> None:
         """Remove expired inbox entries via the comms cleanup callback."""
@@ -692,10 +716,7 @@ class AgentScheduler:
                             _log(f"scheduler: auto-sleep callback failed for {agent.name}: {e}")
                     else:
                         # Fallback: use idle_sleep on the session directly
-                        try:
-                            await ss.idle_sleep()
-                        except Exception as e:
-                            _log(f"scheduler: auto-sleep idle_sleep failed for {agent.name}/{label}: {e}")
+                        self._spawn_idle_sleep(agent.name, label, ss)
 
     LIBRARIAN_GLOBAL_KEY = "__shared_kb__"
 

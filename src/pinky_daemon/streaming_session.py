@@ -1284,6 +1284,7 @@ class StreamingSession:
         # #543 / idle-sleep parity) so tmux can use the same instruction
         # via its internal-prompt mechanism with explicit
         # wait_for_completion semantics.
+        sends_before = self._stats["messages_sent"]
         try:
             self._turn_done.clear()
             await self._client.query(build_idle_sleep_prompt())
@@ -1309,6 +1310,18 @@ class StreamingSession:
                     )
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: memory save failed before idle sleep: {e}")
+
+        # A message accepted during the save window would have its query
+        # killed by the disconnect below. Abort the sleep instead and let
+        # the new traffic run. The send counter is the signal -- last_active
+        # also advances when the save turn itself completes, so it can't
+        # distinguish new inbound messages from the save finishing.
+        if self._stats["messages_sent"] != sends_before:
+            _log(
+                f"streaming[{self.agent_name}]: new message arrived during "
+                f"pre-sleep save window -- aborting idle sleep"
+            )
+            return False
 
         # Set IDLE_SLEEPING state BEFORE the disconnect side effect, so
         # ``disconnect()``'s "from CONNECTED → DEAD" fallback (for callers
@@ -1354,18 +1367,17 @@ class StreamingSession:
         it alive when the initiating caller (e.g. the old reader task,
         cancelled by disconnect()) dies mid-reconnect.
         """
-        existing = self._reconnect_task
-        if existing and not existing.done():
+        task = self._reconnect_task
+        if task is not None and not task.done():
             _log(
                 f"streaming[{self.agent_name}]: reconnect already in flight -- "
                 f"awaiting the existing attempt"
             )
-            await existing
-            return
-        task = asyncio.create_task(self._reconnect_with_backoff())
-        self._reconnect_task = task
-        task.add_done_callback(self._clear_reconnect_task)
-        await task
+        else:
+            task = asyncio.create_task(self._reconnect_with_backoff())
+            self._reconnect_task = task
+            task.add_done_callback(self._clear_reconnect_task)
+        await asyncio.wait_for(task, timeout=None)
 
     def _clear_reconnect_task(self, task: asyncio.Task) -> None:
         if self._reconnect_task is task:
@@ -1472,7 +1484,25 @@ class StreamingSession:
         # Routing entries for turns that will never complete are stale; a
         # reconnected session must not deliver its first responses (e.g. the
         # wake-prompt turn) to a leftover chat_id from before the teardown.
+        # Fire the response callback with empty text for each routed entry
+        # first: broker.route_response is the only place the typing
+        # indicator stops, and a turn that dies in this teardown would
+        # otherwise leave the typing task spinning against the platform API.
+        stale_routes = [entry for entry in self._pending_chats if entry[1]]
         self._pending_chats.clear()
+        if self._response_callback:
+            for platform, chat_id, message_id in stale_routes:
+                try:
+                    await self._response_callback(TurnResponse(
+                        agent_name=self.agent_name,
+                        session_id=self.id,
+                        platform=platform,
+                        chat_id=chat_id,
+                        message_id=message_id,
+                        text="",
+                    ))
+                except Exception as e:
+                    _log(f"streaming[{self.agent_name}]: stale-route callback error: {e}")
         _log(f"streaming[{self.agent_name}]: disconnected")
 
     # ── Analytics helpers ─────────────────────────────────

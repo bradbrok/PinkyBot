@@ -995,6 +995,30 @@ async def test_disconnect_clears_pending_chats() -> None:
 
 
 @pytest.mark.asyncio
+async def test_disconnect_fires_empty_callback_for_routed_pending_entries() -> None:
+    """A routed turn that dies in a teardown (e.g. the disconnect inside a
+    warm reconnect) never reaches broker.route_response -- the only place the
+    typing indicator stops. disconnect() must fire the callback with empty
+    text for each routed entry; sentinels stay silent."""
+    ss = _make_session()
+    routed: list[tuple[str, str, str]] = []
+
+    async def capture(turn_result):
+        routed.append((turn_result.platform, turn_result.chat_id, turn_result.text))
+
+    ss._response_callback = capture
+    ss._pending_chats.append(("telegram", "123", "9"))
+    ss._pending_chats.append(("", "", ""))
+
+    await ss.disconnect()
+
+    assert routed == [("telegram", "123", "")], (
+        f"routed entries must fire an empty-text callback on teardown, got {routed}"
+    )
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
 async def test_system_turn_does_not_consume_user_routing() -> None:
     """A system turn (sentinel entry) completing before a user turn must pop
     its own sentinel, leaving the user tuple for the user turn."""
@@ -1137,6 +1161,27 @@ async def test_idle_sleep_proceeds_after_save_timeout() -> None:
 
     assert result is True
     assert ss.state == SessionState.IDLE_SLEEPING
+
+
+@pytest.mark.asyncio
+async def test_idle_sleep_aborts_when_message_arrives_during_save_window() -> None:
+    """A send() accepted during the save window would have its query killed
+    by the teardown -- the sleep must abort and leave the session connected."""
+    ss = _make_session()
+
+    async def reader_with_traffic() -> None:
+        await ss.send("hi there", platform="telegram", chat_id="123")
+        ss._turn_done.set()
+
+    ss._reader_task = asyncio.create_task(reader_with_traffic())
+
+    result = await ss.idle_sleep()
+
+    assert result is False
+    assert ss.state == SessionState.CONNECTED, (
+        "idle sleep must abort when new traffic arrives mid-save"
+    )
+    assert ss._client is not None, "transport must not be torn down on abort"
 
 
 # -- Warm-reconnect coalescing -------------------------------------------------

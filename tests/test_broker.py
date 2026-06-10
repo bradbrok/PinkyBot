@@ -1054,6 +1054,52 @@ class TestStreamingSessionRegistry:
         finally:
             tmpdir.cleanup()
 
+    @pytest.mark.asyncio
+    async def test_register_streaming_skips_disconnect_when_transport_shared(self):
+        """Tmux names its OS session pinky-{agent} (no per-instance component),
+        so a displaced and a replacement session object drive the SAME tmux
+        session -- resume_handle is that name on both. Disconnecting the
+        displaced object would kill-session the replacement's live transport."""
+        import asyncio
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker = self._make_broker()
+        try:
+            class _TmuxLike:
+                def __init__(self, handle):
+                    self.state = SessionState.CONNECTED
+                    self.resume_handle = handle
+                    self.disconnect_calls = 0
+
+                async def disconnect(self):
+                    self.disconnect_calls += 1
+
+            old = _TmuxLike("pinky-barsik")
+            new = _TmuxLike("pinky-barsik")
+            broker.register_streaming("barsik", old, label="main")
+            broker.register_streaming("barsik", new, label="main")
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+            assert old.disconnect_calls == 0, (
+                "displaced session sharing the transport resource must NOT be "
+                "disconnected -- that would kill the replacement's tmux session"
+            )
+            assert new.disconnect_calls == 0
+            assert broker._streaming["barsik"]["main"] is new
+
+            # Distinct resources (e.g. two SDK sessions with their own
+            # subprocesses) still get the displaced-disconnect treatment.
+            third = _TmuxLike("other-handle")
+            broker.register_streaming("barsik", third, label="main")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert new.disconnect_calls == 1
+            assert third.disconnect_calls == 0
+        finally:
+            tmpdir.cleanup()
+
 
 class TestEventLoopOffload:
     """Blocking platform I/O must run off the event loop (asyncio.to_thread)."""

@@ -1608,6 +1608,12 @@ class MessageBroker:
         under this label, overwriting it would orphan a live SDK subprocess
         that keeps processing messages. Log loudly and schedule a disconnect
         of the displaced session.
+
+        Exception: when displaced and replacement share the same transport
+        resource (equal non-empty resume_handle -- tmux names its OS session
+        ``pinky-{agent}`` with no per-instance component, so both objects
+        drive ONE tmux session), disconnecting the displaced object would
+        ``kill-session`` the replacement's live transport. Skip it.
         """
         if agent_name not in self._streaming:
             self._streaming[agent_name] = {}
@@ -1617,21 +1623,30 @@ class MessageBroker:
             and displaced is not session
             and getattr(displaced, "state", None) == SessionState.CONNECTED
         ):
-            _log(
-                f"broker: WARNING overwriting still-connected streaming session "
-                f"for {agent_name}/{label} -- scheduling disconnect of displaced session"
-            )
-            try:
-                task = asyncio.get_running_loop().create_task(
-                    self._disconnect_displaced(agent_name, label, displaced)
-                )
-                self._background_tasks.add(task)
-                task.add_done_callback(self._background_tasks.discard)
-            except RuntimeError:
+            displaced_handle = getattr(displaced, "resume_handle", "") or ""
+            new_handle = getattr(session, "resume_handle", "") or ""
+            if displaced_handle and displaced_handle == new_handle:
                 _log(
-                    f"broker: no running event loop -- displaced session for "
-                    f"{agent_name}/{label} left connected"
+                    f"broker: displaced streaming session for {agent_name}/{label} "
+                    f"shares its transport resource with the replacement -- "
+                    f"skipping disconnect"
                 )
+            else:
+                _log(
+                    f"broker: WARNING overwriting still-connected streaming session "
+                    f"for {agent_name}/{label} -- scheduling disconnect of displaced session"
+                )
+                try:
+                    task = asyncio.get_running_loop().create_task(
+                        self._disconnect_displaced(agent_name, label, displaced)
+                    )
+                    self._background_tasks.add(task)
+                    task.add_done_callback(self._background_tasks.discard)
+                except RuntimeError:
+                    _log(
+                        f"broker: no running event loop -- displaced session for "
+                        f"{agent_name}/{label} left connected"
+                    )
         self._streaming[agent_name][label] = session
         _log(f"broker: registered streaming session for {agent_name}/{label}")
 
