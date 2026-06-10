@@ -128,10 +128,15 @@ class TestCronNextRun:
         assert cron_matches(cron, when)
         assert when.day in {10, 20, 30}
 
-    def test_range_with_step_returns_none(self):
-        # scheduler._part_matches cannot evaluate '1-5/2'; next_run must not
-        # pretend otherwise.
-        assert _cron_next_run("0 0 * * 1-5/2", "UTC") is None
+    def test_range_with_step_agrees_with_scheduler(self):
+        # Range-with-step support ('1-5/2') depends on the scheduler matcher.
+        # Whatever it says, next_run must agree: either no next run at all, or
+        # a timestamp the scheduler would actually fire on.
+        cron = "0 0 * * 1-5/2"
+        ts = _cron_next_run(cron, "UTC")
+        if ts is not None:
+            when = dt.datetime.fromtimestamp(ts, tz=zoneinfo.ZoneInfo("UTC"))
+            assert cron_matches(cron, when)
 
     def test_never_matching_cron_returns_none_fast(self):
         start = time.monotonic()
