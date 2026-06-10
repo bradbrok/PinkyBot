@@ -212,6 +212,15 @@ class AgentScheduler:
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
+        # In-flight dream/librarian runs (#702). These run as background tasks
+        # so a long dream (~1h with KG extraction) can't freeze the tick loop —
+        # a blocked tick silently skips every cron minute in the window.
+        self._dream_tasks: dict[str, asyncio.Task] = {}  # agent_name -> running dream
+        # The librarian curates ONE shared project-level KBStore (api.py wires a
+        # single LibrarianRunner guarded by a global _librarian_state.running
+        # lock on the ingest-debounce path), so scheduled runs must not execute
+        # concurrently across agents either: single global slot, not per-agent.
+        self._librarian_tasks: dict[str, asyncio.Task] = {}  # LIBRARIAN_GLOBAL_KEY -> running librarian
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -235,6 +244,17 @@ class AgentScheduler:
             except asyncio.CancelledError:
                 pass
             self._task = None
+        # Cancel in-flight dream/librarian runs. Before #702 these ran inside
+        # the loop task, so stop() cancelled them implicitly — keep that contract.
+        for task_map in (self._dream_tasks, self._librarian_tasks):
+            for task in task_map.values():
+                if not task.done():
+                    task.cancel()
+                    try:
+                        await task
+                    except asyncio.CancelledError:
+                        pass
+            task_map.clear()
         _log("scheduler: stopped")
 
     async def _loop(self) -> None:
@@ -677,6 +697,37 @@ class AgentScheduler:
                         except Exception as e:
                             _log(f"scheduler: auto-sleep idle_sleep failed for {agent.name}/{label}: {e}")
 
+    LIBRARIAN_GLOBAL_KEY = "__shared_kb__"
+
+    def _spawn_agent_callback(
+        self, task_map: dict, callback, agent, *, kind: str, fired_msg: str, key: str = ""
+    ) -> None:
+        """Fire a dream/librarian callback as a background task (#702).
+
+        The tick loop must never await these inline: a dream can run for an
+        hour (KG extraction over dozens of reflections), and a blocked tick
+        skips every cron schedule, heartbeat check, and wake in the window —
+        `_check_schedules` matches the current minute only, with no catch-up.
+
+        ``key`` is the overlap-guard slot: agent name for dreams (independent
+        per-agent state), LIBRARIAN_GLOBAL_KEY for librarian runs (shared KB —
+        at most one run in flight fleet-wide).
+        """
+        key = key or agent.name
+        existing = task_map.get(key)
+        if existing and not existing.done():
+            _log(f"scheduler: {kind} run already in flight — skipping fire for '{agent.name}'")
+            return
+        _log(fired_msg)
+
+        async def _run() -> None:
+            try:
+                await callback(agent.name, agent)
+            except Exception as e:
+                _log(f"scheduler: {kind} callback failed for '{agent.name}': {e}")
+
+        task_map[key] = asyncio.create_task(_run())
+
     async def _check_dreams(self, now: float) -> None:
         """Check dream schedules for all dream-enabled agents and fire if due."""
         if not self._dream_callback:
@@ -706,11 +757,10 @@ class AgentScheduler:
 
             if cron_matches(cron_expr, dt):
                 self._last_dream_check[agent.name] = dedup_key
-                _log(f"scheduler: dream schedule fired for '{agent.name}' (cron={cron_expr})")
-                try:
-                    await self._dream_callback(agent.name, agent)
-                except Exception as e:
-                    _log(f"scheduler: dream callback failed for '{agent.name}': {e}")
+                self._spawn_agent_callback(
+                    self._dream_tasks, self._dream_callback, agent, kind="dream",
+                    fired_msg=f"scheduler: dream schedule fired for '{agent.name}' (cron={cron_expr})",
+                )
 
     async def _check_librarian(self, now: float) -> None:
         """Check if the KB librarian should run.
@@ -745,12 +795,12 @@ class AgentScheduler:
 
             if cron_matches(cron_expr, dt):
                 self._last_librarian_check[agent.name] = dedup_key
-                _log(f"scheduler: librarian schedule fired for '{agent.name}' "
-                     f"(cron={cron_expr})")
-                try:
-                    await self._librarian_callback(agent.name, agent)
-                except Exception as e:
-                    _log(f"scheduler: librarian callback failed for '{agent.name}': {e}")
+                self._spawn_agent_callback(
+                    self._librarian_tasks, self._librarian_callback, agent, kind="librarian",
+                    fired_msg=f"scheduler: librarian schedule fired for '{agent.name}' "
+                              f"(cron={cron_expr})",
+                    key=self.LIBRARIAN_GLOBAL_KEY,
+                )
 
     async def _check_url_watchers(self, now: float) -> None:
         """Poll enabled url-type triggers whose interval has elapsed."""
