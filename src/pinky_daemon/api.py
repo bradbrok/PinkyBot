@@ -8183,12 +8183,14 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
         work_dir = Path(agent.working_dir).resolve()
         file_path = work_dir / filename
+        # Safety: don't serve files outside the working dir. Resolve first so
+        # a symlink inside the dir pointing elsewhere is rejected too, and
+        # check containment before existence so outside paths 403, not 404.
+        # is_relative_to avoids the '/dir' vs '/dir-evil' prefix pitfall.
+        if not file_path.resolve().is_relative_to(work_dir):
+            raise HTTPException(403, "Access denied")
         if not file_path.exists() or not file_path.is_file():
             raise HTTPException(404, f"File '{filename}' not found")
-        # Safety: don't serve files outside the working dir. Resolve first so
-        # a symlink inside the dir pointing elsewhere is rejected too.
-        if not str(file_path.resolve()).startswith(str(work_dir)):
-            raise HTTPException(403, "Access denied")
         return {"name": filename, "content": file_path.read_text(errors="replace")}
 
     @app.put("/agents/{name}/files/{filename}")
@@ -8203,8 +8205,8 @@ npm run build</pre>
         work_dir = Path(agent.working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
         file_path = work_dir / filename
-        # Safety check
-        if not str(file_path.resolve()).startswith(str(work_dir)):
+        # Safety check (resolve first; is_relative_to avoids prefix pitfalls)
+        if not file_path.resolve().is_relative_to(work_dir):
             raise HTTPException(403, "Access denied")
         file_path.write_text(req.content)
         if filename == "CLAUDE.md":
@@ -9216,8 +9218,8 @@ npm run build</pre>
                     "activity_log": s.get("activity_log", []),
                     "pending_responses": s.get("pending_responses", 0),
                 }
-            except Exception:
-                pass
+            except Exception as e:
+                _log(f"shutdown: could not snapshot {name} for restart manifest: {e}")
         try:
             manifest_path.write_text(_json.dumps(manifest, indent=2))
             _log(f"shutdown: restart manifest written for {len(manifest['agents'])} agent(s)")
