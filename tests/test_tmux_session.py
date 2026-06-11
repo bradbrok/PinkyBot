@@ -4781,6 +4781,24 @@ async def test_get_context_info_returns_sdk_shape() -> None:
 
 
 @pytest.mark.asyncio
+async def test_context_used_pct_property_for_heartbeat_reconciler() -> None:
+    """#745: the scheduler's heartbeat reconciler reads
+    ``context_used_pct`` via ``getattr(session, ..., 0.0)`` across all
+    transports. TmuxSession didn't define it, so every reconciled
+    heartbeat for a tmux agent recorded 0.0% while the real number sat
+    in ``get_context_info()``. The property must agree with the
+    percentage that the status endpoints already serve."""
+    ss, _ = _make_session_with_response_cb()
+    _seed_inflight(ss)  # #560
+    await ss._handle_turn_complete(
+        _turn_response(input_tokens=5_000, output_tokens=200)
+    )
+    pct = ss.context_used_pct
+    assert pct > 0.0
+    assert pct == ss.get_context_info()["percentage"]
+
+
+@pytest.mark.asyncio
 async def test_raw_max_tokens_for_1m_vs_200k_model() -> None:
     """``_raw_max_tokens_for_model`` returns the raw cap unaltered —
     1M for ``_1M_MODELS`` members, 200k otherwise. Without this split,
