@@ -98,6 +98,7 @@
     // Model provider state
     let providerUrl = '';
     let providerKey = '';
+    let providerKeySet = false; // backend reports provider_key_set instead of the plaintext key
     let providerModel = '';
     let providerPreset = 'anthropic'; // 'anthropic' | 'ollama' | 'zai' | 'openrouter' | 'deepseek' | 'codex_cli' | 'custom'
     let providerRef = '';  // ID of a global provider (empty = use agent-specific config)
@@ -466,8 +467,13 @@
         const members = groupMembers.split(',').map(m => m.trim()).filter(Boolean);
         if (!groupName.trim()) { toast('Group name required', 'error'); return; }
         if (!members.length) { toast('Add at least one member', 'error'); return; }
+        try {
+            await api('POST', '/groups', { name: groupName, members });
+        } catch (e) {
+            toast('Failed to create group: ' + (e?.message || e), 'error');
+            return;
+        }
         groupModalOpen = false;
-        await api('POST', '/groups', { name: groupName, members });
         toast(`Group "${groupName}" created`);
         refreshAgents();
     }
@@ -487,8 +493,13 @@
     async function confirmRetire() {
         if (!pendingRetireAgent || retireConfirmInput !== pendingRetireAgent) return;
         const name = pendingRetireAgent;
+        try {
+            await api('DELETE', `/agents/${name}`);
+        } catch (e) {
+            toast(`Failed to retire ${name}: ` + (e?.message || e), 'error');
+            return;
+        }
         closeRetireModal();
-        await api('DELETE', `/agents/${name}`);
         toast(`${name} retired`);
         if (currentAgent === name) closeDetail();
         refreshAgents();
@@ -546,7 +557,8 @@
             dreamNotify = agent.dream_notify !== false;
             dreamDirty = false;
             providerUrl = agent.provider_url || '';
-            providerKey = agent.provider_key || '';
+            providerKey = '';
+            providerKeySet = !!(agent.provider_key_set ?? agent.provider_key);
             providerModel = agent.provider_model || '';
             providerRef = agent.provider_ref || '';
             if (providerUrl === 'http://localhost:11434') {
@@ -559,7 +571,7 @@
                 providerPreset = 'deepseek';
             } else if (providerUrl === 'codex_cli') {
                 providerPreset = 'codex_cli';
-            } else if (providerUrl || providerKey) {
+            } else if (providerUrl || providerKeySet) {
                 providerPreset = 'custom';
             } else {
                 providerPreset = 'anthropic';
@@ -594,7 +606,7 @@
         }
     }
 
-    function closeDetail() { currentAgent = ''; detailOpen = false; }
+    function closeDetail() { openDetailSeq++; currentAgent = ''; detailOpen = false; }
 
     async function saveClaudeMd() {
         await api('PUT', `/agents/${currentAgent}/files/CLAUDE.md`, { content: claudeMdContent });
@@ -621,12 +633,16 @@
     }
     // Provider preset/selection logic moved to ProviderConfig component
     async function saveProvider() {
-        await api('PUT', `/agents/${currentAgent}/provider`, {
+        const body = {
             provider_url: providerUrl,
-            provider_key: providerKey,
             provider_model: providerModel,
             provider_ref: providerRef,
-        });
+        };
+        // Only send a key the user actually typed; absent means "keep the saved key".
+        if (providerKey) body.provider_key = providerKey;
+        await api('PUT', `/agents/${currentAgent}/provider`, body);
+        providerKeySet = providerKeySet || !!providerKey;
+        providerKey = '';
         providerDirty = false;
         toast('Provider saved — restart session to apply');
     }
@@ -637,12 +653,12 @@
     }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
 
-    async function loadDirectives() { const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`); directives = data.directives || []; }
+    async function loadDirectives() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`); if (req !== openDetailSeq) return; directives = data.directives || []; }
     async function addDirective() { if (!newDirective.trim()) { toast('Enter a directive', 'error'); return; } await api('POST', `/agents/${currentAgent}/directives`, { directive: newDirective.trim(), priority: newDirectivePriority }); newDirective = ''; toast('Directive added'); loadDirectives(); }
     async function removeDirective(id) { if (!confirm('Remove this directive?')) return; await api('DELETE', `/agents/${currentAgent}/directives/${id}`); toast('Directive removed'); loadDirectives(); }
     async function toggleDirective(id, active) { await api('POST', `/agents/${currentAgent}/directives/${id}/toggle?active=${active}`); loadDirectives(); }
 
-    async function loadTokens() { const data = await api('GET', `/agents/${currentAgent}/tokens`); tokens = data.tokens || []; }
+    async function loadTokens() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/tokens`); if (req !== openDetailSeq) return; tokens = data.tokens || []; }
     async function setToken() {
         const hasGlobalTokens = globalBotTokens.some(bt => bt.platform === tokenPlatform);
         const useRef = hasGlobalTokens && tokenRefId && tokenRefId !== '__manual__';
@@ -659,7 +675,7 @@
     async function removeToken(platform) { if (!confirm(`Remove ${platform} token?`)) return; await api('DELETE', `/agents/${currentAgent}/tokens/${platform}`); toast(`${platform} token removed`); loadTokens(); }
 
     // MCP Servers
-    async function loadMcpServers() { try { const data = await api('GET', `/agents/${currentAgent}/mcp-servers`); mcpServers = data.servers || []; } catch { mcpServers = []; } }
+    async function loadMcpServers() { const req = openDetailSeq; try { const data = await api('GET', `/agents/${currentAgent}/mcp-servers`); if (req !== openDetailSeq) return; mcpServers = data.servers || []; } catch { if (req === openDetailSeq) mcpServers = []; } }
     function openMcpModal() { mcpName = ''; mcpType = 'stdio'; mcpCommand = ''; mcpArgs = ''; mcpUrl = ''; mcpEnvPairs = [{ key: '', value: '' }]; mcpModalOpen = true; }
     async function addMcpServer() {
         if (!mcpName.trim()) { toast('Server name required', 'error'); return; }
@@ -682,10 +698,12 @@
 
     // Triggers
     async function loadTriggers(agentName) {
+        const req = openDetailSeq;
         try {
             const data = await api('GET', `/agents/${agentName}/triggers`);
+            if (req !== openDetailSeq) return;
             triggers = data.triggers || [];
-        } catch { triggers = []; }
+        } catch { if (req === openDetailSeq) triggers = []; }
     }
 
     async function deleteTrigger(id) {
@@ -766,15 +784,18 @@
 
     // Agent Skills
     async function loadAgentSkills() {
+        const req = openDetailSeq;
         try {
             const data = await api('GET', `/agents/${currentAgent}/skills?enabled_only=false`);
+            if (req !== openDetailSeq) return;
             agentSkills = data.skills || [];
-        } catch { agentSkills = []; }
+        } catch { if (req !== openDetailSeq) return; agentSkills = []; }
         try {
             const params = skillCategoryFilter ? `&category=${skillCategoryFilter}` : '';
             const avail = await api('GET', `/agents/${currentAgent}/skills/available?self_assignable=false${params}`);
+            if (req !== openDetailSeq) return;
             availableSkills = avail.skills || [];
-        } catch { availableSkills = []; }
+        } catch { if (req !== openDetailSeq) return; availableSkills = []; }
         skillsPendingApply = false;
     }
     async function assignSkill(skillName) {
@@ -831,12 +852,12 @@
         } catch (e) { toast(e.message || 'Failed to create skill', 'error'); }
     }
 
-    async function loadFiles() { const data = await api('GET', `/agents/${currentAgent}/files`); files = data.exists ? (data.files || []) : []; }
+    async function loadFiles() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/files`); if (req !== openDetailSeq) return; files = data.exists ? (data.files || []) : []; }
     async function editFile(filename) { const data = await api('GET', `/agents/${currentAgent}/files/${filename}`); editingFile = filename; fileEditorName = filename; fileEditorContent = data.content; fileEditorOpen = true; }
     function closeFileEditor() { fileEditorOpen = false; editingFile = ''; }
     async function saveFile() { await api('PUT', `/agents/${currentAgent}/files/${editingFile}`, { content: fileEditorContent }); toast(`${editingFile} saved`); loadFiles(); }
 
-    async function loadSchedules() { const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); schedules = data.schedules || []; }
+    async function loadSchedules() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/schedules?enabled_only=false`); if (req !== openDetailSeq) return; schedules = data.schedules || []; }
     function closeCronModal() { cronModalOpen = false; cronName = ''; cronExpression = ''; cronPrompt = ''; cronOneShot = false; }
     function describeCron(expr) {
         const [min, hour, dom, mon, dow] = expr.trim().split(/\s+/);
@@ -903,14 +924,18 @@
     async function toggleSchedule(id, enabled) { await api('POST', `/agents/${currentAgent}/schedules/${id}/toggle?enabled=${enabled}`); loadSchedules(); }
     async function removeSchedule(id) { if (!confirm('Remove this schedule?')) return; await api('DELETE', `/agents/${currentAgent}/schedules/${id}`); toast('Schedule removed'); loadSchedules(); }
 
-    async function loadSessions() { const data = await api('GET', `/agents/${currentAgent}/sessions`); agentSessions = data.sessions || []; }
+    async function loadSessions() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/sessions`); if (req !== openDetailSeq) return; agentSessions = data.sessions || []; }
 
     async function loadStreamingSessions() {
+        const req = openDetailSeq;
         const data = await api('GET', `/agents/${currentAgent}/streaming-sessions`);
+        if (req !== openDetailSeq) return;
         streamingSessions = data.sessions || [];
     }
     async function loadChannelSessions() {
+        const req = openDetailSeq;
         const data = await api('GET', `/agents/${currentAgent}/channel-sessions`);
+        if (req !== openDetailSeq) return;
         channelSessions = {};
         for (const m of (data.mappings || [])) {
             channelSessions[m.chat_id] = m.session_label;
@@ -941,7 +966,7 @@
     let approvedUsers = [];
     let newUserChatId = '';
     let newUserName = '';
-    async function loadApprovedUsers() { const data = await api('GET', `/agents/${currentAgent}/approved-users`); approvedUsers = data.users || []; }
+    async function loadApprovedUsers() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/approved-users`); if (req !== openDetailSeq) return; approvedUsers = data.users || []; }
     async function approveUser() {
         if (!newUserChatId.trim()) { toast('Enter a chat ID', 'error'); return; }
         await api('POST', `/agents/${currentAgent}/approved-users`, { chat_id: newUserChatId.trim(), display_name: newUserName.trim() });
@@ -957,7 +982,9 @@
     let pendingUserCount = 0;
     let pendingTotalCount = 0;
     async function loadPendingMessages() {
+        const req = openDetailSeq;
         const data = await api('GET', `/agents/${currentAgent}/pending-messages`);
+        if (req !== openDetailSeq) return;
         pendingMessages = data.by_sender || {};
         pendingUserCount = data.pending_users || 0;
         pendingTotalCount = data.total_messages || 0;
@@ -979,7 +1006,9 @@
     // Group chats (broker)
     let groupChats = [];
     async function loadGroupChats() {
+        const req = openDetailSeq;
         const data = await api('GET', `/agents/${currentAgent}/group-chats`);
+        if (req !== openDetailSeq) return;
         groupChats = data.group_chats || [];
     }
     async function setGroupAlias(chatId, alias) {
@@ -996,7 +1025,7 @@
 
     // Wizard
     let wizPronouns = '';
-    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizIsolation = 'local'; wizContainerImage = ''; wizIsolationHint = ''; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); wizardOpen = true; }
+    function openWizard() { wizStep = -1; importMode = false; importStep = 1; importFiles = { workspace: null, config: null, lock: null }; importDirPath = ''; importParseId = null; importPreview = null; importLoading = false; importTaskId = null; importProgress = { total: 0, imported: 0, failed: 0, done: false }; importDragover = false; importError = null; importAgentName = null; if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizName = ''; wizDisplayName = ''; wizPronouns = ''; wizModel = 'claude-opus-4-6'; wizProviderRef = ''; wizCustomProvider = false; wizProviderPreset = 'anthropic'; wizProviderUrl = ''; wizProviderKey = ''; wizProviderModel = ''; wizMode = 'bypassPermissions'; wizHeart = 'sidekick'; wizRole = 'sidekick'; wizAutoStart = true; wizHeartbeatInterval = 300; wizThinkingEffort = 'medium'; wizShowAdvanced = false; wizMaxTurns = 0; wizTimeout = 300; wizMaxSessions = 5; wizPlainTextFallback = false; wizTransport = 'tmux'; wizTransportUserSet = false; wizIsolation = 'local'; wizContainerImage = ''; wizIsolationHint = ''; wizCustomSoul = ''; wizTelegramToken = ''; wizDiscordToken = ''; wizSlackToken = ''; wizTelegramRef = ''; wizDiscordRef = ''; wizSlackRef = ''; globalProviders = []; api('GET', '/providers').then(d => { globalProviders = d || []; }).catch(() => { globalProviders = []; }); api('GET', '/bot-tokens').then(d => { globalBotTokens = d || []; }).catch(() => { globalBotTokens = []; }); wizardOpen = true; }
     function closeWizard() { if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } wizardOpen = false; }
 
     // Import (OpenClaw migration) helpers
@@ -1800,6 +1829,9 @@
                     {globalProviders}
                     on:change={() => providerDirty = true}
                 />
+                {#if providerKeySet && !providerKey && !providerRef && providerUrl}
+                    <div style="font-size:0.75rem;color:var(--gray-mid);padding:0.35rem 1.5rem 0">API key (saved) - leave blank to keep it</div>
+                {/if}
             </div>
 
             {#if providerRef}
@@ -2115,7 +2147,7 @@
                                 <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{t.fire_count}× fired</span>
                             {/if}
                             {#if t.last_fired_at}
-                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{timeAgo(t.last_fired_at * 1000)}</span>
+                                <span style="font-family:var(--font-body);font-size:0.7rem;color:var(--text-muted)">{timeAgo(t.last_fired_at)}</span>
                             {/if}
                             <button class="btn btn-sm" on:click={() => toggleTrigger(t.id, !t.enabled)}>{t.enabled ? $_('common.disable') : $_('common.enable')}</button>
                             {#if t.trigger_type === 'webhook'}<button class="btn btn-sm" on:click={() => rotateTriggerToken(t.id)} title="Rotate webhook token"><span class="material-symbols-outlined" style="font-size:0.9rem">key</span></button>{/if}

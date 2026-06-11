@@ -100,7 +100,9 @@
     async function refresh() {
         if (refreshing) return;
         refreshing = true;
-        const activityLimit = Math.max(ACTIVITY_PAGE, activityEvents.length);
+        // Refetch as many raw events as previously fetched (activityOffset tracks the
+        // raw count); sizing off the filtered list would shrink it on every tick.
+        const activityLimit = Math.max(ACTIVITY_PAGE, activityOffset);
         try {
             const [root, agentsData, schedulerStatus, heartbeats, activityData, schedulesData, activityStats] = await Promise.all([
                 api('GET', '/api'),
