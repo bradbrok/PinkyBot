@@ -580,6 +580,99 @@ class TestTmuxPaneStream:
             assert payload["agent"] == "dymok"
 
 
+class TestTmuxPaneKeys:
+    """Tests for ``POST /agents/<name>/tmux/pane/keys``.
+
+    Route-level contract for the typeable pane view (Murzik's #737
+    follow-up): the API layer must reject bad input — control bytes in
+    ``text`` especially, since a literal "\\x04" is C-d and would bypass
+    the named-key whitelist — before anything reaches the session.
+    Session-layer enforcement is covered in test_tmux_session.py.
+    """
+
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client(self, name: str = "dymok"):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert r.status_code == 200
+        return app, client
+
+    def _post(self, client, body, name: str = "dymok"):
+        return client.post(f"/agents/{name}/tmux/pane/keys", json=body)
+
+    def test_404_for_unknown_agent(self):
+        _, client = self._client()
+        assert self._post(client, {"text": "hi"}, name="nobody").status_code == 404
+
+    def test_400_when_both_or_neither_mode(self):
+        _, client = self._client()
+        assert self._post(client, {}).status_code == 400
+        assert self._post(client, {"text": "x", "key": "Enter"}).status_code == 400
+
+    def test_400_on_control_chars_in_text(self):
+        """The literal channel must not smuggle control bytes past the
+        named-key whitelist: "\\u0004" == C-d, which ``key`` denies."""
+        _, client = self._client()
+        for text in ("\x04", "ok\x04", "\x1b[A", "\x7f", "a\nb"):
+            resp = self._post(client, {"text": text})
+            assert resp.status_code == 400, repr(text)
+            assert "control" in resp.json()["detail"].lower()
+
+    def test_400_on_overlong_text(self):
+        _, client = self._client()
+        assert self._post(client, {"text": "x" * 1025}).status_code == 400
+
+    def test_400_on_non_whitelisted_key(self):
+        _, client = self._client()
+        for key in ("C-d", "kill-server", "F12"):
+            assert self._post(client, {"key": key}).status_code == 400, key
+
+    def test_409_without_tmux_session(self):
+        """Valid input but no live tmux session (or a session without
+        ``send_pane_keys`` — e.g. SDK transport) → 409, not 500."""
+        _, client = self._client()
+        assert self._post(client, {"text": "hello"}).status_code == 409
+        assert self._post(client, {"key": "Enter"}).status_code == 409
+
+    def test_valid_input_reaches_session(self):
+        """Happy path: printable text and a whitelisted key are forwarded
+        to the session's ``send_pane_keys`` and the API returns sent=True."""
+        app, client = self._client()
+        calls = []
+
+        class _PaneSession:
+            async def send_pane_keys(self, *, text="", key=""):
+                calls.append({"text": text, "key": key})
+                return True
+
+        app.state.broker.register_streaming("dymok", _PaneSession(), label="main")
+        resp = self._post(client, {"text": "ls -la"})
+        assert resp.status_code == 200
+        assert resp.json() == {"sent": True, "agent": "dymok"}
+        resp = self._post(client, {"key": "Enter"})
+        assert resp.status_code == 200
+        assert calls == [
+            {"text": "ls -la", "key": ""},
+            {"text": "", "key": "Enter"},
+        ]
+
+    def test_502_when_session_send_fails(self):
+        app, client = self._client()
+
+        class _FailingPaneSession:
+            async def send_pane_keys(self, *, text="", key=""):
+                return False
+
+        app.state.broker.register_streaming(
+            "dymok", _FailingPaneSession(), label="main"
+        )
+        assert self._post(client, {"key": "Enter"}).status_code == 502
+
+
 class TestSessionToolCalls:
     """Tests for ``GET /agents/<name>/sessions/<label>/tool-calls``.
 
