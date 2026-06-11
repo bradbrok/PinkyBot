@@ -316,6 +316,17 @@ class HostPinky:
                     out.append(AgentCardSelector(**item))
             except (TypeError, ValueError, json.JSONDecodeError) as e:
                 _log(f"skipping invalid ACL entry for {agent_name}: {item} ({e})")
+        for sel in out:
+            if sel.pinky_type is not None:
+                # v0.1 has no verified pinky_type on inbound cards (signed
+                # agent cards land in v0.2/v0.3), so a pinky_type-bearing
+                # selector can never match. Warn so the resulting
+                # default-deny is not silent.
+                _log(
+                    f"peer_fleet_acl for {agent_name}: selector with "
+                    f"pinky_type={sel.pinky_type!r} cannot match in v0.1 "
+                    "(no verified peer pinky_type yet)"
+                )
         return out
 
     # -- Dispatch: message → broker.handle_inbound ----------------------------
@@ -381,7 +392,9 @@ class HostPinky:
                 f"broker.dispatch_pre_authorized failed for ferry envelope "
                 f"{envelope.id}: {e}"
             )
-            return DeliveryResult(status="rejected", reason="broker_error", detail={"error": str(e)})
+            # Operational failure, not a policy denial -- the broker should
+            # replay rather than terminally drop an ACL-allowed message.
+            return self._transient("broker_error", str(e))
 
         self._stats["delivered"] += 1
         self._stats["messages_routed"] += 1
@@ -401,6 +414,7 @@ class HostPinky:
 
         receiving_address = f"ferry://pinkybot/{agent_name}"
         results: list[IngestResult] = []
+        operational_failures = 0
         for entry in entries:
             populated = populate_port_history(entry, envelope, receiving_address)
             try:
@@ -414,8 +428,27 @@ class HostPinky:
                         note=f"error: {e}",
                     )
                 )
+                operational_failures += 1
                 continue
+            if result.target_store == "skipped" and result.note.endswith("not configured"):
+                operational_failures += 1
             results.append(result)
+
+        if operational_failures == len(results):
+            # Every entry failed for host-side operational reasons (ingest
+            # exception, store not configured) -- the broker must replay
+            # rather than ack an envelope nothing was stored from. Policy
+            # skips (e.g. decayed lifecycle) do not count as failures.
+            self._stats["transient_failures"] += 1
+            _log(
+                f"transient_failure reason=ingest_failed: all {len(results)} "
+                f"substrate entries failed for envelope {envelope.id}"
+            )
+            return DeliveryResult(
+                status="transient_failure",
+                reason="ingest_failed",
+                detail={"ingested": [asdict(r) for r in results]},
+            )
 
         self._stats["delivered"] += 1
         self._stats["substrate_imports"] += sum(1 for r in results if r.target_store != "skipped")

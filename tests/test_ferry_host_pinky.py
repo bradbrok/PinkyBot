@@ -1061,3 +1061,130 @@ class TestBrokerIntegrationFerryInbound:
         assert real_registry.get_user_status(
             "barsik", "ferry:pulse@studio@sigil",
         ) is None
+
+
+# -- Sweep regressions: operational failures must be transient, not terminal ----
+
+
+class FailingMemoryStore:
+    """Memory store whose insert always fails operationally."""
+
+    def insert(self, reflection):  # noqa: ANN001
+        raise RuntimeError("database is locked")
+
+
+class ExplodingBroker:
+    """Broker whose dispatch raises (session restart race, DB lock, ...)."""
+
+    async def dispatch_pre_authorized(self, agent_name, broker_msg) -> None:  # noqa: ANN001
+        raise RuntimeError("session restart race")
+
+
+@pytest.mark.asyncio
+class TestSubstrateIngestFailureIsTransient:
+    async def test_all_entries_failing_ingest_yields_transient_failure(
+        self, allow_misha_acl
+    ):
+        registry = FakeRegistry(allow_misha_acl)
+        host = HostPinky(
+            registry=registry,
+            broker=FakeBroker(),
+            memory_store=FailingMemoryStore(),
+            reflection_factory=lambda kw: FakeReflection(**kw),
+        )
+        envelope = _build_envelope_substrate_batch(
+            [_entry_1_feedback(), _entry_2_pattern()]
+        )
+
+        result = await host.deliver(envelope)
+
+        assert result.status == "transient_failure"
+        assert result.reason == "ingest_failed"
+        # Per-entry outcomes still surfaced for diagnostics.
+        assert len(result.detail["ingested"]) == 2
+        assert all(r["target_store"] == "skipped" for r in result.detail["ingested"])
+        assert host.stats["transient_failures"] == 1
+        assert host.stats["delivered"] == 0
+
+    async def test_stores_not_configured_yields_transient_failure(
+        self, allow_misha_acl
+    ):
+        registry = FakeRegistry(allow_misha_acl)
+        host = HostPinky(registry=registry, broker=FakeBroker())  # no stores
+
+        result = await host.deliver(
+            _build_envelope_substrate_batch([_entry_1_feedback()])
+        )
+
+        assert result.status == "transient_failure"
+        assert result.reason == "ingest_failed"
+        assert host.stats["delivered"] == 0
+
+    async def test_policy_skip_still_delivers(self, allow_misha_acl):
+        # A decayed entry is skipped by policy, not by an operational
+        # failure -- the envelope is satisfied and must be acked.
+        registry = FakeRegistry(allow_misha_acl)
+        host = HostPinky(registry=registry, broker=FakeBroker())
+        decayed = _entry_1_feedback()
+        decayed.lifecycle = SubstrateLifecycle(state="decayed")
+
+        result = await host.deliver(_build_envelope_substrate_batch([decayed]))
+
+        assert result.status == "delivered"
+        assert host.stats["delivered"] == 1
+        assert host.stats["transient_failures"] == 0
+
+    async def test_partial_ingest_success_still_delivers(self, allow_misha_acl):
+        # One entry lands, one fails -- at-least-once is satisfied for the
+        # envelope, so it is acked with per-entry detail.
+        class FlakyMemoryStore:
+            def __init__(self) -> None:
+                self.calls = 0
+
+            def insert(self, reflection):  # noqa: ANN001
+                self.calls += 1
+                if self.calls > 1:
+                    raise RuntimeError("database is locked")
+                if not getattr(reflection, "id", ""):
+                    reflection.id = "refl-1"
+                return reflection
+
+        registry = FakeRegistry(allow_misha_acl)
+        host = HostPinky(
+            registry=registry,
+            broker=FakeBroker(),
+            memory_store=FlakyMemoryStore(),
+            reflection_factory=lambda kw: FakeReflection(**kw),
+        )
+        envelope = _build_envelope_substrate_batch(
+            [_entry_1_feedback(), _entry_2_pattern()]
+        )
+
+        result = await host.deliver(envelope)
+
+        assert result.status == "delivered"
+        stores = [r["target_store"] for r in result.detail["ingested"]]
+        assert stores == ["pinky-memory", "skipped"]
+
+
+@pytest.mark.asyncio
+class TestBrokerDispatchFailureIsTransient:
+    async def test_broker_error_yields_transient_failure(self, allow_misha_acl):
+        registry = FakeRegistry(allow_misha_acl)
+        host = HostPinky(registry=registry, broker=ExplodingBroker())
+        envelope = FerryEnvelope(
+            v="0.1",
+            id="msg-broker-boom",
+            from_="misha@pinky.local",
+            to="ferry://pinkybot/barsik",
+            ts=1,
+            body={"kind": "message", "text": "hi"},
+        )
+
+        result = await host.deliver(envelope)
+
+        assert result.status == "transient_failure"
+        assert result.reason == "broker_error"
+        assert host.stats["transient_failures"] == 1
+        assert host.stats["rejected"] == 0
+        assert host.stats["delivered"] == 0

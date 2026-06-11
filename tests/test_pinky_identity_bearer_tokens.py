@@ -542,6 +542,34 @@ def test_validate_rejects_token_with_internal_equals(store):
         store.validate("AAAA=AAAA")
 
 
+def test_validate_rejects_token_polluted_with_junk_chars(store):
+    """``urlsafe_b64decode`` silently drops non-alphabet bytes, so a real
+    token with junk appended decodes to the same secret. Only the one
+    canonical wire string may authenticate."""
+    result = _mint_default(store)
+    with pytest.raises(BearerTokenNotFoundError):
+        store.validate(result.token + "!!!!")
+    # The canonical form still validates fine.
+    store.validate(result.token)
+
+
+def test_decode_token_rejects_standard_alphabet_variant():
+    """A token rewritten with the standard ``+/`` alphabet decodes to the
+    same secret but is not the canonical no-padding base64url form."""
+    from pinky_identity.bearer_tokens import _decode_token, _encode_token
+
+    secret = b"\xfb\xff" + bytes(30)
+    token = _encode_token(secret)
+    assert "-" in token and "_" in token
+    variant = token.replace("-", "+").replace("_", "/")
+    assert variant != token
+    # Sanity: the variant really does decode to the same secret bytes.
+    assert base64.urlsafe_b64decode(variant + "=") == secret
+    assert _decode_token(token) == secret
+    with pytest.raises(BearerTokenNotFoundError):
+        _decode_token(variant)
+
+
 def test_claims_is_revoked_property():
     now = time.time()
     alive = BearerTokenClaims(

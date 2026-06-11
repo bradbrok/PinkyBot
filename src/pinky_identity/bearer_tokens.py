@@ -163,9 +163,15 @@ def _decode_token(token: str) -> bytes:
         raise BearerTokenNotFoundError("token must not contain padding")
     padding = "=" * (-len(token) % 4)
     try:
-        return base64.urlsafe_b64decode(token + padding)
+        secret_bytes = base64.urlsafe_b64decode(token + padding)
     except (ValueError, binascii.Error) as e:
         raise BearerTokenNotFoundError("malformed token encoding") from e
+    # Round-trip to enforce one canonical wire form: urlsafe_b64decode
+    # silently drops non-alphabet bytes and accepts the standard ``+/``
+    # alphabet, so distinct strings could otherwise decode to one secret.
+    if _encode_token(secret_bytes) != token:
+        raise BearerTokenNotFoundError("non-canonical token encoding")
+    return secret_bytes
 
 
 def _hash_secret(secret_bytes: bytes) -> str:

@@ -622,6 +622,7 @@ class FederationStateStore:
                 enc_pk=excluded.enc_pk,
                 fingerprint=excluded.fingerprint,
                 status=excluded.status,
+                first_seen=excluded.first_seen,
                 last_seen=excluded.last_seen,
                 pending_sig_pk=excluded.pending_sig_pk,
                 pending_enc_pk=excluded.pending_enc_pk,

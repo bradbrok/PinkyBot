@@ -208,6 +208,12 @@ class EncryptedSignerStore:
                     now,
                 ),
             )
+            # On a re-put the conflict clause keeps the original created_at;
+            # echo the persisted value so the returned row matches get_row().
+            row = self._db.execute(
+                "SELECT created_at FROM signing_keystore WHERE kid = ?",
+                (wrapped.kid,),
+            ).fetchone()
         return SignerStoreRow(
             kid=wrapped.kid,
             fingerprint=wrapped.fingerprint,
@@ -215,7 +221,7 @@ class EncryptedSignerStore:
             wrap_version=wrapped.version,
             nonce=wrapped.nonce,
             ciphertext=wrapped.ciphertext,
-            created_at=now,
+            created_at=float(row["created_at"]),
         )
 
     def put_keypair(self, keypair: SigningKeypair) -> SignerStoreRow:
