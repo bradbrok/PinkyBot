@@ -618,6 +618,58 @@ class TestTailerReadOnce:
             f"regression has reopened"
         )
 
+    @pytest.mark.asyncio
+    async def test_swap_during_turn_callback_aborts_old_chunk(
+        self, transcript, tmp_path,
+    ):
+        """A path-changing ``set_transcript_path`` can land from another
+        task while ``_read_and_dispatch`` is parked in an awaited turn
+        callback (late SessionStart hook, #565 first-bind recovery).
+
+        Pre-fix, the read loop kept feeding the REST of the old file's
+        chunk into the buffer the swap just drained (dead-session text
+        leaking into the new session) and then added the old chunk's
+        byte length to the offset the swap just set for the NEW file
+        (offset corruption: skipped bytes or a bogus shrank-branch
+        replay). The swap-generation check discards the remainder of
+        the chunk and leaves the swapped-in offset untouched.
+        """
+        # File A (dying session): two complete turns in one chunk.
+        _write_jsonl(transcript, [
+            _assistant(text="A1"),
+            _stop_hook_summary(),
+            _assistant(text="A2 dead-session text"),
+            _stop_hook_summary(),
+        ])
+        # File B (new session): one turn, to be read from byte 0.
+        new_path = tmp_path / "session_b.jsonl"
+        _write_jsonl(new_path, [
+            _assistant(text="B1"),
+            _stop_hook_summary(),
+        ])
+
+        responses: list[str] = []
+        box: dict = {}
+
+        async def cb(response: TurnResponse) -> None:
+            responses.append(response.text)
+            if len(responses) == 1:
+                # Simulate the concurrent swap landing mid-callback.
+                box["tailer"].set_transcript_path(new_path, seek_to_start=True)
+
+        tailer = TmuxTranscriptTailer(transcript, cb)
+        box["tailer"] = tailer
+
+        await tailer.read_once()
+        # Turn A2 belongs to the dead session and must NOT fire; the
+        # offset must stay where the swap put it for file B.
+        assert responses == ["A1"]
+        assert tailer.offset == 0
+
+        await tailer.read_once()
+        assert responses == ["A1", "B1"]
+        assert tailer.offset == new_path.stat().st_size
+
 
 class TestTailerBackgroundLoop:
     """Drive the actual asyncio loop end-to-end (with shortened cadences)."""

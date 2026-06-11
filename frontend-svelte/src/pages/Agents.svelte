@@ -262,7 +262,7 @@
     function normalizeStreamingSession(agentName, ss) {
         const stats = ss.stats || {};
         const state = ss.connected
-            ? ((stats.pending_responses || 0) > 0 ? 'busy' : 'connected')
+            ? (((stats.pending_responses || 0) + (stats.inflight_turns || 0)) > 0 ? 'busy' : 'connected')
             : 'sleeping';
         return {
             id: `${agentName}-${ss.label}`,
