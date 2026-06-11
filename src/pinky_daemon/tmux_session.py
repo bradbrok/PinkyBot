@@ -3488,11 +3488,31 @@ class TmuxSession:
         # ── Critical section: synchronous deque mutation + signals ────
         if not self._inflight_metas:
             # No meta to pop. Stop hook arrived without a dispatch
-            # behind it — race or stale tailer firing post-reconnect.
-            # Bail cleanly; routing must NOT be synthesized.
+            # behind it — most commonly an AUTONOMOUS turn (background-
+            # task notification, harness re-invocation) that never had a
+            # daemon dispatch; also race/stale tailer. Bail on the
+            # callback chain; routing must NOT be synthesized. But the
+            # turn DID end: clear per-turn live-activity state and tell
+            # the UI, or Chat.svelte shows stale thinking dots + frozen
+            # activity log until the next dispatched turn completes.
             _log(
                 f"tmux[{self.agent_name}]: stop hook with empty inflight_metas "
-                f"(race/stale tailer) — skipping callback chain"
+                f"(autonomous turn / race) — skipping callback chain"
+            )
+            self._current_activity = ""
+            self._current_thinking = ""
+            self._activity_log = []
+            await self._emit_stream_event(
+                {
+                    "type": "turn_completed",
+                    "agent_name": self.agent_name,
+                    "stop_reason": response.stop_reason,
+                    "usage": response.usage,
+                    "duration_ms": response.duration_ms,
+                    "assistant_entry_count": response.assistant_entry_count,
+                    "tool_use_count": len(response.tool_uses),
+                    "autonomous": True,
+                }
             )
             return
 

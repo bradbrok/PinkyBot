@@ -34,18 +34,14 @@
     let thinkingActivity = '';
     let thinkingContent = '';
     let activityLog = [];
-    // Task #94: per-turn tool-call chips driven by tmux SSE events
-    // (`tool_use_start` / `tool_use_finish` — see PR #527). Each entry
-    // is `{ id, toolName, namespace, description, argKeys, startedAt,
-    // finished, isError, resultPreview, finishedAt }`. Cleared when a
-    // new user turn begins; persists between the streaming assistant
-    // bubble and the next user send so finished calls stay visible.
-    let liveToolCalls = [];
-    // Persisted tool calls fetched from analytics on chat load — same
-    // shape as liveToolCalls but with `_startedAtEpoch` for chronological
-    // interleaving with messages. Survives page refresh; PR #527 hooks
-    // write the rows, this list rebuilds the chip strips inline with
-    // the message history.
+    // Persisted tool calls fetched from analytics on chat load — entries
+    // are `{ id, toolName, namespace, description, argKeys, finished,
+    // isError, resultPreview, _startedAtEpoch }`, slotted chronologically
+    // between messages. Survives page refresh; PR #527 hooks write the
+    // rows, this list rebuilds the chip strips inline with the message
+    // history. (The live in-turn chip strip these duplicated was removed:
+    // during a turn the thinking-bubble activity log is the single live
+    // view; chips render as history once the turn lands here.)
     let persistedToolCalls = [];
     // Reactive: chip strips slotted just before the message they precede.
     // Both arrays are sorted ASC; chips with started_at in
@@ -151,12 +147,31 @@
     let savingNudge = false;
     let savingSoftNudge = false;
 
-    const availableModels = [
+    // Model picker options come from the live registry (`GET /models`,
+    // same source as the Agents page) so new models appear without a
+    // frontend change — this list was previously hardcoded and went
+    // stale (Brad's msg #10942: no Fable 5 on the Pi). The static list
+    // is only the fallback when the registry fetch fails.
+    const fallbackModels = [
         { value: 'claude-sonnet-4-6', label: 'Sonnet 4.6 (1M)' },
         { value: 'claude-opus-4-6', label: 'Opus 4.6 (1M)' },
-        { value: 'claude-sonnet-4-5-20250514', label: 'Sonnet 4.5' },
-        { value: 'claude-haiku-4-5-20251001', label: 'Haiku 4.5' },
+        { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
     ];
+    let availableModels = fallbackModels;
+    async function loadModelRegistry() {
+        try {
+            const registry = await api('GET', '/models');
+            const anthropic = (registry || [])
+                .filter((m) => m.provider === 'anthropic')
+                .map((m) => ({
+                    value: m.model_id,
+                    label: m.display_name || m.model_id,
+                }));
+            if (anthropic.length) availableModels = anthropic;
+        } catch (e) {
+            console.warn('Failed to load model registry:', e);
+        }
+    }
 
     let chatPollInterval;
     let streamEventSource = null;
@@ -510,8 +525,8 @@
         } catch { /* non-critical */ }
 
         // Fetch persisted tool calls so the chip strips survive a page
-        // refresh. Same shape as liveToolCalls; the render loop later
-        // interleaves these chronologically with messages by timestamp.
+        // refresh. The render loop interleaves these chronologically
+        // with messages by timestamp.
         try {
             const refreshLabel = activeSessionRecord?._streaming_label
                 || labelFromSessionId(sessionId, agentName);
@@ -703,52 +718,19 @@
                     thinkingActivity = labelText;
                     activityLog = [...activityLog, labelText].slice(-20);
                 }
-            } else if (data.type === 'tool_use_start') {
-                // tmux transport (PR #527): per-call begin event. Push a
-                // new in-flight entry keyed by tool_use_id so the finish
-                // event can match it. Synthetic id covers the (unlikely)
-                // case where Claude Code omits one for a tool call.
-                const callId = data.tool_use_id ||
-                    `synthetic-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
-                liveToolCalls = [...liveToolCalls, {
-                    id: callId,
-                    toolName: String(data.tool_name || ''),
-                    namespace: String(data.tool_namespace || ''),
-                    description: String(data.description || ''),
-                    argKeys: Array.isArray(data.arg_keys) ? data.arg_keys : [],
-                    startedAt: Date.now(),
-                    finished: false,
-                    isError: false,
-                    resultPreview: '',
-                    finishedAt: null,
-                }];
-            } else if (data.type === 'tool_use_finish') {
-                // tmux transport (PR #527): close the matching in-flight
-                // chip. No-op if we never saw the start (e.g. SSE was
-                // disconnected mid-turn) — the chip just stays absent.
-                const callId = data.tool_use_id;
-                if (callId) {
-                    liveToolCalls = liveToolCalls.map((tc) =>
-                        tc.id === callId
-                            ? {
-                                ...tc,
-                                finished: true,
-                                isError: !!data.is_error,
-                                resultPreview: String(data.result_preview || ''),
-                                finishedAt: Date.now(),
-                            }
-                            : tc
-                    );
-                }
             } else if (data.type === 'turn_completed' || data.type === 'turn_failed') {
                 localMessages = localMessages.filter((m) => m._localKind !== 'pending-assistant-stream');
                 if (data.type === 'turn_failed' && data.error) {
                     addLocalMessage({ role: 'system', content: `Codex turn failed: ${data.error}` });
                 }
+                // Turn done: refreshChat re-fetches persisted tool calls,
+                // so the turn's chips slot inline as history
+                // (chipsByMessageIndex). tmux `tool_use_start`/`finish`
+                // events are intentionally unhandled — during the turn the
+                // thinking-bubble activity log (fed by the status poll) is
+                // the single live view; a parallel live chip strip rendered
+                // every call twice.
                 await refreshChat();
-                // Turn done: persisted chips (chipsByMessageIndex) now render these
-                // inline, so drop the live strip to avoid double-rendering each chip.
-                liveToolCalls = [];
             }
         };
     }
@@ -864,7 +846,6 @@
         thinkingActivity = '';
         thinkingContent = '';
         activityLog = [];
-        liveToolCalls = [];
         persistedToolCalls = [];
         agentWorking = false;
         wasWorking = false;
@@ -918,7 +899,6 @@
         thinkingActivity = '';
         thinkingContent = '';
         activityLog = [];
-        liveToolCalls = [];   // task #94: new user turn — clear last turn's chips
         pendingReply = { sessionId, sentAt, priorAssistantTs };
         if (pendingReplyTimer) clearTimeout(pendingReplyTimer);
         pendingReplyTimer = setTimeout(() => {
@@ -1307,6 +1287,7 @@
     // ── Lifecycle ──────────────────────────────────────────
 
     onMount(async () => {
+        loadModelRegistry();
         await refreshSessions();
         refreshInterval = setInterval(refreshSessions, 10000);
         document.addEventListener('click', handleGlobalClick);
@@ -1589,32 +1570,6 @@
                         />
                     {/if}
                 {/each}
-                {#if liveToolCalls.length > 0}
-                    <!-- Task #94: per-turn tool-call chips from tmux SSE events (PR #527). -->
-                    <div class="tool-call-strip">
-                        {#each liveToolCalls as tc (tc.id)}
-                            <div class="tool-call-chip" class:in-flight={!tc.finished} class:finished={tc.finished} class:tool-error={tc.finished && tc.isError}>
-                                <span class="tc-head">
-                                    {#if tc.namespace}<span class="tc-ns">{tc.namespace}/</span>{/if}
-                                    <span class="tc-name">{tc.toolName || '(tool)'}</span>
-                                    {#if tc.finished}
-                                        <span class="tc-status">{tc.isError ? '×' : '✓'}</span>
-                                    {:else}
-                                        <span class="tc-spinner" aria-label="running">·</span>
-                                    {/if}
-                                </span>
-                                {#if tc.description}<span class="tc-desc">{tc.description}</span>{/if}
-                                {#if tc.argKeys && tc.argKeys.length}<span class="tc-keys">[{tc.argKeys.join(', ')}]</span>{/if}
-                                {#if tc.finished && tc.resultPreview}
-                                    <details class="tc-preview-wrap">
-                                        <summary class="tc-preview-summary">result</summary>
-                                        <pre class="tc-preview">{tc.resultPreview}</pre>
-                                    </details>
-                                {/if}
-                            </div>
-                        {/each}
-                    </div>
-                {/if}
                 {#if thinking || agentWorking}
                     <div class="thinking-bubble">
                         <div class="thinking-dots-row">

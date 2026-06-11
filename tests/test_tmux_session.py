@@ -2013,6 +2013,39 @@ async def test_handle_turn_complete_resets_live_activity_state() -> None:
 
 
 @pytest.mark.asyncio
+async def test_handle_turn_complete_autonomous_turn_clears_activity() -> None:
+    """Empty-deque stop hooks (autonomous turns — background-task
+    notifications, harness re-invocations with no daemon dispatch) must
+    still clear live-activity state and emit ``turn_completed``.
+
+    The empty-deque bail correctly skips the routing chain (no meta to
+    synthesize), but before this fix it returned ABOVE the per-turn
+    activity reset — Chat.svelte showed stale thinking dots + a frozen
+    activity log after the agent stopped (Brad's msg #10938 screenshot,
+    2026-06-11)."""
+    events: list[dict] = []
+
+    async def stream_cb(evt):
+        events.append(evt)
+
+    ss, _ = _make_session_with_response_cb(stream_evt=stream_cb)
+    ss._current_activity = "Bash — gh run watch 12345"
+    ss._current_thinking = "waiting on CI"
+    ss._activity_log = ["Bash — gh run watch 12345"]
+    assert not ss._inflight_metas  # autonomous: nothing dispatched
+    response = TurnResponse(text="", stop_reason="end_turn")
+
+    await ss._handle_turn_complete(response)
+
+    assert ss._current_activity == ""
+    assert ss._current_thinking == ""
+    assert ss._activity_log == []
+    types = [e["type"] for e in events]
+    assert types == ["turn_completed"]
+    assert events[0]["autonomous"] is True
+
+
+@pytest.mark.asyncio
 async def test_handle_turn_complete_swallows_callback_exceptions() -> None:
     """A misbehaving response_callback must not strand the session.
 
