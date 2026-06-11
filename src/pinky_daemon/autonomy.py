@@ -198,7 +198,11 @@ You are operating autonomously. Assess the situation above and take action:
 4. **Delegate if needed** — create subtasks for workers if the work is complex
 5. **Save your state** — before stopping, save continuation context so you can resume
 
-If there's nothing to do, say so. Don't invent work.""")
+If the queue is empty, invent useful work — that's encouraged. Fix a known papercut,
+improve tests or docs, follow up on a stale thread, dig into a recurring annoyance, or
+propose a new idea to your owner. Idle time is an opportunity: bias toward doing something
+genuinely useful over doing nothing. The only bar is usefulness — don't manufacture
+busywork or churn just to look active.""")
 
     return "\n\n".join(parts)
 
