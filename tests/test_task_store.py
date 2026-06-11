@@ -74,6 +74,15 @@ class TestTaskCRUD:
         store.delete(parent.id)
         assert store.get(child.id) is None
 
+    def test_delete_cascades_grandchildren(self, store):
+        parent = store.create("Parent")
+        child = store.create("Child", parent_id=parent.id)
+        grandchild = store.create("Grandchild", parent_id=child.id)
+        store.delete(parent.id)
+        assert store.get(parent.id) is None
+        assert store.get(child.id) is None
+        assert store.get(grandchild.id) is None
+
 
 class TestTaskQueries:
     def test_list_default(self, store):
@@ -116,6 +125,15 @@ class TestTaskQueries:
         tasks = store.list(tag="bug")
         assert len(tasks) == 1
         assert "bug" in tasks[0].tags
+
+    def test_list_by_tag_beyond_limit(self, store):
+        # Tagged task sorts last (low priority); tag filter must apply
+        # before LIMIT so it is still returned.
+        tagged = store.create("Tagged", tags=["bug"], priority="low")
+        for i in range(3):
+            store.create(f"Other {i}", priority="high")
+        tasks = store.list(tag="bug", limit=3)
+        assert [t.id for t in tasks] == [tagged.id]
 
     def test_list_by_project(self, store):
         p = store.create_project("Proj")

@@ -50,6 +50,7 @@ def _prev_range_bounds(range_name: str) -> tuple[str, str]:
 class AnalyticsStore:
     def __init__(self, db_path: str) -> None:
         self.db_path = db_path
+        self._pricing_cache: dict[tuple[str, str], list[dict]] | None = None
         self._init_db()
 
     @contextmanager
@@ -1053,6 +1054,8 @@ class AnalyticsStore:
                 WHERE started_at >= ? AND started_at <= ?
                   AND (tool_name = 'Bash' OR tool_name LIKE '%__Bash')
             """
+            if agent_name:
+                bash_query += " AND agent_name=?"
             bash_rows = conn.execute(bash_query, tool_params).fetchall()
 
         # Index tools and bash commands by (session_id, turn_seq)
@@ -1265,25 +1268,29 @@ class AnalyticsStore:
         cached_cost = (int(row["cached_input_tokens"]) / 1_000_000) * float(pricing["cached_input_usd_per_mtok"])
         return input_cost + output_cost + cached_cost
 
-    def _lookup_pricing(self, *, provider: str, model: str, ts: str) -> sqlite3.Row | None:
+    def _pricing_table(self) -> dict[tuple[str, str], list[dict]]:
+        """Pricing rows keyed by (provider, model), newest effective_from first."""
+        if self._pricing_cache is None:
+            with self._connect() as conn:
+                rows = conn.execute(
+                    "SELECT * FROM analytics_model_pricing ORDER BY effective_from DESC"
+                ).fetchall()
+            table: dict[tuple[str, str], list[dict]] = {}
+            for row in rows:
+                table.setdefault((row["provider"], row["model"]), []).append(dict(row))
+            self._pricing_cache = table
+        return self._pricing_cache
+
+    def _lookup_pricing(self, *, provider: str, model: str, ts: str) -> dict | None:
+        table = self._pricing_table()
         provider_aliases = [provider or "", self._provider_alias(provider)]
         model_aliases = self._model_aliases(model)
-        with self._connect() as conn:
-            for provider_name in provider_aliases:
-                for model_name in model_aliases:
-                    row = conn.execute(
-                        """
-                        SELECT *
-                        FROM analytics_model_pricing
-                        WHERE provider=? AND model=?
-                          AND effective_from <= ?
-                          AND (effective_to IS NULL OR effective_to > ?)
-                        ORDER BY effective_from DESC
-                        LIMIT 1
-                        """,
-                        (provider_name, model_name, ts, ts),
-                    ).fetchone()
-                    if row:
+        for provider_name in provider_aliases:
+            for model_name in model_aliases:
+                for row in table.get((provider_name, model_name), []):
+                    if row["effective_from"] <= ts and (
+                        row["effective_to"] is None or row["effective_to"] > ts
+                    ):
                         return row
         return None
 
