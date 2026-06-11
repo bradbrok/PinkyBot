@@ -134,3 +134,21 @@ class TestLastMessageTime:
         convos.append("barsik-main", "user", "hi", timestamp=100.0)
         convos.append("pushok-main", "user", "yo", timestamp=999.0)
         assert convos.last_message_time("barsik-") == 100.0
+
+    def test_underscore_in_agent_name_is_not_a_wildcard(self, convos):
+        # `_` is a SQL LIKE wildcard — unescaped, foo_bar- would match
+        # fooXbar-main (Murzik repro, PR #733 review).
+        convos.append("fooXbar-main", "user", "imposter", timestamp=1234.0)
+        convos.append("foo_bar-main", "user", "real", timestamp=100.0)
+        assert convos.last_message_time("foo_bar-") == 100.0
+
+    def test_known_ambiguity_prefix_family_names(self, convos):
+        # PINS the documented residual: the agent-label session-id encoding
+        # cannot distinguish prefix-family agent names, so foo- also sees
+        # foo-bar's sessions. Worst case = false STALE (collapsed
+        # continuation), never a wrong replay. Real fix = agent_name column
+        # on conversation rows. If this test starts failing because the
+        # encoding got fixed, delete it and the docstring caveat together.
+        convos.append("foo-main", "user", "mine", timestamp=100.0)
+        convos.append("foo-bar-main", "user", "sibling agent", timestamp=999.0)
+        assert convos.last_message_time("foo-") == 999.0
