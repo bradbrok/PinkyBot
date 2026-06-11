@@ -25,6 +25,7 @@ from __future__ import annotations
 import json
 import re
 import secrets
+import shlex
 import sqlite3
 import sys
 import threading
@@ -247,37 +248,29 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
     """Compute the next run timestamp for a cron expression using stdlib only.
 
     Supports standard 5-field cron: min hour dom month dow.
-    Returns a UTC unix timestamp, or None on parse error.
+    Matching delegates to ``scheduler._field_matches`` so the displayed
+    next_run agrees with when ``scheduler.cron_matches`` actually fires.
+    Returns a UTC unix timestamp, or None on parse error / no match within
+    a year.
     """
     try:
         import datetime as dt
         import zoneinfo
 
+        from pinky_daemon.scheduler import _field_matches
+
         parts = cron.strip().split()
         if len(parts) != 5:
             return None
 
-        def _parse_field(val: str, lo: int, hi: int) -> set[int]:
-            result: set[int] = set()
-            for part in val.split(","):
-                if part == "*":
-                    result.update(range(lo, hi + 1))
-                elif "/" in part:
-                    base, step = part.split("/", 1)
-                    start = lo if base == "*" else int(base)
-                    result.update(range(start, hi + 1, int(step)))
-                elif "-" in part:
-                    a, b = part.split("-", 1)
-                    result.update(range(int(a), int(b) + 1))
-                else:
-                    result.add(int(part))
-            return result
-
-        minutes = _parse_field(parts[0], 0, 59)
-        hours = _parse_field(parts[1], 0, 23)
-        doms = _parse_field(parts[2], 1, 31)
-        months = _parse_field(parts[3], 1, 12)
-        dows = _parse_field(parts[4], 0, 6)  # 0=Sun
+        limits = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
+        sets: list[set[int]] = []
+        for raw, (lo, hi) in zip(parts, limits):
+            matched = {v for v in range(lo, hi + 1) if _field_matches(raw.strip(), v, lo, hi)}
+            if not matched:
+                return None  # unsatisfiable field, never fires
+            sets.append(matched)
+        minutes, hours, doms, months, dows = sets
 
         try:
             tz = zoneinfo.ZoneInfo(timezone)
@@ -286,17 +279,21 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
 
         now = dt.datetime.now(tz)
         candidate = now.replace(second=0, microsecond=0) + dt.timedelta(minutes=1)
+        horizon = candidate + dt.timedelta(days=366)
 
-        for _ in range(527040):  # max 1 year of minutes
+        while candidate <= horizon:
             if (
                 candidate.month in months
                 and candidate.day in doms
-                and (candidate.weekday() + 1) % 7 in dows  # Python Mon=0→1, Sun=6→0; cron Sun=0
-                and candidate.hour in hours
-                and candidate.minute in minutes
+                and candidate.isoweekday() % 7 in dows  # same mapping as cron_matches; Sun=0
             ):
-                return candidate.timestamp()
-            candidate += dt.timedelta(minutes=1)
+                if candidate.hour in hours and candidate.minute in minutes:
+                    return candidate.timestamp()
+                candidate += dt.timedelta(minutes=1)
+            else:
+                # Date fields miss: skip the rest of the day in one step
+                # instead of walking it minute by minute.
+                candidate = (candidate + dt.timedelta(days=1)).replace(hour=0, minute=0)
 
         return None
     except Exception:
@@ -520,7 +517,7 @@ class Agent:
             "runtime": self.runtime,
             "transport": self.transport,
             "provider_url": self.provider_url,
-            "provider_key": self.provider_key,
+            "provider_key_set": bool(self.provider_key),
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
             "thinking_effort": self.thinking_effort,
@@ -1790,20 +1787,23 @@ except Exception:
         """
         import json as _json
 
+        # Quote script paths: a working_dir containing spaces would otherwise
+        # make python3 open a nonexistent file, and the trailing
+        # "|| true" would swallow the failure silently.
         verify_cmd = (
-            f"python3 {verify_effort_path}"
+            f"python3 {shlex.quote(str(verify_effort_path))}"
             f' "$CLAUDE_PROJECT_DIR" 2>/dev/null || true'
         )
-        working_cmd = f"python3 {working_path} 2>/dev/null || true"
-        idle_cmd = f"python3 {idle_path} 2>/dev/null || true"
-        tmux_wake_cmd = f"python3 {tmux_wake_path} 2>/dev/null || true"
+        working_cmd = f"python3 {shlex.quote(str(working_path))} 2>/dev/null || true"
+        idle_cmd = f"python3 {shlex.quote(str(idle_path))} 2>/dev/null || true"
+        tmux_wake_cmd = f"python3 {shlex.quote(str(tmux_wake_path))} 2>/dev/null || true"
         tmux_session_start_cmd = (
-            f"python3 {tmux_session_start_path} 2>/dev/null || true"
+            f"python3 {shlex.quote(str(tmux_session_start_path))} 2>/dev/null || true"
         )
-        tmux_pre_tool_cmd = f"python3 {tmux_pre_tool_path} 2>/dev/null || true"
-        tmux_post_tool_cmd = f"python3 {tmux_post_tool_path} 2>/dev/null || true"
+        tmux_pre_tool_cmd = f"python3 {shlex.quote(str(tmux_pre_tool_path))} 2>/dev/null || true"
+        tmux_post_tool_cmd = f"python3 {shlex.quote(str(tmux_post_tool_path))} 2>/dev/null || true"
         tmux_stop_failure_cmd = (
-            f"python3 {tmux_stop_failure_path} 2>/dev/null || true"
+            f"python3 {shlex.quote(str(tmux_stop_failure_path))} 2>/dev/null || true"
         )
 
         if not settings_path.exists():
@@ -1989,7 +1989,7 @@ except Exception:
             # Merge: only update provided fields
             updates = {}
             for key in ("display_name", "model", "soul", "users", "boundaries",
-                        "system_prompt", "working_dir",
+                        "system_prompt",
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
                         "context_nudge_threshold_pct",
                         "auto_restart", "parent", "max_sessions", "enabled",
@@ -1997,11 +1997,32 @@ except Exception:
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
                         "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                         "librarian_enabled", "librarian_schedule",
-                        "runtime", "transport", "provider_url", "provider_key", "provider_model", "provider_ref",
+                        "runtime", "transport", "provider_url", "provider_model", "provider_ref",
                         "thinking_effort", "strict_effort_enforcement", "isolated",
                         "isolation_mode", "container_image"):
                 if key in kwargs:
                     updates[key] = kwargs[key]
+
+            # Secret: empty/absent means "unchanged" so callers round-tripping
+            # the redacted to_dict() (provider_key_set) can't wipe the key.
+            # Wiping requires the explicit clear_provider_key flag, which the
+            # routes set when a caller sends provider_key="".
+            if kwargs.get("provider_key"):
+                updates["provider_key"] = kwargs["provider_key"]
+            elif kwargs.get("clear_provider_key"):
+                updates["provider_key"] = ""
+
+            # working_dir keeps the create-path invariants on update: empty
+            # means "unchanged" (POST /agents upserts always pass it, default
+            # ""), relative paths are absolutized so they don't break when the
+            # daemon CWD differs from the install dir, and the workspace is
+            # initialized for the new directory.
+            if kwargs.get("working_dir"):
+                upd_dir = Path(kwargs["working_dir"])
+                upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
+                if str(upd_dir_abs) != existing.working_dir:
+                    self._init_workspace(upd_dir_abs, agent_name=name)
+                updates["working_dir"] = str(upd_dir_abs)
 
             if "watchdog_config" in kwargs:
                 updates["watchdog_config"] = json.dumps(kwargs["watchdog_config"])
@@ -3235,7 +3256,10 @@ except Exception:
                (agent_name, chat_id, display_name, status, approved_by, created_at, updated_at)
                VALUES (?, ?, ?, 'approved', ?, ?, ?)
                ON CONFLICT (agent_name, chat_id)
-               DO UPDATE SET status='approved', display_name=excluded.display_name,
+               DO UPDATE SET status='approved',
+                            display_name=COALESCE(
+                                NULLIF(excluded.display_name, ''),
+                                approved_users.display_name),
                             approved_by=excluded.approved_by, updated_at=excluded.updated_at""",
             (agent_name, chat_id, display_name, approved_by, now, now),
         )
@@ -3636,7 +3660,9 @@ except Exception:
     def list_all_tokens(self) -> list[dict]:
         """List all agent tokens across all agents."""
         rows = self._db.execute(
-            "SELECT agent_name, platform, token != '' as token_set, enabled, settings, updated_at "
+            "SELECT agent_name, platform, "
+            "(token != '' OR COALESCE(token_ref, '') != '') as token_set, "
+            "enabled, settings, updated_at "
             "FROM agent_tokens ORDER BY agent_name, platform",
         ).fetchall()
         return [
