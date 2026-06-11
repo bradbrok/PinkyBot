@@ -319,6 +319,23 @@ class ConversationStore:
             for r in rows
         ]
 
+    def last_message_time(self, session_prefix: str) -> float | None:
+        """Most recent message timestamp for sessions of one agent.
+
+        ``session_prefix`` is matched as ``{prefix}%`` so it covers the
+        agent's main session and any labeled siblings (``barsik-main``,
+        ``barsik-research``, …). Used by the autonomy engine's
+        continuation-staleness guard (#732): a saved-context snapshot
+        older than the agent's last conversation activity is history the
+        live thread already supersedes. Returns ``None`` when the agent
+        has no recorded messages.
+        """
+        row = self._conn.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE session_id LIKE ?",
+            (f"{session_prefix}%",),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def count(self, session_id: str = "") -> int:
         """Count messages, optionally filtered by session."""
         if session_id:

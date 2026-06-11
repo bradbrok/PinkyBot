@@ -118,6 +118,46 @@ class EventQueue:
         return {name: q.qsize() for name, q in self._queues.items()}
 
 
+def mark_stale_context(
+    context: dict | None,
+    last_message_time: float | None,
+    *,
+    slack_sec: float = 2.0,
+) -> dict | None:
+    """Flag a saved-context dict as stale when the conversation has moved on.
+
+    #732: autonomy event-wakes fire into LIVE sessions, where the
+    conversation itself is the freshest record. If the agent has exchanged
+    messages since the snapshot was saved (``last_message_time`` past
+    ``updated_at`` + slack), the full continuation replay is redundant at
+    best and misleading at worst — a stale ``wake_action`` ("deploy X")
+    can invite duplicate execution after X already shipped.
+
+    Pure helper (returns the same dict, mutated) so the verdict is unit-
+    testable without the async loop. Missing timestamps on either side
+    mean "can't tell" — the context is left as-is (today's behavior).
+    """
+    if not context:
+        return context
+    saved_at = float(context.get("updated_at") or 0)
+    if saved_at and last_message_time and last_message_time > saved_at + slack_sec:
+        context["stale"] = True
+    return context
+
+
+def _format_saved_age(updated_at: float) -> str:
+    """Human age stamp for the continuation header, e.g. ' (saved 42m ago)'."""
+    if not updated_at:
+        return ""
+    age_sec = max(0.0, time.time() - updated_at)
+    if age_sec < 90:
+        return " (saved moments ago)"
+    age_min = int(age_sec / 60)
+    if age_min < 120:
+        return f" (saved {age_min}m ago)"
+    return f" (saved {age_min // 60}h {age_min % 60}m ago)"
+
+
 def build_wake_prompt(
     agent_name: str,
     *,
@@ -133,14 +173,29 @@ def build_wake_prompt(
     """
     parts = []
 
-    # Continuation context (if any)
+    # Continuation context (if any). A snapshot flagged stale (see
+    # mark_stale_context) collapses to a one-line breadcrumb: the live
+    # conversation already carries everything the full block would replay,
+    # and replaying a stale wake_action invites double execution (#732).
     if context:
-        if context.get("task"):
-            parts.append(f"## Continuation\nYou were working on: {context['task']}")
-        if context.get("context"):
-            parts.append(f"### Previous Context\n{context['context']}")
-        if context.get("notes"):
-            parts.append(f"### Notes\n{context['notes']}")
+        stamp = _format_saved_age(float(context.get("updated_at") or 0))
+        if context.get("stale"):
+            if context.get("task"):
+                parts.append(
+                    f"## Continuation — STALE snapshot{stamp}\n"
+                    f"The conversation has continued past this save; trust the "
+                    f"live thread over it. Last saved task, for reference only: "
+                    f"{context['task']}"
+                )
+        else:
+            if context.get("task"):
+                parts.append(
+                    f"## Continuation{stamp}\nYou were working on: {context['task']}"
+                )
+            if context.get("context"):
+                parts.append(f"### Previous Context\n{context['context']}")
+            if context.get("notes"):
+                parts.append(f"### Notes\n{context['notes']}")
 
     # Events that triggered this wake
     if events:
@@ -342,6 +397,16 @@ class AutonomyEngine:
 
                 wake_context = self._registry.get_context(agent_name)
                 ctx_dict = wake_context.to_dict() if wake_context else None
+
+                # #732: collapse the continuation block when the live
+                # conversation already moved past the snapshot. Probe
+                # failure means "can't tell" — keep today's behavior.
+                if ctx_dict:
+                    try:
+                        last_msg = self._convos.last_message_time(f"{agent_name}-")
+                    except Exception:
+                        last_msg = None
+                    ctx_dict = mark_stale_context(ctx_dict, last_msg)
 
                 # Build decision prompt
                 prompt = build_wake_prompt(
