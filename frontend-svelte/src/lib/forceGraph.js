@@ -119,7 +119,7 @@ export function createForceSim(opts) {
                     const a = nodes[i], b = nodes[j];
                     const dx = b.x - a.x, dy = b.y - a.y;
                     const dist = Math.sqrt(dx * dx + dy * dy) || 0.01;
-                    const minDist = a.r + b.r + 3;
+                    const minDist = a.r + b.r + 5;
                     if (dist < minDist) {
                         const push = (minDist - dist) / 2;
                         const ux = dx / dist, uy = dy / dist;
@@ -192,19 +192,22 @@ export function animateView(from, to, apply, duration = 380) {
 /**
  * Greedy label declutter: walk nodes by degree (hubs first) and keep a label
  * only if its estimated text rect doesn't collide with an already-placed one.
- * Font size is in graph units (labels live inside the zoomed <g>), so the
- * result is zoom-independent and only needs recomputing per layout/filter.
+ * Labels render at constant SCREEN size (callers divide font-size by zoom),
+ * so collision rects grow in graph units as zoom shrinks — pass the current
+ * `zoom` and recompute when it changes: zooming in reveals more labels.
  * Returns a Set of node ids whose labels should render.
  */
-export function computeLabelSet(nodes, { fontSize = 11, charW = 6.6, maxLabels = 80 } = {}) {
+export function computeLabelSet(nodes, { fontSize = 11, charW = 6.6, maxLabels = 80, zoom = 1 } = {}) {
+    const z = Math.max(0.05, zoom);
+    const fs = fontSize / z, cw = charW / z;
     const placed = [];
     const visible = new Set();
     const sorted = [...nodes].sort((a, b) => (b.degree || 0) - (a.degree || 0) || b.r - a.r);
     for (const n of sorted) {
         if (visible.size >= maxLabels) break;
         const label = n.label || '';
-        const w = Math.min(22, label.length) * charW;
-        const h = fontSize + 4;
+        const w = Math.min(22, label.length) * cw;
+        const h = fs + 4;
         // label rect sits centered below the node (matches both renderers)
         const rect = { x: n.x - w / 2, y: n.y + n.r + 3, w, h };
         let collides = false;

@@ -361,17 +361,52 @@
         return { x: kgWidth / 2 + Math.cos(angle) * rx, y: kgHeight / 2 + Math.sin(angle) * ry };
     }
 
+    // "unknown" isn't a semantic cluster — it's missing taxonomy. Piling those
+    // nodes into their own island rendered a giant dead-gray continent, so
+    // anchor each one near the centroid of its TYPED neighbors' islands with a
+    // deterministic per-node scatter — without the scatter, every gray whose
+    // neighbors span types lands on the same centroid and knots up; with no
+    // anchor at all, the link web drags the whole layout into one center blob.
+    function kgIdHash(id) {
+        let h = 0;
+        const s = String(id);
+        for (let i = 0; i < s.length; i++) h = ((h << 5) - h + s.charCodeAt(i)) | 0;
+        return Math.abs(h);
+    }
+    function computeKgAnchors() {
+        for (const node of kgNodes) {
+            node._anchor = null;
+            if (node.type !== 'unknown') continue;
+            let sx = 0, sy = 0, k = 0;
+            for (const nb of (kgAdj.get(node.id) || [])) {
+                const o = kgNodeMap.get(nb);
+                if (!o || o.type === 'unknown') continue;
+                const c = clusterCenter(o.type);
+                sx += c.x; sy += c.y; k++;
+            }
+            if (k === 0) continue;
+            const h = kgIdHash(node.id);
+            const angle = (h % 360) * Math.PI / 180;
+            const radius = 60 + (h >> 3) % 110;
+            node._anchor = {
+                x: sx / k + Math.cos(angle) * radius,
+                y: sy / k + Math.sin(angle) * radius,
+            };
+        }
+    }
+
     function restartKgSim() {
         if (kgSim) { kgSim.stop(); kgSim = null; }
         if (kgDestroyed || kgNodes.length === 0) { kgLabelSet = new Set(); return; }
+        computeKgAnchors();
         kgSim = createForceSim({
             nodes: kgNodes,
             edges: kgEdges,
             nodeById: kgNodeMap,
-            clusterCenter: (n) => clusterCenter(n.type),
+            clusterCenter: (n) => n._anchor || clusterCenter(n.type),
             gravity: 0.016,        // soft islands — repulsion does the spreading
-            repulsion: 2400,
-            linkBase: 90,
+            repulsion: 2800,
+            linkBase: 110,         // longer leashes = looser hub neighborhoods
             onTick: (it) => {
                 kgNodes = kgNodes;                          // trigger reactivity
                 // keep the growing layout framed while it settles
@@ -382,7 +417,12 @@
             },
             onSettle: () => {
                 kgSim = null;
-                kgLabelSet = computeLabelSet(kgNodes);
+                // labels are screen-constant: declutter against the zoom the
+                // view is about to animate to, not wherever it is mid-flight
+                const target = kgUserMoved
+                    ? { zoom: kgZoom }
+                    : fitView(kgNodes, kgWidth, kgHeight);
+                kgLabelSet = computeLabelSet(kgNodes, { zoom: target.zoom });
                 kgAutoFit();
             },
         });
@@ -394,6 +434,7 @@
         if (kgUserMoved && !force) return;
         if (kgFitCancel) kgFitCancel();
         const target = fitView(kgNodes, kgWidth, kgHeight);
+        kgLabelSet = computeLabelSet(kgNodes, { zoom: target.zoom });
         kgFitCancel = animateView(
             { zoom: kgZoom, panX: kgPanX, panY: kgPanY },
             target,
@@ -441,6 +482,7 @@
     }
 
     // --- pan / zoom (background-drag pans, wheel zooms at cursor) ---
+    let kgLabelTimer = null;
     function kgWheel(e) {
         e.preventDefault();
         if (kgFitCancel) { kgFitCancel(); kgFitCancel = null; }
@@ -450,6 +492,9 @@
         const vbY = (e.clientY - rect.top) * (kgHeight / rect.height);
         const next = zoomAt({ zoom: kgZoom, panX: kgPanX, panY: kgPanY }, vbX, vbY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
         kgZoom = next.zoom; kgPanX = next.panX; kgPanY = next.panY;
+        // screen-constant labels free up room as you zoom in — re-declutter
+        clearTimeout(kgLabelTimer);
+        kgLabelTimer = setTimeout(() => { kgLabelSet = computeLabelSet(kgNodes, { zoom: kgZoom }); }, 150);
     }
     function kgPointerDown(e) { kgPanning = true; kgPanLast = { x: e.clientX, y: e.clientY }; }
     function kgPointerMove(e) {
@@ -701,19 +746,23 @@
                         {#if src && tgt}
                             {@const lit = (kgHoveredNode && (kgHoveredNode.id === edge.source || kgHoveredNode.id === edge.target)) || (kgSelectedId && (kgSelectedId === edge.source || kgSelectedId === edge.target))}
                             {@const sameType = src.type === tgt.type}
+                            {@const heavy = (edge.weight || 1) > 1}
+                            <!-- strokes/fonts divide by zoom: constant SCREEN size at any fit level.
+                                 weight-graded alpha: repeated relations read strong, one-off facts
+                                 fade back — kills the edge soup around hub nodes -->
                             <path
                                 d={edgePath(src, tgt)}
                                 fill="none"
-                                stroke={lit ? 'rgba(255,255,255,0.6)' : hexToRgba(kgNodeColor(src), sameType ? 0.3 : 0.13)}
-                                stroke-width={lit ? 2 : sameType ? 1.4 : 1}
+                                stroke={lit ? 'rgba(255,255,255,0.6)' : hexToRgba(kgNodeColor(src), (sameType ? 0.42 : 0.26) * (heavy ? 1 : 0.55))}
+                                stroke-width={(lit ? 2 : heavy ? 1.5 : 1) / kgZoom}
                             />
                             {#if (kgShowEdgeLabels && kgZoom >= 1.05) || lit}
                                 <text
                                     x={(src.x + tgt.x) / 2}
-                                    y={(src.y + tgt.y) / 2 - 4}
+                                    y={(src.y + tgt.y) / 2 - 4 / kgZoom}
                                     text-anchor="middle"
                                     fill="rgba(255,255,255,0.5)"
-                                    font-size="9px"
+                                    font-size="{9 / kgZoom}px"
                                     font-family="monospace"
                                 >{edge.label}</text>
                             {/if}
@@ -739,15 +788,15 @@
                                 cx={node.x} cy={node.y} r={node.r}
                                 fill={kgNodeColor(node)}
                                 stroke={sel || kgHoveredNode?.id === node.id ? '#fff' : 'rgba(255,255,255,0.2)'}
-                                stroke-width={sel ? 3 : kgHoveredNode?.id === node.id ? 2.5 : 1}
+                                stroke-width={(sel ? 3 : kgHoveredNode?.id === node.id ? 2.5 : 1.2) / kgZoom}
                                 opacity={dim ? 0.25 : 0.92}
                             />
                             {#if kgLabelVisible(node, kgLabelSet)}
                                 <text
-                                    x={node.x} y={node.y + node.r + 13}
+                                    x={node.x} y={node.y + node.r + 13 / kgZoom}
                                     text-anchor="middle"
-                                    fill={dim ? 'rgba(255,255,255,0.3)' : kgHoveredNode?.id === node.id || sel ? '#fff' : 'rgba(255,255,255,0.75)'}
-                                    font-size={node.degree >= 8 ? '12px' : '11px'}
+                                    fill={dim ? 'rgba(255,255,255,0.3)' : kgHoveredNode?.id === node.id || sel ? '#fff' : 'rgba(255,255,255,0.78)'}
+                                    font-size="{(node.degree >= 8 ? 12 : 11) / kgZoom}px"
                                     font-family="monospace"
                                     style="pointer-events:none"
                                 >
@@ -757,32 +806,34 @@
                         </g>
                     {/each}
 
-                    <!-- Tooltip -->
+                    <!-- Tooltip (inverse-scaled group = constant screen size) -->
                     {#if kgHoveredNode}
-                        <rect
-                            x={kgHoveredNode.x + kgHoveredNode.r + 8}
-                            y={kgHoveredNode.y - 16}
-                            width={Math.max(140, kgHoveredNode.label.length * 7 + 60)}
-                            height="32"
-                            rx="4"
-                            fill="rgba(0,0,0,0.85)"
-                            stroke="rgba(255,255,255,0.2)"
-                        />
-                        <text
-                            x={kgHoveredNode.x + kgHoveredNode.r + 14}
-                            y={kgHoveredNode.y + 1}
-                            fill="#fff"
-                            font-size="12px"
-                            font-family="monospace"
-                        >
-                            {kgHoveredNode.label} ({kgHoveredNode.type}) · {kgHoveredNode.degree}
-                        </text>
+                        <g transform="translate({kgHoveredNode.x} {kgHoveredNode.y}) scale({1 / kgZoom})">
+                            <rect
+                                x={kgHoveredNode.r * kgZoom + 8}
+                                y="-16"
+                                width={Math.max(140, kgHoveredNode.label.length * 7 + 60)}
+                                height="32"
+                                rx="4"
+                                fill="rgba(0,0,0,0.85)"
+                                stroke="rgba(255,255,255,0.2)"
+                            />
+                            <text
+                                x={kgHoveredNode.r * kgZoom + 14}
+                                y="4"
+                                fill="#fff"
+                                font-size="12px"
+                                font-family="monospace"
+                            >
+                                {kgHoveredNode.label} ({kgHoveredNode.type}) · {kgHoveredNode.degree}
+                            </text>
+                        </g>
                     {/if}
                 </g>
             </svg>
 
             <div style="display:flex;justify-content:center;margin-top:0.5rem;font-family:var(--font-grotesk);font-size:0.62rem;color:var(--text-muted)">
-                node size = connections · nodes cluster by type · labels show on hover &amp; for hubs
+                node size = connections · nodes cluster by type · zoom in to reveal more labels
             </div>
         </div>
     {/if}

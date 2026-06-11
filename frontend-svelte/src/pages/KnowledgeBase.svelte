@@ -216,7 +216,11 @@
             },
             onSettle: () => {
                 graphSim = null;
-                graphLabelSet = computeLabelSet(graphNodes, { maxLabels: 60 });
+                // labels are screen-constant — declutter against the upcoming fit zoom
+                const target = graphUserMoved
+                    ? { zoom: graphZoom }
+                    : fitView(graphNodes, graphWidth, graphHeight, 55);
+                graphLabelSet = computeLabelSet(graphNodes, { maxLabels: 60, zoom: target.zoom });
                 graphAutoFit();
             },
         });
@@ -226,6 +230,7 @@
         if (graphUserMoved && !force) return;
         if (graphFitCancel) graphFitCancel();
         const target = fitView(graphNodes, graphWidth, graphHeight, 55);
+        graphLabelSet = computeLabelSet(graphNodes, { maxLabels: 60, zoom: target.zoom });
         graphFitCancel = animateView(
             { zoom: graphZoom, panX: graphPanX, panY: graphPanY },
             target,
@@ -235,6 +240,7 @@
     }
 
     // --- pan / zoom (mirrors the KG view) ---
+    let graphLabelTimer = null;
     function graphWheel(e) {
         e.preventDefault();
         if (graphFitCancel) { graphFitCancel(); graphFitCancel = null; }
@@ -244,6 +250,9 @@
         const vbY = (e.clientY - rect.top) * (graphHeight / rect.height);
         const next = zoomAt({ zoom: graphZoom, panX: graphPanX, panY: graphPanY }, vbX, vbY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
         graphZoom = next.zoom; graphPanX = next.panX; graphPanY = next.panY;
+        // screen-constant labels free up room as you zoom in — re-declutter
+        clearTimeout(graphLabelTimer);
+        graphLabelTimer = setTimeout(() => { graphLabelSet = computeLabelSet(graphNodes, { maxLabels: 60, zoom: graphZoom }); }, 150);
     }
     function graphPointerDown(e) { graphPanning = true; graphDragMoved = false; graphPanLast = { x: e.clientX, y: e.clientY }; }
     function graphPointerMove(e) {
@@ -271,7 +280,7 @@
     function edgeColor(edge, src, tgt) {
         const wiki = src?.type === 'wiki' ? src : tgt?.type === 'wiki' ? tgt : null;
         const base = wiki ? nodeColor(wiki) : '#888888';
-        return hexToRgba(base, edge.type === 'related' ? 0.35 : 0.12);
+        return hexToRgba(base, edge.type === 'related' ? 0.45 : 0.22);
     }
 
     function onGraphNodeClick(node) {
@@ -787,11 +796,12 @@
                         {@const tgt = graphNodeMap.get(edge.target)}
                         {#if src && tgt}
                             {@const lit = hoveredNode && (hoveredNode.id === edge.source || hoveredNode.id === edge.target)}
+                            <!-- strokes/fonts divide by zoom: constant SCREEN size at any fit level -->
                             <path
                                 d={edgePath(src, tgt)}
                                 fill="none"
                                 stroke={lit ? 'rgba(255,255,255,0.6)' : edgeColor(edge, src, tgt)}
-                                stroke-width={lit ? 2 : edge.type === 'related' ? 1.6 : 1}
+                                stroke-width={(lit ? 2 : edge.type === 'related' ? 1.6 : 1.1) / graphZoom}
                             />
                         {/if}
                     {/each}
@@ -819,15 +829,15 @@
                                 cx={node.x} cy={node.y} r={node.r}
                                 fill={nodeColor(node)}
                                 stroke={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.2)'}
-                                stroke-width={hoveredNode === node ? 2.5 : 1}
+                                stroke-width={(hoveredNode === node ? 2.5 : 1.2) / graphZoom}
                                 opacity={hoveredNode && hoveredNode !== node ? 0.4 : 0.92}
                             />
                             {#if hoveredNode === node || graphLabelSet.has(node.id)}
                                 <text
-                                    x={node.x} y={node.y + node.r + 14}
+                                    x={node.x} y={node.y + node.r + 14 / graphZoom}
                                     text-anchor="middle"
-                                    fill={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.7)'}
-                                    font-size={node.type === 'wiki' ? '11px' : '9px'}
+                                    fill={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.75)'}
+                                    font-size="{(node.type === 'wiki' ? 11 : 9) / graphZoom}px"
                                     font-family="monospace"
                                     style="pointer-events:none"
                                 >
@@ -837,26 +847,28 @@
                         </g>
                     {/each}
 
-                    <!-- Tooltip -->
+                    <!-- Tooltip (inverse-scaled group = constant screen size) -->
                     {#if hoveredNode}
-                        <rect
-                            x={hoveredNode.x + hoveredNode.r + 8}
-                            y={hoveredNode.y - 16}
-                            width={Math.max(120, hoveredNode.label.length * 7 + 40)}
-                            height="32"
-                            rx="4"
-                            fill="rgba(0,0,0,0.85)"
-                            stroke="rgba(255,255,255,0.2)"
-                        />
-                        <text
-                            x={hoveredNode.x + hoveredNode.r + 14}
-                            y={hoveredNode.y + 1}
-                            fill="#fff"
-                            font-size="12px"
-                            font-family="monospace"
-                        >
-                            {hoveredNode.label} ({hoveredNode.degree})
-                        </text>
+                        <g transform="translate({hoveredNode.x} {hoveredNode.y}) scale({1 / graphZoom})">
+                            <rect
+                                x={hoveredNode.r * graphZoom + 8}
+                                y="-16"
+                                width={Math.max(120, hoveredNode.label.length * 7 + 40)}
+                                height="32"
+                                rx="4"
+                                fill="rgba(0,0,0,0.85)"
+                                stroke="rgba(255,255,255,0.2)"
+                            />
+                            <text
+                                x={hoveredNode.r * graphZoom + 14}
+                                y="4"
+                                fill="#fff"
+                                font-size="12px"
+                                font-family="monospace"
+                            >
+                                {hoveredNode.label} ({hoveredNode.degree})
+                            </text>
+                        </g>
                     {/if}
                     </g>
                 </svg>
