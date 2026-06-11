@@ -7814,6 +7814,33 @@ async def test_send_pane_keys_rejects_non_whitelisted_key() -> None:
 
 
 @pytest.mark.asyncio
+async def test_send_pane_keys_rejects_control_chars_in_text() -> None:
+    """Control bytes in the literal channel never reach tmux — a literal
+    "\\x04" is C-d in the pane, which would bypass the named-key
+    whitelist's explicit C-d exclusion."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+
+    assert await session.send_pane_keys(text="\x04") is False  # C-d
+    assert await session.send_pane_keys(text="ok\x04") is False  # embedded
+    assert await session.send_pane_keys(text="\x1b[A") is False  # raw ESC seq
+    assert await session.send_pane_keys(text="\x7f") is False  # DEL
+    assert await session.send_pane_keys(text="a\nb") is False  # newline
+    tmux.send_literal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_allows_printable_text() -> None:
+    """The control-char guard must not over-reject: printable ASCII,
+    spaces, and non-ASCII (IME input, emoji) all pass through."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+
+    assert await session.send_pane_keys(text="ls -la ~/файл 🐈") is True
+    tmux.send_literal.assert_awaited_once_with("ls -la ~/файл 🐈")
+
+
+@pytest.mark.asyncio
 async def test_send_pane_keys_swallows_exceptions() -> None:
     """Same defensive posture as get_pane_snapshot/resize_pane: a tmux
     blip logs + returns False, never raises into the API layer."""

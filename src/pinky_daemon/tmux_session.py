@@ -2882,6 +2882,8 @@ class TmuxSession:
 
         - ``text`` — literal characters, sent with ``send-keys -l`` so tmux
           performs NO keyname interpretation ("Enter" types five letters).
+          C0/DEL control characters are rejected — a literal "\\x04" would
+          be C-d in the pane, bypassing the named-key whitelist.
         - ``key`` — one named key from ``PANE_KEY_WHITELIST`` (tmux keyname
           semantics: Enter submits, Up/Down navigate dialogs, C-c interrupts).
 
@@ -2896,6 +2898,15 @@ class TmuxSession:
             _log(
                 f"tmux[{self.agent_name}]: send_pane_keys rejected "
                 f"non-whitelisted key {key!r}"
+            )
+            return False
+        if text and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+            # Control bytes in the literal channel would bypass the key
+            # whitelist ("\x04" is C-d regardless of which door it came
+            # through) — control sequences are only reachable as named keys.
+            _log(
+                f"tmux[{self.agent_name}]: send_pane_keys rejected "
+                f"control characters in literal text"
             )
             return False
         try:

@@ -8053,6 +8053,14 @@ npm run build</pre>
             raise HTTPException(400, "provide exactly one of 'text' or 'key'")
         if len(req.text) > 1024:
             raise HTTPException(400, "text too long (max 1024 chars)")
+        if req.text and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in req.text):
+            # Control bytes in 'text' would bypass the named-key whitelist
+            # ("\x04" is C-d either way) — controls only via whitelisted 'key'.
+            raise HTTPException(
+                400,
+                "text must not contain control characters; "
+                "use a whitelisted 'key' for control sequences",
+            )
         if req.key and req.key not in TmuxSession.PANE_KEY_WHITELIST:
             raise HTTPException(
                 400,

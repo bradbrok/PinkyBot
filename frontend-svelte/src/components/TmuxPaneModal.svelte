@@ -97,6 +97,13 @@
         }
         // Mixed chunk (e.g. IME/paste or burst typing). Split out any
         // embedded control sequences; send printable runs literally.
+        // Unknown control/escape bytes are DROPPED, never sent as text —
+        // the backend rejects control chars in the literal channel (they'd
+        // bypass the named-key whitelist: literal "\x04" is C-d).
+        const isControl = (ch) => {
+            const code = ch.charCodeAt(0);
+            return code < 0x20 || code === 0x7f;
+        };
         let literal = '';
         let i = 0;
         while (i < data.length) {
@@ -104,10 +111,20 @@
             for (const seq of Object.keys(KEY_SEQUENCES)) {
                 if (data.startsWith(seq, i) && seq.length > matched.length) matched = seq;
             }
+            if (matched === '\x1b' && (data[i + 1] === '[' || data[i + 1] === 'O')) {
+                // Unknown CSI/SS3 sequence (a known one would out-match bare
+                // ESC). Consume through its final byte (0x40–0x7e) and drop.
+                let j = i + 2;
+                while (j < data.length && !(data.charCodeAt(j) >= 0x40 && data.charCodeAt(j) <= 0x7e)) j += 1;
+                i = Math.min(j + 1, data.length);
+                continue;
+            }
             if (matched) {
                 if (literal) { queueSend({ text: literal }); literal = ''; }
                 queueSend({ key: KEY_SEQUENCES[matched] });
                 i += matched.length;
+            } else if (isControl(data[i])) {
+                i += 1; // unknown control byte — drop, never forward
             } else {
                 literal += data[i];
                 i += 1;
