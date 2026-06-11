@@ -6,6 +6,7 @@
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { escapeHtml } from '../lib/utils.js';
+    import { createForceSim, fitView, animateView, computeLabelSet, edgePath, zoomAt, hexToRgba } from '../lib/forceGraph.js';
 
     let agentList = [];
     let currentAgent = '';
@@ -33,11 +34,13 @@
     let kgEdges = [];
     let kgStats = null;
     let kgLoading = false;
-    let kgSimRunning = false;
     let kgWidth = 1000;
     let kgHeight = 640;
     let kgHoveredNode = null;
-    let kgRaf = null;
+    let kgSim = null;            // createForceSim handle
+    let kgFitCancel = null;      // in-flight auto-fit animation canceller
+    let kgLabelSet = new Set();  // decluttered label set (recomputed at settle)
+    let kgUserMoved = false;     // user panned/zoomed — don't yank the view on settle
     let kgDestroyed = false;
     // --- KG viz rework (#153): raw data, filters, cluster layout, pan/zoom ---
     let kgRawNodes = [];
@@ -56,7 +59,6 @@
     let kgPanY = 0;
     let kgPanning = false;
     let kgPanLast = null;
-    const KG_HUB_DEGREE = 5;         // always label nodes at/above this degree
 
     // Dreams tab state
     let dreamStates = [];
@@ -281,19 +283,20 @@
 
     function nodeRadius(degree) {
         // sqrt scaling + hard cap so hub nodes don't swallow the canvas
-        return Math.max(9, Math.min(30, 8 + Math.sqrt(degree) * 5));
+        return Math.max(7, Math.min(26, 6 + Math.sqrt(degree) * 4.5));
     }
 
     // Reset every piece of KG state (rendered + raw + filters + view + sim) so
     // an empty/errored (re)load shows a truthful no-data state. (Murzik review.)
     function clearKgState() {
-        if (kgRaf) { cancelAnimationFrame(kgRaf); kgRaf = null; }
-        kgSimRunning = false;
+        if (kgSim) { kgSim.stop(); kgSim = null; }
+        if (kgFitCancel) { kgFitCancel(); kgFitCancel = null; }
         kgNodes = []; kgEdges = [];
         kgRawNodes = []; kgRawEdges = [];
         kgNodeMap = new Map(); kgAdj = new Map();
         kgAllTypes = []; kgActiveTypes = new Set();
         kgSelectedId = null; kgHoveredNode = null; kgSearch = '';
+        kgLabelSet = new Set(); kgUserMoved = false;
         kgZoom = 1; kgPanX = 0; kgPanY = 0;
     }
 
@@ -359,60 +362,44 @@
     }
 
     function restartKgSim() {
-        if (kgRaf) { cancelAnimationFrame(kgRaf); kgRaf = null; }
-        kgSimRunning = false;
-        runKgSimulation();
+        if (kgSim) { kgSim.stop(); kgSim = null; }
+        if (kgDestroyed || kgNodes.length === 0) { kgLabelSet = new Set(); return; }
+        kgSim = createForceSim({
+            nodes: kgNodes,
+            edges: kgEdges,
+            nodeById: kgNodeMap,
+            clusterCenter: (n) => clusterCenter(n.type),
+            gravity: 0.016,        // soft islands — repulsion does the spreading
+            repulsion: 2400,
+            linkBase: 90,
+            onTick: (it) => {
+                kgNodes = kgNodes;                          // trigger reactivity
+                // keep the growing layout framed while it settles
+                if (!kgUserMoved && it % 20 === 0) {
+                    const v = fitView(kgNodes, kgWidth, kgHeight);
+                    kgZoom = v.zoom; kgPanX = v.panX; kgPanY = v.panY;
+                }
+            },
+            onSettle: () => {
+                kgSim = null;
+                kgLabelSet = computeLabelSet(kgNodes);
+                kgAutoFit();
+            },
+        });
     }
 
-    function runKgSimulation() {
-        if (kgSimRunning) return;
-        kgSimRunning = true;
-        let iteration = 0;
-        const maxIter = 240;
-        function tick() {
-            if (kgDestroyed) { kgSimRunning = false; return; }
-            if (iteration >= maxIter) { kgSimRunning = false; kgRaf = null; return; }
-            iteration++;
-            const decay = 1 - iteration / maxIter;
-            const len = kgNodes.length;
-            // Repulsion (O(n^2), but on the FILTERED subset — small)
-            for (let i = 0; i < len; i++) {
-                for (let j = i + 1; j < len; j++) {
-                    const a = kgNodes[i], b = kgNodes[j];
-                    let dx = b.x - a.x, dy = b.y - a.y;
-                    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                    const force = 900 / (dist * dist) * decay;
-                    const fx = dx / dist * force, fy = dy / dist * force;
-                    a.vx -= fx; a.vy -= fy;
-                    b.vx += fx; b.vy += fy;
-                }
-            }
-            // Attraction along edges (eased off so cross-type edges don't drag
-            // clusters back together; same-type edges still tighten within an island)
-            for (const e of kgEdges) {
-                const a = kgNodeMap.get(e.source), b = kgNodeMap.get(e.target);
-                if (!a || !b) continue;
-                let dx = b.x - a.x, dy = b.y - a.y;
-                let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                const force = (dist - 80) * 0.006 * decay;
-                const fx = dx / dist * force, fy = dy / dist * force;
-                a.vx += fx; a.vy += fy;
-                b.vx -= fx; b.vy -= fy;
-            }
-            // Cluster gravity (dominant): pull each node hard toward its type centroid
-            for (const nd of kgNodes) {
-                const c = clusterCenter(nd.type);
-                nd.vx += (c.x - nd.x) * 0.045 * decay;
-                nd.vy += (c.y - nd.y) * 0.045 * decay;
-                nd.vx *= 0.9; nd.vy *= 0.9;
-                nd.x += nd.vx; nd.y += nd.vy;
-                nd.x = Math.max(nd.r + 8, Math.min(kgWidth - nd.r - 8, nd.x));
-                nd.y = Math.max(nd.r + 8, Math.min(kgHeight - nd.r - 8, nd.y));
-            }
-            kgNodes = kgNodes; // trigger reactivity
-            kgRaf = requestAnimationFrame(tick);
-        }
-        kgRaf = requestAnimationFrame(tick);
+    // Auto-zoom: frame the settled layout. Skipped when the user has already
+    // panned/zoomed by hand (their view, their rules — Fit button re-engages).
+    function kgAutoFit(force = false) {
+        if (kgUserMoved && !force) return;
+        if (kgFitCancel) kgFitCancel();
+        const target = fitView(kgNodes, kgWidth, kgHeight);
+        kgFitCancel = animateView(
+            { zoom: kgZoom, panX: kgPanX, panY: kgPanY },
+            target,
+            (v) => { kgZoom = v.zoom; kgPanX = v.panX; kgPanY = v.panY; },
+        );
+        if (force) kgUserMoved = false;
     }
 
     const KG_COLORS = {
@@ -436,16 +423,17 @@
         applyKgFilters();
     }
     function kgResetView() {
-        kgZoom = 1; kgPanX = 0; kgPanY = 0;
         kgSelectedId = null; kgSearch = ''; kgMinDegree = 2;
         kgActiveTypes = new Set(kgAllTypes);
+        kgUserMoved = false;
         applyKgFilters();
     }
-    function kgLabelVisible(node) {
+    function kgLabelVisible(node, labelSet) {
         return kgHoveredNode?.id === node.id
             || kgSelectedId === node.id
             || (kgSelectedId && kgAdj.get(kgSelectedId)?.has(node.id))
-            || node.degree >= KG_HUB_DEGREE;
+            || (kgHoveredNode && kgAdj.get(kgHoveredNode.id)?.has(node.id))
+            || labelSet.has(node.id);
     }
     function kgNodeDimmed(node) {
         if (!kgHoveredNode) return false;
@@ -455,18 +443,19 @@
     // --- pan / zoom (background-drag pans, wheel zooms at cursor) ---
     function kgWheel(e) {
         e.preventDefault();
+        if (kgFitCancel) { kgFitCancel(); kgFitCancel = null; }
+        kgUserMoved = true;
         const rect = kgSvgEl.getBoundingClientRect();
         const vbX = (e.clientX - rect.left) * (kgWidth / rect.width);
         const vbY = (e.clientY - rect.top) * (kgHeight / rect.height);
-        const gx = (vbX - kgPanX) / kgZoom, gy = (vbY - kgPanY) / kgZoom;
-        const factor = e.deltaY < 0 ? 1.12 : 1 / 1.12;
-        kgZoom = Math.max(0.3, Math.min(4, kgZoom * factor));
-        kgPanX = vbX - gx * kgZoom;
-        kgPanY = vbY - gy * kgZoom;
+        const next = zoomAt({ zoom: kgZoom, panX: kgPanX, panY: kgPanY }, vbX, vbY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+        kgZoom = next.zoom; kgPanX = next.panX; kgPanY = next.panY;
     }
     function kgPointerDown(e) { kgPanning = true; kgPanLast = { x: e.clientX, y: e.clientY }; }
     function kgPointerMove(e) {
         if (!kgPanning || !kgPanLast) return;
+        if (kgFitCancel) { kgFitCancel(); kgFitCancel = null; }
+        kgUserMoved = true;
         const rect = kgSvgEl.getBoundingClientRect();
         kgPanX += (e.clientX - kgPanLast.x) * (kgWidth / rect.width);
         kgPanY += (e.clientY - kgPanLast.y) * (kgHeight / rect.height);
@@ -482,7 +471,11 @@
     }
 
     onMount(init);
-    onDestroy(() => { kgDestroyed = true; if (kgRaf) cancelAnimationFrame(kgRaf); kgSimRunning = false; });
+    onDestroy(() => {
+        kgDestroyed = true;
+        if (kgSim) { kgSim.stop(); kgSim = null; }
+        if (kgFitCancel) { kgFitCancel(); kgFitCancel = null; }
+    });
 </script>
 
 <div class="content">
@@ -657,6 +650,7 @@
                 <label style="display:flex;align-items:center;gap:0.3rem;font-family:var(--font-grotesk);font-size:0.7rem;color:var(--text-muted);cursor:pointer">
                     <input type="checkbox" bind:checked={kgShowEdgeLabels} /> edge labels
                 </label>
+                <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={() => kgAutoFit(true)}>Fit</button>
                 <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={kgResetView}>Reset</button>
                 <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={loadKnowledgeGraph}>Refresh</button>
             </div>
@@ -680,7 +674,7 @@
                     {kgNodes.length} / {kgRawNodes.length} nodes · {kgEdges.length} edges
                     {#if kgSelectedId}· <span style="color:var(--accent-contrast)">focus: {kgSelectedId}</span> <button on:click={() => { kgSelectedId = null; applyKgFilters(); }} style="background:none;border:none;color:var(--text-muted);cursor:pointer;text-decoration:underline;font-size:0.7rem">clear</button>{/if}
                 </span>
-                <span style="font-size:0.62rem;color:var(--text-muted)">scroll = zoom · drag = pan · click node = focus</span>
+                <span style="font-size:0.62rem;color:var(--text-muted)">scroll = zoom · drag = pan · click node = focus · double-click = fit</span>
             </div>
 
             <!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
@@ -697,21 +691,23 @@
                 on:mousemove={kgPointerMove}
                 on:mouseup={kgPointerUp}
                 on:mouseleave={kgPointerUp}
+                on:dblclick={() => kgAutoFit(true)}
             >
                 <g transform="translate({kgPanX} {kgPanY}) scale({kgZoom})">
-                    <!-- Edges -->
+                    <!-- Edges: curved + tinted by source-node cluster color (flavor-network look) -->
                     {#each kgEdges as edge}
                         {@const src = kgNodeMap.get(edge.source)}
                         {@const tgt = kgNodeMap.get(edge.target)}
                         {#if src && tgt}
                             {@const lit = (kgHoveredNode && (kgHoveredNode.id === edge.source || kgHoveredNode.id === edge.target)) || (kgSelectedId && (kgSelectedId === edge.source || kgSelectedId === edge.target))}
-                            <line
-                                x1={src.x} y1={src.y}
-                                x2={tgt.x} y2={tgt.y}
-                                stroke={lit ? 'rgba(255,255,255,0.55)' : 'rgba(255,255,255,0.14)'}
-                                stroke-width={lit ? 2 : 1}
+                            {@const sameType = src.type === tgt.type}
+                            <path
+                                d={edgePath(src, tgt)}
+                                fill="none"
+                                stroke={lit ? 'rgba(255,255,255,0.6)' : hexToRgba(kgNodeColor(src), sameType ? 0.3 : 0.13)}
+                                stroke-width={lit ? 2 : sameType ? 1.4 : 1}
                             />
-                            {#if kgShowEdgeLabels || lit}
+                            {#if (kgShowEdgeLabels && kgZoom >= 1.05) || lit}
                                 <text
                                     x={(src.x + tgt.x) / 2}
                                     y={(src.y + tgt.y) / 2 - 4}
@@ -746,13 +742,14 @@
                                 stroke-width={sel ? 3 : kgHoveredNode?.id === node.id ? 2.5 : 1}
                                 opacity={dim ? 0.25 : 0.92}
                             />
-                            {#if kgLabelVisible(node)}
+                            {#if kgLabelVisible(node, kgLabelSet)}
                                 <text
                                     x={node.x} y={node.y + node.r + 13}
                                     text-anchor="middle"
-                                    fill={dim ? 'rgba(255,255,255,0.3)' : kgHoveredNode?.id === node.id || sel ? '#fff' : 'rgba(255,255,255,0.7)'}
-                                    font-size="11px"
+                                    fill={dim ? 'rgba(255,255,255,0.3)' : kgHoveredNode?.id === node.id || sel ? '#fff' : 'rgba(255,255,255,0.75)'}
+                                    font-size={node.degree >= 8 ? '12px' : '11px'}
                                     font-family="monospace"
+                                    style="pointer-events:none"
                                 >
                                     {node.label.length > 22 ? node.label.slice(0, 20) + '…' : node.label}
                                 </text>

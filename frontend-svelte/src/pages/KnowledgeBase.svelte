@@ -5,6 +5,7 @@
     import { api } from '../lib/api.js';
     import { toast } from '../lib/stores.js';
     import { timeAgo, formatDate, truncate, renderMarkdown } from '../lib/utils.js';
+    import { createForceSim, fitView, animateView, computeLabelSet, edgePath, zoomAt, hexToRgba } from '../lib/forceGraph.js';
 
     let loading = true;
     let refreshInterval;
@@ -19,13 +20,23 @@
     let graphData = null;
     let graphNodes = [];
     let graphEdges = [];
-    let graphSimRunning = false;
-    let graphRafId = null;
+    let graphNodeMap = new Map();    // id -> node (persistent across re-inits)
+    let graphSim = null;             // createForceSim handle
+    let graphFitCancel = null;       // in-flight auto-fit animation canceller
+    let graphLabelSet = new Set();   // decluttered label set
+    let graphCategories = [];        // wiki categories present (cluster anchors)
     let showRawInGraph = false;
     let graphWidth = 800;
     let graphHeight = 500;
     let hoveredNode = null;
-    let dragNode = null;
+    let graphSvgEl;
+    let graphZoom = 1;
+    let graphPanX = 0;
+    let graphPanY = 0;
+    let graphPanning = false;
+    let graphPanLast = null;
+    let graphUserMoved = false;
+    let graphDragMoved = false;      // suppress node-click after a drag-pan
 
     // Sources list
     let sources = [];
@@ -145,86 +156,106 @@
     function initGraph() {
         if (!graphData) return;
 
+        // Reuse persistent node objects so positions survive re-init (raw toggle).
+        const map = new Map();
         const nodes = graphData.nodes
             .filter(n => showRawInGraph || n.type === 'wiki')
-            .map(n => ({
-                ...n,
-                x: graphWidth / 2 + (Math.random() - 0.5) * 300,
-                y: graphHeight / 2 + (Math.random() - 0.5) * 200,
-                vx: 0, vy: 0,
-                r: n.type === 'wiki' ? Math.max(18, 12 + n.degree * 3) : 10,
-            }));
+            .map(n => {
+                const prev = graphNodeMap.get(n.id);
+                const node = {
+                    ...n,
+                    x: prev?.x ?? (graphWidth / 2 + (Math.random() - 0.5) * 300),
+                    y: prev?.y ?? (graphHeight / 2 + (Math.random() - 0.5) * 200),
+                    vx: 0, vy: 0,
+                    r: n.type === 'wiki' ? Math.max(14, Math.min(34, 10 + Math.sqrt(n.degree || 0) * 6)) : 8,
+                };
+                map.set(n.id, node);
+                return node;
+            });
+        graphNodeMap = map;
 
         const nodeIds = new Set(nodes.map(n => n.id));
         const edges = graphData.edges.filter(e => nodeIds.has(e.source) && nodeIds.has(e.target));
 
+        graphCategories = [...new Set(nodes.filter(n => n.type === 'wiki').map(n => n.category || 'other'))].sort();
         graphNodes = nodes;
         graphEdges = edges;
         runSimulation();
     }
 
-    function runSimulation() {
-        if (graphSimRunning) {
-            if (graphRafId !== null) cancelAnimationFrame(graphRafId);
-            graphRafId = null;
-            graphSimRunning = false;
-        }
-        graphSimRunning = true;
-
-        const alpha = 1;
-        let iteration = 0;
-        const maxIter = 200;
-        const centerX = graphWidth / 2;
-        const centerY = graphHeight / 2;
-
-        function tick() {
-            if (iteration >= maxIter) { graphRafId = null; graphSimRunning = false; return; }
-            iteration++;
-            const decay = 1 - iteration / maxIter;
-
-            // Repulsion between nodes
-            for (let i = 0; i < graphNodes.length; i++) {
-                for (let j = i + 1; j < graphNodes.length; j++) {
-                    const a = graphNodes[i], b = graphNodes[j];
-                    let dx = b.x - a.x, dy = b.y - a.y;
-                    let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                    const force = 800 / (dist * dist) * decay;
-                    const fx = dx / dist * force, fy = dy / dist * force;
-                    a.vx -= fx; a.vy -= fy;
-                    b.vx += fx; b.vy += fy;
-                }
-            }
-
-            // Attraction along edges
-            for (const e of graphEdges) {
-                const a = graphNodes.find(n => n.id === e.source);
-                const b = graphNodes.find(n => n.id === e.target);
-                if (!a || !b) continue;
-                let dx = b.x - a.x, dy = b.y - a.y;
-                let dist = Math.sqrt(dx * dx + dy * dy) || 1;
-                const force = (dist - 100) * 0.01 * decay;
-                const fx = dx / dist * force, fy = dy / dist * force;
-                a.vx += fx; a.vy += fy;
-                b.vx -= fx; b.vy -= fy;
-            }
-
-            // Center gravity
-            for (const n of graphNodes) {
-                if (n === dragNode) continue;
-                n.vx += (centerX - n.x) * 0.005 * decay;
-                n.vy += (centerY - n.y) * 0.005 * decay;
-                n.vx *= 0.9; n.vy *= 0.9;
-                n.x += n.vx; n.y += n.vy;
-                // Bounds
-                n.x = Math.max(n.r + 10, Math.min(graphWidth - n.r - 10, n.x));
-                n.y = Math.max(n.r + 10, Math.min(graphHeight - n.r - 10, n.y));
-            }
-
-            graphNodes = graphNodes; // trigger reactivity
-            graphRafId = requestAnimationFrame(tick);
-        }
-        graphRafId = requestAnimationFrame(tick);
+    // Wiki categories claim regions on a ring; raw sources get no anchor —
+    // their edges pull them next to the wiki page they feed.
+    function kbClusterCenter(node) {
+        if (node.type !== 'wiki') return null;
+        const i = Math.max(0, graphCategories.indexOf(node.category || 'other'));
+        const n = Math.max(1, graphCategories.length);
+        const angle = (i / n) * Math.PI * 2 - Math.PI / 2;
+        return {
+            x: graphWidth / 2 + Math.cos(angle) * graphWidth * 0.3,
+            y: graphHeight / 2 + Math.sin(angle) * graphHeight * 0.28,
+        };
     }
+
+    function runSimulation() {
+        if (graphSim) { graphSim.stop(); graphSim = null; }
+        if (graphNodes.length === 0) { graphLabelSet = new Set(); return; }
+        graphSim = createForceSim({
+            nodes: graphNodes,
+            edges: graphEdges,
+            nodeById: graphNodeMap,
+            clusterCenter: kbClusterCenter,
+            gravity: 0.012,
+            repulsion: 2000,
+            linkBase: 80,
+            onTick: (it) => {
+                graphNodes = graphNodes;                    // trigger reactivity
+                if (!graphUserMoved && it % 20 === 0) {
+                    const v = fitView(graphNodes, graphWidth, graphHeight, 55);
+                    graphZoom = v.zoom; graphPanX = v.panX; graphPanY = v.panY;
+                }
+            },
+            onSettle: () => {
+                graphSim = null;
+                graphLabelSet = computeLabelSet(graphNodes, { maxLabels: 60 });
+                graphAutoFit();
+            },
+        });
+    }
+
+    function graphAutoFit(force = false) {
+        if (graphUserMoved && !force) return;
+        if (graphFitCancel) graphFitCancel();
+        const target = fitView(graphNodes, graphWidth, graphHeight, 55);
+        graphFitCancel = animateView(
+            { zoom: graphZoom, panX: graphPanX, panY: graphPanY },
+            target,
+            (v) => { graphZoom = v.zoom; graphPanX = v.panX; graphPanY = v.panY; },
+        );
+        if (force) graphUserMoved = false;
+    }
+
+    // --- pan / zoom (mirrors the KG view) ---
+    function graphWheel(e) {
+        e.preventDefault();
+        if (graphFitCancel) { graphFitCancel(); graphFitCancel = null; }
+        graphUserMoved = true;
+        const rect = graphSvgEl.getBoundingClientRect();
+        const vbX = (e.clientX - rect.left) * (graphWidth / rect.width);
+        const vbY = (e.clientY - rect.top) * (graphHeight / rect.height);
+        const next = zoomAt({ zoom: graphZoom, panX: graphPanX, panY: graphPanY }, vbX, vbY, e.deltaY < 0 ? 1.12 : 1 / 1.12);
+        graphZoom = next.zoom; graphPanX = next.panX; graphPanY = next.panY;
+    }
+    function graphPointerDown(e) { graphPanning = true; graphDragMoved = false; graphPanLast = { x: e.clientX, y: e.clientY }; }
+    function graphPointerMove(e) {
+        if (!graphPanning || !graphPanLast) return;
+        if (graphFitCancel) { graphFitCancel(); graphFitCancel = null; }
+        graphUserMoved = true; graphDragMoved = true;
+        const rect = graphSvgEl.getBoundingClientRect();
+        graphPanX += (e.clientX - graphPanLast.x) * (graphWidth / rect.width);
+        graphPanY += (e.clientY - graphPanLast.y) * (graphHeight / rect.height);
+        graphPanLast = { x: e.clientX, y: e.clientY };
+    }
+    function graphPointerUp() { graphPanning = false; graphPanLast = null; }
 
     function nodeColor(node) {
         if (node.type === 'raw') return '#555';
@@ -235,11 +266,16 @@
         return colors[node.category] || colors.other;
     }
 
-    function edgeColor(edge) {
-        return edge.type === 'related' ? 'rgba(255,255,255,0.25)' : 'rgba(255,255,255,0.08)';
+    // Edges tinted by the wiki endpoint's category color (flavor-network look);
+    // wiki<->wiki "related" links read stronger than wiki<-source feeds.
+    function edgeColor(edge, src, tgt) {
+        const wiki = src?.type === 'wiki' ? src : tgt?.type === 'wiki' ? tgt : null;
+        const base = wiki ? nodeColor(wiki) : '#888888';
+        return hexToRgba(base, edge.type === 'related' ? 0.35 : 0.12);
     }
 
     function onGraphNodeClick(node) {
+        if (graphDragMoved) return;   // it was a pan, not a click
         if (node.type === 'wiki') {
             openWikiDetail({ slug: node.id, title: node.label });
         } else {
@@ -491,7 +527,8 @@
 
     onDestroy(() => {
         if (refreshInterval) clearInterval(refreshInterval);
-        if (graphRafId !== null) cancelAnimationFrame(graphRafId);
+        if (graphSim) { graphSim.stop(); graphSim = null; }
+        if (graphFitCancel) { graphFitCancel(); graphFitCancel = null; }
     });
 </script>
 
@@ -723,30 +760,44 @@
                     </label>
                     <span class="graph-stats">
                         {graphNodes.length} nodes · {graphEdges.length} edges
+                        · <span style="opacity:0.6">scroll = zoom · drag = pan · double-click = fit</span>
                     </span>
+                    <button class="btn btn-sm" style="background:var(--surface-3);color:var(--text-muted);font-size:0.72rem" on:click={() => graphAutoFit(true)}>Fit</button>
                 </div>
+                <!-- svelte-ignore a11y_no_static_element_interactions a11y_no_noninteractive_element_interactions -->
                 <svg
+                    bind:this={graphSvgEl}
                     width={graphWidth}
                     height={graphHeight}
-                    style="background: var(--surface-inverse); border-radius: 8px; cursor: grab;"
+                    style="background: var(--surface-inverse); border-radius: 8px; cursor: {graphPanning ? 'grabbing' : 'grab'}; touch-action: none;"
                     viewBox="0 0 {graphWidth} {graphHeight}"
+                    role="application"
+                    aria-label="Knowledge base graph"
+                    on:wheel={graphWheel}
+                    on:mousedown={graphPointerDown}
+                    on:mousemove={graphPointerMove}
+                    on:mouseup={graphPointerUp}
+                    on:mouseleave={graphPointerUp}
+                    on:dblclick={() => graphAutoFit(true)}
                 >
-                    <!-- Edges -->
+                    <g transform="translate({graphPanX} {graphPanY}) scale({graphZoom})">
+                    <!-- Edges: curved + tinted by the wiki endpoint's category -->
                     {#each graphEdges as edge}
-                        {@const src = graphNodes.find(n => n.id === edge.source)}
-                        {@const tgt = graphNodes.find(n => n.id === edge.target)}
+                        {@const src = graphNodeMap.get(edge.source)}
+                        {@const tgt = graphNodeMap.get(edge.target)}
                         {#if src && tgt}
-                            <line
-                                x1={src.x} y1={src.y}
-                                x2={tgt.x} y2={tgt.y}
-                                stroke={edgeColor(edge)}
-                                stroke-width={edge.type === 'related' ? 2 : 1}
+                            {@const lit = hoveredNode && (hoveredNode.id === edge.source || hoveredNode.id === edge.target)}
+                            <path
+                                d={edgePath(src, tgt)}
+                                fill="none"
+                                stroke={lit ? 'rgba(255,255,255,0.6)' : edgeColor(edge, src, tgt)}
+                                stroke-width={lit ? 2 : edge.type === 'related' ? 1.6 : 1}
                             />
                         {/if}
                     {/each}
 
                     <!-- Nodes -->
-                    {#each graphNodes as node}
+                    {#each graphNodes as node (node.id)}
                         <g
                             role="button"
                             tabindex="0"
@@ -754,7 +805,7 @@
                             style="cursor: pointer;"
                             on:mouseenter={() => hoveredNode = node}
                             on:mouseleave={() => hoveredNode = null}
-                            on:click={() => onGraphNodeClick(node)}
+                            on:click|stopPropagation={() => onGraphNodeClick(node)}
                             on:keydown={(e) => {
                                 if (e.key === 'Enter' || e.key === ' ') {
                                     e.preventDefault();
@@ -769,17 +820,20 @@
                                 fill={nodeColor(node)}
                                 stroke={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.2)'}
                                 stroke-width={hoveredNode === node ? 2.5 : 1}
-                                opacity={hoveredNode && hoveredNode !== node ? 0.4 : 0.9}
+                                opacity={hoveredNode && hoveredNode !== node ? 0.4 : 0.92}
                             />
-                            <text
-                                x={node.x} y={node.y + node.r + 14}
-                                text-anchor="middle"
-                                fill={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.6)'}
-                                font-size={node.type === 'wiki' ? '11px' : '9px'}
-                                font-family="monospace"
-                            >
-                                {node.label.length > 20 ? node.label.slice(0, 18) + '…' : node.label}
-                            </text>
+                            {#if hoveredNode === node || graphLabelSet.has(node.id)}
+                                <text
+                                    x={node.x} y={node.y + node.r + 14}
+                                    text-anchor="middle"
+                                    fill={hoveredNode === node ? '#fff' : 'rgba(255,255,255,0.7)'}
+                                    font-size={node.type === 'wiki' ? '11px' : '9px'}
+                                    font-family="monospace"
+                                    style="pointer-events:none"
+                                >
+                                    {node.label.length > 20 ? node.label.slice(0, 18) + '…' : node.label}
+                                </text>
+                            {/if}
                         </g>
                     {/each}
 
@@ -804,6 +858,7 @@
                             {hoveredNode.label} ({hoveredNode.degree})
                         </text>
                     {/if}
+                    </g>
                 </svg>
 
                 <!-- Legend -->
