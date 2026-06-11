@@ -247,6 +247,83 @@ class TestSeedContainerTrust:
         # sign-in step even with valid credentials present.
         assert "d['hasCompletedOnboarding']=True" in seed
         assert "CLAUDE_CONFIG_DIR" in seed  # resolves the in-container config dir
+        # #735 lera rollout: both first-spawn wedges must be pre-cleared — the
+        # project-MCP approval prompt and the bypass-permissions accept dialog
+        # (whose default is "No, exit"; the queued-message paste's Enter kills
+        # the REPL and strands the transport).
+        assert "pr[proj]['enableAllProjectMcpServers']=True" in seed
+        assert "skipDangerousModePermissionPrompt" in seed
+
+    async def test_seed_script_writes_both_files(self, monkeypatch, tmp_path):
+        """Execute the embedded seed script for real against a temp config dir:
+        it must produce a valid .claude.json (trust + MCP approval) AND a
+        settings.json with skipDangerousModePermissionPrompt, preserving any
+        pre-existing settings keys."""
+        import json
+        import subprocess
+
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _RecordingInner()
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_trust("/srv/agents/dymok")
+        cmd = inner.calls[0]
+        seed = cmd[cmd.index("-c") + 1]
+
+        cfg = tmp_path / "cfgdir"
+        cfg.mkdir()
+        # Pre-existing settings must survive the merge.
+        (cfg / "settings.json").write_text(json.dumps({"theme": "dark"}))
+        subprocess.run(
+            ["python3", "-c", seed, str(tmp_path / "proj")],
+            check=True, env={"CLAUDE_CONFIG_DIR": str(cfg), "HOME": str(tmp_path)},
+        )
+
+        claude_json = json.loads((cfg / ".claude.json").read_text())
+        assert claude_json["bypassPermissionsModeAccepted"] is True
+        proj = claude_json["projects"][str(tmp_path / "proj")]
+        assert proj["hasTrustDialogAccepted"] is True
+        assert proj["enableAllProjectMcpServers"] is True
+
+        settings = json.loads((cfg / "settings.json").read_text())
+        assert settings["skipDangerousModePermissionPrompt"] is True
+        assert settings["theme"] == "dark"  # merged, not clobbered
+
+    async def test_seed_script_settings_path_without_config_dir(
+        self, monkeypatch, tmp_path
+    ):
+        """Without CLAUDE_CONFIG_DIR the settings seed must land in
+        ~/.claude/settings.json (claude's home-level settings path), not
+        ~/settings.json."""
+        import json
+        import subprocess
+
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _RecordingInner()
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_trust("/srv/agents/dymok")
+        seed = inner.calls[0][inner.calls[0].index("-c") + 1]
+
+        subprocess.run(
+            ["python3", "-c", seed, str(tmp_path / "proj")],
+            check=True, env={"HOME": str(tmp_path)},
+        )
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text()
+        )
+        assert settings["skipDangerousModePermissionPrompt"] is True
+        assert not (tmp_path / "settings.json").exists()
 
 
 @pytest.mark.asyncio

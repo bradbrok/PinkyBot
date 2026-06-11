@@ -1314,8 +1314,30 @@ class TmuxSession:
             "pr.setdefault(proj,{})\n"
             "pr[proj]['hasTrustDialogAccepted']=True\n"
             "pr[proj]['hasCompletedProjectOnboarding']=True\n"
+            # Live-validated on the Pi (lera rollout, #735): a fresh container
+            # also wedges on Claude Code's "N new MCP servers found" approval
+            # prompt at first spawn — and the queued-message paste then sends
+            # Enter onto whatever is highlighted. Pre-approve the project's own
+            # .mcp.json servers (the daemon wrote that file; they're trusted).
+            "pr[proj]['enableAllProjectMcpServers']=True\n"
             "p.parent.mkdir(parents=True,exist_ok=True)\n"
             "p.write_text(json.dumps(d,indent=2))\n"
+            # Same rollout, second wedge: `--dangerously-skip-permissions`
+            # shows the Bypass Permissions accept dialog whose DEFAULT is
+            # "No, exit" — the message paste's Enter kills the REPL. The
+            # .claude.json flag above is NOT sufficient on CC 2.1.x; the
+            # actual switch is skipDangerousModePermissionPrompt in
+            # CLAUDE_CONFIG_DIR/settings.json. Merge it in, never clobber.
+            "sp=(base if cfg else base/'.claude')/'settings.json'\n"
+            "sp.parent.mkdir(parents=True,exist_ok=True)\n"
+            "s={}\n"
+            "if sp.exists():\n"
+            "    try: s=json.loads(sp.read_text())\n"
+            "    except Exception: s={}\n"
+            "if not isinstance(s,dict): s={}\n"
+            "if not s.get('skipDangerousModePermissionPrompt'):\n"
+            "    s['skipDangerousModePermissionPrompt']=True\n"
+            "    sp.write_text(json.dumps(s,indent=2))\n"
         )
         try:
             res = await runner.run(
