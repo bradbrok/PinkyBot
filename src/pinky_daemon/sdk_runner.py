@@ -200,7 +200,6 @@ class SDKRunner:
         usage = {}
         model_usage = {}
         duration_api_ms = 0
-        turn_usage: list[dict] = []  # Per-turn usage tracking
 
         # Fire session_start hook
         await self._fire_hook(HookEvent.session_start, session_id=session_id)
@@ -233,10 +232,6 @@ class SDKRunner:
                     duration_api_ms = getattr(message, "duration_api_ms", 0) or 0
 
                 elif isinstance(message, AssistantMessage) and not got_result:
-                    # Track per-turn usage
-                    turn_data = getattr(message, "usage", None)
-                    if turn_data:
-                        turn_usage.append(dict(turn_data) if hasattr(turn_data, "__iter__") else {"raw": turn_data})
                     # Collect text content + detect tool use
                     for block in message.content:
                         if isinstance(block, TextBlock):

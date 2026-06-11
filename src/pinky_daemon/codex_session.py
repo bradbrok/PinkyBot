@@ -88,6 +88,11 @@ class CodexSession:
         self._connect_attempted = False  # distinguishes UNINITIALIZED from DEAD
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
+        # Serializes _exec_codex between the worker and out-of-band callers
+        # (idle_sleep's save turn): two concurrent execs would resume the same
+        # codex thread and clobber the shared _current_proc / app-server
+        # turn-correlation state.
+        self._exec_lock = asyncio.Lock()
         self._worker_task: asyncio.Task | None = None
         self._current_proc: asyncio.subprocess.Process | None = None  # For cleanup on disconnect
         # #591 P1#2 (Murzik round-2): callback fired after the NEXT
@@ -284,8 +289,8 @@ class CodexSession:
                     self.id, "user", prompt,
                     platform=platform, chat_id=chat_id,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                _log(f"codex[{self.agent_name}]: conversation store append failed: {e}")
 
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         await self._message_queue.put((queued_prompt, platform, chat_id, message_id))
@@ -300,7 +305,8 @@ class CodexSession:
                 try:
                     self._processing = True
                     self._current_turn_seq = self._stats["turns"] + 1
-                    result = await self._exec_codex(prompt)
+                    async with self._exec_lock:
+                        result = await self._exec_codex(prompt)
 
                     # #591 P1#2 (Murzik round-2): fire the pending wake
                     # callback after exec confirms delivery. Only on
@@ -584,6 +590,7 @@ class CodexSession:
         )
 
         proc = None
+        stderr_task = None
         try:
             # limit=10MB — codex emits large tool-result events that exceed
             # asyncio's default 64KB StreamReader limit and kill the session
@@ -598,6 +605,12 @@ class CodexSession:
                 limit=10 * 1024 * 1024,
             )
             self._current_proc = proc
+
+            # Drain stderr concurrently: an undrained PIPE blocks the child
+            # once the OS buffer (~64KiB) fills, wedging the turn (same hazard
+            # codex_app_server._drain_stderr guards against).
+            if proc.stderr:
+                stderr_task = asyncio.create_task(proc.stderr.read())
 
             # Feed prompt via stdin, then close stdin to signal EOF
             proc.stdin.write(prompt.encode())
@@ -663,8 +676,8 @@ class CodexSession:
                 except Exception:
                     pass
 
-            if proc.stderr:
-                stderr_data = await proc.stderr.read()
+            if stderr_task is not None:
+                stderr_data = await stderr_task
                 if stderr_data:
                     stderr_str = stderr_data.decode().strip()
                     if stderr_str:
@@ -682,8 +695,11 @@ class CodexSession:
             _log(f"codex[{self.agent_name}]: exec timed out")
             await self._emit_stream_event({"type": "turn_failed", "agent": self.agent_name, "session_id": self.id, "error": "codex exec timed out after 600s"})
             if proc:
-                proc.kill()
-                await proc.wait()
+                try:
+                    proc.kill()
+                    await proc.wait()
+                except Exception:
+                    pass
         except Exception as e:
             result.failed = True
             result.errors.append(str(e))
@@ -697,6 +713,8 @@ class CodexSession:
                     pass
         finally:
             self._current_proc = None
+            if stderr_task is not None and not stderr_task.done():
+                stderr_task.cancel()
 
         return result
 
@@ -1057,12 +1075,16 @@ class CodexSession:
                 text = item.get("text", "")
                 if text:
                     result.text_parts.append(text)
-                    await self._emit_stream_event({
-                        "type": "assistant_delta",
-                        "agent": self.agent_name,
-                        "session_id": self.id,
-                        "delta": text,
-                    })
+                    # App-server mode already streamed this text incrementally
+                    # via item/agentMessage/delta; emitting the full text again
+                    # would duplicate it in the live chat stream.
+                    if not self._use_app_server:
+                        await self._emit_stream_event({
+                            "type": "assistant_delta",
+                            "agent": self.agent_name,
+                            "session_id": self.id,
+                            "delta": text,
+                        })
 
             elif item_type == "command_execution":
                 cmd_str = item.get("command", "")
@@ -1358,15 +1380,17 @@ class CodexSession:
 
         _log(f"codex[{self.agent_name}]: idle sleep triggered")
 
-        # Ask agent to save state before sleeping
+        # Ask agent to save state before sleeping. The lock keeps this exec
+        # from racing a worker turn against the same codex thread.
         try:
-            await self._exec_codex(
-                "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
-                "Before your session is suspended:\n"
-                "1. Use reflect() to persist key learnings and current task state\n"
-                "2. Note what you were working on so you can resume later\n\n"
-                "Your session will be preserved and resumed when you're needed next."
-            )
+            async with self._exec_lock:
+                await self._exec_codex(
+                    "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
+                    "Before your session is suspended:\n"
+                    "1. Use reflect() to persist key learnings and current task state\n"
+                    "2. Note what you were working on so you can resume later\n\n"
+                    "Your session will be preserved and resumed when you're needed next."
+                )
             _log(f"codex[{self.agent_name}]: memory save prompt sent before idle sleep")
         except Exception as e:
             _log(f"codex[{self.agent_name}]: memory save failed before idle sleep: {e}")

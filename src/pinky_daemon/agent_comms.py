@@ -65,6 +65,9 @@ class AgentComms:
 
     def __init__(self, db_path: str = "data/agent_comms.db") -> None:
         self._db_path = db_path
+        # Anchor file transfers next to the DB so the destination does not
+        # depend on the caller's cwd at send time.
+        self._transfers_root = Path(db_path).resolve().parent / "transfers"
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
@@ -272,6 +275,15 @@ class AgentComms:
         ttl_seconds: int | None = None,
     ) -> AgentMessage:
         """Internal: store message and deliver to recipients' inboxes."""
+        if parent_message_id is not None:
+            parent = self._conn.execute(
+                "SELECT 1 FROM messages WHERE id = ?", (parent_message_id,)
+            ).fetchone()
+            if parent is None:
+                raise ValueError(
+                    f"parent_message_id {parent_message_id} does not reference an existing message"
+                )
+
         ts = time.time()
         meta_json = json.dumps(metadata or {})
 
@@ -336,8 +348,18 @@ class AgentComms:
         if not os.path.isfile(file_path):
             raise FileNotFoundError(f"Source file does not exist: {file_path}")
 
+        if (
+            not to_session
+            or to_session in (".", "..")
+            or os.path.basename(to_session) != to_session
+        ):
+            raise ValueError(f"Invalid file transfer recipient: {to_session!r}")
+
         filename = os.path.basename(file_path)
-        dest_dir = os.path.join("data", "transfers", to_session)
+        dest_root = os.path.realpath(self._transfers_root)
+        dest_dir = os.path.realpath(os.path.join(dest_root, to_session))
+        if os.path.dirname(dest_dir) != dest_root:
+            raise ValueError(f"Invalid file transfer recipient: {to_session!r}")
         os.makedirs(dest_dir, exist_ok=True)
 
         dest_path = os.path.join(dest_dir, filename)
@@ -408,7 +430,9 @@ class AgentComms:
         Returns:
             Number of messages marked.
         """
-        if message_ids:
+        if message_ids is not None:
+            if not message_ids:
+                return 0
             placeholders = ",".join("?" * len(message_ids))
             cursor = self._conn.execute(
                 f"""UPDATE inbox SET read = 1
@@ -510,21 +534,25 @@ class AgentComms:
                 break
             root_id = row["parent_message_id"]
 
-        # Recursive CTE to get all descendants at any depth.
+        # Recursive CTE to get all descendants at any depth. UNION (not
+        # UNION ALL) so cyclic parent chains in legacy data terminate.
         # Left-join inbox to get the real read state for this session
         # (falls back to False when the session has no inbox entry).
+        # A session is authorized to see a message if it sent it, is the
+        # direct recipient, or had it delivered to its inbox (group and
+        # broadcast messages store the group name or "*" in to_session).
         if session_id:
             query = """
                 WITH RECURSIVE thread AS (
                     SELECT m.* FROM messages m WHERE m.id = ?
-                    UNION ALL
+                    UNION
                     SELECT m.* FROM messages m
                     JOIN thread t ON m.parent_message_id = t.id
                 )
                 SELECT t.*, COALESCE(i.read, 0) as read
                 FROM thread t
                 LEFT JOIN inbox i ON i.message_id = t.id AND i.session_id = ?
-                WHERE t.from_session = ? OR t.to_session = ?
+                WHERE t.from_session = ? OR t.to_session = ? OR i.session_id IS NOT NULL
                 ORDER BY t.timestamp ASC
             """
             params: list = [root_id, session_id, session_id, session_id]
@@ -532,7 +560,7 @@ class AgentComms:
             query = """
                 WITH RECURSIVE thread AS (
                     SELECT m.* FROM messages m WHERE m.id = ?
-                    UNION ALL
+                    UNION
                     SELECT m.* FROM messages m
                     JOIN thread t ON m.parent_message_id = t.id
                 )
@@ -556,9 +584,10 @@ class AgentComms:
         """
         total = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         rows = self._conn.execute(
-            """SELECT m.*, COALESCE(i.read, 0) as read
+            """SELECT m.*, COALESCE(MAX(i.read), 0) as read
                FROM messages m
                LEFT JOIN inbox i ON m.id = i.message_id
+               GROUP BY m.id
                ORDER BY m.timestamp DESC
                LIMIT ? OFFSET ?""",
             (limit, offset),
