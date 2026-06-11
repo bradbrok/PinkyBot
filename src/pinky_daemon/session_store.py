@@ -16,7 +16,7 @@ import json
 import sqlite3
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 
@@ -46,6 +46,13 @@ class SessionRecord:
     sdk_session_id: str
     session_type: str = "chat"
     agent_name: str = ""
+    disallowed_tools: list[str] = field(default_factory=list)
+    provider_url: str = ""
+    # Stored as plaintext, like the other secrets in the data/ SQLite stores.
+    # At-rest protection is the owner-only 0600 file mode applied by the
+    # startup permission sweep (db_security.sweep_db_permissions, #673).
+    # Never log or echo this field.
+    provider_key: str = ""
 
 
 class SessionStore:
@@ -77,7 +84,10 @@ class SessionStore:
                 restart_count INTEGER NOT NULL DEFAULT 0,
                 sdk_session_id TEXT NOT NULL DEFAULT '',
                 session_type TEXT NOT NULL DEFAULT 'chat',
-                agent_name TEXT NOT NULL DEFAULT ''
+                agent_name TEXT NOT NULL DEFAULT '',
+                disallowed_tools TEXT NOT NULL DEFAULT '[]',
+                provider_url TEXT NOT NULL DEFAULT '',
+                provider_key TEXT NOT NULL DEFAULT ''
             );
 
         """)
@@ -94,7 +104,7 @@ class SessionStore:
         "id, model, soul, working_dir, allowed_tools, max_turns, timeout, "
         "system_prompt, restart_threshold_pct, auto_restart, permission_mode, "
         "state, created_at, last_active, restart_count, sdk_session_id, "
-        "session_type, agent_name"
+        "session_type, agent_name, disallowed_tools, provider_url, provider_key"
     )
 
     def _migrate(self) -> None:
@@ -105,6 +115,9 @@ class SessionStore:
         migrations = [
             ("session_type", "TEXT NOT NULL DEFAULT 'chat'"),
             ("agent_name", "TEXT NOT NULL DEFAULT ''"),
+            ("disallowed_tools", "TEXT NOT NULL DEFAULT '[]'"),
+            ("provider_url", "TEXT NOT NULL DEFAULT ''"),
+            ("provider_key", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -116,7 +129,7 @@ class SessionStore:
         """Save or update a session record."""
         self._db.execute(
             f"""INSERT INTO sessions ({self._COLUMNS})
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (id) DO UPDATE SET
                 model=excluded.model, soul=excluded.soul, working_dir=excluded.working_dir,
                 allowed_tools=excluded.allowed_tools, max_turns=excluded.max_turns,
@@ -125,7 +138,9 @@ class SessionStore:
                 auto_restart=excluded.auto_restart, permission_mode=excluded.permission_mode,
                 state=excluded.state, last_active=excluded.last_active,
                 restart_count=excluded.restart_count, sdk_session_id=excluded.sdk_session_id,
-                session_type=excluded.session_type, agent_name=excluded.agent_name""",
+                session_type=excluded.session_type, agent_name=excluded.agent_name,
+                disallowed_tools=excluded.disallowed_tools,
+                provider_url=excluded.provider_url, provider_key=excluded.provider_key""",
             (
                 record.id, record.model, record.soul, record.working_dir,
                 json.dumps(record.allowed_tools), record.max_turns, record.timeout,
@@ -134,6 +149,8 @@ class SessionStore:
                 record.state, record.created_at, record.last_active,
                 record.restart_count, record.sdk_session_id,
                 record.session_type, record.agent_name,
+                json.dumps(record.disallowed_tools),
+                record.provider_url, record.provider_key,
             ),
         )
         self._db.commit()
@@ -253,6 +270,9 @@ class SessionStore:
             sdk_session_id=row[15],
             session_type=row[16] if len(row) > 16 else "chat",
             agent_name=row[17] if len(row) > 17 else "",
+            disallowed_tools=json.loads(row[18]) if len(row) > 18 and row[18] else [],
+            provider_url=row[19] if len(row) > 19 else "",
+            provider_key=row[20] if len(row) > 20 else "",
         )
 
     def close(self) -> None:

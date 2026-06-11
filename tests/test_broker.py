@@ -951,3 +951,260 @@ class TestOutboundDedupe:
             assert dup["deduped"] is True
         finally:
             tmpdir.cleanup()
+
+
+class TestStreamingSessionRegistry:
+    """_get_streaming_session mapping + register_streaming displacement."""
+
+    def _make_broker(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        registry = AgentRegistry(db_path=f"{tmpdir.name}/agents.db")
+        registry.register("barsik", model="sonnet", working_dir=tmpdir.name)
+        broker = MessageBroker(registry, SessionManager())
+        return tmpdir, registry, broker
+
+    def test_mapped_session_returned_even_when_not_connected(self):
+        """A channel mapped to a non-main label must get THAT session back in
+        any state, so _route_streaming's auto-wake targets the assigned
+        session instead of leaking the message into main's context."""
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, registry, broker = self._make_broker()
+        try:
+            class _Session:
+                def __init__(self, state):
+                    self.state = state
+
+            main = _Session(SessionState.CONNECTED)
+            research = _Session(SessionState.IDLE_SLEEPING)
+            broker.register_streaming("barsik", main, label="main")
+            broker.register_streaming("barsik", research, label="research")
+            registry.set_channel_session("barsik", "chat-1", "research")
+
+            got = broker._get_streaming_session("barsik", "chat-1")
+            assert got is research, (
+                "mapped session must be returned in ANY state -- falling back "
+                "to main delivers the message into the wrong session context"
+            )
+            # Unmapped chat still falls back to main.
+            assert broker._get_streaming_session("barsik", "chat-2") is main
+            # Mapped label with no session object falls back to main.
+            registry.set_channel_session("barsik", "chat-3", "ghost")
+            assert broker._get_streaming_session("barsik", "chat-3") is main
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_register_streaming_disconnects_displaced_connected_session(self):
+        """Overwriting a still-connected session must schedule a disconnect of
+        the displaced one instead of orphaning a live SDK subprocess."""
+        import asyncio
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker = self._make_broker()
+        try:
+            class _Session:
+                def __init__(self, state):
+                    self.state = state
+                    self.disconnect_calls = 0
+
+                async def disconnect(self):
+                    self.disconnect_calls += 1
+
+            old = _Session(SessionState.CONNECTED)
+            new = _Session(SessionState.CONNECTED)
+            broker.register_streaming("barsik", old, label="main")
+            broker.register_streaming("barsik", new, label="main")
+
+            # Let the scheduled disconnect task run.
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+            assert old.disconnect_calls == 1, "displaced session must be disconnected"
+            assert new.disconnect_calls == 0
+            assert broker._streaming["barsik"]["main"] is new
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_register_streaming_leaves_disconnected_displaced_alone(self):
+        import asyncio
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker = self._make_broker()
+        try:
+            class _Session:
+                def __init__(self, state):
+                    self.state = state
+                    self.disconnect_calls = 0
+
+                async def disconnect(self):
+                    self.disconnect_calls += 1
+
+            old = _Session(SessionState.DEAD)
+            new = _Session(SessionState.CONNECTED)
+            broker.register_streaming("barsik", old, label="main")
+            broker.register_streaming("barsik", new, label="main")
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+            assert old.disconnect_calls == 0, "non-connected displaced session is left alone"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_register_streaming_skips_disconnect_when_transport_shared(self):
+        """Tmux names its OS session pinky-{agent} (no per-instance component),
+        so a displaced and a replacement session object drive the SAME tmux
+        session -- resume_handle is that name on both. Disconnecting the
+        displaced object would kill-session the replacement's live transport."""
+        import asyncio
+
+        from pinky_daemon.transport_state import SessionState
+
+        tmpdir, _, broker = self._make_broker()
+        try:
+            class _TmuxLike:
+                def __init__(self, handle):
+                    self.state = SessionState.CONNECTED
+                    self.resume_handle = handle
+                    self.disconnect_calls = 0
+
+                async def disconnect(self):
+                    self.disconnect_calls += 1
+
+            old = _TmuxLike("pinky-barsik")
+            new = _TmuxLike("pinky-barsik")
+            broker.register_streaming("barsik", old, label="main")
+            broker.register_streaming("barsik", new, label="main")
+            for _ in range(5):
+                await asyncio.sleep(0)
+
+            assert old.disconnect_calls == 0, (
+                "displaced session sharing the transport resource must NOT be "
+                "disconnected -- that would kill the replacement's tmux session"
+            )
+            assert new.disconnect_calls == 0
+            assert broker._streaming["barsik"]["main"] is new
+
+            # Distinct resources (e.g. two SDK sessions with their own
+            # subprocesses) still get the displaced-disconnect treatment.
+            third = _TmuxLike("other-handle")
+            broker.register_streaming("barsik", third, label="main")
+            for _ in range(5):
+                await asyncio.sleep(0)
+            assert new.disconnect_calls == 1
+            assert third.disconnect_calls == 0
+        finally:
+            tmpdir.cleanup()
+
+
+class TestEventLoopOffload:
+    """Blocking platform I/O must run off the event loop (asyncio.to_thread)."""
+
+    def _make_broker(self):
+        tmpdir = tempfile.TemporaryDirectory()
+        registry = AgentRegistry(db_path=f"{tmpdir.name}/agents.db")
+        registry.register("barsik", model="sonnet", working_dir=tmpdir.name)
+
+        sent_messages: list[tuple[str, str, str, str]] = []
+
+        async def send_callback(agent_name, platform, chat_id, content):
+            sent_messages.append((agent_name, platform, chat_id, content))
+
+        broker = MessageBroker(registry, SessionManager(), send_callback=send_callback)
+        return tmpdir, registry, broker, sent_messages
+
+    @pytest.mark.asyncio
+    async def test_download_photo_attachments_offloads_sync_download(self, monkeypatch):
+        """TelegramAdapter.download_file is fully synchronous (blocking httpx
+        GET + file write). It must run in a worker thread, not on the loop."""
+        import os
+        import threading
+
+        from pinky_outreach.telegram import TelegramAdapter
+
+        tmpdir, registry, broker, _ = self._make_broker()
+        try:
+            registry.set_token("barsik", "telegram", "123:abc")
+            loop_thread = threading.get_ident()
+            download_threads: list[int] = []
+
+            def fake_download(self, file_id, dest_dir=""):
+                download_threads.append(threading.get_ident())
+                return os.path.join(dest_dir, "photo.jpg")
+
+            monkeypatch.setattr(TelegramAdapter, "download_file", fake_download)
+
+            msg = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="look at this",
+                agent_name="barsik",
+                attachments=[{"type": "photo", "file_id": "f-1"}],
+            )
+            await broker._download_photo_attachments("barsik", msg)
+
+            assert download_threads, "download_file was never called"
+            assert download_threads[0] != loop_thread, (
+                "download_file ran on the event-loop thread -- a multi-MB "
+                "download would freeze the entire daemon"
+            )
+            assert msg.attachments[0]["local_path"].endswith("photo.jpg")
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_try_voice_reply_uses_daemon_url_and_offloads(self, monkeypatch):
+        """The voice-reply HTTP loopback targets THIS process: a sync urlopen
+        on the event loop self-deadlocks until the 60s socket timeout. It must
+        run in a worker thread and honor PINKY_DAEMON_URL."""
+        import threading
+        import urllib.request
+
+        tmpdir, registry, broker, sent_messages = self._make_broker()
+        try:
+            registry.register("barsik", voice_config={"voice_reply": True})
+            monkeypatch.setenv("PINKY_DAEMON_URL", "http://127.0.0.1:9111")
+
+            loop_thread = threading.get_ident()
+            captured: list[tuple[str, int]] = []
+
+            class _FakeResp:
+                def __enter__(self):
+                    return self
+
+                def __exit__(self, *args):
+                    return False
+
+                def read(self):
+                    return b'{"sent": true}'
+
+            def fake_urlopen(req, timeout=0):
+                captured.append((req.full_url, threading.get_ident()))
+                return _FakeResp()
+
+            monkeypatch.setattr(urllib.request, "urlopen", fake_urlopen)
+
+            sent = await broker._try_voice_reply(
+                "barsik", "telegram", "6770805286", "hello in voice",
+            )
+
+            assert sent is True
+            assert captured, "urlopen never called"
+            url, thread_id = captured[0]
+            assert url == "http://127.0.0.1:9111/broker/send-voice", (
+                f"voice reply must honor PINKY_DAEMON_URL, got {url}"
+            )
+            assert thread_id != loop_thread, (
+                "urlopen ran on the event-loop thread -- guaranteed deadlock "
+                "against our own /broker/send-voice endpoint"
+            )
+            # Accessibility text companion still goes out.
+            assert ("barsik", "telegram", "6770805286", "hello in voice") in sent_messages
+        finally:
+            tmpdir.cleanup()

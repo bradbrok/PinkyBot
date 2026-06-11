@@ -942,3 +942,276 @@ async def test_billing_error_assistant_does_not_block_subsequent_auth_alert() ->
     assert callback.await_count == 1
     args, _ = callback.await_args
     assert args == (ss.agent_name, "authentication_failed")
+
+
+# -- _pending_chats routing-queue 1:1 invariant -------------------------------
+#
+# Response routing relies on FIFO correlation: one _pending_chats entry per
+# query, one pop per ResultMessage. System-initiated queries (wake prompt,
+# context warn, restart-blocked notice, idle-sleep save prompt) used to skip
+# the enqueue, so their ResultMessages consumed USER routing tuples and the
+# real user turn popped ("", "", "") -- silently dropping the reply (or
+# delivering a system turn's text to the user's chat). The queue also
+# survived disconnect(), leaking stale chat_ids into a resumed session.
+
+
+@pytest.mark.asyncio
+async def test_send_enqueues_routing_entry_even_without_chat_id() -> None:
+    """Every query through send() must enqueue exactly one routing entry,
+    including internal sends with no chat_id (e.g. inject_agent_message)."""
+    ss = _make_session()
+    await ss.send("internal prompt")
+    assert ss._pending_chats == [("", "", "")]
+
+    await ss.send("user prompt", platform="telegram", chat_id="123", message_id="9")
+    assert ss._pending_chats == [("", "", ""), ("telegram", "123", "9")]
+
+
+@pytest.mark.asyncio
+async def test_context_warn_enqueues_unrouted_sentinel() -> None:
+    """The [SYSTEM] context warning triggers an agent turn whose ResultMessage
+    pops a routing tuple -- a sentinel must be enqueued for it."""
+    ss = _make_session(warn_pct=40, restart_pct=80)
+    _stub_ctx(ss, pct=50)
+    await ss._check_context()
+    assert ss._pending_chats == [("", "", "")]
+
+
+@pytest.mark.asyncio
+async def test_restart_blocked_notice_enqueues_unrouted_sentinel() -> None:
+    ss = _make_session()
+    await ss._notify_restart_blocked({"message": "save first"})
+    assert ss._pending_chats == [("", "", "")]
+
+
+@pytest.mark.asyncio
+async def test_disconnect_clears_pending_chats() -> None:
+    """Stale routing entries must not survive a teardown -- a reconnected
+    session's first turns would otherwise be routed to an old chat_id."""
+    ss = _make_session()
+    ss._pending_chats.append(("telegram", "123", "9"))
+    await ss.disconnect()
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
+async def test_disconnect_fires_empty_callback_for_routed_pending_entries() -> None:
+    """A routed turn that dies in a teardown (e.g. the disconnect inside a
+    warm reconnect) never reaches broker.route_response -- the only place the
+    typing indicator stops. disconnect() must fire the callback with empty
+    text for each routed entry; sentinels stay silent."""
+    ss = _make_session()
+    routed: list[tuple[str, str, str]] = []
+
+    async def capture(turn_result):
+        routed.append((turn_result.platform, turn_result.chat_id, turn_result.text))
+
+    ss._response_callback = capture
+    ss._pending_chats.append(("telegram", "123", "9"))
+    ss._pending_chats.append(("", "", ""))
+
+    await ss.disconnect()
+
+    assert routed == [("telegram", "123", "")], (
+        f"routed entries must fire an empty-text callback on teardown, got {routed}"
+    )
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
+async def test_system_turn_does_not_consume_user_routing() -> None:
+    """A system turn (sentinel entry) completing before a user turn must pop
+    its own sentinel, leaving the user tuple for the user turn."""
+    ss = _make_session()
+    routed: list[tuple[str, str]] = []
+
+    async def capture(turn_result):
+        routed.append((turn_result.platform, turn_result.chat_id))
+
+    ss._response_callback = capture
+    # System turn queued first (e.g. wake prompt), then a user message.
+    ss._pending_chats.append(("", "", ""))
+    ss._pending_chats.append(("telegram", "123", "9"))
+
+    await _run_reader_against_stream(
+        ss,
+        [
+            _make_result_message(),  # system turn -- pops the sentinel
+            _make_result_message(),  # user turn -- pops the user tuple
+        ],
+    )
+
+    assert routed == [("telegram", "123")], (
+        f"user turn must route to the user's chat, got {routed}"
+    )
+
+
+# -- Typing-indicator leak: callback must fire for every routed turn ----------
+#
+# broker.route_response is the only place the Telegram typing loop is
+# cancelled. The reader loop used to skip the response callback for errored
+# turns and for turns with no text/tool uses, leaving the typing task
+# hammering the Telegram API forever.
+
+
+@pytest.mark.asyncio
+async def test_error_result_fires_callback_with_empty_text_for_routed_turn() -> None:
+    ss = _make_session()
+    routed: list[tuple[str, str]] = []
+
+    async def capture(turn_result):
+        routed.append((turn_result.chat_id, turn_result.response_text))
+
+    ss._response_callback = capture
+    ss._pending_chats.append(("telegram", "123", "9"))
+
+    await _run_reader_against_stream(
+        ss,
+        [_make_result_message(is_error=True, api_error_status=429)],
+    )
+
+    assert routed == [("123", "")], (
+        "errored routed turn must still fire the callback (empty text) so "
+        "the broker can stop the typing indicator"
+    )
+
+
+@pytest.mark.asyncio
+async def test_routed_turn_with_no_text_or_tools_still_fires_callback() -> None:
+    ss = _make_session()
+    routed: list[str] = []
+
+    async def capture(turn_result):
+        routed.append(turn_result.chat_id)
+
+    ss._response_callback = capture
+    ss._pending_chats.append(("telegram", "123", "9"))
+
+    await _run_reader_against_stream(ss, [_make_result_message()])
+
+    assert routed == ["123"]
+
+
+@pytest.mark.asyncio
+async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
+    """Sentinel turns with no content stay silent -- no routing target."""
+    ss = _make_session()
+    routed: list[str] = []
+
+    async def capture(turn_result):
+        routed.append(turn_result.chat_id)
+
+    ss._response_callback = capture
+    ss._pending_chats.append(("", "", ""))
+
+    await _run_reader_against_stream(ss, [_make_result_message()])
+
+    assert routed == []
+
+
+# -- idle_sleep must let the memory-save turn finish before teardown ----------
+#
+# query() returns as soon as the prompt hits the transport. idle_sleep()
+# used to disconnect() immediately after, killing the CLI subprocess before
+# the save-memories turn ever ran -- the "save state before sleeping"
+# contract was a no-op.
+
+
+@pytest.mark.asyncio
+async def test_idle_sleep_waits_for_save_turn_completion() -> None:
+    ss = _make_session()
+    order: list[str] = []
+
+    async def fake_reader() -> None:
+        await asyncio.sleep(0.05)
+        order.append("save_turn_done")
+        ss._turn_done.set()
+
+    ss._reader_task = asyncio.create_task(fake_reader())
+
+    orig_disconnect = ss.disconnect
+
+    async def tracking_disconnect() -> None:
+        order.append("disconnect")
+        await orig_disconnect()
+
+    ss.disconnect = tracking_disconnect  # type: ignore[assignment]
+
+    result = await ss.idle_sleep()
+
+    assert result is True
+    assert order == ["save_turn_done", "disconnect"], (
+        f"disconnect must happen AFTER the save turn completes, got {order}"
+    )
+    assert ss.state == SessionState.IDLE_SLEEPING
+
+
+@pytest.mark.asyncio
+async def test_idle_sleep_proceeds_after_save_timeout() -> None:
+    """The wait is bounded -- a wedged save turn must not block sleep forever."""
+    ss = _make_session()
+    ss._IDLE_SLEEP_SAVE_TIMEOUT_SEC = 0.05  # type: ignore[assignment]
+
+    async def never_finishes() -> None:
+        await asyncio.sleep(60)
+
+    ss._reader_task = asyncio.create_task(never_finishes())
+
+    result = await ss.idle_sleep()
+
+    assert result is True
+    assert ss.state == SessionState.IDLE_SLEEPING
+
+
+@pytest.mark.asyncio
+async def test_idle_sleep_aborts_when_message_arrives_during_save_window() -> None:
+    """A send() accepted during the save window would have its query killed
+    by the teardown -- the sleep must abort and leave the session connected."""
+    ss = _make_session()
+
+    async def reader_with_traffic() -> None:
+        await ss.send("hi there", platform="telegram", chat_id="123")
+        ss._turn_done.set()
+
+    ss._reader_task = asyncio.create_task(reader_with_traffic())
+
+    result = await ss.idle_sleep()
+
+    assert result is False
+    assert ss.state == SessionState.CONNECTED, (
+        "idle sleep must abort when new traffic arrives mid-save"
+    )
+    assert ss._client is not None, "transport must not be torn down on abort"
+
+
+# -- Warm-reconnect coalescing -------------------------------------------------
+#
+# A transport drop surfaces in send() AND the reader loop (and the watchdog
+# can fire during the backoff window). Unguarded, two concurrent
+# attempt_reconnect calls interleave disconnect/sleep/connect: each connect()
+# builds its own SDK client + reader task and the later assignment orphans
+# the first live subprocess.
+
+
+@pytest.mark.asyncio
+async def test_concurrent_attempt_reconnect_coalesces_to_single_cycle() -> None:
+    ss = _make_session()
+    ss._RECONNECT_BACKOFF = (0.01,)  # type: ignore[assignment]
+    connect_calls = 0
+
+    async def fake_connect() -> None:
+        nonlocal connect_calls
+        connect_calls += 1
+        await asyncio.sleep(0.05)
+        ss._state_machine._state = SessionState.CONNECTED
+
+    ss.connect = fake_connect  # type: ignore[assignment]
+
+    await asyncio.gather(ss.attempt_reconnect(), ss.attempt_reconnect())
+
+    assert connect_calls == 1, (
+        f"concurrent attempt_reconnect must coalesce onto one cycle; "
+        f"connect() ran {connect_calls}x"
+    )
+    assert ss.state == SessionState.CONNECTED
+    assert ss._reconnect_task is None, "in-flight marker must clear when done"

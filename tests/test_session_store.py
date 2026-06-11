@@ -394,3 +394,156 @@ def test_is_purgeable_legacy_session():
     # Owned by an agent that does NOT have a streaming session — keep it.
     assert is_purgeable_legacy_session("persik", streaming) is False
     assert is_purgeable_legacy_session("persik", set()) is False
+
+
+class TestGuardrailPersistence:
+    """disallowed_tools and provider overrides must survive a restart --
+    a restored session silently losing its tool restrictions or reverting
+    to the default Anthropic endpoint is config drift with no error."""
+
+    def test_record_roundtrips_disallowed_tools_and_provider(self, store):
+        store.save(_make_record(
+            disallowed_tools=["Bash", "Write"],
+            provider_url="http://localhost:11434",
+            provider_key="sk-local",
+        ))
+        got = store.get("test-session")
+        assert got.disallowed_tools == ["Bash", "Write"]
+        assert got.provider_url == "http://localhost:11434"
+        assert got.provider_key == "sk-local"
+
+    def test_record_defaults_when_fields_omitted(self, store):
+        store.save(_make_record())
+        got = store.get("test-session")
+        assert got.disallowed_tools == []
+        assert got.provider_url == ""
+        assert got.provider_key == ""
+
+    def test_migration_adds_columns_to_old_database(self):
+        """Opening a pre-existing DB without the new columns must migrate it
+        in place and read old rows with safe defaults."""
+        import sqlite3
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            conn = sqlite3.connect(path)
+            conn.execute("""
+                CREATE TABLE sessions (
+                    id TEXT PRIMARY KEY,
+                    model TEXT NOT NULL DEFAULT '',
+                    soul TEXT NOT NULL DEFAULT '',
+                    working_dir TEXT NOT NULL DEFAULT '.',
+                    allowed_tools TEXT NOT NULL DEFAULT '[]',
+                    max_turns INTEGER NOT NULL DEFAULT 0,
+                    timeout REAL NOT NULL DEFAULT 300.0,
+                    system_prompt TEXT NOT NULL DEFAULT '',
+                    restart_threshold_pct REAL NOT NULL DEFAULT 80.0,
+                    auto_restart INTEGER NOT NULL DEFAULT 1,
+                    permission_mode TEXT NOT NULL DEFAULT '',
+                    state TEXT NOT NULL DEFAULT 'idle',
+                    created_at REAL NOT NULL,
+                    last_active REAL NOT NULL,
+                    restart_count INTEGER NOT NULL DEFAULT 0,
+                    sdk_session_id TEXT NOT NULL DEFAULT '',
+                    session_type TEXT NOT NULL DEFAULT 'chat',
+                    agent_name TEXT NOT NULL DEFAULT ''
+                )
+            """)
+            conn.execute(
+                "INSERT INTO sessions (id, created_at, last_active) VALUES (?, ?, ?)",
+                ("legacy", 1000.0, 1000.0),
+            )
+            conn.commit()
+            conn.close()
+
+            s = SessionStore(db_path=path)
+            got = s.get("legacy")
+            assert got is not None
+            assert got.disallowed_tools == []
+            assert got.provider_url == ""
+            assert got.provider_key == ""
+            # New fields persist on the migrated DB too.
+            s.save(_make_record(id="legacy", disallowed_tools=["Bash"]))
+            assert s.get("legacy").disallowed_tools == ["Bash"]
+            s.close()
+        finally:
+            os.unlink(path)
+
+    def test_manager_restore_passes_guardrails_to_session(self):
+        from pinky_daemon.sessions import SessionManager
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        try:
+            st1 = SessionStore(db_path=path)
+            mgr1 = SessionManager(store=st1)
+            mgr1.create(
+                session_id="locked",
+                model="sonnet",
+                disallowed_tools=["Bash", "Write"],
+                provider_url="http://localhost:11434",
+                provider_key="sk-local",
+            )
+            st1.close()
+
+            st2 = SessionStore(db_path=path)
+            mgr2 = SessionManager(store=st2)
+            session = mgr2.get("locked")
+            assert session is not None
+            assert session.disallowed_tools == ["Bash", "Write"], (
+                "restored session silently lost its tool restrictions"
+            )
+            assert session._provider_url == "http://localhost:11434"
+            assert session._provider_key == "sk-local"
+            st2.close()
+        finally:
+            os.unlink(path)
+
+
+class TestSendStateRecovery:
+    """Session.send must not strand the session in 'running' when the runner
+    raises or the caller is cancelled -- a stuck-running session is
+    unevictable and rejects all future sends as busy."""
+
+    @pytest.mark.asyncio
+    async def test_send_resets_state_when_runner_cancelled(self):
+        import asyncio
+
+        from pinky_daemon.sessions import SessionManager, SessionState
+
+        mgr = SessionManager()
+        session = mgr.create(session_id="cancel-me")
+
+        class _CancelledRunner:
+            async def run(self, content, **kwargs):
+                raise asyncio.CancelledError()
+
+        session._runner = _CancelledRunner()
+        session._runner_type = "sdk"
+
+        with pytest.raises(asyncio.CancelledError):
+            await session.send("hello")
+
+        assert session.state == SessionState.error, (
+            f"state must not stay 'running' after cancellation, got {session.state}"
+        )
+
+    @pytest.mark.asyncio
+    async def test_send_resets_state_when_runner_raises(self):
+        from pinky_daemon.sessions import SessionManager, SessionState
+
+        mgr = SessionManager()
+        session = mgr.create(session_id="boom")
+
+        class _BoomRunner:
+            async def run(self, content, **kwargs):
+                raise RuntimeError("runner exploded")
+
+        session._runner = _BoomRunner()
+        session._runner_type = "sdk"
+
+        with pytest.raises(RuntimeError, match="runner exploded"):
+            await session.send("hello")
+
+        assert session.state == SessionState.error
