@@ -54,7 +54,7 @@ class iMessageAdapter:  # noqa: N801
         # Try to connect to chat.db
         self._init_db()
 
-    def _init_db(self) -> None:
+    def _init_db(self, *, reseed: bool = True) -> None:
         """Open a read-only connection to chat.db, bounded by a timeout.
 
         ``sqlite3.connect``'s open() is a C-level syscall that, under some macOS
@@ -65,7 +65,19 @@ class iMessageAdapter:  # noqa: N801
         and ``join`` with a timeout; if it doesn't return in time we give up,
         mark receive unavailable, and leave the stuck opener thread orphaned
         (daemon=True, so it never blocks process exit).
+
+        ``reseed=False`` (reconnect path) keeps the existing ``_last_rowid``
+        high-water mark so messages that arrived during a transient query
+        failure are replayed on the next poll instead of being skipped.
         """
+        if self._db is not None:
+            try:
+                self._db.close()
+            except sqlite3.Error:
+                pass
+            self._db = None
+        self._db_available = False
+
         if not os.path.exists(self._db_path):
             _log(f"imessage: chat.db not found at {self._db_path}")
             return
@@ -116,7 +128,8 @@ class iMessageAdapter:  # noqa: N801
             return
 
         self._db = result["db"]
-        self._last_rowid = result["last_rowid"]
+        if reseed:
+            self._last_rowid = result["last_rowid"]
         self._db_available = True
         _log(f"imessage: chat.db connected, last_rowid={self._last_rowid}")
 
@@ -258,8 +271,9 @@ end tell
             ).fetchall()
         except sqlite3.OperationalError as e:
             _log(f"imessage: chat.db query error: {e}")
-            # Try reconnecting
-            self._init_db()
+            # Reconnect without reseeding _last_rowid so the rows we failed
+            # to read here are replayed on the next poll.
+            self._init_db(reseed=False)
             return []
 
         messages = []

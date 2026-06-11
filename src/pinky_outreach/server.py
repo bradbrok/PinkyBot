@@ -109,16 +109,10 @@ def create_server(
         """List configured messaging platforms."""
         return json.dumps({"platforms": active_platforms})
 
-    @mcp.tool()
-    def send_message(
-        content: str,
-        chat_id: str,
-        platform: str = default_platform,
-        reply_to: str = "",
-        parse_mode: str = "",
-        silent: bool = False,
-    ) -> str:
-        f"""Send a message to a chat on any configured platform.
+    # Tool docs are interpolated with the active platform list, so they are
+    # passed as decorator descriptions: an f-string first statement is an
+    # expression, not a docstring, and would register an empty description.
+    @mcp.tool(description=f"""Send a message to a chat on any configured platform.
 
         Available platforms: {platform_list}
 
@@ -129,7 +123,15 @@ def create_server(
             reply_to: Message ID to reply to (optional). For Slack, this is a thread_ts.
             parse_mode: Text formatting: HTML or Markdown (Telegram only).
             silent: Send without notification sound (Telegram only).
-        """
+        """)
+    def send_message(
+        content: str,
+        chat_id: str,
+        platform: str = default_platform,
+        reply_to: str = "",
+        parse_mode: str = "",
+        silent: bool = False,
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -200,15 +202,7 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported. Available: {platform_list}")
 
-    @mcp.tool()
-    def check_messages(
-        chat_id: str = "",
-        platform: str = default_platform,
-        timeout: int = 0,
-        limit: int = 20,
-        after: str = "",
-    ) -> str:
-        f"""Poll for new inbound messages.
+    @mcp.tool(description=f"""Poll for new inbound messages.
 
         Telegram: uses long polling (chat_id not required, returns all new messages).
         Discord/Slack: fetches recent messages from a channel (chat_id required).
@@ -219,10 +213,17 @@ def create_server(
         Args:
             chat_id: Channel ID (required for Discord/Slack, ignored for Telegram/WhatsApp).
             platform: Platform to check ({platform_list}).
-            timeout: Long poll timeout in seconds (Telegram only, 0 = instant, max 50).
+            timeout: Long poll timeout in seconds (Telegram only, 0 = instant, max 25).
             limit: Max messages to return (1-100).
             after: Only messages after this ID/timestamp (Discord/Slack).
-        """
+        """)
+    def check_messages(
+        chat_id: str = "",
+        platform: str = default_platform,
+        timeout: int = 0,
+        limit: int = 20,
+        after: str = "",
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -230,7 +231,9 @@ def create_server(
             if not telegram:
                 return _not_configured("telegram")
             try:
-                messages = telegram.get_updates(timeout=min(timeout, 50), limit=limit)
+                # Cap below the adapter's 30s httpx client timeout: a longer
+                # long-poll would hit the transport read timeout first.
+                messages = telegram.get_updates(timeout=min(timeout, 25), limit=limit)
                 _log(f"outreach: checked telegram, {len(messages)} new messages")
                 return json.dumps({
                     "platform": "telegram",
@@ -296,14 +299,7 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def send_photo(
-        chat_id: str,
-        file_path: str,
-        caption: str = "",
-        platform: str = default_platform,
-    ) -> str:
-        f"""Send a photo/image to a chat.
+    @mcp.tool(description=f"""Send a photo/image to a chat.
 
         Available platforms: {platform_list}
 
@@ -312,7 +308,13 @@ def create_server(
             file_path: Absolute path to the image file.
             caption: Optional caption text.
             platform: Platform ({platform_list}).
-        """
+        """)
+    def send_photo(
+        chat_id: str,
+        file_path: str,
+        caption: str = "",
+        platform: str = default_platform,
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -359,14 +361,7 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def send_document(
-        chat_id: str,
-        file_path: str,
-        caption: str = "",
-        platform: str = default_platform,
-    ) -> str:
-        f"""Send a file/document to a chat.
+    @mcp.tool(description=f"""Send a file/document to a chat.
 
         Available platforms: {platform_list}
 
@@ -375,7 +370,13 @@ def create_server(
             file_path: Absolute path to the file.
             caption: Optional caption text.
             platform: Platform ({platform_list}).
-        """
+        """)
+    def send_document(
+        chat_id: str,
+        file_path: str,
+        caption: str = "",
+        platform: str = default_platform,
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -422,14 +423,7 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def send_video(
-        chat_id: str,
-        file_path: str,
-        caption: str = "",
-        platform: str = default_platform,
-    ) -> str:
-        f"""Send a video that plays inline (not a file download) to a chat.
+    @mcp.tool(description=f"""Send a video that plays inline (not a file download) to a chat.
 
         On Telegram this uses sendVideo with streaming enabled so the clip plays
         in-place instead of arriving as a downloadable attachment. Other platforms
@@ -442,7 +436,13 @@ def create_server(
             file_path: Absolute path to the video file (.mp4 recommended).
             caption: Optional caption text.
             platform: Platform ({platform_list}).
-        """
+        """)
+    def send_video(
+        chat_id: str,
+        file_path: str,
+        caption: str = "",
+        platform: str = default_platform,
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -489,19 +489,18 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def get_chat_info(
-        chat_id: str,
-        platform: str = default_platform,
-    ) -> str:
-        f"""Get information about a chat/channel.
+    @mcp.tool(description=f"""Get information about a chat/channel.
 
         Available platforms: {platform_list}
 
         Args:
             chat_id: Chat/channel ID to look up.
             platform: Platform ({platform_list}).
-        """
+        """)
+    def get_chat_info(
+        chat_id: str,
+        platform: str = default_platform,
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -558,14 +557,7 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def add_reaction(
-        chat_id: str,
-        message_id: str,
-        emoji: str,
-        platform: str = default_platform,
-    ) -> str:
-        f"""React to a message with an emoji.
+    @mcp.tool(description=f"""React to a message with an emoji.
 
         Available platforms: {platform_list}
 
@@ -574,7 +566,13 @@ def create_server(
             message_id: Message to react to. For Slack, this is the message timestamp (ts).
             emoji: Emoji to react with. For Slack, use name without colons (e.g. "thumbsup").
             platform: Platform ({platform_list}).
-        """
+        """)
+    def add_reaction(
+        chat_id: str,
+        message_id: str,
+        emoji: str,
+        platform: str = default_platform,
+    ) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
@@ -621,14 +619,7 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def download_file(
-        file_id: str,
-        platform: str = default_platform,
-        url: str = "",
-        dest_dir: str = "/tmp/pinky_files",
-    ) -> str:
-        f"""Download a file attachment from any platform.
+    @mcp.tool(description=f"""Download a file attachment from any platform.
 
         Available platforms: {platform_list}
 
@@ -637,7 +628,13 @@ def create_server(
             platform: Platform the file is from ({platform_list}).
             url: Direct download URL (required for Discord/Slack).
             dest_dir: Local directory to save files to.
-        """
+        """)
+    def download_file(
+        file_id: str,
+        platform: str = default_platform,
+        url: str = "",
+        dest_dir: str = "/tmp/pinky_files",
+    ) -> str:
         import os
 
         if platform not in active_platforms:
@@ -694,15 +691,14 @@ def create_server(
         else:
             return _err(f"Platform '{platform}' not supported.")
 
-    @mcp.tool()
-    def bot_info(platform: str = default_platform) -> str:
-        f"""Get info about the configured bot.
+    @mcp.tool(description=f"""Get info about the configured bot.
 
         Available platforms: {platform_list}
 
         Args:
             platform: Platform ({platform_list}).
-        """
+        """)
+    def bot_info(platform: str = default_platform) -> str:
         if platform not in active_platforms:
             return _err(f"Platform '{platform}' not available. Configured: {platform_list}")
 
