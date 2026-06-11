@@ -3264,6 +3264,22 @@ class TmuxSession:
         except (TypeError, ValueError):
             return 0
 
+    @property
+    def context_used_pct(self) -> float:
+        """Context-window usage as a percentage (#745).
+
+        ``StreamingSession`` and ``CodexSession`` both expose this
+        property, and callers that don't know the transport — the
+        scheduler's heartbeat reconciler in particular — read it via
+        ``getattr(session, "context_used_pct", 0.0)``. Without it every
+        reconciled heartbeat for a tmux agent recorded 0.0% while the
+        real number sat one call away in ``get_context_info()``.
+        """
+        max_tokens = self._max_tokens_for_model()
+        if max_tokens <= 0:
+            return 0.0
+        return round(self._current_total_tokens() / max_tokens * 100.0, 1)
+
     def get_context_info(self) -> dict:
         """Return SDK-compatible context-window snapshot.
 

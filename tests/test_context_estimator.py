@@ -70,3 +70,17 @@ def test_context_info_shape_and_percentage():
         "categories": [],
         "mcp_tools": [],
     }
+
+
+def test_context_info_percentage_clamped_at_100():
+    """#745: the estimate sums all persisted history and never learns about
+    a runtime's internal compaction (Codex CLI), so it drifts past the
+    window size — murzik's gauge read 108%. A live context can't exceed
+    its window; clamp the reported percentage."""
+    estimator = ContextTextEstimator(chars_per_token=4)
+    estimator.record_internal_text("x" * 80)  # 20 tokens vs max 10
+
+    info = estimator.context_info(session_id="agent-main", max_tokens=10)
+
+    assert info["total_tokens"] == 20  # raw estimate stays honest
+    assert info["percentage"] == 100.0  # display gauge is clamped

@@ -1531,7 +1531,10 @@ class CodexSession:
     def context_used_pct(self) -> float:
         if self.max_tokens <= 0:
             return 0.0
-        return (self.estimated_tokens / self.max_tokens) * 100
+        # Clamped for the same reason as ContextTextEstimator.context_info
+        # (#745): the char-count estimate never learns about Codex CLI's
+        # internal auto-compaction, so beyond the window size it's drift.
+        return min(100.0, (self.estimated_tokens / self.max_tokens) * 100)
 
     def get_context_info(self) -> dict:
         """Best-effort context info for APIs that expect session context details."""

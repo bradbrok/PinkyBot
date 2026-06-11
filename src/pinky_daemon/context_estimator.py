@@ -55,7 +55,12 @@ class ContextTextEstimator:
             conversation_store=conversation_store,
             history_limit=history_limit,
         )
-        pct = round(total / max_tokens * 100, 1) if max_tokens > 0 else 0.0
+        # Clamp at 100: the estimate sums ALL persisted history plus every
+        # internal prompt ever recorded, but runtimes like Codex CLI compact
+        # their real context internally — so past the window size the excess
+        # is pure drift, not signal (#745: murzik's gauge read 108%). A live
+        # context can never truly exceed its window.
+        pct = min(100.0, round(total / max_tokens * 100, 1)) if max_tokens > 0 else 0.0
         return {
             "total_tokens": total,
             "max_tokens": max_tokens,
