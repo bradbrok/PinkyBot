@@ -23,6 +23,7 @@ Architecture:
 from __future__ import annotations
 
 import asyncio
+import itertools
 import sys
 import time
 from dataclasses import dataclass, field
@@ -75,6 +76,10 @@ class EventQueue:
 
     def __init__(self) -> None:
         self._queues: dict[str, asyncio.PriorityQueue] = {}
+        # Monotonic tiebreaker: AgentEvent has no ordering, so two events with
+        # equal priority and timestamp would make heapq compare the events
+        # themselves and raise TypeError, losing the event.
+        self._seq = itertools.count()
 
     def ensure_queue(self, agent_name: str) -> None:
         if agent_name not in self._queues:
@@ -85,7 +90,7 @@ class EventQueue:
         self.ensure_queue(event.agent_name)
         # Priority queue: lower number = higher priority, negate for urgency
         await self._queues[event.agent_name].put(
-            (-event.priority, event.timestamp, event)
+            (-event.priority, event.timestamp, next(self._seq), event)
         )
 
     async def pop(self, agent_name: str, timeout: float = 0) -> AgentEvent | None:
@@ -93,11 +98,11 @@ class EventQueue:
         self.ensure_queue(agent_name)
         try:
             if timeout > 0:
-                _, _, event = await asyncio.wait_for(
+                _, _, _, event = await asyncio.wait_for(
                     self._queues[agent_name].get(), timeout=timeout
                 )
             else:
-                _, _, event = self._queues[agent_name].get_nowait()
+                _, _, _, event = self._queues[agent_name].get_nowait()
             return event
         except (asyncio.QueueEmpty, asyncio.TimeoutError):
             return None

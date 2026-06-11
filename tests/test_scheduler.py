@@ -78,6 +78,35 @@ class TestCronParser:
         assert cron_matches("0 9 * * 1-5", dt_saturday) is False
 
 
+class TestCronRobustness:
+    """Malformed crons must never raise (one bad schedule would abort the
+    whole scheduler tick), and standard name/range-step tokens must parse."""
+
+    def test_day_name_token(self):
+        dt_monday = datetime(2026, 3, 23, 9, 0)  # Monday
+        dt_tuesday = datetime(2026, 3, 24, 9, 0)  # Tuesday
+        assert cron_matches("0 9 * * mon", dt_monday) is True
+        assert cron_matches("0 9 * * mon", dt_tuesday) is False
+        assert cron_matches("0 9 * * mon-fri", dt_monday) is True
+
+    def test_month_name_token(self):
+        dt = datetime(2026, 3, 27, 8, 0)
+        assert cron_matches("0 8 * mar *", dt) is True
+        assert cron_matches("0 8 * apr *", dt) is False
+
+    def test_range_with_step(self):
+        assert cron_matches("1-5/2 * * * *", datetime(2026, 3, 23, 9, 3)) is True
+        assert cron_matches("1-5/2 * * * *", datetime(2026, 3, 23, 9, 4)) is False
+        assert cron_matches("1-5/2 * * * *", datetime(2026, 3, 23, 9, 7)) is False
+
+    def test_malformed_cron_returns_false_instead_of_raising(self):
+        dt = datetime(2026, 3, 23, 9, 0)
+        assert cron_matches("0 9 * * funky", dt) is False
+        assert cron_matches("*/x * * * *", dt) is False
+        assert cron_matches("0 9 * * 1-x", dt) is False
+        assert cron_matches("*/0 * * * *", dt) is False
+
+
 class TestCronDescription:
     def test_hourly(self):
         desc = next_cron_description("0 8 * * *")
@@ -856,3 +885,75 @@ class TestDreamNonBlocking:
         await asyncio.wait_for(
             scheduler._librarian_tasks[AgentScheduler.LIBRARIAN_GLOBAL_KEY], timeout=2
         )
+
+
+# -- URL Watcher Tests ---------------------------------------
+
+
+class _StubTrigger:
+    def __init__(self) -> None:
+        self.id = 1
+        self.name = "watch"
+        self.agent_name = "ivan"
+        self.url = "http://example.invalid/status"
+        self.method = "GET"
+        self.condition = "status_is"
+        self.condition_value = "200"
+        self.last_value = ""
+        self.prompt_template = ""
+
+
+class _StubTriggerStore:
+    def __init__(self) -> None:
+        self.checks: list = []
+        self.fires: list = []
+
+    def record_check(self, trigger_id, value):
+        self.checks.append((trigger_id, value))
+
+    def record_fire(self, trigger_id):
+        self.fires.append(trigger_id)
+
+
+class TestUrlWatcherOffLoop:
+    @pytest.mark.asyncio
+    async def test_fetch_runs_off_event_loop(self, registry, monkeypatch):
+        """The urlopen+read must run in a worker thread, not block the shared
+        event loop (which also serves the API, pollers, and broker)."""
+        import threading
+        import urllib.request
+
+        loop_thread = threading.current_thread()
+        seen = {}
+
+        class _Resp:
+            status = 200
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self, n=-1):
+                return b"ok"
+
+        def _fake_urlopen(req, timeout=None):
+            seen["thread"] = threading.current_thread()
+            return _Resp()
+
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+
+        store = _StubTriggerStore()
+        fired = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            fired.append(agent_name)
+
+        scheduler = AgentScheduler(registry, wake_callback=wake_cb, trigger_store=store)
+        await scheduler._poll_url_trigger(_StubTrigger(), time.time())
+
+        assert seen["thread"] is not loop_thread
+        assert fired == ["ivan"]
+        assert store.fires == [1]
+        assert store.checks == [(1, "200")]

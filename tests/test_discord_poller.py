@@ -86,6 +86,47 @@ class TestBrokerDiscordPoller:
         mock_broker.handle_inbound.assert_not_called()
 
     @pytest.mark.asyncio
+    async def test_priming_failure_does_not_replay_history(self, mock_adapter, mock_broker):
+        """A channel whose priming fetch failed must not be polled floorless.
+
+        Polling with no after-filter would replay the latest 50 historical
+        messages as fresh inbound. The channel stays parked until the next
+        discovery re-primes it.
+        """
+        history = [
+            _msg(msg_id=str(200 - i), content=f"old-{i}", author_id="user-9")
+            for i in range(3)
+        ]
+        mock_adapter.get_messages.side_effect = [
+            DiscordError("transient", status_code=502),  # priming fails
+        ]
+
+        poller = self._make_poller(mock_adapter, mock_broker)
+        await poller._refresh_channels(verbose=True)
+        assert poller.watched_channels == ["chan-A"]
+        assert "chan-A" not in poller._last_id
+
+        # The channel is in the watch set, but the poll must skip it
+        mock_adapter.get_messages.side_effect = [history]
+        await poller._poll_once()
+        await asyncio.sleep(0)
+        mock_broker.handle_inbound.assert_not_called()
+
+        # Next discovery re-primes it and polling resumes with a floor
+        latest = _msg(msg_id="200", content="latest")
+        new_msg = _msg(msg_id="201", content="fresh", author_id="user-9")
+        mock_adapter.get_messages.side_effect = [
+            [latest],    # re-prime
+            [new_msg],   # poll
+        ]
+        await poller._refresh_channels(verbose=False)
+        await poller._poll_once()
+        await asyncio.sleep(0)
+
+        assert mock_broker.handle_inbound.await_count == 1
+        assert mock_broker.handle_inbound.await_args.args[0].message_id == "201"
+
+    @pytest.mark.asyncio
     async def test_new_message_routed_through_broker(self, mock_adapter, mock_broker):
         """Real inbound user message should produce a BrokerMessage with platform=discord."""
         baseline = _msg(msg_id="100", content="baseline")
