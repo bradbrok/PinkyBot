@@ -3765,18 +3765,34 @@ except Exception:
         # Anthropic
         ("anthropic", "claude-fable-5", "Claude Fable 5", "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 1),
         ("anthropic", "claude-mythos-5", "Claude Mythos 5", "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 2),
-        ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 3),
-        ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 5),
-        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 15.0, 75.0, 1.5, 1, 10),
+        ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
+        ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
+        ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 10),
         ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
-        ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 0.8, 4.0, 0.08, 1, 30),
-        ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 15.0, 75.0, 1.5, 1, 40),
+        ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 1.0, 5.0, 0.1, 1, 30),
+        ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
         ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
         # OpenAI / Codex CLI
         ("openai", "gpt-5.5", "GPT-5.5", "Newest frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 55),
         ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
         ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
         ("openai", "gpt-5.4-nano", "GPT-5.4 Nano", "Cheapest. High-volume tasks.", "low", 200_000, 0, 0.05, 0.4, 0.005, 0, 80),
+    ]
+
+    # One-time data corrections for rows already seeded with wrong values.
+    # ``_seed_models`` is INSERT OR IGNORE, so fixing ``_MODEL_SEEDS`` alone
+    # never reaches an existing install. Each entry rewrites the prices of one
+    # model id ONLY while the row still carries the exact stale numbers —
+    # operator-customized prices are left untouched. (#741: Opus 4.5+ seeded
+    # at the pre-4.5 $15/$75 tier, Haiku 4.5 at the 3.5 tier's $0.80/$4;
+    # pricing.py — the actual cost engine — was always correct.)
+    _PRICE_CORRECTIONS = [
+        # (id, (stale in, out, cached), (correct in, out, cached))
+        ("anthropic/claude-opus-4-8", (15.0, 75.0, 1.5), (5.0, 25.0, 0.5)),
+        ("anthropic/claude-opus-4-7", (15.0, 75.0, 1.5), (5.0, 25.0, 0.5)),
+        ("anthropic/claude-opus-4-6", (15.0, 75.0, 1.5), (5.0, 25.0, 0.5)),
+        ("anthropic/claude-opus-4-5", (15.0, 75.0, 1.5), (5.0, 25.0, 0.5)),
+        ("anthropic/claude-haiku-4-5", (0.8, 4.0, 0.08), (1.0, 5.0, 0.1)),
     ]
 
     def _seed_models(self) -> None:
@@ -3804,9 +3820,24 @@ except Exception:
                  inp, out, cached, thinking, sort, now, now),
             )
             added += cur.rowcount
+        corrected = 0
+        for mid, (old_in, old_out, old_cached), (new_in, new_out, new_cached) \
+                in self._PRICE_CORRECTIONS:
+            cur = self._db.execute(
+                """UPDATE models
+                   SET input_price=?, output_price=?, cached_input_price=?,
+                       updated_at=?
+                   WHERE id=? AND input_price=? AND output_price=?
+                     AND cached_input_price=?""",
+                (new_in, new_out, new_cached, now,
+                 mid, old_in, old_out, old_cached),
+            )
+            corrected += cur.rowcount
         self._db.commit()
         if added:
             _log(f"agent_registry: seeded {added} model(s)")
+        if corrected:
+            _log(f"agent_registry: corrected stale prices on {corrected} model(s)")
 
     def list_models(self, *, provider: str = "", active_only: bool = True) -> list[dict]:
         """List available models, optionally filtered by provider."""

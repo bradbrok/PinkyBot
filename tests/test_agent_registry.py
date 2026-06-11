@@ -885,3 +885,56 @@ class TestModelSeeds:
             for m in registry.list_models(active_only=False)
         )
         assert len(registry.list_models(active_only=False)) == n
+
+    def test_anthropic_seed_prices_match_pricing_rate_table(self, registry):
+        """#741 invariant: the registry's display prices must agree with
+        pricing.py (the actual cost engine) for every Anthropic model both
+        tables know. Catches the next list-price change that lands in one
+        place but not the other."""
+        from pinky_daemon.pricing import RATE_TABLE
+
+        for m in registry.list_models(provider="anthropic", active_only=False):
+            rate = RATE_TABLE.get(m["model_id"])
+            if rate is None:
+                continue
+            assert m["input_price"] == rate["input"], m["model_id"]
+            assert m["output_price"] == rate["output"], m["model_id"]
+            assert m["cached_input_price"] == rate["cache_read"], m["model_id"]
+
+    def test_stale_prices_corrected_on_existing_rows(self, registry):
+        """#741: rows already seeded with the stale tier are rewritten on the
+        next seed pass (INSERT OR IGNORE alone never reaches existing DBs)."""
+        registry._db.execute(
+            "UPDATE models SET input_price=15.0, output_price=75.0,"
+            " cached_input_price=1.5 WHERE id='anthropic/claude-opus-4-8'"
+        )
+        registry._db.execute(
+            "UPDATE models SET input_price=0.8, output_price=4.0,"
+            " cached_input_price=0.08 WHERE id='anthropic/claude-haiku-4-5'"
+        )
+        registry._db.commit()
+        registry._seed_models()
+        models = {
+            m["id"]: m
+            for m in registry.list_models(provider="anthropic", active_only=False)
+        }
+        opus = models["anthropic/claude-opus-4-8"]
+        assert (opus["input_price"], opus["output_price"],
+                opus["cached_input_price"]) == (5.0, 25.0, 0.5)
+        haiku = models["anthropic/claude-haiku-4-5"]
+        assert (haiku["input_price"], haiku["output_price"],
+                haiku["cached_input_price"]) == (1.0, 5.0, 0.1)
+
+    def test_operator_customized_prices_survive_reseed(self, registry):
+        """The correction is gated on the exact stale triple — a price an
+        operator changed by hand must not be clobbered."""
+        registry._db.execute(
+            "UPDATE models SET input_price=12.34 WHERE id='anthropic/claude-opus-4-8'"
+        )
+        registry._db.commit()
+        registry._seed_models()
+        opus = next(
+            m for m in registry.list_models(provider="anthropic", active_only=False)
+            if m["id"] == "anthropic/claude-opus-4-8"
+        )
+        assert opus["input_price"] == 12.34
