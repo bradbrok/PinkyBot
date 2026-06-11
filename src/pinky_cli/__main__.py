@@ -33,9 +33,15 @@ def main() -> None:
     # run (daemon)
     run_parser = subparsers.add_parser("run", help="Run the Pinky daemon (headless Claude Code)")
     run_parser.add_argument(
+        "--mode",
+        default="api",
+        choices=["api", "poll"],
+        help="Run mode: api (HTTP server) or poll (message polling daemon)",
+    )
+    run_parser.add_argument(
         "--config",
         default="pinky.yaml",
-        help="Path to pinky.yaml config",
+        help="Path to pinky.yaml config (poll mode)",
     )
     run_parser.add_argument(
         "--working-dir",
@@ -57,7 +63,12 @@ def main() -> None:
     elif args.command == "run":
         from pinky_daemon.__main__ import main as daemon_main
         # Override sys.argv for the daemon's own arg parser
-        sys.argv = ["pinky-daemon", "--config", args.config, "--working-dir", args.working_dir]
+        sys.argv = [
+            "pinky-daemon",
+            "--mode", args.mode,
+            "--config", args.config,
+            "--working-dir", args.working_dir,
+        ]
         daemon_main()
     else:
         parser.print_help()
