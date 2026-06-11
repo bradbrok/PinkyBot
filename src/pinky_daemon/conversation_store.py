@@ -319,6 +319,33 @@ class ConversationStore:
             for r in rows
         ]
 
+    def last_message_time(self, session_prefix: str) -> float | None:
+        """Most recent message timestamp for sessions of one agent.
+
+        ``session_prefix`` is matched as ``{prefix}%`` so it covers the
+        agent's main session and any labeled siblings (``barsik-main``,
+        ``barsik-research``, …). Used by the autonomy engine's
+        continuation-staleness guard (#732): a saved-context snapshot
+        older than the agent's last conversation activity is history the
+        live thread already supersedes. Returns ``None`` when the agent
+        has no recorded messages.
+
+        LIKE wildcards in the prefix (``_``/``%`` are legal in agent
+        names) are escaped so ``foo_bar-`` can't match ``fooXbar-main``.
+        Known residual ambiguity (Murzik, PR #733): the ``agent-label``
+        session-id encoding can't distinguish prefix-FAMILY agent names —
+        ``foo-`` also matches ``foo-bar-main``. Worst case is a false
+        STALE verdict (a collapsed continuation, never a wrong replay),
+        and the fleet has no prefix-family names today; the real fix is
+        an ``agent_name`` column on conversation rows.
+        """
+        escaped = session_prefix.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+        row = self._conn.execute(
+            "SELECT MAX(timestamp) FROM messages WHERE session_id LIKE ? ESCAPE '\\'",
+            (f"{escaped}%",),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else None
+
     def count(self, session_id: str = "") -> int:
         """Count messages, optionally filtered by session."""
         if session_id:
