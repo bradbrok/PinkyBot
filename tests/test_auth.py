@@ -301,6 +301,27 @@ def test_session_cookie_rejects_tampering():
     assert verify_session_cookie("top-secret", tampered) is None
 
 
+def test_session_cookie_non_ascii_denied_not_raised():
+    # Starlette decodes cookies as latin-1, so bytes >= 0x80 reach the verifier
+    # as non-ASCII str. That must be a clean deny, never a TypeError/
+    # UnicodeEncodeError (which the middleware would surface as a 500).
+    assert verify_session_cookie("top-secret", "p\xe9yload.sig") is None
+    assert verify_session_cookie("top-secret", "payload.s\xffg") is None
+
+
+def test_internal_signature_non_ascii_denied_not_raised():
+    # hmac.compare_digest raises TypeError on non-ASCII str; a malformed
+    # attacker-controlled signature header must fail auth, not raise.
+    assert verify_internal_request(
+        "top-secret",
+        agent_name="barsik",
+        method="GET",
+        path="/tasks/next",
+        timestamp=str(int(time.time())),
+        signature="\xfe\xff-bogus",
+    ) is False
+
+
 def test_internal_signature_round_trip():
     now = int(time.time())
     headers = build_internal_auth_headers(

@@ -90,6 +90,12 @@ UNIX_USER_SHELL = "/usr/sbin/nologin"
 # so even another managed tenant on the same host can't read across.
 DIR_MODE = 0o700
 SECRET_MODE = 0o600
+# Atomic-create flags for secret-bearing files: O_EXCL fails closed on a
+# pre-existing file and O_NOFOLLOW never follows a planted symlink (same threat
+# model as key_store / db_security / fs_security).
+_SECRET_OPEN_FLAGS = (
+    os.O_CREAT | os.O_EXCL | os.O_WRONLY | getattr(os, "O_NOFOLLOW", 0)
+)
 
 # Container naming + in-container layout for the ``container`` isolation mode.
 # One container, one home volume, and one signing-key secret per agent, all
@@ -101,6 +107,8 @@ CONTAINER_BINARY = "podman"
 # operator sets this on the daemon host — "" = OFF, "docker" = docker, any other
 # truthy value ("podman"/"1"/...) = podman. Default OFF, so registering/labeling
 # a container agent is allowed but it cannot RUN until the host is set up.
+# NOTE: "docker" selects the docker CLI for exec paths, but get_provisioner
+# rejects it for now (provisioning relies on podman-only secret delivery).
 CONTAINER_RUNTIME_ENV = "PINKY_CONTAINER_RUNTIME"
 # In-container HOME. Everything the tenant persists — including any CLI's OAuth
 # state under ~/.config — lives here and is backed by the per-agent home VOLUME,
@@ -306,8 +314,9 @@ class SystemProvisionOps:
 
     def write_secret_file(self, path: str, content: str) -> None:
         # Open with O_CREAT|O_EXCL|O_WRONLY at 0600 so the secret is never world-
-        # readable even for the instant between create and chmod.
-        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, SECRET_MODE)
+        # readable even for the instant between create and chmod, a pre-existing
+        # file fails closed, and (O_NOFOLLOW) a planted symlink is never followed.
+        fd = os.open(path, _SECRET_OPEN_FLAGS, SECRET_MODE)
         try:
             os.write(fd, content.encode("utf-8"))
         finally:
@@ -316,8 +325,9 @@ class SystemProvisionOps:
 
     def write_keystore(self, path: str, agent_name: str, signing_key: str) -> None:
         # Create the file 0600 BEFORE sqlite opens it, so the DB (which holds a
-        # signing secret) is never briefly group/world-readable.
-        fd = os.open(path, os.O_CREAT | os.O_TRUNC | os.O_WRONLY, SECRET_MODE)
+        # signing secret) is never briefly group/world-readable. O_EXCL+O_NOFOLLOW:
+        # fail closed on a pre-existing file or planted symlink.
+        fd = os.open(path, _SECRET_OPEN_FLAGS, SECRET_MODE)
         os.close(fd)
         conn = sqlite3.connect(path)
         try:
@@ -1094,9 +1104,21 @@ def get_provisioner(
         )
     if isolation_mode == CONTAINER:
         if container_runtime_enabled():
+            binary = container_runtime_binary()
+            if binary == "docker":
+                # Provisioning is podman-only today: signing-key delivery uses
+                # `secret create` + `create --secret ...,type=mount`, which
+                # docker only supports for swarm services. Fail closed with an
+                # actionable message instead of an opaque mid-provision error.
+                raise NotImplementedError(
+                    f"{CONTAINER_RUNTIME_ENV}='docker' is not supported yet: container "
+                    "provisioning relies on podman-only secret delivery (podman secret "
+                    "create / --secret). Set the env to 'podman' (rootless) to activate "
+                    "container isolation."
+                )
             return ContainerProvisioner(
                 signing_key_provider=signing_key_provider,
-                binary=container_runtime_binary(),
+                binary=binary,
             )
         raise NotImplementedError(
             "isolation_mode='container' is implemented (ContainerProvisioner) but "

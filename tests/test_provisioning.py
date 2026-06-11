@@ -418,6 +418,31 @@ class TestSystemProvisionOps:
         assert target.read_text() == "hunter2"
         assert (target.stat().st_mode & 0o777) == SECRET_MODE
 
+    def test_write_secret_file_fails_closed_on_existing_file(self, tmp_path):
+        # O_EXCL: never write a secret into a pre-existing (possibly
+        # loose-permissioned) file.
+        target = tmp_path / "secret.txt"
+        target.write_text("old")
+        with pytest.raises(FileExistsError):
+            SystemProvisionOps().write_secret_file(str(target), "hunter2")
+        assert target.read_text() == "old"
+
+    def test_write_secret_file_never_follows_symlink(self, tmp_path):
+        victim = tmp_path / "victim"
+        victim.write_text("keep")
+        link = tmp_path / "link"
+        link.symlink_to(victim)
+        with pytest.raises(OSError):
+            SystemProvisionOps().write_secret_file(str(link), "hunter2")
+        assert victim.read_text() == "keep"
+
+    def test_write_keystore_fails_closed_on_existing_file(self, tmp_path):
+        target = tmp_path / "agent_keys.db"
+        target.write_text("not a db")
+        with pytest.raises(FileExistsError):
+            SystemProvisionOps().write_keystore(str(target), "tenant", "sekret")
+        assert target.read_text() == "not a db"
+
     def test_write_keystore_single_row_0600(self, tmp_path):
         import sqlite3
 
@@ -803,9 +828,16 @@ class TestContainerRuntimeGate:
         assert p.mode == "container"
         assert p._binary == "podman"
 
-    def test_docker_binary_selected(self, monkeypatch):
+    def test_docker_runtime_rejected_with_actionable_error(self, monkeypatch):
+        # Provisioning emits podman-only secret commands (`secret create`,
+        # `create --secret`), which docker cannot run outside swarm. Selecting
+        # docker must fail closed at the factory with a clear message, not
+        # produce a tenant that can never provision.
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "docker")
-        assert get_provisioner("container")._binary == "docker"
+        with pytest.raises(NotImplementedError) as exc:
+            get_provisioner("container")
+        assert "podman" in str(exc.value)
+        assert "docker" in str(exc.value)
 
     def test_truthy_value_defaults_to_podman(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "1")

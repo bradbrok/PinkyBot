@@ -425,12 +425,10 @@ class SkillStore:
                 "agent_enabled": None,  # No agent-level override
             }
 
-        # 2. Direct assignments (override shared if both exist)
-        where = "WHERE a.agent_name=?"
-        params: list = [agent_name]
-        if enabled_only:
-            where += " AND a.enabled=1"
-
+        # 2. Direct assignments (override shared if both exist). Disabled rows
+        # must be fetched even when enabled_only: a disabled assignment is the
+        # opt-out that overrides a shared skill, and the effective_enabled
+        # filter below drops it afterwards.
         # Prefix skill columns with s. to avoid ambiguity in JOIN
         s_cols = ", ".join(f"s.{c.strip()}" for c in _SKILL_COLS.split(","))
         rows = self._db.execute(
@@ -438,9 +436,9 @@ class SkillStore:
                        {s_cols}
                 FROM agent_skills a
                 JOIN skills s ON a.skill_name = s.name
-                {where}
+                WHERE a.agent_name=?
                 ORDER BY s.category, s.name""",
-            params,
+            (agent_name,),
         ).fetchall()
 
         for r in rows:
@@ -527,6 +525,9 @@ class SkillStore:
             # MCP server config — substitute {agent_name} placeholder
             mcp_cfg = skill_data.get("mcp_server_config", {})
             if mcp_cfg:
+                overrides = skill_data.get("config_overrides") or {}
+                if overrides:
+                    mcp_cfg = _deep_merge(mcp_cfg, overrides)
                 resolved = _substitute_placeholders(mcp_cfg, agent_name)
                 # Use skill name as the MCP server key
                 server_name = skill_data["name"]
@@ -639,6 +640,17 @@ class SkillStore:
 
     def close(self) -> None:
         self._db.close()
+
+
+def _deep_merge(base: dict, overrides: dict) -> dict:
+    """Merge overrides into a copy of base: nested dicts merge, other values replace."""
+    result = dict(base)
+    for k, v in overrides.items():
+        if isinstance(v, dict) and isinstance(result.get(k), dict):
+            result[k] = _deep_merge(result[k], v)
+        else:
+            result[k] = v
+    return result
 
 
 def _substitute_placeholders(config: dict, agent_name: str) -> dict:

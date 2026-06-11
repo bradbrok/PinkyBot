@@ -156,6 +156,78 @@ class TestSessionSkills:
         assert store.clear_session_override("sess-1", "memory") is False
 
 
+class TestAgentSkills:
+    def test_shared_skill_optout_overrides_when_enabled_only(self, store):
+        # The POST /agents/{name}/skills/{skill}/disable opt-out flow: a shared
+        # skill is opted out via a disabled assignment row, which must override
+        # the shared auto-apply even in the enabled_only mode used by
+        # materialize_for_agent.
+        store.register(
+            "shared-skill",
+            shared=True,
+            enabled=True,
+            mcp_server_config={"command": "run-shared"},
+            directive="shared directive",
+            tool_patterns=["mcp__shared-skill__*"],
+        )
+        assert any(
+            s["name"] == "shared-skill"
+            for s in store.get_agent_skills("bob", enabled_only=True)
+        )
+
+        store.assign_to_agent("bob", "shared-skill", assigned_by="user")
+        store.set_agent_skill_enabled("bob", "shared-skill", False)
+
+        assert all(
+            s["name"] != "shared-skill"
+            for s in store.get_agent_skills("bob", enabled_only=True)
+        )
+        mat = store.materialize_for_agent("bob")
+        assert "shared-skill" not in mat["mcp_servers"]
+        assert "shared directive" not in mat["directives"]
+        assert "mcp__shared-skill__*" not in mat["tool_patterns"]
+
+        # Other agents keep the shared skill.
+        assert any(
+            s["name"] == "shared-skill"
+            for s in store.get_agent_skills("alice", enabled_only=True)
+        )
+
+    def test_optout_row_visible_when_not_enabled_only(self, store):
+        store.register("shared-skill", shared=True, enabled=True)
+        store.assign_to_agent("bob", "shared-skill")
+        store.set_agent_skill_enabled("bob", "shared-skill", False)
+        by_name = {s["name"]: s for s in store.get_agent_skills("bob", enabled_only=False)}
+        assert by_name["shared-skill"]["effective_enabled"] is False
+        assert by_name["shared-skill"]["agent_enabled"] is False
+
+    def test_disabled_direct_assignment_excluded_when_enabled_only(self, store):
+        store.register("plain")
+        store.assign_to_agent("bob", "plain")
+        store.set_agent_skill_enabled("bob", "plain", False)
+        assert store.get_agent_skills("bob", enabled_only=True) == []
+
+    def test_config_overrides_merge_into_mcp_config(self, store):
+        store.register(
+            "svc",
+            mcp_server_config={"command": "run", "env": {"A": "1", "B": "2"}},
+        )
+        store.assign_to_agent(
+            "bob", "svc",
+            config_overrides={"env": {"B": "9", "C": "{agent_name}"}, "cwd": "/tmp"},
+        )
+        cfg = store.materialize_for_agent("bob")["mcp_servers"]["svc"]
+        assert cfg["command"] == "run"
+        assert cfg["env"] == {"A": "1", "B": "9", "C": "bob"}
+        assert cfg["cwd"] == "/tmp"
+
+    def test_no_overrides_leaves_mcp_config_untouched(self, store):
+        store.register("svc", mcp_server_config={"command": "run-{agent_name}"})
+        store.assign_to_agent("bob", "svc")
+        cfg = store.materialize_for_agent("bob")["mcp_servers"]["svc"]
+        assert cfg == {"command": "run-bob"}
+
+
 class TestSkillAPI:
     def _make_client(self):
         from fastapi.testclient import TestClient
