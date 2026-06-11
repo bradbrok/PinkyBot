@@ -62,9 +62,19 @@ export function contextClass(pct) {
 }
 
 export function escapeHtml(text) {
-    const div = document.createElement('div');
-    div.textContent = text;
-    return div.innerHTML;
+    return String(text ?? '')
+        .replace(/&/g, '&amp;')
+        .replace(/</g, '&lt;')
+        .replace(/>/g, '&gt;')
+        .replace(/"/g, '&quot;')
+        .replace(/'/g, '&#39;');
+}
+
+// Allow http(s)/mailto and scheme-less relative URLs; blocks javascript:,
+// data:, vbscript: etc. from becoming clickable hrefs.
+function isSafeLinkUrl(url) {
+    if (/^(?:https?|mailto):/i.test(url)) return true;
+    return !url.split(/[/?#]/, 1)[0].includes(':');
 }
 
 export function renderMarkdown(text) {
@@ -88,7 +98,8 @@ export function renderMarkdown(text) {
 
     const applyInline = (value) => {
         let html = escapeHtml(value);
-        html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, '<a href="$2" target="_blank" rel="noreferrer">$1</a>');
+        html = html.replace(/\[([^\]]+)\]\(([^)\s]+)\)/g, (match, label, url) =>
+            isSafeLinkUrl(url) ? `<a href="${url}" target="_blank" rel="noreferrer">${label}</a>` : match);
         // [[Wiki Link]] → clickable wiki cross-link
         html = html.replace(/\[\[([^\]]+)\]\]/g, (_, title) => {
             const slug = title.toLowerCase().replace(/\s+/g, '-');

@@ -313,7 +313,8 @@
     "session": "会话",
     "show_agents": "显示智能体",
     "upload_file": "上传文件",
-    "search_placeholder": "搜索聊天..."
+    "search_placeholder": "搜索聊天...",
+    "offline_banner": "无法连接守护进程 - 显示缓存数据"
   },
   "fleet": {
     "search_placeholder": "搜索智能体...",

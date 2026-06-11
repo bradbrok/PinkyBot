@@ -313,7 +313,8 @@
     "session": "Session",
     "show_agents": "Show Agents",
     "upload_file": "Upload file",
-    "search_placeholder": "Search chats..."
+    "search_placeholder": "Search chats...",
+    "offline_banner": "daemon unreachable - showing cached data"
   },
   "fleet": {
     "search_placeholder": "Search agents...",

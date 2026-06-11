@@ -313,7 +313,8 @@
     "session": "세션",
     "show_agents": "에이전트 표시",
     "upload_file": "파일 업로드",
-    "search_placeholder": "채팅 검색..."
+    "search_placeholder": "채팅 검색...",
+    "offline_banner": "데몬에 연결할 수 없음 - 캐시된 데이터 표시 중"
   },
   "fleet": {
     "search_placeholder": "에이전트 검색...",

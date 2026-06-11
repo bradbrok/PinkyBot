@@ -119,6 +119,7 @@
     let replyTo = null;
 
     const PAGE_SIZE = 100;
+    const HISTORY_LIMIT_MAX = 1000;
     let hasMore = false;
     let totalMessages = 0;
     let loadedPersistedCount = 0;
@@ -202,7 +203,7 @@
         persistedMessages = cached.persistedMessages || [];
         localMessages = cached.localMessages || [];
         totalMessages = cached.totalMessages || persistedMessages.length;
-        loadedPersistedCount = cached.loadedPersistedCount || persistedMessages.length;
+        loadedPersistedCount = cached.loadedPersistedCount || 0;
         hasMore = !!cached.hasMore;
         currentHistorySource = cached.currentHistorySource || { kind: null, sessionId: null };
         infoMessages = cached.infoMessages ?? totalMessages;
@@ -286,6 +287,30 @@
 
     // ── Session & Chat Data ────────────────────────────────
 
+    // Session ids are `${agentName}-${label}` and agent names may themselves
+    // contain hyphens, so resolve via longest-prefix match against the known
+    // agents instead of split('-').
+    function agentFromSessionId(sessionId) {
+        if (!sessionId) return null;
+        let best = null;
+        for (const a of agentsList) {
+            if (sessionId === a.name || sessionId.startsWith(`${a.name}-`)) {
+                if (!best || a.name.length > best.length) best = a.name;
+            }
+        }
+        return best || sessionId.split('-')[0];
+    }
+
+    function labelFromSessionId(sessionId, agentName = null) {
+        if (!sessionId) return 'main';
+        const name = agentName || agentFromSessionId(sessionId);
+        if (name) {
+            if (sessionId === name) return 'main';
+            if (sessionId.startsWith(`${name}-`)) return sessionId.slice(name.length + 1) || 'main';
+        }
+        return sessionId.split('-').slice(1).join('-') || 'main';
+    }
+
     async function refreshSessions() {
         try {
             const [agentsData, sessData, convsData] = await Promise.all([
@@ -317,7 +342,7 @@
                     model: 'streaming',
                     message_count: c.message_count,
                     last_active: c.last_message_at,
-                    agent_name: c.session_id.split('-')[0],
+                    agent_name: agentFromSessionId(c.session_id),
                     session_type: 'streaming',
                     _from_store: true,
                 }));
@@ -361,8 +386,9 @@
 
             sessionsList = [...merged, ...streamingSessions];
             connected = true;
-        } catch {
+        } catch (e) {
             connected = false;
+            console.error('Failed to refresh sessions:', e);
         }
     }
 
@@ -381,7 +407,7 @@
 
         const requestSeq = ++chatRefreshSeq;
         const sessionId = activeSession;
-        const agentName = activeAgent || sessionId.split('-')[0];
+        const agentName = activeAgent || agentFromSessionId(sessionId);
         const sessionRecord = sessionsList.find((s) => s.id === sessionId) || null;
         const { preferred, fallback } = getConversationTargets(sessionId, agentName);
 
@@ -391,9 +417,21 @@
         let nextSource = { kind: null, sessionId: null };
         let loadedFromConversation = false;
 
+        // Keep the window the user paged in via loadOlderMessages instead of
+        // shrinking back to the newest page on every poll. loadedPersistedCount
+        // only counts store-loaded messages (session events are merged in
+        // afterwards), and the window is capped so polling stays bounded.
+        const historyLimit = (target) => (
+            currentHistorySource.kind === 'conversation'
+            && currentHistorySource.sessionId === target
+            && loadedPersistedCount > PAGE_SIZE
+                ? Math.min(loadedPersistedCount, HISTORY_LIMIT_MAX)
+                : PAGE_SIZE
+        );
+
         // Try preferred conversation history
         try {
-            const history = await api('GET', `/conversations/${preferred}/history?limit=${PAGE_SIZE}`);
+            const history = await api('GET', `/conversations/${preferred}/history?limit=${historyLimit(preferred)}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             if ((history.total || 0) > 0 || preferred === fallback || sessionRecord?._from_store) {
                 nextPersisted = sortMessages(history.messages || []);
@@ -407,7 +445,7 @@
         // Try fallback
         if (!loadedFromConversation && fallback) {
             try {
-                const history = await api('GET', `/conversations/${fallback}/history?limit=${PAGE_SIZE}`);
+                const history = await api('GET', `/conversations/${fallback}/history?limit=${historyLimit(fallback)}`);
                 if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
                 if ((history.total || 0) > 0) {
                     nextPersisted = sortMessages(history.messages || []);
@@ -434,6 +472,10 @@
                 nextSource = { kind: null, sessionId: null };
             }
         }
+
+        // Store-loaded count, captured before session events inflate the list;
+        // drives historyLimit and loadOlderMessages' offset.
+        const nextStoreCount = nextPersisted.length;
 
         // Merge session events (agent-level covers all sessions + lifecycle events)
         try {
@@ -472,8 +514,7 @@
         // interleaves these chronologically with messages by timestamp.
         try {
             const refreshLabel = activeSessionRecord?._streaming_label
-                || sessionId?.split('-').slice(1).join('-')
-                || 'main';
+                || labelFromSessionId(sessionId, agentName);
             const tcData = await api(
                 'GET',
                 `/agents/${agentName}/sessions/${encodeURIComponent(refreshLabel)}/tool-calls?limit=500`,
@@ -494,13 +535,15 @@
                 };
             }).filter((tc) => tc._startedAtEpoch != null)
               .sort((a, b) => a._startedAtEpoch - b._startedAtEpoch);
-        } catch { persistedToolCalls = []; }
+        } catch {
+            if (requestSeq === chatRefreshSeq && sessionId === activeSession) persistedToolCalls = [];
+        }
 
         if (preserveScroll) captureScroll('refresh');
 
         persistedMessages = nextPersisted;
         totalMessages = nextTotal;
-        loadedPersistedCount = nextPersisted.length;
+        loadedPersistedCount = nextStoreCount;
         hasMore = nextHasMore;
         infoMessages = nextTotal;
         infoSession = sessionId;
@@ -536,7 +579,7 @@
 
         // Fetch session-level effort (overrides agent default if set)
         try {
-            const refreshLabel = activeSessionRecord?._streaming_label || sessionId?.split('-').slice(1).join('-') || 'main';
+            const refreshLabel = activeSessionRecord?._streaming_label || labelFromSessionId(sessionId, agentName);
             const effortData = await api('GET', `/agents/${agentName}/effort?label=${encodeURIComponent(refreshLabel)}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             if (effortData.effective) selectedEffort = effortData.effective;
@@ -544,7 +587,7 @@
 
         let gotStreamingContext = false;
         try {
-            const refreshLabel = activeSessionRecord?._streaming_label || sessionId?.split('-').slice(1).join('-') || 'main';
+            const refreshLabel = activeSessionRecord?._streaming_label || labelFromSessionId(sessionId, agentName);
             const streamStatus = await api('GET', `/agents/${agentName}/streaming/status?label=${encodeURIComponent(refreshLabel)}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             if (streamStatus.connected) {
@@ -633,7 +676,7 @@
     function startStreamEvents() {
         stopStreamEvents();
         if (!activeAgent || !activeSession || !canUseStreamingChat) return;
-        const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+        const label = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
         streamEventSource = sse(`/agents/${activeAgent}/streaming/events?label=${encodeURIComponent(label)}`);
         streamEventSource.onmessage = async (evt) => {
             let data = null;
@@ -724,7 +767,7 @@
     async function fetchSessionMeta() {
         if (!activeAgent || !activeSession) { sessionMeta = null; return; }
         try {
-            const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+            const label = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
             sessionMeta = await api('GET', `/agents/${activeAgent}/session-meta?label=${encodeURIComponent(label)}`);
         } catch { sessionMeta = null; }
     }
@@ -749,10 +792,10 @@
     function startActivityPolling() {
         stopActivityPolling();
         const pollSessionId = activeSession;
-        const pollAgentName = activeAgent || (activeSession ? activeSession.split('-')[0] : null);
+        const pollAgentName = activeAgent || agentFromSessionId(activeSession);
         if (!pollAgentName) return;
         const pollRecord = sessionsList.find((s) => s.id === pollSessionId);
-        const pollLabel = pollRecord?._streaming_label || pollSessionId?.split('-').slice(1).join('-') || 'main';
+        const pollLabel = pollRecord?._streaming_label || labelFromSessionId(pollSessionId, pollAgentName);
 
         activityPollInterval = setInterval(async () => {
             if (pollSessionId !== activeSession) return;
@@ -822,6 +865,7 @@
         thinkingContent = '';
         activityLog = [];
         liveToolCalls = [];
+        persistedToolCalls = [];
         agentWorking = false;
         wasWorking = false;
         if (window.innerWidth <= 768) sidebarCollapsed = true;
@@ -888,7 +932,7 @@
 
         try {
             if (canUseStreamingChat) {
-                const sessionLabel = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+                const sessionLabel = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
                 const sessionParam = sessionLabel !== 'main' ? `?session=${encodeURIComponent(sessionLabel)}` : '';
                 await api('POST', `/agents/${activeAgent}/chat${sessionParam}`, { content: text });
                 sending = false;
@@ -1076,7 +1120,7 @@
         if (!activeAgent) return;
         savingEffort = true;
         try {
-            const label = activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main';
+            const label = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
             await api('POST', `/agents/${activeAgent}/sessions/${encodeURIComponent(label)}/effort`, { effort: selectedEffort });
         } catch (e) { toast(`Failed to update effort: ${e.message}`, 'error'); }
         savingEffort = false;
@@ -1153,8 +1197,11 @@
         }
         try {
             await api('PATCH', `/agents/${agentName}/streaming-sessions/${encodeURIComponent(label)}`, { label: newLabel });
-            if (activeSession === `${agentName}-${label}`) activeSession = `${agentName}-${newLabel}`;
+            const wasActive = activeSession === `${agentName}-${label}`;
             await refreshSessions();
+            // Re-select so polling and stream events rebind to the new id;
+            // the old interval/SSE callbacks captured the previous session id.
+            if (wasActive) await selectSession(`${agentName}-${newLabel}`, agentName);
         } catch (e) {
             addLocalMessage({ role: 'system', content: `Rename failed: ${e.message}` });
         }
@@ -1303,6 +1350,9 @@
     </div>
 
     <div class="chat-area">
+        {#if !connected}
+            <div class="offline-banner">{$_('chat.offline_banner')}</div>
+        {/if}
         {#if !activeSession}
             <div class="empty-state">{$_('chat.select_agent')}</div>
         {:else}
@@ -1686,7 +1736,7 @@
         {:else}
             <div class="search-modal-count">{chatSearchResults.length} result{chatSearchResults.length !== 1 ? 's' : ''}</div>
             {#each chatSearchResults as r}
-                {@const agentName = (r.session_id || '').split('-')[0]}
+                {@const agentName = agentFromSessionId(r.session_id)}
                 {@const ts = r.timestamp ? new Date(r.timestamp * 1000) : null}
                 <div class="search-modal-item" role="button" tabindex="0" on:click={() => { selectSession(r.session_id, agentName || null); chatSearchOpen = false; }} on:keydown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); selectSession(r.session_id, agentName || null); chatSearchOpen = false; } }}>
                     <div class="search-modal-item-header">
@@ -1706,7 +1756,7 @@
 <TmuxPaneModal
     bind:show={showTmuxPane}
     agent={activeAgent || ''}
-    label={activeSessionRecord?._streaming_label || activeSession?.split('-').slice(1).join('-') || 'main'}
+    label={activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent)}
 />
 
 <style>
@@ -1718,6 +1768,7 @@
 
     /* Chat area */
     .chat-area { flex: 1; display: flex; flex-direction: column; background: var(--app-bg); }
+    .offline-banner { padding: 0.35rem 1.5rem; background: var(--red, #b91c1c); color: #fff; font-family: var(--font-grotesk); font-size: 0.65rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; text-align: center; }
     .empty-state { flex: 1; display: flex; align-items: center; justify-content: center; font-family: var(--font-grotesk); color: var(--text-muted); font-size: 0.9rem; }
 
     /* Header bar */

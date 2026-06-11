@@ -313,7 +313,8 @@
     "session": "セッション",
     "show_agents": "エージェントを表示",
     "upload_file": "ファイルをアップロード",
-    "search_placeholder": "チャットを検索..."
+    "search_placeholder": "チャットを検索...",
+    "offline_banner": "デーモンに接続できません - キャッシュデータを表示中"
   },
   "fleet": {
     "search_placeholder": "エージェントを検索...",
