@@ -33,6 +33,10 @@ _base_url: str = ""
 # Active WebSocket connections keyed by session ID (for mid-call control)
 _active_ws: dict[str, WebSocket] = {}
 
+# Strong references to in-flight finalize tasks; the event loop only keeps
+# weak refs, so a bare create_task() can be garbage-collected mid-run.
+_finalize_tasks: set[asyncio.Task] = set()
+
 # Agents trusted for auto-approve (skip manual approval, dial immediately)
 AUTO_APPROVE_AGENTS = {"barsik"}
 
@@ -619,6 +623,13 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
         await ws.close(code=4003, reason="Session not active")
         return
 
+    # One live WS per session; a duplicate would clobber the registration
+    # the control endpoints (terminate/transfer/dtmf) rely on.
+    if call_session_id in _active_ws:
+        _log(f"voice: WS rejected - session {call_session_id} already connected")
+        await ws.close(code=4003, reason="Session already connected")
+        return
+
     _active_ws[call_session_id] = ws
     _log(f"voice: WS connected for session {call_session_id}")
 
@@ -665,6 +676,9 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
     messages: list[dict] = []
     call_active = True
     setup_received = False
+    # False when this handler rejected the connection during setup validation:
+    # the call may still be live elsewhere, so don't stamp it completed.
+    mark_completed = True
     # Track mutable call state locally (session object is stale after DB updates)
     live_call_sid = session.call_sid
     live_answered_at: float | None = session.answered_at
@@ -694,6 +708,7 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
                              f"expected {session.call_sid}, got {call_sid}")
                         await ws.close(code=4003, reason="callSid mismatch")
                         call_active = False
+                        mark_completed = False
                         continue
 
                 # Validate: accountSid should match our Twilio account
@@ -703,6 +718,7 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
                         _log("voice: accountSid mismatch — rejecting")
                         await ws.close(code=4003, reason="Invalid account")
                         call_active = False
+                        mark_completed = False
                         continue
 
                 if call_sid and call_sid != session.call_sid:
@@ -858,19 +874,22 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
     except Exception as e:
         _log(f"voice: WS error — {e}")
     finally:
-        _active_ws.pop(call_session_id, None)
+        # Only unregister our own WS, never another handler's.
+        if _active_ws.get(call_session_id) is ws:
+            _active_ws.pop(call_session_id, None)
 
-        # Update session as ended
-        _voice_store.update_session(
-            session.id, status="completed", ended_at=time.time()
-        )
+        if mark_completed:
+            # Update session as ended
+            _voice_store.update_session(
+                session.id, status="completed", ended_at=time.time()
+            )
 
         # Finalize call in background (Opus review + artifact + notify).
         # get_session() can return None under session-expiry races (session
         # was cleaned up between the update above and this lookup, or it was
         # never committed). Check explicitly — handing None to finalize_call()
         # would raise AttributeError on session.call_sid. (#286)
-        if messages:
+        if messages and mark_completed:
             finalize_session = _voice_store.get_session(call_session_id)
             if finalize_session is None:
                 _log(
@@ -879,13 +898,15 @@ async def conversationrelay_ws(ws: WebSocket, call_session_id: str):
                     f"skipping Opus review + artifact"
                 )
             else:
-                asyncio.create_task(
+                task = asyncio.create_task(
                     finalize_call(
                         finalize_session,
                         _voice_store, _agents, _broker_send,
                         api_key=_api_key,
                     )
                 )
+                _finalize_tasks.add(task)
+                task.add_done_callback(_finalize_tasks.discard)
 
         _log(f"voice: WS closed for session {call_session_id}")
 
@@ -908,6 +929,7 @@ async def terminate_session(
         raise HTTPException(status_code=404, detail="Session not found")
 
     # Send end message over WS if connected
+    ws_ended = False
     ws = _active_ws.get(session.id)
     if ws:
         try:
@@ -915,10 +937,13 @@ async def terminate_session(
                 "type": "end",
                 "handoffData": json.dumps({"reason": body.reason}),
             }))
+            ws_ended = True
         except Exception:
             pass
 
     # Also hang up via Twilio REST
+    rest_ended = False
+    rest_error = ""
     try:
         from pinky_daemon.voice_engine import get_twilio_client
         client = get_twilio_client(_agents)
@@ -927,8 +952,16 @@ async def terminate_session(
             None,
             lambda: client.calls(call_sid).update(status="completed"),
         )
+        rest_ended = True
     except Exception as e:
-        _log(f"voice: terminate failed — {e}")
+        rest_error = str(e)
+        _log(f"voice: terminate failed - {e}")
+
+    if not ws_ended and not rest_ended:
+        raise HTTPException(
+            status_code=502,
+            detail=f"Failed to terminate call: {rest_error or 'no active connection'}",
+        )
 
     _voice_store.update_session(
         session.id, status="completed", ended_at=time.time()

@@ -19,9 +19,25 @@ from typing import Any, AsyncIterator, Callable
 _HAIKU_MODEL = "claude-haiku-4-5-20251001"
 _OPUS_MODEL = "claude-opus-4-8"
 
+# Reuse one AsyncAnthropic client (and its connection pool) per API key so
+# each conversation turn doesn't pay a fresh TLS handshake.
+_anthropic_clients: dict[str, Any] = {}
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+def _get_anthropic_client(api_key: str = "") -> Any:
+    """Get a cached AsyncAnthropic client for the given (or env) API key."""
+    import anthropic
+
+    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
+    client = _anthropic_clients.get(key)
+    if client is None:
+        client = anthropic.AsyncAnthropic(api_key=key)
+        _anthropic_clients[key] = client
+    return client
 
 
 # ── Twilio helpers ───────────────────────────────────────────────────────────
@@ -132,10 +148,7 @@ async def haiku_respond(
     Yields text chunks as they arrive. Caller is responsible for
     sending them as CR text messages.
     """
-    import anthropic
-
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-    client = anthropic.AsyncAnthropic(api_key=key)
+    client = _get_anthropic_client(api_key)
 
     async with client.messages.stream(
         model=_HAIKU_MODEL,
@@ -259,7 +272,7 @@ def build_outbound_twiml(ws_url: str, welcome_greeting: str = "") -> str:
     greeting_attr = ""
     if welcome_greeting:
         greeting_attr = (
-            f' welcomeGreeting="{saxutils.escape(welcome_greeting)}"'
+            f" welcomeGreeting={saxutils.quoteattr(welcome_greeting)}"
             ' welcomeGreetingInterruptible="speech"'
         )
 
@@ -306,10 +319,7 @@ async def extract_outcome_with_opus(
     api_key: str = "",
 ) -> dict:
     """Use Opus to review a call transcript and extract structured outcome."""
-    import anthropic
-
-    key = api_key or os.environ.get("ANTHROPIC_API_KEY", "")
-    client = anthropic.AsyncAnthropic(api_key=key)
+    client = _get_anthropic_client(api_key)
 
     transcript_text = "\n".join(
         f"[{t.get('role', 'unknown')}] {t.get('text', '')}"
@@ -397,16 +407,20 @@ async def finalize_call(
         session, transcript, goal, api_key=api_key
     )
 
-    # Save artifact
-    voice_store.save_artifact(
-        call_sid=session.call_sid,
-        call_session_id=session.id,
-        transcript_url="",  # local only for now
-        summary=outcome.get("summary", ""),
-        extracted_outcome=outcome,
-        caller_name="",
-        caller_purpose="",
-    )
+    # Save artifact (duplicate finalize hits the UNIQUE call_sid constraint;
+    # log and still deliver the owner notification)
+    try:
+        voice_store.save_artifact(
+            call_sid=session.call_sid,
+            call_session_id=session.id,
+            transcript_url="",  # local only for now
+            summary=outcome.get("summary", ""),
+            extracted_outcome=outcome,
+            caller_name="",
+            caller_purpose="",
+        )
+    except Exception as e:
+        _log(f"voice: artifact save failed for {session.call_sid} - {e}")
 
     # Notify owner
     if broker_send and agents:

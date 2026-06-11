@@ -11,15 +11,12 @@ and inbound AI voicemail. Four tables:
 
 from __future__ import annotations
 
-import hashlib
-import hmac
 import json
 import re
 import sqlite3
 import sys
 import time
 import uuid
-from base64 import urlsafe_b64decode, urlsafe_b64encode
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -55,37 +52,9 @@ def _normalize_e164(phone: str) -> str:
     return result
 
 
-# ── HMAC approval tokens ─────────────────────────────────────────────────────
+# -- Approval window ----------------------------------------------------------
 
 _APPROVAL_TOKEN_TTL = 3600  # 1 hour
-
-
-def make_approval_token(request_id: str, secret: str) -> str:
-    """Generate HMAC-signed token encoding request_id + expiry."""
-    expiry = str(int(time.time() + _APPROVAL_TOKEN_TTL))
-    payload = f"{request_id}:{expiry}"
-    sig = hmac.new(secret.encode(), payload.encode(), hashlib.sha256).hexdigest()[:16]
-    raw = f"{payload}:{sig}"
-    return urlsafe_b64encode(raw.encode()).decode().rstrip("=")
-
-
-def verify_approval_token(token: str, secret: str) -> str | None:
-    """Verify token and return request_id if valid and not expired, else None."""
-    try:
-        padded = token + "=" * (4 - len(token) % 4)
-        raw = urlsafe_b64decode(padded.encode()).decode()
-        request_id, expiry_str, sig = raw.rsplit(":", 2)
-        payload = f"{request_id}:{expiry_str}"
-        expected = hmac.new(
-            secret.encode(), payload.encode(), hashlib.sha256
-        ).hexdigest()[:16]
-        if not hmac.compare_digest(sig, expected):
-            return None
-        if time.time() > float(expiry_str):
-            return None
-        return request_id
-    except Exception:
-        return None
 
 
 # ── Dataclasses ───────────────────────────────────────────────────────────────
