@@ -91,6 +91,7 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    TmuxPaneKeysRequest,
     TransportStopFailureRequest,
     TransportToolResultRequest,
     TransportToolUseRequest,
@@ -8023,6 +8024,55 @@ npm run build</pre>
         return StreamingResponse(
             event_generator(), media_type="text/event-stream",
         )
+
+    @app.post("/agents/{agent_name}/tmux/pane/keys")
+    async def send_tmux_pane_keys(agent_name: str, req: TmuxPaneKeysRequest):
+        """Type into the agent's live tmux pane from the terminal modal.
+
+        The interactive counterpart of ``stream_tmux_pane``: lets the
+        operator resolve first-run dialogs, menus, and wedged prompts
+        straight from the web UI instead of SSH + ``tmux attach`` (born
+        from lera's container rollout, #735 — three dialogs, three round
+        trips to a shell).
+
+        Exactly one of ``text`` / ``key`` per request; ``key`` must be in
+        ``TmuxSession.PANE_KEY_WHITELIST``. Bounded to 1024 chars — the
+        modal sends keystrokes, not documents. Every send is logged with
+        the agent name for auditability (input content included: this is
+        an operator-facing admin surface, and "what did I type into the
+        wedged dialog" is exactly what the log needs to answer).
+
+        404 unknown agent · 409 not a tmux session · 400 bad input.
+        """
+        from pinky_daemon.tmux_session import TmuxSession
+
+        agent = agents.get(agent_name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if bool(req.text) == bool(req.key):
+            raise HTTPException(400, "provide exactly one of 'text' or 'key'")
+        if len(req.text) > 1024:
+            raise HTTPException(400, "text too long (max 1024 chars)")
+        if req.key and req.key not in TmuxSession.PANE_KEY_WHITELIST:
+            raise HTTPException(
+                400,
+                f"key {req.key!r} not allowed; whitelist: "
+                f"{sorted(TmuxSession.PANE_KEY_WHITELIST)}",
+            )
+
+        session = broker.get_streaming_session(agent_name, label=req.label)
+        sender = getattr(session, "send_pane_keys", None)
+        if session is None or not callable(sender):
+            raise HTTPException(
+                409, f"Agent '{agent_name}' has no live tmux session"
+            )
+
+        summary = f"text={req.text!r}" if req.text else f"key={req.key}"
+        _log(f"api: pane-keys → {agent_name} ({summary})")
+        ok = await sender(text=req.text, key=req.key)
+        if not ok:
+            raise HTTPException(502, "tmux send-keys failed (see daemon log)")
+        return {"sent": True, "agent": agent_name}
 
     @app.get("/agents/{agent_name}/sessions/{label}/tool-calls")
     async def list_session_tool_calls(

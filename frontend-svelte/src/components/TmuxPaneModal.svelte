@@ -1,12 +1,18 @@
 <!--
-  TmuxPaneModal — read-only live viewer for a tmux agent's terminal pane.
+  TmuxPaneModal — live viewer (+ optional input) for a tmux agent's terminal pane.
 
   Subscribes to `/agents/{agent}/tmux/pane/stream` (SSE, snapshot per frame)
-  and renders the captured ANSI output into an xterm.js terminal in
-  disableStdin mode. Each frame is a full pane snapshot — we clear + redraw
-  in one write so cursor/colours come through but the previous frame doesn't
-  leak. xterm.js is dynamic-imported so the ~150 KB dependency only loads
-  when the modal opens.
+  and renders the captured ANSI output into an xterm.js terminal. Each frame
+  is a full pane snapshot — we clear + redraw in one write so cursor/colours
+  come through but the previous frame doesn't leak. xterm.js is
+  dynamic-imported so the ~150 KB dependency only loads when the modal opens.
+
+  Input: read-only by default. The footer's "input" toggle arms keystroke
+  passthrough — xterm onData chunks are mapped to the backend's
+  `/tmux/pane/keys` endpoint (named keys for control sequences, literal text
+  otherwise), so an operator can answer first-run dialogs or interrupt a
+  wedged REPL without SSH + `tmux attach`. Sends are serialized through a
+  promise chain to preserve keystroke order.
 
   Props:
     show:  bool   — modal open state (bind from parent)
@@ -18,7 +24,7 @@
 <script>
     import { onDestroy } from 'svelte';
     import Modal from './Modal.svelte';
-    import { sse } from '../lib/api.js';
+    import { api, sse } from '../lib/api.js';
 
     export let show = false;
     export let agent = '';
@@ -44,6 +50,80 @@
     // opens + host div is rendered + we have an agent. Teardown when the
     // modal closes or the target changes.
     $: void reconcile(show, agent, label, hostEl);
+
+    // ── Typeable input (off by default) ──────────────────────────
+    let inputEnabled = false;
+    let inputError = '';
+    let onDataDisposable = null;
+    // Serialize sends so fast typing can't reorder keystrokes (fetches
+    // racing each other would scramble e.g. "ls" into "sl").
+    let sendChain = Promise.resolve();
+
+    // xterm onData control sequences → backend named keys (tmux names).
+    const KEY_SEQUENCES = {
+        '\r': 'Enter',
+        '\t': 'Tab',
+        '\x7f': 'BSpace',
+        '\x03': 'C-c',
+        '\x15': 'C-u',
+        '\x1b': 'Escape',
+        '\x1b[A': 'Up',
+        '\x1b[B': 'Down',
+        '\x1b[C': 'Right',
+        '\x1b[D': 'Left',
+        '\x1b[Z': 'BTab',
+        '\x1b[3~': 'DC',
+        '\x1b[H': 'Home',
+        '\x1b[1~': 'Home',
+        '\x1b[F': 'End',
+        '\x1b[4~': 'End',
+        '\x1b[5~': 'PPage',
+        '\x1b[6~': 'NPage',
+    };
+
+    function queueSend(payload) {
+        sendChain = sendChain
+            .then(() => api('POST', `/agents/${encodeURIComponent(agent)}/tmux/pane/keys`, { ...payload, label }))
+            .then(() => { if (inputError) inputError = ''; })
+            .catch((e) => { inputError = `send failed: ${e?.message || e}`; });
+    }
+
+    function handleTerminalData(data) {
+        if (!inputEnabled || !data) return;
+        const named = KEY_SEQUENCES[data];
+        if (named) {
+            queueSend({ key: named });
+            return;
+        }
+        // Mixed chunk (e.g. IME/paste or burst typing). Split out any
+        // embedded control sequences; send printable runs literally.
+        let literal = '';
+        let i = 0;
+        while (i < data.length) {
+            let matched = '';
+            for (const seq of Object.keys(KEY_SEQUENCES)) {
+                if (data.startsWith(seq, i) && seq.length > matched.length) matched = seq;
+            }
+            if (matched) {
+                if (literal) { queueSend({ text: literal }); literal = ''; }
+                queueSend({ key: KEY_SEQUENCES[matched] });
+                i += matched.length;
+            } else {
+                literal += data[i];
+                i += 1;
+            }
+        }
+        if (literal) queueSend({ text: literal });
+    }
+
+    function toggleInput() {
+        inputEnabled = !inputEnabled;
+        inputError = '';
+        if (terminal) {
+            terminal.options.disableStdin = !inputEnabled;
+            if (inputEnabled) terminal.focus();
+        }
+    }
 
     let lastKey = '';
     async function reconcile(s, a, l, host) {
@@ -138,6 +218,9 @@
             });
             fitAddon = new FitAddon();
             terminal.loadAddon(fitAddon);
+            // Input passthrough — inert until the footer toggle arms it
+            // (disableStdin stays true, so xterm emits no data).
+            onDataDisposable = terminal.onData(handleTerminalData);
 
             if (!hostEl) {
                 // Host unmounted before async resolved — abort.
@@ -178,12 +261,16 @@
         if (resizeDebounceId) { clearTimeout(resizeDebounceId); resizeDebounceId = null; }
         if (sseSource) { try { sseSource.close(); } catch {} sseSource = null; }
         if (resizeObserver) { try { resizeObserver.disconnect(); } catch {} resizeObserver = null; }
+        if (onDataDisposable) { try { onDataDisposable.dispose(); } catch {} onDataDisposable = null; }
         if (terminal) { try { terminal.dispose(); } catch {} terminal = null; }
         fitAddon = null;
         statusMessage = '';
         lastFrameAt = 0;
         lastReqCols = 0;
         lastReqRows = 0;
+        inputEnabled = false;
+        inputError = '';
+        sendChain = Promise.resolve();
     }
 
     onDestroy(teardown);
@@ -196,7 +283,18 @@
         {/if}
         <div class="pane-host" bind:this={hostEl}></div>
         {#if lastFrameAt > 0}
-            <div class="pane-footer">read-only · live · last frame {new Date(lastFrameAt * 1000).toLocaleTimeString()}</div>
+            <div class="pane-footer">
+                <button class="input-toggle" class:armed={inputEnabled} on:click={toggleInput}
+                        title={inputEnabled ? 'Disable keyboard passthrough' : 'Type into this terminal'}>
+                    ⌨ input: {inputEnabled ? 'ON' : 'off'}
+                </button>
+                {#if inputError}
+                    <span class="input-error">{inputError}</span>
+                {/if}
+                <span class="footer-status">
+                    {inputEnabled ? 'keystrokes go to the agent' : 'read-only'} · live · last frame {new Date(lastFrameAt * 1000).toLocaleTimeString()}
+                </span>
+            </div>
         {/if}
     </div>
 </Modal>
@@ -235,6 +333,33 @@
         color: var(--text-muted, #666);
         padding: 0.3rem 0.8rem;
         border-top: 1px solid #222;
-        text-align: right;
+        display: flex;
+        align-items: center;
+        gap: 0.8rem;
+    }
+    .footer-status {
+        margin-left: auto;
+    }
+    .input-toggle {
+        font-family: inherit;
+        font-size: inherit;
+        background: transparent;
+        color: var(--text-muted, #888);
+        border: 1px solid #333;
+        border-radius: 3px;
+        padding: 0.15rem 0.5rem;
+        cursor: pointer;
+    }
+    .input-toggle:hover {
+        border-color: #555;
+        color: #ccc;
+    }
+    .input-toggle.armed {
+        color: #7dd87d;
+        border-color: #3a6b3a;
+        background: #14240f;
+    }
+    .input-error {
+        color: #e07070;
     }
 </style>

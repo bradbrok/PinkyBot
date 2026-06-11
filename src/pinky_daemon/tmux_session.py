@@ -497,6 +497,16 @@ class _TmuxControl:
             args.append("Enter")
         return await self._run(*args)
 
+    async def send_literal(self, text: str) -> TmuxCommandResult:
+        """Send ``text`` as LITERAL characters (``send-keys -l``).
+
+        Unlike ``send_keys``, tmux performs no keyname interpretation —
+        "Enter" types the five letters, "C-c" types three characters.
+        Used by the typeable pane view, where the operator's typed text
+        must never be accidentally promoted to a control key.
+        """
+        return await self._run("send-keys", "-t", self.session_name, "-l", text)
+
     async def paste_text(
         self,
         text: str,
@@ -2850,6 +2860,55 @@ class TmuxSession:
         if not result.ok:
             _log(
                 f"tmux[{self.agent_name}]: resize_pane failed "
+                f"(rc={result.returncode}): {result.stderr.strip()}"
+            )
+            return False
+        return True
+
+    # Named keys the typeable pane view may send. Bounded on purpose:
+    # enough to drive Claude Code's dialogs/menus and edit a prompt line,
+    # without exposing tmux's full keyname surface. C-c is included —
+    # interrupting a runaway turn is half the point of operator input.
+    PANE_KEY_WHITELIST = frozenset({
+        "Enter", "Escape", "Tab", "BTab", "Space", "BSpace", "DC",
+        "Up", "Down", "Left", "Right", "Home", "End", "PPage", "NPage",
+        "C-c", "C-u",
+    })
+
+    async def send_pane_keys(self, *, text: str = "", key: str = "") -> bool:
+        """Operator keystrokes from the pane-view modal (typeable terminal).
+
+        Exactly one of ``text`` / ``key`` per call:
+
+        - ``text`` — literal characters, sent with ``send-keys -l`` so tmux
+          performs NO keyname interpretation ("Enter" types five letters).
+        - ``key`` — one named key from ``PANE_KEY_WHITELIST`` (tmux keyname
+          semantics: Enter submits, Up/Down navigate dialogs, C-c interrupts).
+
+        This is the interactive counterpart of ``get_pane_snapshot`` — same
+        pane, same defensive posture (log + False, never raise). It exists so
+        an operator can resolve first-run dialogs / wedged prompts from the
+        web UI without SSH + ``tmux attach``.
+        """
+        if bool(text) == bool(key):
+            return False  # exactly one input mode per call
+        if key and key not in self.PANE_KEY_WHITELIST:
+            _log(
+                f"tmux[{self.agent_name}]: send_pane_keys rejected "
+                f"non-whitelisted key {key!r}"
+            )
+            return False
+        try:
+            if text:
+                result = await self._tmux.send_literal(text)
+            else:
+                result = await self._tmux.send_keys(key, enter=False)
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: send_pane_keys raised: {e}")
+            return False
+        if not result.ok:
+            _log(
+                f"tmux[{self.agent_name}]: send_pane_keys failed "
                 f"(rc={result.returncode}): {result.stderr.strip()}"
             )
             return False
