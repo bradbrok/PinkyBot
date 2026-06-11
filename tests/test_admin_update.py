@@ -94,8 +94,8 @@ class _GitMock:
                 joined += "\n"
             return joined.encode()
 
-        # git checkout -- .  (force reset of tracked files)
-        if cmd[:3] == ["git", "checkout", "--"]:
+        # git checkout HEAD -- .  (force reset of tracked files, incl. staged)
+        if cmd[:4] == ["git", "checkout", "HEAD", "--"]:
             return b""
 
         # git checkout <branch>  (used when on detached HEAD / wrong branch)
@@ -117,7 +117,7 @@ class _GitMock:
         return b""
 
     def did_force_reset(self) -> bool:
-        return any(c[:4] == ["git", "checkout", "--", "."] for c in self.calls)
+        return any(c[:5] == ["git", "checkout", "HEAD", "--", "."] for c in self.calls)
 
     def did_pull(self) -> bool:
         return any(c[:3] == ["git", "pull", "origin"] for c in self.calls)
@@ -171,7 +171,8 @@ class TestAdminUpdateForce:
 
         # Critical ordering: reset must happen BEFORE the deploy checkout
         reset_idx = next(
-            i for i, c in enumerate(gm.calls) if c[:4] == ["git", "checkout", "--", "."]
+            i for i, c in enumerate(gm.calls)
+            if c[:5] == ["git", "checkout", "HEAD", "--", "."]
         )
         deploy_idx = next(
             i for i, c in enumerate(gm.calls)

@@ -159,6 +159,7 @@ from pinky_daemon.shared_mcp import (
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.streaming_session import _1M_MODELS
 from pinky_daemon.task_store import TaskStore
 
 # Alias: pinky_daemon.sessions.SessionState (imported above) is the
@@ -522,13 +523,14 @@ def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
     core tools only (no gates). They can always load_skill() to get more.
     """
     if not skill_store:
-        # No skill store available — fall back to all gates for safety
-        return list(ALL_TOOL_GATES)
+        # No skill store available: fail closed (core tools only)
+        return []
 
     try:
         agent_skills = skill_store.get_agent_skills(agent_name, enabled_only=True)
     except Exception:
-        return list(ALL_TOOL_GATES)
+        # Skill lookup failed: fail closed rather than granting every gate
+        return []
 
     if not agent_skills:
         return []  # No skills → core tools only
@@ -1303,6 +1305,15 @@ def create_api(
         silent: bool = False,
     ) -> SimpleNamespace:
         """Send a text message and return SimpleNamespace(message_id=...)."""
+        # iMessage has its own adapter factory; the generic lookup below
+        # never constructs one and would 503 before this branch could run.
+        if platform == "imessage":
+            im = _get_imessage_adapter(agent_name)
+            if not im:
+                raise HTTPException(503, "iMessage not enabled for this agent")
+            result = im.send_message(chat_id, content)
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
         adapter = _get_platform_adapter(agent_name, platform)
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name}")
@@ -1344,13 +1355,6 @@ def create_api(
 
         if platform == "slack":
             result = adapter.send_message(chat_id, content, thread_ts=reply_to or None)
-            return SimpleNamespace(message_id=_extract_message_id(result))
-
-        if platform == "imessage":
-            im = _get_imessage_adapter(agent_name)
-            if not im:
-                raise HTTPException(503, "iMessage not enabled for this agent")
-            result = im.send_message(chat_id, content)
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
@@ -1738,6 +1742,11 @@ def create_api(
             sessions_map = broker._streaming.get(agent_name, {})
             total_session_cost = sum(ss.usage.total_cost_usd for ss in sessions_map.values())
             fired = _agent_cost_milestones.setdefault(agent_name, set())
+            # Session restarts reset the live cost baseline to ~0; drop fired
+            # thresholds above the current total so they can fire again.
+            fired.intersection_update(
+                {m for m in _COST_MILESTONES if m <= total_session_cost}
+            )
             for milestone in _COST_MILESTONES:
                 if total_session_cost >= milestone and milestone not in fired:
                     fired.add(milestone)
@@ -2505,6 +2514,15 @@ def create_api(
     _CONTEXT_CACHE_TTL = 30.0  # noqa: N806 — seconds
     _context_fetch_in_progress: set[str] = set()
 
+    def _context_cache_put(sid: str, info: dict, now: float) -> None:
+        _context_cache[sid] = (now, info)
+        # Keys are resume handles, which churn on every context restart; keep
+        # stale entries a few TTLs as fallback but drop them after that so the
+        # cache stays bounded over the daemon's lifetime.
+        stale_after = 10 * _CONTEXT_CACHE_TTL
+        for key in [k for k, (ts, _) in _context_cache.items() if now - ts > stale_after]:
+            del _context_cache[key]
+
     async def _streaming_context_info(ss, *, force: bool = False) -> dict:
         """Best-effort context usage details for a streaming session.
 
@@ -2525,7 +2543,7 @@ def create_api(
                 except Exception:
                     info = {}
                 if info:
-                    _context_cache[sid] = (now, info)
+                    _context_cache_put(sid, info, now)
                 return info
             return {}
 
@@ -2561,7 +2579,7 @@ def create_api(
                 "categories": ctx.get("categories", []),
                 "mcp_tools": ctx.get("mcpTools", []),
             }
-            _context_cache[sid] = (now, info)
+            _context_cache_put(sid, info, now)
             return info
         except Exception:
             # Return stale cache on timeout rather than empty
@@ -2756,7 +2774,24 @@ def create_api(
         codex_mcp_servers = {}
         if is_codex and SHARED_MCP_ENABLED:
             shared_base = f"http://{_mcp_connect_host()}:{SHARED_MCP_PORT}"
+            # #623: codex agents need the derived bearer too (see _sse_headers
+            # in _write_mcp_json) or any config requiring bearer auth (exposed
+            # bind / PINKY_SHARED_MCP_REQUIRE_AUTH=1) rejects their MCP calls.
             agent_headers = {"X-Agent-Name": agent_name}
+            try:
+                agent_key = (agents.get_or_create_signing_key(agent_name) or "").strip()
+            except Exception:
+                agent_key = ""
+            if agent_key:
+                from pinky_daemon.shared_mcp import derive_mcp_bearer
+
+                agent_headers["Authorization"] = f"Bearer {derive_mcp_bearer(agent_key)}"
+            else:
+                _log(
+                    f"api: WARNING no signing key for codex agent '{agent_name}' "
+                    f"-- its shared-MCP requests will be rejected wherever "
+                    f"bearer auth is required"
+                )
             for srv_name in ("self", "memory", "messaging"):
                 codex_mcp_servers[f"pinky-{srv_name}"] = {
                     "url": f"{shared_base}/mcp/{srv_name}/http/mcp",
@@ -2866,9 +2901,9 @@ def create_api(
                         agent_name=agent_name,
                         platform="telegram",
                         chat_id=str(owner_chat),
-                        text=(
-                            f"⚠️ {agent_name} cold-start connect timed out after "
-                            f"{COLD_START_CONNECT_TIMEOUT_SEC:.0f}s ({label}) — "
+                        content=(
+                            f"WARNING: {agent_name} cold-start connect timed out after "
+                            f"{COLD_START_CONNECT_TIMEOUT_SEC:.0f}s ({label}) -- "
                             f"session not started."
                         ),
                     )
@@ -2914,6 +2949,13 @@ def create_api(
 
         return ss
 
+    # Per-(agent,label) locks so concurrent triggers (inbound platform
+    # message, scheduler wake, HTTP chat/wake endpoints) cannot all observe
+    # "no session" and each launch a full cold start. The loser of such a
+    # race would be silently dropped from the broker registry while its
+    # subprocess kept running, invisible to the watchdog.
+    _streaming_ensure_locks: dict[tuple[str, str], asyncio.Lock] = {}
+
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
         """Return a connected streaming session for an agent label.
 
@@ -2928,37 +2970,51 @@ def create_api(
                               "not running" fallback shape downstream)
           - DEAD / UNINITIALIZED → connect() (this is the auto-start /
                               resurrection path; explicit and intentional)
+
+        Cold starts / reconnects are serialized per (agent, label); the
+        connected fast path stays lock-free.
         """
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
-        if ss:
-            state = ss.state
-            if state == TransportSessionState.CONNECTED:
-                return ss
-            if state == TransportSessionState.RECONNECTING:
-                # Wait for the in-flight reconnect to land. Use the same
-                # bounded poll the broker uses on the inbound path so the
-                # waits stay consistent.
-                from pinky_daemon.broker import (
-                    _INBOUND_RECONNECT_POLL_SEC,
-                    _INBOUND_RECONNECT_WAIT_SEC,
-                )
-                deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
-                while time.monotonic() < deadline:
-                    await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
-                    if ss.state == TransportSessionState.CONNECTED:
-                        break
-                return ss
-            # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect().
-            # #149 P1: this relaunches the transport for an existing session
-            # object — guard it too, else a local→unix_user update could wake
-            # the old local session under the daemon uid (Murzik #642 review).
-            _enforce_isolation_runnable(agent_name)
-            await ss.connect()
+        if ss and ss.state == TransportSessionState.CONNECTED:
             return ss
 
-        resume_id = agents.get_streaming_session_id(agent_name, label=label)
-        return await _start_streaming_session(agent_name, label=label, resume_id=resume_id)
+        lock = _streaming_ensure_locks.setdefault((agent_name, label), asyncio.Lock())
+        async with lock:
+            # Re-check under the lock: a concurrent caller may have started
+            # or reconnected the session while we waited.
+            sessions = broker._streaming.get(agent_name, {})
+            ss = sessions.get(label)
+            if ss:
+                state = ss.state
+                if state == TransportSessionState.CONNECTED:
+                    return ss
+                if state == TransportSessionState.RECONNECTING:
+                    # Wait for the in-flight reconnect to land. Use the same
+                    # bounded poll the broker uses on the inbound path so the
+                    # waits stay consistent.
+                    from pinky_daemon.broker import (
+                        _INBOUND_RECONNECT_POLL_SEC,
+                        _INBOUND_RECONNECT_WAIT_SEC,
+                    )
+                    deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+                    while time.monotonic() < deadline:
+                        await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+                        if ss.state == TransportSessionState.CONNECTED:
+                            break
+                    return ss
+                # IDLE_SLEEPING / DEAD / UNINITIALIZED → explicit connect().
+                # #149 P1: this relaunches the transport for an existing session
+                # object — guard it too, else a local→unix_user update could wake
+                # the old local session under the daemon uid (Murzik #642 review).
+                _enforce_isolation_runnable(agent_name)
+                await ss.connect()
+                return ss
+
+            resume_id = agents.get_streaming_session_id(agent_name, label=label)
+            return await _start_streaming_session(
+                agent_name, label=label, resume_id=resume_id
+            )
 
     # Wire the broker's cold-wake path so inbound platform messages
     # (Telegram, Discord, etc.) can start a fresh streaming session for a
@@ -4037,21 +4093,27 @@ npm run build</pre>
 
     # ── Auth Rate Limiting ─────────────────────────────────
     # In-memory per-IP rate limiter for auth endpoints. No external deps.
+    # Keyed by the socket peer address: X-Forwarded-For is client-controlled
+    # (no trusted-proxy config exists), so honoring it would hand attackers a
+    # fresh budget per spoofed value plus an unbounded dict entry each.
     _auth_attempts: dict[str, list[float]] = {}  # IP -> list of attempt timestamps
     _AUTH_MAX_ATTEMPTS = 5  # noqa: N806 — max attempts per window
     _AUTH_WINDOW_SECONDS = 300  # noqa: N806 — 5-minute window
 
     def _check_auth_rate_limit(request: Request) -> None:
         """Raise 429 if IP has exceeded auth attempt limit."""
-        ip = request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (request.client.host if request.client else "unknown")
+        ip = request.client.host if request.client else "unknown"
         now = time.time()
         cutoff = now - _AUTH_WINDOW_SECONDS
 
-        # Clean old entries
+        # Evict IPs whose attempts have all expired so the dict stays bounded
+        for stale_ip in [k for k, ts in _auth_attempts.items() if not ts or ts[-1] <= cutoff]:
+            del _auth_attempts[stale_ip]
+
         attempts = [t for t in _auth_attempts.get(ip, []) if t > cutoff]
-        _auth_attempts[ip] = attempts
 
         if len(attempts) >= _AUTH_MAX_ATTEMPTS:
+            _auth_attempts[ip] = attempts
             _log(f"auth: rate limited {ip} ({len(attempts)} attempts in {_AUTH_WINDOW_SECONDS}s)")
             raise HTTPException(429, "Too many authentication attempts. Try again later.")
 
@@ -5094,7 +5156,7 @@ npm run build</pre>
         }
         if key_name not in allowed:
             raise HTTPException(400, f"Unknown key: {key_name}. Allowed: {', '.join(sorted(allowed))}")
-        value = req.get("value", "").strip()
+        value = (req.get("value") or "").strip()
         if not value:
             raise HTTPException(400, "value is required")
         agents.set_setting(key_name, value)
@@ -5897,13 +5959,19 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
         updates = {}
         if "provider_url" in req:
-            updates["provider_url"] = req["provider_url"].strip()
-        if "provider_key" in req:
-            updates["provider_key"] = req["provider_key"].strip()
+            updates["provider_url"] = (req["provider_url"] or "").strip()
+        if req.get("provider_key") is not None:
+            # Secret: JSON null (like omitting the field) means "unchanged";
+            # an explicit "" clears the stored key.
+            key = req["provider_key"].strip()
+            if key:
+                updates["provider_key"] = key
+            else:
+                updates["clear_provider_key"] = True
         if "provider_model" in req:
-            updates["provider_model"] = req["provider_model"].strip()
+            updates["provider_model"] = (req["provider_model"] or "").strip()
         if "provider_ref" in req:
-            updates["provider_ref"] = req["provider_ref"].strip()
+            updates["provider_ref"] = (req["provider_ref"] or "").strip()
         if updates:
             agents.register(name, **updates)
         return {"saved": True, **updates}
@@ -6078,6 +6146,12 @@ npm run build</pre>
             enabled=req.enabled, settings=req.settings, token_ref=req.token_ref,
         )
 
+        # Evict the cached outbound adapter so sends pick up the new token
+        # immediately (adapters bind the token at construction).
+        _platform_adapters.pop((name, platform), None)
+        if platform == "imessage":
+            _platform_adapters.pop(("__global__", "imessage"), None)
+
         # Dynamically start/restart a broker poller for Telegram tokens
         raw_token = agents.get_raw_token(name, platform)
         if platform == "telegram" and raw_token:
@@ -6159,6 +6233,11 @@ npm run build</pre>
         """Remove a bot token for an agent."""
         if not agents.remove_token(name, platform):
             raise HTTPException(404, "Token not found")
+
+        # Evict the cached outbound adapter so sends stop using the removed token
+        _platform_adapters.pop((name, platform), None)
+        if platform == "imessage":
+            _platform_adapters.pop(("__global__", "imessage"), None)
 
         # Stop broker poller if removing a Telegram token
         if platform == "telegram":
@@ -6826,6 +6905,11 @@ npm run build</pre>
             raise HTTPException(409, f"Session '{new_label}' already exists for {name}")
         # Move in broker registry
         sessions[new_label] = sessions.pop(label)
+        # Retarget the live session: its id derives from _config.label and the
+        # resume-handle callback closed over the old label, so without this the
+        # session keeps persisting turns and resume handles under the old name.
+        ss._config.label = new_label
+        ss._on_resume_handle = await _make_streaming_resume_handle_callback(name, new_label)
         # Update stored session ID mapping
         old_sid = agents.get_streaming_session_id(name, label=label)
         if old_sid:
@@ -7495,12 +7579,14 @@ npm run build</pre>
             pass
 
         new_is_1m = req.model in _1M_MODELS
-        old_is_1m = old_max > 500_000  # Current window is 1M-class
+        if old_max > 0:
+            old_is_1m = old_max > 500_000  # Current window is 1M-class
+        else:
+            # Usage fetch failed: fall back to the configured model class so a
+            # 1M -> 200k switch still forces the context-window restart.
+            old_is_1m = (ss._config.model or "") in _1M_MODELS
 
         needs_restart = new_is_1m != old_is_1m
-
-        # Update agent config first
-        agents.register(name, model=req.model)
 
         if needs_restart:
             # Context window changes — need full restart
@@ -7508,6 +7594,10 @@ npm run build</pre>
             guard = _get_streaming_restart_guard(name, ss)
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
+
+            # Persist only once the restart is actually going ahead, so a 409
+            # above leaves the DB matching the still-running session.
+            agents.register(name, model=req.model)
 
             # Ask agent to save state
             try:
@@ -7553,6 +7643,8 @@ npm run build</pre>
             except Exception as e:
                 raise HTTPException(500, f"Failed to set model: {e}")
 
+            # Persist only after the live session actually switched
+            agents.register(name, model=req.model)
             return {"updated": True, "agent": name, "model": req.model, "restarted": False}
 
     @app.post("/agents/{name}/streaming/compact")
@@ -8095,12 +8187,16 @@ npm run build</pre>
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        file_path = Path(agent.working_dir).resolve() / filename
+        work_dir = Path(agent.working_dir).resolve()
+        file_path = work_dir / filename
+        # Safety: don't serve files outside the working dir. Resolve first so
+        # a symlink inside the dir pointing elsewhere is rejected too, and
+        # check containment before existence so outside paths 403, not 404.
+        # is_relative_to avoids the '/dir' vs '/dir-evil' prefix pitfall.
+        if not file_path.resolve().is_relative_to(work_dir):
+            raise HTTPException(403, "Access denied")
         if not file_path.exists() or not file_path.is_file():
             raise HTTPException(404, f"File '{filename}' not found")
-        # Safety: don't serve files outside the working dir
-        if not str(file_path).startswith(str(Path(agent.working_dir).resolve())):
-            raise HTTPException(403, "Access denied")
         return {"name": filename, "content": file_path.read_text(errors="replace")}
 
     @app.put("/agents/{name}/files/{filename}")
@@ -8115,8 +8211,8 @@ npm run build</pre>
         work_dir = Path(agent.working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
         file_path = work_dir / filename
-        # Safety check
-        if not str(file_path.resolve()).startswith(str(work_dir)):
+        # Safety check (resolve first; is_relative_to avoids prefix pitfalls)
+        if not file_path.resolve().is_relative_to(work_dir):
             raise HTTPException(403, "Access denied")
         file_path.write_text(req.content)
         if filename == "CLAUDE.md":
@@ -8707,7 +8803,7 @@ npm run build</pre>
                         agent_name=agent_name,
                         platform="telegram",
                         chat_id=str(owner_chat),
-                        text=message,
+                        content=message,
                     )
         except Exception as exc:
             _log(f"watchdog: alert delivery failed for {agent_name}: {exc}")
@@ -8957,14 +9053,14 @@ npm run build</pre>
                 )
                 if existing:
                     _log(f"startup: telegram poller already exists for {agent.name}, skipping")
-                    continue
-                adapter = TelegramAdapter(token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
-                poller = BrokerTelegramPoller(
-                    adapter, agent.name, broker, registry=agents,
-                )
-                _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
-                _log(f"startup: broker poller started for {agent.name}")
+                else:
+                    adapter = TelegramAdapter(token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
+                    poller = BrokerTelegramPoller(
+                        adapter, agent.name, broker, registry=agents,
+                    )
+                    _broker_pollers.append(poller)
+                    asyncio.create_task(poller.start())
+                    _log(f"startup: broker poller started for {agent.name}")
 
             # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
             discord_token = agents.get_raw_token(agent.name, "discord")
@@ -9113,18 +9209,23 @@ npm run build</pre>
         }
         for name in list(broker._streaming.keys()):
             sessions = broker._streaming.get(name, {})
-            for label, ss in list(sessions.items()):
-                try:
-                    s = ss.stats
-                    manifest["agents"][name] = {
-                        "label": label,
-                        "timestamp": datetime.now(timezone.utc).isoformat(),
-                        "in_progress": s.get("current_activity", ""),
-                        "activity_log": s.get("activity_log", []),
-                        "pending_responses": s.get("pending_responses", 0),
-                    }
-                except Exception:
-                    pass
+            if not sessions:
+                continue
+            # One entry per agent; prefer the main session's state so a
+            # multi-label agent does not overwrite it with a sub-session's.
+            label = "main" if "main" in sessions else next(iter(sessions))
+            ss = sessions[label]
+            try:
+                s = ss.stats
+                manifest["agents"][name] = {
+                    "label": label,
+                    "timestamp": datetime.now(timezone.utc).isoformat(),
+                    "in_progress": s.get("current_activity", ""),
+                    "activity_log": s.get("activity_log", []),
+                    "pending_responses": s.get("pending_responses", 0),
+                }
+            except Exception as e:
+                _log(f"shutdown: could not snapshot {name} for restart manifest: {e}")
         try:
             manifest_path.write_text(_json.dumps(manifest, indent=2))
             _log(f"shutdown: restart manifest written for {len(manifest['agents'])} agent(s)")
@@ -9142,6 +9243,7 @@ npm run build</pre>
             broker.unregister_streaming(name)
         for poller in _broker_pollers:
             poller.stop()
+        _broker_pollers.clear()
         await autonomy.stop()
         await scheduler.stop()
         await watchdog.stop()
@@ -9322,259 +9424,271 @@ npm run build</pre>
         branch = "main"
         repo_dir = str(Path(__file__).resolve().parent.parent.parent)
 
-        # Current state
-        try:
-            before_hash = sp.check_output(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-        except Exception:
-            before_hash = "unknown"
-
-        # Current tag (if any)
-        try:
-            current_tag = sp.check_output(
-                ["git", "describe", "--tags", "--exact-match", "HEAD"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-        except Exception:
-            current_tag = None
-
-        # Fetch tags + branch
-        try:
-            sp.check_output(
-                ["git", "fetch", "origin", "--tags", branch],
-                cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
-            )
-        except sp.CalledProcessError as e:
-            return {"error": f"git fetch failed: {e.output.decode()[:500]}"}
-
-        # Unshallow if needed (install.sh uses --depth 1) so tag/commit
-        # resolution and verification see full history.
-        try:
-            is_shallow = sp.check_output(
-                ["git", "rev-parse", "--is-shallow-repository"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-            if is_shallow == "true":
-                sp.check_output(
-                    ["git", "fetch", "--unshallow", "origin"],
-                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
-                )
-        except Exception:
-            pass  # Non-fatal — shallow log may still miss commits
-
-        # Resolve + verify the deploy target. Empty target = latest published
-        # release; a tag = that release (verified against the GitHub Releases
-        # API over TLS unless force); a commit SHA = an explicit operator pin.
-        from pinky_daemon import self_update
-        decision = self_update.resolve_and_verify(
-            repo_dir, target, force=force, log=_log,
-        )
-        target_tag = self_update.latest_release_tag(repo_dir)
-
-        # Preview mode — report the planned deploy without mutating anything.
-        if dry_run:
+        # The whole update pipeline (git fetch/checkout, release
+        # verification over TLS, pip install, npm build) is blocking and can
+        # take minutes; run it off the event loop so the daemon keeps
+        # routing messages while the update proceeds.
+        def _run_update() -> dict:
+            # Current state
             try:
-                pending = sp.check_output(
-                    ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                before_hash = sp.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
                     cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
                 ).decode().strip()
             except Exception:
-                pending = ""
-            commits = [line for line in pending.splitlines() if line.strip()] if pending else []
-            result = {
-                "dry_run": True,
-                "current_hash": before_hash,
-                "current_release": current_tag,
-                "branch": branch,
-                "pending_commits": len(commits),
-                "commits": commits,
-                "up_to_date": len(commits) == 0,
-                "deploy_ref": decision.ref or None,
-                "deploy_kind": decision.kind or None,
-                "verified": decision.verified,
-            }
-            if target_tag:
-                result["latest_release"] = target_tag
+                before_hash = "unknown"
+
+            # Current tag (if any)
+            try:
+                current_tag = sp.check_output(
+                    ["git", "describe", "--tags", "--exact-match", "HEAD"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            except Exception:
+                current_tag = None
+
+            # Fetch tags + branch
+            try:
+                sp.check_output(
+                    ["git", "fetch", "origin", "--tags", branch],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
+                )
+            except sp.CalledProcessError as e:
+                return {"error": f"git fetch failed: {e.output.decode()[:500]}"}
+
+            # Unshallow if needed (install.sh uses --depth 1) so tag/commit
+            # resolution and verification see full history.
+            try:
+                is_shallow = sp.check_output(
+                    ["git", "rev-parse", "--is-shallow-repository"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+                if is_shallow == "true":
+                    sp.check_output(
+                        ["git", "fetch", "--unshallow", "origin"],
+                        cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                    )
+            except Exception:
+                pass  # Non-fatal — shallow log may still miss commits
+
+            # Resolve + verify the deploy target. Empty target = latest published
+            # release; a tag = that release (verified against the GitHub Releases
+            # API over TLS unless force); a commit SHA = an explicit operator pin.
+            from pinky_daemon import self_update
+            decision = self_update.resolve_and_verify(
+                repo_dir, target, force=force, log=_log,
+            )
+            target_tag = self_update.latest_release_tag(repo_dir)
+
+            # Preview mode — report the planned deploy without mutating anything.
+            if dry_run:
+                try:
+                    pending = sp.check_output(
+                        ["git", "log", "--oneline", f"HEAD..origin/{branch}"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                    ).decode().strip()
+                except Exception:
+                    pending = ""
+                commits = [line for line in pending.splitlines() if line.strip()] if pending else []
+                result = {
+                    "dry_run": True,
+                    "current_hash": before_hash,
+                    "current_release": current_tag,
+                    "branch": branch,
+                    "pending_commits": len(commits),
+                    "commits": commits,
+                    "up_to_date": len(commits) == 0,
+                    "deploy_ref": decision.ref or None,
+                    "deploy_kind": decision.kind or None,
+                    "verified": decision.verified,
+                }
+                if target_tag:
+                    result["latest_release"] = target_tag
+                if decision.error:
+                    result["verify_error"] = decision.error
+                return result
+
+            # Refuse before touching the working tree if verification failed.
             if decision.error:
-                result["verify_error"] = decision.error
+                return {
+                    "error": decision.error,
+                    "current_release": current_tag,
+                    "staying_on_version": before_hash,
+                }
+
+            # Force mode: discard local mods to TRACKED files before checkout.
+            # Untracked files (e.g. .env, local notes) are NOT touched.
+            forced_reset = False
+            forced_files: list[str] = []
+            if force:
+                try:
+                    dirty = sp.check_output(
+                        ["git", "diff", "--name-only", "HEAD"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                    ).decode().strip()
+                    if dirty:
+                        forced_files = [f for f in dirty.splitlines() if f.strip()]
+                        # checkout HEAD (not the index) so staged changes are
+                        # discarded too; plain `checkout -- .` restores from the
+                        # index and leaves staged mods to break the deploy checkout
+                        sp.check_output(
+                            ["git", "checkout", "HEAD", "--", "."],
+                            cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
+                        )
+                        forced_reset = True
+                        _log(f"admin: force=True reset {len(forced_files)} tracked file(s): {forced_files[:10]}")
+                except sp.CalledProcessError as e:
+                    return {"error": f"force reset failed: {e.output.decode()[:500]}"}
+                except Exception as e:
+                    _log(f"admin: force reset warning: {e}")
+
+            # Check out the resolved + verified ref (detached HEAD at the tag, or
+            # the pinned commit). Replaces `git pull origin main` so production
+            # runs exactly the verified ref, not whatever is at branch HEAD.
+            try:
+                sp.check_output(
+                    ["git", "checkout", decision.ref],
+                    cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
+                )
+                _log(f"admin: checked out {decision.kind} {decision.ref} (verified={decision.verified})")
+            except sp.CalledProcessError as e:
+                return {"error": f"git checkout {decision.ref} failed: {e.output.decode()[:500]}"}
+
+            # After hash + commit summary
+            try:
+                after_hash = sp.check_output(
+                    ["git", "rev-parse", "--short", "HEAD"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            except Exception:
+                after_hash = "unknown"
+
+            try:
+                summary = sp.check_output(
+                    ["git", "log", "--oneline", f"{before_hash}..{after_hash}"],
+                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                ).decode().strip()
+            except Exception:
+                summary = ""
+
+            # Detect dependency changes — rebuild whenever pyproject.toml or uv.lock
+            # changed in the pull, when force_deps=True is passed, or when the
+            # installed package versions have drifted from the pyproject pins
+            # (e.g., pyproject was bumped on an earlier pull that skipped reinstall).
+            deps_rebuilt = False
+            deps_error = ""
+            deps_drift: list[dict] = []
+            try:
+                if before_hash != after_hash:
+                    changed = sp.check_output(
+                        ["git", "diff", "--name-only", before_hash, after_hash, "--",
+                         "pyproject.toml", "uv.lock"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
+                    ).decode().strip()
+                else:
+                    changed = ""
+
+                # Auto-deps drift check: compare installed versions to pyproject pins
+                # independently of git diff. Catches the "pyproject bumped earlier,
+                # routine restart skipped reinstall" case that force_deps used to
+                # paper over manually.
+                try:
+                    deps_drift = _check_installed_deps_drift(repo_dir)
+                except Exception as drift_exc:
+                    _log(f"admin: deps drift check failed (non-fatal): {drift_exc}")
+                    deps_drift = []
+
+                if changed or force_deps or deps_drift:
+                    # Prefer project venv pip if present, else use the running daemon's
+                    # interpreter (sys.executable). This works for both venv and
+                    # system-python deployments — the prior `.venv/bin/pip`-only path
+                    # silently skipped rebuilds on system-python hosts.
+                    venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
+                    if venv_pip.exists():
+                        pip_cmd = [str(venv_pip), "install", "-e", ".[all]", "--quiet"]
+                    else:
+                        # PEP 668: system pythons (Homebrew, Debian) mark themselves
+                        # externally-managed. --break-system-packages lets us install
+                        # into the same env the daemon imports from.
+                        pip_cmd = [
+                            sys.executable, "-m", "pip", "install",
+                            "-e", ".[all]", "--quiet", "--break-system-packages",
+                        ]
+                    sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180)
+                    deps_rebuilt = True
+            except sp.CalledProcessError as e:
+                deps_error = f"pip install failed: {e.output.decode()[:500] if e.output else e}"
+                _log(f"admin: {deps_error}")
+            except Exception as e:
+                deps_error = f"deps rebuild failed: {e}"
+                _log(f"admin: {deps_error}")
+
+            # Always rebuild frontend on update to keep compiled assets fresh
+            frontend_rebuilt = False
+            frontend_error = ""
+            frontend_manifest: dict | None = None
+            try:
+                fe_dir = str(Path(repo_dir) / "frontend-svelte")
+                npm_path = shutil.which("npm")
+                if npm_path and Path(fe_dir).exists():
+                    _log("admin: rebuilding frontend...")
+                    sp.check_output(
+                        [npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
+                    )
+                    sp.check_output(
+                        [npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
+                    )
+                    frontend_rebuilt = True
+                elif not npm_path:
+                    frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
+                    _log(f"admin: {frontend_error}")
+            except Exception as e:
+                frontend_error = f"Frontend build failed: {e}"
+                _log(f"admin: {frontend_error}")
+
+            if frontend_rebuilt:
+                try:
+                    frontend_manifest = _write_frontend_build_manifest(
+                        repo_dir, git_hash=after_hash,
+                    )
+                except Exception as e:
+                    frontend_error = f"Frontend build manifest failed: {e}"
+                    _log(f"admin: {frontend_error}")
+
+            frontend_status = _frontend_build_status(repo_dir, current_git_hash=after_hash)
+            app.state.frontend_build_status = frontend_status
+
+            result = {
+                "updated": True,
+                "before_hash": before_hash,
+                "after_hash": after_hash,
+                # The release actually deployed (the resolved ref when it's a tag);
+                # None for an operator-pinned commit. latest_release reports the
+                # newest tag regardless, for context.
+                "release": decision.ref if decision.kind == "release" else None,
+                "latest_release": target_tag,
+                "deploy_ref": decision.ref,
+                "deploy_kind": decision.kind,
+                "verified": decision.verified,
+                "commits": summary.splitlines() if summary else [],
+                "deps_rebuilt": deps_rebuilt,
+                "deps_error": deps_error or None,
+                "deps_drift": deps_drift,
+                "frontend_rebuilt": frontend_rebuilt,
+                "frontend_error": frontend_error or None,
+                "frontend_manifest": frontend_manifest,
+                "frontend_status": frontend_status,
+                "forced_reset": forced_reset,
+                "forced_files": forced_files,
+                "restarting": before_hash != after_hash or deps_rebuilt,
+            }
+
             return result
 
-        # Refuse before touching the working tree if verification failed.
-        if decision.error:
-            return {
-                "error": decision.error,
-                "current_release": current_tag,
-                "staying_on_version": before_hash,
-            }
-
-        # Force mode: discard local mods to TRACKED files before checkout.
-        # Untracked files (e.g. .env, local notes) are NOT touched.
-        forced_reset = False
-        forced_files: list[str] = []
-        if force:
-            try:
-                dirty = sp.check_output(
-                    ["git", "diff", "--name-only", "HEAD"],
-                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                ).decode().strip()
-                if dirty:
-                    forced_files = [f for f in dirty.splitlines() if f.strip()]
-                    sp.check_output(
-                        ["git", "checkout", "--", "."],
-                        cwd=repo_dir, stderr=sp.STDOUT, timeout=30,
-                    )
-                    forced_reset = True
-                    _log(f"admin: force=True reset {len(forced_files)} tracked file(s): {forced_files[:10]}")
-            except sp.CalledProcessError as e:
-                return {"error": f"force reset failed: {e.output.decode()[:500]}"}
-            except Exception as e:
-                _log(f"admin: force reset warning: {e}")
-
-        # Check out the resolved + verified ref (detached HEAD at the tag, or
-        # the pinned commit). Replaces `git pull origin main` so production
-        # runs exactly the verified ref, not whatever is at branch HEAD.
-        try:
-            sp.check_output(
-                ["git", "checkout", decision.ref],
-                cwd=repo_dir, stderr=sp.STDOUT, timeout=60,
-            )
-            _log(f"admin: checked out {decision.kind} {decision.ref} (verified={decision.verified})")
-        except sp.CalledProcessError as e:
-            return {"error": f"git checkout {decision.ref} failed: {e.output.decode()[:500]}"}
-
-        # After hash + commit summary
-        try:
-            after_hash = sp.check_output(
-                ["git", "rev-parse", "--short", "HEAD"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-        except Exception:
-            after_hash = "unknown"
-
-        try:
-            summary = sp.check_output(
-                ["git", "log", "--oneline", f"{before_hash}..{after_hash}"],
-                cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-            ).decode().strip()
-        except Exception:
-            summary = ""
-
-        # Detect dependency changes — rebuild whenever pyproject.toml or uv.lock
-        # changed in the pull, when force_deps=True is passed, or when the
-        # installed package versions have drifted from the pyproject pins
-        # (e.g., pyproject was bumped on an earlier pull that skipped reinstall).
-        deps_rebuilt = False
-        deps_error = ""
-        deps_drift: list[dict] = []
-        try:
-            if before_hash != after_hash:
-                changed = sp.check_output(
-                    ["git", "diff", "--name-only", before_hash, after_hash, "--",
-                     "pyproject.toml", "uv.lock"],
-                    cwd=repo_dir, stderr=sp.DEVNULL, timeout=10,
-                ).decode().strip()
-            else:
-                changed = ""
-
-            # Auto-deps drift check: compare installed versions to pyproject pins
-            # independently of git diff. Catches the "pyproject bumped earlier,
-            # routine restart skipped reinstall" case that force_deps used to
-            # paper over manually.
-            try:
-                deps_drift = _check_installed_deps_drift(repo_dir)
-            except Exception as drift_exc:
-                _log(f"admin: deps drift check failed (non-fatal): {drift_exc}")
-                deps_drift = []
-
-            if changed or force_deps or deps_drift:
-                # Prefer project venv pip if present, else use the running daemon's
-                # interpreter (sys.executable). This works for both venv and
-                # system-python deployments — the prior `.venv/bin/pip`-only path
-                # silently skipped rebuilds on system-python hosts.
-                venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
-                if venv_pip.exists():
-                    pip_cmd = [str(venv_pip), "install", "-e", ".[all]", "--quiet"]
-                else:
-                    # PEP 668: system pythons (Homebrew, Debian) mark themselves
-                    # externally-managed. --break-system-packages lets us install
-                    # into the same env the daemon imports from.
-                    pip_cmd = [
-                        sys.executable, "-m", "pip", "install",
-                        "-e", ".[all]", "--quiet", "--break-system-packages",
-                    ]
-                sp.check_output(pip_cmd, cwd=repo_dir, stderr=sp.STDOUT, timeout=180)
-                deps_rebuilt = True
-        except sp.CalledProcessError as e:
-            deps_error = f"pip install failed: {e.output.decode()[:500] if e.output else e}"
-            _log(f"admin: {deps_error}")
-        except Exception as e:
-            deps_error = f"deps rebuild failed: {e}"
-            _log(f"admin: {deps_error}")
-
-        # Always rebuild frontend on update to keep compiled assets fresh
-        frontend_rebuilt = False
-        frontend_error = ""
-        frontend_manifest: dict | None = None
-        try:
-            fe_dir = str(Path(repo_dir) / "frontend-svelte")
-            npm_path = shutil.which("npm")
-            if npm_path and Path(fe_dir).exists():
-                _log("admin: rebuilding frontend...")
-                sp.check_output(
-                    [npm_path, "install", "--silent"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
-                )
-                sp.check_output(
-                    [npm_path, "run", "build"], cwd=fe_dir, stderr=sp.STDOUT, timeout=120
-                )
-                frontend_rebuilt = True
-            elif not npm_path:
-                frontend_error = "npm not found — install Node.js 18+ to enable auto frontend builds"
-                _log(f"admin: {frontend_error}")
-        except Exception as e:
-            frontend_error = f"Frontend build failed: {e}"
-            _log(f"admin: {frontend_error}")
-
-        if frontend_rebuilt:
-            try:
-                frontend_manifest = _write_frontend_build_manifest(
-                    repo_dir, git_hash=after_hash,
-                )
-            except Exception as e:
-                frontend_error = f"Frontend build manifest failed: {e}"
-                _log(f"admin: {frontend_error}")
-
-        frontend_status = _frontend_build_status(repo_dir, current_git_hash=after_hash)
-        app.state.frontend_build_status = frontend_status
-
-        result = {
-            "updated": True,
-            "before_hash": before_hash,
-            "after_hash": after_hash,
-            # The release actually deployed (the resolved ref when it's a tag);
-            # None for an operator-pinned commit. latest_release reports the
-            # newest tag regardless, for context.
-            "release": decision.ref if decision.kind == "release" else None,
-            "latest_release": target_tag,
-            "deploy_ref": decision.ref,
-            "deploy_kind": decision.kind,
-            "verified": decision.verified,
-            "commits": summary.splitlines() if summary else [],
-            "deps_rebuilt": deps_rebuilt,
-            "deps_error": deps_error or None,
-            "deps_drift": deps_drift,
-            "frontend_rebuilt": frontend_rebuilt,
-            "frontend_error": frontend_error or None,
-            "frontend_manifest": frontend_manifest,
-            "frontend_status": frontend_status,
-            "forced_reset": forced_reset,
-            "forced_files": forced_files,
-            "restarting": before_hash != after_hash or deps_rebuilt,
-        }
+        result = await asyncio.to_thread(_run_update)
 
         # Schedule graceful restart if anything changed
-        if result["restarting"]:
+        if result.get("restarting"):
             import signal
 
             async def _delayed_exit():
@@ -9905,7 +10019,8 @@ npm run build</pre>
             result["setup_message"] = "Claude Code CLI not found. Install it first: npm install -g @anthropic-ai/claude-code"
         else:
             try:
-                proc = subprocess.run(
+                proc = await asyncio.to_thread(
+                    subprocess.run,
                     ["claude", "auth", "status"],
                     capture_output=True, text=True, timeout=10,
                 )
@@ -9922,7 +10037,8 @@ npm run build</pre>
         # ── Codex CLI auth ──
         if result["codex_installed"]:
             try:
-                proc = subprocess.run(
+                proc = await asyncio.to_thread(
+                    subprocess.run,
                     ["codex", "login", "status"],
                     capture_output=True, text=True, timeout=10,
                 )
