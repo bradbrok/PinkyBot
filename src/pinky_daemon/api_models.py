@@ -1051,3 +1051,16 @@ class PeerFleetAclSetRequest(BaseModel):
     """Replace the full peer-fleet ACL for an agent (full replacement, not merge)."""
 
     selectors: list[PeerFleetAclEntryRequest] = []
+
+
+class TmuxPaneKeysRequest(BaseModel):
+    """Operator keystrokes for the typeable pane view (terminal modal).
+
+    Exactly one of ``text`` (literal characters, no tmux keyname
+    interpretation) or ``key`` (named tmux key — Enter, Up, C-c, ... —
+    validated against ``TmuxSession.PANE_KEY_WHITELIST``) per request.
+    """
+
+    text: str = ""
+    key: str = ""
+    label: str = "main"

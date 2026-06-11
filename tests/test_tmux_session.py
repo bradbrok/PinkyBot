@@ -7731,3 +7731,128 @@ def test_stats_pending_responses_excludes_inflight_turns() -> None:
     ss._message_queue.put_nowait(_QueuedTurn(prompt="queued"))
     assert ss.stats["pending_responses"] == 1
     assert ss.stats["inflight_turns"] == 1
+
+# ──────────────────────────────────────────────────────────────────────────
+# send_literal / send_pane_keys: typeable pane view (operator input from the
+# terminal modal — born from lera's container rollout, #735)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_send_literal_passes_l_flag() -> None:
+    """Literal sends must use ``send-keys -l`` so tmux performs no keyname
+    interpretation — operator-typed "Enter" is five letters, not a submit."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.send_literal("Enter")
+
+    assert len(calls) == 1
+    args = calls[0]
+    assert args[0] == "send-keys"
+    assert "-l" in args
+    assert args[-1] == "Enter"
+    # -l must precede the text argument (tmux flag ordering).
+    assert args.index("-l") < args.index("Enter")
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_text_goes_literal() -> None:
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+    tmux.send_keys = AsyncMock(return_value=_ok())
+
+    ok = await session.send_pane_keys(text="hello")
+
+    assert ok is True
+    tmux.send_literal.assert_awaited_once_with("hello")
+    tmux.send_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_named_key_goes_send_keys() -> None:
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+    tmux.send_keys = AsyncMock(return_value=_ok())
+
+    ok = await session.send_pane_keys(key="Enter")
+
+    assert ok is True
+    tmux.send_keys.assert_awaited_once_with("Enter", enter=False)
+    tmux.send_literal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_requires_exactly_one_mode() -> None:
+    """Both or neither of text/key is a caller bug — refuse without
+    touching tmux."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+    tmux.send_keys = AsyncMock(return_value=_ok())
+
+    assert await session.send_pane_keys() is False
+    assert await session.send_pane_keys(text="x", key="Enter") is False
+    tmux.send_literal.assert_not_awaited()
+    tmux.send_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_rejects_non_whitelisted_key() -> None:
+    """Key names outside PANE_KEY_WHITELIST never reach tmux — the
+    whitelist is the API's security boundary for named keys."""
+    session, tmux = _make_session()
+    tmux.send_keys = AsyncMock(return_value=_ok())
+
+    assert await session.send_pane_keys(key="C-d") is False
+    assert await session.send_pane_keys(key="kill-server") is False
+    tmux.send_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_rejects_control_chars_in_text() -> None:
+    """Control bytes in the literal channel never reach tmux — a literal
+    "\\x04" is C-d in the pane, which would bypass the named-key
+    whitelist's explicit C-d exclusion."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+
+    assert await session.send_pane_keys(text="\x04") is False  # C-d
+    assert await session.send_pane_keys(text="ok\x04") is False  # embedded
+    assert await session.send_pane_keys(text="\x1b[A") is False  # raw ESC seq
+    assert await session.send_pane_keys(text="\x7f") is False  # DEL
+    assert await session.send_pane_keys(text="a\nb") is False  # newline
+    tmux.send_literal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_allows_printable_text() -> None:
+    """The control-char guard must not over-reject: printable ASCII,
+    spaces, and non-ASCII (IME input, emoji) all pass through."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+
+    assert await session.send_pane_keys(text="ls -la ~/файл 🐈") is True
+    tmux.send_literal.assert_awaited_once_with("ls -la ~/файл 🐈")
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_swallows_exceptions() -> None:
+    """Same defensive posture as get_pane_snapshot/resize_pane: a tmux
+    blip logs + returns False, never raises into the API layer."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(side_effect=RuntimeError("kaboom"))
+
+    assert await session.send_pane_keys(text="x") is False
+
+
+@pytest.mark.asyncio
+async def test_send_pane_keys_false_on_tmux_failure() -> None:
+    session, tmux = _make_session()
+    tmux.send_keys = AsyncMock(return_value=_fail("no server running"))
+
+    assert await session.send_pane_keys(key="Enter") is False
