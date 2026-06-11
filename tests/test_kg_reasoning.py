@@ -103,6 +103,19 @@ class TestKGWhatChanged:
             result = store.kg_what_changed(since=since)
             assert result["counts"]["added"] >= 1
 
+    def test_bare_year_is_year_not_epoch(self, store):
+        """since='2099' means the year 2099, not 2099 epoch seconds (1970)."""
+        store.kg_add("Brad", "uses", "Python")
+        result = store.kg_what_changed(since="2099")
+        assert result["counts"]["added"] == 0
+
+    def test_epoch_since_still_parses(self, store):
+        store.kg_add("Brad", "uses", "Python")
+        # Float epoch and a >4-digit integer epoch both stay epoch-parsed
+        for since in ("946684800.0", "946684800"):  # 2000-01-01 UTC
+            result = store.kg_what_changed(since=since)
+            assert result["counts"]["added"] >= 1
+
     def test_malformed_since_safe(self, store):
         store.kg_add("Brad", "uses", "Python")
         # garbage falls back to "everything changed", never raises

@@ -257,6 +257,14 @@ class TestKGExtractorWithMockLLM:
             def kg_query(self, entity="", predicate="", include_expired=False, limit=10):
                 return self.queries  # Pre-populated for conflict tests
 
+            def kg_has_active_triple(self, subject, predicate, obj):
+                return any(
+                    q["subject"].lower() == subject.lower()
+                    and q["predicate"].lower() == predicate.lower()
+                    and q["object"].lower() == obj.lower()
+                    for q in self.queries
+                )
+
         return MockStore()
 
     def test_basic_extraction(self):
@@ -360,6 +368,29 @@ class TestKGExtractorWithMockLLM:
         extractor = KGExtractor(store=store, llm_caller=lambda p: llm_response)
 
         result = extractor.extract_from_reflection("ref1", "Brad uses Python for all his projects")
+        assert result.total_added == 0
+        assert len(result.triples_skipped) == 1
+        assert "duplicate" in result.triples_skipped[0]["reason"]
+
+    def test_dedupe_sees_triples_beyond_recent_window(self, tmp_path):
+        """Dedupe must be an exact-match existence check, not a scan of the 10
+        most recent triples; busy subjects regrow duplicates otherwise."""
+        from pinky_memory.store import ReflectionStore
+
+        store = ReflectionStore(str(tmp_path / "kg.db"))
+        store.kg_add("Brad", "uses", "Python")
+        # Bury the original well past any recency window
+        for i in range(12):
+            store.kg_add("Brad", "uses", f"Tool{i}")
+
+        llm_response = json.dumps([{
+            "subject": "Brad",
+            "predicate": "uses",
+            "object": "Python",
+            "confidence": 0.9,
+        }])
+        extractor = KGExtractor(store=store, llm_caller=lambda p: llm_response)
+        result = extractor.extract_from_reflection("ref1", "Brad uses Python for everything")
         assert result.total_added == 0
         assert len(result.triples_skipped) == 1
         assert "duplicate" in result.triples_skipped[0]["reason"]

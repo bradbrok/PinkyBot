@@ -231,6 +231,67 @@ class TestKeywordSearch:
         assert isinstance(score, float)
         assert "vector" in reflection.content
 
+    def test_scored_best_match_gets_highest_score(self, tmp_path):
+        """BM25 normalisation: best match -> 1.0, worst -> 0.0 (not inverted)."""
+        store = _store(tmp_path)
+        if not store._fts5_available:
+            pytest.skip("FTS5 not available")
+        both = store.insert(_fact("alpha beta gamma"))
+        one = store.insert(_fact("alpha unrelated filler"))
+        scored = dict(
+            (ref.id, score)
+            for score, ref in store.search_by_keyword_scored("alpha beta")
+        )
+        assert scored[both.id] > scored[one.id]
+        assert scored[both.id] == 1.0
+        assert scored[one.id] == 0.0
+
+    def test_fts5_fallback_preserves_type_exclude(self, tmp_path):
+        """A query that breaks FTS5 syntax falls back to LIKE; the fallback
+        must still honour type_exclude."""
+        store = _store(tmp_path)
+        # Double quote in the token breaks the manually built MATCH expression
+        query = 'cool"stuff'
+        store.insert(Reflection(
+            type=ReflectionType.insight, content='cool"stuff should be excluded',
+        ))
+        store.insert(_fact('cool"stuff should remain'))
+        results = store.search_by_keyword_scored(
+            query, type_exclude=[ReflectionType.insight],
+        )
+        assert results, "fallback should still match by LIKE"
+        assert all(ref.type != ReflectionType.insight for _, ref in results)
+
+    def test_search_batches_access_tracking(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("touch tracking sample"))
+        store.search_by_keyword("touch tracking")
+        assert store.get(r.id).access_count == 1
+
+    def test_fts_update_trigger_is_column_scoped(self, tmp_path):
+        """Access-tracking UPDATEs must not churn the FTS index; the update
+        trigger only fires for indexed columns and still reindexes content."""
+        store = _store(tmp_path)
+        if not store._fts5_available:
+            pytest.skip("FTS5 not available")
+        sql = store._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'reflections_au'"
+        ).fetchone()[0]
+        assert "AFTER UPDATE OF" in sql
+        # Content changes still propagate to the index
+        r = store.insert(_fact("original searchable phrase"))
+        store._conn.execute(
+            "UPDATE reflections SET content = ? WHERE id = ?",
+            ("replacement findable text", r.id),
+        )
+        store._conn.commit()
+        assert any(
+            x.id == r.id for x in store.search_by_keyword("replacement findable")
+        )
+        assert all(
+            x.id != r.id for x in store.search_by_keyword("original searchable")
+        )
+
     def test_search_respects_active_filter(self, tmp_path):
         store = _store(tmp_path)
         r = store.insert(_fact("inactive keyword test"))
@@ -666,6 +727,55 @@ class TestMemoryEvents:
         # Source should be reactivated
         assert store.get(r.id).active is True
 
+    def test_revert_decay_restores_weight_not_salience(self, tmp_path):
+        """Decay revert must restore the 0-1 weight from metadata, never write
+        the 1-5 salience integer into the weight column."""
+        store = _store(tmp_path)
+        r = store.insert(_fact("decayed", salience=5))
+        store._conn.execute(
+            "UPDATE reflections SET weight = 0.05, active = 0 WHERE id = ?", (r.id,)
+        )
+        store._conn.commit()
+        event_id = store.log_memory_event(
+            "decay",
+            source_ids=[r.id],
+            prior_salience=5,
+            metadata={"prior_weight": 0.8, "archived": True},
+        )
+        assert store.revert_memory_event(event_id) is True
+        fetched = store.get(r.id)
+        assert fetched.active is True
+        assert abs(fetched.weight - 0.8) < 0.001
+
+    def test_revert_decay_without_prior_weight_keeps_weight(self, tmp_path):
+        """Old-style decay events (no prior_weight metadata) must not corrupt
+        weight with the salience integer."""
+        store = _store(tmp_path)
+        r = store.insert(_fact("decayed", salience=4))
+        store._conn.execute(
+            "UPDATE reflections SET weight = 0.4, active = 0 WHERE id = ?", (r.id,)
+        )
+        store._conn.commit()
+        event_id = store.log_memory_event(
+            "decay", source_ids=[r.id], prior_salience=4, metadata={"archived": True},
+        )
+        assert store.revert_memory_event(event_id) is True
+        fetched = store.get(r.id)
+        assert fetched.active is True
+        assert fetched.weight <= 1.0
+
+    def test_revert_archive_event_reactivates(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("archived memory"))
+        store.archive_reflection(r.id, reason="cleanup")
+        assert store.get(r.id).active is False
+        event = store._conn.execute(
+            "SELECT id FROM memory_events WHERE event_type = 'archive' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()
+        assert store.revert_memory_event(event["id"]) is True
+        assert store.get(r.id).active is True
+
     def test_revert_unknown_event_type_returns_false(self, tmp_path):
         store = _store(tmp_path)
         r = store.insert(_fact("x"))
@@ -1073,3 +1183,24 @@ class TestConsolidateBatch:
         # One should be deactivated as duplicate
         active_count = sum(1 for rid in [r1.id, r2.id] if store.get(rid).active)
         assert active_count <= 2  # at most kept one
+
+    def test_consolidate_deactivated_ref_cannot_win(self, tmp_path):
+        """Once a batch reflection loses a merge, it must stop consuming
+        candidates: an inactive reflection must never archive active memories
+        (that would leave a supersession chain pointing at an inactive row)."""
+        store = _store(tmp_path)
+        emb = _emb()
+        winner = store.insert(_fact("canonical version", embedding=emb, salience=5))
+        perturbed = [x + 0.001 for x in emb]
+        mag = sum(x * x for x in perturbed) ** 0.5
+        perturbed = [x / mag for x in perturbed]
+        weak = store.insert(_fact("weak near duplicate", embedding=perturbed, salience=1))
+        ref = store.insert(_fact("new near duplicate", embedding=emb, salience=2))
+
+        store.consolidate_batch([ref.id], merge_threshold=0.85)
+
+        # ref lost to the high-salience canonical version...
+        assert store.get(ref.id).active is False
+        assert store.get(ref.id).superseded_by == winner.id
+        # ...and must not have gone on to archive the weaker active memory
+        assert store.get(weak.id).active is True

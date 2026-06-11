@@ -397,16 +397,7 @@ class KGExtractor:
                     continue  # Older than existing — skip
 
             # Dedupe: skip if an identical active triple already exists
-            existing_dupes = self._store.kg_query(
-                entity=t.subject, predicate=t.predicate,
-                include_expired=False, limit=10,
-            )
-            is_dupe = any(
-                e["subject"].lower() == t.subject.lower()
-                and e["object"].lower() == t.object.lower()
-                for e in existing_dupes
-            )
-            if is_dupe:
+            if self._store.kg_has_active_triple(t.subject, t.predicate, t.object):
                 result.triples_skipped.append({
                     "subject": t.subject, "predicate": t.predicate,
                     "object": t.object, "reason": "duplicate active triple",
