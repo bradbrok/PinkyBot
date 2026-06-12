@@ -1019,8 +1019,9 @@ class ReflectionStore:
         if not tokens:
             return []
 
-        # Use OR matching so partial keyword hits still return results
-        fts_query = " OR ".join(f'"{t}"' for t in tokens)
+        # Use OR matching so partial keyword hits still return results.
+        # Escape internal quotes so user input can't break FTS5 query syntax.
+        fts_query = " OR ".join('"' + t.replace('"', '""') + '"' for t in tokens)
 
         # Join FTS5 with the main table for filtering + full row data.
         # FTS5 MATCH goes in the WHERE clause alongside other filters.

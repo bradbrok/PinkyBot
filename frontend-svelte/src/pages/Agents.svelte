@@ -638,10 +638,11 @@
             provider_model: providerModel,
             provider_ref: providerRef,
         };
-        // Only send a key the user actually typed; absent means "keep the saved key".
+        // Send the key the user typed; or explicitly clear it when resetting to Anthropic.
         if (providerKey) body.provider_key = providerKey;
+        else if (!providerUrl && !providerRef) body.provider_key = '';
         await api('PUT', `/agents/${currentAgent}/provider`, body);
-        providerKeySet = providerKeySet || !!providerKey;
+        providerKeySet = providerKey ? true : (providerUrl || providerRef ? providerKeySet : false);
         providerKey = '';
         providerDirty = false;
         toast('Provider saved — restart session to apply');
