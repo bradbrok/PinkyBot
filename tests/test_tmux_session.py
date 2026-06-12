@@ -96,9 +96,28 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     """
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "pinky-test"
-    tmux.has_session = AsyncMock(return_value=has_session_initial)
-    tmux.new_session = AsyncMock(return_value=_ok())
-    tmux.kill_session = AsyncMock(return_value=_ok())
+    # ``has_session`` tracks real tmux lifecycle: it reports
+    # ``has_session_initial`` until ``new_session`` is awaited (the
+    # pre-spawn stale-reap check), then True (a live REPL keeps the
+    # session alive — so the post-launch liveness check passes), and
+    # False again after ``kill_session``. Tests that simulate a REPL
+    # dying on launch override ``has_session`` directly.
+    _alive = {"v": has_session_initial}
+
+    async def _has_session() -> bool:
+        return _alive["v"]
+
+    async def _new_session(*_a, **_k) -> TmuxCommandResult:
+        _alive["v"] = True
+        return _ok()
+
+    async def _kill_session(*_a, **_k) -> TmuxCommandResult:
+        _alive["v"] = False
+        return _ok()
+
+    tmux.has_session = AsyncMock(side_effect=_has_session)
+    tmux.new_session = AsyncMock(side_effect=_new_session)
+    tmux.kill_session = AsyncMock(side_effect=_kill_session)
     tmux.send_keys = AsyncMock(return_value=_ok())
     tmux.paste_text = AsyncMock(return_value=_ok())
     tmux.capture_pane = AsyncMock(return_value=_ok())
@@ -138,6 +157,15 @@ def _make_session(
     if state is not None:
         ss._state_machine._state = state
     return ss, tmux
+
+
+@pytest.fixture(autouse=True)
+def _fast_repl_liveness(monkeypatch):
+    """Zero the post-launch liveness grace/poll so unit tests don't sleep
+    real seconds. The liveness *logic* (retry on dead REPL) is exercised
+    via the mock's ``has_session`` flipping, independent of wall-clock."""
+    monkeypatch.setattr(tmux_session, "_REPL_LIVENESS_GRACE_SEC", 0.0)
+    monkeypatch.setattr(tmux_session, "_REPL_LIVENESS_POLL_SEC", 0.0)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -267,6 +295,95 @@ async def test_cold_start_omits_continue_when_no_prior_transcript(
     assert "--dangerously-skip-permissions" in cmd
     # The critical assertion — no --continue when no prior transcript.
     assert "--continue" not in cmd
+
+
+@pytest.mark.asyncio
+async def test_continue_relaunches_fresh_when_repl_dies_on_launch(
+    tmp_path, monkeypatch
+) -> None:
+    """Regression: a ``*.jsonl`` exists so ``_has_prior_transcript`` is
+    True and the first launch uses ``--continue`` — but the newest
+    transcript isn't interactive-resumable (e.g. SDK-origin after an
+    SDK→tmux transport switch), so ``claude --continue`` exits 1 and the
+    detached session is auto-reaped. The cold-start must detect the dead
+    REPL and retry ONCE with a fresh launch (no ``--continue``) so the
+    agent comes up instead of wedging CONNECTED-against-dead-REPL.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    tmux = _make_mock_tmux()
+    spawn_count = {"n": 0}
+
+    async def _new_session(*_a, **_k) -> TmuxCommandResult:
+        spawn_count["n"] += 1
+        return _ok()
+
+    async def _has_session() -> bool:
+        # Dead after the 1st (--continue) spawn; alive after the 2nd (fresh).
+        return spawn_count["n"] >= 2
+
+    tmux.new_session = AsyncMock(side_effect=_new_session)
+    tmux.has_session = AsyncMock(side_effect=_has_session)
+    ss, _ = _make_session(tmux=tmux)
+    project_dir = ss._project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "seed.jsonl").write_text("")
+
+    await ss.connect()
+
+    assert ss.state == SessionState.CONNECTED
+    assert tmux.new_session.await_count == 2
+    first_cmd = tmux.new_session.call_args_list[0].kwargs["command"]
+    second_cmd = tmux.new_session.call_args_list[1].kwargs["command"]
+    assert "--continue" in first_cmd
+    assert "--continue" not in second_cmd
+
+
+@pytest.mark.asyncio
+async def test_repl_dead_even_after_fresh_retry_raises(tmp_path, monkeypatch) -> None:
+    """If the REPL dies on launch even after the fresh retry, that's a
+    genuine cold-start failure (not an unresumable-transcript issue) —
+    raise so the caller transitions DEAD rather than retrying forever.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    tmux = _make_mock_tmux()
+
+    async def _has_session() -> bool:
+        return False  # REPL never survives launch
+
+    tmux.has_session = AsyncMock(side_effect=_has_session)
+    ss, _ = _make_session(tmux=tmux)
+    project_dir = ss._project_dir()
+    project_dir.mkdir(parents=True, exist_ok=True)
+    (project_dir / "seed.jsonl").write_text("")
+
+    with pytest.raises(RuntimeError, match="genuine cold-start failure"):
+        await ss.connect()
+    assert ss.state == SessionState.DEAD
+    # Original --continue spawn + exactly one fresh retry (no infinite loop).
+    assert tmux.new_session.await_count == 2
+
+
+@pytest.mark.asyncio
+async def test_fresh_launch_skips_liveness_retry(tmp_path, monkeypatch) -> None:
+    """A fresh launch (no prior transcript → no ``--continue``) is never
+    subject to the died-on-launch retry, even if ``has_session`` reports
+    dead — only ``--continue`` launches can hit the 'no conversation
+    found' exit, so the liveness check is gated on that.
+    """
+    # Empty HOME → no transcript → fresh launch.
+    monkeypatch.setenv("HOME", str(tmp_path))
+    tmux = _make_mock_tmux()
+
+    async def _has_session() -> bool:
+        return False
+
+    tmux.has_session = AsyncMock(side_effect=_has_session)
+    ss, _ = _make_session(tmux=tmux)
+
+    await ss.connect()
+
+    # Exactly one spawn: the liveness/retry path is skipped for fresh launches.
+    assert tmux.new_session.await_count == 1
 
 
 def test_has_prior_transcript_false_when_project_dir_missing(
@@ -1051,7 +1168,7 @@ def test_build_repl_env_omits_agent_key_when_none(monkeypatch) -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_cold_start_runs_one_tmux_spawn() -> None:
+async def test_concurrent_cold_start_runs_one_tmux_spawn(tmp_path, monkeypatch) -> None:
     """PR6's canonical concurrent-connect race regression, applied to the
     greenfield tmux backend. Two concurrent connect() calls must result
     in exactly one tmux new-session.
@@ -1062,6 +1179,12 @@ async def test_concurrent_cold_start_runs_one_tmux_spawn() -> None:
     the same-target in-flight branch — subscribes via InFlightHandle,
     inherits the owner's CONNECTED outcome.
     """
+    # Isolate HOME → no prior transcript → fresh launch. Keeps this dedup
+    # test deterministic (independent of stray real-HOME transcripts) and
+    # off the ``--continue`` liveness-retry path, which is covered by its
+    # own tests and would otherwise re-spawn against this mock's blocking
+    # ``new_session`` (which doesn't simulate a live REPL).
+    monkeypatch.setenv("HOME", str(tmp_path))
     tmux = _make_mock_tmux()
     release_spawn = asyncio.Event()
     spawn_started = asyncio.Event()
@@ -1230,7 +1353,7 @@ async def test_warm_wake_failure_drives_to_dead() -> None:
 
 
 @pytest.mark.asyncio
-async def test_concurrent_warm_wake_runs_one_spawn() -> None:
+async def test_concurrent_warm_wake_runs_one_spawn(tmp_path, monkeypatch) -> None:
     """Concurrent connect() on an IDLE_SLEEPING session must result in
     exactly one tmux spawn. Same shape as the cold-start Case A
     regression — caller A wins RECONNECTING ownership, caller B
@@ -1240,6 +1363,12 @@ async def test_concurrent_warm_wake_runs_one_spawn() -> None:
     direct-mutated CONNECTED — double-spawn, no subscriber protection.
     Post-fix: matrix subscriber path applies to warm-wake too.
     """
+    # Isolate HOME → no prior transcript → fresh launch. Keeps this dedup
+    # test deterministic (independent of stray real-HOME transcripts) and
+    # off the ``--continue`` liveness-retry path, which is covered by its
+    # own tests and would otherwise re-spawn against this mock's blocking
+    # ``new_session`` (which doesn't simulate a live REPL).
+    monkeypatch.setenv("HOME", str(tmp_path))
     tmux = _make_mock_tmux()
     release_spawn = asyncio.Event()
     spawn_started = asyncio.Event()

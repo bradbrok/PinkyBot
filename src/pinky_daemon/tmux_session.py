@@ -747,6 +747,20 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
+# Post-launch liveness window: how long to confirm the in-pane ``claude``
+# REPL actually survived after ``tmux new-session`` returns rc=0. A
+# ``claude --continue`` that finds no *resumable* conversation exits
+# almost immediately ("no conversation found to continue"); the detached
+# session (no remain-on-exit) is then auto-reaped, so ``new-session``'s
+# rc=0 is NOT proof of a live REPL. ``_has_prior_transcript`` can't catch
+# this — it only checks that *some* ``*.jsonl`` exists, not that the
+# newest one is interactive-resumable (notably an SDK-origin transcript
+# left behind after an SDK→tmux transport switch). We poll ``has-session``
+# over this window; only paid on ``--continue`` launches, so healthy fresh
+# boots cost nothing and a dead REPL is detected fast (early-return).
+_REPL_LIVENESS_GRACE_SEC = 2.0
+_REPL_LIVENESS_POLL_SEC = 0.25
+
 # Per-turn timeout: how long ANY single in-flight turn can be at the
 # HEAD of ``_inflight_metas`` without its ``stop_hook_summary`` landing
 # before the watchdog considers it stuck and triggers ``force_restart``.
@@ -2166,6 +2180,55 @@ class TmuxSession:
                 f"{_COLD_START_TIMEOUT_SEC}s"
             ) from None
 
+        # ``tmux new-session`` returning rc=0 means the session was
+        # created, NOT that the REPL is alive. ``claude --continue``
+        # exits 1 when the newest transcript for cwd isn't interactive-
+        # resumable — the classic trigger is SDK-origin transcripts left
+        # behind after an SDK→tmux transport switch. ``_has_prior_transcript``
+        # green-lights ``--continue`` (a ``*.jsonl`` does exist), the REPL
+        # dies on boot, and the detached session is auto-reaped — leaving
+        # the state machine CONNECTED against a dead REPL and warm-wakes
+        # crash-looping forever. Detect the dead REPL and retry ONCE with
+        # a forced-fresh launch so the agent comes up on a new transcript
+        # instead of wedging. Only ``--continue`` launches can hit this,
+        # so healthy fresh boots pay nothing. Builds on #511 (which only
+        # gates ``--continue`` on file existence).
+        if self._last_launch_used_continue and not await self._verify_repl_survived_launch():
+            _log(
+                f"tmux[{self.agent_name}]: --continue REPL died on launch "
+                f"(unresumable transcript for cwd); retrying with fresh context"
+            )
+            # Reap any remnant, then re-launch fresh. Setting the one-shot
+            # flag makes ``_build_claude_cmd`` drop ``--continue``; it is
+            # consumed at the end of this method once the launch succeeds
+            # as a unit (REPL + tailer).
+            try:
+                await self._tmux.kill_session()
+            except Exception:
+                pass
+            self._config.force_fresh_context_once = True
+            claude_cmd = self._build_claude_cmd()
+            try:
+                await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
+            except asyncio.TimeoutError:
+                try:
+                    await self._tmux.kill_session()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: cold-start timed out after "
+                    f"{_COLD_START_TIMEOUT_SEC}s (fresh retry)"
+                ) from None
+            if not await self._verify_repl_survived_launch():
+                try:
+                    await self._tmux.kill_session()
+                except Exception:
+                    pass
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: REPL died on launch even with "
+                    f"fresh context — genuine cold-start failure"
+                )
+
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
         # the end of this method (after tailer startup also succeeds),
         # NOT here — see the load-bearing comment at the consume site
@@ -2210,6 +2273,35 @@ class TmuxSession:
         # as a complete unit.
         if self._last_launch_forced_fresh:
             self._config.force_fresh_context_once = False
+
+    async def _verify_repl_survived_launch(self) -> bool:
+        """Confirm the in-pane ``claude`` REPL is still running shortly
+        after ``tmux new-session`` returned.
+
+        ``new-session`` returns rc=0 the instant the session is created,
+        even if the command inside it (``claude``) then exits immediately.
+        The detached session has no ``remain-on-exit``, so on that exit
+        tmux auto-reaps the whole session — and a rc=0 ``new-session`` is
+        therefore NOT proof of a live REPL. The canonical trigger is
+        ``claude --continue`` exiting 1 ("no conversation found to
+        continue") when the newest transcript for cwd isn't interactive-
+        resumable (e.g. an SDK-origin transcript after an SDK→tmux
+        transport switch).
+
+        We poll ``has-session`` over a short grace window: a healthy REPL
+        keeps the session alive (returns True once the window elapses); a
+        died-on-launch REPL gets reaped, so the first poll that sees the
+        session gone returns False immediately (fast recovery — no need to
+        wait out the full window). Returns True if the session is still
+        alive at the end of the window, False if it vanished.
+        """
+        deadline = time.monotonic() + _REPL_LIVENESS_GRACE_SEC
+        while True:
+            if not await self._tmux.has_session():
+                return False
+            if time.monotonic() >= deadline:
+                return True
+            await asyncio.sleep(_REPL_LIVENESS_POLL_SEC)
 
     def _build_claude_cmd(self) -> str:
         """Build the in-pane ``claude`` invocation as a single shell string.
