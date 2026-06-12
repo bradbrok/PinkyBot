@@ -24,7 +24,7 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Artificial Intelligence",
 ]
 dependencies = [
-    "mcp>=1.27",
+    "mcp>=1.27,<2.0",
     "pydantic>=2.12",
     "pyyaml>=6.0",
     "numpy>=2.2",
