@@ -207,6 +207,7 @@ class AnalyticsStore:
             )
             self._seed_default_pricing(conn)
             self._migrate_opus_haiku_seed_pricing(conn)
+            self._migrate_legacy_dotted_model_ids(conn)
             # Schema migration: add user_message_snippet to turn_usage
             cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(analytics_turn_usage)").fetchall()
@@ -269,17 +270,17 @@ class AnalyticsStore:
             ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
             ("anthropic", "claude-opus-4-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
             # Pre-4.5 Opus stays on the legacy $15/$75 tier.
-            ("anthropic", "claude-opus-4.1", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
+            ("anthropic", "claude-opus-4-1", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-sonnet-4-6", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-4-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-4", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            ("anthropic", "claude-sonnet-3.7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            ("anthropic", "claude-sonnet-3.5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
+            ("anthropic", "claude-sonnet-3-7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
+            ("anthropic", "claude-sonnet-3-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             # Haiku 4.5 is the $1/$5 tier; 0.80/4.00/0.08 was the old Haiku 3.5
             # price. Corrected in #669.
             ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 1.00, 5.00, 0.10, "seed"),
-            ("anthropic", "claude-haiku-3.5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
+            ("anthropic", "claude-haiku-3-5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3", "2020-01-01T00:00:00Z", None, 0.25, 1.25, 0.03, "seed"),
         ]
         conn.executemany(
@@ -361,6 +362,59 @@ class AnalyticsStore:
                 )
         # Drop the lazily-built cache so corrected rows are read next lookup.
         self._pricing_cache = None
+
+    # Legacy seed rows that used a dotted minor-version id, mapped to the
+    # canonical hyphenated form pinky_daemon.pricing.RATE_TABLE / the Anthropic
+    # API use. _seed_default_pricing now emits the canonical form directly; this
+    # corrects DBs seeded before #759.
+    _LEGACY_DOTTED_MODEL_IDS = {
+        "claude-opus-4.1": "claude-opus-4-1",
+        "claude-sonnet-3.7": "claude-sonnet-3-7",
+        "claude-sonnet-3.5": "claude-sonnet-3-5",
+        "claude-haiku-3.5": "claude-haiku-3-5",
+    }
+
+    def _migrate_legacy_dotted_model_ids(self, conn) -> None:
+        """Rename dotted legacy seed ids to the canonical hyphenated form (#759).
+
+        The seed historically registered some legacy models with a dotted minor
+        version (``claude-opus-4.1``, ``claude-sonnet-3.7/3.5``,
+        ``claude-haiku-3.5``) that never matched ``pricing.RATE_TABLE`` or the
+        Anthropic API ids — so the rows were dead to canonical lookups and sat
+        outside the #669 parity drift-guard. ``_seed_default_pricing`` now emits
+        the canonical form, but ``_seed_default_pricing`` only runs on an empty
+        table, so deployed DBs keep the dotted rows; this corrects them on init.
+
+        Safe/idempotent: only ``notes='seed'`` rows are touched (operator
+        overrides are left alone); if a canonical seed row already exists the
+        dotted dupe is dropped instead of renamed (no UNIQUE constraint on the
+        table, so a blind rename could otherwise duplicate); after the first run
+        no dotted rows remain, so a second run is a no-op.
+        """
+        touched = False
+        for dotted, canonical in self._LEGACY_DOTTED_MODEL_IDS.items():
+            canonical_exists = conn.execute(
+                "SELECT 1 FROM analytics_model_pricing "
+                "WHERE provider='anthropic' AND model=? AND notes='seed' LIMIT 1",
+                (canonical,),
+            ).fetchone()
+            if canonical_exists:
+                cur = conn.execute(
+                    "DELETE FROM analytics_model_pricing "
+                    "WHERE provider='anthropic' AND model=? AND notes='seed'",
+                    (dotted,),
+                )
+            else:
+                cur = conn.execute(
+                    "UPDATE analytics_model_pricing SET model=? "
+                    "WHERE provider='anthropic' AND model=? AND notes='seed'",
+                    (canonical, dotted),
+                )
+            if cur.rowcount:
+                touched = True
+        if touched:
+            # Drop the lazily-built cache so renamed rows are read next lookup.
+            self._pricing_cache = None
 
     def ensure_session_fact(
         self,
