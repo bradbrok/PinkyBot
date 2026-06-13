@@ -15,6 +15,7 @@ round-trip over Tailscale:
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import tempfile
@@ -648,3 +649,71 @@ class TestAclAddressFormMatching:
             from_="ferry://tod/onesie",
         )
         assert status == "rejected"
+
+
+# -- Listener startup (regression: capture_signals override must be a CM) ------
+
+
+@pytest.mark.asyncio
+class TestFerryListenerStartup:
+    """Actually start the ferry uvicorn.Server the way __main__ does — with the
+    capture_signals override — and confirm it serves /ferry/health.
+
+    Regression for: uvicorn's serve() does `with self.capture_signals():`, so
+    overriding capture_signals with `lambda: None` makes `with None:` raise
+    "'NoneType' object does not support the context manager protocol" and the
+    listener never binds. The override must return a context manager
+    (contextlib.nullcontext). A unit test of the app alone would NOT catch this
+    — it only manifests through a real uvicorn.Server.serve().
+    """
+
+    async def test_listener_serves_with_capture_signals_override(self):
+        import contextlib as _ctx
+        import json as _json
+        import socket
+        import urllib.request
+
+        import uvicorn
+
+        s = socket.socket()
+        s.bind(("127.0.0.1", 0))
+        port = s.getsockname()[1]
+        s.close()
+
+        cfg = FerryConfig.from_env(
+            {
+                "PINKYBOT_FERRY_ENABLED": "1",
+                "PINKYBOT_FERRY_SHARED_SECRET": "s",
+                "PINKYBOT_FERRY_BIND_HOST": "127.0.0.1",
+                "PINKYBOT_FLEET_NAME": "mini",
+            }
+        )
+        app = build_ferry_app(
+            host_pinky=_FakeHostPinky(DeliveryResult(status="delivered")), config=cfg
+        )
+        server = uvicorn.Server(
+            uvicorn.Config(app, host="127.0.0.1", port=port, log_level="warning")
+        )
+        # Mirror __main__: no-op CONTEXT MANAGER (the bug was `lambda: None`).
+        server.capture_signals = lambda: _ctx.nullcontext()
+
+        task = asyncio.create_task(server.serve())
+        try:
+            for _ in range(100):
+                if getattr(server, "started", False):
+                    break
+                await asyncio.sleep(0.05)
+            assert getattr(server, "started", False), "ferry listener failed to start"
+
+            def _get():
+                with urllib.request.urlopen(
+                    f"http://127.0.0.1:{port}/ferry/health", timeout=5
+                ) as r:
+                    return r.getcode(), r.read()
+
+            code, body = await asyncio.to_thread(_get)
+            assert code == 200
+            assert _json.loads(body)["ok"] is True
+        finally:
+            server.should_exit = True
+            await asyncio.gather(task, return_exceptions=True)
