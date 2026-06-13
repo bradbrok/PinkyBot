@@ -213,3 +213,68 @@ class TestReindex:
         kb.ingest(title="Searchable", content="unique keyword xyzzy")
         kb.reindex()
         assert len(kb.search("xyzzy")) == 1
+
+
+class TestUpsertSnapshot:
+    """Idempotent singleton snapshots keyed by source_url (issue #703).
+
+    The nightly people-profiles / project-state snapshots re-file under a
+    constant source_url. A second call must REPLACE in place, never a second
+    INSERT (which trips the UNIQUE raw_sources.source_url index).
+    """
+
+    URL = "internal://people-profiles-snapshot"
+
+    def test_first_call_inserts(self, kb):
+        s = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="v1 body")
+        assert s.source_url == self.URL
+        assert (kb.kb_dir / s.file_path).exists()
+        assert kb.count_raw() == 1
+
+    def test_repeat_call_replaces_in_place(self, kb):
+        s1 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="version one")
+        # Pre-#703 this second call raised: UNIQUE constraint failed.
+        s2 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="version two now")
+        # Replaced, not duplicated.
+        assert s2.id == s1.id
+        assert kb.count_raw() == 1
+        # File holds the new content, not the old.
+        body = (kb.kb_dir / s2.file_path).read_text()
+        assert "version two now" in body
+        assert "version one" not in body
+        # FTS reflects the new content (old tokens gone).
+        assert len(kb.search("two")) == 1
+        assert len(kb.search("one")) == 0
+
+    def test_replaces_after_backing_file_deleted(self, kb):
+        s1 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="v1")
+        # Orphan the row: drop the file but leave the DB row + its UNIQUE url.
+        (kb.kb_dir / s1.file_path).unlink()
+        # Must re-create cleanly, not collide on the UNIQUE source_url index.
+        s2 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="v2 reborn")
+        assert (kb.kb_dir / s2.file_path).exists()
+        assert "v2 reborn" in (kb.kb_dir / s2.file_path).read_text()
+        assert kb.count_raw() == 1
+
+    def test_distinct_urls_coexist(self, kb):
+        a = kb.upsert_snapshot(source_url="internal://people", title="People", content="aaa")
+        b = kb.upsert_snapshot(source_url="internal://projects", title="Projects", content="bbb")
+        assert a.id != b.id
+        assert kb.count_raw() == 2
+
+    def test_replacement_bumps_filed_at_for_rediscovery(self, kb):
+        # The librarian discovers work via list_raw(since=last_run), which
+        # filters filed_at > last_run. If a replacement keeps the original
+        # filed_at, curation silently misses every snapshot after the first
+        # once the watermark has advanced (issue #703 P1, caught in review).
+        s1 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="first")
+        first_filed_at = s1.filed_at
+        # Simulate the librarian having curated up to s1: nothing is newer.
+        assert kb.list_raw(since=first_filed_at) == []
+
+        s2 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="second")
+        assert s2.id == s1.id
+        # filed_at advanced, so the since-watermark query re-sees the snapshot.
+        assert s2.filed_at > first_filed_at
+        rediscovered = kb.list_raw(since=first_filed_at)
+        assert any(r.id == s1.id for r in rediscovered)

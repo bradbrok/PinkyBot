@@ -3212,44 +3212,40 @@ def create_api(
         if not content or not content.strip():
             return False
 
-        # Check for existing source by URL (snapshot replace) or content (dedup)
+        # Snapshot sources (internal:// URLs) are singletons keyed by
+        # source_url — regenerated on a schedule and replaced in place.
+        # One-off sources are deduped by content. The snapshot path used to
+        # hand-roll a file overwrite guarded by ``Path(file_path).exists()``,
+        # but file_path is stored relative to kb_dir, so the check resolved
+        # against the wrong CWD and was always False — the overwrite was
+        # skipped and execution fell through to a second INSERT, tripping the
+        # UNIQUE raw_sources.source_url index on every run (issue #703).
         existing = kb.check_duplicate(source_url=source_url, content=content)
-        if existing:
-            if source_url and existing.source_url == source_url:
-                # Snapshot replace: overwrite the file with updated content
-                try:
-                    file_path = existing.file_path
-                    if file_path and Path(file_path).exists():
-                        from datetime import datetime
-                        from datetime import timezone as tz
-                        now_iso = datetime.now(tz.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-                        frontmatter = (
-                            f"---\nid: {existing.id}\ntitle: {title}\n"
-                            f"source_type: {source_type}\nfiled_at: {now_iso}\n"
-                            f"filed_by: {filed_by}\ntags: {tags or []}\n"
-                            f"source_url: {source_url}\n---\n\n"
-                        )
-                        Path(file_path).write_text(frontmatter + f"# {title}\n\n{content}")
-                        _log(f"kb-auto-ingest: updated snapshot '{title}' ({existing.id})")
-                        _schedule_librarian()
-                        return True
-                except Exception as e:
-                    _log(f"kb-auto-ingest: snapshot update failed for '{title}': {e}")
-                    return False
-            else:
-                # Content duplicate — skip
-                _log(f"kb-auto-ingest: skipped duplicate '{title}' (existing: {existing.id})")
-                return False
+        if existing and not (source_url and existing.source_url == source_url):
+            # Content duplicate of a different source — skip.
+            _log(f"kb-auto-ingest: skipped duplicate '{title}' (existing: {existing.id})")
+            return False
 
         try:
-            source = kb.ingest(
-                title=title,
-                content=content,
-                source_url=source_url,
-                source_type=source_type,
-                filed_by=filed_by,
-                tags=tags or [],
-            )
+            if source_url:
+                # Insert first time, replace file + DB row + FTS in place
+                # thereafter — never a second INSERT for the same URL.
+                source = kb.upsert_snapshot(
+                    source_url=source_url,
+                    title=title,
+                    content=content,
+                    source_type=source_type,
+                    filed_by=filed_by,
+                    tags=tags or [],
+                )
+            else:
+                source = kb.ingest(
+                    title=title,
+                    content=content,
+                    source_type=source_type,
+                    filed_by=filed_by,
+                    tags=tags or [],
+                )
             _log(f"kb-auto-ingest: filed '{title}' as {source.id}")
             _schedule_librarian()
             return True

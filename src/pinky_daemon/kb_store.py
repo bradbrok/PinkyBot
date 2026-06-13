@@ -438,11 +438,17 @@ class KBStore:
         source_url: str | None = None,
         source_type: str | None = None,
         owner_notes: str | None = None,
+        refresh_filed_at: bool = False,
     ) -> RawSource | None:
         """Update fields on an existing raw source.
 
         Only provided (non-None) fields are updated. Rewrites the markdown file
         and updates the DB row + FTS index.
+
+        ``refresh_filed_at`` bumps ``filed_at`` to now (off by default so a
+        manual metadata edit keeps the original file time). Snapshot
+        replacements set it so the librarian's ``list_raw(since=last_run)``
+        discovery (``filed_at > last_run``) re-sees the refreshed content.
 
         Returns:
             The updated RawSource, or None if not found.
@@ -474,6 +480,14 @@ class KBStore:
             else:
                 fm.pop("owner_notes", None)
 
+        # Snapshot replacements refresh filed_at (file + DB) so downstream
+        # discovery re-sees the new content; metadata edits leave it as-is.
+        if refresh_filed_at:
+            new_filed_at = datetime.now(timezone.utc).isoformat()
+            fm["filed_at"] = new_filed_at
+        else:
+            new_filed_at = source.filed_at
+
         # Apply content update — rebuild body section
         if content is not None:
             body = content
@@ -497,11 +511,13 @@ class KBStore:
             conn.execute(
                 """UPDATE raw_sources
                    SET title = ?, source_url = ?, source_type = ?,
-                       tags = ?, content_hash = ?, content_preview = ?
+                       tags = ?, content_hash = ?, content_preview = ?,
+                       filed_at = ?
                    WHERE id = ?""",
                 (
                     new_title, new_url, new_type,
                     json.dumps(new_tags), c_hash, c_preview,
+                    new_filed_at,
                     source_id,
                 ),
             )
@@ -524,6 +540,52 @@ class KBStore:
             conn.close()
 
         return self.get_raw(source_id)
+
+    def upsert_snapshot(
+        self,
+        *,
+        source_url: str,
+        title: str,
+        content: str,
+        source_type: str = "note",
+        filed_by: str = "system",
+        tags: list[str] | None = None,
+    ) -> RawSource:
+        """File-or-replace a singleton snapshot keyed by ``source_url``.
+
+        Scheduled snapshots (people-profiles, project-state, ...) regenerate
+        under a constant ``source_url``. The first call inserts; every later
+        call replaces the file + DB row + FTS index in place via
+        ``update_raw``. It never issues a second INSERT for the same URL,
+        which would violate the UNIQUE ``raw_sources.source_url`` index
+        (issue #703). If the row exists but its backing file has gone
+        missing, the orphan is dropped and re-created cleanly.
+        """
+        tags = tags or []
+        existing = self.check_duplicate(source_url=source_url)
+        if existing:
+            updated = self.update_raw(
+                existing.id,
+                title=title,
+                content=content,
+                tags=tags,
+                source_type=source_type,
+                source_url=source_url,
+                refresh_filed_at=True,
+            )
+            if updated:
+                return updated
+            # Row exists but its file is gone — drop the orphan so the
+            # insert below re-creates it instead of colliding on the index.
+            self.delete_raw(existing.id)
+        return self.ingest(
+            title=title,
+            content=content,
+            source_url=source_url,
+            source_type=source_type,
+            filed_by=filed_by,
+            tags=tags,
+        )
 
     def count_raw(
         self,
