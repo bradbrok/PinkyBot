@@ -492,3 +492,42 @@ def select_mesh_sender(config: Any | None = None):
     if cfg.enabled and cfg.peers:
         return HttpMeshSender(config=cfg)
     return MeshSender()
+
+
+def send_ferry_text(
+    *,
+    agent_name: str,
+    fleet: str,
+    target: str,
+    text: str,
+    allowlist: list[str],
+    reply_to: str | None = None,
+    sender: Any | None = None,
+) -> tuple[FerryEnvelope, SendResult]:
+    """Build + send a ferry text message — the outbound path for ``platform="ferry"``.
+
+    Enforces the same default-deny ``mesh_outbound_allowlist`` as the
+    ``/mesh/send`` endpoint, builds a canonical ``from_`` (``ferry://<fleet>/
+    <agent>``), and dispatches via the selected transport. Returns
+    ``(envelope, SendResult)`` so the caller can audit-log and surface the id.
+
+    Raises:
+        ValueError       — target address is unparseable.
+        PermissionError  — target not in the agent's allowlist (default-deny).
+
+    ``sender`` is injectable for tests; production leaves it ``None`` →
+    :func:`select_mesh_sender`.
+    """
+    tgt = (target or "").strip()
+    if parse_address(tgt) is None:
+        raise ValueError(f"unparseable ferry target address: {target!r}")
+    if not allowlist_matches(tgt, allowlist):
+        raise PermissionError(f"target {tgt!r} not in agent's mesh_outbound_allowlist")
+    envelope = build_envelope(
+        from_=f"ferry://{fleet}/{agent_name}",
+        to=tgt,
+        body={"text": text, "kind": "msg"},
+        reply_to=reply_to or None,
+    )
+    s = sender if sender is not None else select_mesh_sender()
+    return envelope, s.send(envelope)
