@@ -1315,6 +1315,41 @@ def create_api(
             result = im.send_message(chat_id, content)
             return SimpleNamespace(message_id=_extract_message_id(result))
 
+        # Ferry (cross-fleet) has no platform adapter — it routes over the
+        # daemon mesh sender (Route A / Tailscale), with the same default-deny
+        # allowlist as /mesh/send. (#755 — so send()/thread() replies to a ferry
+        # message work, matching the inbound reply-hint, instead of 503ing.)
+        if platform == "ferry":
+            from pinky_daemon.ferry.config import fleet_name as _ferry_fleet_name
+            from pinky_daemon.ferry.outbound import parse_address, send_ferry_text
+
+            try:
+                envelope, result = send_ferry_text(
+                    agent_name=agent_name,
+                    fleet=_ferry_fleet_name(),
+                    target=chat_id,
+                    text=content,
+                    allowlist=agents.get_mesh_outbound_allowlist(agent_name),
+                    reply_to=reply_to or None,
+                )
+            except ValueError as e:
+                raise HTTPException(400, str(e))
+            except PermissionError as e:
+                raise HTTPException(403, str(e))
+            if not result.sent:
+                raise HTTPException(502, f"ferry send failed: {result.error}")
+            try:
+                tf, ta = parse_address(chat_id) or ("", "")
+                mesh_store.log_message(
+                    direction="outbound", local_agent=agent_name, remote_fleet=tf,
+                    remote_agent=ta, correlation_id=envelope.correlation_id or "",
+                    kind="msg", body=envelope.body, envelope_ts=envelope.ts,
+                    reply_to=envelope.reply_to, error=result.error,
+                )
+            except Exception as exc:  # noqa: BLE001 — audit log must not break send
+                _log(f"ferry outbound log failed (non-fatal): {exc}")
+            return SimpleNamespace(message_id=envelope.id)
+
         adapter = _get_platform_adapter(agent_name, platform)
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name}")

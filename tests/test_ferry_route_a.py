@@ -28,9 +28,11 @@ from pinky_daemon.ferry.inbound_server import build_ferry_app, envelope_from_wir
 from pinky_daemon.ferry.outbound import (
     HttpMeshSender,
     MeshSender,
+    SendResult,
     build_envelope,
     envelope_to_wire,
     select_mesh_sender,
+    send_ferry_text,
 )
 from pinky_daemon.ferry.types import AgentCardSelector, DeliveryResult
 
@@ -417,6 +419,58 @@ class TestSenderSelection:
             }
         )
         assert isinstance(select_mesh_sender(cfg), MeshSender)
+
+
+# -- send_ferry_text (platform="ferry" outbound path, #755) -------------------
+
+
+class _RecordingSender:
+    def __init__(self, sent=True, error=None):
+        self.envelopes = []
+        self._sent = sent
+        self._error = error
+
+    def send(self, envelope):
+        self.envelopes.append(envelope)
+        return SendResult(sent=self._sent, correlation_id=envelope.correlation_id,
+                          subject="test", ts=envelope.ts, error=self._error)
+
+
+class TestSendFerryText:
+    def test_builds_canonical_from_and_sends(self):
+        s = _RecordingSender()
+        env, res = send_ferry_text(
+            agent_name="barsik", fleet="mini", target="onesie@tod",
+            text="hi there", allowlist=["onesie@tod"], sender=s,
+        )
+        assert res.sent is True
+        assert len(s.envelopes) == 1
+        assert env.from_ == "ferry://mini/barsik"
+        assert env.to == "onesie@tod"
+        assert env.body == {"text": "hi there", "kind": "msg"}
+
+    def test_allowlist_deny_raises_permissionerror(self):
+        with pytest.raises(PermissionError):
+            send_ferry_text(agent_name="barsik", fleet="mini", target="onesie@tod",
+                            text="x", allowlist=[], sender=_RecordingSender())
+
+    def test_unparseable_target_raises_valueerror(self):
+        with pytest.raises(ValueError):
+            send_ferry_text(agent_name="barsik", fleet="mini", target="::::",
+                            text="x", allowlist=["*"], sender=_RecordingSender())
+
+    def test_reply_to_threaded_through(self):
+        s = _RecordingSender()
+        env, _ = send_ferry_text(agent_name="barsik", fleet="mini", target="onesie@tod",
+                                 text="re", allowlist=["onesie@tod"], reply_to="cid-9", sender=s)
+        assert env.reply_to == "cid-9"
+
+    def test_send_failure_propagates_result(self):
+        s = _RecordingSender(sent=False, error="peer returned HTTP 503")
+        _, res = send_ferry_text(agent_name="barsik", fleet="mini", target="onesie@tod",
+                                 text="x", allowlist=["onesie@tod"], sender=s)
+        assert res.sent is False
+        assert "503" in res.error
 
 
 # -- build_ferry_app listener -------------------------------------------------
