@@ -83,6 +83,13 @@ CREATE INDEX IF NOT EXISTS idx_reflections_project ON reflections(project);
 CREATE INDEX IF NOT EXISTS idx_reflections_active ON reflections(active);
 CREATE INDEX IF NOT EXISTS idx_reflections_salience ON reflections(salience);
 CREATE INDEX IF NOT EXISTS idx_reflections_created_at ON reflections(created_at);
+-- #630: partial index over only stranded ('[]') active rows. Keeps the
+-- heal-on-write backlog probe (get_unembedded, run after every successful
+-- reflect) a near-empty index scan in steady state — a store with zero strays
+-- pays ~nothing instead of scanning active rows. Mirrors get_unembedded's
+-- WHERE + created_at order exactly so the planner uses it.
+CREATE INDEX IF NOT EXISTS idx_reflections_unembedded
+    ON reflections(created_at) WHERE active = 1 AND embedding = '[]';
 
 CREATE TABLE IF NOT EXISTS daemon_sync_counts (
     session_id TEXT PRIMARY KEY,
@@ -503,8 +510,16 @@ class ReflectionStore:
         backfill re-embeds them once the embedder is live again (#630).
         """
         with self._lock:
+            # INDEXED BY pins the partial index idx_reflections_unembedded (only
+            # stranded active rows): without the hint SQLite's planner prefers
+            # the active=? equality search + a temp-b-tree sort, scanning every
+            # active row on each reflect. The partial index makes the
+            # steady-state (zero-stray) probe a scan of an empty index and drops
+            # the sort. The index is created in SCHEMA (IF NOT EXISTS) so the
+            # hint is always satisfiable.
             rows = self._conn.execute(
                 "SELECT id, content FROM reflections "
+                "INDEXED BY idx_reflections_unembedded "
                 "WHERE embedding = '[]' AND active = 1 "
                 "ORDER BY created_at ASC LIMIT ?",
                 (max(0, limit),),
