@@ -24,6 +24,8 @@ from collections.abc import Callable
 from dataclasses import asdict
 from typing import Any
 
+from pinky_daemon.ferry.config import DEFAULT_FLEET_NAME
+from pinky_daemon.ferry.outbound import parse_address
 from pinky_daemon.ferry.substrate import (
     classify_entry_destination,
     populate_port_history,
@@ -53,21 +55,27 @@ def _log(msg: str) -> None:
 
 # -- Address parsing -----------------------------------------------------------
 
-_FERRY_PINKY_PREFIX = "ferry://pinkybot/"
 
+def parse_pinkybot_address(addr: str, fleet_name: str = DEFAULT_FLEET_NAME) -> str | None:
+    """Extract the local agent name from a ferry address aimed at *this* fleet.
 
-def parse_pinkybot_address(addr: str) -> str | None:
-    """Extract the agent name from a ferry://pinkybot/<name> address.
+    Accepts both address forms and verifies the fleet segment matches
+    ``fleet_name`` (default ``pinkybot``):
+      - ``ferry://<fleet_name>/<agent>``  — canonical form
+      - ``<agent>@<fleet_name>``          — at-form (what ``mesh_remote_send``
+        produces, e.g. ``onesie@tod``)
 
-    Returns the agent name on success, or None if the address is not
-    pointed at this fleet.
+    Returns the agent name on success, or ``None`` if the address is malformed
+    or pointed at a different fleet. Reuses ``outbound.parse_address`` so the
+    inbound and outbound sides parse addresses identically.
     """
-    if not addr:
+    parsed = parse_address(addr)
+    if parsed is None:
         return None
-    if not addr.startswith(_FERRY_PINKY_PREFIX):
+    addr_fleet, agent_slug = parsed
+    if addr_fleet != fleet_name:
         return None
-    name = addr[len(_FERRY_PINKY_PREFIX):].strip()
-    return name or None
+    return agent_slug or None
 
 
 def parse_peer_card(addr: str) -> tuple[str, str]:
@@ -88,6 +96,27 @@ def parse_peer_card(addr: str) -> tuple[str, str]:
     if len(parts) >= 2:
         return (parts[-1], addr)
     return ("", addr)
+
+
+def _canonical_agent_id(addr: str) -> str:
+    """Canonicalize a peer address to a stable agent_id for ACL matching.
+
+    The outbound endpoint emits ``from_`` in canonical form
+    (``ferry://<fleet>/<agent>``) while operators configure ``peer_fleet_acl``
+    selectors in at-form (``<agent>@<fleet>``). Both forms collapse to the same
+    at-form here so an ACL configured in either form matches a wire ``from_`` in
+    either form:
+
+        ferry://tod/onesie  -> onesie@tod
+        onesie@tod          -> onesie@tod
+
+    Unparseable input is returned unchanged (exact-match fallback).
+    """
+    parsed = parse_address(addr)
+    if parsed is None:
+        return addr
+    fleet, agent_slug = parsed
+    return f"{agent_slug}@{fleet}"
 
 
 # -- HostPinky -----------------------------------------------------------------
@@ -113,10 +142,16 @@ class HostPinky:
         memory_store: Any | None = None,
         task_store: Any | None = None,
         mesh_store: Any | None = None,
+        fleet_name: str = DEFAULT_FLEET_NAME,
         verify_signatures: bool = False,
         reflection_factory: Callable[[dict[str, Any]], Any] | None = None,
     ) -> None:
         """Construct a HostPinky.
+
+        ``fleet_name``: this daemon's fleet name (``PINKYBOT_FLEET_NAME``).
+        Used to recognise which inbound ``to`` addresses are local
+        (``ferry://<fleet_name>/<agent>`` or ``<agent>@<fleet_name>``).
+        Defaults to ``pinkybot`` for backward compatibility.
 
         ``reflection_factory`` (optional): callable that builds a Reflection
         from a kwargs dict. Defaults to ``pinky_memory.types.Reflection`` when
@@ -132,6 +167,7 @@ class HostPinky:
         self._memory_store = memory_store
         self._task_store = task_store
         self._mesh_store = mesh_store
+        self._fleet_name = fleet_name or DEFAULT_FLEET_NAME
         self._verify_signatures = verify_signatures
         self._reflection_factory = reflection_factory
         self._stats: dict[str, int] = {
@@ -175,7 +211,7 @@ class HostPinky:
                 return self._reject("auth_failed", verify_err)
 
         # 2. Resolve target agent
-        agent_name = parse_pinkybot_address(envelope.to)
+        agent_name = parse_pinkybot_address(envelope.to, self._fleet_name)
         if not agent_name:
             return self._reject(
                 "unknown_agent",
@@ -201,14 +237,23 @@ class HostPinky:
                 f"peer {envelope.from_!r} not on {agent_name}'s peer_fleet_acl",
             )
 
-        # 4. Dispatch by payload kind
+        # 4. Dispatch by payload kind.
+        #
+        # Substrate has two explicit kinds. Everything else is treated as a
+        # message — the outbound side (mesh_remote_send) defaults body.kind to
+        # "msg", and the protocol's body.kind is open-ended ("message", "msg",
+        # "smoke", "ack", ...). Routing all non-substrate kinds to the message
+        # path is what makes a plain mesh_remote_send actually deliver instead
+        # of being silently rejected as an unknown kind (an empty body is still
+        # rejected downstream in _deliver_message).
         kind = envelope.kind
-        if kind == "message":
-            return await self._deliver_message(agent_name, envelope)
         if kind in ("substrate.entry", "substrate.batch"):
             return await self._deliver_substrate(agent_name, envelope)
-
-        return self._reject("unsupported_payload_kind", f"kind={kind!r}")
+        if kind.startswith("substrate."):
+            # A substrate.* kind we don't handle — reject rather than dump a
+            # malformed substrate payload into the agent's chat feed.
+            return self._reject("unsupported_payload_kind", f"kind={kind!r}")
+        return await self._deliver_message(agent_name, envelope)
 
     def _log_inbound_safely(
         self,
@@ -220,7 +265,7 @@ class HostPinky:
         if self._mesh_store is None:
             return
         try:
-            local_agent = parse_pinkybot_address(envelope.to) or ""
+            local_agent = parse_pinkybot_address(envelope.to, self._fleet_name) or ""
             peer_fleet, peer_agent_id = parse_peer_card(envelope.from_)
             error: str | None = None
             if result.status in ("rejected", "transient_failure"):
@@ -272,14 +317,32 @@ class HostPinky:
         """Check peer_fleet_acl for the receiving agent.
 
         Default-deny: empty/missing ACL means no peer-fleet inbound allowed.
+
+        Both the peer's wire ``from_`` and each selector's ``agent_id`` are
+        canonicalized to at-form before comparison, so an ACL configured as
+        ``onesie@tod`` matches the canonical ``ferry://tod/onesie`` that the
+        outbound endpoint actually emits — and vice versa. (Without this, an
+        agent_id-scoped ACL silently 403s every real cross-fleet message,
+        because the stored at-form selector never string-equals the canonical
+        wire ``from_``.)
         """
         selectors = self._load_peer_fleet_acl(agent_name)
         if not selectors:
             return False
-        peer_fleet, peer_agent_id = parse_peer_card(peer_address)
+        peer_fleet, _peer_raw = parse_peer_card(peer_address)
+        peer_agent_id = _canonical_agent_id(peer_address)
         for sel in selectors:
-            if sel.matches(peer_fleet, peer_agent_id, ""):
-                return True
+            if sel.fleet is not None and sel.fleet != "*" and sel.fleet != peer_fleet:
+                continue
+            if sel.agent_id is not None and sel.agent_id != "*":
+                if _canonical_agent_id(sel.agent_id) != peer_agent_id:
+                    continue
+            if sel.pinky_type is not None:
+                # v0.1 has no verified inbound pinky_type, so a pinky_type-bearing
+                # selector can never match (mirrors the warning in
+                # _load_peer_fleet_acl).
+                continue
+            return True
         return False
 
     def _load_peer_fleet_acl(self, agent_name: str) -> list[AgentCardSelector]:
@@ -412,7 +475,7 @@ class HostPinky:
         if not entries:
             return self._reject("empty_substrate_payload", "no entries in body")
 
-        receiving_address = f"ferry://pinkybot/{agent_name}"
+        receiving_address = f"ferry://{self._fleet_name}/{agent_name}"
         results: list[IngestResult] = []
         operational_failures = 0
         for entry in entries:

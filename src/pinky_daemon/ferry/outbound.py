@@ -365,3 +365,108 @@ class MeshSender:
             ts=ts,
             error=None,
         )
+
+
+class HttpMeshSender:
+    """Route A outbound — POST a ferry envelope to the peer fleet's
+    ``/ferry/inbound`` over Tailscale.
+
+    Same surface as :class:`MeshSender` (``send`` / ``configured`` /
+    ``diagnostics``) so the API endpoint can pick either transport without
+    branching on shape. Where ``MeshSender`` publishes to a NATS broker, this
+    POSTs directly to the addressed peer daemon's dedicated ferry listener
+    over the tailnet — no third-party broker, no public-internet hop.
+
+    The shared secret is sent as a bearer token and never logged. The peer
+    URL map + secret come from :class:`pinky_daemon.ferry.config.FerryConfig`
+    (the environment), never from the request body, so they don't leak into
+    agent context.
+    """
+
+    DEFAULT_TIMEOUT_S = 10.0
+
+    def __init__(
+        self,
+        *,
+        config: Any | None = None,
+        timeout_s: float = DEFAULT_TIMEOUT_S,
+    ) -> None:
+        from pinky_daemon.ferry.config import FerryConfig
+
+        self._config = config if config is not None else FerryConfig.from_env()
+        self._timeout_s = timeout_s
+
+    @property
+    def configured(self) -> bool:
+        """True iff a shared secret and at least one peer URL are set."""
+        return bool(self._config.shared_secret and self._config.peers)
+
+    def diagnostics(self) -> dict[str, Any]:
+        """Operator-facing health snapshot. Never includes the secret value."""
+        return {"transport": "http", "configured": self.configured, **self._config.diagnostics()}
+
+    def send(self, envelope: FerryEnvelope) -> SendResult:
+        """POST an envelope to its peer fleet's ferry listener. Synchronous.
+
+        Failures are returned as ``SendResult(sent=False, error=...)`` rather
+        than raised — callers want a structured response either way. This is a
+        blocking call (stdlib ``urllib``); the API endpoint runs it in a
+        threadpool so it never blocks the event loop.
+        """
+        import urllib.error
+        import urllib.request
+
+        ts = envelope.ts
+        cid = envelope.correlation_id
+
+        parsed = parse_address(envelope.to)
+        if parsed is None:
+            return SendResult(
+                sent=False, correlation_id=cid, subject="", ts=ts,
+                error=f"unparseable target address: {envelope.to!r}",
+            )
+        fleet, _agent = parsed
+        url = self._config.peer_url(fleet)
+        if not url:
+            return SendResult(
+                sent=False, correlation_id=cid, subject="", ts=ts,
+                error=f"no ferry peer URL configured for fleet {fleet!r}",
+            )
+        if not self._config.shared_secret:
+            return SendResult(
+                sent=False, correlation_id=cid, subject=url, ts=ts,
+                error="ferry shared secret not configured",
+            )
+
+        wire = envelope_to_wire(envelope)
+        req = urllib.request.Request(
+            url,
+            data=wire.encode("utf-8"),
+            method="POST",
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {self._config.shared_secret}",
+            },
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=self._timeout_s) as resp:
+                code = resp.getcode()
+                resp.read()  # drain so the connection can be reused/closed
+        except urllib.error.HTTPError as exc:
+            # Peer reachable but rejected (401 auth, 403 ACL, 503 transient...).
+            return SendResult(
+                sent=False, correlation_id=cid, subject=url, ts=ts,
+                error=f"peer returned HTTP {exc.code}",
+            )
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            return SendResult(
+                sent=False, correlation_id=cid, subject=url, ts=ts,
+                error=f"ferry POST failed: {exc}",
+            )
+
+        if code != 200:
+            return SendResult(
+                sent=False, correlation_id=cid, subject=url, ts=ts,
+                error=f"peer returned HTTP {code}",
+            )
+        return SendResult(sent=True, correlation_id=cid, subject=url, ts=ts, error=None)

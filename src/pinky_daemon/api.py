@@ -3099,6 +3099,21 @@ def create_api(
     trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
     mesh_store = MeshStore(db_path=db_path.replace(".db", "_mesh.db"))
 
+    # Ferry host-callback (cross-fleet inbound). Constructed here so it shares
+    # the live registry + broker + mesh_store; stashed on app.state for the
+    # dedicated Tailscale-bound ferry listener that __main__ starts when
+    # PINKYBOT_FERRY_ENABLED is set. memory_store/task_store stay None — v1
+    # ferry carries messages only; substrate import is a later consumer.
+    from pinky_daemon.ferry.config import fleet_name as _ferry_fleet_name
+    from pinky_daemon.ferry.host_pinky import HostPinky
+
+    app.state.host_pinky = HostPinky(
+        registry=agents,
+        broker=broker,
+        mesh_store=mesh_store,
+        fleet_name=_ferry_fleet_name(),
+    )
+
     # Knowledge Base — project-level, all agents share
     _data_dir = Path(db_path).parent
     kb = KBStore(data_dir=_data_dir)
@@ -6598,15 +6613,30 @@ npm run build</pre>
             "patterns": agents.get_mesh_outbound_allowlist(name),
         }
 
+    def _build_mesh_sender():
+        """Pick the outbound ferry transport from the environment.
+
+        Route A (HTTP-over-Tailscale via ``HttpMeshSender``) when a ferry
+        shared secret + peer URL map are configured; otherwise fall back to the
+        NATS ``MeshSender``. Both share the ``send``/``configured``/
+        ``diagnostics`` surface.
+        """
+        from pinky_daemon.ferry.config import FerryConfig
+        from pinky_daemon.ferry.outbound import HttpMeshSender, MeshSender
+
+        cfg = FerryConfig.from_env()
+        if cfg.shared_secret and cfg.peers:
+            return HttpMeshSender(config=cfg)
+        return MeshSender()
+
     @app.get("/mesh/diagnostics")
     async def mesh_diagnostics():
         """Operator-facing health snapshot for the daemon's mesh sender.
 
-        Reports whether creds + URL + nats CLI are wired without leaking
-        the password.
+        Reports the active transport (HTTP-over-Tailscale or NATS) and whether
+        it is wired, without leaking the shared secret or NATS password.
         """
-        from pinky_daemon.ferry.outbound import MeshSender
-        return MeshSender().diagnostics()
+        return _build_mesh_sender().diagnostics()
 
     @app.post("/agents/{name}/mesh/send")
     async def mesh_send(name: str, req: MeshSendRequest):
@@ -6618,8 +6648,8 @@ npm run build</pre>
         Returns ``{sent, correlation_id, subject, ts}`` on success;
         on failure the error is surfaced in ``error``.
         """
+        from pinky_daemon.ferry.config import fleet_name as _ferry_fleet_name
         from pinky_daemon.ferry.outbound import (
-            MeshSender,
             allowlist_matches,
             build_envelope,
             parse_address,
@@ -6650,7 +6680,7 @@ npm run build</pre>
         body_dict["kind"] = req.kind or "msg"
 
         envelope = build_envelope(
-            from_=f"ferry://pinkybot/{name}",
+            from_=f"ferry://{_ferry_fleet_name()}/{name}",
             to=target,
             body=body_dict,
             correlation_id=req.correlation_id or None,
@@ -6658,8 +6688,9 @@ npm run build</pre>
             priority=req.priority or "normal",
         )
 
-        sender = MeshSender()
-        result = sender.send(envelope)
+        sender = _build_mesh_sender()
+        # send() blocks (subprocess / HTTP); run it off the event loop.
+        result = await asyncio.to_thread(sender.send, envelope)
 
         # Audit log: every send attempt, success or failure. Persistence
         # failure must not propagate into the API response (defensive try).

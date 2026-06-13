@@ -137,7 +137,81 @@ def _run_api(args) -> None:
         default_working_dir=working_dir,
     )
 
-    uvicorn.run(app, host=args.host, port=args.port)
+    from pinky_daemon.ferry.config import FerryConfig
+
+    ferry_cfg = FerryConfig.from_env()
+    if not ferry_cfg.enabled:
+        # Default / current prod: single server, unchanged behavior. If the
+        # operator tried to turn ferry ON but the config is incomplete or the
+        # bind host is unsafe, say why (fail-closed — we never bind publicly).
+        if (os.environ.get("PINKYBOT_FERRY_ENABLED") or "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            print(f"[pinky] Ferry disabled: {ferry_cfg.why_disabled()}", file=sys.stderr)
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
+    # Ferry enabled: run the main API + a dedicated ferry listener bound to the
+    # Tailscale IP only, so the cross-fleet surface is one authed endpoint and
+    # the main API keeps its existing bind. Both servers share one event loop
+    # (so HostPinky.deliver dispatches on the same loop the broker runs on).
+    from pinky_daemon.ferry.inbound_server import build_ferry_app
+
+    host_pinky = getattr(app.state, "host_pinky", None)
+    if host_pinky is None:
+        print(
+            "[pinky] ferry enabled but host_pinky missing — starting API only",
+            file=sys.stderr,
+        )
+        uvicorn.run(app, host=args.host, port=args.port)
+        return
+
+    ferry_app = build_ferry_app(host_pinky=host_pinky, config=ferry_cfg)
+    print(
+        f"[pinky] Ferry listener: {ferry_cfg.bind_host}:{ferry_cfg.bind_port} "
+        f"(fleet={ferry_cfg.fleet_name})",
+        file=sys.stderr,
+    )
+
+    main_server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))
+    ferry_server = uvicorn.Server(
+        uvicorn.Config(ferry_app, host=ferry_cfg.bind_host, port=ferry_cfg.bind_port)
+    )
+    # uvicorn's serve() calls capture_signals(), which does signal.signal(...).
+    # With two servers on one loop the second would clobber the first's handler,
+    # leaving one server un-stoppable on SIGINT/SIGTERM. Disable both and
+    # install ONE loop-level handler that stops both.
+    main_server.capture_signals = lambda: None
+    ferry_server.capture_signals = lambda: None
+
+    async def _serve_ferry() -> None:
+        # Best-effort: a ferry bind failure (e.g. the Tailscale IP isn't
+        # assigned yet) must NOT take down the core daemon. Log it and let the
+        # main API keep serving.
+        try:
+            await ferry_server.serve()
+        except (Exception, SystemExit) as e:  # noqa: BLE001
+            print(
+                f"[pinky] Ferry listener failed (main API unaffected): {e}",
+                file=sys.stderr,
+            )
+
+    async def _serve_both() -> None:
+        loop = asyncio.get_running_loop()
+
+        def _shutdown(*_a) -> None:
+            main_server.should_exit = True
+            ferry_server.should_exit = True
+
+        for sig in (signal.SIGINT, signal.SIGTERM):
+            try:
+                loop.add_signal_handler(sig, _shutdown)
+            except (NotImplementedError, RuntimeError):
+                pass
+        # main API failures propagate (core); the ferry side is best-effort.
+        await asyncio.gather(main_server.serve(), _serve_ferry())
+
+    asyncio.run(_serve_both())
 
 
 def _run_poll(args) -> None:
