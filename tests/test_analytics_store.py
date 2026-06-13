@@ -410,9 +410,10 @@ class TestSeedRateTableParity:
                 "cached_input_usd_per_mtok FROM analytics_model_pricing "
                 "WHERE provider = 'anthropic'"
             ).fetchall()
-        # Normalize dotted legacy ids (claude-opus-4.1) to the hyphenated form
-        # RATE_TABLE uses (claude-opus-4-1) so the two key spaces line up.
-        seeded = {r["model"].replace(".", "-"): r for r in rows}
+        # Seed ids are canonical (hyphenated) since #759, so they line up with
+        # RATE_TABLE directly — no normalization. A dotted-id regression would
+        # drop the matching RATE_TABLE key out of `seeded` and fail the check.
+        seeded = {r["model"]: r for r in rows}
 
         missing = [m for m in RATE_TABLE if m not in seeded]
         assert not missing, f"models in RATE_TABLE but absent from Analytics seed: {missing}"
@@ -434,6 +435,18 @@ class TestSeedRateTableParity:
         assert not mismatches, "Analytics seed disagrees with pricing.RATE_TABLE:\n" + "\n".join(
             mismatches
         )
+
+    def test_seed_has_no_dotted_legacy_ids(self, tmp_path):
+        """#759: every Anthropic seed id must use the canonical hyphenated form
+        (no dotted minor version like claude-opus-4.1), so it matches
+        RATE_TABLE / the Anthropic API and stays inside the parity guard."""
+        store = _store(tmp_path)
+        with store._connect() as conn:
+            rows = conn.execute(
+                "SELECT model FROM analytics_model_pricing WHERE provider='anthropic'"
+            ).fetchall()
+        dotted = [r["model"] for r in rows if "." in r["model"]]
+        assert not dotted, f"dotted (non-canonical) seed ids found: {dotted}"
 
 
 class TestSeedPricingMigration:
@@ -519,3 +532,98 @@ class TestSeedPricingMigration:
                 "WHERE model='claude-opus-4-8' AND notes='operator'"
             ).fetchone()
         assert row is not None and row[0] == 15.00
+
+
+class TestLegacyDottedIdMigration:
+    """#759: deployed DBs seeded before the canonicalization keep dotted legacy
+    ids. _migrate_legacy_dotted_model_ids renames them to the hyphenated form on
+    init so they match RATE_TABLE / the Anthropic API and join the parity guard."""
+
+    _PAIRS = {
+        "claude-opus-4-1": "claude-opus-4.1",
+        "claude-sonnet-3-7": "claude-sonnet-3.7",
+        "claude-sonnet-3-5": "claude-sonnet-3.5",
+        "claude-haiku-3-5": "claude-haiku-3.5",
+    }
+
+    def _stomp_to_dotted(self, db_path: str) -> None:
+        """Rewrite a seeded DB to its pre-#759 (dotted-id) state."""
+        with sqlite3.connect(db_path) as conn:
+            for canonical, dotted in self._PAIRS.items():
+                conn.execute(
+                    "UPDATE analytics_model_pricing SET model=? "
+                    "WHERE model=? AND notes='seed'",
+                    (dotted, canonical),
+                )
+
+    def test_dotted_ids_renamed_on_reopen(self, tmp_path):
+        db_path = str(tmp_path / "dotted.db")
+        AnalyticsStore(db_path)  # seeds canonical rows
+        self._stomp_to_dotted(db_path)  # simulate a pre-#759 deployed DB
+        AnalyticsStore(db_path)  # __init__ runs the migration
+
+        with sqlite3.connect(db_path) as conn:
+            models = {
+                r[0]
+                for r in conn.execute(
+                    "SELECT model FROM analytics_model_pricing WHERE provider='anthropic'"
+                ).fetchall()
+            }
+        for canonical, dotted in self._PAIRS.items():
+            assert canonical in models, f"{canonical} missing after rename"
+            assert dotted not in models, f"{dotted} should have been renamed away"
+
+    def test_rename_is_idempotent(self, tmp_path):
+        db_path = str(tmp_path / "idem.db")
+        AnalyticsStore(db_path)
+        self._stomp_to_dotted(db_path)
+        AnalyticsStore(db_path)  # first migration
+        AnalyticsStore(db_path)  # second init — must not duplicate or error
+        with sqlite3.connect(db_path) as conn:
+            for canonical in self._PAIRS:
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM analytics_model_pricing WHERE model=?",
+                    (canonical,),
+                ).fetchone()[0]
+                assert count == 1, f"{canonical} has {count} rows"
+
+    def test_dedupes_when_canonical_already_present(self, tmp_path):
+        db_path = str(tmp_path / "dupe.db")
+        AnalyticsStore(db_path)  # canonical claude-opus-4-1 exists
+        # Add a stray dotted seed dupe alongside the canonical row.
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO analytics_model_pricing (provider, model, effective_from, "
+                "effective_to, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok, notes) VALUES "
+                "('anthropic','claude-opus-4.1','2020-01-01T00:00:00Z',NULL,15.00,75.00,1.50,'seed')"
+            )
+        AnalyticsStore(db_path)  # migration must drop the dotted dupe, keep canonical
+        with sqlite3.connect(db_path) as conn:
+            canon = conn.execute(
+                "SELECT COUNT(*) FROM analytics_model_pricing WHERE model='claude-opus-4-1'"
+            ).fetchone()[0]
+            dotted = conn.execute(
+                "SELECT COUNT(*) FROM analytics_model_pricing WHERE model='claude-opus-4.1'"
+            ).fetchone()[0]
+        assert canon == 1, f"canonical row count {canon}"
+        assert dotted == 0, "dotted dupe should have been deleted"
+
+    def test_preserves_operator_dotted_override(self, tmp_path):
+        db_path = str(tmp_path / "op.db")
+        AnalyticsStore(db_path)
+        # A non-'seed' dotted row (operator override) must be left untouched.
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO analytics_model_pricing (provider, model, effective_from, "
+                "effective_to, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok, notes) VALUES "
+                "('anthropic','claude-opus-4.1','2026-06-01T00:00:00Z',NULL,9.99,9.99,9.99,'operator')"
+            )
+        AnalyticsStore(db_path)
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT input_usd_per_mtok FROM analytics_model_pricing "
+                "WHERE model='claude-opus-4.1' AND notes='operator'"
+            ).fetchone()
+        assert row is not None and row[0] == 9.99
