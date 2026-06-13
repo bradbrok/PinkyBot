@@ -525,6 +525,51 @@ class KBStore:
 
         return self.get_raw(source_id)
 
+    def upsert_snapshot(
+        self,
+        *,
+        source_url: str,
+        title: str,
+        content: str,
+        source_type: str = "note",
+        filed_by: str = "system",
+        tags: list[str] | None = None,
+    ) -> RawSource:
+        """File-or-replace a singleton snapshot keyed by ``source_url``.
+
+        Scheduled snapshots (people-profiles, project-state, ...) regenerate
+        under a constant ``source_url``. The first call inserts; every later
+        call replaces the file + DB row + FTS index in place via
+        ``update_raw``. It never issues a second INSERT for the same URL,
+        which would violate the UNIQUE ``raw_sources.source_url`` index
+        (issue #703). If the row exists but its backing file has gone
+        missing, the orphan is dropped and re-created cleanly.
+        """
+        tags = tags or []
+        existing = self.check_duplicate(source_url=source_url)
+        if existing:
+            updated = self.update_raw(
+                existing.id,
+                title=title,
+                content=content,
+                tags=tags,
+                source_type=source_type,
+                source_url=source_url,
+            )
+            if updated:
+                return updated
+            # Row exists but its file is gone — drop the orphan so the
+            # insert below re-creates it instead of colliding on the index.
+            self.delete_raw(existing.id)
+        return self.ingest(
+            title=title,
+            content=content,
+            source_url=source_url,
+            source_type=source_type,
+            filed_by=filed_by,
+            tags=tags,
+        )
+
     def count_raw(
         self,
         *,
