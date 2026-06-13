@@ -26,8 +26,10 @@ from pinky_daemon.ferry.host_pinky import HostPinky, parse_pinkybot_address
 from pinky_daemon.ferry.inbound_server import build_ferry_app, envelope_from_wire
 from pinky_daemon.ferry.outbound import (
     HttpMeshSender,
+    MeshSender,
     build_envelope,
     envelope_to_wire,
+    select_mesh_sender,
 )
 from pinky_daemon.ferry.types import AgentCardSelector, DeliveryResult
 
@@ -359,6 +361,61 @@ class TestHttpMeshSender:
         res = HttpMeshSender(config=_http_cfg()).send(env)
         assert res.sent is False
         assert "failed" in res.error
+
+
+# -- outbound transport selection (flag-off contract) -------------------------
+
+
+class TestSenderSelection:
+    """Outbound must NOT cut over to Route A HTTP unless ferry is fully enabled
+    (review: Murzik #753). Flag-off → legacy NATS transport, zero prod change.
+    """
+
+    def test_flag_off_with_secret_and_peers_stays_nats(self):
+        # secret + peers present but NO master flag / bind host → enabled False.
+        cfg = FerryConfig.from_env(
+            {
+                "PINKYBOT_FERRY_SHARED_SECRET": "s",
+                "PINKYBOT_FERRY_PEERS": "tod=http://100.112.44.64:8899",
+            }
+        )
+        assert cfg.enabled is False
+        assert isinstance(select_mesh_sender(cfg), MeshSender)
+
+    def test_unsafe_bind_with_secret_and_peers_stays_nats(self):
+        # Inbound disabled by an unsafe bind must not silently enable Route A out.
+        cfg = FerryConfig.from_env(
+            {
+                "PINKYBOT_FERRY_ENABLED": "1",
+                "PINKYBOT_FERRY_SHARED_SECRET": "s",
+                "PINKYBOT_FERRY_BIND_HOST": "0.0.0.0",
+                "PINKYBOT_FERRY_PEERS": "tod=http://100.112.44.64:8899",
+            }
+        )
+        assert cfg.enabled is False
+        assert isinstance(select_mesh_sender(cfg), MeshSender)
+
+    def test_enabled_with_peers_uses_http(self):
+        cfg = FerryConfig.from_env(
+            {
+                "PINKYBOT_FERRY_ENABLED": "1",
+                "PINKYBOT_FERRY_SHARED_SECRET": "s",
+                "PINKYBOT_FERRY_BIND_HOST": "100.108.59.106",
+                "PINKYBOT_FERRY_PEERS": "tod=http://100.112.44.64:8899",
+            }
+        )
+        assert cfg.enabled is True
+        assert isinstance(select_mesh_sender(cfg), HttpMeshSender)
+
+    def test_enabled_without_peers_stays_nats(self):
+        cfg = FerryConfig.from_env(
+            {
+                "PINKYBOT_FERRY_ENABLED": "1",
+                "PINKYBOT_FERRY_SHARED_SECRET": "s",
+                "PINKYBOT_FERRY_BIND_HOST": "100.108.59.106",
+            }
+        )
+        assert isinstance(select_mesh_sender(cfg), MeshSender)
 
 
 # -- build_ferry_app listener -------------------------------------------------

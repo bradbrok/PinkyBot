@@ -6616,18 +6616,14 @@ npm run build</pre>
     def _build_mesh_sender():
         """Pick the outbound ferry transport from the environment.
 
-        Route A (HTTP-over-Tailscale via ``HttpMeshSender``) when a ferry
-        shared secret + peer URL map are configured; otherwise fall back to the
-        NATS ``MeshSender``. Both share the ``send``/``configured``/
-        ``diagnostics`` surface.
+        Route A (HTTP-over-Tailscale) only when ferry is fully enabled AND a
+        peer map is configured; otherwise the NATS ``MeshSender``. Gating on
+        ``FerryConfig.enabled`` preserves the flag-off contract — see
+        ``ferry.outbound.select_mesh_sender``.
         """
-        from pinky_daemon.ferry.config import FerryConfig
-        from pinky_daemon.ferry.outbound import HttpMeshSender, MeshSender
+        from pinky_daemon.ferry.outbound import select_mesh_sender
 
-        cfg = FerryConfig.from_env()
-        if cfg.shared_secret and cfg.peers:
-            return HttpMeshSender(config=cfg)
-        return MeshSender()
+        return select_mesh_sender()
 
     @app.get("/mesh/diagnostics")
     async def mesh_diagnostics():

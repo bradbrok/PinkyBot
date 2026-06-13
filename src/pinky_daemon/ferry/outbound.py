@@ -470,3 +470,25 @@ class HttpMeshSender:
                 error=f"peer returned HTTP {code}",
             )
         return SendResult(sent=True, correlation_id=cid, subject=url, ts=ts, error=None)
+
+
+def select_mesh_sender(config: Any | None = None):
+    """Pick the outbound ferry transport.
+
+    Route A (``HttpMeshSender``, HTTP-over-Tailscale) ONLY when ferry is fully
+    enabled (``FerryConfig.enabled`` — master flag + secret + safe bind host)
+    AND a peer URL map is configured; otherwise the legacy NATS ``MeshSender``.
+
+    Gating on ``enabled`` (not merely secret+peers) preserves the zero-prod-
+    change flag-off contract: with ``PINKYBOT_FERRY_ENABLED`` unset — or a
+    missing/unsafe bind host that disabled inbound — outbound stays on the
+    legacy transport instead of silently cutting over to Route A. (If a
+    send-only fleet is ever needed, add an explicit outbound flag rather than
+    loosening this.)
+    """
+    from pinky_daemon.ferry.config import FerryConfig
+
+    cfg = config if config is not None else FerryConfig.from_env()
+    if cfg.enabled and cfg.peers:
+        return HttpMeshSender(config=cfg)
+    return MeshSender()
