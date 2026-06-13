@@ -62,6 +62,20 @@ def set_dependencies(
     _log = log
 
 
+def _reject_if_core(name: str, action: str) -> None:
+    """Block destructive *global* skill ops on core skills.
+
+    The four core skills (file-access, pinky-memory, pinky-messaging,
+    pinky-self) are shared+core and underpin every agent — globally
+    disabling or deleting one would strip foundational tooling
+    (self-management/recovery, memory, messaging, file access) fleet-wide.
+    Mirrors the per-agent DELETE/disable guards in api.py.
+    """
+    skill = _skills.get(name)
+    if skill and skill.category == "core":
+        raise HTTPException(400, f"Cannot {action} core skill '{name}'")
+
+
 # ── Skill Management ──────────────────────────────────────────────────────────
 
 
@@ -161,6 +175,7 @@ async def update_skill(name: str, req: UpdateSkillRequest):
 @router.delete("/skills/{name}")
 async def delete_skill(name: str):
     """Unregister a skill."""
+    _reject_if_core(name, "delete")
     deleted = _skills.delete(name)
     if not deleted:
         raise HTTPException(404, f"Skill '{name}' not found")
@@ -178,6 +193,7 @@ async def enable_skill(name: str):
 @router.post("/skills/{name}/disable")
 async def disable_skill(name: str):
     """Disable a skill globally."""
+    _reject_if_core(name, "disable")
     if not _skills.disable(name):
         raise HTTPException(404, f"Skill '{name}' not found")
     return {"disabled": True, "name": name}
