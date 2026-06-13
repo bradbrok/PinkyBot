@@ -2288,7 +2288,7 @@ requires-dist = [
     { name = "httpx", specifier = ">=0.28" },
     { name = "icalendar", marker = "extra == 'calendar'", specifier = ">=5.0" },
     { name = "markdownify", marker = "extra == 'web'", specifier = ">=1.0" },
-    { name = "mcp", specifier = ">=1.27" },
+    { name = "mcp", specifier = ">=1.27,<2.0" },
     { name = "numpy", specifier = ">=2.2" },
     { name = "openai", specifier = ">=2.30" },
     { name = "pillow", specifier = ">=10.0" },
