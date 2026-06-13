@@ -5085,9 +5085,14 @@ npm run build</pre>
     @app.post("/agents/{name}/skills/{skill_name}/disable")
     async def disable_agent_skill(name: str, skill_name: str):
         """Disable an assigned skill for an agent (opt-out)."""
+        # Core skills (self-management, memory, messaging, file access) are
+        # foundational — mirror the DELETE guard so a single toggle can't
+        # opt an agent out of them (e.g. stripping its own pinky-self).
+        skill = skills.get(skill_name)
+        if skill and skill.category == "core":
+            raise HTTPException(400, f"Cannot disable core skill '{skill_name}'")
         if not skills.set_agent_skill_enabled(name, skill_name, False):
             # For shared skills, create a disabled assignment to opt out
-            skill = skills.get(skill_name)
             if skill and skill.shared:
                 skills.assign_to_agent(name, skill_name, assigned_by="user")
                 skills.set_agent_skill_enabled(name, skill_name, False)
