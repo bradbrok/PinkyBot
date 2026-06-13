@@ -32,6 +32,17 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+def _fts5_quote_token(token: str) -> str:
+    """Quote one token as an FTS5 phrase, doubling embedded ``"`` chars.
+
+    Mirrors the escaping in ``conversation_store._fts5_phrase`` / ``kb_store``
+    (#717), per-token so ``_search_by_fts5`` can keep its OR-of-tokens matching.
+    Without the quote-doubling, a token containing ``"`` produces invalid FTS5
+    syntax (the MATCH errors and silently degrades to the slower LIKE path).
+    """
+    return '"' + token.replace('"', '""') + '"'
+
+
 class InvalidQueryEmbeddingError(ValueError):
     """Raised when a query embedding cannot be used for similarity search.
 
@@ -1019,8 +1030,10 @@ class ReflectionStore:
         if not tokens:
             return []
 
-        # Use OR matching so partial keyword hits still return results
-        fts_query = " OR ".join(f'"{t}"' for t in tokens)
+        # Use OR matching so partial keyword hits still return results.
+        # Quote-escape each token (#726) so embedded " chars don't break the
+        # MATCH expression and silently degrade the query to LIKE.
+        fts_query = " OR ".join(_fts5_quote_token(t) for t in tokens)
 
         # Join FTS5 with the main table for filtering + full row data.
         # FTS5 MATCH goes in the WHERE clause alongside other filters.

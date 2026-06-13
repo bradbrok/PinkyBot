@@ -246,11 +246,11 @@ class TestKeywordSearch:
         assert scored[both.id] == 1.0
         assert scored[one.id] == 0.0
 
-    def test_fts5_fallback_preserves_type_exclude(self, tmp_path):
-        """A query that breaks FTS5 syntax falls back to LIKE; the fallback
-        must still honour type_exclude."""
+    def test_quote_in_token_escaped_honors_type_exclude(self, tmp_path):
+        """A token containing a `"` is now quote-escaped (#726) so the query is
+        handled by FTS5 instead of silently degrading to LIKE — and type_exclude
+        is still honoured. (Previously this token broke the MATCH expression.)"""
         store = _store(tmp_path)
-        # Double quote in the token breaks the manually built MATCH expression
         query = 'cool"stuff'
         store.insert(Reflection(
             type=ReflectionType.insight, content='cool"stuff should be excluded',
@@ -259,7 +259,32 @@ class TestKeywordSearch:
         results = store.search_by_keyword_scored(
             query, type_exclude=[ReflectionType.insight],
         )
-        assert results, "fallback should still match by LIKE"
+        assert results, "escaped quote query should still match"
+        assert all(ref.type != ReflectionType.insight for _, ref in results)
+
+    def test_quote_in_token_does_not_error_and_finds_match(self, tmp_path):
+        """Regression for #726: a quote in the query must not raise / silently
+        return nothing — it finds the reflection via the escaped FTS5 path."""
+        store = _store(tmp_path)
+        if not store._fts5_available:
+            pytest.skip("FTS5 not available")
+        r = store.insert(_fact('the alpha"beta gamma report'))
+        results = store.search_by_keyword_scored('alpha"beta')
+        assert any(ref.id == r.id for _, ref in results)
+
+    def test_like_fallback_still_honors_type_exclude(self, tmp_path):
+        """Preserve the original coverage: when FTS5 is unavailable the LIKE
+        path must still honour type_exclude (forced via _fts5_available=False)."""
+        store = _store(tmp_path)
+        store._fts5_available = False
+        store.insert(Reflection(
+            type=ReflectionType.insight, content="brightwidget should be excluded",
+        ))
+        store.insert(_fact("brightwidget should remain"))
+        results = store.search_by_keyword_scored(
+            "brightwidget", type_exclude=[ReflectionType.insight],
+        )
+        assert results, "LIKE path should still match"
         assert all(ref.type != ReflectionType.insight for _, ref in results)
 
     def test_search_batches_access_tracking(self, tmp_path):
