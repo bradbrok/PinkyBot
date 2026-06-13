@@ -941,6 +941,9 @@
                                         {#if s.category !== 'core'}
                                             <button class="btn btn-sm" on:click={() => toggleSkill(s.name, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>
                                             <button class="btn btn-sm btn-danger" on:click={() => deleteSkill(s.name)}>{$_('common.delete')}</button>
+                                        {:else if !s.enabled}
+                                            <!-- Core skill stuck disabled (e.g. from the pre-guard footgun): allow recovery, but never offer disable/delete. -->
+                                            <button class="btn btn-sm" on:click={() => toggleSkill(s.name, true)}>{$_('common.enable')}</button>
                                         {:else}
                                             <span style="font-size:0.75rem;color:var(--gray-mid)" title="Core skill — always on, cannot be disabled or deleted">--</span>
                                         {/if}
