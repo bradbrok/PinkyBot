@@ -206,6 +206,7 @@ class AnalyticsStore:
                 """
             )
             self._seed_default_pricing(conn)
+            self._migrate_opus_haiku_seed_pricing(conn)
             # Schema migration: add user_message_snippet to turn_usage
             cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(analytics_turn_usage)").fetchall()
@@ -255,18 +256,29 @@ class AnalyticsStore:
             ("openai", "gpt-5.2-chat-latest", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             ("openai", "gpt-5.2-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             # Anthropic defaults seeded for future provider expansion.
+            # NOTE: these rates must mirror pinky_daemon.pricing.RATE_TABLE — the
+            # live per-turn cost path reads that table, this Analytics path reads
+            # this seed, and the two must agree on the same turn's dollar figure.
+            # test_seed_pricing_matches_rate_table pins them together (#669).
             ("anthropic", "claude-fable-5", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 1.00, "seed"),
             ("anthropic", "claude-mythos-5", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 1.00, "seed"),
-            ("anthropic", "claude-opus-4-8", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
-            ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
-            ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
+            # Opus 4.5+ is the standard $5/$25 tier (flat across 4.5→4.8), not the
+            # pre-4.5 legacy $15/$75 tier. Mispriced as legacy until #669.
+            ("anthropic", "claude-opus-4-8", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            ("anthropic", "claude-opus-4-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+            # Pre-4.5 Opus stays on the legacy $15/$75 tier.
             ("anthropic", "claude-opus-4.1", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-opus-4", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
             ("anthropic", "claude-sonnet-4-6", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
+            ("anthropic", "claude-sonnet-4-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-4", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3.5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
+            # Haiku 4.5 is the $1/$5 tier; 0.80/4.00/0.08 was the old Haiku 3.5
+            # price. Corrected in #669.
+            ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 1.00, 5.00, 0.10, "seed"),
             ("anthropic", "claude-haiku-3.5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3", "2020-01-01T00:00:00Z", None, 0.25, 1.25, 0.03, "seed"),
         ]
@@ -279,6 +291,76 @@ class AnalyticsStore:
             """,
             seed_rows,
         )
+
+    def _migrate_opus_haiku_seed_pricing(self, conn) -> None:
+        """Realign mispriced Anthropic seed rows on already-seeded DBs (#669).
+
+        ``_seed_default_pricing`` only runs on an empty table, so deployed
+        Analytics DBs keep their original (wrong) rates after a seed fix
+        lands. This one-shot, idempotent migration corrects them to match
+        ``pinky_daemon.pricing.RATE_TABLE``:
+
+        * Opus 4.6/4.7/4.8 were seeded at the legacy $15/$75 tier — a ~3x
+          overstatement. Corrected to the standard $5/$25 tier.
+        * ``claude-opus-4-5`` was missing — inserted at $5/$25.
+        * Haiku 4.5 was seeded at the old Haiku-3.5 $0.80/$4.00 price —
+          corrected to $1.00/$5.00.
+        * ``claude-sonnet-4-5`` was missing — inserted at $3/$15.
+
+        Safe/idempotent: only ``notes='seed'`` rows are touched (operator
+        overrides with any other ``notes`` are left alone); the UPDATEs match
+        only the known-stale rate, so a second run is a no-op; the INSERTs are
+        skipped when the model already has a row.
+        """
+        # Opus 4.5+ standard tier: fix legacy-priced seed rows in place.
+        conn.execute(
+            """
+            UPDATE analytics_model_pricing
+            SET input_usd_per_mtok = 5.00,
+                output_usd_per_mtok = 25.00,
+                cached_input_usd_per_mtok = 0.50
+            WHERE provider = 'anthropic'
+              AND model IN ('claude-opus-4-8', 'claude-opus-4-7', 'claude-opus-4-6')
+              AND notes = 'seed'
+              AND input_usd_per_mtok = 15.00
+            """
+        )
+        # Haiku 4.5: replace the old Haiku-3.5 price.
+        conn.execute(
+            """
+            UPDATE analytics_model_pricing
+            SET input_usd_per_mtok = 1.00,
+                output_usd_per_mtok = 5.00,
+                cached_input_usd_per_mtok = 0.10
+            WHERE provider = 'anthropic'
+              AND model = 'claude-haiku-4-5'
+              AND notes = 'seed'
+              AND input_usd_per_mtok = 0.80
+            """
+        )
+        # Models absent from older seeds — insert at the correct tier.
+        for model, inp, out, cached in (
+            ("claude-opus-4-5", 5.00, 25.00, 0.50),
+            ("claude-sonnet-4-5", 3.00, 15.00, 0.30),
+        ):
+            exists = conn.execute(
+                "SELECT 1 FROM analytics_model_pricing "
+                "WHERE provider = 'anthropic' AND model = ? LIMIT 1",
+                (model,),
+            ).fetchone()
+            if not exists:
+                conn.execute(
+                    """
+                    INSERT INTO analytics_model_pricing (
+                      provider, model, effective_from, effective_to,
+                      input_usd_per_mtok, output_usd_per_mtok,
+                      cached_input_usd_per_mtok, notes
+                    ) VALUES ('anthropic', ?, '2020-01-01T00:00:00Z', NULL, ?, ?, ?, 'seed')
+                    """,
+                    (model, inp, out, cached),
+                )
+        # Drop the lazily-built cache so corrected rows are read next lookup.
+        self._pricing_cache = None
 
     def ensure_session_fact(
         self,
