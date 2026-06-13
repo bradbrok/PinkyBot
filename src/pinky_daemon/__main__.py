@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import faulthandler
 import os
 import signal
@@ -177,12 +178,14 @@ def _run_api(args) -> None:
     ferry_server = uvicorn.Server(
         uvicorn.Config(ferry_app, host=ferry_cfg.bind_host, port=ferry_cfg.bind_port)
     )
-    # uvicorn's serve() calls capture_signals(), which does signal.signal(...).
-    # With two servers on one loop the second would clobber the first's handler,
-    # leaving one server un-stoppable on SIGINT/SIGTERM. Disable both and
-    # install ONE loop-level handler that stops both.
-    main_server.capture_signals = lambda: None
-    ferry_server.capture_signals = lambda: None
+    # uvicorn's serve() does `with self.capture_signals():` — a context manager
+    # that installs signal.signal(...) handlers. With two servers on one loop the
+    # second would clobber the first's handler, leaving one server un-stoppable
+    # on SIGINT/SIGTERM. Replace it with a no-op CONTEXT MANAGER (nullcontext) —
+    # NOT `lambda: None`, which makes `with None:` raise — so neither server
+    # installs handlers; we install ONE loop-level handler that stops both.
+    main_server.capture_signals = lambda: contextlib.nullcontext()
+    ferry_server.capture_signals = lambda: contextlib.nullcontext()
 
     async def _serve_ferry() -> None:
         # Best-effort: a ferry bind failure (e.g. the Tailscale IP isn't
