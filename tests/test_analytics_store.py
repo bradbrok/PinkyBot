@@ -19,6 +19,7 @@ from pathlib import Path
 import pytest
 
 from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.pricing import RATE_TABLE
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
@@ -393,3 +394,128 @@ class TestPricingLookup:
         assert row is not None
         assert row["input_usd_per_mtok"] == 3.00
         assert store._lookup_pricing(provider="anthropic", model="no-such-model", ts=ts) is None
+
+
+class TestSeedRateTableParity:
+    """#669: the Analytics seed and pinky_daemon.pricing.RATE_TABLE are two
+    hand-maintained rate tables that feed two cost paths (dashboard vs live
+    per-turn). They must agree for the same model, or the same usage reports
+    different dollar figures. This pins them together as a drift guard."""
+
+    def test_seed_pricing_matches_rate_table(self, tmp_path):
+        store = _store(tmp_path)
+        with store._connect() as conn:
+            rows = conn.execute(
+                "SELECT model, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok FROM analytics_model_pricing "
+                "WHERE provider = 'anthropic'"
+            ).fetchall()
+        # Normalize dotted legacy ids (claude-opus-4.1) to the hyphenated form
+        # RATE_TABLE uses (claude-opus-4-1) so the two key spaces line up.
+        seeded = {r["model"].replace(".", "-"): r for r in rows}
+
+        missing = [m for m in RATE_TABLE if m not in seeded]
+        assert not missing, f"models in RATE_TABLE but absent from Analytics seed: {missing}"
+
+        mismatches = []
+        for model, rates in RATE_TABLE.items():
+            row = seeded[model]
+            if (
+                row["input_usd_per_mtok"] != rates["input"]
+                or row["output_usd_per_mtok"] != rates["output"]
+                or row["cached_input_usd_per_mtok"] != rates["cache_read"]
+            ):
+                mismatches.append(
+                    f"{model}: seed "
+                    f"{row['input_usd_per_mtok']}/{row['output_usd_per_mtok']}/"
+                    f"{row['cached_input_usd_per_mtok']} != RATE_TABLE "
+                    f"{rates['input']}/{rates['output']}/{rates['cache_read']}"
+                )
+        assert not mismatches, "Analytics seed disagrees with pricing.RATE_TABLE:\n" + "\n".join(
+            mismatches
+        )
+
+
+class TestSeedPricingMigration:
+    """#669: deployed Analytics DBs are already seeded, so _seed_default_pricing
+    (empty-table guard) won't re-run. _migrate_opus_haiku_seed_pricing corrects
+    the stale rows on every init; these cover a stale DB and operator safety."""
+
+    def _stomp_stale(self, db_path: str) -> None:
+        """Rewrite a seeded DB to its pre-#669 (wrong) state."""
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "UPDATE analytics_model_pricing SET input_usd_per_mtok=15.00, "
+                "output_usd_per_mtok=75.00, cached_input_usd_per_mtok=1.50 "
+                "WHERE notes='seed' AND model IN "
+                "('claude-opus-4-8','claude-opus-4-7','claude-opus-4-6')"
+            )
+            conn.execute(
+                "UPDATE analytics_model_pricing SET input_usd_per_mtok=0.80, "
+                "output_usd_per_mtok=4.00, cached_input_usd_per_mtok=0.08 "
+                "WHERE notes='seed' AND model='claude-haiku-4-5'"
+            )
+            conn.execute(
+                "DELETE FROM analytics_model_pricing "
+                "WHERE model IN ('claude-opus-4-5','claude-sonnet-4-5')"
+            )
+
+    def test_migration_corrects_stale_seed_on_reopen(self, tmp_path):
+        db_path = str(tmp_path / "stale.db")
+        AnalyticsStore(db_path)  # seeds correct rows
+        self._stomp_stale(db_path)  # simulate a pre-#669 deployed DB
+        store = AnalyticsStore(db_path)  # __init__ runs the migration
+
+        ts = _iso(datetime.now(UTC))
+        for model in (
+            "claude-opus-4-8",
+            "claude-opus-4-7",
+            "claude-opus-4-6",
+            "claude-opus-4-5",
+        ):
+            row = store._lookup_pricing(provider="anthropic", model=model, ts=ts)
+            assert row is not None, f"{model} missing after migration"
+            assert row["input_usd_per_mtok"] == 5.00, model
+            assert row["output_usd_per_mtok"] == 25.00, model
+            assert row["cached_input_usd_per_mtok"] == 0.50, model
+
+        haiku = store._lookup_pricing(provider="anthropic", model="claude-haiku-4-5", ts=ts)
+        assert haiku["input_usd_per_mtok"] == 1.00
+        assert haiku["output_usd_per_mtok"] == 5.00
+        assert haiku["cached_input_usd_per_mtok"] == 0.10
+
+        sonnet45 = store._lookup_pricing(provider="anthropic", model="claude-sonnet-4-5", ts=ts)
+        assert sonnet45 is not None and sonnet45["input_usd_per_mtok"] == 3.00
+
+    def test_migration_is_idempotent_and_inserts_once(self, tmp_path):
+        db_path = str(tmp_path / "idem.db")
+        AnalyticsStore(db_path)
+        self._stomp_stale(db_path)
+        AnalyticsStore(db_path)  # first migration
+        AnalyticsStore(db_path)  # second init — must not double-insert or re-touch
+        with sqlite3.connect(db_path) as conn:
+            for model in ("claude-opus-4-5", "claude-sonnet-4-5"):
+                count = conn.execute(
+                    "SELECT COUNT(*) FROM analytics_model_pricing WHERE model=?",
+                    (model,),
+                ).fetchone()[0]
+                assert count == 1, f"{model} duplicated: {count} rows"
+
+    def test_migration_preserves_operator_overrides(self, tmp_path):
+        db_path = str(tmp_path / "override.db")
+        AnalyticsStore(db_path)
+        # Operator-priced row (non-'seed' notes) at the legacy tier must survive.
+        with sqlite3.connect(db_path) as conn:
+            conn.execute(
+                "INSERT INTO analytics_model_pricing (provider, model, effective_from, "
+                "effective_to, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok, notes) VALUES "
+                "('anthropic','claude-opus-4-8','2026-06-01T00:00:00Z',NULL,15.00,75.00,1.50,'operator')"
+            )
+        AnalyticsStore(db_path)  # migration must not touch the operator row
+        with sqlite3.connect(db_path) as conn:
+            row = conn.execute(
+                "SELECT input_usd_per_mtok FROM analytics_model_pricing "
+                "WHERE model='claude-opus-4-8' AND notes='operator'"
+            ).fetchone()
+        assert row is not None and row[0] == 15.00
