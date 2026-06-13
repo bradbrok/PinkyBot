@@ -1336,8 +1336,8 @@ def create_api(
                 raise HTTPException(400, str(e))
             except PermissionError as e:
                 raise HTTPException(403, str(e))
-            if not result.sent:
-                raise HTTPException(502, f"ferry send failed: {result.error}")
+            # Audit-log every attempt (success or failure) BEFORE raising, for
+            # failure-evidence parity with /mesh/send (Murzik #756 review note).
             try:
                 tf, ta = parse_address(chat_id) or ("", "")
                 mesh_store.log_message(
@@ -1348,6 +1348,8 @@ def create_api(
                 )
             except Exception as exc:  # noqa: BLE001 — audit log must not break send
                 _log(f"ferry outbound log failed (non-fatal): {exc}")
+            if not result.sent:
+                raise HTTPException(502, f"ferry send failed: {result.error}")
             return SimpleNamespace(message_id=envelope.id)
 
         adapter = _get_platform_adapter(agent_name, platform)
