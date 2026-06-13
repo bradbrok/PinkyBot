@@ -83,6 +83,13 @@ CREATE INDEX IF NOT EXISTS idx_reflections_project ON reflections(project);
 CREATE INDEX IF NOT EXISTS idx_reflections_active ON reflections(active);
 CREATE INDEX IF NOT EXISTS idx_reflections_salience ON reflections(salience);
 CREATE INDEX IF NOT EXISTS idx_reflections_created_at ON reflections(created_at);
+-- #630: partial index over only stranded ('[]') active rows. Keeps the
+-- heal-on-write backlog probe (get_unembedded, run after every successful
+-- reflect) a near-empty index scan in steady state — a store with zero strays
+-- pays ~nothing instead of scanning active rows. Mirrors get_unembedded's
+-- WHERE + created_at order exactly so the planner uses it.
+CREATE INDEX IF NOT EXISTS idx_reflections_unembedded
+    ON reflections(created_at) WHERE active = 1 AND embedding = '[]';
 
 CREATE TABLE IF NOT EXISTS daemon_sync_counts (
     session_id TEXT PRIMARY KEY,
@@ -489,6 +496,87 @@ class ReflectionStore:
 
             self._conn.commit()
             return reflection
+
+    # ── Re-embed / heal (#630) ──
+
+    def get_unembedded(self, limit: int = 50) -> list[tuple[str, str]]:
+        """Return ``(id, content)`` for active reflections stored without an
+        embedding (``embedding == '[]'``), oldest first.
+
+        These rows persist and are findable via structured/keyword query but
+        silently miss semantic ``recall`` (the primary retrieval path) because
+        they have no vector. They arise whenever the embedder is a NoOp (no
+        key) or transiently degraded at insert time. The server's heal-on-write
+        backfill re-embeds them once the embedder is live again (#630).
+        """
+        with self._lock:
+            # INDEXED BY pins the partial index idx_reflections_unembedded (only
+            # stranded active rows): without the hint SQLite's planner prefers
+            # the active=? equality search + a temp-b-tree sort, scanning every
+            # active row on each reflect. The partial index makes the
+            # steady-state (zero-stray) probe a scan of an empty index and drops
+            # the sort. The index is created in SCHEMA (IF NOT EXISTS) so the
+            # hint is always satisfiable.
+            rows = self._conn.execute(
+                "SELECT id, content FROM reflections "
+                "INDEXED BY idx_reflections_unembedded "
+                "WHERE embedding = '[]' AND active = 1 "
+                "ORDER BY created_at ASC LIMIT ?",
+                (max(0, limit),),
+            ).fetchall()
+        return [(row[0], row[1]) for row in rows]
+
+    def set_embedding(self, reflection_id: str, embedding: list[float]) -> bool:
+        """Attach ``embedding`` to an existing reflection and sync the vec table.
+
+        Mirrors :meth:`insert`'s embedding + ``reflections_vec`` write so a
+        re-embedded row is equivalent to one embedded at insert time (same JSON
+        storage, same blob packing, same lazy dim-table creation). Idempotent:
+        clears any stale vec row for the rowid first.
+
+        Used by the server's heal-on-write backfill (#630). Returns ``True`` if
+        a row was updated. A falsy ``embedding`` is a no-op (returns ``False``)
+        — callers must pass a validated, non-degraded vector (see
+        ``server._safe_embed``), never ``[]``.
+        """
+        if not embedding:
+            return False
+        with self._lock:
+            cur = self._conn.execute(
+                "SELECT rowid FROM reflections WHERE id = ?", (reflection_id,)
+            ).fetchone()
+            if cur is None:
+                return False
+            rowid = cur[0]
+            self._conn.execute(
+                "UPDATE reflections SET embedding = ? WHERE id = ?",
+                (json.dumps(embedding), reflection_id),
+            )
+            if self._vec_available:
+                # Lazily create the vec table on the first embedding the store
+                # ever sees (mirrors insert()).
+                if self._vec_dimensions == 0:
+                    self._create_vec_table(len(embedding))
+                if len(embedding) == self._vec_dimensions:
+                    try:
+                        # An un-embedded row was never in the vec table, but
+                        # clearing first keeps a re-heal idempotent.
+                        self._conn.execute(
+                            "DELETE FROM reflections_vec WHERE rowid = ?", (rowid,)
+                        )
+                        self._conn.execute(
+                            "INSERT INTO reflections_vec(rowid, embedding) VALUES (?, ?)",
+                            (rowid, self._embedding_to_blob(embedding)),
+                        )
+                    except sqlite3.OperationalError as exc:
+                        # Non-fatal: vector search for this row degrades to the
+                        # numpy fallback (same handling as insert(), #295).
+                        logger.debug(
+                            "vec set_embedding failed for rowid=%s id=%s: %s",
+                            rowid, reflection_id, exc,
+                        )
+            self._conn.commit()
+        return True
 
     # ── Get ──
 
