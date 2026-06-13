@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import re
 import sys
 from collections.abc import Callable
@@ -36,6 +37,22 @@ def _log(msg: str) -> None:
 # store-factory path resolution against traversal / injection even though the
 # resolver also validates against the registry (defense in depth).
 _AGENT_SLUG_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+
+# #630: cap on how many stranded ('[]') rows a single successful write
+# re-embeds. Bounds the embed calls added to a reflect; a backlog drains over
+# successive writes rather than blocking one.
+_HEAL_BATCH = 5
+
+
+def _heal_disabled() -> bool:
+    """Kill-switch for heal-on-write (#630). Heal is on by default — it's a
+    best-effort safety net — but ``PINKY_MEMORY_DISABLE_HEAL=1`` turns it off
+    fleet-wide without a redeploy if it ever misbehaves in prod."""
+    return os.getenv("PINKY_MEMORY_DISABLE_HEAL", "").strip().lower() in (
+        "1",
+        "true",
+        "yes",
+    )
 
 
 def _safe_embed(
@@ -157,6 +174,39 @@ def create_server(
                 f"agent '{caller}' is not authorized for cross-agent memory access"
             )
 
+    def _heal_unembedded(s: "ReflectionStore", *, limit: int = _HEAL_BATCH) -> int:
+        """Re-embed up to ``limit`` stranded ('[]') rows in ``s`` (#630).
+
+        Called right after a *successful* embed, so the embedder is known live;
+        a row whose re-embed still degrades (-> []) is left for a future write
+        and the batch stops early. Best-effort and fully guarded: a heal failure
+        must never break the write that triggered it. Returns the count healed.
+        """
+        if _heal_disabled():
+            return 0
+        try:
+            stranded = s.get_unembedded(limit)
+        except Exception as exc:  # noqa: BLE001 — heal must never break a write
+            _log(f"[backfill] get_unembedded failed: {type(exc).__name__}: {exc}")
+            return 0
+        healed = 0
+        for rid, content in stranded:
+            vec = _safe_embed(embedder, content, "backfill")
+            if not vec:
+                # Embedder degraded mid-batch — stop and retry on a later write.
+                break
+            try:
+                if s.set_embedding(rid, vec):
+                    healed += 1
+            except Exception as exc:  # noqa: BLE001 — best-effort
+                _log(
+                    f"[backfill] set_embedding failed for {rid}: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        if healed:
+            _log(f"[backfill] re-embedded {healed} stranded reflection(s) (#630)")
+        return healed
+
     def _embed_build_insert(s: "ReflectionStore", input_data: "ReflectInput") -> dict:
         """Embed + build + insert a Reflection into ``s``; handle supersession.
 
@@ -185,6 +235,12 @@ def create_server(
             # replacing — intended for consolidation, but it means these tools
             # are not strictly insert-only.
             s.deactivate_superseded(input_data.supersedes, superseded_by=ref.id)
+        if embedding:
+            # Heal-on-write (#630): this embed just succeeded, so the embedder is
+            # live now — opportunistically re-embed a bounded few rows that a
+            # prior degraded/NoOp embedder stranded at '[]' (silently invisible
+            # to semantic recall). Best-effort; never raises into the write.
+            _heal_unembedded(s)
         return {
             "id": ref.id,
             "type": ref.type.value,
