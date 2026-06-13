@@ -438,11 +438,17 @@ class KBStore:
         source_url: str | None = None,
         source_type: str | None = None,
         owner_notes: str | None = None,
+        refresh_filed_at: bool = False,
     ) -> RawSource | None:
         """Update fields on an existing raw source.
 
         Only provided (non-None) fields are updated. Rewrites the markdown file
         and updates the DB row + FTS index.
+
+        ``refresh_filed_at`` bumps ``filed_at`` to now (off by default so a
+        manual metadata edit keeps the original file time). Snapshot
+        replacements set it so the librarian's ``list_raw(since=last_run)``
+        discovery (``filed_at > last_run``) re-sees the refreshed content.
 
         Returns:
             The updated RawSource, or None if not found.
@@ -474,6 +480,14 @@ class KBStore:
             else:
                 fm.pop("owner_notes", None)
 
+        # Snapshot replacements refresh filed_at (file + DB) so downstream
+        # discovery re-sees the new content; metadata edits leave it as-is.
+        if refresh_filed_at:
+            new_filed_at = datetime.now(timezone.utc).isoformat()
+            fm["filed_at"] = new_filed_at
+        else:
+            new_filed_at = source.filed_at
+
         # Apply content update — rebuild body section
         if content is not None:
             body = content
@@ -497,11 +511,13 @@ class KBStore:
             conn.execute(
                 """UPDATE raw_sources
                    SET title = ?, source_url = ?, source_type = ?,
-                       tags = ?, content_hash = ?, content_preview = ?
+                       tags = ?, content_hash = ?, content_preview = ?,
+                       filed_at = ?
                    WHERE id = ?""",
                 (
                     new_title, new_url, new_type,
                     json.dumps(new_tags), c_hash, c_preview,
+                    new_filed_at,
                     source_id,
                 ),
             )
@@ -555,6 +571,7 @@ class KBStore:
                 tags=tags,
                 source_type=source_type,
                 source_url=source_url,
+                refresh_filed_at=True,
             )
             if updated:
                 return updated

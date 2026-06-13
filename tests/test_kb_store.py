@@ -261,3 +261,20 @@ class TestUpsertSnapshot:
         b = kb.upsert_snapshot(source_url="internal://projects", title="Projects", content="bbb")
         assert a.id != b.id
         assert kb.count_raw() == 2
+
+    def test_replacement_bumps_filed_at_for_rediscovery(self, kb):
+        # The librarian discovers work via list_raw(since=last_run), which
+        # filters filed_at > last_run. If a replacement keeps the original
+        # filed_at, curation silently misses every snapshot after the first
+        # once the watermark has advanced (issue #703 P1, caught in review).
+        s1 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="first")
+        first_filed_at = s1.filed_at
+        # Simulate the librarian having curated up to s1: nothing is newer.
+        assert kb.list_raw(since=first_filed_at) == []
+
+        s2 = kb.upsert_snapshot(source_url=self.URL, title="Snap", content="second")
+        assert s2.id == s1.id
+        # filed_at advanced, so the since-watermark query re-sees the snapshot.
+        assert s2.filed_at > first_filed_at
+        rediscovered = kb.list_raw(since=first_filed_at)
+        assert any(r.id == s1.id for r in rediscovered)
