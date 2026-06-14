@@ -3581,6 +3581,77 @@ def test_background_tasks_recently_active_false_without_session_dir(tmp_path) ->
     )
 
 
+def test_inflight_verdict_growing_when_foreground_tool_in_flight() -> None:
+    """#731: a long FOREGROUND tool call (main transcript quiet, no subagent
+    dir, REPL 'working') must be ``growing`` while its tool_use_id is in
+    flight — otherwise the watchdog SIGKILLs a healthy turn's tool child."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time(),
+    }
+    # A foreground tool started recently and hasn't reported finish.
+    ss._inflight_tool_calls = {"toolu_x": _time.time()}
+    assert ss._inflight_stall_verdict(_time.time()) == "growing"
+
+
+def test_inflight_verdict_wedged_when_no_foreground_tool() -> None:
+    """#731 negative: no in-flight tool + quiet + 'working' → still ``wedged``,
+    preserving genuine stuck-REPL recovery (the wedge the model actually hit
+    has no tool running)."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time(),
+    }
+    assert ss._inflight_tool_calls == {}
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+
+
+def test_inflight_verdict_wedged_when_foreground_tool_past_ceiling() -> None:
+    """#731 bound: a tool 'in flight' longer than the ceiling is a lost
+    finish-POST or a hung child — NOT credited (and pruned), so a real wedge
+    still recovers (just later)."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _age_out_head(ss)
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time(),
+    }
+    stale = _time.time() - (
+        tmux_session._FOREGROUND_TOOL_ACTIVE_CEILING_SEC + 60.0
+    )
+    ss._inflight_tool_calls = {"toolu_stale": stale}
+    assert ss._inflight_stall_verdict(_time.time()) == "wedged"
+    # Stale entry pruned so the set can't grow unbounded.
+    assert ss._inflight_tool_calls == {}
+
+
+def test_foreground_tool_in_flight_prunes_stale_keeps_fresh() -> None:
+    """Helper prunes only entries past the ceiling; a fresh concurrent entry
+    still counts as live."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    stale = now - (tmux_session._FOREGROUND_TOOL_ACTIVE_CEILING_SEC + 1.0)
+    ss._inflight_tool_calls = {"old": stale, "new": now}
+    assert ss._foreground_tool_in_flight(now) is True
+    assert "old" not in ss._inflight_tool_calls  # pruned
+    assert "new" in ss._inflight_tool_calls  # retained
+
+
+def test_foreground_tool_in_flight_false_when_empty() -> None:
+    """Helper returns False with no in-flight tools — preserves the
+    wedged/idle fall-through for ordinary turns."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    assert ss._inflight_tool_calls == {}
+    assert ss._foreground_tool_in_flight(_time.time()) is False
+
+
 def test_inflight_verdict_wedged_when_idle_predates_head() -> None:
     """Hang-on-paste: a turn was pasted (head started) but the REPL's idle
     status is STALE (predates the head) — the REPL never came alive for this
@@ -4416,6 +4487,46 @@ async def test_record_tool_use_finish_caps_huge_response_at_200() -> None:
         tool_response=huge,
     )
     assert len(events[0]["result_preview"]) == 200
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_start_marks_inflight() -> None:
+    """#731: record_tool_use_start adds the tool_use_id to the in-flight set so
+    the watchdog can credit a long foreground call as liveness."""
+    ss, _analytics, _events = _make_session_with_analytics()
+    await ss.record_tool_use_start(
+        tool_use_id="toolu_fg",
+        tool_name="Bash",
+        tool_input={"command": "gh run watch 123 --exit-status"},
+    )
+    assert "toolu_fg" in ss._inflight_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_finish_clears_inflight() -> None:
+    """#731: record_tool_use_finish removes the tool_use_id so the watchdog
+    stops crediting it once the tool returns."""
+    ss, _analytics, _events = _make_session_with_analytics()
+    await ss.record_tool_use_start(
+        tool_use_id="toolu_fg", tool_name="Bash", tool_input={"command": "sleep 1"}
+    )
+    assert "toolu_fg" in ss._inflight_tool_calls
+    await ss.record_tool_use_finish(
+        tool_use_id="toolu_fg", tool_name="Bash", is_error=False, tool_response="done"
+    )
+    assert "toolu_fg" not in ss._inflight_tool_calls
+
+
+@pytest.mark.asyncio
+async def test_record_tool_use_start_untracked_without_id() -> None:
+    """#731: a synthetic-key tool call (no tool_use_id) isn't tracked for the
+    watchdog — analytics still opens a row, but with no id there'd be nothing
+    to clear on finish, so we avoid a permanent in-flight leak."""
+    ss, _analytics, _events = _make_session_with_analytics()
+    await ss.record_tool_use_start(
+        tool_use_id="", tool_name="Bash", tool_input={"command": "ls"}
+    )
+    assert ss._inflight_tool_calls == {}
 
 
 # ──────────────────────────────────────────────────────────────────────────
