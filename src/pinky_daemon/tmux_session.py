@@ -798,6 +798,20 @@ _TRANSCRIPT_PASTE_SLACK = 5.0
 # silent this long AND whose main REPL is quiet is genuinely stuck.
 _BACKGROUND_TASK_ACTIVE_WINDOW_SEC = 180.0
 
+# #731 — absolute ceiling for crediting an in-flight FOREGROUND tool call as
+# liveness. A single long blocking foreground tool call (e.g. a deliberate
+# ``gh run watch`` up to ~10 min, or a slow build) writes nothing to the main
+# transcript and — unlike a Workflow/Agent — spawns no subagent dir, so it
+# looks identical to a wedge to the stall verdict. The PreToolUse/PostToolUse
+# hooks (task #93) tell us a tool is genuinely in flight, and we extend the
+# wedge window while one is. The ceiling bounds that trust: a tool "in flight"
+# longer than this is treated as a lost finish-POST or a genuinely hung child
+# and is NOT credited (and is pruned), so a real stuck REPL still recovers —
+# just later. 30 min is generous headroom over the ~10 min worst-case legit
+# foreground wait while keeping the worst-case false-negative (delayed wedge
+# recovery) bounded.
+_FOREGROUND_TOOL_ACTIVE_CEILING_SEC = 1800.0
+
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
 # reason.startswith("wake_")`` so the wake prompt's paste doesn't land while
@@ -932,6 +946,11 @@ class TmuxSession:
         self.account_info: dict = {"apiProvider": "tmux_claude_repl"}
         self._current_activity = ""
         self._current_thinking = ""
+        # #731: tool_use_id → start-time for tool calls that have started
+        # (PreToolUse hook) but not finished (PostToolUse hook). The inflight
+        # watchdog reads this as positive liveness so a long foreground tool
+        # call isn't mistaken for a wedged REPL. Bounded/pruned by the verdict.
+        self._inflight_tool_calls: dict[str, float] = {}
         self._activity_log: list[str] = []
 
         # Response capture pipeline (PR8b). Lazily constructed in
@@ -1522,6 +1541,14 @@ class TmuxSession:
         if not tool_name:
             return
 
+        # #731: mark this tool call in-flight so the inflight watchdog doesn't
+        # mistake a long foreground tool call (e.g. a blocking `gh run watch`)
+        # for a wedged REPL. Cleared by record_tool_use_finish; bounded by
+        # _FOREGROUND_TOOL_ACTIVE_CEILING_SEC in the verdict so a lost
+        # finish-POST can't extend the window forever.
+        if tool_use_id:
+            self._inflight_tool_calls[tool_use_id] = time.time()
+
         # Human-readable activity line — mirror SDK by importing the
         # shared describer if available, falling back to a basic format.
         try:
@@ -1615,6 +1642,11 @@ class TmuxSession:
         """
         if not tool_name and not tool_use_id:
             return
+
+        # #731: this tool call is done — drop it from the in-flight set so the
+        # watchdog stops extending the wedge window on its behalf.
+        if tool_use_id:
+            self._inflight_tool_calls.pop(tool_use_id, None)
 
         # Short result snippet for the stream event — same cap SDK
         # uses for parity. Tool responses can be huge (file contents,
@@ -2457,6 +2489,9 @@ class TmuxSession:
         drained = list(self._inflight_metas)
         self._inflight_metas.clear()
         self._head_started_at = None
+        # #731: session is being torn down — drop in-flight tool state so a
+        # stale entry can't leak across the disconnect/reconnect boundary.
+        self._inflight_tool_calls.clear()
         for entry in drained:
             if entry.completion_event is not None and not entry.completion_event.is_set():
                 entry.completion_event.set()
@@ -3502,6 +3537,11 @@ class TmuxSession:
         twist (route to wrong chat from an empty/zero state).
         """
         # ── Critical section: synchronous deque mutation + signals ────
+        # #731: a Stop hook means the model yielded — no foreground tool is
+        # executing, so any remaining in-flight tool entries are leaked (a lost
+        # PostToolUse finish-POST). Clear them here so the next turn's wedge
+        # verdict can't be spuriously extended by a stale entry.
+        self._inflight_tool_calls.clear()
         if not self._inflight_metas:
             # No meta to pop. Stop hook arrived without a dispatch
             # behind it — most commonly an AUTONOMOUS turn (background-
@@ -4469,6 +4509,39 @@ class TmuxSession:
                 continue
         return False
 
+    def _foreground_tool_in_flight(self, now: float) -> bool:
+        """True if a FOREGROUND tool call is still running (#731).
+
+        A single long blocking foreground tool call (e.g. a deliberate
+        ``gh run watch`` up to ~10 min, or a slow build) writes nothing to the
+        main transcript until it returns and — unlike a Workflow/Agent — spawns
+        no subagent transcript, so both ``_transcript_recently_grew`` and
+        ``_background_tasks_recently_active`` read it as "quiet". With the REPL
+        legitimately ``working`` that is indistinguishable from a wedge, and the
+        watchdog force_restarts a healthy turn, SIGKILLing the tool child (#731).
+
+        The PreToolUse/PostToolUse hooks (task #93) already POST tool-start and
+        tool-finish to the daemon, so ``_inflight_tool_calls`` holds the
+        ``tool_use_id``s that have started but not finished — an authoritative
+        "a tool is genuinely running" signal. We credit that as liveness, the
+        same carve-out background tasks get.
+
+        Bounded by ``_FOREGROUND_TOOL_ACTIVE_CEILING_SEC``: an entry older than
+        the ceiling is a lost finish-POST or a genuinely hung child, so it is
+        NOT credited and is pruned here (keeping the set bounded). A real stuck
+        REPL therefore still recovers — just one ceiling-window later.
+        """
+        if not self._inflight_tool_calls:
+            return False
+        alive = False
+        for tool_use_id, started_at in list(self._inflight_tool_calls.items()):
+            if (now - started_at) >= _FOREGROUND_TOOL_ACTIVE_CEILING_SEC:
+                # Suspected lost finish / hung child — stop crediting + prune.
+                del self._inflight_tool_calls[tool_use_id]
+                continue
+            alive = True
+        return alive
+
     def _inflight_stall_verdict(self, now: float) -> str:
         """Classify a possibly-stalled inflight head for the watchdog (#118).
 
@@ -4477,8 +4550,10 @@ class TmuxSession:
           - ``"growing"`` — aged out BUT the main transcript is still being
                             written, OR a background task (a Workflow / Agent
                             tool call) is still writing its own subagent
-                            transcript → a long/streaming or background-busy
-                            turn, not wedged (#692).
+                            transcript (#692), OR a foreground tool call is
+                            still in flight (#731) → a long/streaming,
+                            background-busy, or foreground-tool-busy turn, not
+                            wedged.
           - ``"idle"``    — aged out, transcript quiet, and Claude Code last
                             reported *idle* (Stop hook) at-or-after this head
                             started → the REPL finished and is waiting for
@@ -4512,6 +4587,14 @@ class TmuxSession:
         if self._background_tasks_recently_active(
             now, _BACKGROUND_TASK_ACTIVE_WINDOW_SEC
         ):
+            return "growing"
+        # (a3) Parked on a long-running FOREGROUND tool call (#731)? The
+        # PreToolUse/PostToolUse hooks (task #93) track in-flight tool_use_ids;
+        # a tool that has started but not finished (within the ceiling) is
+        # genuine liveness — extend, don't restart. Checked before the idle
+        # reconcile for the same reason as (a2): an actively-working foreground
+        # turn must never be drained as a phantom.
+        if self._foreground_tool_in_flight(now):
             return "growing"
         # (b) REPL reported idle? Consult Claude Code's working/idle hook
         # signal (Stop hook → "idle"; PreToolUse/etc → "working"). An idle
@@ -4618,7 +4701,8 @@ class TmuxSession:
             f"head_started_at={self._head_started_at} "
             f"transcript_mtime={transcript_mtime} "
             f"age_s={age_str} "
-            f"depth={len(self._inflight_metas)}"
+            f"depth={len(self._inflight_metas)} "
+            f"inflight_tools={len(self._inflight_tool_calls)}"
         )
 
     async def _inflight_watchdog(self) -> None:
