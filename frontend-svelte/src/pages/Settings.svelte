@@ -173,25 +173,37 @@
             if (skillDefaultConfig.trim()) payload.default_config = JSON.parse(skillDefaultConfig);
         } catch { toast('Invalid default config JSON', 'error'); return; }
 
-        await api('POST', '/skills', payload);
-        skillName = ''; skillDesc = ''; skillToolPatterns = ''; skillDirective = '';
-        skillMcpConfig = ''; skillRequires = ''; skillFileTemplates = ''; skillDefaultConfig = '';
-        skillShared = false; skillSelfAssignable = false; showAdvancedSkill = false;
-        toast($_('settings.toast_skill_registered'));
-        refreshSkills();
+        try {
+            await api('POST', '/skills', payload);
+            skillName = ''; skillDesc = ''; skillToolPatterns = ''; skillDirective = '';
+            skillMcpConfig = ''; skillRequires = ''; skillFileTemplates = ''; skillDefaultConfig = '';
+            skillShared = false; skillSelfAssignable = false; showAdvancedSkill = false;
+            toast($_('settings.toast_skill_registered'));
+            refreshSkills();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     async function toggleSkill(name, enable) {
-        await api('POST', `/skills/${name}/${enable ? 'enable' : 'disable'}`);
-        toast(`${name} ${enable ? 'enabled' : 'disabled'}`);
-        refreshSkills();
+        try {
+            await api('POST', `/skills/${name}/${enable ? 'enable' : 'disable'}`);
+            toast(`${name} ${enable ? 'enabled' : 'disabled'}`);
+            refreshSkills();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     async function deleteSkill(name) {
         if (!confirm(`Delete "${name}"?`)) return;
-        await api('DELETE', `/skills/${name}`);
-        toast(`${name} deleted`);
-        refreshSkills();
+        try {
+            await api('DELETE', `/skills/${name}`);
+            toast(`${name} deleted`);
+            refreshSkills();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     async function loadTimezone() {
@@ -252,10 +264,14 @@
     }
     async function deleteGlobalBotToken(id, name) {
         if (!confirm(`Delete bot token "${name}"? Agents using it will lose their token.`)) return;
-        await api('DELETE', `/bot-tokens/${id}`);
-        toast('Bot token deleted');
-        loadGlobalBotTokens();
-        loadAllTokens();
+        try {
+            await api('DELETE', `/bot-tokens/${id}`);
+            toast('Bot token deleted');
+            loadGlobalBotTokens();
+            loadAllTokens();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
     async function loadAllTokens() {
         const data = await api('GET', '/system/all-tokens');
@@ -413,9 +429,13 @@
 
     async function deleteApiKey(name) {
         if (!confirm(`Remove ${name}?`)) return;
-        await api('DELETE', `/system/api-keys/${name}`);
-        toast(`${name} removed`);
-        loadApiKeys();
+        try {
+            await api('DELETE', `/system/api-keys/${name}`);
+            toast(`${name} removed`);
+            loadApiKeys();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     // Calendar
@@ -458,15 +478,23 @@
         if (oauthTimer) clearTimeout(oauthTimer);
         try {
             const { auth_url, session } = await api('GET', '/calendar/google/auth-url');
+            // Only trust postMessages from the proxy origin we actually opened
+            // (derived from auth_url so it tracks the backend, proxied or direct).
+            const proxyOrigin = new URL(auth_url).origin;
             const popup = window.open(auth_url, 'pinkybot-google-oauth', 'width=600,height=700');
 
-            // Listen for postMessage from proxy callback
+            // Listen for postMessage from the proxy callback. Validate the origin
+            // AND that the session matches the one we started — a stray/malicious
+            // message must not close the listener or fetch tokens for another session.
             oauthHandler = async (event) => {
+                if (event.origin !== proxyOrigin) return;
                 if (event.data?.type !== 'pinkybot-oauth') return;
+                if (event.data.session !== session) return;
                 window.removeEventListener('message', oauthHandler);
-                // Fetch tokens from proxy via local API
+                oauthHandler = null;
+                // Fetch tokens via local API using OUR session (not the message's).
                 try {
-                    await api('GET', `/calendar/google/fetch-token?session=${event.data.session}`);
+                    await api('GET', `/calendar/google/fetch-token?session=${encodeURIComponent(session)}`);
                     toast('Google Calendar connected!');
                     await loadGoogleStatus();
                 } catch (e) {
@@ -482,6 +510,7 @@
             // Timeout after 5 min
             oauthTimer = setTimeout(() => {
                 window.removeEventListener('message', oauthHandler);
+                oauthHandler = null;
                 googleConnecting = false;
             }, 300000);
         } catch (e) {
@@ -492,9 +521,13 @@
 
     async function disconnectGoogle() {
         if (!confirm('Disconnect Google Calendar?')) return;
-        await api('DELETE', '/calendar/google/disconnect');
-        toast('Google Calendar disconnected');
-        await loadGoogleStatus();
+        try {
+            await api('DELETE', '/calendar/google/disconnect');
+            toast('Google Calendar disconnected');
+            await loadGoogleStatus();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     async function removeGoogleCredentials() {
@@ -557,17 +590,25 @@
 
     async function deleteCalendarConfig() {
         if (!confirm('Remove calendar credentials?')) return;
-        await api('DELETE', '/calendar/config');
-        calendarStatus = { configured: false };
-        calendarUrl = ''; calendarUsername = ''; calendarPassword = '';
-        calendarAgents = [];
-        toast('Calendar config removed');
+        try {
+            await api('DELETE', '/calendar/config');
+            calendarStatus = { configured: false };
+            calendarUrl = ''; calendarUsername = ''; calendarPassword = '';
+            calendarAgents = [];
+            toast('Calendar config removed');
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     async function toggleAgentCalendar(agentName, enable) {
-        await api('POST', `/agents/${agentName}/calendar/${enable ? 'enable' : 'disable'}`);
-        toast(`Calendar ${enable ? 'enabled' : 'disabled'} for ${agentName}`);
-        loadCalendarAgentStatuses();
+        try {
+            await api('POST', `/agents/${agentName}/calendar/${enable ? 'enable' : 'disable'}`);
+            toast(`Calendar ${enable ? 'enabled' : 'disabled'} for ${agentName}`);
+            loadCalendarAgentStatuses();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     // Active tab
@@ -596,6 +637,7 @@
     // Provider presets and helpers moved to ProviderConfig component
     function detectProvFormPreset(url) {
         if (!url) return 'custom';
+        if (url === 'codex_cli') return 'codex_cli';
         if (url === 'http://localhost:11434') return 'ollama';
         if (url === 'https://api.z.ai/api/anthropic') return 'zai';
         if (url === 'https://openrouter.ai/api') return 'openrouter';
@@ -677,14 +719,18 @@
 
     async function deleteProvider(p) {
         if (!confirm(`Delete provider "${p.name}"? Agents using it will fall back to Anthropic defaults.`)) return;
-        await api('DELETE', `/providers/${p.id}`);
-        if (defaultProviderId === p.id) {
-            defaultProviderId = '';
-            defaultProviderSavedId = '';
-            await api('PUT', '/settings/default-provider', { provider_id: '' }).catch(() => {});
+        try {
+            await api('DELETE', `/providers/${p.id}`);
+            if (defaultProviderId === p.id) {
+                defaultProviderId = '';
+                defaultProviderSavedId = '';
+                await api('PUT', '/settings/default-provider', { provider_id: '' }).catch(() => {});
+            }
+            toast('Provider deleted');
+            await loadProviders();
+        } catch (e) {
+            toast(e.message, 'error');
         }
-        toast('Provider deleted');
-        await loadProviders();
     }
 
     onMount(() => {
@@ -1038,7 +1084,7 @@
                 {#if calendarStatus?.caldav?.configured}
                     <div>
                         <div style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.cal_apple_id_label')}</div>
-                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.caldav.caldav_username || '--'}</div>
+                        <div style="margin-top:0.35rem;font-family:var(--font-grotesk);font-size:0.85rem">{calendarStatus.caldav.username || '--'}</div>
                     </div>
                 {/if}
             </div>
