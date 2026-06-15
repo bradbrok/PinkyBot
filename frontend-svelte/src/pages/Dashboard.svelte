@@ -375,7 +375,7 @@
                             <span class="feed-icon" style="color:var(--tone-lilac-text)">⏱</span>
                             <span class="feed-agent">{sched.agent_name}</span>
                             <span class="feed-title" title={sched.name}>{sched.name}</span>
-                            <span class="sched-cron mono">{sched.cron}{#if sched.one_shot} <span style="color:var(--tone-amber-text,#d4a);font-size:0.65rem">once</span>{/if}</span>
+                            <span class="sched-cron mono">{sched.cron}{#if sched.one_shot} <span style="color:var(--tone-warning-text,#92400e);font-size:0.65rem">once</span>{/if}</span>
                             <span class="feed-time">{formatNextRun(sched.next_run)}</span>
                         </div>
                     {/each}
