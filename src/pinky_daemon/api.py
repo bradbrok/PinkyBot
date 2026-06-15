@@ -13,6 +13,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import hashlib
 import hmac
 import json
@@ -218,6 +219,69 @@ COLD_START_CONNECT_TIMEOUT_SEC = float(
     os.environ.get("PINKY_COLD_START_CONNECT_TIMEOUT_SEC", "120")
 )
 
+# ── Cold-start serialization (#202) ──────────────────────────
+# The Claude OAuth credentials file (``~/.claude/.credentials.json``) is shared
+# by every agent in a fleet that shares ``$HOME``, and its refresh token is
+# *single-use* — the auth server rotates it on each refresh. When several agents
+# boot a fresh ``claude`` at once (the daemon-restart boot loop, or a watchdog
+# batch-resurrection), their concurrent token refreshes race: one wins the
+# rotation and the rest fail with a now-invalid refresh token, de-authing most
+# of the fleet (the "thundering herd"). Serializing the spawn→ready window —
+# plus a short post-ready settle so the just-booted process can flush its
+# rotated token to disk — removes the race; each refresh completes and persists
+# before the next boot starts.
+#
+# Default OFF (flag-gated soak, per trust rails): enable with
+# ``PINKY_COLDSTART_SERIALIZE=1`` on a fleet that shares creds. Scope is *fresh
+# boots only* (cold start + resurrection); warm reconnects / interactive wakes
+# don't pass through the gate, so they keep their lock-free latency.
+COLDSTART_SERIALIZE = os.environ.get(
+    "PINKY_COLDSTART_SERIALIZE", "0"
+).strip().lower() in ("1", "true", "yes", "on")
+COLDSTART_SETTLE_SEC = float(os.environ.get("PINKY_COLDSTART_SETTLE_SEC", "3.0"))
+
+# Process-global gate. Lazily created and rebound if the running loop changes
+# (keeps a single instance in the daemon's one loop; stays correct under
+# pytest-asyncio's per-test loops).
+_coldstart_lock: "asyncio.Lock | None" = None
+_coldstart_lock_loop = None
+
+
+def _get_coldstart_lock() -> "asyncio.Lock":
+    """Return the process-global cold-start lock bound to the running loop."""
+    global _coldstart_lock, _coldstart_lock_loop
+    loop = asyncio.get_running_loop()
+    if _coldstart_lock is None or _coldstart_lock_loop is not loop:
+        _coldstart_lock = asyncio.Lock()
+        _coldstart_lock_loop = loop
+    return _coldstart_lock
+
+
+@contextlib.asynccontextmanager
+async def _coldstart_gate(agent_name: str, label: str):
+    """Serialize a fresh-``claude`` boot across the process (#202).
+
+    No-op (no lock, no settle) when ``COLDSTART_SERIALIZE`` is disabled. When
+    enabled, holds a process-global lock for the duration of the wrapped boot
+    and, on success, sleeps ``COLDSTART_SETTLE_SEC`` before releasing so the
+    just-booted process flushes its rotated OAuth token before the next boot
+    begins. The settle is skipped if the wrapped boot raises — a failed boot
+    rotated nothing worth waiting on, and the next attempt shouldn't be delayed.
+    """
+    if not COLDSTART_SERIALIZE:
+        yield
+        return
+    lock = _get_coldstart_lock()
+    if lock.locked():
+        _log(
+            f"streaming-start: {agent_name}/{label} cold boot queued — "
+            f"serializing behind an in-flight boot (#202)"
+        )
+    async with lock:
+        yield
+        if COLDSTART_SETTLE_SEC > 0:
+            await asyncio.sleep(COLDSTART_SETTLE_SEC)
+
 
 async def _bounded_cold_start_connect(
     ss,
@@ -235,22 +299,28 @@ async def _bounded_cold_start_connect(
     bypassing that handler and leaving an unregistered-but-connected client. So
     we always best-effort ``disconnect()`` before re-raising; the caller must
     treat any raise as "do NOT register this session".
+
+    #202: the spawn→ready window runs under the process-global cold-start gate
+    (``_coldstart_gate``) so concurrent boots don't race the shared single-use
+    OAuth refresh token. The gate is a no-op unless ``PINKY_COLDSTART_SERIALIZE``
+    is enabled.
     """
-    try:
-        await asyncio.wait_for(ss.connect(), timeout=timeout)
-    except asyncio.TimeoutError:
-        _log(
-            f"streaming-start: cold start timed out for {agent_name}/{label} "
-            f"after {timeout:.0f}s — discarding unregistered session"
-        )
+    async with _coldstart_gate(agent_name, label):
         try:
-            await ss.disconnect()
-        except Exception as de:  # best-effort cleanup; never mask the timeout
+            await asyncio.wait_for(ss.connect(), timeout=timeout)
+        except asyncio.TimeoutError:
             _log(
-                f"streaming-start: post-timeout disconnect failed for "
-                f"{agent_name}/{label}: {de}"
+                f"streaming-start: cold start timed out for {agent_name}/{label} "
+                f"after {timeout:.0f}s — discarding unregistered session"
             )
-        raise
+            try:
+                await ss.disconnect()
+            except Exception as de:  # best-effort cleanup; never mask the timeout
+                _log(
+                    f"streaming-start: post-timeout disconnect failed for "
+                    f"{agent_name}/{label}: {de}"
+                )
+            raise
 
 
 # ── Request/Response Models ──────────────────────────────────
@@ -8808,27 +8878,31 @@ npm run build</pre>
             return
         _log(f"api: watchdog resurrection — reconnecting {agent_name}")
         try:
-            # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
-            # tick isn't blocked for up to ~40s during the internal backoff.
-            attempt_reconnect = getattr(ss, "attempt_reconnect", None)
-            if callable(attempt_reconnect):
-                await attempt_reconnect()
-            else:
-                # Runtime-tolerant fallback for future StreamingSession-compatible
-                # implementations that have connect/disconnect but not the richer
-                # watchdog reconnect helper yet.
-                try:
-                    disconnect = getattr(ss, "disconnect", None)
-                    if callable(disconnect):
-                        await disconnect()
-                except Exception as e:
-                    _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
-                connect = getattr(ss, "connect", None)
-                if not callable(connect):
-                    raise AttributeError(
-                        f"{ss.__class__.__name__} has no attempt_reconnect or connect"
-                    )
-                await connect()
+            # #202: serialize the fresh boot behind the process-global cold-start
+            # gate so a watchdog batch-resurrection doesn't race the shared
+            # single-use OAuth refresh token (no-op unless PINKY_COLDSTART_SERIALIZE).
+            async with _coldstart_gate(agent_name, "main"):
+                # TODO(#338-followup): wrap in asyncio.create_task so the scheduler
+                # tick isn't blocked for up to ~40s during the internal backoff.
+                attempt_reconnect = getattr(ss, "attempt_reconnect", None)
+                if callable(attempt_reconnect):
+                    await attempt_reconnect()
+                else:
+                    # Runtime-tolerant fallback for future StreamingSession-compatible
+                    # implementations that have connect/disconnect but not the richer
+                    # watchdog reconnect helper yet.
+                    try:
+                        disconnect = getattr(ss, "disconnect", None)
+                        if callable(disconnect):
+                            await disconnect()
+                    except Exception as e:
+                        _log(f"api: resurrection pre-disconnect failed for {agent_name}: {e}")
+                    connect = getattr(ss, "connect", None)
+                    if not callable(connect):
+                        raise AttributeError(
+                            f"{ss.__class__.__name__} has no attempt_reconnect or connect"
+                        )
+                    await connect()
             if getattr(ss, "state", None) == TransportSessionState.CONNECTED:
                 activity.log(
                     agent_name, "watchdog_resurrect",
