@@ -459,7 +459,10 @@
     }
 
     function openChat(id) {
-        window.location.hash = `/chat#${id}`;
+        // `?session=<id>` is read by Chat's onMount, which selects that exact
+        // session after refreshSessions(). The old `/chat#<id>` form was ignored
+        // by the router, so the button landed on an empty "select a session".
+        window.location.hash = `/chat?session=${encodeURIComponent(id)}`;
     }
 
     function openGroupModal() { groupName = ''; groupMembers = ''; groupModalOpen = true; }
