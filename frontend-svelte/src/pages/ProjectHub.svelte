@@ -2,6 +2,7 @@
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
     import { timeAgo } from '../lib/utils.js';
+    import { safeExternalHref } from '../lib/safe.js';
 
     export let params = {};
 
@@ -147,7 +148,10 @@
                 </div>
                 <div class="proj-meta-row">
                     {#if p.repo_url}
-                        <a href={p.repo_url} target="_blank" rel="noopener noreferrer" class="btn btn-sm">Repo →</a>
+                        {@const repoHref = safeExternalHref(p.repo_url)}
+                        {#if repoHref}
+                            <a href={repoHref} target="_blank" rel="noopener noreferrer" class="btn btn-sm">Repo →</a>
+                        {/if}
                     {/if}
                     <a href="#/tasks" class="btn btn-sm">{$_('nav.tasks')} →</a>
                 </div>
@@ -299,7 +303,12 @@
                             <span class="asset-chip">
                                 <span class="asset-icon material-symbols-outlined">{assetIcon(a.type)}</span>
                                 {#if a.url}
-                                    <a href={a.url} target="_blank" rel="noopener noreferrer" class="asset-link" title={a.description || a.title}>{a.title}</a>
+                                    {@const assetHref = safeExternalHref(a.url)}
+                                    {#if assetHref}
+                                        <a href={assetHref} target="_blank" rel="noopener noreferrer" class="asset-link" title={a.description || a.title}>{a.title}</a>
+                                    {:else}
+                                        <span class="asset-title">{a.title}</span>
+                                    {/if}
                                 {:else}
                                     <span class="asset-title">{a.title}</span>
                                 {/if}
