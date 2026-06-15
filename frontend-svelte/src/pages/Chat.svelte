@@ -1292,7 +1292,15 @@
         refreshInterval = setInterval(refreshSessions, 10000);
         document.addEventListener('click', handleGlobalClick);
         document.addEventListener('keydown', handleGlobalKeydown);
-        if (params?.agent && !activeSession) {
+        // Deep-link: `#/chat?session=<id>` (e.g. the Agents page "Chat" button)
+        // selects that exact session; `/chat/:agent` falls back to main.
+        const hashQ = window.location.hash.indexOf('?');
+        const deepSession = hashQ >= 0
+            ? new URLSearchParams(window.location.hash.slice(hashQ + 1)).get('session')
+            : null;
+        if (deepSession && !activeSession && sessionsList.some((s) => s.id === deepSession)) {
+            selectSession(deepSession, agentFromSessionId(deepSession));
+        } else if (params?.agent && !activeSession) {
             const mainSessionId = `${params.agent}-main`;
             if (sessionsList.some(s => s.id === mainSessionId)) selectSession(mainSessionId, params.agent);
         }
