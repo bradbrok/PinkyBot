@@ -18,7 +18,7 @@
     let activeOnly = true;
     let searchInput = '';
     let memLoading = false;
-    let memSeq = 0; let statsSeq = 0; let chatSeq = 0; let kgSeq = 0;
+    let memSeq = 0; let statsSeq = 0; let chatSeq = 0; let kgSeq = 0; let dreamSeq = 0;
 
     // Tab: memories vs chat vs dreams
     let activeTab = 'memories';
@@ -227,16 +227,25 @@
 
     async function loadDreamHistory() {
         dreamLoading = true;
+        const seq = ++dreamSeq; const agent = currentAgent;
         try {
-            if (currentAgent) {
-                const data = await api('GET', `/agents/${currentAgent}/dream/history`);
+            if (agent) {
+                const data = await api('GET', `/agents/${agent}/dream/history`);
+                if (seq !== dreamSeq || agent !== currentAgent) return;
                 dreamStates = data.dream_state ? [data.dream_state] : [];
             } else {
                 const data = await api('GET', '/dreams');
+                if (seq !== dreamSeq || agent !== currentAgent) return;
                 dreamStates = data.dream_states || [];
             }
-        } catch (e) { console.error('Dream history error:', e); dreamStates = []; }
-        dreamLoading = false;
+        } catch (e) {
+            if (seq === dreamSeq && agent === currentAgent) {
+                console.error('Dream history error:', e);
+                dreamStates = [];
+            }
+        } finally {
+            if (seq === dreamSeq && agent === currentAgent) dreamLoading = false;
+        }
     }
 
     async function triggerDream(agentName) {
@@ -518,6 +527,7 @@
     onMount(init);
     onDestroy(() => {
         kgDestroyed = true;
+        if (kgLabelTimer) clearTimeout(kgLabelTimer);
         if (kgSim) { kgSim.stop(); kgSim = null; }
         if (kgFitCancel) { kgFitCancel(); kgFitCancel = null; }
     });

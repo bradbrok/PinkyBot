@@ -49,6 +49,12 @@
     let createdAgentName = '';
     let existingAgents = [];
 
+    function normalizeAgentsResponse(data) {
+        if (Array.isArray(data)) return data;
+        if (Array.isArray(data?.agents)) return data.agents;
+        return [];
+    }
+
     // Step 4: Channel
     let selectedPlatform = 'telegram';
     let platformToken = '';
@@ -78,8 +84,7 @@
                 ownerLanguages = profile.languages || '';
                 ownerCommStyle = profile.comm_style || '';
             } else if (step === 4) {
-                existingAgents = await api('GET', '/agents').catch(() => []);
-                if (!Array.isArray(existingAgents)) existingAgents = [];
+                existingAgents = normalizeAgentsResponse(await api('GET', '/agents').catch(() => []));
             } else if (step === 5) {
                 const platforms = await api('GET', '/outreach/platforms').catch(() => ({}));
                 configuredPlatforms = (platforms.platforms || []).filter(p => p.enabled);
@@ -97,7 +102,7 @@
                         api('GET', '/settings/owner-profile').catch(() => ({})),
                     ]);
                     authStatus = authResp;
-                    existingAgents = Array.isArray(agentsResp) ? agentsResp : [];
+                    existingAgents = normalizeAgentsResponse(agentsResp);
                     configuredPlatforms = (platformsResp.platforms || []).filter(p => p.enabled);
                     ownerName = profileResp.name || ownerName;
                 } finally {
@@ -191,7 +196,7 @@
             await api('POST', `/agents/${agentName}/streaming-sessions?label=main`);
             createdAgentName = agentName;
             agentCreated = true;
-            existingAgents = await api('GET', '/agents').catch(() => []);
+            existingAgents = normalizeAgentsResponse(await api('GET', '/agents').catch(() => []));
             toast(`${agentDisplayName || agentName} created`);
             // Auto-advance after brief pause so user sees the success
             advanceTimer = setTimeout(() => { advanceTimer = null; next(); }, 800);

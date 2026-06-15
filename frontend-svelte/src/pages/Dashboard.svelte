@@ -27,6 +27,14 @@
 
     let refreshInterval;
     let uptimeInterval;
+    let stoppingAgents = new Set();
+
+    function setAgentStopping(name, stopping) {
+        const next = new Set(stoppingAgents);
+        if (stopping) next.add(name);
+        else next.delete(name);
+        stoppingAgents = next;
+    }
 
     function formatUptime() {
         if (!serverStartedAt) return '--';
@@ -54,15 +62,14 @@
     async function stopAgent(name, event) {
         event.preventDefault();
         event.stopPropagation();
-        const agent = agents.find(a => a.name === name);
-        if (agent?.stopping) return;
-        if (agent) { agent.stopping = true; agents = agents; }
+        if (stoppingAgents.has(name)) return;
+        setAgentStopping(name, true);
         try {
             await api('POST', `/agents/${name}/stop`);
             refresh();
         } catch (e) {
             toast(`Failed to stop ${name}`, 'error');
-            if (agent) { agent.stopping = false; agents = agents; }
+            setAgentStopping(name, false);
         }
     }
 
@@ -169,6 +176,7 @@
                     contextRestarts: restartsByAgent[agent.name] || 0,
                     workerCount: streamingSessions.filter(s => s.label !== 'main' && s.connected).length,
                     recommendation: health.recommendation || null,
+                    stopping: stoppingAgents.has(agent.name),
                 };
             }));
 
@@ -176,6 +184,7 @@
             const statusOrder = { online: 0, idle: 1, offline: 2, unknown: 3 };
             agentDetails.sort((a, b) => (statusOrder[a.status] ?? 3) - (statusOrder[b.status] ?? 3));
             agents = agentDetails;
+            stoppingAgents = new Set([...stoppingAgents].filter(name => agentDetails.some(a => a.name === name && a.connected)));
 
             const noisy = new Set(['agent_working', 'agent_idle']);
             const freshEvents = (activityData.events || []).filter(e => !noisy.has(e.event_type));

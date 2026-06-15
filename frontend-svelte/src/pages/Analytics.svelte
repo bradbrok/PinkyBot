@@ -167,6 +167,7 @@
 
     async function selectAgent(name) {
         if (selectedAgent === name) {
+            detailSeq++;
             selectedAgent = null;
             agentDetail = null;
             return;
@@ -186,6 +187,7 @@
     }
 
     function changeRange(newRange) {
+        detailSeq++;
         range = newRange;
         loading = true;
         selectedAgent = null;

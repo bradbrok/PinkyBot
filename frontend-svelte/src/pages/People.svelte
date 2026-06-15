@@ -36,8 +36,23 @@
 
     // Pending flags to prevent double-submit
     let savingEntry = false;
+    let savingEdit = false;
     let savingRel = false;
     let deletingUser = false;
+    let deletingEntries = new Set();
+    let deletingRelationships = new Set();
+    let togglingVisibility = new Set();
+
+    function setPending(setValue, key, pending) {
+        const next = new Set(setValue);
+        if (pending) next.add(key);
+        else next.delete(key);
+        return next;
+    }
+
+    function visibilityPendingKey(uid, agentName) {
+        return `${uid || ''}:${agentName}`;
+    }
 
     const REL_TYPES = [
         'wife', 'husband', 'partner', 'friend', 'collaborator', 'colleague',
@@ -147,20 +162,28 @@
     }
 
     async function deleteRelationship(relId) {
+        if (deletingRelationships.has(relId)) return;
         if (!confirm('Remove this relationship?')) return;
+        deletingRelationships = setPending(deletingRelationships, relId, true);
         try {
             await api('DELETE', `/user-profiles/relationships/${relId}`);
             await loadRelationships();
             toast('Relationship removed');
         } catch (e) { toast('Failed to delete', 'error'); }
+        finally { deletingRelationships = setPending(deletingRelationships, relId, false); }
     }
 
     async function toggleVisibility(agentName, currentVisible) {
+        const uid = selectedUser;
+        const pendingKey = visibilityPendingKey(uid, agentName);
+        if (!uid || togglingVisibility.has(pendingKey)) return;
+        togglingVisibility = setPending(togglingVisibility, pendingKey, true);
         try {
-            await api('PUT', `/user-profiles/${selectedUser}/visibility/${agentName}`, { visible: !currentVisible });
-            await loadVisibility();
+            await api('PUT', `/user-profiles/${uid}/visibility/${agentName}`, { visible: !currentVisible });
+            await loadVisibility(uid);
             toast(`${agentName}: ${!currentVisible ? 'visible' : 'hidden'}`);
         } catch (e) { toast('Failed to update visibility', 'error'); }
+        finally { togglingVisibility = setPending(togglingVisibility, pendingKey, false); }
     }
 
     function startEdit(entry) {
@@ -170,24 +193,35 @@
     }
 
     async function saveEdit() {
+        if (savingEdit) return;
+        const value = String(editValue ?? '').trim();
+        if (!value) {
+            toast('Value is required', 'error');
+            return;
+        }
+        savingEdit = true;
         try {
             await api('PUT', `/user-profiles/entries/${editingEntry}`, {
-                value: editValue,
+                value,
                 confidence: editConfidence,
             });
             editingEntry = null;
             await loadEntries();
             toast('Updated');
         } catch (e) { toast('Failed to update', 'error'); }
+        finally { savingEdit = false; }
     }
 
     async function deleteEntry(id) {
+        if (deletingEntries.has(id)) return;
         if (!confirm('Delete this entry?')) return;
+        deletingEntries = setPending(deletingEntries, id, true);
         try {
             await api('DELETE', `/user-profiles/entries/${id}`);
             await loadEntries();
             toast('Deleted');
         } catch (e) { toast('Failed to delete', 'error'); }
+        finally { deletingEntries = setPending(deletingEntries, id, false); }
     }
 
     async function addEntry() {
@@ -355,8 +389,8 @@
                                             <span class="entry-key">{entry.key}</span>
                                             <input type="text" bind:value={editValue} class="edit-input">
                                             <input type="range" min="0" max="1" step="0.1" bind:value={editConfidence} style="width:60px" title="Confidence">
-                                            <button class="btn btn-xs btn-primary" on:click={saveEdit}>Save</button>
-                                            <button class="btn btn-xs" on:click={() => { editingEntry = null; }}>Cancel</button>
+                                            <button class="btn btn-xs btn-primary" on:click={saveEdit} disabled={savingEdit}>Save</button>
+                                            <button class="btn btn-xs" on:click={() => { editingEntry = null; }} disabled={savingEdit}>Cancel</button>
                                         </div>
                                     {:else}
                                         <div class="entry-content">
@@ -370,7 +404,7 @@
                                             <button class="btn-icon" on:click={() => startEdit(entry)} title="Edit">
                                                 <span class="material-symbols-outlined" style="font-size:0.85rem">edit</span>
                                             </button>
-                                            <button class="btn-icon" on:click={() => deleteEntry(entry.id)} title="Delete">
+                                            <button class="btn-icon" on:click={() => deleteEntry(entry.id)} disabled={deletingEntries.has(entry.id)} title="Delete">
                                                 <span class="material-symbols-outlined" style="font-size:0.85rem">delete</span>
                                             </button>
                                         </div>
@@ -441,7 +475,7 @@
                                             <span class="rel-context">{rel.context}</span>
                                         {/if}
                                         <span class="confidence-badge" style="color:{confidenceColor(rel.confidence)}">{confidenceLabel(rel.confidence)}</span>
-                                        <button class="btn-icon" on:click={() => deleteRelationship(rel.id)} title="Remove">
+                                        <button class="btn-icon" on:click={() => deleteRelationship(rel.id)} disabled={deletingRelationships.has(rel.id)} title="Remove">
                                             <span class="material-symbols-outlined" style="font-size:0.85rem">close</span>
                                         </button>
                                     </div>
@@ -484,6 +518,7 @@
                                     class="visibility-chip"
                                     class:visible={v.visible}
                                     on:click={() => toggleVisibility(v.agent_name, v.visible)}
+                                    disabled={togglingVisibility.has(visibilityPendingKey(selectedUser, v.agent_name))}
                                 >
                                     <span class="material-symbols-outlined" style="font-size:0.85rem">
                                         {v.visible ? 'visibility' : 'visibility_off'}
