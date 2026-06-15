@@ -691,9 +691,15 @@
     function startStreamEvents() {
         stopStreamEvents();
         if (!activeAgent || !activeSession || !canUseStreamingChat) return;
-        const label = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
-        streamEventSource = sse(`/agents/${activeAgent}/streaming/events?label=${encodeURIComponent(label)}`);
+        const streamSessionId = activeSession;
+        const streamAgentName = activeAgent;
+        const label = activeSessionRecord?._streaming_label || labelFromSessionId(streamSessionId, streamAgentName);
+        streamEventSource = sse(`/agents/${streamAgentName}/streaming/events?label=${encodeURIComponent(label)}`);
         streamEventSource.onmessage = async (evt) => {
+            // Stale-session guard: switching sessions closes the old EventSource,
+            // but an already-queued event can still fire — it must not mutate the
+            // newly-active session's messages/activity.
+            if (activeSession !== streamSessionId) return;
             let data = null;
             try { data = JSON.parse(evt.data || '{}'); } catch { return; }
             if (!data || !data.type) return;
@@ -892,6 +898,10 @@
         }
         const sentAt = Date.now() / 1000;
         const sessionId = activeSession;
+        // Snapshot the target before any await — a session/agent switch mid-send
+        // must not redirect this POST to the newly-selected agent.
+        const sendAgent = activeAgent;
+        const sendSessionRecord = activeSessionRecord;
         const priorAssistantTs = latestAssistantTimestamp(persistedMessages);
         messageInput = '';
         sending = true;
@@ -912,9 +922,9 @@
 
         try {
             if (canUseStreamingChat) {
-                const sessionLabel = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
+                const sessionLabel = sendSessionRecord?._streaming_label || labelFromSessionId(sessionId, sendAgent);
                 const sessionParam = sessionLabel !== 'main' ? `?session=${encodeURIComponent(sessionLabel)}` : '';
-                await api('POST', `/agents/${activeAgent}/chat${sessionParam}`, { content: text });
+                await api('POST', `/agents/${sendAgent}/chat${sessionParam}`, { content: text });
                 sending = false;
                 await refreshChat();
             } else if (canUseLegacySessionChat) {
@@ -961,7 +971,7 @@
         await tick();
         scrollToBottom();
         try {
-            const resp = await fetch(`/agents/${activeAgent}/upload`, { method: 'POST', body: formData, credentials: 'same-origin' });
+            const resp = await fetch(`/agents/${uploadAgent}/upload`, { method: 'POST', body: formData, credentials: 'same-origin' });
             if (resp.status === 401) {
                 let payload = null;
                 if ((resp.headers.get('content-type') || '').includes('application/json')) {
