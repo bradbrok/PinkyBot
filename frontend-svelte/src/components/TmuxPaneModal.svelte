@@ -81,11 +81,22 @@
         '\x1b[6~': 'NPage',
     };
 
+    // Bumped on teardown (close/switch) so queued keystrokes from a previous
+    // pane are dropped instead of landing on the newly-selected agent/label.
+    let sendEpoch = 0;
     function queueSend(payload) {
+        // Snapshot the target at enqueue time — a queued link of the chain must
+        // hit the pane the keystroke was typed for, not the live agent/label.
+        const targetAgent = agent;
+        const targetLabel = label;
+        const epoch = sendEpoch;
         sendChain = sendChain
-            .then(() => api('POST', `/agents/${encodeURIComponent(agent)}/tmux/pane/keys`, { ...payload, label }))
-            .then(() => { if (inputError) inputError = ''; })
-            .catch((e) => { inputError = `send failed: ${e?.message || e}`; });
+            .then(() => {
+                if (epoch !== sendEpoch) return; // pane torn down/switched — drop
+                return api('POST', `/agents/${encodeURIComponent(targetAgent)}/tmux/pane/keys`, { ...payload, label: targetLabel });
+            })
+            .then(() => { if (epoch === sendEpoch && inputError) inputError = ''; })
+            .catch((e) => { if (epoch === sendEpoch) inputError = `send failed: ${e?.message || e}`; });
     }
 
     function handleTerminalData(data) {
@@ -202,6 +213,10 @@
         };
         sseSource.onerror = () => {
             statusMessage = 'Stream disconnected. Close + reopen to retry.';
+            // Close it: EventSource auto-reconnects forever by default, and on a
+            // persistent backend error that loops silently. We tell the user to
+            // reopen, so stop the native retry loop.
+            if (sseSource) { try { sseSource.close(); } catch {} sseSource = null; }
         };
     }
 
@@ -287,6 +302,7 @@
         lastReqRows = 0;
         inputEnabled = false;
         inputError = '';
+        sendEpoch++; // invalidate any keystrokes still queued for the old pane
         sendChain = Promise.resolve();
     }
 
