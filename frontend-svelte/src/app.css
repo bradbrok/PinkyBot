@@ -94,6 +94,20 @@
     --gray-mid: var(--text-muted);
     --gray-dark: var(--text-secondary);
     --black: var(--text-primary);
+    /* Back-compat aliases for legacy token names still referenced by some
+       components (Analytics, ChatInput, ProviderConfig, TabBar, ChatSidebar,
+       Agents, Settings). They resolve through the theme-aware tokens, so they
+       follow light/dark automatically and undefined-var fallbacks disappear. */
+    --text: var(--text-primary);
+    --bg: var(--app-bg);
+    --bg-secondary: var(--surface-2);
+    --bg-hover: var(--hover-soft);
+    --radius-md: var(--radius-lg);
+    /* Semantic tokens a few components reference with hardcoded fallbacks;
+       define them once (theme-aware) so e.g. LocalePicker's border doesn't fall
+       back to a dark rgba in light mode. */
+    --border-subtle: var(--surface-3);
+    --text-error: var(--red);
 }
 
 :root[data-theme='dark'] {
