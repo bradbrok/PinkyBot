@@ -403,7 +403,7 @@
 
     async function handleContainerActionError(agentName, e, retry) {
         const msg = e?.message || String(e);
-        if (msg.startsWith('409:') && confirm(`${msg}\n\nForce the transition and stop active sessions?`)) {
+        if (msg.startsWith('409:') && msg.toLowerCase().includes('busy') && confirm(`${msg}\n\nForce the transition and stop active sessions?`)) {
             await retry(true);
             return;
         }
