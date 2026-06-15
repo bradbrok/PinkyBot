@@ -3098,7 +3098,14 @@ def create_api(
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
         if ss and ss.state == TransportSessionState.CONNECTED:
-            return ss
+            # #204: the connected fast path stays lock-free EXCEPT while a
+            # containerize/decontainerize apply holds this agent's lifecycle
+            # lock — then returning the live session would let a new turn start
+            # on a session that's about to be torn down at cutover. If the lock
+            # is held, fall through to the slow path, which awaits it and then
+            # re-reads (picking up the freshly-started post-cutover session).
+            if not _container_lifecycle_lock(agent_name).locked():
+                return ss
 
         lock = _streaming_ensure_locks.setdefault((agent_name, label), asyncio.Lock())
         # #204: lifecycle (outer) → ensure (inner). The lifecycle lock blocks
@@ -6179,6 +6186,7 @@ npm run build</pre>
             has_live_session=lambda n: bool(broker._streaming.get(n)),
             lifecycle_lock=_container_lifecycle_lock,
             op_registry=_container_op_registry,
+            is_busy=_container_agent_busy,
             log=_log,
         )
     )
@@ -6324,7 +6332,9 @@ npm run build</pre>
 
         _container_op_registry.begin(name, _cops.OP_CONTAINERIZE, image=image)
         _spawn_container_op(
-            _container_lifecycle.containerize(name, image=image, start=req.start)
+            _container_lifecycle.containerize(
+                name, image=image, start=req.start, force=req.force
+            )
         )
         rec = _container_op_registry.get(name)
         return JSONResponse(
@@ -6363,7 +6373,9 @@ npm run build</pre>
             _cops.OP_DECONTAINERIZE,
             image=getattr(agent, "container_image", "") or "",
         )
-        _spawn_container_op(_container_lifecycle.decontainerize(name, start=req.start))
+        _spawn_container_op(
+            _container_lifecycle.decontainerize(name, start=req.start, force=req.force)
+        )
         rec = _container_op_registry.get(name)
         return JSONResponse(
             status_code=202,

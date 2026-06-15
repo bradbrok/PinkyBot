@@ -186,6 +186,10 @@ class ContainerLifecycleDeps:
     # streaming-ensure slow path so a wake can't start a session mid-apply)
     lifecycle_lock: Callable[[str], asyncio.Lock]
     op_registry: ContainerOpRegistry
+    # (agent_name) -> (busy: bool, reason: str). Re-checked AT CUTOVER under the
+    # lifecycle lock — not just at enqueue — so a turn that starts during the
+    # (lock-free) provision phase can't be killed by a non-forced apply.
+    is_busy: Callable[[str], tuple[bool, str]] = field(default=lambda _n: (False, ""))
     # off-loop executor for blocking podman work; asyncio.to_thread in prod, a
     # synchronous shim in tests.
     runner: Callable[..., Awaitable[Any]] = field(default=asyncio.to_thread)
@@ -206,7 +210,22 @@ class ContainerLifecycle:
         self.deps = deps
 
     # -- containerize ---------------------------------------------------------
-    async def containerize(self, name: str, *, image: str, start: bool = True) -> None:
+    async def containerize(
+        self, name: str, *, image: str, start: bool = True, force: bool = False
+    ) -> None:
+        """Terminal-status guard wrapper: any unexpected failure (incl. in an
+        apply step like register / write_mcp_json / disconnect) must leave the op
+        in a TERMINAL state, never stuck in-flight (which would 409 every future
+        attempt + make the UI poll forever)."""
+        try:
+            await self._containerize(name, image=image, start=start, force=force)
+        except Exception as e:  # noqa: BLE001
+            self.deps.log(f"container_ops: containerize {name!r} crashed: {e}")
+            self.deps.op_registry.update(
+                name, ERROR, f"containerize failed unexpectedly: {e}"
+            )
+
+    async def _containerize(self, name: str, *, image: str, start: bool, force: bool) -> None:
         d = self.deps
         reg = d.op_registry
         prov = d.provisioner_for()
@@ -256,6 +275,21 @@ class ContainerLifecycle:
         # the per-agent lifecycle lock so a concurrent wake can't start a session
         # against a half-applied row.
         async with d.lifecycle_lock(name):
+            # Re-check active work AT CUTOVER, not just at enqueue: a turn may
+            # have started during the (lock-free, minutes-long) provision phase.
+            # The streaming-ensure fast path respects this held lock, so no NEW
+            # turn can start once we hold it — this check is the accurate one.
+            if not force:
+                busy, why = d.is_busy(name)
+                if busy:
+                    await self._safe_deprovision(prov, desired)  # DB never flipped
+                    reg.update(
+                        name,
+                        ERROR,
+                        f"agent became busy during provisioning ({why}); "
+                        f"retry with force=true to override",
+                    )
+                    return
             reg.update(name, APPLYING, "persisting container configuration")
             d.registry.register(
                 name,
@@ -293,7 +327,19 @@ class ContainerLifecycle:
         )
 
     # -- decontainerize -------------------------------------------------------
-    async def decontainerize(self, name: str, *, start: bool = True) -> None:
+    async def decontainerize(
+        self, name: str, *, start: bool = True, force: bool = False
+    ) -> None:
+        """Terminal-status guard wrapper (see :meth:`containerize`)."""
+        try:
+            await self._decontainerize(name, start=start, force=force)
+        except Exception as e:  # noqa: BLE001
+            self.deps.log(f"container_ops: decontainerize {name!r} crashed: {e}")
+            self.deps.op_registry.update(
+                name, ERROR, f"decontainerize failed unexpectedly: {e}"
+            )
+
+    async def _decontainerize(self, name: str, *, start: bool, force: bool) -> None:
         d = self.deps
         reg = d.op_registry
         agent = d.registry.get(name)
@@ -302,6 +348,17 @@ class ContainerLifecycle:
             return
 
         async with d.lifecycle_lock(name):
+            # Active-work guard at cutover (same rationale as containerize): don't
+            # tear down a session that's mid-turn unless forced.
+            if not force:
+                busy, why = d.is_busy(name)
+                if busy:
+                    reg.update(
+                        name,
+                        ERROR,
+                        f"agent is busy ({why}); retry with force=true to override",
+                    )
+                    return
             reg.update(name, APPLYING, "reverting to local (home volume kept)")
             # Tear down container + key secret but KEEP the home volume (its CLI
             # logins survive a future re-containerize). Best-effort: a gate-off

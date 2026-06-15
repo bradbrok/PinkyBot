@@ -98,7 +98,7 @@ async def _sync_runner(fn, *a, **k):
     return fn(*a, **k)
 
 
-def _make_deps(agent, ops, *, has_live=True, provisioner=True):
+def _make_deps(agent, ops, *, has_live=True, provisioner=True, busy=False, mcp_raises=False):
     reg = FakeRegistry(agent)
     rec = {"disconnect": [], "start": [], "mcp": []}
     locks: dict[str, asyncio.Lock] = {}
@@ -116,15 +116,21 @@ def _make_deps(agent, ops, *, has_live=True, provisioner=True):
     async def _start(name):
         rec["start"].append(name)
 
+    def _mcp(name):
+        if mcp_raises:
+            raise RuntimeError("boom: .mcp.json write failed")
+        rec["mcp"].append(name)
+
     deps = cops.ContainerLifecycleDeps(
         registry=reg,
         provisioner_for=(lambda: prov) if provisioner else (lambda: None),
-        write_mcp_json=lambda n: rec["mcp"].append(n),
+        write_mcp_json=_mcp,
         disconnect_sessions=_disconnect,
         start_session=_start,
         has_live_session=lambda n: has_live,
         lifecycle_lock=lambda n: locks.setdefault(n, asyncio.Lock()),
         op_registry=cops.ContainerOpRegistry(),
+        is_busy=lambda n: (busy, "mid-turn") if busy else (False, ""),
         runner=_sync_runner,
     )
     return deps, reg, rec
@@ -245,6 +251,56 @@ class TestContainerizeOrchestration:
         assert reg.register_calls == []
         r = deps.op_registry.get("tenant")
         assert r.status == cops.ERROR and "not enabled" in r.message
+
+    def test_busy_at_cutover_aborts_unless_force(self):
+        """INVARIANT (Murzik #783): work that starts during the lock-free
+        provision phase must NOT be killed by a non-forced apply — the cutover
+        re-checks busy under the lock and aborts (DB never flipped)."""
+        ops = RecordingContainerOps()
+        agent = _agent()
+        deps, reg, rec = _make_deps(agent, ops, has_live=True, busy=True)
+        lc = cops.ContainerLifecycle(deps)
+        deps.op_registry.begin("tenant", cops.OP_CONTAINERIZE, image="myco/agent:1")
+
+        asyncio.run(lc.containerize("tenant", image="myco/agent:1", start=True, force=False))
+
+        assert reg.register_calls == []  # never flipped
+        assert reg.get("tenant").isolation_mode == "local"
+        assert rec["disconnect"] == []  # no session torn down
+        r = deps.op_registry.get("tenant")
+        assert r.status == cops.ERROR and "became busy" in r.message
+        # The container built during provisioning was cleaned up (volume kept).
+        n = ContainerNames.for_agent("tenant")
+        assert ops.container_exists(n.container) is False
+
+    def test_busy_at_cutover_proceeds_with_force(self):
+        ops = RecordingContainerOps()
+        agent = _agent()
+        deps, reg, rec = _make_deps(agent, ops, has_live=True, busy=True)
+        lc = cops.ContainerLifecycle(deps)
+        deps.op_registry.begin("tenant", cops.OP_CONTAINERIZE, image="myco/agent:1")
+
+        asyncio.run(lc.containerize("tenant", image="myco/agent:1", start=True, force=True))
+
+        assert len(reg.register_calls) == 1  # forced through
+        assert rec["disconnect"] == ["tenant"]
+        assert deps.op_registry.get("tenant").status == cops.READY
+
+    def test_apply_step_exception_is_terminal_not_stuck(self):
+        """INVARIANT (Murzik #783): an exception in an apply step (here
+        write_mcp_json) must leave the op in a TERMINAL error state — never stuck
+        in-flight, which would 409 every future op + poll forever."""
+        ops = RecordingContainerOps()
+        agent = _agent()
+        deps, reg, rec = _make_deps(agent, ops, has_live=True, mcp_raises=True)
+        lc = cops.ContainerLifecycle(deps)
+        deps.op_registry.begin("tenant", cops.OP_CONTAINERIZE, image="myco/agent:1")
+
+        asyncio.run(lc.containerize("tenant", image="myco/agent:1", start=True))
+
+        r = deps.op_registry.get("tenant")
+        assert r.status == cops.ERROR
+        assert deps.op_registry.in_flight("tenant") is False  # not stuck
 
     def test_no_restart_when_not_live(self):
         """start=True only restarts a session that was ALREADY live."""
