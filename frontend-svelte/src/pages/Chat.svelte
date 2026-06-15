@@ -691,9 +691,15 @@
     function startStreamEvents() {
         stopStreamEvents();
         if (!activeAgent || !activeSession || !canUseStreamingChat) return;
-        const label = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
-        streamEventSource = sse(`/agents/${activeAgent}/streaming/events?label=${encodeURIComponent(label)}`);
+        const streamSessionId = activeSession;
+        const streamAgentName = activeAgent;
+        const label = activeSessionRecord?._streaming_label || labelFromSessionId(streamSessionId, streamAgentName);
+        streamEventSource = sse(`/agents/${streamAgentName}/streaming/events?label=${encodeURIComponent(label)}`);
         streamEventSource.onmessage = async (evt) => {
+            // Stale-session guard: switching sessions closes the old EventSource,
+            // but an already-queued event can still fire — it must not mutate the
+            // newly-active session's messages/activity.
+            if (activeSession !== streamSessionId) return;
             let data = null;
             try { data = JSON.parse(evt.data || '{}'); } catch { return; }
             if (!data || !data.type) return;
@@ -892,6 +898,14 @@
         }
         const sentAt = Date.now() / 1000;
         const sessionId = activeSession;
+        // Snapshot the target AND transport before any await — a session/agent
+        // switch mid-send must not redirect this POST to the newly-selected agent,
+        // and the captured target must stay coherent with the captured mode
+        // (else e.g. a legacy→streaming switch posts to /agents/null/chat).
+        const sendAgent = activeAgent;
+        const sendSessionRecord = activeSessionRecord;
+        const sendCanUseStreamingChat = canUseStreamingChat;
+        const sendCanUseLegacySessionChat = canUseLegacySessionChat;
         const priorAssistantTs = latestAssistantTimestamp(persistedMessages);
         messageInput = '';
         sending = true;
@@ -911,13 +925,13 @@
         await restoreScroll({ forceBottom: true });
 
         try {
-            if (canUseStreamingChat) {
-                const sessionLabel = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
+            if (sendCanUseStreamingChat) {
+                const sessionLabel = sendSessionRecord?._streaming_label || labelFromSessionId(sessionId, sendAgent);
                 const sessionParam = sessionLabel !== 'main' ? `?session=${encodeURIComponent(sessionLabel)}` : '';
-                await api('POST', `/agents/${activeAgent}/chat${sessionParam}`, { content: text });
+                await api('POST', `/agents/${sendAgent}/chat${sessionParam}`, { content: text });
                 sending = false;
                 await refreshChat();
-            } else if (canUseLegacySessionChat) {
+            } else if (sendCanUseLegacySessionChat) {
                 const data = await api('POST', `/sessions/${sessionId}/message`, { content: text });
                 localMessages = [...localMessages, buildLocalMessage({
                     role: 'assistant', content: data.content, duration_ms: data.duration_ms,
@@ -944,7 +958,7 @@
             // timer is safe to clear here. Streaming path returns from the POST while
             // pendingReply/thinking remain true on purpose — leave the 60s failsafe
             // armed so a crashed/never-replying agent doesn't spin forever.
-            if (!canUseStreamingChat && pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
+            if (!sendCanUseStreamingChat && pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
         }
     }
 
@@ -961,7 +975,7 @@
         await tick();
         scrollToBottom();
         try {
-            const resp = await fetch(`/agents/${activeAgent}/upload`, { method: 'POST', body: formData, credentials: 'same-origin' });
+            const resp = await fetch(`/agents/${uploadAgent}/upload`, { method: 'POST', body: formData, credentials: 'same-origin' });
             if (resp.status === 401) {
                 let payload = null;
                 if ((resp.headers.get('content-type') || '').includes('application/json')) {
