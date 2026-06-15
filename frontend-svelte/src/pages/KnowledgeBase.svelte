@@ -6,6 +6,7 @@
     import { toast } from '../lib/stores.js';
     import { timeAgo, formatDate, truncate, renderMarkdown } from '../lib/utils.js';
     import { createForceSim, fitView, animateView, computeLabelSet, edgePath, zoomAt, hexToRgba } from '../lib/forceGraph.js';
+    import { safeExternalHref } from '../lib/safe.js';
 
     let loading = true;
     let refreshInterval;
@@ -441,9 +442,12 @@
         try {
             const body = {};
             body.title = editTitle.trim();
-            if (editTags.trim()) body.tags = editTags.split(',').map(t => t.trim()).filter(Boolean);
+            // Always send tags + source_url (even empty) so clearing them sticks —
+            // the backend ignores only absent/None fields, so a guarded
+            // `if (...trim())` made removal a silent no-op.
+            body.tags = editTags.trim() ? editTags.split(',').map(t => t.trim()).filter(Boolean) : [];
             if (editType) body.source_type = editType;
-            if (editUrl.trim()) body.source_url = editUrl.trim();
+            body.source_url = editUrl.trim();
             body.owner_notes = editNotes.trim();
             body.content = editContent.trim();
 
@@ -536,6 +540,7 @@
 
     onDestroy(() => {
         if (refreshInterval) clearInterval(refreshInterval);
+        if (graphLabelTimer) clearTimeout(graphLabelTimer);
         if (graphSim) { graphSim.stop(); graphSim = null; }
         if (graphFitCancel) { graphFitCancel(); graphFitCancel = null; }
     });
@@ -866,7 +871,7 @@
                                 font-size="12px"
                                 font-family="monospace"
                             >
-                                {hoveredNode.label} ({hoveredNode.degree})
+                                {hoveredNode.label} ({hoveredNode.degree ?? 0})
                             </text>
                         </g>
                     {/if}
@@ -901,10 +906,13 @@
                     <span class="meta-date">{formatDate(detailItem.filed_at)}</span>
                 {/if}
                 {#if detailItem.source_url}
-                    <a href={detailItem.source_url} target="_blank" rel="noopener" class="source-link">
-                        <span class="material-symbols-outlined" style="font-size:14px">open_in_new</span>
-                        source
-                    </a>
+                    {@const srcHref = safeExternalHref(detailItem.source_url)}
+                    {#if srcHref}
+                        <a href={srcHref} target="_blank" rel="noopener" class="source-link">
+                            <span class="material-symbols-outlined" style="font-size:14px">open_in_new</span>
+                            source
+                        </a>
+                    {/if}
                 {/if}
             {:else}
                 <Badge text="wiki" variant="model" />
