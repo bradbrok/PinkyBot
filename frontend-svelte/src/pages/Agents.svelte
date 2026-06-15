@@ -2427,7 +2427,7 @@
                                 disabled={containerizeDisabled(currentAgentData)}
                                 title={containerizeDisabledReason(currentAgentData)}
                                 on:click={() => containerizeAgent(currentAgent)}>
-                            {detailContainerBusy ? 'Working...' : 'Containerize ⚡'}
+                            {#if detailContainerBusy}Working...{:else}<span class="material-symbols-outlined" aria-hidden="true" style="font-size:1rem;vertical-align:-3px;margin-right:0.25rem">deployed_code</span>Containerize{/if}
                         </button>
                         <button class="btn btn-sm" on:click={() => containerAdvancedOpen = !containerAdvancedOpen}>
                             {containerAdvancedOpen ? 'Hide image' : 'Image override'}
