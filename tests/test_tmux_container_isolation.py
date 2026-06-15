@@ -546,6 +546,16 @@ class TestSeedContainerClaudeCreds:
         ss._seed_container_claude_creds()
         assert (wd / ".claude-container" / ".credentials.json").exists()
 
+    def test_seed_skipped_when_flag_on_but_token_missing(self, monkeypatch, tmp_path):
+        # #781 P2: flag ON but no token in env → fail CLOSED. Do NOT fall back to
+        # seeding the refresh-prone creds (operator opted into static-token auth;
+        # a misconfig must surface as a loud login wall, not a silent race).
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        ss._seed_container_claude_creds()
+        assert not (wd / ".claude-container" / ".credentials.json").exists()
+
 
 class TestStaticOAuthTokenForward:
     """#780: forward a long-lived CLAUDE_CODE_OAUTH_TOKEN into the session env so
@@ -594,6 +604,18 @@ class TestStaticOAuthTokenForward:
         env = ss._build_repl_env()
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
         assert env["ANTHROPIC_API_KEY"] == "gw-secret"
+
+    def test_withheld_for_custom_provider_url_without_key(self, monkeypatch):
+        # #781 P1: a custom base URL with an EMPTY key is still a custom-provider
+        # signal — a first-party subscription token must never reach a gateway.
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss._config.provider_url = "https://gateway.example/v1"
+        env = ss._build_repl_env()
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert env["ANTHROPIC_BASE_URL"] == "https://gateway.example/v1"
 
     def test_flag_on_but_no_token_noop(self, monkeypatch):
         self._clear(monkeypatch)

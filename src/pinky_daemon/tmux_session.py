@@ -1226,14 +1226,16 @@ class TmuxSession:
             "0", "false", "no",
         ):
             return
-        # #780: when the static token is being forwarded, claude authenticates
-        # via CLAUDE_CODE_OAUTH_TOKEN and never refreshes — so don't seed the
-        # refresh-prone OAuth creds at all. With no .credentials.json present
-        # there is nothing for concurrent agents to race on.
-        if self._static_oauth_token():
+        # #780: when static-token forwarding is enabled, claude authenticates
+        # via CLAUDE_CODE_OAUTH_TOKEN (no refresh) — never seed the refresh-prone
+        # .credentials.json. Keyed on the FLAG, not token presence: fail CLOSED
+        # so a rollout misconfig (flag on, token missing) surfaces as a loud
+        # login wall instead of silently falling back to the shared refresh-
+        # token file (Murzik #781 P2).
+        if self._forward_oauth_enabled():
             _log(
-                f"tmux[{self.agent_name}]: static OAuth token forwarding active — "
-                f"skipping container creds seed (#780)"
+                f"tmux[{self.agent_name}]: static OAuth token forwarding enabled — "
+                f"skipping container creds seed (#780; fail-closed if token absent)"
             )
             return
         wd = (self._config.working_dir or "").strip()
@@ -2350,9 +2352,24 @@ class TmuxSession:
         )
         return cmd
 
+    def _forward_oauth_enabled(self) -> bool:
+        """Whether static OAuth-token forwarding is enabled (#780).
+
+        Flag-gated (``PINKY_FORWARD_OAUTH_TOKEN``, default OFF) for staged
+        rollout/soak. This is the operator's *intent* signal: when ON, the
+        fleet is meant to authenticate via a long-lived static token, so the
+        refresh-prone ``.credentials.json`` container seed is suppressed
+        REGARDLESS of whether the token is currently set — a misconfig (flag
+        on, token missing) must fail CLOSED (a loud login wall) rather than
+        silently fall back to the shared refresh-token file (Murzik #781 P2).
+        """
+        return os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() in (
+            "1", "true", "yes", "on",
+        )
+
     def _static_oauth_token(self) -> str:
-        """The long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` to forward into this
-        session's env, or ``""`` when static-token forwarding is inactive (#780).
+        """The long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` to inject into this
+        session's env, or ``""`` when forwarding is inactive/withheld (#780).
 
         A ``claude setup-token`` token (``sk-ant-oat01-…``, ~1yr, NEVER
         refreshed) authenticates without ever touching the single-use OAuth
@@ -2361,17 +2378,15 @@ class TmuxSession:
         cold-start serialization only narrows that window; the in-REPL refresh
         still races, so a static token is the durable fix.
 
-        Flag-gated (``PINKY_FORWARD_OAUTH_TOKEN``, default OFF) for staged
-        rollout/soak. Withheld for custom-provider agents: that path already
-        injects ``ANTHROPIC_API_KEY``/``ANTHROPIC_AUTH_TOKEN`` (higher auth
-        precedence), and a gateway-routed agent must not also present a
-        subscription token.
+        Withheld for custom-provider agents — keyed on ``provider_url`` OR
+        ``provider_key`` (Murzik #781 P1): provider resolution can yield
+        ``(url, "", model)`` (a non-default base URL with an EMPTY key), and a
+        first-party Claude subscription token must NEVER be presented to a
+        gateway / custom base URL, even when no key is set.
         """
-        if self._config.provider_key:
+        if not self._forward_oauth_enabled():
             return ""
-        if os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() not in (
-            "1", "true", "yes", "on",
-        ):
+        if (self._config.provider_url or "").strip() or self._config.provider_key:
             return ""
         return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
 
