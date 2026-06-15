@@ -466,10 +466,14 @@
 
     async function saveGoogleCredentials() {
         if (!googleClientId || !googleClientSecret) { toast('Client ID and secret required', 'error'); return; }
-        await api('PUT', '/calendar/google/credentials', { client_id: googleClientId, client_secret: googleClientSecret });
-        toast('Google credentials saved');
-        googleClientSecret = '';
-        await loadGoogleStatus();
+        try {
+            await api('PUT', '/calendar/google/credentials', { client_id: googleClientId, client_secret: googleClientSecret });
+            toast('Google credentials saved');
+            googleClientSecret = '';
+            await loadGoogleStatus();
+        } catch (e) {
+            toast(e.message, 'error');
+        }
     }
 
     async function startGoogleOAuth() {
