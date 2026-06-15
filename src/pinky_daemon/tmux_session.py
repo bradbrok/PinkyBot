@@ -1226,6 +1226,16 @@ class TmuxSession:
             "0", "false", "no",
         ):
             return
+        # #780: when the static token is being forwarded, claude authenticates
+        # via CLAUDE_CODE_OAUTH_TOKEN and never refreshes — so don't seed the
+        # refresh-prone OAuth creds at all. With no .credentials.json present
+        # there is nothing for concurrent agents to race on.
+        if self._static_oauth_token():
+            _log(
+                f"tmux[{self.agent_name}]: static OAuth token forwarding active — "
+                f"skipping container creds seed (#780)"
+            )
+            return
         wd = (self._config.working_dir or "").strip()
         if not wd or not Path(wd).is_absolute():
             return
@@ -2340,6 +2350,31 @@ class TmuxSession:
         )
         return cmd
 
+    def _static_oauth_token(self) -> str:
+        """The long-lived ``CLAUDE_CODE_OAUTH_TOKEN`` to forward into this
+        session's env, or ``""`` when static-token forwarding is inactive (#780).
+
+        A ``claude setup-token`` token (``sk-ant-oat01-…``, ~1yr, NEVER
+        refreshed) authenticates without ever touching the single-use OAuth
+        refresh token in ``.credentials.json`` — eliminating the shared-creds
+        refresh race that de-auths a fleet on concurrent cold-start. The #777
+        cold-start serialization only narrows that window; the in-REPL refresh
+        still races, so a static token is the durable fix.
+
+        Flag-gated (``PINKY_FORWARD_OAUTH_TOKEN``, default OFF) for staged
+        rollout/soak. Withheld for custom-provider agents: that path already
+        injects ``ANTHROPIC_API_KEY``/``ANTHROPIC_AUTH_TOKEN`` (higher auth
+        precedence), and a gateway-routed agent must not also present a
+        subscription token.
+        """
+        if self._config.provider_key:
+            return ""
+        if os.environ.get("PINKY_FORWARD_OAUTH_TOKEN", "0").strip().lower() not in (
+            "1", "true", "yes", "on",
+        ):
+            return ""
+        return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+
     def _build_repl_env(self) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
@@ -2369,6 +2404,17 @@ class TmuxSession:
         if self._config.provider_key:
             env["ANTHROPIC_API_KEY"] = self._config.provider_key
             env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
+        # Static OAuth token forwarding (#780): inject a long-lived, never-
+        # refreshed CLAUDE_CODE_OAUTH_TOKEN so claude authenticates with it
+        # instead of the single-use refresh token in .credentials.json (no
+        # refresh ⇒ no shared-creds de-auth race). ESSENTIAL for container
+        # agents — their isolated env does NOT inherit the daemon env, so
+        # without this -e the token never reaches them; local tmux agents get
+        # it via tmux-server inheritance, but forwarding makes it explicit and
+        # uniform. Flag-gated + provider-guarded inside _static_oauth_token.
+        oauth_token = self._static_oauth_token()
+        if oauth_token:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
         # Surface the RESOLVED effort (#151): the drift hook compares this to

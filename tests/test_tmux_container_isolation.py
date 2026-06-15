@@ -527,6 +527,80 @@ class TestSeedContainerClaudeCreds:
         ss._seed_container_claude_creds()  # must not raise
         assert not (wd / ".claude-container" / ".credentials.json").exists()
 
+    def test_skipped_when_static_token_forwarded(self, monkeypatch, tmp_path):
+        # #780: with the static token forwarded, claude authenticates via
+        # CLAUDE_CODE_OAUTH_TOKEN (no refresh) — the refresh-prone creds must
+        # NOT be seeded, so there's nothing for concurrent agents to race on.
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-deadbeef")
+        ss._seed_container_claude_creds()
+        assert not (wd / ".claude-container" / ".credentials.json").exists()
+
+    def test_seeded_when_forward_flag_off(self, monkeypatch, tmp_path):
+        # Token present but flag OFF (default) → forwarding inactive → seed as
+        # before. Proves the skip is gated on the flag, not the token's presence.
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        monkeypatch.delenv("PINKY_FORWARD_OAUTH_TOKEN", raising=False)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-deadbeef")
+        ss._seed_container_claude_creds()
+        assert (wd / ".claude-container" / ".credentials.json").exists()
+
+
+class TestStaticOAuthTokenForward:
+    """#780: forward a long-lived CLAUDE_CODE_OAUTH_TOKEN into the session env so
+    claude authenticates with a never-refreshed token instead of the single-use
+    OAuth refresh token — killing the shared-creds de-auth race that #777
+    serialization only narrows. Flag-gated (PINKY_FORWARD_OAUTH_TOKEN, default
+    OFF), withheld for custom-provider agents, and reaches container agents
+    (whose isolated env can't inherit the daemon env otherwise)."""
+
+    def _clear(self, monkeypatch):
+        monkeypatch.delenv("PINKY_FORWARD_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    def test_default_off_not_forwarded(self, monkeypatch):
+        # Token present in daemon env but flag unset → not injected (soak default).
+        self._clear(monkeypatch)
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-x")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in ss._build_repl_env()
+
+    def test_forwarded_when_flag_on(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        assert ss._build_repl_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-tok"
+
+    def test_forwarded_to_container_agent(self, monkeypatch):
+        # The whole point: a container agent's isolated env can't inherit the
+        # daemon env, so the explicit -e is the only way the token reaches it.
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "on")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-c")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        assert ss._build_repl_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-c"
+
+    def test_withheld_for_custom_provider(self, monkeypatch):
+        # Gateway-routed agents inject ANTHROPIC_* (higher precedence) — a
+        # subscription token must never be mixed in alongside them.
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok")
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss._config.provider_key = "gw-secret"
+        env = ss._build_repl_env()
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        assert env["ANTHROPIC_API_KEY"] == "gw-secret"
+
+    def test_flag_on_but_no_token_noop(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")  # no token in env
+        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in ss._build_repl_env()
+
 
 @pytest.mark.asyncio
 class TestCheckContainerImageContract:
