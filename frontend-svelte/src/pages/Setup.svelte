@@ -2,6 +2,7 @@
     import { onMount } from 'svelte';
     import { _ } from 'svelte-i18n';
     import { api } from '../lib/api.js';
+    import { sanitizeNextPath } from '../lib/safe.js';
     import AuthShell from '../components/AuthShell.svelte';
 
     let password = '';
@@ -10,7 +11,7 @@
     let error = '';
 
     const params = new URLSearchParams(window.location.search);
-    const nextPath = params.get('next') || '/';
+    const nextPath = sanitizeNextPath(params.get('next'));
 
     onMount(async () => {
         try {
@@ -37,7 +38,7 @@
         error = '';
         try {
             const result = await api('POST', '/auth/setup', { password, next: nextPath });
-            window.location.href = result.next || nextPath;
+            window.location.href = sanitizeNextPath(result.next || nextPath);
         } catch (e) {
             error = e.message.replace(/^\d+:\s*/, '');
         } finally {
