@@ -9091,7 +9091,12 @@ npm run build</pre>
         if hasattr(ss, "codex_session_id"):
             ss.codex_session_id = ""
         try:
-            await ss.connect()
+            # #202: a force-fresh MCP recovery boots a brand-new `claude`, so
+            # serialize it behind the cold-start gate too — it's globally
+            # rate-limited, but can still overlap a daemon cold boot / manual
+            # cold start and race the shared single-use OAuth refresh token.
+            async with _coldstart_gate(agent_name, label):
+                await ss.connect()
             session_event_store.log(
                 session_id=ss.id,
                 agent_name=agent_name,
