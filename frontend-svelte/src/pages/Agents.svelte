@@ -1116,7 +1116,7 @@
 
     function importStatusBadgeStyle(status) {
         if (status === 'ok') return 'background:var(--tone-success-bg,#d1fae5);color:var(--tone-success-text,#065f46)';
-        if (status === 'warn') return 'background:var(--warning-bg,#fef3c7);color:#92400e';
+        if (status === 'warn') return 'background:var(--tone-warning-bg,#fef3c7);color:var(--tone-warning-text,#92400e)';
         return 'background:rgba(239,68,68,0.15);color:var(--red,#ef4444)';
     }
     function importStatusIcon(status) {
@@ -2021,7 +2021,7 @@
                     </button>
                 </div>
                 {#if skillsPendingApply}
-                    <div style="background:var(--warning-bg, #fff3cd);border:none;border-radius:var(--radius-lg);padding:0.5rem 0.8rem;font-size:0.75rem;margin-top:0.5rem">
+                    <div style="background:var(--tone-warning-bg, #fff3cd);border:none;border-radius:var(--radius-lg);padding:0.5rem 0.8rem;font-size:0.75rem;margin-top:0.5rem">
                         {$_('agents.skill_pending_note')}
                     </div>
                 {/if}
@@ -2176,7 +2176,7 @@
                         <div class="token-item" style="flex-wrap:wrap;gap:0.4rem;{!s.enabled ? 'opacity:0.5' : ''}">
                             <span style="font-family:var(--font-grotesk);font-size:0.8rem;font-weight:700">{s.name || 'unnamed'}</span>
                             <span style="font-family:var(--font-grotesk);font-size:0.75rem;color:var(--gray-mid)">{s.cron}</span>
-                            {#if s.one_shot}<span class="badge" style="background:var(--tone-amber-bg,#3a3520);color:var(--tone-amber-text,#d4a);font-size:0.65rem">once</span>{/if}
+                            {#if s.one_shot}<span class="badge" style="background:var(--tone-warning-bg,#FEF3C7);color:var(--tone-warning-text,#92400e);font-size:0.65rem">once</span>{/if}
                             <span class="badge badge-{s.enabled ? 'on' : 'off'}">{s.enabled ? $_('common.active') : $_('common.off')}</span>
                             <span style="flex:1"></span>
                             <button class="btn btn-sm" on:click={() => toggleSchedule(s.id, !s.enabled)}>{s.enabled ? $_('common.disable') : $_('common.enable')}</button>
