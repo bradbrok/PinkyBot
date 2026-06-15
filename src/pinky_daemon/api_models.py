@@ -444,6 +444,30 @@ class UpdateAgentRequest(BaseModel):
         return v
 
 
+class ContainerizeRequest(BaseModel):
+    """One-click containerize an agent — POST /agents/{name}/containerize (#204).
+
+    Backend-owned choreography: validate runtime/image, provision + probe a
+    container, and only then flip isolation_mode=container (+ tmux transport) and
+    bounce the session. Image string validation happens in the handler so a bad
+    ref returns 400 with an actionable message."""
+
+    image: str = ""  # bring-your-own override; "" → use PINKY_CONTAINER_DEFAULT_IMAGE
+    start: bool = True  # restart the session under the new mode if it was already live
+    force: bool = False  # proceed even if the agent has active/inflight work (else 409)
+
+
+class DecontainerizeRequest(BaseModel):
+    """Return a containerized agent to local — POST /agents/{name}/decontainerize.
+
+    Tears down the container + key secret (KEEPS the home volume) and flips
+    isolation_mode=local. The return path so a bad image can never strand an
+    agent in container mode."""
+
+    start: bool = True  # restart the session as local if it was already live
+    force: bool = False  # proceed even if the agent has active/inflight work (else 409)
+
+
 class AddDirectiveRequest(BaseModel):
     """Add a directive to an agent."""
 

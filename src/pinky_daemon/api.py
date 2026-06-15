@@ -61,10 +61,12 @@ from pinky_daemon.api_models import (
     AuthLoginRequest,
     AuthSetupRequest,
     CloneWorkerRequest,
+    ContainerizeRequest,
     ContextResponse,
     ConversationListResponse,
     CreateGroupRequest,
     CreateSessionRequest,
+    DecontainerizeRequest,
     EffortDriftRequest,
     FederationPeerUpsertRequest,
     ForceRestartAgentRequest,
@@ -3064,6 +3066,17 @@ def create_api(
     # subprocess kept running, invisible to the watchdog.
     _streaming_ensure_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
+    # #204 one-click containerize: a per-AGENT lifecycle lock (keyed by name
+    # only, ENCLOSING the per-(agent,label) ensure locks above). The containerize
+    # / decontainerize apply phase (persist + MCP rewrite + stop-all + start-fresh)
+    # holds this so a concurrent inbound-message / scheduler wake can't start a
+    # session against a half-applied row. Acquisition order is ALWAYS lifecycle
+    # (outer) → ensure (inner); nothing takes them the other way, so no deadlock.
+    _container_lifecycle_locks: dict[str, asyncio.Lock] = {}
+
+    def _container_lifecycle_lock(agent_name: str) -> asyncio.Lock:
+        return _container_lifecycle_locks.setdefault(agent_name, asyncio.Lock())
+
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
         """Return a connected streaming session for an agent label.
 
@@ -3088,7 +3101,12 @@ def create_api(
             return ss
 
         lock = _streaming_ensure_locks.setdefault((agent_name, label), asyncio.Lock())
-        async with lock:
+        # #204: lifecycle (outer) → ensure (inner). The lifecycle lock blocks
+        # the slow start/reconnect path while a containerize/decontainerize apply
+        # is in flight for this agent, so we never start a session against a
+        # half-applied isolation row. The CONNECTED fast path above stays
+        # lock-free, so this adds no contention on the hot inbound path.
+        async with _container_lifecycle_lock(agent_name), lock:
             # Re-check under the lock: a concurrent caller may have started
             # or reconnected the session while we waited.
             sessions = broker._streaming.get(agent_name, {})
@@ -6074,6 +6092,287 @@ npm run build</pre>
         # The file is written once at spawn; agents edit it directly after that.
 
         return agent.to_dict()
+
+    # ── One-click containerize (#204 / specs/one-click-containerize.md) ──────
+    # Operator/UI-only endpoints to enable (and disable) Podman container
+    # isolation on an agent in one click. The backend owns the whole
+    # choreography — runtime preflight, default/override image, tmux transport,
+    # .mcp.json rewrite, provision + a real runnability probe, cold session
+    # bounce — so the UI is a single button. The cardinal invariant lives in
+    # container_ops.ContainerLifecycle: provision + probe a DESIRED copy BEFORE
+    # persisting isolation_mode=container, so a bad image can never strand the
+    # agent in an unrunnable mode.
+    from pinky_daemon import container_ops as _cops
+
+    _container_op_registry = _cops.ContainerOpRegistry()
+    # Hold strong refs to in-flight op tasks: asyncio only weakly references
+    # tasks, so a bare create_task() can be GC'd mid-provision (CPython footgun).
+    _container_op_tasks: set[asyncio.Task] = set()
+
+    def _spawn_container_op(coro) -> None:
+        task = asyncio.create_task(coro)
+        _container_op_tasks.add(task)
+        task.add_done_callback(_container_op_tasks.discard)
+
+    def _container_provisioner_for():
+        """Real ContainerProvisioner for this host, or None when the runtime gate
+        is off (PINKY_CONTAINER_RUNTIME unset, or docker — unsupported today)."""
+        from pinky_daemon.provisioning import get_provisioner
+
+        try:
+            return get_provisioner(
+                "container", signing_key_provider=agents.get_or_create_signing_key
+            )
+        except NotImplementedError:
+            return None
+
+    def _container_regen_mcp(agent_name: str) -> None:
+        a = agents.get(agent_name)
+        if a and a.working_dir:
+            _write_mcp_json(
+                Path(a.working_dir), agent_name, agent_registry=agents, skill_store=skills
+            )
+
+    async def _container_start_main(agent_name: str):
+        # Cold-start a FRESH main session — selects the session class from the
+        # updated row (sdk→tmux needs a rebuild, not a reconnect). Calls
+        # _start_streaming_session DIRECTLY, never _ensure_streaming_session,
+        # which would try to re-take the lifecycle lock we already hold.
+        return await _start_streaming_session(agent_name, label="main", resume_id="")
+
+    def _container_agent_busy(agent_name: str) -> tuple[bool, str]:
+        """Is the agent doing active work right now? Combines transport state +
+        per-class in-flight turn counts + the coarse hook-reported live status
+        (freshness-gated). Drives the 409-unless-force guard."""
+        sessions = broker._streaming.get(agent_name, {})
+        for label, ss in sessions.items():
+            try:
+                state = ss.state
+            except Exception:
+                state = None
+            if state in (
+                TransportSessionState.BOOTING,
+                TransportSessionState.RECONNECTING,
+            ):
+                return True, f"session '{label}' is {getattr(state, 'value', state)}"
+            try:
+                stats = ss.stats
+            except Exception:
+                stats = {}
+            if stats.get("inflight_turns", 0) or stats.get("pending_responses", 0):
+                return True, f"session '{label}' has work in flight"
+        live = _agent_live_status.get(agent_name)
+        if live and live.get("status") in ("working", "thinking", "tool_use"):
+            # Only trust a RECENT hook update — a stale 'working' (missed Stop
+            # hook) shouldn't pin the agent busy forever.
+            if time.time() - float(live.get("last_updated", 0)) < 90:
+                return True, f"agent is {live.get('status')}"
+        return False, ""
+
+    _container_lifecycle = _cops.ContainerLifecycle(
+        _cops.ContainerLifecycleDeps(
+            registry=agents,
+            provisioner_for=_container_provisioner_for,
+            write_mcp_json=_container_regen_mcp,
+            disconnect_sessions=_disconnect_streaming_sessions,
+            start_session=_container_start_main,
+            has_live_session=lambda n: bool(broker._streaming.get(n)),
+            lifecycle_lock=_container_lifecycle_lock,
+            op_registry=_container_op_registry,
+            log=_log,
+        )
+    )
+
+    def _require_operator(request: Request, action: str) -> None:
+        """Operator/UI-only gate. The auth middleware lets BOTH a browser session
+        AND a signed internal agent through /agents/*, so reject any
+        internal-agent caller here — a tenant must never containerize or
+        decontainerize itself (or anyone) via an internal route. A browser /
+        operator session carries no internal-agent header."""
+        caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
+        if caller:
+            _log(f"containerize: denied internal caller '{caller}' from {action}")
+            raise HTTPException(403, "containerize endpoints are operator/UI-only")
+
+    @app.get("/system/container-runtime")
+    async def system_container_runtime(request: Request):
+        """Preflight for the one-click containerize UI: is the host's container
+        runtime usable, and what is the default image? ``ready`` is false unless
+        the runtime is enabled AND the binary is supported (podman; docker is
+        rejected today). The UI additionally requires default_image OR a typed
+        override before enabling the button."""
+        _require_operator(request, "GET /system/container-runtime")
+        from pinky_daemon.provisioning import (
+            container_default_image,
+            container_runtime_binary,
+            container_runtime_enabled,
+            container_runtime_supported,
+        )
+
+        enabled = container_runtime_enabled()
+        return {
+            "enabled": enabled,
+            "binary": container_runtime_binary() if enabled else None,
+            "default_image": container_default_image() or None,
+            "ready": container_runtime_supported(),
+        }
+
+    @app.get("/agents/{name}/container-status")
+    async def get_container_status(name: str, request: Request):
+        """Poll the in-flight containerize/decontainerize op, or — when there is
+        no live op record (e.g. after a daemon restart dropped it) — a coarse
+        status reconstructed from the registry + is_provisioned(). Never fakes
+        continuity of an interrupted operation."""
+        _require_operator(request, "GET container-status")
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        from pinky_daemon.provisioning import container_runtime_supported
+
+        runtime_ready = container_runtime_supported()
+        mode = getattr(agent, "isolation_mode", "local") or "local"
+        rec = _container_op_registry.get(name)
+        if rec is not None:
+            out = rec.to_dict()
+            out["isolation_mode"] = mode
+            out["runtime_ready"] = runtime_ready
+            return out
+        # No live op record — reconstruct coarsely.
+        provisioned = False
+        status = _cops.IDLE
+        if mode == "container":
+            prov = _container_provisioner_for()
+            if prov is not None:
+                try:
+                    provisioned = await asyncio.to_thread(prov.is_provisioned, agent)
+                except Exception:
+                    provisioned = False
+            status = _cops.READY if provisioned else _cops.UNKNOWN
+        now = time.time()
+        return {
+            "agent": name,
+            "isolation_mode": mode,
+            "operation": "",
+            "status": status,
+            "message": "",
+            "image": getattr(agent, "container_image", "") or "",
+            "provisioned": provisioned,
+            "runtime_ready": runtime_ready,
+            "started_at": now,
+            "updated_at": now,
+        }
+
+    @app.post("/agents/{name}/containerize")
+    async def containerize_agent(name: str, req: ContainerizeRequest, request: Request):
+        """Enable Podman container isolation on an agent in one operator action.
+        Returns 202 with the initial op record; the UI polls container-status
+        while the (possibly minutes-long) provision + probe runs."""
+        _require_operator(request, "POST containerize")
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        from pinky_daemon.provisioning import (
+            container_default_image,
+            container_runtime_enabled,
+            container_runtime_supported,
+        )
+
+        if not container_runtime_enabled():
+            raise HTTPException(
+                501,
+                "container runtime is not enabled on this host "
+                "(set PINKY_CONTAINER_RUNTIME)",
+            )
+        if not container_runtime_supported():
+            raise HTTPException(
+                501,
+                "container runtime is not supported on this host "
+                "(podman required; docker is not supported yet)",
+            )
+        # Don't auto-convert the runtime engine — only claude_sdk supports the
+        # tmux transport that container mode runs the session through (Murzik).
+        # Auto-setting transport=tmux is fine; changing runtime is not.
+        runtime = (getattr(agent, "runtime", "") or "claude_sdk").strip() or "claude_sdk"
+        if runtime != "claude_sdk":
+            raise HTTPException(
+                400,
+                f"containerize requires runtime='claude_sdk' (agent is {runtime!r}); "
+                "container mode runs the session inside the container via tmux",
+            )
+        # working_dir must be absolute for the same-path bind mount (hooks,
+        # transcripts, and creds all key on the identical absolute path).
+        wd = (getattr(agent, "working_dir", "") or "").strip()
+        if not wd or not Path(wd).is_absolute():
+            raise HTTPException(
+                400, f"containerize requires an absolute working_dir (agent has {wd!r})"
+            )
+        # Resolve + validate the image (override beats the fleet default).
+        try:
+            image = _cops.validate_container_image(req.image or container_default_image())
+        except ValueError as e:
+            raise HTTPException(400, str(e))
+        if _container_op_registry.in_flight(name):
+            raise HTTPException(
+                409, "a container operation is already in progress for this agent"
+            )
+        if not req.force:
+            busy, why = _container_agent_busy(name)
+            if busy:
+                raise HTTPException(
+                    409, f"agent is busy ({why}); retry with force=true to override"
+                )
+
+        _container_op_registry.begin(name, _cops.OP_CONTAINERIZE, image=image)
+        _spawn_container_op(
+            _container_lifecycle.containerize(name, image=image, start=req.start)
+        )
+        rec = _container_op_registry.get(name)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "operation": _cops.OP_CONTAINERIZE,
+                "status": rec.status if rec else _cops.QUEUED,
+                "status_url": f"/agents/{name}/container-status",
+                "image": image,
+            },
+        )
+
+    @app.post("/agents/{name}/decontainerize")
+    async def decontainerize_agent(
+        name: str, req: DecontainerizeRequest, request: Request
+    ):
+        """Return a containerized agent to local: tear down the container + key
+        secret (KEEP the home volume), flip isolation_mode=local, bounce the
+        session. Returns 202; the UI polls container-status."""
+        _require_operator(request, "POST decontainerize")
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if _container_op_registry.in_flight(name):
+            raise HTTPException(
+                409, "a container operation is already in progress for this agent"
+            )
+        if not req.force:
+            busy, why = _container_agent_busy(name)
+            if busy:
+                raise HTTPException(
+                    409, f"agent is busy ({why}); retry with force=true to override"
+                )
+        _container_op_registry.begin(
+            name,
+            _cops.OP_DECONTAINERIZE,
+            image=getattr(agent, "container_image", "") or "",
+        )
+        _spawn_container_op(_container_lifecycle.decontainerize(name, start=req.start))
+        rec = _container_op_registry.get(name)
+        return JSONResponse(
+            status_code=202,
+            content={
+                "operation": _cops.OP_DECONTAINERIZE,
+                "status": rec.status if rec else _cops.QUEUED,
+                "status_url": f"/agents/{name}/container-status",
+            },
+        )
 
     @app.put("/agents/{name}/provider")
     async def set_agent_provider(name: str, req: dict):

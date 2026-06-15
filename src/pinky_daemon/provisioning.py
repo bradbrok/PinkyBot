@@ -129,6 +129,19 @@ CONTAINER_MEMORY_ENV = "PINKY_CONTAINER_MEMORY"
 CONTAINER_MEMORY_DEFAULT = "2g"
 CONTAINER_PIDS_ENV = "PINKY_CONTAINER_PIDS_LIMIT"
 CONTAINER_PIDS_DEFAULT = "2048"
+# Fleet default bring-your-own image for one-click containerize: when an operator
+# clicks "Containerize" without supplying an override, this image is used. Empty
+# (default) means there is no fleet default — the operator must supply an image
+# per agent, and preflight reports default_image=null. A canonical Pinky runtime
+# image is a product follow-up; this env keeps v1 a controlled, opt-in rollout.
+CONTAINER_DEFAULT_IMAGE_ENV = "PINKY_CONTAINER_DEFAULT_IMAGE"
+# In-container tooling a containerized tenant MUST have on PATH to host a tmux +
+# claude session. The bring-your-own image is operator-supplied, so a one-click
+# containerize probes for these before persisting isolation_mode=container — a
+# missing binary means the image can't run the agent and the flip is refused
+# (rather than stranding the agent in BOOT_FAILED at next spawn). Mirrors the
+# session-side contract check in tmux_session._check_container_image_contract.
+CONTAINER_REQUIRED_BINARIES = ("tmux", "claude", "python3")
 
 
 def container_config_dir(working_dir: str) -> str:
@@ -1022,6 +1035,48 @@ class ContainerProvisioner(AgentProvisioner):
         if not result.ok:
             raise ProvisionError(result.message)
 
+    def verify_runnable(self, agent: "Agent") -> ProvisionResult:
+        """Probe that a STARTED container can actually host a tenant: the
+        bring-your-own image must provide every binary in
+        :data:`CONTAINER_REQUIRED_BINARIES` (tmux / claude / python3) on PATH.
+
+        This is the runnability half of a "verified" provision — ``provision``
+        only ``podman create``s the container (stopped) and ``is_provisioned``
+        only checks the resources EXIST, neither proves the image can run the
+        agent. A one-click containerize gates the DB flip on this so a bad image
+        is refused up front instead of stranding the agent in BOOT_FAILED at
+        next spawn (mirrors tmux_session._check_container_image_contract, but
+        callable from the provisioning layer with no live session). The caller
+        must ``start``/``ensure_started`` the container first. Returns
+        ``ok=False`` with an actionable message on a missing binary (or if the
+        exec itself fails); never raises.
+        """
+        n = self.names(agent)
+        required = CONTAINER_REQUIRED_BINARIES
+        # One `sh -c` AND-chain: exits 0 iff every binary resolves. ContainerOps
+        # .run raises on a non-zero exit, so a missing binary surfaces as the
+        # except below. Args go through argv (no shell on the host side) — the
+        # only shell is the in-container `sh` evaluating a fixed, static string.
+        check = " && ".join(f"command -v {c} >/dev/null 2>&1" for c in required)
+        try:
+            self._ops.run([self._binary, "exec", n.container, "sh", "-c", check])
+        except Exception as e:
+            image = self._image_provider(agent) or "<unset>"
+            return ProvisionResult(
+                ok=False,
+                mode=CONTAINER,
+                message=(
+                    f"container image {image!r} for {agent.name!r} is not runnable: "
+                    f"missing required tooling (needs {', '.join(required)} on PATH) "
+                    f"or exec failed: {e}"
+                ),
+            )
+        return ProvisionResult(
+            ok=True,
+            mode=CONTAINER,
+            message=f"container {n.container} is runnable ({', '.join(required)} present)",
+        )
+
     def _rollback(self, created: list[str]) -> list[str]:
         """Undo ``created`` resources in reverse; best-effort, never raises."""
         removed: list[str] = []
@@ -1074,6 +1129,24 @@ def container_runtime_binary() -> str:
     truthy value). Only meaningful when :func:`container_runtime_enabled`."""
     val = os.environ.get(CONTAINER_RUNTIME_ENV, "").strip().lower()
     return "docker" if val == "docker" else CONTAINER_BINARY
+
+
+def container_runtime_supported() -> bool:
+    """True iff the host's selected container runtime is one we can actually
+    provision against today — i.e. enabled AND podman (docker is rejected by
+    :func:`get_provisioner` because provisioning relies on podman-only secret
+    delivery). Preflight + the one-click endpoints use this to fail fast with an
+    actionable message rather than 500-ing at provision time on a docker host."""
+    return container_runtime_enabled() and container_runtime_binary() == CONTAINER_BINARY
+
+
+def container_default_image() -> str:
+    """The fleet default bring-your-own image for one-click containerize
+    (``PINKY_CONTAINER_DEFAULT_IMAGE``), or ``""`` if none is configured — in
+    which case the operator must supply a per-agent override. Never a baked
+    constant: a canonical image is a product follow-up, and this keeps v1 an
+    opt-in, host-configured rollout."""
+    return os.environ.get(CONTAINER_DEFAULT_IMAGE_ENV, "").strip()
 
 
 def get_provisioner(
