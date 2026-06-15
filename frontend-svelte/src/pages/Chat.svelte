@@ -898,10 +898,14 @@
         }
         const sentAt = Date.now() / 1000;
         const sessionId = activeSession;
-        // Snapshot the target before any await — a session/agent switch mid-send
-        // must not redirect this POST to the newly-selected agent.
+        // Snapshot the target AND transport before any await — a session/agent
+        // switch mid-send must not redirect this POST to the newly-selected agent,
+        // and the captured target must stay coherent with the captured mode
+        // (else e.g. a legacy→streaming switch posts to /agents/null/chat).
         const sendAgent = activeAgent;
         const sendSessionRecord = activeSessionRecord;
+        const sendCanUseStreamingChat = canUseStreamingChat;
+        const sendCanUseLegacySessionChat = canUseLegacySessionChat;
         const priorAssistantTs = latestAssistantTimestamp(persistedMessages);
         messageInput = '';
         sending = true;
@@ -921,13 +925,13 @@
         await restoreScroll({ forceBottom: true });
 
         try {
-            if (canUseStreamingChat) {
+            if (sendCanUseStreamingChat) {
                 const sessionLabel = sendSessionRecord?._streaming_label || labelFromSessionId(sessionId, sendAgent);
                 const sessionParam = sessionLabel !== 'main' ? `?session=${encodeURIComponent(sessionLabel)}` : '';
                 await api('POST', `/agents/${sendAgent}/chat${sessionParam}`, { content: text });
                 sending = false;
                 await refreshChat();
-            } else if (canUseLegacySessionChat) {
+            } else if (sendCanUseLegacySessionChat) {
                 const data = await api('POST', `/sessions/${sessionId}/message`, { content: text });
                 localMessages = [...localMessages, buildLocalMessage({
                     role: 'assistant', content: data.content, duration_ms: data.duration_ms,
@@ -954,7 +958,7 @@
             // timer is safe to clear here. Streaming path returns from the POST while
             // pendingReply/thinking remain true on purpose — leave the 60s failsafe
             // armed so a crashed/never-replying agent doesn't spin forever.
-            if (!canUseStreamingChat && pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
+            if (!sendCanUseStreamingChat && pendingReplyTimer) { clearTimeout(pendingReplyTimer); pendingReplyTimer = null; }
         }
     }
 
