@@ -5341,6 +5341,13 @@ npm run build</pre>
     _calendar_set_deps(agents=agents)
     app.include_router(_calendar_router)
 
+    # ── QBO Endpoints (read-only QuickBooks Online, per-agent) ─
+    from pinky_daemon.routes.qbo import router as _qbo_router
+    from pinky_daemon.routes.qbo import set_dependencies as _qbo_set_deps
+
+    _qbo_set_deps(agents=agents)
+    app.include_router(_qbo_router)
+
     # ── Agent Registry Endpoints ────────────────────────────
 
     @app.post("/agents")
