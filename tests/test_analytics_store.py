@@ -395,6 +395,60 @@ class TestPricingLookup:
         assert row["input_usd_per_mtok"] == 3.00
         assert store._lookup_pricing(provider="anthropic", model="no-such-model", ts=ts) is None
 
+    def test_gpt55_priced_via_codex_alias(self, tmp_path):
+        # #206: Codex agents (Murzik runs gpt-5.5) showed $0 because the
+        # pricing seed stopped at gpt-5.2. gpt-5.5 must resolve through the
+        # codex_cli -> openai alias at the verified $5/$30/$0.50 rates.
+        store = _store(tmp_path)
+        ts = _iso(datetime.now(UTC))
+        row = store._lookup_pricing(provider="codex_cli", model="gpt-5.5", ts=ts)
+        assert row is not None
+        assert row["input_usd_per_mtok"] == 5.00
+        assert row["output_usd_per_mtok"] == 30.00
+        assert row["cached_input_usd_per_mtok"] == 0.50
+
+    def test_codex_turn_cost_nonzero(self, tmp_path):
+        # End-to-end: a codex_cli/gpt-5.5 turn lands in the overview cost
+        # (regression guard for the $0-Codex bug).
+        store = _store(tmp_path)
+        _seed_session(store)
+        store.log_turn_usage(
+            session_id="sess1", agent_name="barsik", turn_seq=1,
+            provider="codex_cli", model="gpt-5.5",
+            input_tokens=1_000_000, output_tokens=0, cached_input_tokens=0,
+        )
+        overview = store.get_overview(range_name="7d")
+        assert overview["totals"]["cost_usd"] == pytest.approx(5.0)
+
+    def test_ensure_pricing_rows_idempotent(self, tmp_path):
+        # The idempotent backfill runs on every init; re-opening the same DB
+        # must not duplicate the gpt-5.5 row.
+        db = str(tmp_path / "analytics.db")
+        AnalyticsStore(db)
+        store = AnalyticsStore(db)
+        with store._connect() as conn:
+            n = conn.execute(
+                "SELECT COUNT(*) AS c FROM analytics_model_pricing "
+                "WHERE provider='openai' AND model='gpt-5.5'"
+            ).fetchone()["c"]
+        assert n == 1
+
+    def test_categories_includes_codex_cost(self, tmp_path):
+        # #206 P1: the per-category cost view was hard-gated to Anthropic
+        # providers, so Codex turns never appeared. A codex_cli/gpt-5.5 turn
+        # must now show up with non-zero cost in get_categories().
+        store = _store(tmp_path)
+        _seed_session(store)
+        store.log_turn_usage(
+            session_id="sess1", agent_name="barsik", turn_seq=1,
+            provider="codex_cli", model="gpt-5.5",
+            input_tokens=1_000_000, output_tokens=0, cached_input_tokens=0,
+        )
+        cats = store.get_categories(range_name="7d")
+        assert cats["categories"], "Codex turn should produce a category row"
+        total = sum(c["cost_usd"] for c in cats["categories"])
+        assert total == pytest.approx(5.0)
+
 
 class TestSeedRateTableParity:
     """#669: the Analytics seed and pinky_daemon.pricing.RATE_TABLE are two

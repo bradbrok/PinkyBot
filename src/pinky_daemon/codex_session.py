@@ -57,6 +57,21 @@ class CodexTurnResult:
     errors: list[str] = field(default_factory=list)
     failed: bool = False
 
+    @property
+    def uncached_input_tokens(self) -> int:
+        """Billable (uncached) input under the daemon's disjoint convention.
+
+        Codex/OpenAI report ``input_tokens`` INCLUSIVE of the cached prefix
+        (``cached_input_tokens`` ⊆ ``input_tokens``), while the rest of the
+        daemon — and the analytics cost math (``_compute_usage_cost``) —
+        follow the Anthropic convention where ``input_tokens`` is the
+        *uncached* remainder priced at the full input rate and the cached
+        span is priced separately at the cached rate. Feeding the raw codex
+        ``input_tokens`` into that math double-bills the cached tokens, so
+        downstream cost/usage rows use this disjoint value instead.
+        """
+        return max(0, self.input_tokens - self.cached_input_tokens)
+
 
 class CodexSession:
     """Agent session backed by Codex CLI.
@@ -352,14 +367,19 @@ class CodexSession:
                             for tu in result.tool_uses
                         ),
                         usage={
-                            "input_tokens": result.input_tokens,
+                            "input_tokens": result.uncached_input_tokens,
                             "output_tokens": result.output_tokens,
                             "cached_input_tokens": result.cached_input_tokens,
                         },
-                        total_cost_usd=0.0,  # Codex doesn't report cost in JSONL
+                        # Per-turn dollar figure stays 0.0 here — Codex JSONL
+                        # carries no cost. The authoritative Codex cost is
+                        # computed by the analytics store from token counts +
+                        # the seeded OpenAI pricing (compute_usage_cost), same
+                        # as the tmux transport (#648).
+                        total_cost_usd=0.0,
                         num_turns=1,
                         model_usage={
-                            "input_tokens": result.input_tokens,
+                            "input_tokens": result.uncached_input_tokens,
                             "output_tokens": result.output_tokens,
                             "cached_input_tokens": result.cached_input_tokens,
                         },
@@ -1278,19 +1298,31 @@ class CodexSession:
             )
             self._current_thinking = ""
             self._current_activity = ""
+            # Log the UNCACHED input (cached span priced separately) so the
+            # analytics cost math doesn't double-bill the cached tokens. The
+            # observability metadata/stream below keep the raw codex totals.
             self._analytics_log_turn_usage(
-                input_tokens=result.input_tokens,
+                input_tokens=result.uncached_input_tokens,
                 output_tokens=result.output_tokens,
                 cached_input_tokens=result.cached_input_tokens,
                 error=False,
             )
+            # Reasoning tokens are a SUBSET of output_tokens (output = visible +
+            # reasoning) and are intentionally NOT billed — Codex cost is computed
+            # from input/output/cached only. Guard the invariant: reasoning >
+            # output means the Codex usage parse mis-attributed tokens. Surface it
+            # as an observability flag (queryable in analytics_activity_events)
+            # rather than silently trusting the number or corrupting billed counts.
+            reasoning_tokens = result.reasoning_output_tokens
+            reasoning_gt_output = reasoning_tokens > result.output_tokens
             self._analytics_log_activity(
                 "turn_completed",
                 metadata={
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
                     "cached_input_tokens": result.cached_input_tokens,
-                    "reasoning_output_tokens": result.reasoning_output_tokens,
+                    "reasoning_output_tokens": reasoning_tokens,
+                    "reasoning_gt_output": reasoning_gt_output,
                 },
             )
             self._stamp_last_seen()
@@ -1302,7 +1334,8 @@ class CodexSession:
                     "input_tokens": result.input_tokens,
                     "output_tokens": result.output_tokens,
                     "cached_input_tokens": result.cached_input_tokens,
-                    "reasoning_output_tokens": result.reasoning_output_tokens,
+                    "reasoning_output_tokens": reasoning_tokens,
+                    "reasoning_gt_output": reasoning_gt_output,
                 },
             })
 

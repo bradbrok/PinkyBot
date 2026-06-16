@@ -24,6 +24,22 @@ class TestCodexTurnResult:
         assert r.output_tokens == 0
         assert not r.failed
 
+    def test_uncached_input_tokens_disjoint(self):
+        # #206: Codex reports input_tokens INCLUSIVE of the cached prefix.
+        # The billable/disjoint value (Anthropic convention) is input - cached,
+        # so the analytics cost math doesn't double-bill the cached span.
+        # Real Murzik sample: input=78121, cached=77696 -> uncached=425.
+        r = CodexTurnResult(input_tokens=78121, cached_input_tokens=77696)
+        assert r.uncached_input_tokens == 425
+        # No caching: uncached == input.
+        assert CodexTurnResult(input_tokens=100).uncached_input_tokens == 100
+        # Anomalous (cached > input) clamps at 0, never negative.
+        assert (
+            CodexTurnResult(input_tokens=10, cached_input_tokens=50)
+            .uncached_input_tokens
+            == 0
+        )
+
 
 class TestCodexSessionInterface:
     """Verify CodexSession exposes the same public interface as StreamingSession."""
@@ -600,6 +616,53 @@ class TestCodexReasoningOutputTokens:
             result,
         )
         assert result.reasoning_output_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_reasoning_gt_output_flagged_anomaly(self):
+        """Guard (#206): reasoning is a subset of output, so reasoning > output
+        is a usage-parse anomaly. It must surface as a queryable observability
+        flag in the turn_completed metadata — not silently trusted."""
+        config = StreamingSessionConfig(
+            agent_name="test", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        captured: list = []
+        session._analytics_log_activity = (
+            lambda event_type, *, metadata=None: captured.append((event_type, metadata))
+        )
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 100, "output_tokens": 20,
+                "cached_input_tokens": 50, "reasoning_output_tokens": 4096,
+            }},
+            result,
+        )
+        meta = next(m for e, m in captured if e == "turn_completed")
+        assert meta["reasoning_gt_output"] is True
+        assert meta["reasoning_output_tokens"] == 4096
+
+    @pytest.mark.asyncio
+    async def test_reasoning_within_output_not_flagged(self):
+        """Normal case: reasoning <= output → no anomaly flag."""
+        config = StreamingSessionConfig(
+            agent_name="test", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        captured: list = []
+        session._analytics_log_activity = (
+            lambda event_type, *, metadata=None: captured.append((event_type, metadata))
+        )
+        result = CodexTurnResult()
+        await session._handle_event(
+            {"type": "turn.completed", "usage": {
+                "input_tokens": 100, "output_tokens": 5000,
+                "cached_input_tokens": 50, "reasoning_output_tokens": 4096,
+            }},
+            result,
+        )
+        meta = next(m for e, m in captured if e == "turn_completed")
+        assert meta["reasoning_gt_output"] is False
 
 
 class TestCodexWorkerDoneCallback:

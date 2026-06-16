@@ -9,6 +9,18 @@ from datetime import UTC, datetime, timedelta
 # Providers to include in analytics dashboards.
 # Only Anthropic/Claude usage — excludes Codex CLI (OpenAI) and other non-Anthropic providers.
 _ANTHROPIC_PROVIDERS = {"firstParty", "default", "anthropic", "bedrock", "vertex"}
+# Providers whose token usage carries a real per-token cost we price in the
+# overview/agent/category cost views. Extends the Anthropic set with the
+# OpenAI/Codex family so Codex agents (e.g. Murzik on gpt-5.5) appear in the
+# cost dashboards at parity with Claude agents (#206) — previously the cost
+# views were hard-gated to Anthropic-only, leaving Codex usage invisible
+# even though OpenAI pricing was already seeded.
+# NOTE: opencode is intentionally NOT included yet — it has no seeded pricing
+# and `_provider_alias` can't map it to one rate table (opencode runs either
+# Anthropic or OpenAI models depending on config), so including it would surface
+# opencode turns at a misleading $0. Add it back alongside pricing + a model-aware
+# alias when an opencode agent ships (#786).
+_COSTED_PROVIDERS = _ANTHROPIC_PROVIDERS | {"openai", "openai_api", "codex_cli"}
 
 
 def _utcnow() -> str:
@@ -208,6 +220,7 @@ class AnalyticsStore:
             self._seed_default_pricing(conn)
             self._migrate_opus_haiku_seed_pricing(conn)
             self._migrate_legacy_dotted_model_ids(conn)
+            self._ensure_pricing_rows(conn)
             # Schema migration: add user_message_snippet to turn_usage
             cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(analytics_turn_usage)").fetchall()
@@ -237,6 +250,15 @@ class AnalyticsStore:
                 "CREATE INDEX IF NOT EXISTS idx_atc_status_started "
                 "ON analytics_tool_calls(status, started_at)"
             )
+
+    # Pricing rows added AFTER the original seed batch. _seed_default_pricing
+    # only fires on an empty table, so these reach already-seeded production
+    # DBs via the idempotent _ensure_pricing_rows below (insert-if-absent,
+    # never clobbering an operator-set price). Verified official 2026 rates.
+    _LATEST_PRICING_ADDITIONS = [
+        ("openai", "gpt-5.5", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
+        ("openai", "gpt-5.3-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
+    ]
 
     def _seed_default_pricing(self, conn) -> None:
         row = conn.execute("SELECT COUNT(*) AS count FROM analytics_model_pricing").fetchone()
@@ -290,7 +312,7 @@ class AnalyticsStore:
               input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            seed_rows,
+            seed_rows + self._LATEST_PRICING_ADDITIONS,
         )
 
     def _migrate_opus_haiku_seed_pricing(self, conn) -> None:
@@ -415,6 +437,32 @@ class AnalyticsStore:
         if touched:
             # Drop the lazily-built cache so renamed rows are read next lookup.
             self._pricing_cache = None
+
+    def _ensure_pricing_rows(self, conn) -> None:
+        """Idempotently backfill pricing rows added after the initial seed.
+
+        ``_seed_default_pricing`` only populates an empty table, so models
+        introduced in later releases (e.g. gpt-5.5) never reach an
+        already-seeded production DB through it. Insert each addition only
+        when no row exists for that (provider, model) — never overrides an
+        operator-set or already-present price.
+        """
+        for r in self._LATEST_PRICING_ADDITIONS:
+            conn.execute(
+                """
+                INSERT INTO analytics_model_pricing (
+                  provider, model, effective_from, effective_to,
+                  input_usd_per_mtok, output_usd_per_mtok,
+                  cached_input_usd_per_mtok, notes
+                )
+                SELECT ?, ?, ?, ?, ?, ?, ?, ?
+                WHERE NOT EXISTS (
+                  SELECT 1 FROM analytics_model_pricing
+                  WHERE provider = ? AND model = ?
+                )
+                """,
+                (*r, r[0], r[1]),
+            )
 
     def ensure_session_fact(
         self,
@@ -1151,9 +1199,10 @@ class AnalyticsStore:
         """Get token usage breakdown by task category for the given range."""
         start_ts, end_ts = _range_bounds(range_name)
 
-        # Fetch all turns with their tool calls and user message snippets
-        # Filter to Anthropic providers only (exclude Codex/OpenAI)
-        provider_placeholders = ",".join("?" for _ in _ANTHROPIC_PROVIDERS)
+        # Fetch all turns with their tool calls and user message snippets.
+        # Costed providers (Anthropic + OpenAI/Codex) so Codex agents show up in
+        # the per-category cost breakdown at parity with Claude agents (#206).
+        provider_placeholders = ",".join("?" for _ in _COSTED_PROVIDERS)
         usage_query = f"""
             SELECT u.session_id, u.agent_name, u.turn_seq, u.ts,
                    u.input_tokens, u.output_tokens, u.cached_input_tokens,
@@ -1162,7 +1211,7 @@ class AnalyticsStore:
             WHERE u.ts >= ? AND u.ts <= ?
               AND u.provider IN ({provider_placeholders})
         """
-        params: list = [start_ts, end_ts, *_ANTHROPIC_PROVIDERS]
+        params: list = [start_ts, end_ts, *_COSTED_PROVIDERS]
         if agent_name:
             usage_query += " AND u.agent_name=?"
             params.append(agent_name)
@@ -1270,15 +1319,16 @@ class AnalyticsStore:
 
         start_ts, end_ts = _range_bounds(range_name)
 
-        # Fetch current period turns (Anthropic providers only)
-        provider_placeholders = ",".join("?" for _ in _ANTHROPIC_PROVIDERS)
+        # Fetch current period turns (costed providers incl. Codex/OpenAI, #206)
+        # so the hourly token chart reconciles with the overview totals.
+        provider_placeholders = ",".join("?" for _ in _COSTED_PROVIDERS)
         query = f"""
             SELECT ts, input_tokens, output_tokens, cached_input_tokens
             FROM analytics_turn_usage
             WHERE ts >= ? AND ts <= ?
               AND provider IN ({provider_placeholders})
         """
-        params: list = [start_ts, end_ts, *_ANTHROPIC_PROVIDERS]
+        params: list = [start_ts, end_ts, *_COSTED_PROVIDERS]
         if agent_name:
             query += " AND agent_name=?"
             params.append(agent_name)
@@ -1294,7 +1344,7 @@ class AnalyticsStore:
             WHERE ts >= ? AND ts < ?
               AND provider IN ({provider_placeholders})
         """
-        hist_params: list = [hist_start, start_ts, *_ANTHROPIC_PROVIDERS]
+        hist_params: list = [hist_start, start_ts, *_COSTED_PROVIDERS]
         if agent_name:
             hist_query += " AND agent_name=?"
             hist_params.append(agent_name)
@@ -1372,7 +1422,7 @@ class AnalyticsStore:
         start_ts: str,
         end_ts: str,
         agent_name: str = "",
-        anthropic_only: bool = True,
+        costed_only: bool = True,
     ) -> list[sqlite3.Row]:
         query = """
             SELECT session_id, agent_name, ts, provider, model, input_tokens, output_tokens, cached_input_tokens
@@ -1383,10 +1433,10 @@ class AnalyticsStore:
         if agent_name:
             query += " AND agent_name=?"
             params.append(agent_name)
-        if anthropic_only:
-            placeholders = ",".join("?" for _ in _ANTHROPIC_PROVIDERS)
+        if costed_only:
+            placeholders = ",".join("?" for _ in _COSTED_PROVIDERS)
             query += f" AND provider IN ({placeholders})"
-            params.extend(_ANTHROPIC_PROVIDERS)
+            params.extend(_COSTED_PROVIDERS)
         query += " ORDER BY ts"
         with self._connect() as conn:
             return conn.execute(query, params).fetchall()
