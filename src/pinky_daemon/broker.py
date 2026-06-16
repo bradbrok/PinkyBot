@@ -761,10 +761,14 @@ class MessageBroker:
         """Consume an owner reply carrying a tmux login code (#205).
 
         Returns True (short-circuiting normal routing) only when this agent has
-        a pending login relay AND the message is the owner replying to it.
-        Owner-only is load-bearing: a third-party code would sign the agent into
-        the *attacker's* Claude account. Default-deny on every other case. The
-        code itself is never logged.
+        a pending login relay AND the owner *quote-replies* to our specific
+        relay message. Two load-bearing gates, both default-deny:
+          - Owner-only: a third-party code would sign the agent into the
+            *attacker's* Claude account.
+          - Quote-reply correlation: a bare owner message is never consumed as
+            the code even if it looks code-shaped, so a token-like string the
+            owner happens to send mid-login can't be injected into the sign-in.
+        The code itself is never logged.
         """
         agent_name = message.agent_name
         if not _auth_relay.has_pending(agent_name):
@@ -776,10 +780,13 @@ class MessageBroker:
         if not primary.get("chat_id") or sender_id != primary["chat_id"]:
             return False
 
-        # If the owner quote-replied to a DIFFERENT message, they're talking
-        # about something else — don't hijack it as the code.
+        # Strict quote-reply correlation. The code is accepted ONLY when the
+        # owner quote-replies to our exact relay message — a deliberate act that
+        # binds the code to this login. A message with no reply, a reply to some
+        # other message, or a relay we never tracked (empty relay_mid) is not a
+        # reply to us → route normally, never consume it as the code.
         relay_mid = _auth_relay.pending_relay_mid(agent_name)
-        if message.reply_to and relay_mid and message.reply_to != relay_mid:
+        if not relay_mid or message.reply_to != relay_mid:
             return False
 
         code = extract_auth_code(message.content)

@@ -79,13 +79,20 @@ async def test_owner_quote_reply_with_code_is_consumed(monkeypatch):
         tmp.cleanup()
 
 
-async def test_plain_reply_without_quote_is_consumed(monkeypatch):
+async def test_plain_message_without_quote_is_not_consumed(monkeypatch):
+    # A bare owner message (no quote-reply) must route normally and never be
+    # consumed as the code, even though it looks code-shaped — fail-closed
+    # quote-reply correlation (#784, Murzik P1). The spec requires the code to
+    # arrive as a reply to our specific relay message.
     tmp, registry, brk, sent = _make_broker()
     try:
         coord, task = await _fresh_coord_with_pending(monkeypatch, registry)
         handled = await brk._handle_auth_code_reply(_msg(reply_to=""))
-        assert handled is True
-        assert await asyncio.wait_for(task, timeout=1) == CODE
+        assert handled is False  # routes normally; code NOT injected
+        assert coord.has_pending("barsik")  # relay still waiting
+        # clean up the still-pending open
+        coord.submit("barsik", CODE)
+        await task
     finally:
         tmp.cleanup()
 
