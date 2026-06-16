@@ -1517,6 +1517,10 @@ class TmuxSession:
         return {
             **self._stats,
             "state": self.state.value,
+            # Wall-clock epoch the current state was entered (grant time) — lets
+            # the watchdog age stuck transitions precisely instead of sampling
+            # (#206).
+            "state_entered_at": self._state_machine.state_entered_at,
             "pending_responses": self._message_queue.qsize(),
             "inflight_turns": len(self._inflight_metas),
             "current_activity": self._current_activity,

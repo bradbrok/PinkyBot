@@ -847,3 +847,45 @@ class TestOwnerToken:
             assert result.owner_token is not None
             tokens.add(result.owner_token.token)
         assert len(tokens) == 20, "OwnerToken hash collision or non-uniqueness"
+
+
+class TestStateEnteredAt:
+    """#206: StateMachine stamps ``state_entered_at`` whenever ``_state`` flips —
+    at GRANT time in request_transition (not only at completion) — so the watchdog
+    can age stuck BOOTING/RECONNECTING transitions precisely instead of sampling."""
+
+    @pytest.mark.asyncio
+    async def test_stamped_at_grant_and_each_completion(self):
+        sm = StateMachine("t")
+        t0 = sm.state_entered_at  # UNINITIALIZED — stamped at construction
+        assert t0 > 0
+
+        await asyncio.sleep(0.01)
+        res = await sm.request_transition(SessionState.BOOTING, Trigger.BOOT)
+        granted_at = sm.state_entered_at
+        # Stamped at GRANT: the timestamp advanced as soon as the state flipped
+        # to BOOTING, BEFORE the owner completes the transition.
+        assert sm.state == SessionState.BOOTING
+        assert granted_at > t0
+
+        await asyncio.sleep(0.01)
+        await sm.transition_complete(
+            res.owner_token, SessionState.CONNECTED, trigger=Trigger.BOOT_COMPLETE
+        )
+        # Completion entered a NEW state → re-stamped, strictly later than grant.
+        assert sm.state == SessionState.CONNECTED
+        assert sm.state_entered_at > granted_at
+
+    @pytest.mark.asyncio
+    async def test_not_restamped_on_observational_read(self):
+        sm = StateMachine("t")
+        res = await sm.request_transition(SessionState.BOOTING, Trigger.BOOT)
+        await sm.transition_complete(
+            res.owner_token, SessionState.CONNECTED, trigger=Trigger.BOOT_COMPLETE
+        )
+        entered = sm.state_entered_at
+        # Same-state (observational) request must NOT re-stamp the entry time.
+        await asyncio.sleep(0.01)
+        obs = await sm.request_transition(SessionState.CONNECTED, Trigger.BROKER)
+        assert obs.changed is False
+        assert sm.state_entered_at == entered

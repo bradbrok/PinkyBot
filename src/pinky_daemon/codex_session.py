@@ -35,7 +35,12 @@ from pinky_daemon.streaming_session import (
     _is_outreach_tool,
     _log,
 )
-from pinky_daemon.transport_state import SessionState
+from pinky_daemon.transport_state import (
+    OwnerToken,
+    SessionState,
+    StateMachine,
+    Trigger,
+)
 from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import WakeReason
 
@@ -98,9 +103,15 @@ class CodexSession:
         self._stream_event_callback = stream_event_callback
         self._analytics_store = analytics_store
         self._registry = registry
-        self._connected = False
-        self._idle_sleeping = False
-        self._connect_attempted = False  # distinguishes UNINITIALIZED from DEAD
+        # Lifecycle state machine (#206) — Codex now uses the same explicit
+        # five-state contract as TmuxSession/StreamingSession instead of the
+        # old _connected/_idle_sleeping/_connect_attempted bool lattice. The
+        # machine is the single source of truth for ``state`` + ``stats`` and
+        # surfaces BOOTING (cold start in flight) and RECONNECTING (warm wake /
+        # recovery in flight) to the broker, watchdog, and dashboard. Internal
+        # control flow gates on ``self.state`` (e.g. the worker loop runs while
+        # CONNECTED; send is accepted only while CONNECTED).
+        self._state_machine = StateMachine(owner_label=f"codex:{config.agent_name}")
         self._processing = False  # True while a codex exec is running
         self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
         # Serializes _exec_codex between the worker and out-of-band callers
@@ -170,28 +181,155 @@ class CodexSession:
         # app-server reports usage out-of-band, not inside turn/completed.
         self._appserver_last_usage: dict = {}
 
-    async def connect(self) -> None:
-        """Start the session. Sends wake prompt via codex exec."""
-        self._connect_attempted = True  # tracks state ≠ UNINITIALIZED
-        if self._connected:
-            self._idle_sleeping = False
+    async def connect(self, *, trigger: Trigger = Trigger.BROKER) -> None:
+        """Bring the Codex session up through the state machine (#206).
+
+        Mirrors TmuxSession.connect's owner-token discipline:
+
+        - Cold start (state ∈ {UNINITIALIZED, BOOTING}): BOOT → BOOTING →
+          CONNECTED|DEAD via the BOOT / BOOT_COMPLETE / BOOT_FAILED triplet.
+          ``trigger`` is ignored (BOOT is the only legal edge out of
+          UNINITIALIZED).
+        - Warm wake (state ∈ {IDLE_SLEEPING, DEAD}): RECONNECTING → CONNECTED|
+          DEAD via the caller-supplied ``trigger`` (BROKER on inbound auto-wake,
+          SCHEDULER on cron, WATCHDOG on recovery, API_ADMIN on operator wake).
+        - CONNECTED: no-op straggler (return).
+        - RECONNECTING: another path (force_restart/attempt_reconnect) owns the
+          transition — refuse.
+
+        "Usable" (BOOT_COMPLETE / RECONNECTING→CONNECTED) means the transport can
+        accept and DRAIN work, NOT that the first model turn finished: the
+        app-server substrate is up (app-server mode) and the worker drainer is
+        about to run. We never hold BOOTING across a model turn (#206; Murzik).
+        """
+        cold_start_token: OwnerToken | None = None
+        warm_wake_token: OwnerToken | None = None
+        st = self.state
+
+        if st in (SessionState.UNINITIALIZED, SessionState.BOOTING):
+            boot = await self._state_machine.request_transition(
+                SessionState.BOOTING, Trigger.BOOT, reason="codex_cold_start"
+            )
+            if boot.owner_token is None:
+                if boot.in_flight_handle is not None:
+                    final = await boot.in_flight_handle.wait()
+                    if final == SessionState.CONNECTED:
+                        return
+                    raise RuntimeError(
+                        f"codex[{self.agent_name}]: cold-start BOOT in-flight "
+                        f"resolved to {final.value}; not returning as connected"
+                    )
+                _log(
+                    f"codex[{self.agent_name}]: BOOT rejected "
+                    f"({boot.rejection_reason!r})"
+                )
+                if self.state == SessionState.DEAD:
+                    raise RuntimeError(
+                        f"codex[{self.agent_name}]: cold-start BOOT rejected "
+                        f"post-DEAD; not returning as connected"
+                    )
+                return
+            cold_start_token = boot.owner_token
+        elif st in (SessionState.IDLE_SLEEPING, SessionState.DEAD):
+            wake = await self._state_machine.request_transition(
+                SessionState.RECONNECTING, trigger,
+                reason=f"codex_warm_wake_from_{st.value}",
+            )
+            if wake.owner_token is None:
+                if wake.in_flight_handle is not None:
+                    final = await wake.in_flight_handle.wait()
+                    if final == SessionState.CONNECTED:
+                        return
+                    raise RuntimeError(
+                        f"codex[{self.agent_name}]: warm-wake RECONNECTING "
+                        f"in-flight resolved to {final.value}; not returning "
+                        f"as connected"
+                    )
+                _log(
+                    f"codex[{self.agent_name}]: warm-wake rejected "
+                    f"({wake.rejection_reason!r}) — state={self.state.value}"
+                )
+                if self.state == SessionState.DEAD:
+                    raise RuntimeError(
+                        f"codex[{self.agent_name}]: warm-wake rejected "
+                        f"post-DEAD; not returning as connected"
+                    )
+                return
+            warm_wake_token = wake.owner_token
+        elif st == SessionState.CONNECTED:
+            _log(
+                f"codex[{self.agent_name}]: connect() while already CONNECTED "
+                f"— no-op (post-completion straggler)"
+            )
+            return
+        else:  # RECONNECTING — owned by force_restart / attempt_reconnect
+            _log(
+                f"codex[{self.agent_name}]: connect() with state={st.value} — "
+                f"refusing (another path owns this transition)"
+            )
             return
 
-        self._connected = True
-        self._idle_sleeping = False
-        self._analytics_session_started()
+        # Bring up the substrate (app-server spawn+initialize for app-server
+        # mode; nothing persistent for exec mode). A failure here is structural
+        # — terminalize the in-flight transition to DEAD so the broker
+        # resurrects on the next inbound, never leaving a leaked owner token.
+        try:
+            await self._bring_up_substrate()
+        except BaseException as e:
+            _log(f"codex[{self.agent_name}]: substrate bring-up failed: {e}")
+            if cold_start_token is not None:
+                await self._state_machine.transition_complete(
+                    cold_start_token, SessionState.DEAD, trigger=Trigger.BOOT_FAILED
+                )
+            elif warm_wake_token is not None:
+                await self._state_machine.transition_complete(
+                    warm_wake_token, SessionState.DEAD, trigger=Trigger.INTERNAL
+                )
+            raise
 
-        # Start the message processing worker
+        # Substrate up → flip CONNECTED ("can accept and drain work").
+        if cold_start_token is not None:
+            await self._state_machine.transition_complete(
+                cold_start_token, SessionState.CONNECTED,
+                trigger=Trigger.BOOT_COMPLETE,
+            )
+        elif warm_wake_token is not None:
+            await self._state_machine.transition_complete(
+                warm_wake_token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+            )
+
+        self._analytics_session_started()
+        self._start_worker()
+        _log(f"codex[{self.agent_name}]: connected, worker started")
+        await self._enqueue_wake()
+
+    async def _bring_up_substrate(self) -> None:
+        """Bring up the structural substrate for a turn-capable session.
+
+        App-server mode: spawn + initialize the long-lived ``codex app-server``
+        connection (the persistent transport). Exec mode: nothing persistent —
+        each turn spawns its own ``codex exec``, so there's no substrate to fail
+        on boot. Raises on failure; the caller terminalizes the in-flight
+        transition to DEAD.
+        """
+        if self._use_app_server:
+            await self._ensure_app_server()
+
+    def _start_worker(self) -> None:
+        """Spawn the message-drainer worker if not already running.
+
+        Called AFTER the state flips to CONNECTED — the worker loop runs
+        ``while self.state == CONNECTED``, so spawning it earlier (during
+        BOOTING/RECONNECTING) would make it exit immediately. The done-callback
+        surfaces silent worker death and terminalizes the session to DEAD (see
+        ``_worker_done_callback``).
+        """
         if not self._worker_task or self._worker_task.done():
             self._worker_task = asyncio.create_task(self._message_worker())
-            # WEDGE FIX: surface silent worker death. Without this
-            # callback, an unhandled exception or unexpected loop exit
-            # leaves the broker thinking the session is alive while the
-            # queue piles up forever. The callback flips ``_connected``
-            # so the broker's reconnect path can re-spawn us.
             self._worker_task.add_done_callback(self._worker_done_callback)
 
-        _log(f"codex[{self.agent_name}]: connected, worker started")
+    async def _enqueue_wake(self) -> None:
+        """Assemble + enqueue the wake prompt for the freshly-connected session."""
 
         # Send wake prompt
         is_resume = bool(self.codex_session_id)
@@ -281,8 +419,11 @@ class CodexSession:
                 Mirrors StreamingSession.send so the broker can call both
                 session types polymorphically.
         """
-        if not self._connected:
-            _log(f"codex[{self.agent_name}]: not connected, dropping message")
+        if self.state != SessionState.CONNECTED:
+            _log(
+                f"codex[{self.agent_name}]: not connected "
+                f"(state={self.state.value}), dropping message"
+            )
             return
 
         self.last_active = time.time()
@@ -315,7 +456,12 @@ class CodexSession:
         """Process queued messages sequentially via codex exec."""
         _log(f"codex[{self.agent_name}]: message worker started")
         try:
-            while self._connected:
+            # Drain while CONNECTED. The worker is only spawned after the state
+            # flips to CONNECTED (see _start_worker); a transition out of
+            # CONNECTED (idle_sleep, force_restart, terminalized failure) stops
+            # the loop at the next iteration, and disconnect() cancels an
+            # in-flight ``get``. (#206 — was ``while self._connected``.)
+            while self.state == SessionState.CONNECTED:
                 prompt, platform, chat_id, message_id = await self._message_queue.get()
                 try:
                     self._processing = True
@@ -438,41 +584,72 @@ class CodexSession:
         except asyncio.CancelledError:
             _log(f"codex[{self.agent_name}]: worker cancelled")
         except Exception as e:
+            # Unhandled worker error → the worker returns and the done-callback
+            # fires; it terminalizes the session to DEAD (worker owns the queue,
+            # so its death = the session can't process — see #206 / Murzik Q3).
             _log(f"codex[{self.agent_name}]: worker error: {e}")
-            self._connected = False
 
     def _worker_done_callback(self, task: asyncio.Task) -> None:
-        """Surface silent worker death.
+        """Surface silent worker death by terminalizing the session to DEAD.
 
-        Called via ``task.add_done_callback`` when the worker exits for
-        any reason. The worker normally only exits when ``_connected``
-        is already False (graceful disconnect) or via an unhandled
-        exception (caught + flips ``_connected``). The pathological
-        case this guards is: worker exits while ``_connected`` is still
-        True — broker still thinks we're alive, queue keeps accepting
-        sends, nothing processes them. Flip ``_connected`` so the
-        broker's reconnect path can re-spawn us.
+        Called via ``task.add_done_callback`` when the worker exits for any
+        reason. A graceful disconnect cancels the worker (handled by the
+        ``task.cancelled()`` early-return). The pathological case this guards is:
+        the worker exits while the session is still CONNECTED — broker thinks
+        we're alive, queue keeps accepting sends, nothing processes them.
 
-        Defensive: callback is sync (asyncio constraint) and runs from
-        the event loop's task-finalisation step, so we keep work
-        minimal — just log + flip the flag. Anything heavier would
-        risk re-entering broker code at an awkward moment.
+        The worker owns the queue, so its unexpected death means the session
+        can't process. We drive it **straight to DEAD** — NOT an inline reconnect
+        (reconnecting from the death callback risks resurrecting on corrupted
+        queue/processing state, #206 Murzik Q3). The broker/heartbeat resurrects
+        it via ``attempt_reconnect`` on the next inbound/recovery tick
+        (DEAD → RECONNECTING → CONNECTED).
+
+        Defensive: the callback is sync (asyncio constraint) and runs from the
+        event loop's task-finalisation step, so we keep it minimal — log + schedule
+        the (async, lock-guarded) transition rather than mutate state inline.
         """
         if task.cancelled():
             return  # graceful — disconnect() cancelled us
         exc = task.exception()
-        if self._connected:
+        if self.state == SessionState.CONNECTED:
             if exc is not None:
                 _log(
                     f"codex[{self.agent_name}]: WORKER DIED with "
-                    f"{type(exc).__name__}: {exc} — flipping _connected=False"
+                    f"{type(exc).__name__}: {exc} — marking session DEAD"
                 )
             else:
                 _log(
                     f"codex[{self.agent_name}]: WORKER EXITED unexpectedly "
-                    f"(no exception, no cancel) — flipping _connected=False"
+                    f"(no exception, no cancel) — marking session DEAD"
                 )
-            self._connected = False
+            try:
+                asyncio.get_running_loop().create_task(
+                    self._terminalize_dead("worker died")
+                )
+            except RuntimeError:
+                pass  # no running loop (interpreter / loop shutdown)
+
+    async def _terminalize_dead(self, reason: str) -> None:
+        """Drive the session CONNECTED → DEAD (best-effort, tolerant).
+
+        Used by the worker-death callback and the app-server structural-failure
+        paths to terminalize a session whose transport can no longer process.
+        Requests ``DEAD`` via ``INTERNAL`` and completes it. If another path
+        already moved the state (or a transition is in flight to a different
+        target), ``request_transition`` returns no owner token and this is a
+        no-op — so it's safe to call from anywhere.
+        """
+        try:
+            res = await self._state_machine.request_transition(
+                SessionState.DEAD, Trigger.INTERNAL, reason=reason
+            )
+            if res.owner_token is not None:
+                await self._state_machine.transition_complete(
+                    res.owner_token, SessionState.DEAD, trigger=Trigger.INTERNAL
+                )
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: terminalize-dead failed: {e}")
 
     def is_healthy(self) -> dict:
         """Return diagnostic state for the broker / liveness probe.
@@ -500,12 +677,13 @@ class CodexSession:
         # 1. broker thinks we're connected but worker is dead
         # 2. processing flag stuck True for longer than the inner 600s
         #    timeout could reasonably take + a generous buffer
+        connected = self.state == SessionState.CONNECTED
         wedged = bool(
-            (self._connected and not worker_alive)
+            (connected and not worker_alive)
             or (self._processing and seconds_since_active > 900)
         )
         return {
-            "connected": self._connected,
+            "connected": connected,
             "worker_alive": worker_alive,
             "processing": self._processing,
             "queue_depth": self._message_queue.qsize(),
@@ -769,7 +947,18 @@ class CodexSession:
             server_request_handler=self._on_appserver_request,
             log=_log,
         )
-        await self._app_client.initialize(name="pinkybot", version="1")
+        try:
+            await self._app_client.initialize(name="pinkybot", version="1")
+        except BaseException:
+            # Spawn succeeded but initialize() failed: never leave a
+            # half-initialized client/proc cached. The early-return guard above
+            # checks only (client is not None and proc still alive), so a
+            # cached-but-uninitialized substrate would make the NEXT reconnect
+            # skip initialization entirely and flip the state machine to
+            # CONNECTED on a dead app-server. Tear down before re-raising so
+            # the next _ensure_app_server() respawns from scratch.
+            await self._teardown_app_server()
+            raise
         _log(f"codex[{self.agent_name}]: app-server connected (pid={self._app_proc.pid})")
 
     async def _teardown_app_server(self) -> None:
@@ -823,7 +1012,12 @@ class CodexSession:
         result = CodexTurnResult()
         try:
             await self._ensure_app_server()
-        except Exception as e:  # noqa: BLE001 — surface as a failed turn, keep session alive
+        except Exception as e:  # noqa: BLE001
+            # Structural (#206): the persistent app-server substrate failed to
+            # come back up mid-life — the session can't process. Terminalize to
+            # DEAD; the broker/heartbeat resurrects via attempt_reconnect on the
+            # next inbound/recovery tick. (A per-turn MODEL failure, by contrast,
+            # arrives as turn/failed and leaves the session CONNECTED.)
             result.failed = True
             result.errors.append(f"app-server connect failed: {e}")
             _log(f"codex[{self.agent_name}]: app-server connect failed: {e}")
@@ -831,6 +1025,7 @@ class CodexSession:
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
+            await self._terminalize_dead("app-server connect failed")
             return result
 
         client = self._app_client
@@ -903,9 +1098,11 @@ class CodexSession:
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": "codex app-server turn timed out after 600s",
             })
-            # A wedged thread is unrecoverable — drop the connection so the next
-            # turn respawns and resumes cleanly.
+            # A 600s timeout is a transport/thread wedge, not just a slow
+            # response (#206 Murzik): tear the connection down AND terminalize to
+            # DEAD so it can't sit silently CONNECTED behind a dead transport.
             await self._teardown_app_server()
+            await self._terminalize_dead("app-server turn timed out")
         except CodexAppServerError as e:
             result.failed = True
             result.errors.append(str(e))
@@ -915,7 +1112,11 @@ class CodexSession:
                 "session_id": self.id, "error": str(e),
             })
             await self._teardown_app_server()
-        except Exception as e:  # noqa: BLE001 — keep the session alive across turn failures
+            await self._terminalize_dead("app-server protocol error")
+        except Exception as e:  # noqa: BLE001
+            # Generic turn exception that tore down the transport (#206 Murzik):
+            # once _teardown_app_server() runs, the session must NOT stay silently
+            # CONNECTED — terminalize to DEAD for broker-driven resurrection.
             result.failed = True
             result.errors.append(str(e))
             _log(f"codex[{self.agent_name}]: app-server turn exception: {e}")
@@ -924,6 +1125,7 @@ class CodexSession:
                 "session_id": self.id, "error": str(e),
             })
             await self._teardown_app_server()
+            await self._terminalize_dead("app-server turn exception")
         finally:
             self._active_turn_result = None
             self._turn_done = None
@@ -1378,68 +1580,107 @@ class CodexSession:
 
         _log(f"codex[{self.agent_name}]: force restarting")
 
-        # Clear the resume handle
-        if self._on_resume_handle:
-            try:
-                await self._on_resume_handle(self.agent_name, "")
-            except Exception:
-                pass
-
-        await self.disconnect()
-
-        # #591 P1#1 (Murzik round-2): the prior eager refresh here ran
-        # the builder 1-arg (commit=True), consuming inbox + restart-
-        # manifest BEFORE connect() ran its own reason-aware committed
-        # rebuild — same double-consume pattern as the API-layer sites.
-        # Removed: connect() is the single source-of-truth for both the
-        # wake_context body and side-effect consumption.
-
-        self.codex_session_id = ""
-        self.resume_handle = ""
+        # Own the CONNECTED → RECONNECTING transition (USER_AGENT = the agent's
+        # own context_restart). disconnect() below sees state==RECONNECTING and
+        # skips its standalone-DEAD path, and we drive the substrate back up via
+        # the private helper rather than connect() (which would request a nested
+        # transition — #206 Murzik).
+        res = await self._state_machine.request_transition(
+            SessionState.RECONNECTING, Trigger.USER_AGENT, reason="force_restart"
+        )
+        if res.owner_token is None:
+            _log(
+                f"codex[{self.agent_name}]: force_restart could not own "
+                f"RECONNECTING (state={self.state.value}, {res.rejection_reason!r})"
+            )
+            return False
+        token = res.owner_token
 
         try:
-            await self.connect()
-            _log(f"codex[{self.agent_name}]: force restart complete")
-            return True
-        except Exception as e:
+            # Clear the resume handle (fresh start).
+            if self._on_resume_handle:
+                try:
+                    await self._on_resume_handle(self.agent_name, "")
+                except Exception:
+                    pass
+
+            await self.disconnect()
+
+            # #591 P1#1 (Murzik round-2): connect() is the single source-of-truth
+            # for the wake_context body + side-effect consumption; _enqueue_wake
+            # (below) rebuilds it reason-aware, so no eager refresh here.
+            self.codex_session_id = ""
+            self.resume_handle = ""
+
+            await self._bring_up_substrate()
+        except BaseException as e:
             _log(f"codex[{self.agent_name}]: force restart failed: {e}")
-            self._connected = False
+            await self._state_machine.transition_complete(
+                token, SessionState.DEAD, trigger=Trigger.INTERNAL
+            )
             return False
+
+        await self._state_machine.transition_complete(
+            token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+        )
+        self._analytics_session_started()
+        self._start_worker()
+        await self._enqueue_wake()
+        _log(f"codex[{self.agent_name}]: force restart complete")
+        return True
 
     async def idle_sleep(self) -> bool:
         """Put the session to sleep. Codex session ID preserved for resume."""
-        if not self._connected:
+        if self.state != SessionState.CONNECTED:
             return False
 
         _log(f"codex[{self.agent_name}]: idle sleep triggered")
 
-        # Ask agent to save state before sleeping. The lock keeps this exec
-        # from racing a worker turn against the same codex thread.
-        try:
-            async with self._exec_lock:
-                await self._exec_codex(
-                    "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
-                    "Before your session is suspended:\n"
-                    "1. Use reflect() to persist key learnings and current task state\n"
-                    "2. Note what you were working on so you can resume later\n\n"
-                    "Your session will be preserved and resumed when you're needed next."
-                )
-            _log(f"codex[{self.agent_name}]: memory save prompt sent before idle sleep")
-        except Exception as e:
-            _log(f"codex[{self.agent_name}]: memory save failed before idle sleep: {e}")
+        # Own CONNECTED → IDLE_SLEEPING up front (USER_AGENT). Pre-flipping the
+        # state before the save-exec + disconnect (mirrors tmux) avoids a DEAD
+        # flicker: a concurrent heartbeat-watchdog tick must observe
+        # IDLE_SLEEPING throughout the teardown window, not a transient DEAD that
+        # would trigger _heartbeat_resurrect on a session about to sleep (PR3
+        # Bug 1 class; transport_state.py §5 "no flicker" invariant).
+        res = await self._state_machine.request_transition(
+            SessionState.IDLE_SLEEPING, Trigger.USER_AGENT, reason="idle_sleep"
+        )
+        if res.owner_token is None:
+            _log(
+                f"codex[{self.agent_name}]: idle_sleep could not own "
+                f"IDLE_SLEEPING (state={self.state.value})"
+            )
+            return False
+        token = res.owner_token
 
-        # Set the idle-sleeping flag BEFORE disconnect() so the derived
-        # ``state`` property reports IDLE_SLEEPING throughout the teardown
-        # window. Otherwise a concurrent heartbeat-watchdog tick between
-        # disconnect() landing _connected=False and this line setting
-        # _idle_sleeping=True would observe state == DEAD and call
-        # _heartbeat_resurrect on a session that's about to be IDLE_SLEEPING.
-        # Same class as PR3 Bug 1 on StreamingSession.force_restart, just
-        # on the codex backend (per @pushok PR #492 Nit 2). Echoes the
-        # "no flicker DEAD ↔ IDLE_SLEEPING/RECONNECTING" invariant from
-        # transport_state.py §5.
-        self._idle_sleeping = True
-        await self.disconnect()
+        try:
+            # Ask the agent to save state before sleeping. The exec lock keeps
+            # this from racing a worker turn on the same codex thread (the worker
+            # loop has already stopped — state left CONNECTED at grant).
+            try:
+                async with self._exec_lock:
+                    await self._exec_codex(
+                        "[SYSTEM] You've been idle for over an hour. Auto-sleep is activating.\n\n"
+                        "Before your session is suspended:\n"
+                        "1. Use reflect() to persist key learnings and current task state\n"
+                        "2. Note what you were working on so you can resume later\n\n"
+                        "Your session will be preserved and resumed when you're needed next."
+                    )
+                _log(f"codex[{self.agent_name}]: memory save prompt sent before idle sleep")
+            except Exception as e:
+                _log(f"codex[{self.agent_name}]: memory save failed before idle sleep: {e}")
+
+            await self.disconnect()
+        except BaseException as e:
+            _log(f"codex[{self.agent_name}]: idle_sleep teardown failed: {e}")
+            await self._state_machine.transition_complete(
+                token, SessionState.DEAD, trigger=Trigger.INTERNAL
+            )
+            return False
+
+        await self._state_machine.transition_complete(
+            token, SessionState.IDLE_SLEEPING, trigger=Trigger.USER_AGENT
+        )
         self._stats["auto_restarts"] += 1
         _log(f"codex[{self.agent_name}]: idle sleep complete")
         return True
@@ -1448,12 +1689,30 @@ class CodexSession:
     # watchdog contract so api._heartbeat_resurrect can treat runtimes uniformly.
     _RECONNECT_BACKOFF = (2, 8, 30)
 
-    async def attempt_reconnect(self) -> None:
-        """Attempt to reconnect after a failure with bounded retries."""
-        try:
-            await self.disconnect()
-        except Exception as e:
-            _log(f"codex[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+    async def attempt_reconnect(self, *, trigger: Trigger = Trigger.WATCHDOG) -> None:
+        """Reconnect with bounded retries under a SINGLE RECONNECTING transition.
+
+        Takes RECONNECTING ownership once and retries the substrate bring-up
+        under it — rather than calling connect() per attempt, which would request
+        a nested transition (#206 Murzik). Completes to CONNECTED on the first
+        success, or DEAD once the retry budget is exhausted. Legal from CONNECTED
+        / IDLE_SLEEPING / DEAD via WATCHDOG (the default; the heartbeat-resurrect
+        + watchdog-recovery callers).
+        """
+        res = await self._state_machine.request_transition(
+            SessionState.RECONNECTING, trigger, reason="attempt_reconnect"
+        )
+        if res.owner_token is None:
+            if res.in_flight_handle is not None:
+                # Another path already owns the reconnect — inherit its outcome.
+                await res.in_flight_handle.wait()
+            else:
+                _log(
+                    f"codex[{self.agent_name}]: attempt_reconnect rejected "
+                    f"(state={self.state.value}, {res.rejection_reason!r})"
+                )
+            return
+        token = res.owner_token
 
         last_error: Exception | None = None
         for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
@@ -1463,28 +1722,45 @@ class CodexSession:
                 f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
                 f"after {delay}s backoff"
             )
+            try:
+                await self.disconnect()  # state==RECONNECTING → no standalone DEAD
+            except Exception as e:
+                _log(f"codex[{self.agent_name}]: pre-attempt disconnect raised: {e}")
             await asyncio.sleep(delay)
             try:
-                await self.connect()
-                _log(f"codex[{self.agent_name}]: reconnected successfully")
-                return
+                await self._bring_up_substrate()
             except Exception as e:
                 last_error = e
                 _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
-                try:
-                    await self.disconnect()
-                except Exception:
-                    pass
+                continue
+            # Success — complete to CONNECTED + bring the worker/wake back up.
+            await self._state_machine.transition_complete(
+                token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+            )
+            self._analytics_session_started()
+            self._start_worker()
+            await self._enqueue_wake()
+            _log(f"codex[{self.agent_name}]: reconnected successfully")
+            return
 
-        self._connected = False
+        await self._state_machine.transition_complete(
+            token, SessionState.DEAD, trigger=Trigger.INTERNAL
+        )
         _log(
             f"codex[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
-            f"attempts failed (last error: {last_error}); session left disconnected"
+            f"attempts failed (last error: {last_error}); session DEAD"
         )
 
     async def disconnect(self) -> None:
-        """Disconnect — kill any running subprocess and cancel the worker."""
-        self._connected = False
+        """Tear down the worker + any codex subprocess / app-server. Idempotent.
+
+        Per the Transport contract, disconnect is the side-effect runner, NOT the
+        intent declarer: force_restart / idle_sleep / attempt_reconnect drive the
+        state machine FIRST (to RECONNECTING / IDLE_SLEEPING), then call this for
+        teardown — so the standalone-DEAD path below is skipped for them. A bare
+        external disconnect() (state still CONNECTED, no in-flight transition) is
+        a terminal shutdown and drives CONNECTED → DEAD, matching StreamingSession.
+        """
         self._analytics_log_activity("session_end")
         self._analytics_session_ended()
 
@@ -1510,38 +1786,36 @@ class CodexSession:
                 pass
         self._worker_task = None
         self._processing = False
+
+        # Standalone terminal shutdown: only when still CONNECTED with no
+        # caller-declared intent. request_transition returns no owner token when
+        # a transition is already in flight (force_restart/idle_sleep/
+        # attempt_reconnect hold one) or the state isn't CONNECTED, so this is a
+        # no-op for those callers and a clean CONNECTED → DEAD for a bare close.
+        if self._state_machine.state == SessionState.CONNECTED:
+            res = await self._state_machine.request_transition(
+                SessionState.DEAD, Trigger.INTERNAL, reason="standalone_disconnect"
+            )
+            if res.owner_token is not None:
+                await self._state_machine.transition_complete(
+                    res.owner_token, SessionState.DEAD, trigger=Trigger.INTERNAL
+                )
         _log(f"codex[{self.agent_name}]: disconnected")
 
     @property
     def state(self) -> SessionState:
-        """Lifecycle state derived from internal ``_connected``,
-        ``_idle_sleeping``, and ``_connect_attempted`` bools.
+        """Current lifecycle state — the single source of truth (#206).
 
-        CodexSession does not (yet) embed the full ``StateMachine`` that
-        StreamingSession adopted in PR3 of #486 — the codex backend's
-        lifecycle is simpler (no reconnect retry loop, no resume handle
-        capture race). Until/unless it adopts the matrix, the state
-        property is a derived view over the legacy bools:
-
-        - ``_idle_sleeping=True``                       → ``IDLE_SLEEPING``
-        - ``_connected=True``                           → ``CONNECTED``
-        - ``_connect_attempted=False`` (never tried)    → ``UNINITIALIZED``
-        - otherwise (tried and currently disconnected)  → ``DEAD``
-
-        RECONNECTING is not modeled; the external readers (broker, api,
-        scheduler) only branch on ``CONNECTED`` / ``IDLE_SLEEPING`` /
-        ``DEAD`` / ``UNINITIALIZED`` so the coarser mapping is sufficient
-        for the Transport protocol's polymorphic contract. Distinguishing
-        UNINITIALIZED from DEAD on a never-connected fresh session
-        (@pushok PR #492 Nit 1) preserves the "never tried" semantic.
+        CodexSession now embeds the same ``StateMachine`` as TmuxSession /
+        StreamingSession instead of deriving state from the old
+        ``_connected`` / ``_idle_sleeping`` / ``_connect_attempted`` bool
+        lattice. It surfaces BOOTING (cold start in flight) and RECONNECTING
+        (warm wake / recovery in flight) in addition to CONNECTED /
+        IDLE_SLEEPING / DEAD / UNINITIALIZED, so the broker, watchdog, and
+        dashboard see the true Codex lifecycle at parity with the other
+        transports.
         """
-        if self._idle_sleeping:
-            return SessionState.IDLE_SLEEPING
-        if self._connected:
-            return SessionState.CONNECTED
-        if not getattr(self, "_connect_attempted", False):
-            return SessionState.UNINITIALIZED
-        return SessionState.DEAD
+        return self._state_machine.state
 
     @property
     def max_tokens(self) -> int:
@@ -1579,15 +1853,17 @@ class CodexSession:
 
     @property
     def stats(self) -> dict:
+        state = self.state
         return {
             **self._stats,
-            "connected": self._connected,
-            # Consistency with tmux/streaming stats (#109). Codex only ever
-            # reports CONNECTED/IDLE_SLEEPING/UNINITIALIZED/DEAD — it never
-            # models BOOTING/RECONNECTING — so it's naturally excluded from
-            # the lifecycle transition-age watchdog.
-            "state": self.state.value,
-            "idle_sleeping": self._idle_sleeping,
+            "connected": state == SessionState.CONNECTED,
+            "state": state.value,
+            # Wall-clock epoch the current state was entered (grant time) — lets
+            # the watchdog age stuck BOOTING/RECONNECTING transitions precisely
+            # instead of sampling (#206). Codex now surfaces those transitions,
+            # so it participates in the lifecycle transition-age watchdog.
+            "state_entered_at": self._state_machine.state_entered_at,
+            "idle_sleeping": state == SessionState.IDLE_SLEEPING,
             "processing": self._processing,
             "pending_messages": self._message_queue.qsize(),
             "current_activity": self._current_activity,
