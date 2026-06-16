@@ -67,6 +67,8 @@ from collections import deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from pinky_daemon.auth_relay import coordinator as _auth_relay
+from pinky_daemon.auth_relay import extract_oauth_url, looks_like_login_wall
 from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
@@ -575,7 +577,7 @@ class _TmuxControl:
         return await self._run("send-keys", "-t", self.session_name, "Enter")
 
     async def capture_pane(
-        self, *, lines: int = 200, escapes: bool = False,
+        self, *, lines: int = 200, escapes: bool = False, join: bool = False,
     ) -> TmuxCommandResult:
         """Capture the last ``lines`` lines of the pane's visible content.
 
@@ -588,6 +590,11 @@ class _TmuxControl:
         and cursor escapes it stripped by default — needed for xterm
         to render the pane faithfully. Default ``False`` preserves the
         plain-text shape callers expect.
+
+        ``join=True`` adds ``-J`` so tmux joins wrapped lines and preserves
+        trailing spaces — needed by the auth-relay watcher (#205) to read a
+        long OAuth URL back as one contiguous string rather than column-wrapped
+        fragments. Default ``False`` keeps the per-line shape.
         """
         args = [
             "capture-pane",
@@ -596,6 +603,8 @@ class _TmuxControl:
         ]
         if escapes:
             args.append("-e")  # include ANSI escape sequences
+        if join:
+            args.append("-J")  # join wrapped lines (de-wrap long URLs)
         args.extend(["-S", str(-abs(lines))])
         return await self._run(*args)
 
@@ -828,6 +837,17 @@ _FOREGROUND_TOOL_ACTIVE_CEILING_SEC = 1800.0
 # across the bootstrap window (Murzik #571 review catch).
 _SESSION_READY_GATE_TIMEOUT_SEC = 30.0
 
+# Auth-relay (#205): after spawn, watch the pane for the claude OAuth login
+# wall for this long, polling at this interval. The wall (if any) appears
+# within seconds of launch; if it never shows the session authed normally and
+# the watcher exits. Read-only capture_pane — no turn is pasted, so the
+# inflight watchdog never ages the session out from under the watcher.
+_AUTH_WALL_DETECT_WINDOW_SEC = 90.0
+_AUTH_WALL_POLL_SEC = 2.5
+# Pause after injecting the code before re-reading the pane, to let claude
+# complete the login handshake and clear the wall.
+_AUTH_LOGIN_SETTLE_SEC = 2.5
+
 # Issue #151 — native ultracode activation settle. After typing the interactive
 # ``/effort ultracode`` into a freshly-ready REPL (see ``_deliver_turn``), pause
 # briefly so the CLI processes the slash command before the wake prompt's
@@ -898,6 +918,10 @@ class TmuxSession:
         # isn't blocked behind a per-turn wait. Started/cancelled
         # alongside ``_worker_task``.
         self._watchdog_task: asyncio.Task | None = None
+        # Auth-relay watcher (#205): flag-gated background task that detects the
+        # claude OAuth login wall and relays it to the owner. Started at the end
+        # of ``_spawn_tmux_repl``, cancelled in ``disconnect``.
+        self._auth_watcher_task: asyncio.Task | None = None
         self._processing = False
 
         # Operational stats. Shape matches StreamingSession.stats for the
@@ -2255,6 +2279,96 @@ class TmuxSession:
         if self._last_launch_forced_fresh:
             self._config.force_fresh_context_once = False
 
+        # Auth-relay (#205): if enabled + configured, start a flag-gated
+        # background watcher that detects the claude OAuth login wall and relays
+        # it to the owner. The normal path is byte-identical when off. Cancel a
+        # watcher left over from a prior spawn on this reused session object.
+        if _auth_relay.enabled() and _auth_relay.configured:
+            prev = self._auth_watcher_task
+            if prev is not None and not prev.done():
+                prev.cancel()
+            self._auth_watcher_task = asyncio.create_task(
+                self._watch_for_oauth_url()
+            )
+
+    async def _watch_for_oauth_url(self) -> None:
+        """Watch the pane for the claude OAuth login wall and relay it (#205).
+
+        Flag-gated; started at the end of ``_spawn_tmux_repl`` only when the
+        auth relay is enabled + configured. Pure read-only observation
+        (``capture_pane``) — it never pastes a turn, so the inflight watchdog
+        never sees an aging head and the session stays CONNECTED for as long as
+        the owner needs to reply. Bounded to a short window after spawn: the
+        wall (if any) appears within seconds; if it never shows, the session
+        authenticated normally and the watcher exits.
+        """
+        deadline = time.monotonic() + _AUTH_WALL_DETECT_WINDOW_SEC
+        try:
+            while time.monotonic() < deadline:
+                if self.state != SessionState.CONNECTED:
+                    return
+                res = await self._tmux.capture_pane(lines=40, join=True)
+                text = res.stdout if res.ok and res.stdout else ""
+                url = extract_oauth_url(text)
+                if url:
+                    await self._relay_login_and_inject(url)
+                    return
+                await asyncio.sleep(_AUTH_WALL_POLL_SEC)
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: auth-relay watcher error "
+                f"(non-fatal): {e}"
+            )
+
+    async def _relay_login_and_inject(self, url: str) -> None:
+        """Relay the OAuth URL to the owner, await the code, inject it (#205).
+
+        Never logs the code. On success notifies the owner the agent is signed
+        in; on a rejected code or relay timeout, tells them to restart.
+        """
+        _log(
+            f"tmux[{self.agent_name}]: claude OAuth login wall detected — "
+            f"relaying sign-in link to owner"
+        )
+        try:
+            code = await _auth_relay.open(self.agent_name, url)
+        except asyncio.TimeoutError:
+            _log(f"tmux[{self.agent_name}]: auth relay expired before a code arrived")
+            return
+        except Exception as e:
+            _log(f"tmux[{self.agent_name}]: auth relay failed (non-fatal): {e}")
+            return
+
+        # Inject the owner-supplied code via bracketed paste (never logged).
+        await self._tmux.paste_text(code, enter=True)
+        _log(f"tmux[{self.agent_name}]: injected owner-supplied auth code")
+
+        # Give claude a moment to complete login, then confirm the wall cleared.
+        await asyncio.sleep(_AUTH_LOGIN_SETTLE_SEC)
+        try:
+            res = await self._tmux.capture_pane(lines=40, join=True)
+            text = res.stdout if res.ok and res.stdout else ""
+        except Exception:
+            text = ""
+        if looks_like_login_wall(text):
+            _log(
+                f"tmux[{self.agent_name}]: login wall still present after code "
+                f"— likely rejected"
+            )
+            await _auth_relay.notify_owner(
+                self.agent_name,
+                f'That code did not complete the sign-in for "{self.agent_name}". '
+                f"Restart the session to try again.",
+            )
+        else:
+            _log(f"tmux[{self.agent_name}]: claude sign-in completed")
+            await _auth_relay.notify_owner(
+                self.agent_name,
+                f'Agent "{self.agent_name}" is signed in to Claude.',
+            )
+
     def _build_claude_cmd(self) -> str:
         """Build the in-pane ``claude`` invocation as a single shell string.
 
@@ -2535,6 +2649,14 @@ class TmuxSession:
             except asyncio.CancelledError:
                 pass
         self._watchdog_task = None
+        # Cancel the auth-relay watcher (#205) alongside the worker/watchdog.
+        if self._auth_watcher_task and not self._auth_watcher_task.done():
+            self._auth_watcher_task.cancel()
+            try:
+                await self._auth_watcher_task
+            except asyncio.CancelledError:
+                pass
+        self._auth_watcher_task = None
         self._processing = False
 
         # Drain the in-flight metadata deque (#560 replaces PR #496
