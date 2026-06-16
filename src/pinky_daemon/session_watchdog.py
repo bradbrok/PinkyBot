@@ -186,6 +186,10 @@ class _SessionSnapshot:
     current_activity: str
     sample_time: float
     state: str = ""  # lifecycle state value (e.g. "booting"); "" if unknown
+    # Wall-clock epoch the session entered ``state``, stamped at grant time by
+    # the transport's StateMachine (#206). 0.0 when the transport doesn't
+    # expose it — the watchdog then falls back to its own sampled timing.
+    state_entered_at: float = 0.0
 
 
 @dataclass
@@ -338,6 +342,7 @@ class SessionWatchdog:
             current_activity=stats.get("current_activity", ""),
             sample_time=time.time(),
             state=state,
+            state_entered_at=stats.get("state_entered_at", 0.0) or 0.0,
         )
 
     async def _evaluate(self, snap: _SessionSnapshot, now: float) -> None:
@@ -485,14 +490,29 @@ class SessionWatchdog:
         required — a session stuck BOOTING can't receive anything regardless of
         queue depth.
         """
-        # (Re)start the sampled timer on first observation of this transition
-        # state, or when it changed since the last sweep. No age has accrued
-        # yet, so don't warn/recover on the same sweep.
-        if state.transition_state != snap.state:
-            state.transition_state = snap.state
-            state.transition_since = now
-            state.transition_warned = False
-            return
+        # Anchor the age clock. Prefer the session-provided ``state_entered_at``
+        # (stamped at GRANT time by the StateMachine — precise) over the sampled
+        # timer (starts on the first sweep that observes the state — up to one
+        # interval, ~60s, late). Fall back to sampling for transports that don't
+        # expose it (#206; Murzik).
+        authoritative = snap.state_entered_at if snap.state_entered_at > 0 else None
+        if authoritative is not None:
+            # (Re)anchor whenever the tracked state value changes OR the entry
+            # time advanced (a same-value re-entry, e.g. a fresh RECONNECTING
+            # grant). No early return: the real entry time may ALREADY exceed a
+            # threshold, and the sampled path would have wrongly reset to ``now``.
+            if state.transition_state != snap.state or state.transition_since != authoritative:
+                state.transition_state = snap.state
+                state.transition_since = authoritative
+                state.transition_warned = False
+        else:
+            # Sampled fallback: start the timer on first observation / on change.
+            # No age has accrued yet, so don't warn/recover on the same sweep.
+            if state.transition_state != snap.state:
+                state.transition_state = snap.state
+                state.transition_since = now
+                state.transition_warned = False
+                return
 
         age = now - state.transition_since
 

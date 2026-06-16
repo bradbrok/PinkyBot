@@ -12,6 +12,45 @@ import pytest
 from pinky_daemon.codex_session import CodexSession, CodexTurnResult
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.streaming_session import StreamingSessionConfig
+from pinky_daemon.transport_state import SessionState, Trigger
+
+
+async def _to_connected(s: CodexSession) -> None:
+    """Drive a test session's state machine straight to CONNECTED — without
+    spawning the worker or running codex (#206; replaces the old inert
+    ``s._connected = True``)."""
+    sm = s._state_machine
+    res = await sm.request_transition(SessionState.BOOTING, Trigger.BOOT)
+    await sm.transition_complete(
+        res.owner_token, SessionState.CONNECTED, trigger=Trigger.BOOT_COMPLETE
+    )
+
+
+async def _to_idle(s: CodexSession) -> None:
+    """Drive a test session to IDLE_SLEEPING."""
+    await _to_connected(s)
+    sm = s._state_machine
+    res = await sm.request_transition(SessionState.IDLE_SLEEPING, Trigger.USER_AGENT)
+    await sm.transition_complete(
+        res.owner_token, SessionState.IDLE_SLEEPING, trigger=Trigger.USER_AGENT
+    )
+
+
+async def _to_dead(s: CodexSession) -> None:
+    """Drive a test session to DEAD (via CONNECTED if fresh)."""
+    if s.state != SessionState.CONNECTED:
+        await _to_connected(s)
+    sm = s._state_machine
+    res = await sm.request_transition(SessionState.DEAD, Trigger.INTERNAL)
+    if res.owner_token is not None:
+        await sm.transition_complete(
+            res.owner_token, SessionState.DEAD, trigger=Trigger.INTERNAL
+        )
+
+
+async def _noop(*_a, **_k) -> None:
+    """Async no-op — patch over _enqueue_wake / side effects in state tests."""
+    return None
 
 
 class TestCodexTurnResult:
@@ -301,7 +340,7 @@ class TestCodexSessionSendSignature:
         """Hint should be appended to the queued prompt (matches Streaming-
         Session.send behavior) but NOT stored in the conversation log."""
         s = self._make()
-        s._connected = True  # bypass the dropped-when-disconnected branch
+        await _to_connected(s)  # state-machine CONNECTED (bypass the drop branch)
 
         await s.send(
             "actual user text",
@@ -319,7 +358,7 @@ class TestCodexSessionSendSignature:
     async def test_send_without_agent_hint_unchanged(self):
         """No-hint path is the previous behavior — prompt queued verbatim."""
         s = self._make()
-        s._connected = True
+        await _to_connected(s)
 
         await s.send("plain prompt", platform="telegram", chat_id="123")
 
@@ -365,7 +404,7 @@ class TestCodexSessionDisconnect:
             provider_url="codex_cli",
         )
         s = CodexSession(config)
-        s._connected = True
+        await _to_connected(s)
 
         async def fake_exec(prompt: str) -> CodexTurnResult:
             return CodexTurnResult()
@@ -404,8 +443,7 @@ class TestCodexSessionDisconnect:
             provider_url="codex_cli",
         )
         s = CodexSession(config)
-        s._connected = True
-        s._connect_attempted = True  # mirror post-connect()
+        await _to_connected(s)
 
         async def fake_exec(prompt: str) -> CodexTurnResult:
             return CodexTurnResult()
@@ -444,21 +482,25 @@ class TestCodexSessionDisconnect:
             provider_url="codex_cli",
         )
         s = CodexSession(config)
-        s._idle_sleeping = True
+        await _to_idle(s)
 
         async def fake_worker() -> None:
             await asyncio.sleep(60)
 
         s._message_worker = fake_worker  # type: ignore[assignment]
 
-        await s.connect()
+        await s.connect()  # warm-wake: IDLE_SLEEPING → RECONNECTING → CONNECTED
 
         from pinky_daemon.transport_state import SessionState
         assert s.state == SessionState.CONNECTED
         await s.disconnect()
 
     @pytest.mark.asyncio
-    async def test_attempt_reconnect_uses_connect_and_preserves_codex_session_id(self):
+    async def test_attempt_reconnect_preserves_codex_session_id(self):
+        # #206: attempt_reconnect now owns ONE RECONNECTING transition and
+        # retries _bring_up_substrate under it (no nested connect()). It resumes
+        # from DEAD, preserves the codex_session_id (only force_restart clears
+        # it), and completes to CONNECTED.
         config = StreamingSessionConfig(
             agent_name="test",
             working_dir="/tmp",
@@ -468,25 +510,29 @@ class TestCodexSessionDisconnect:
         s.codex_session_id = "thread-123"
         s.resume_handle = "thread-123"
         s._RECONNECT_BACKOFF = (0,)
+        await _to_dead(s)  # broker/heartbeat resurrects from DEAD
+
         calls = []
 
         async def fake_disconnect() -> None:
             calls.append("disconnect")
-            s._connected = False
 
-        async def fake_connect() -> None:
-            calls.append("connect")
-            s._connected = True
-            s._idle_sleeping = False
+        async def fake_bring_up() -> None:
+            calls.append("bring_up")
+
+        async def fake_enqueue() -> None:
+            calls.append("wake")
 
         s.disconnect = fake_disconnect  # type: ignore[method-assign]
-        s.connect = fake_connect  # type: ignore[method-assign]
+        s._bring_up_substrate = fake_bring_up  # type: ignore[method-assign]
+        s._start_worker = lambda: calls.append("worker")  # type: ignore[method-assign]
+        s._enqueue_wake = fake_enqueue  # type: ignore[method-assign]
+        s._analytics_session_started = lambda: None  # type: ignore[method-assign]
 
         await s.attempt_reconnect()
 
-        from pinky_daemon.transport_state import SessionState
-        assert calls == ["disconnect", "connect"]
         assert s.state == SessionState.CONNECTED
+        assert calls == ["disconnect", "bring_up", "worker", "wake"]
         assert s.codex_session_id == "thread-123"
         assert s.resume_handle == "thread-123"
         assert s.stats["reconnects"] == 1
@@ -666,12 +712,13 @@ class TestCodexReasoningOutputTokens:
 
 
 class TestCodexWorkerDoneCallback:
-    """Worker-task watchdog: surface silent worker death.
+    """Worker-task watchdog: surface silent worker death (#206).
 
-    Pathological case being guarded: worker exits while ``_connected``
-    is still True. Broker thinks session is alive, queue piles up, no
-    messages process. The callback flips ``_connected`` so the broker
-    can resurrect the session.
+    Pathological case: the worker exits while the session is still CONNECTED.
+    Broker thinks the session is alive, the queue piles up, nothing processes.
+    The callback drives the session straight to DEAD (no inline reconnect — the
+    worker owns the queue) so the broker/heartbeat resurrects it via
+    attempt_reconnect on the next inbound/recovery tick.
     """
 
     def _make_session(self):
@@ -682,11 +729,10 @@ class TestCodexWorkerDoneCallback:
         return CodexSession(config)
 
     @pytest.mark.asyncio
-    async def test_callback_flips_connected_on_silent_exit(self):
-        """Worker task finishes without exception while _connected=True
-        → callback flips _connected to False and logs loud."""
+    async def test_callback_marks_dead_on_silent_exit(self):
+        """Worker finishes without exception while CONNECTED → session → DEAD."""
         s = self._make_session()
-        s._connected = True  # broker's view: alive
+        await _to_connected(s)
 
         # Build a real completed task (graceful exit, no exception, no cancel).
         async def _no_op():
@@ -695,17 +741,18 @@ class TestCodexWorkerDoneCallback:
         await task
 
         s._worker_done_callback(task)
+        await asyncio.sleep(0)  # let the scheduled _terminalize_dead run
+        await asyncio.sleep(0)
 
-        assert s._connected is False, (
-            "silent worker exit must flip _connected so broker can resurrect"
+        assert s.state == SessionState.DEAD, (
+            "silent worker exit must drive DEAD so the broker can resurrect"
         )
 
     @pytest.mark.asyncio
-    async def test_callback_flips_connected_on_exception_exit(self):
-        """Worker task that raised an exception while _connected=True
-        also flips _connected."""
+    async def test_callback_marks_dead_on_exception_exit(self):
+        """Worker that raised while CONNECTED also drives the session DEAD."""
         s = self._make_session()
-        s._connected = True
+        await _to_connected(s)
 
         async def _raises():
             raise RuntimeError("simulated worker crash")
@@ -717,15 +764,17 @@ class TestCodexWorkerDoneCallback:
             pass
 
         s._worker_done_callback(task)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
 
-        assert s._connected is False
+        assert s.state == SessionState.DEAD
 
     @pytest.mark.asyncio
     async def test_callback_noop_when_cancelled(self):
-        """Graceful disconnect cancels the worker — callback must NOT
-        treat that as a wedge or flip state (disconnect already did)."""
+        """Graceful disconnect cancels the worker — callback must NOT treat
+        that as a wedge (disconnect already drove the state)."""
         s = self._make_session()
-        s._connected = False  # disconnect path already flipped this
+        await _to_connected(s)
 
         async def _block_forever():
             await asyncio.Event().wait()
@@ -737,15 +786,16 @@ class TestCodexWorkerDoneCallback:
             pass
 
         s._worker_done_callback(task)
-        # Callback shouldn't touch _connected; it stays whatever disconnect set.
-        assert s._connected is False
+        await asyncio.sleep(0)
+        # Cancelled → early return → state untouched (still CONNECTED).
+        assert s.state == SessionState.CONNECTED
 
     @pytest.mark.asyncio
-    async def test_callback_noop_when_connected_already_false(self):
-        """Worker exit during a normal disconnect: _connected already
-        False, no need to log a wedge."""
+    async def test_callback_noop_when_not_connected(self):
+        """Worker exit when the session isn't CONNECTED (already torn down):
+        callback is a no-op, no spurious transition."""
         s = self._make_session()
-        s._connected = False
+        await _to_dead(s)  # already DEAD
 
         async def _no_op():
             return None
@@ -753,7 +803,8 @@ class TestCodexWorkerDoneCallback:
         await task
 
         s._worker_done_callback(task)
-        assert s._connected is False  # unchanged
+        await asyncio.sleep(0)
+        assert s.state == SessionState.DEAD  # unchanged
 
 
 class TestCodexIsHealthy:
@@ -790,7 +841,7 @@ class TestCodexIsHealthy:
         done. ``wedged`` must be True so broker / health endpoint can
         surface it."""
         s = self._make_session()
-        s._connected = True
+        await _to_connected(s)
 
         async def _exits_immediately():
             return None
@@ -808,7 +859,7 @@ class TestCodexIsHealthy:
         worker likely hung mid-turn (the proc.wait wedge before the
         Tier 1.A timeout caught it)."""
         s = self._make_session()
-        s._connected = True
+        await _to_connected(s)
         s._processing = True
         # Pretend last_active was an hour ago.
         s.last_active = s.last_active - 3600
@@ -857,8 +908,7 @@ class TestCodexPendingWakeCallback:
             provider_url="codex_cli",
         )
         s = CodexSession(config)
-        s._connected = True
-        s._connect_attempted = True
+        await _to_connected(s)
 
         fires: list[str] = []
         s._pending_wake_callback = lambda: fires.append("delivered")
@@ -872,7 +922,7 @@ class TestCodexPendingWakeCallback:
         worker = asyncio.create_task(s._message_worker())
         # Let worker process one turn, then stop the loop.
         await asyncio.sleep(0.05)
-        s._connected = False
+        await _to_dead(s)  # flip off CONNECTED to stop the worker loop
         s._message_queue.put_nowait(("noop", "", "", ""))  # unblock get()
         try:
             await asyncio.wait_for(worker, timeout=2.0)
@@ -900,8 +950,7 @@ class TestCodexPendingWakeCallback:
             provider_url="codex_cli",
         )
         s = CodexSession(config)
-        s._connected = True
-        s._connect_attempted = True
+        await _to_connected(s)
 
         fires: list[str] = []
         s._pending_wake_callback = lambda: fires.append("delivered")
@@ -916,7 +965,7 @@ class TestCodexPendingWakeCallback:
 
         worker = asyncio.create_task(s._message_worker())
         await asyncio.sleep(0.05)
-        s._connected = False
+        await _to_dead(s)  # flip off CONNECTED to stop the worker loop
         s._message_queue.put_nowait(("noop", "", "", ""))
         try:
             await asyncio.wait_for(worker, timeout=2.0)
@@ -1412,3 +1461,146 @@ class TestAssistantDeltaDedupe:
         assert result.text_parts == ["hello"]
         deltas = [e["delta"] for e in events if e["type"] == "assistant_delta"]
         assert deltas == ["hello"]
+
+
+# ── #206: CodexSession state-machine parity (BOOTING/RECONNECTING) ──────────
+#
+# Murzik-required coverage: cold-start BOOTING→CONNECTED (and →DEAD on substrate
+# failure, no leaked owner token), warm reconnect RECONNECTING→CONNECTED/DEAD,
+# worker-death terminalization, per-turn turn/failed staying CONNECTED, and the
+# state_entered_at stamp surfaced in stats.
+
+
+class TestCodexStateMachine:
+    @pytest.mark.asyncio
+    async def test_cold_connect_exposes_booting_then_connected(self):
+        # App-server mode: BOOTING is held across spawn+initialize, then flips
+        # CONNECTED. Block _ensure_app_server to observe BOOTING.
+        s = _appserver_session()
+        gate = asyncio.Event()
+
+        async def blocked_ensure():
+            await gate.wait()
+            s._app_client = object()  # mark substrate "up"
+
+        s._ensure_app_server = blocked_ensure  # type: ignore[assignment]
+        s._start_worker = lambda: None  # type: ignore[assignment] — no real worker
+        s._enqueue_wake = _noop  # type: ignore[assignment]
+        s._analytics_session_started = lambda: None  # type: ignore[assignment]
+
+        task = asyncio.create_task(s.connect())
+        await asyncio.sleep(0.03)  # let connect reach the blocked substrate bring-up
+        assert s.state == SessionState.BOOTING
+        gate.set()
+        await asyncio.wait_for(task, timeout=2)
+        assert s.state == SessionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_cold_connect_appserver_init_failure_dies_no_leak(self):
+        # App-server initialize failure during BOOT → BOOTING completes to DEAD,
+        # and the owner token is NOT leaked (a later resurrection can proceed).
+        s = _appserver_session()
+
+        async def failing_ensure():
+            raise RuntimeError("app-server init boom")
+
+        s._ensure_app_server = failing_ensure  # type: ignore[assignment]
+
+        with pytest.raises(RuntimeError):
+            await s.connect()
+        assert s.state == SessionState.DEAD
+        assert s._state_machine._in_flight is None, "owner token leaked on BOOT failure"
+
+        # No leak → resurrection works: DEAD → RECONNECTING → CONNECTED.
+        async def ok_ensure():
+            s._app_client = object()
+
+        s._ensure_app_server = ok_ensure  # type: ignore[assignment]
+        s._start_worker = lambda: None  # type: ignore[assignment]
+        s._enqueue_wake = _noop  # type: ignore[assignment]
+        s._analytics_session_started = lambda: None  # type: ignore[assignment]
+        await s.connect()
+        assert s.state == SessionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_warm_reconnect_exposes_reconnecting_then_connected(self):
+        s = _appserver_session()
+        await _to_dead(s)
+        s._RECONNECT_BACKOFF = (0,)
+        gate = asyncio.Event()
+
+        async def blocked_bring_up():
+            await gate.wait()
+
+        s._bring_up_substrate = blocked_bring_up  # type: ignore[assignment]
+        s._start_worker = lambda: None  # type: ignore[assignment]
+        s._enqueue_wake = _noop  # type: ignore[assignment]
+        s._analytics_session_started = lambda: None  # type: ignore[assignment]
+
+        task = asyncio.create_task(s.attempt_reconnect())
+        await asyncio.sleep(0.03)  # grant RECONNECTING, then block in bring-up
+        assert s.state == SessionState.RECONNECTING
+        gate.set()
+        await asyncio.wait_for(task, timeout=2)
+        assert s.state == SessionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_warm_reconnect_exhausts_budget_to_dead(self):
+        s = _appserver_session()
+        await _to_dead(s)
+        s._RECONNECT_BACKOFF = (0, 0)  # two quick attempts, both fail
+
+        async def always_fail():
+            raise RuntimeError("substrate down")
+
+        s._bring_up_substrate = always_fail  # type: ignore[assignment]
+
+        await s.attempt_reconnect()
+        assert s.state == SessionState.DEAD
+        assert s._state_machine._in_flight is None
+        assert s.stats["reconnects"] == 2
+
+    @pytest.mark.asyncio
+    async def test_worker_death_terminalizes_and_visible_in_stats(self):
+        # Worker exits unexpectedly while CONNECTED → session DEAD, and the
+        # watchdog (which reads stats) sees state=="dead"/connected=False.
+        s = _plain_session()
+        await _to_connected(s)
+
+        async def _no_op():
+            return None
+        task = asyncio.create_task(_no_op())
+        await task
+
+        s._worker_done_callback(task)
+        await asyncio.sleep(0)
+        await asyncio.sleep(0)
+
+        assert s.state == SessionState.DEAD
+        assert s.stats["state"] == "dead"
+        assert s.stats["connected"] is False
+
+    @pytest.mark.asyncio
+    async def test_app_server_turn_failed_leaves_connected(self):
+        # A per-turn MODEL failure (turn.failed) does NOT tear down the
+        # transport, so the session stays CONNECTED (vs. a structural transport
+        # failure, which terminalizes — see codex_session app-server paths).
+        s = _appserver_session()
+        await _to_connected(s)
+        result = CodexTurnResult()
+        await s._handle_event(
+            {"type": "turn.failed", "error": {"message": "model declined"}},
+            result,
+        )
+        assert result.failed is True
+        assert s.state == SessionState.CONNECTED
+
+    @pytest.mark.asyncio
+    async def test_state_entered_at_surfaced_in_stats(self):
+        s = _plain_session()
+        before = s.stats["state_entered_at"]  # UNINITIALIZED, stamped at construction
+        await _to_connected(s)
+        after = s.stats["state_entered_at"]
+        assert after >= before
+        assert s.stats["state_entered_at"] == s._state_machine.state_entered_at
+        assert s.stats["state"] == "connected"

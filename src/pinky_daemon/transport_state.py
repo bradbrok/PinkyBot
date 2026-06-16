@@ -79,6 +79,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import sys
+import time
 from dataclasses import dataclass, field
 from enum import Enum
 
@@ -418,6 +419,14 @@ class StateMachine:
             )
         self._label = owner_label
         self._state = initial_state
+        # Wall-clock time the current state was entered. Stamped at GRANT time
+        # (when ``_state`` flips), not at completion — so a BOOTING/RECONNECTING
+        # transition's age starts the instant ownership is granted. The watchdog
+        # prefers this over its own sampled timing, which removes the up-to-one-
+        # sweep (~60s) blind window before the stuck-transition clock starts
+        # (#206; Murzik). Wall-clock (not monotonic) to match the watchdog's
+        # ``time.time()``-based ``now``.
+        self._state_entered_at = time.time()
         self._lock = asyncio.Lock()
         # At most one in-flight transition per state machine (singleton, not
         # keyed by target). Same-target requests subscribe; different-target
@@ -434,6 +443,24 @@ class StateMachine:
         enum reads); callers wanting consistency with a transition should use
         the ``TransitionResult`` returned from ``request_transition``."""
         return self._state
+
+    @property
+    def state_entered_at(self) -> float:
+        """Wall-clock time (epoch seconds) the current state was entered.
+
+        Updated whenever ``_state`` flips — at grant time in
+        ``request_transition`` and at completion in ``transition_complete``.
+        The watchdog reads this to age stuck BOOTING/RECONNECTING transitions
+        precisely instead of starting the clock on its own first observation
+        (#206)."""
+        return self._state_entered_at
+
+    def _enter_state(self, new_state: SessionState) -> None:
+        """Single choke point for state mutation: flip ``_state`` and stamp the
+        entry time together so ``state_entered_at`` is always consistent with
+        ``state``. All in-lock mutation paths go through here."""
+        self._state = new_state
+        self._state_entered_at = time.time()
 
     async def request_transition(
         self,
@@ -542,7 +569,7 @@ class StateMachine:
             # Case 4: caller drives the change. Mint owner token, mutate state,
             # register the in-flight transition.
             token = OwnerToken._new(target)
-            self._state = target
+            self._enter_state(target)
             self._in_flight = _InFlight(
                 from_state=from_state,
                 target=target,
@@ -620,7 +647,7 @@ class StateMachine:
                 # "BOOT_FAILED emergency" etc.
                 if final_state == SessionState.DEAD:
                     from_state = self._state
-                    self._state = SessionState.DEAD
+                    self._enter_state(SessionState.DEAD)
                     self._audit(
                         from_state, SessionState.DEAD, trigger,
                         "emergency_completed",
@@ -642,7 +669,7 @@ class StateMachine:
                             f"DEAD is always legal as emergency exit)"
                         )
                     from_state = self._state
-                    self._state = final_state
+                    self._enter_state(final_state)
                     self._audit(
                         from_state, final_state, trigger, "completed",
                         reason=f"in-flight {in_flight.from_state.value} → "

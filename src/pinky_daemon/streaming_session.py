@@ -1703,6 +1703,10 @@ class StreamingSession:
             # enum without waiting for PR4's reader migration. Stringified
             # for JSON compatibility.
             "state": state.value,
+            # Wall-clock epoch the current state was entered (grant time). Lets
+            # the watchdog age stuck transitions precisely instead of sampling
+            # (#206).
+            "state_entered_at": self._state_machine.state_entered_at,
             "pending_responses": len(self._pending_chats),
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,
