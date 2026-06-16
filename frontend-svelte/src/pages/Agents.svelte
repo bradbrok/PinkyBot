@@ -107,6 +107,13 @@
     let thinkingEffortDirty = false;
     let detailIsolationMode = 'local';   // 'local' | 'container' — detail Runtime tab editor state
     let detailContainerImage = '';       // OCI image ref shown/edited in the detail Runtime tab
+    let containerRuntime = { enabled: false, binary: null, default_image: null, ready: false, unavailable: true };
+    let containerRuntimeLoading = false;
+    let containerStatusMap = {};          // agent name -> latest /container-status payload
+    let containerStatusTimers = {};       // agent name -> poll interval id
+    let containerActionBusy = {};         // agent name -> true while POST is in flight
+    let containerAdvancedOpen = false;
+    let containerImageOverride = '';
     let globalProviders = [];
     let modelRegistry = [];
     $: anthropicModels = modelRegistry.filter(m => m.provider === 'anthropic');
@@ -257,6 +264,191 @@
             if (r.status === 'fulfilled') m[r.value.name] = r.value.pct;
         }
         contextMap = m;
+    }
+
+    function normalizeContainerRuntime(data = {}) {
+        return {
+            enabled: !!data.enabled,
+            binary: data.binary || null,
+            default_image: data.default_image || null,
+            ready: !!data.ready,
+            unavailable: false,
+        };
+    }
+
+    async function loadContainerRuntime() {
+        containerRuntimeLoading = true;
+        try {
+            const data = await api('GET', '/system/container-runtime');
+            containerRuntime = normalizeContainerRuntime(data);
+        } catch (e) {
+            containerRuntime = { enabled: false, binary: null, default_image: null, ready: false, unavailable: true };
+        } finally {
+            containerRuntimeLoading = false;
+        }
+    }
+
+    function containerStatusFor(agentName) {
+        return containerStatusMap[agentName] || null;
+    }
+
+    function setContainerStatus(agentName, status) {
+        containerStatusMap = { ...containerStatusMap, [agentName]: status };
+    }
+
+    function containerStatusActive(status) {
+        return ['queued', 'validating', 'pulling', 'creating', 'probing', 'applying', 'restarting'].includes(status?.status);
+    }
+
+    function containerStatusTone(status) {
+        const s = status?.status || '';
+        if (s === 'ready') return 'on';
+        if (s === 'error') return 'off';
+        if (containerStatusActive(status)) return 'busy';
+        return 'idle';
+    }
+
+    function containerStatusLabel(agent) {
+        const status = containerStatusFor(agent.name);
+        if (containerStatusActive(status)) return (status.status || 'working').toUpperCase();
+        if (status?.status === 'error') return 'ERROR';
+        return (agent.isolation_mode || 'local').toLowerCase() === 'container' ? 'CONTAINERIZED' : 'LOCAL';
+    }
+
+    function containerStatusStyle(agent) {
+        const tone = containerStatusTone(containerStatusFor(agent.name));
+        if (tone === 'on') return 'background:var(--tone-success-bg,#d1fae5);color:var(--tone-success-text,#065f46)';
+        if (tone === 'off') return 'background:var(--tone-error-bg,#fee2e2);color:var(--tone-error-text,#991b1b)';
+        if (tone === 'busy') return 'background:var(--tone-warning-bg,#fef3c7);color:var(--tone-warning-text,#92400e)';
+        return 'background:var(--surface-2);color:var(--text-muted)';
+    }
+
+    function containerRuntimeMessage() {
+        if (containerRuntimeLoading) return 'Checking container runtime...';
+        if (containerRuntime.unavailable) return 'Container runtime controls are unavailable on this daemon.';
+        if (!containerRuntime.enabled) return 'Container runtime is not enabled on this host.';
+        if (containerRuntime.binary !== 'podman') return `Container runtime ${containerRuntime.binary || 'unknown'} is not supported for one-click isolation.`;
+        if (!containerRuntime.ready) return 'Container runtime is enabled but not ready.';
+        return `Runtime ready${containerRuntime.default_image ? ` · default ${containerRuntime.default_image}` : ''}`;
+    }
+
+    function clearContainerStatusTimer(agentName) {
+        const timer = containerStatusTimers[agentName];
+        if (timer) clearInterval(timer);
+        const next = { ...containerStatusTimers };
+        delete next[agentName];
+        containerStatusTimers = next;
+    }
+
+    function stopAllContainerStatusTimers() {
+        for (const timer of Object.values(containerStatusTimers)) clearInterval(timer);
+        containerStatusTimers = {};
+    }
+
+    async function loadContainerStatus(agentName, { quiet = false } = {}) {
+        if (!agentName) return null;
+        try {
+            const status = await api('GET', `/agents/${agentName}/container-status`);
+            setContainerStatus(agentName, status);
+            if (!containerStatusActive(status)) clearContainerStatusTimer(agentName);
+            return status;
+        } catch (e) {
+            if (!quiet) toast('Failed to load container status: ' + (e?.message || e), 'error');
+            clearContainerStatusTimer(agentName);
+            return null;
+        }
+    }
+
+    function pollContainerStatus(agentName) {
+        if (!agentName || containerStatusTimers[agentName]) return;
+        const timer = setInterval(() => {
+            loadContainerStatus(agentName, { quiet: true }).then((status) => {
+                if (!status || !containerStatusActive(status)) {
+                    refreshAgents();
+                    if (agentName === currentAgent) loadStreamingSessions();
+                }
+            });
+        }, 2000);
+        containerStatusTimers = { ...containerStatusTimers, [agentName]: timer };
+    }
+
+    function containerOperationInFlight(agentName) {
+        return !!containerActionBusy[agentName] || containerStatusActive(containerStatusFor(agentName));
+    }
+
+    function containerizeDisabled(agent) {
+        if (containerOperationInFlight(agent.name)) return true;
+        if (!containerRuntime.ready) return true;
+        if ((agent.runtime || 'claude_sdk') !== 'claude_sdk') return true;
+        return !((containerImageOverride || '').trim() || containerRuntime.default_image);
+    }
+
+    function containerizeDisabledReason(agent) {
+        if (containerOperationInFlight(agent.name)) return 'Container operation already in progress.';
+        if (containerRuntime.unavailable) return 'Backend does not expose one-click container controls yet.';
+        if (!containerRuntime.enabled) return 'Set PINKY_CONTAINER_RUNTIME=podman on the daemon host.';
+        if (containerRuntime.binary !== 'podman') return 'One-click container isolation currently supports Podman only.';
+        if (!containerRuntime.ready) return 'Container runtime is not ready.';
+        if ((agent.runtime || 'claude_sdk') !== 'claude_sdk') return 'Container isolation is only available for claude_sdk agents.';
+        if (!((containerImageOverride || '').trim() || containerRuntime.default_image)) return 'Set a default image or enter an override image.';
+        return '';
+    }
+
+    function containerPayload({ force = false } = {}) {
+        const payload = { start: true, force };
+        const img = (containerImageOverride || '').trim();
+        if (img) payload.image = img;
+        return payload;
+    }
+
+    async function handleContainerActionError(agentName, e, retry) {
+        const msg = e?.message || String(e);
+        if (msg.startsWith('409:') && msg.toLowerCase().includes('busy') && confirm(`${msg}\n\nForce the transition and stop active sessions?`)) {
+            await retry(true);
+            return;
+        }
+        toast(msg, 'error');
+        loadContainerStatus(agentName, { quiet: true });
+    }
+
+    async function containerizeAgent(agentName, force = false) {
+        const agent = agentList.find(a => a.name === agentName) || {};
+        if (!force && containerizeDisabled(agent)) {
+            toast(containerizeDisabledReason(agent), 'error');
+            return;
+        }
+        containerActionBusy = { ...containerActionBusy, [agentName]: true };
+        try {
+            const result = await api('POST', `/agents/${agentName}/containerize`, containerPayload({ force }));
+            if (result?.status) setContainerStatus(agentName, result);
+            pollContainerStatus(agentName);
+            toast('Containerizing agent...');
+            refreshAgents();
+        } catch (e) {
+            await handleContainerActionError(agentName, e, (retryForce) => containerizeAgent(agentName, retryForce));
+        } finally {
+            const next = { ...containerActionBusy };
+            delete next[agentName];
+            containerActionBusy = next;
+        }
+    }
+
+    async function decontainerizeAgent(agentName, force = false) {
+        if (!force && !confirm(`Return ${agentName} to local execution? The container home volume will be kept.`)) return;
+        containerActionBusy = { ...containerActionBusy, [agentName]: true };
+        try {
+            const result = await api('POST', `/agents/${agentName}/decontainerize`, { start: true, force });
+            if (result?.status) setContainerStatus(agentName, result);
+            pollContainerStatus(agentName);
+            toast('Returning agent to local execution...');
+            refreshAgents();
+        } catch (e) {
+            await handleContainerActionError(agentName, e, (retryForce) => decontainerizeAgent(agentName, retryForce));
+        } finally {
+            const next = { ...containerActionBusy };
+            delete next[agentName];
+            containerActionBusy = next;
+        }
     }
 
     function normalizeStreamingSession(agentName, ss) {
@@ -425,39 +617,6 @@
         }
     }
 
-    /**
-     * Persist an agent's isolation settings ('local' | 'container').
-     * Saved immediately (same pattern as the transport toggle); like
-     * transport, the agent must be stopped and re-started to take effect.
-     * Container mode requires a container image ref, and the daemon rejects
-     * container + non-tmux spawns, so container mode also requires transport=tmux.
-     */
-    async function saveAgentIsolation(agentName, mode, image) {
-        if (mode === 'container') {
-            const agent = agentList.find(a => a.name === agentName);
-            if (((agent && agent.transport) || 'sdk').toLowerCase() !== 'tmux') {
-                toast('Container isolation requires the tmux transport. Switch transport to tmux first.', 'error');
-                detailIsolationMode = 'local'; // snap the select back; nothing was saved
-                return;
-            }
-        }
-        const img = (image || '').trim();
-        if (mode === 'container' && !img) {
-            toast('Container image is required for container isolation', 'error');
-            return;
-        }
-        try {
-            const payload = mode === 'container'
-                ? { isolation_mode: 'container', container_image: img }
-                : { isolation_mode: 'local' };
-            await api('PUT', `/agents/${agentName}`, payload);
-            toast(`Isolation → ${mode.toUpperCase()} (stop and restart agent to apply)`);
-            refreshAgents();
-        } catch (e) {
-            toast('Failed to update isolation: ' + (e?.message || e), 'error');
-        }
-    }
-
     function openChat(id) {
         // `?session=<id>` is read by Chat's onMount, which selects that exact
         // session after refreshSessions(). The old `/chat#<id>` form was ignored
@@ -584,6 +743,8 @@
             thinkingEffortDirty = false;
             detailIsolationMode = (agent.isolation_mode || 'local').toLowerCase();
             detailContainerImage = agent.container_image || '';
+            containerImageOverride = '';
+            containerAdvancedOpen = false;
             globalProviders = await api('GET', '/providers').catch(() => []);
             globalBotTokens = await api('GET', '/bot-tokens').catch(() => []);
             if (req !== openDetailSeq) return;
@@ -603,13 +764,22 @@
             loadMcpServers();
             loadTriggers(agent.name);
             loadGroupChats();
+            loadContainerStatus(agent.name, { quiet: true }).then((status) => {
+                if (status && containerStatusActive(status)) pollContainerStatus(agent.name);
+            });
         } catch (e) {
             if (req !== openDetailSeq) return;
             toast(`Failed to open ${name}: ${e.message}`, 'error');
         }
     }
 
-    function closeDetail() { openDetailSeq++; currentAgent = ''; detailOpen = false; }
+    function closeDetail() {
+        openDetailSeq++;
+        currentAgent = '';
+        detailOpen = false;
+        containerAdvancedOpen = false;
+        containerImageOverride = '';
+    }
 
     async function saveClaudeMd() {
         await api('PUT', `/agents/${currentAgent}/files/CLAUDE.md`, { content: claudeMdContent });
@@ -1216,8 +1386,17 @@
     async function loadModels() {
         try { modelRegistry = await api('GET', '/models'); } catch(e) { console.warn('Failed to load models:', e); }
     }
-    onMount(() => { refreshAgents(); loadModels(); refreshInterval = setInterval(refreshAgents, 15000); });
-    onDestroy(() => { clearInterval(refreshInterval); if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; } });
+    onMount(() => {
+        refreshAgents();
+        loadModels();
+        loadContainerRuntime();
+        refreshInterval = setInterval(refreshAgents, 15000);
+    });
+    onDestroy(() => {
+        clearInterval(refreshInterval);
+        stopAllContainerStatusTimers();
+        if (importProgressInterval) { clearInterval(importProgressInterval); importProgressInterval = null; }
+    });
 </script>
 
 <div class="content">
@@ -1296,6 +1475,7 @@
                             <div class="agent-tags">
                                 {#if a.name === mainAgent}<span class="badge" style="background:var(--tone-warning-bg);color:var(--tone-warning-text)">main</span>{/if}
                                 <span class="agent-model-tag">{a.model}</span>
+                                <span class="badge" style={containerStatusStyle(a)}>{containerStatusLabel(a)}</span>
                                 {#if !a.enabled}<span class="badge badge-off">disabled</span>{/if}
                                 {#each a.groups as g}<span class="badge badge-group">{g}</span>{/each}
                                 {#each aSessions.filter(s => s.sdk_session_id) as s}
@@ -2192,6 +2372,9 @@
             {@const detailTransport = (currentAgentData.transport || 'sdk').toLowerCase()}
             {@const detailRuntime = currentAgentData.runtime || 'claude_sdk'}
             {@const detailTransportDisabled = detailRuntime !== 'claude_sdk'}
+            {@const detailContainerStatus = containerStatusFor(currentAgent) || {}}
+            {@const detailContainerBusy = containerOperationInFlight(currentAgent)}
+            {@const detailIsContainer = (currentAgentData.isolation_mode || detailIsolationMode || 'local').toLowerCase() === 'container'}
             <!-- Transport -->
             <SectionHeader title="Transport" variant="detail" />
             <div class="token-item">
@@ -2210,24 +2393,65 @@
 
             <!-- Isolation -->
             <SectionHeader title="Isolation" variant="detail" style="margin-top:0.5rem" />
-            <div class="token-item">
-                <select class="form-select" bind:value={detailIsolationMode}
-                        title="Where the agent's Claude process runs"
-                        on:change={() => { if (detailIsolationMode === 'local' || detailContainerImage.trim()) saveAgentIsolation(currentAgent, detailIsolationMode, detailContainerImage); }}>
-                    <option value="local">LOCAL</option>
-                    <option value="container">CONTAINER</option>
-                </select>
-                {#if detailIsolationMode === 'container'}
-                    <input type="text" class="form-input" style="flex:1;min-width:180px"
-                           bind:value={detailContainerImage} placeholder="registry/image:tag"
-                           autocomplete="off" spellcheck="false"
-                           on:change={() => { if (detailContainerImage.trim()) saveAgentIsolation(currentAgent, 'container', detailContainerImage); }}>
-                {:else}
-                    <span style="flex:1"></span>
+            <div class="containerize-panel">
+                <div class="containerize-head">
+                    <div>
+                        <div class="containerize-title">{detailIsContainer ? 'Containerized' : 'Local execution'}</div>
+                        <div class="containerize-sub">
+                            {#if detailIsContainer}
+                                {currentAgentData.container_image || detailContainerImage || detailContainerStatus.image || 'container image not reported'}
+                            {:else}
+                                Runs on the daemon host.
+                            {/if}
+                        </div>
+                    </div>
+                    <span class="badge" style={containerStatusStyle(currentAgentData)}>{containerStatusLabel(currentAgentData)}</span>
+                </div>
+
+                {#if detailContainerStatus.message}
+                    <div class="containerize-message {detailContainerStatus.status === 'error' ? 'error' : ''}">
+                        {detailContainerStatus.message}
+                    </div>
                 {/if}
-                <span style="font-size:0.7rem;color:var(--gray-mid)">stop &amp; restart agent to apply</span>
+
+                <div class="containerize-runtime">
+                    <span>{containerRuntimeMessage()}</span>
+                    <button class="btn btn-sm" disabled={containerRuntimeLoading} on:click={loadContainerRuntime}>
+                        {containerRuntimeLoading ? 'Checking...' : 'Recheck'}
+                    </button>
+                </div>
+
+                {#if !detailIsContainer}
+                    <div class="containerize-actions">
+                        <button class="btn btn-primary"
+                                disabled={containerizeDisabled(currentAgentData)}
+                                title={containerizeDisabledReason(currentAgentData)}
+                                on:click={() => containerizeAgent(currentAgent)}>
+                            {#if detailContainerBusy}Working...{:else}<span class="material-symbols-outlined" aria-hidden="true" style="font-size:1rem;vertical-align:-3px;margin-right:0.25rem">deployed_code</span>Containerize{/if}
+                        </button>
+                        <button class="btn btn-sm" on:click={() => containerAdvancedOpen = !containerAdvancedOpen}>
+                            {containerAdvancedOpen ? 'Hide image' : 'Image override'}
+                        </button>
+                    </div>
+                    {#if containerAdvancedOpen}
+                        <input type="text" class="form-input containerize-image"
+                               bind:value={containerImageOverride}
+                               placeholder={containerRuntime.default_image || 'registry/image:tag'}
+                               autocomplete="off" spellcheck="false">
+                    {/if}
+                    {#if !containerRuntime.default_image && !containerImageOverride.trim()}
+                        <div class="containerize-message">No default image is configured. Enter an override image to enable one-click containerization.</div>
+                    {/if}
+                {:else}
+                    <div class="containerize-actions">
+                        <button class="btn btn-sm btn-danger"
+                                disabled={detailContainerBusy}
+                                on:click={() => decontainerizeAgent(currentAgent)}>
+                            {detailContainerBusy ? 'Working...' : 'Return to local'}
+                        </button>
+                    </div>
+                {/if}
             </div>
-            <div style="font-size:0.7rem;color:var(--gray-mid);margin:0.3rem 0 0.5rem">Container mode requires the container runtime enabled on the daemon host (PINKY_CONTAINER_RUNTIME); the image must provide tmux, claude, python3.</div>
 
             <!-- Live Sessions (formerly Streaming Sessions) -->
             <SectionHeader title={$_('agents.live_sessions')} variant="detail" style="margin-top:0.5rem">
@@ -2889,6 +3113,16 @@
 
     .token-item { display: flex; align-items: center; gap: 1rem; padding: 0.6rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
     .token-item:nth-child(even) { background: var(--surface-2); }
+    .containerize-panel { display: flex; flex-direction: column; gap: 0.65rem; padding: 0.8rem 1rem; background: var(--surface-1); border-radius: var(--radius-lg); }
+    .containerize-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 0.75rem; }
+    .containerize-title { font-family: var(--font-grotesk); font-size: 0.85rem; font-weight: 700; text-transform: uppercase; letter-spacing: 0.05em; }
+    .containerize-sub { margin-top: 0.15rem; font-size: 0.72rem; color: var(--text-muted); overflow-wrap: anywhere; }
+    .containerize-runtime { display: flex; align-items: center; gap: 0.6rem; flex-wrap: wrap; font-size: 0.72rem; color: var(--text-muted); }
+    .containerize-runtime span { flex: 1; min-width: 180px; }
+    .containerize-actions { display: flex; align-items: center; gap: 0.5rem; flex-wrap: wrap; }
+    .containerize-message { font-size: 0.72rem; color: var(--text-muted); background: var(--surface-2); border-radius: var(--radius); padding: 0.45rem 0.6rem; }
+    .containerize-message.error { background: var(--tone-error-bg,#fee2e2); color: var(--tone-error-text,#991b1b); }
+    .containerize-image { width: 100%; font-size: 0.78rem; }
 
     .wizard-overlay { position: fixed; inset: 0; background: var(--overlay-scrim); z-index: 999; display: flex; align-items: center; justify-content: center; }
     .wizard { background: var(--surface-1); color: var(--text-primary); border: none; border-radius: var(--radius-xl); max-width: 600px; width: 95%; max-height: 90vh; overflow-y: auto; }
