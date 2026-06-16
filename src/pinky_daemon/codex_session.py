@@ -947,7 +947,18 @@ class CodexSession:
             server_request_handler=self._on_appserver_request,
             log=_log,
         )
-        await self._app_client.initialize(name="pinkybot", version="1")
+        try:
+            await self._app_client.initialize(name="pinkybot", version="1")
+        except BaseException:
+            # Spawn succeeded but initialize() failed: never leave a
+            # half-initialized client/proc cached. The early-return guard above
+            # checks only (client is not None and proc still alive), so a
+            # cached-but-uninitialized substrate would make the NEXT reconnect
+            # skip initialization entirely and flip the state machine to
+            # CONNECTED on a dead app-server. Tear down before re-raising so
+            # the next _ensure_app_server() respawns from scratch.
+            await self._teardown_app_server()
+            raise
         _log(f"codex[{self.agent_name}]: app-server connected (pid={self._app_proc.pid})")
 
     async def _teardown_app_server(self) -> None:

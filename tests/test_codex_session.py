@@ -1523,6 +1523,83 @@ class TestCodexStateMachine:
         assert s.state == SessionState.CONNECTED
 
     @pytest.mark.asyncio
+    async def test_ensure_app_server_init_failure_is_atomic(self, monkeypatch):
+        # P1 (#206 P2 review, Murzik): a spawn that succeeds but whose
+        # initialize() raises must NOT leave a half-initialized client/proc
+        # cached. The early-return guard in _ensure_app_server() checks only
+        # (client is not None and proc alive), so a cached-but-uninitialized
+        # substrate would make the next reconnect skip initialization and flip
+        # CONNECTED on a dead app-server.
+        s = _appserver_session()
+
+        class _FakeProc:
+            def __init__(self):
+                self.returncode = None  # "alive" — would satisfy the guard
+                self.pid = 4242
+                self.killed = False
+
+            def kill(self):
+                self.killed = True
+                self.returncode = -9
+
+            async def wait(self):
+                return self.returncode
+
+        class _InitBoomClient:
+            def __init__(self):
+                self.closed = False
+
+            async def initialize(self, **kw):
+                raise RuntimeError("initialize boom")
+
+            async def close(self):
+                self.closed = True
+
+        boom_procs: list = []
+        boom_clients: list = []
+
+        async def fake_spawn_boom(**kw):
+            proc, client = _FakeProc(), _InitBoomClient()
+            boom_procs.append(proc)
+            boom_clients.append(client)
+            return client, proc
+
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.spawn_app_server", fake_spawn_boom
+        )
+
+        with pytest.raises(RuntimeError, match="initialize boom"):
+            await s._ensure_app_server()
+
+        # Half-initialized substrate must be torn down, not cached.
+        assert s._app_client is None
+        assert s._app_proc is None
+        assert boom_clients[0].closed is True, "client not closed on init failure"
+        assert boom_procs[0].killed is True, "proc not killed on init failure"
+
+        # A later attempt must respawn AND re-run initialize — the guard must
+        # not short-circuit on the cleared (None) fields.
+        init_calls: list = []
+
+        class _OkClient:
+            async def initialize(self, **kw):
+                init_calls.append(True)
+
+            async def close(self):
+                pass
+
+        async def fake_spawn_ok(**kw):
+            return _OkClient(), _FakeProc()
+
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.spawn_app_server", fake_spawn_ok
+        )
+        await s._ensure_app_server()
+        assert init_calls == [True], "initialization was skipped on reconnect"
+        assert s._app_client is not None
+        assert s._app_proc is not None
+
+    @pytest.mark.asyncio
     async def test_warm_reconnect_exposes_reconnecting_then_connected(self):
         s = _appserver_session()
         await _to_dead(s)
