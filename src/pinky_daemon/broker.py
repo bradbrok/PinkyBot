@@ -20,6 +20,8 @@ import urllib.request
 from dataclasses import dataclass, field
 
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.auth_relay import coordinator as _auth_relay
+from pinky_daemon.auth_relay import extract_auth_code
 from pinky_daemon.transport_state import SessionState
 
 # Bounded wait for an in-flight reconnect/restart to complete before we drop an
@@ -193,6 +195,18 @@ class MessageBroker:
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
         self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "deduped": 0}
+
+        # Auth-relay (#205): wire the tmux login-relay coordinator to this
+        # broker's outbound sender + owner resolver. Harmless when the
+        # PINKY_TMUX_AUTH_RELAY flag is off (the coordinator is only ever
+        # called from the flag-gated tmux watcher / inbound intercept).
+        try:
+            if self._send_callback is not None:
+                _auth_relay.configure(
+                    self._send_callback, self._registry.get_primary_user
+                )
+        except Exception:
+            pass
 
         # Outbound dedupe — suppress accidental duplicate sends. The usual
         # trigger (issue #113): a slow platform leg makes the messaging tool
@@ -743,6 +757,60 @@ class MessageBroker:
             )
         return True
 
+    async def _handle_auth_code_reply(self, message: BrokerMessage) -> bool:
+        """Consume an owner reply carrying a tmux login code (#205).
+
+        Returns True (short-circuiting normal routing) only when this agent has
+        a pending login relay AND the owner *quote-replies* to our specific
+        relay message. Two load-bearing gates, both default-deny:
+          - Owner-only: a third-party code would sign the agent into the
+            *attacker's* Claude account.
+          - Quote-reply correlation: a bare owner message is never consumed as
+            the code even if it looks code-shaped, so a token-like string the
+            owner happens to send mid-login can't be injected into the sign-in.
+        The code itself is never logged.
+        """
+        agent_name = message.agent_name
+        if not _auth_relay.has_pending(agent_name):
+            return False
+
+        # Owner-only gate (mirrors the approval-command intercepts).
+        primary = self._registry.get_primary_user()
+        sender_id = message.sender_id or message.chat_id
+        if not primary.get("chat_id") or sender_id != primary["chat_id"]:
+            return False
+
+        # Strict quote-reply correlation. The code is accepted ONLY when the
+        # owner quote-replies to our exact relay message — a deliberate act that
+        # binds the code to this login. A message with no reply, a reply to some
+        # other message, or a relay we never tracked (empty relay_mid) is not a
+        # reply to us → route normally, never consume it as the code.
+        relay_mid = _auth_relay.pending_relay_mid(agent_name)
+        if not relay_mid or message.reply_to != relay_mid:
+            return False
+
+        code = extract_auth_code(message.content)
+        if not code:
+            if self._send_callback:
+                await self._send_callback(
+                    agent_name,
+                    message.platform,
+                    message.chat_id,
+                    "That didn't look like a sign-in code — reply with just the "
+                    "code the link gave you.",
+                )
+            return True
+
+        _auth_relay.submit(agent_name, code)
+        if self._send_callback:
+            await self._send_callback(
+                agent_name,
+                message.platform,
+                message.chat_id,
+                f'Got it — signing "{agent_name}" in.',
+            )
+        return True
+
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
         agent_name = message.agent_name
@@ -763,6 +831,13 @@ class MessageBroker:
         # 0c. Intercept /approve_<id> and /deny_<id> from owner (user approval)
         if text_lower.startswith("/approve_") or text_lower.startswith("/deny_"):
             handled = await self._handle_approval_command(message)
+            if handled:
+                return
+
+        # 0d. Intercept an owner reply carrying a tmux login code (#205).
+        # Flag-gated; only fires when this agent is awaiting a sign-in code.
+        if _auth_relay.enabled(self._registry.get_setting):
+            handled = await self._handle_auth_code_reply(message)
             if handled:
                 return
 
