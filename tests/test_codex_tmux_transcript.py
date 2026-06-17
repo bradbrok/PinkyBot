@@ -39,7 +39,6 @@ from pinky_daemon.codex_tmux_transcript import (
 )
 from pinky_daemon.turn_response import TurnResponse
 
-
 # ──────────────────────────────────────────────────────────────────────────
 # JSONL builder helpers — format-accurate, content-clean
 # ──────────────────────────────────────────────────────────────────────────
@@ -845,6 +844,12 @@ class TestDiscoverCodexRollout:
     that matches one of them.
     """
 
+    @pytest.fixture(autouse=True)
+    def _clear_codex_home(self, monkeypatch):
+        # Discovery now honors CODEX_HOME; clear it so these tests
+        # deterministically exercise the ~/.codex (Path.home) fallback.
+        monkeypatch.delenv("CODEX_HOME", raising=False)
+
     def _fake_rollout(
         self, parent: Path, name: str, cwd: str, *, mtime_offset: float = 0,
     ) -> Path:
@@ -940,3 +945,23 @@ class TestDiscoverCodexRollout:
         )
         result = _discover_codex_rollout(target_cwd)
         assert result == good
+
+    def test_honors_codex_home_env(self, tmp_path, monkeypatch):
+        """CODEX_HOME points discovery at the right session store; Path.home is NOT used."""
+        codex_home = tmp_path / "custom-codex"
+        sessions = codex_home / "sessions" / "2026" / "06" / "17"
+        sessions.mkdir(parents=True)
+        target_cwd = str(tmp_path / "agent")
+        os.makedirs(target_cwd, exist_ok=True)
+        match = self._fake_rollout(sessions, "rollout-x.jsonl", target_cwd)
+
+        monkeypatch.setenv("CODEX_HOME", str(codex_home))
+        # Point Path.home at an EMPTY dir to prove it is never consulted.
+        empty_home = tmp_path / "wrong-home"
+        empty_home.mkdir()
+        monkeypatch.setattr(
+            "pinky_daemon.codex_tmux_transcript.Path.home",
+            lambda: empty_home,
+        )
+        result = _discover_codex_rollout(target_cwd)
+        assert result == match

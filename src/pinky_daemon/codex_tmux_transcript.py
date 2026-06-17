@@ -43,7 +43,6 @@ uses for ``TmuxTranscriptTailer``.
 from __future__ import annotations
 
 import asyncio
-import glob
 import json
 import os
 import sys
@@ -221,7 +220,12 @@ def _discover_codex_rollout(working_dir: str | Path) -> Path | None:
     """
     target_cwd = os.path.realpath(str(working_dir))
 
-    sessions_root = Path.home() / ".codex" / "sessions"
+    # Honor CODEX_HOME (the fleet sets it; #792 hardened its propagation to
+    # codex under tmux) — else fall back to ~/.codex. Discovery MUST scan the
+    # same session store the codex process actually writes to, or an agent
+    # launched with a fleet CODEX_HOME would never bind its transcript.
+    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    sessions_root = codex_home / "sessions"
     if not sessions_root.exists():
         return None
 
