@@ -659,6 +659,45 @@ def _isolation_path_target(path: str) -> str | None:
     return None
 
 
+def _container_isolation_block_reason(
+    *, transport: str, runtime: str, agent_name: str
+) -> tuple[int, str] | None:
+    """Preconditions for ``isolation_mode='container'`` (pure → unit-testable).
+
+    Container isolation runs the session INSIDE the container via ``tmux exec``;
+    the SDK/Codex backends don't go through the CommandRunner seam, so a
+    container agent must use ``transport='tmux'`` (else the session silently runs
+    on the host, unisolated). That's a 400 config error.
+
+    The ``codex_cli`` runtime additionally has NO container support yet: the
+    inherited tmux container spawn path seeds Claude-specific state
+    (``.credentials.json``, ``CLAUDE_CONFIG_DIR``, claude trust hooks), and
+    codex's own container auth / ``CODEX_HOME`` bootstrap is explicitly deferred
+    to #215 PR3. Running codex inside a Claude-bootstrapped container would boot
+    it under the wrong auth/config, so fail closed with a 501 until PR3 lands the
+    real bootstrap (Murzik #795 P1). One-click containerize already rejects
+    non-``claude_sdk``, but direct agent updates / imported rows can still create
+    the combo — this guard catches every (re)spawn path.
+
+    Returns ``(http_status, detail)`` to block, or ``None`` to allow.
+    """
+    if transport != "tmux":
+        return (
+            400,
+            f"isolation_mode 'container' for agent '{agent_name}' requires "
+            f"transport='tmux' (got '{transport}')",
+        )
+    if runtime == "codex_cli":
+        return (
+            501,
+            f"isolation_mode 'container' is not supported for the codex_cli "
+            f"runtime yet (agent '{agent_name}'): codex container auth/CODEX_HOME "
+            f"bootstrap is deferred to #215 PR3. Use isolation_mode='local' or "
+            f"runtime='claude_sdk'.",
+        )
+    return None
+
+
 def _redact_env_secrets(env: dict) -> dict:
     """Mask values of sensitive env vars before returning an env dict via API."""
     if not isinstance(env, dict):
@@ -2739,18 +2778,21 @@ def create_api(
         if not agent:
             return None
         mode = (getattr(agent, "isolation_mode", "") or "local").strip() or "local"
-        # Container isolation runs the session INSIDE the container via tmux
-        # exec; the SDK/Codex backends don't go through the CommandRunner seam,
-        # so a container agent must use transport="tmux". Surface this as a clear
-        # config error rather than letting it fail obscurely at spawn.
+        # Container preconditions (transport=tmux required; codex_cli deferred to
+        # #215 PR3). Surface as a clear config error rather than failing obscurely
+        # at spawn. See _container_isolation_block_reason for the rationale.
         if mode == "container":
             transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
-            if transport != "tmux":
-                return (
-                    400,
-                    f"isolation_mode 'container' for agent '{agent_name}' requires "
-                    f"transport='tmux' (got '{transport}')",
-                )
+            # Resolve runtime with the same legacy provider_url fallback as
+            # _start_streaming_session (rows pre-dating the runtime column).
+            runtime = (getattr(agent, "runtime", "") or "").strip()
+            if not runtime and (getattr(agent, "provider_url", "") or "").strip() == "codex_cli":
+                runtime = "codex_cli"
+            blocked = _container_isolation_block_reason(
+                transport=transport, runtime=runtime or "claude_sdk", agent_name=agent_name
+            )
+            if blocked:
+                return blocked
         try:
             from pinky_daemon.provisioning import get_provisioner
             get_provisioner(mode)
@@ -2866,7 +2908,10 @@ def create_api(
         # All four runtime×transport combos are now valid — (claude_sdk, sdk),
         # (claude_sdk, tmux), (codex_cli, sdk), (codex_cli, tmux). The codex tmux
         # transport (#215) is the last to land; runtime/transport were each range-
-        # checked above, so no combo needs an extra reject here.
+        # checked above, so no combo needs an extra reject here. The orthogonal
+        # isolation_mode='container' dimension is NOT free for all combos: the
+        # cold-start guard below rejects codex_cli+container (deferred to #215
+        # PR3) and container+non-tmux (see _container_isolation_block_reason).
 
         # #149 phase-3 cold-start guard (see _enforce_isolation_runnable).
         _enforce_isolation_runnable(agent_name)

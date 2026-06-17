@@ -18,13 +18,16 @@ Overridden seams:
   * ``_build_session_name``      → ``pinky-codex-<agent>`` (distinct namespace)
   * ``_build_claude_cmd``        → the in-pane ``codex`` invocation (kept name;
                                    it's TmuxSession's spawn hook)
-  * ``_build_repl_env``          → OPENAI_API_KEY / CODEX_HOME / PATH (no ANTHROPIC_*)
+  * ``_build_repl_env``          → full daemon-env parity (Murzik #795 P1; mirrors
+                                   the subprocess + app-server codex transports)
   * ``_project_dir`` / ``_has_prior_transcript`` / ``_discover_transcript_path``
                                  → codex rollout store (``~/.codex/sessions``)
   * ``_start_tailer``            → ``CodexTmuxTranscriptTailer``
   * ``_spawn_tmux_repl``         → wrap super() with codex trust pre-seed +
                                    first-run NUX dismissal + readiness gate
   * ``_watch_for_oauth_url``     → no-op (claude OAuth wall N/A for codex)
+  * ``handle_stop_failure``      → no-op (codex turn-end = rollout tailer, not a
+                                   ``.claude`` StopFailure hook; Murzik #795 P2)
   * paste settle                 → ``_CodexTmuxControl`` (4000ms, codex composer
                                    renders slower than claude's 300ms)
 
@@ -168,25 +171,49 @@ class CodexTmuxSession(TmuxSession):
         )
         return cmd
 
+    # tmux-internal vars that must not leak into the nested REPL's children
+    # (mirrors ``CodexAppServerSupervisor._ENV_DROP``).
+    _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})
+
     # ── seam: env ───────────────────────────────────────────────────────────
     def _build_repl_env(self) -> dict[str, str]:
-        """Env injected into the tmux session. Tmux ``new-session`` drops parent
-        env (except a tiny allowlist), so codex's auth + the rollout store +
-        PATH must be passed explicitly. NO ANTHROPIC_* (codex uses OpenAI auth /
-        ~/.codex/auth.json)."""
+        """Full daemon-env parity for the codex tmux pane — NOT a small allowlist.
+
+        tmux ``new-session`` drops the parent process env entirely; only the
+        ``-e KEY=VAL`` pairs we pass survive into the pane (and its codex child).
+        Both other codex transports launch codex with the daemon's FULL env:
+        ``CodexSession._exec_codex`` uses ``env={**os.environ}`` (+ the configured
+        key), and #792's tmux app-server (``CodexAppServerSupervisor._build_env``)
+        does the same after CODEX_HOME / proxy / XDG / cert divergence proved a
+        real footgun. A 4-key allowlist silently boots codex under different auth
+        / network / session config: it drops ``HOME`` / ``XDG_*``, the proxy +
+        TLS bundle (``HTTPS_PROXY`` / ``SSL_CERT_FILE`` / ``NODE_EXTRA_CA_CERTS``),
+        ``OPENAI_BASE_URL`` / ``OPENAI_ORG`` / other ``OPENAI_*`` + ``CODEX_*``
+        knobs, and any future auth/config env (Murzik #795 P1; same class as the
+        #792 app-server env-parity fix).
+
+        So we propagate the entire daemon env — including ``CODEX_HOME`` (item G:
+        the child writes, and discovery scans, the SAME rollout store) and
+        ``PATH`` (so the ``codex`` / ``node`` binaries resolve) — minus
+        tmux-internal vars and any value tmux ``-e`` can't carry (newlines, which
+        are pathological for env anyway), then overlay the configured
+        ``OPENAI_API_KEY`` (item H) and this agent's ``PINKY_AGENT_NAME``. No
+        ANTHROPIC_* special-casing is needed: codex ignores them, exactly as the
+        subprocess transport already inherits them harmlessly.
+        """
         env: dict[str, str] = {}
+        for key, value in os.environ.items():
+            if key in self._ENV_DROP:
+                continue
+            if "\n" in value or "\r" in value:
+                _log(
+                    f"tmux[{self.agent_name}]: dropping multiline env {key!r} "
+                    f"(cannot pass via tmux -e)"
+                )
+                continue
+            env[key] = value
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
-        # #792: honor the fleet's CODEX_HOME so the child writes — and discovery
-        # scans — the SAME rollout store. Without it an agent launched under a
-        # custom CODEX_HOME would never bind its transcript.
-        codex_home = os.environ.get("CODEX_HOME", "").strip()
-        if codex_home:
-            env["CODEX_HOME"] = codex_home
-        # PATH so the `codex`/`node` binaries resolve under tmux.
-        path = os.environ.get("PATH", "")
-        if path:
-            env["PATH"] = path
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
         return env
@@ -246,6 +273,31 @@ class CodexTmuxSession(TmuxSession):
         codex; overriding prevents the inherited watcher from scanning the codex
         pane for a wall that never appears."""
         return
+
+    async def handle_stop_failure(
+        self, error_type: str, message: str = "", session_id: str = ""
+    ) -> bool:
+        """No-op for codex (Murzik #795 P2 hardening).
+
+        The inherited ``handle_stop_failure`` synthesizes a failed
+        ``TurnResponse`` and pops the in-flight turn off ``_inflight_metas``. That
+        is correct for Claude Code, whose ``.claude`` StopFailure hook (#584/#108)
+        POSTs ``/transport/stop-failure`` as the authoritative turn-end marker for
+        terminal API-error turns. Codex does NOT close turns that way — a codex
+        turn ends via the rollout's ``task_complete`` / ``turn_aborted`` (owned by
+        ``CodexTmuxTranscriptTailer``), and codex doesn't run ``.claude`` hooks. A
+        StopFailure POST landing on a codex-tmux agent (stale/misrouted wire)
+        would therefore falsely pop a codex turn that may still be completing
+        normally. Fail safe: ignore it and let the tailer own turn-end. Returns
+        ``False`` — the inherited "nothing was resolved" signal — so the
+        ``/transport/stop-failure`` endpoint's response shape is unchanged. A real
+        codex failure hook can replace this in a later PR."""
+        if self._inflight_metas:
+            _log(
+                f"tmux[{self.agent_name}]: ignoring StopFailure ({error_type!r}) "
+                f"for codex session — codex turn-end is owned by the rollout tailer"
+            )
+        return False
 
     def _seed_codex_trust(self, cwd: str) -> None:
         """Idempotently mark ``cwd`` trusted in ``config.toml`` so codex's

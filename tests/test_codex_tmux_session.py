@@ -123,17 +123,39 @@ def test_build_cmd_injects_mcp(monkeypatch):
 
 # ── env ─────────────────────────────────────────────────────────────────────
 def test_build_repl_env_codex(monkeypatch):
+    # #795 P1: full daemon-env PARITY (mirrors the subprocess + #792 app-server
+    # codex transports), NOT a 4-key allowlist. tmux `new-session -e` is the only
+    # env the pane receives, so everything codex can depend on must be carried.
     monkeypatch.setenv("CODEX_HOME", "/tmp/fleet-codex")
     monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    # Sentinels codex can depend on (auth / network / TLS / config dirs).
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy.local:3128")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://oai.internal/v1")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/tmp/xdg")
+    monkeypatch.setenv("NODE_EXTRA_CA_CERTS", "/etc/ssl/corp.pem")
+    # tmux-internal vars must be dropped (they'd corrupt a nested session).
+    monkeypatch.setenv("TMUX", "/tmp/tmux-1000/default,1234,0")
+    monkeypatch.setenv("TMUX_PANE", "%7")
+    # multiline values can't be passed via tmux -e and must be dropped.
+    monkeypatch.setenv("BROKEN_MULTILINE", "line1\nline2")
+
     ss = _session(provider_key="sk-abc")
     env = ss._build_repl_env()
+
+    # configured key + agent identity overlaid
     assert env["OPENAI_API_KEY"] == "sk-abc"
+    assert env["PINKY_AGENT_NAME"] == "murzik"
+    # daemon config carried through (parity)
     assert env["CODEX_HOME"] == "/tmp/fleet-codex"
     assert env["PATH"] == "/usr/bin:/bin"
-    assert env["PINKY_AGENT_NAME"] == "murzik"
-    # codex uses OpenAI auth — never the anthropic vars.
-    assert "ANTHROPIC_API_KEY" not in env
-    assert "ANTHROPIC_BASE_URL" not in env
+    assert env["HTTPS_PROXY"] == "http://proxy.local:3128"
+    assert env["OPENAI_BASE_URL"] == "https://oai.internal/v1"
+    assert env["XDG_CONFIG_HOME"] == "/tmp/xdg"
+    assert env["NODE_EXTRA_CA_CERTS"] == "/etc/ssl/corp.pem"
+    # tmux-internal + multiline dropped
+    assert "TMUX" not in env
+    assert "TMUX_PANE" not in env
+    assert "BROKEN_MULTILINE" not in env
 
 
 def test_build_repl_env_falls_back_to_openai_env(monkeypatch):
@@ -284,6 +306,69 @@ async def test_oauth_watcher_is_noop():
     # Must return immediately without touching the pane.
     await ss._watch_for_oauth_url()
     ss._tmux.capture_pane.assert_not_called()
+
+
+# ── StopFailure hook is a no-op for codex (#795 P2) ─────────────────────────
+@pytest.mark.asyncio
+async def test_handle_stop_failure_is_noop_for_codex():
+    # Codex turn-end is owned by the rollout tailer (task_complete/turn_aborted),
+    # NOT the .claude StopFailure hook. A misrouted StopFailure POST must NOT pop
+    # a live codex turn (the inherited claude impl would synthesize + pop it).
+    ss = _session()
+    sentinel = object()
+    ss._inflight_metas.append(sentinel)
+    before = len(ss._inflight_metas)
+
+    result = await ss.handle_stop_failure("api_error", message="boom", session_id="sid")
+
+    assert result is False
+    assert len(ss._inflight_metas) == before  # in-flight codex turn left intact
+    assert ss._inflight_metas[-1] is sentinel
+
+
+# ── container isolation guard: codex_cli + container blocked (#795 P1) ──────
+def test_container_isolation_blocks_codex_cli():
+    from pinky_daemon.api import _container_isolation_block_reason
+
+    blocked = _container_isolation_block_reason(
+        transport="tmux", runtime="codex_cli", agent_name="ctr"
+    )
+    assert blocked is not None
+    status, detail = blocked
+    assert status == 501  # not-implemented-yet (deferred to PR3)
+    assert "codex_cli" in detail and "PR3" in detail
+
+
+def test_container_isolation_allows_claude_tmux():
+    from pinky_daemon.api import _container_isolation_block_reason
+
+    # The existing supported combo must keep working.
+    assert _container_isolation_block_reason(
+        transport="tmux", runtime="claude_sdk", agent_name="ctr"
+    ) is None
+
+
+def test_container_isolation_requires_tmux_transport():
+    from pinky_daemon.api import _container_isolation_block_reason
+
+    blocked = _container_isolation_block_reason(
+        transport="sdk", runtime="claude_sdk", agent_name="ctr"
+    )
+    assert blocked is not None
+    status, detail = blocked
+    assert status == 400
+    assert "transport='tmux'" in detail
+
+
+def test_container_isolation_transport_checked_before_runtime():
+    # codex_cli + non-tmux + container hits the transport wall first (400), not
+    # the codex 501 — both are blocks; this just pins the ordering.
+    from pinky_daemon.api import _container_isolation_block_reason
+
+    status, _ = _container_isolation_block_reason(
+        transport="sdk", runtime="codex_cli", agent_name="ctr"
+    )
+    assert status == 400
 
 
 # ── gated integration smoke (the make-or-break; opt-in) ─────────────────────
