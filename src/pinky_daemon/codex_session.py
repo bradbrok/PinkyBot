@@ -28,6 +28,7 @@ from pinky_daemon.codex_app_server import (
     CodexAppServerError,
     spawn_app_server,
 )
+from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import MODEL_CONTEXT_SIZES, SessionUsage
 from pinky_daemon.streaming_session import (
@@ -170,6 +171,22 @@ class CodexSession:
         # app-server process + one thread per session here (chunk 2); a shared
         # supervisor lands in chunk 3.
         self._use_app_server = os.environ.get("PINKY_CODEX_APP_SERVER") == "1"
+        # #791: when additionally PINKY_CODEX_TMUX_APP_SERVER=1, front the
+        # app-server with a tmux-hosted UDS shim (Design A) instead of a daemon
+        # child subprocess. Same JSON-RPC client + initialize/thread-resume flow
+        # downstream; only how the process is spawned and torn down differs.
+        # Default-off, side-by-side with the direct-subprocess path.
+        self._use_tmux_app_server = (
+            self._use_app_server and os.environ.get("PINKY_CODEX_TMUX_APP_SERVER") == "1"
+        )
+        self._app_supervisor: CodexAppServerSupervisor | None = None
+        if self._use_tmux_app_server:
+            self._app_supervisor = CodexAppServerSupervisor(
+                self.agent_name,
+                working_dir=self._working_dir,
+                openai_api_key=self._openai_api_key,
+                log=_log,
+            )
         self._app_client: CodexAppServerClient | None = None
         self._app_proc: asyncio.subprocess.Process | None = None
         # Active turn correlation: the read loop dispatches notifications onto
@@ -936,17 +953,29 @@ class CodexSession:
             # Process died under us — drop the stale client and respawn.
             await self._teardown_app_server()
 
-        env = {**os.environ}
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
+        if self._use_tmux_app_server:
+            # #791 Design A: the supervisor spawns the shim under tmux and hands
+            # back an UN-initialized client (accept-readiness only — no probe
+            # initialize, which would burn the child's single-use one). The
+            # single initialize below stays the real end-to-end gate, and its
+            # half-initialized guard covers a dead tmux child (item F).
+            assert self._app_supervisor is not None
+            self._app_client, self._app_proc = await self._app_supervisor.start(
+                notification_handler=self._on_appserver_notification,
+                server_request_handler=self._on_appserver_request,
+            )
+        else:
+            env = {**os.environ}
+            if self._openai_api_key:
+                env["OPENAI_API_KEY"] = self._openai_api_key
 
-        self._app_client, self._app_proc = await spawn_app_server(
-            cwd=self._working_dir,
-            env=env,
-            notification_handler=self._on_appserver_notification,
-            server_request_handler=self._on_appserver_request,
-            log=_log,
-        )
+            self._app_client, self._app_proc = await spawn_app_server(
+                cwd=self._working_dir,
+                env=env,
+                notification_handler=self._on_appserver_notification,
+                server_request_handler=self._on_appserver_request,
+                log=_log,
+            )
         try:
             await self._app_client.initialize(name="pinkybot", version="1")
         except BaseException:
@@ -1854,8 +1883,17 @@ class CodexSession:
     @property
     def stats(self) -> dict:
         state = self.state
+        app_server: dict = {}
+        if self._use_app_server:
+            app_server["app_server_mode"] = "tmux" if self._use_tmux_app_server else "subprocess"
+            if self._app_proc is not None:
+                app_server["child_pid"] = self._app_proc.pid
+            if self._app_supervisor is not None:
+                app_server["tmux_session"] = self._app_supervisor.session_name
+                app_server["sock_path"] = self._app_supervisor.sock_path
         return {
             **self._stats,
+            **app_server,
             "connected": state == SessionState.CONNECTED,
             "state": state.value,
             # Wall-clock epoch the current state was entered (grant time) — lets
