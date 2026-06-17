@@ -1384,21 +1384,48 @@ class TestAPI:
                 assert session._config.model == "sonnet"
                 assert session.resume_handle == "pinky-tmux-agent"
 
-    def test_wake_rejects_tmux_transport_for_codex_runtime(self):
-        with tempfile.TemporaryDirectory() as tmpdir:
+    def test_wake_uses_codex_tmux_session_for_codex_tmux_transport(self):
+        # #215 PR2: codex_cli + transport=tmux is now a VALID combo (it was
+        # rejected before this PR). It must build a CodexTmuxSession, not error.
+        async def fake_connect(self):
+            from pinky_daemon.transport_state import SessionState
+            self._state_machine._state = SessionState.CONNECTED
+            if self._on_resume_handle:
+                await self._on_resume_handle(self.agent_name, self.resume_handle)
+
+        async def fake_send(
+            self,
+            prompt: str,
+            *,
+            platform: str = "",
+            chat_id: str = "",
+            message_id: str = "",
+            agent_hint: str = "",
+        ):
+            del prompt, platform, chat_id, message_id, agent_hint
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.tmux_session.TmuxSession.connect", new=fake_connect), \
+                patch("pinky_daemon.tmux_session.TmuxSession.send", new=fake_send):
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
                 client.post("/agents", json={
-                    "name": "bad-agent",
+                    "name": "codextmux-agent",
                     "model": "gpt-5-codex",
                     "runtime": "codex_cli",
                     "transport": "tmux",
                 })
 
-                resp = client.post("/agents/bad-agent/wake?prompt=Wake")
-                assert resp.status_code == 400
-                assert "only valid for claude_sdk runtime" in resp.text
+                resp = client.post("/agents/codextmux-agent/wake?prompt=Wake")
+                assert resp.status_code == 200
+
+                session = app.state.broker._streaming["codextmux-agent"]["main"]
+                assert session.__class__.__name__ == "CodexTmuxSession"
+                assert session._config.provider_url == "codex_cli"
+                assert session._config.model == "gpt-5-codex"
+                # codex namespace — distinct from claude's pinky-<agent>
+                assert session.resume_handle == "pinky-codex-codextmux-agent"
 
     def test_wake_rejects_opencode_runtime_until_session_exists(self):
         with tempfile.TemporaryDirectory() as tmpdir:
