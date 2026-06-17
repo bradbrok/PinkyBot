@@ -11,9 +11,10 @@ from the daemon process.
 What this supervisor owns:
 
   * spawn the shim in a detached tmux session ``pinky-codex-as-<agent>``,
-    passing PATH + OPENAI_API_KEY via tmux ``-e`` (tmux drops parent env, so
-    these must be injected explicitly — and OPENAI_API_KEY must reach the
-    grandchild ``codex`` the shim spawns, not just the shim)
+    passing the full daemon env via tmux ``-e`` (tmux drops parent env, so it
+    must be injected explicitly — parity with the subprocess path's
+    ``{**os.environ}`` so CODEX_HOME/HOME/XDG/proxy/cert all reach the
+    grandchild ``codex`` the shim spawns, not just the shim; see _build_env)
   * idempotent pre-start cleanup: kill a stale tmux session + unlink a stale
     socket so a crashed predecessor can't wedge bind()
   * readiness = socket ACCEPT only. We open the one allowed connection and
