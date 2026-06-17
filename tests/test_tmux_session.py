@@ -4837,10 +4837,13 @@ async def test_cost_callback_failure_is_swallowed() -> None:
 
 
 @pytest.mark.asyncio
-async def test_emits_context_usage_event_with_sdk_shape() -> None:
+async def test_emits_context_usage_event_with_sdk_shape(monkeypatch) -> None:
     """``context_usage`` SSE event must carry the SDK-compatible fields
     so Chat.svelte's session-info card renders for tmux agents the same
     way it does for SDK ones (totalTokens / maxTokens / categories)."""
+    # Clear any ambient CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (e.g. set by Claude Code)
+    # so the test exercises the default 33K-buffer path it was written for.
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
     events: list[dict] = []
 
     async def stream_cb(evt):
