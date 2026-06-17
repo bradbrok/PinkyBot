@@ -130,6 +130,52 @@ async def test_start_spawns_shim_and_initialize_round_trips(workdir):
 
 
 @pytest.mark.asyncio
+async def test_full_daemon_env_propagated_to_session(workdir, monkeypatch):
+    """#792 P1 (Murzik): tmux drops parent env, so the supervisor must carry the
+    daemon's full Codex config — not just PATH — or a fresh child runs under a
+    different CODEX_HOME/session store and breaks auth + item G resume."""
+    monkeypatch.setenv("CODEX_HOME", "/fleet/codex")
+    monkeypatch.setenv("HOME", "/fleet/home")
+    monkeypatch.setenv("XDG_CONFIG_HOME", "/fleet/xdg")
+    monkeypatch.setenv("HTTPS_PROXY", "http://proxy:8080")
+    monkeypatch.setenv("no_proxy", "localhost")
+    monkeypatch.setenv("SSL_CERT_FILE", "/fleet/ca.pem")
+    monkeypatch.setenv("OPENAI_BASE_URL", "https://fleet.example/v1")
+    monkeypatch.setenv("TMUX", "/private/tmp/tmux-0/default,123,4")  # must be dropped
+    # spawn=False -> no listener -> readiness times out, but new_session (and the
+    # env build it exercises) has already run by then; shrink the wait.
+    monkeypatch.setattr(mod, "_READINESS_TIMEOUT", 0.3)
+    fake = FakeTmux(spawn=False)
+    sup = _make_supervisor(workdir, fake)
+    with pytest.raises(TimeoutError):
+        await sup.start()
+    env = fake.new_session_env
+    for key, val in {
+        "CODEX_HOME": "/fleet/codex",
+        "HOME": "/fleet/home",
+        "XDG_CONFIG_HOME": "/fleet/xdg",
+        "HTTPS_PROXY": "http://proxy:8080",
+        "no_proxy": "localhost",
+        "SSL_CERT_FILE": "/fleet/ca.pem",
+        "OPENAI_BASE_URL": "https://fleet.example/v1",
+    }.items():
+        assert env.get(key) == val, f"daemon env {key} not propagated to tmux session"
+    # The configured key is overlaid (item H), and tmux-internal vars are dropped.
+    assert env.get("OPENAI_API_KEY") == "sk-SENTINEL"
+    assert "TMUX" not in env
+
+
+@pytest.mark.asyncio
+async def test_long_working_dir_falls_back_to_short_sock_dir():
+    """A working_dir long enough to blow past the AF_UNIX limit must not yield
+    an unbindable socket path (would surface as a readiness timeout)."""
+    long_wd = "/tmp/" + ("d" * 140)
+    sup = CodexAppServerSupervisor("kztest", working_dir=long_wd)
+    assert len(sup.sock_path) <= 104
+    assert sup.sock_path.startswith(tempfile.gettempdir())
+
+
+@pytest.mark.asyncio
 async def test_new_session_failure_raises(workdir):
     fake = FakeTmux(new_session_ok=False)
     sup = _make_supervisor(workdir, fake)

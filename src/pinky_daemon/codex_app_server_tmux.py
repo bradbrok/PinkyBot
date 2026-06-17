@@ -32,9 +32,11 @@ with no changes to those call sites.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import os
 import shlex
 import sys
+import tempfile
 from collections.abc import Callable
 
 from pinky_daemon.codex_app_server import (
@@ -99,21 +101,32 @@ class CodexAppServerSupervisor:
         *,
         working_dir: str,
         openai_api_key: str = "",
-        env_path: str = "",
         log: Callable[[str], None] = _log,
     ) -> None:
         self.agent_name = agent_name
         self._log = log
         self._openai_api_key = openai_api_key
-        # tmux drops parent env; without PATH the shell can't resolve ``codex``.
-        self._env_path = env_path or os.environ.get("PATH", "")
-        # Socket inside the agent's working dir keeps it within the agent
-        # boundary (forward-compatible with #149 isolation) and under our own
-        # perms. Absolute so bind()/connect() don't depend on cwd.
-        self._sock_dir = os.path.abspath(os.path.join(working_dir or ".", ".codex-app-server"))
+        self._sock_dir = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
         self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
         self._kill_requested = False
+
+    @staticmethod
+    def _resolve_sock_dir(agent_name: str, working_dir: str) -> str:
+        """Socket dir inside the agent's working dir (keeps it within the agent
+        boundary — forward-compatible with #149 isolation — and under our own
+        perms). Absolute so bind()/connect() don't depend on cwd.
+
+        macOS AF_UNIX paths cap near 104 chars; a long working_dir would
+        otherwise surface as a 30s readiness timeout. If the in-boundary path is
+        too long, fall back to a short, agent-stable ``/tmp`` runtime dir so the
+        transport still works (the #149 isolated path will need an in-boundary
+        socket regardless — tracked separately)."""
+        in_boundary = os.path.abspath(os.path.join(working_dir or ".", ".codex-app-server"))
+        if len(os.path.join(in_boundary, "app.sock")) <= 100:
+            return in_boundary
+        digest = hashlib.sha1(in_boundary.encode()).hexdigest()[:10]
+        return os.path.join(tempfile.gettempdir(), f"pinky-codex-as-{digest}")
 
     @property
     def session_name(self) -> str:
@@ -145,15 +158,9 @@ class CodexAppServerSupervisor:
             shlex.quote(p)
             for p in [sys.executable, "-m", "pinky_daemon.codex_app_server_shim", self.sock_path]
         )
-        env: dict[str, str] = {}
-        if self._env_path:
-            env["PATH"] = self._env_path
-        if self._openai_api_key:
-            # Reaches the tmux session -> the shim -> the grandchild ``codex``
-            # (the shim spawns it inheriting this env). Item H.
-            env["OPENAI_API_KEY"] = self._openai_api_key
-
-        result = await self._tmux.new_session(cwd=self._sock_dir, command=command, env=env)
+        result = await self._tmux.new_session(
+            cwd=self._sock_dir, command=command, env=self._build_env()
+        )
         if not result.ok:
             raise RuntimeError(
                 f"codex app-server tmux new-session failed for {self.agent_name}: "
@@ -176,6 +183,40 @@ class CodexAppServerSupervisor:
             f"(session={self.session_name} sock={self.sock_path})"
         )
         return client, _TmuxAppServerProc(self, pid=0)
+
+    # tmux-internal vars that must not leak into a nested session's children.
+    _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})
+
+    def _build_env(self) -> dict[str, str]:
+        """Full daemon-env parity for the tmux session — NOT just PATH.
+
+        tmux ``new-session`` drops the parent process env (only ``-e KEY=VAL``
+        survive), and the tmux *server's* env is not the daemon's. The
+        direct-subprocess app-server path passes ``env={**os.environ}``, so the
+        codex child sees the daemon's full config; we must reproduce that here or
+        the child silently runs under different CODEX_HOME / HOME / XDG_* / proxy
+        / cert / OPENAI_*/CODEX_* settings. That breaks auth and — critically —
+        item G: a fresh child's ``thread/resume`` only finds the prior thread if
+        it points at the SAME Codex home/session store (Murzik, #792 P1).
+
+        We propagate the entire daemon env (overlaying the configured key for
+        item H), minus tmux-internal vars and any value tmux ``-e`` can't carry
+        (newlines), which are pathological for env anyway.
+        """
+        env: dict[str, str] = {}
+        for key, value in os.environ.items():
+            if key in self._ENV_DROP:
+                continue
+            if "\n" in value or "\r" in value:
+                self._log(
+                    f"codex[{self.agent_name}]: dropping multiline env {key!r} "
+                    f"(cannot pass via tmux -e)"
+                )
+                continue
+            env[key] = value
+        if self._openai_api_key:
+            env["OPENAI_API_KEY"] = self._openai_api_key
+        return env
 
     async def _await_accept(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Readiness probe: poll until the shim's socket ACCEPTS our connection.
