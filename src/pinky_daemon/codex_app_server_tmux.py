@@ -33,9 +33,9 @@ with no changes to those call sites.
 from __future__ import annotations
 
 import asyncio
-import hashlib
 import os
 import shlex
+import stat
 import sys
 import tempfile
 from collections.abc import Callable
@@ -107,27 +107,33 @@ class CodexAppServerSupervisor:
         self.agent_name = agent_name
         self._log = log
         self._openai_api_key = openai_api_key
-        self._sock_dir = self._resolve_sock_dir(agent_name, working_dir)
+        self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
         self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
         self._kill_requested = False
 
     @staticmethod
-    def _resolve_sock_dir(agent_name: str, working_dir: str) -> str:
-        """Socket dir inside the agent's working dir (keeps it within the agent
-        boundary — forward-compatible with #149 isolation — and under our own
-        perms). Absolute so bind()/connect() don't depend on cwd.
+    def _resolve_sock_dir(agent_name: str, working_dir: str) -> tuple[str, bool]:
+        """Pick the socket dir; return (dir, is_tmp_fallback).
+
+        Default: ``<working_dir>/.codex-app-server`` — inside the agent boundary
+        (forward-compatible with #149 isolation) and under a parent only we can
+        write. Absolute so bind()/connect() don't depend on cwd.
 
         macOS AF_UNIX paths cap near 104 chars; a long working_dir would
-        otherwise surface as a 30s readiness timeout. If the in-boundary path is
-        too long, fall back to a short, agent-stable ``/tmp`` runtime dir so the
-        transport still works (the #149 isolated path will need an in-boundary
-        socket regardless — tracked separately)."""
+        otherwise surface as a 30s readiness timeout. Fall back to a short dir —
+        but NOT a predictable ``/tmp/<name>`` (world-writable + sticky /tmp, for
+        an approvals=never danger-full-access codex, is the worst place for a
+        perms slip: a predictable name invites a pre-create/symlink race). Use
+        ``mkdtemp(dir=/tmp)`` instead: it creates an unguessable, atomically
+        0700, owner-only dir — the parent-dir perms, not just the 0600 socket,
+        are what close the create-race window. (gettempdir() on macOS is itself
+        long, so anchor to /tmp to stay under the limit.) The #149-isolated path
+        will need an in-boundary socket regardless — tracked in #793."""
         in_boundary = os.path.abspath(os.path.join(working_dir or ".", ".codex-app-server"))
         if len(os.path.join(in_boundary, "app.sock")) <= 100:
-            return in_boundary
-        digest = hashlib.sha1(in_boundary.encode()).hexdigest()[:10]
-        return os.path.join(tempfile.gettempdir(), f"pinky-codex-as-{digest}")
+            return in_boundary, False
+        return tempfile.mkdtemp(dir="/tmp", prefix=f"pinky-codex-as-{agent_name}-"), True
 
     @property
     def session_name(self) -> str:
@@ -149,11 +155,7 @@ class CodexAppServerSupervisor:
         await self._tmux.kill_session()
         self._unlink_sock()
 
-        os.makedirs(self._sock_dir, exist_ok=True)
-        try:
-            os.chmod(self._sock_dir, 0o700)  # fail-closed dir; shim 0600s the file
-        except OSError:
-            pass
+        self._ensure_sock_dir_secure()
 
         command = " ".join(
             shlex.quote(p)
@@ -239,6 +241,32 @@ class CodexAppServerSupervisor:
             f"codex app-server shim for {self.agent_name} did not accept on "
             f"{self.sock_path} within {_READINESS_TIMEOUT}s (last: {last_err})"
         )
+
+    def _ensure_sock_dir_secure(self) -> None:
+        """Create the socket dir and assert it's a 0700 dir we own.
+
+        The /tmp fallback was born 0700 via mkdtemp (no race); the in-boundary
+        dir lives under a parent only we can write, so its makedirs+chmod race is
+        benign. Either way we verify before binding: a socket dir that isn't an
+        owner-only directory we own is a hard stop, never a silent downgrade —
+        the parent-dir perms are what gate who can connect to an
+        approvals=never codex."""
+        os.makedirs(self._sock_dir, exist_ok=True)
+        try:
+            os.chmod(self._sock_dir, 0o700)
+        except OSError:
+            pass
+        st = os.lstat(self._sock_dir)
+        if not stat.S_ISDIR(st.st_mode) or st.st_uid != os.getuid():
+            raise RuntimeError(
+                f"refusing app-server socket dir {self._sock_dir}: "
+                f"not an owner-owned directory"
+            )
+        if stat.S_IMODE(st.st_mode) != 0o700:
+            raise RuntimeError(
+                f"refusing app-server socket dir {self._sock_dir}: "
+                f"perms {oct(stat.S_IMODE(st.st_mode))} != 0o700"
+            )
 
     def request_kill(self) -> None:
         self._kill_requested = True

@@ -167,12 +167,23 @@ async def test_full_daemon_env_propagated_to_session(workdir, monkeypatch):
 
 @pytest.mark.asyncio
 async def test_long_working_dir_falls_back_to_short_sock_dir():
-    """A working_dir long enough to blow past the AF_UNIX limit must not yield
-    an unbindable socket path (would surface as a readiness timeout)."""
+    """A working_dir long enough to blow past the AF_UNIX limit must fall back
+    to a short, owner-only 0700 dir — not a predictable /tmp path, and not an
+    unbindable long one (would surface as a readiness timeout)."""
     long_wd = "/tmp/" + ("d" * 140)
     sup = CodexAppServerSupervisor("kztest", working_dir=long_wd)
-    assert len(sup.sock_path) <= 104
-    assert sup.sock_path.startswith(tempfile.gettempdir())
+    try:
+        assert sup._sock_dir_is_tmp is True
+        assert len(sup.sock_path) <= 104
+        assert sup.sock_path.startswith("/tmp/")
+        # mkdtemp gives an unguessable, atomically-0700, owner-only dir — the
+        # parent-dir perms are what gate connect() to an approvals=never codex.
+        st = os.lstat(sup._sock_dir)
+        assert stat.S_ISDIR(st.st_mode)
+        assert stat.S_IMODE(st.st_mode) == 0o700
+        assert st.st_uid == os.getuid()
+    finally:
+        shutil.rmtree(sup._sock_dir, ignore_errors=True)
 
 
 @pytest.mark.asyncio
