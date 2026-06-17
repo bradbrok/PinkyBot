@@ -2777,6 +2777,7 @@ def create_api(
     ):
         """Create, connect, and register a streaming session for an agent label."""
         from pinky_daemon.codex_session import CodexSession
+        from pinky_daemon.codex_tmux_session import CodexTmuxSession
         from pinky_daemon.streaming_session import (
             DEFAULT_STREAMING_ALLOWED_TOOLS,
             StreamingSession,
@@ -2862,19 +2863,21 @@ def create_api(
             msg = f"unknown transport '{transport}' for agent '{agent_name}'"
             _log(f"api: {msg}")
             raise HTTPException(400, msg)
-        if runtime != "claude_sdk" and transport != "sdk":
-            msg = (
-                f"transport '{transport}' is only valid for claude_sdk runtime "
-                f"(agent '{agent_name}' has runtime '{runtime}')"
-            )
-            _log(f"api: {msg}")
-            raise HTTPException(400, msg)
+        # All four runtime×transport combos are now valid — (claude_sdk, sdk),
+        # (claude_sdk, tmux), (codex_cli, sdk), (codex_cli, tmux). The codex tmux
+        # transport (#215) is the last to land; runtime/transport were each range-
+        # checked above, so no combo needs an extra reject here.
 
         # #149 phase-3 cold-start guard (see _enforce_isolation_runnable).
         _enforce_isolation_runnable(agent_name)
 
         is_codex = runtime == "codex_cli"
         is_tmux = runtime == "claude_sdk" and transport == "tmux"
+        # #215: codex over the tmux transport. ``is_codex`` stays True for both
+        # codex transports (it correctly drives MCP injection + the no-auth-
+        # callback / stream-event-callback init below); ``is_codex_tmux`` only
+        # selects the session class + provider stamp.
+        is_codex_tmux = runtime == "codex_cli" and transport == "tmux"
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         if is_codex:
             resolved_provider_url = "codex_cli"
@@ -2955,8 +2958,10 @@ def create_api(
         callback = await _make_streaming_response_callback()
         sid_callback = await _make_streaming_resume_handle_callback(agent_name, label)
 
-        # Select session class based on persisted runtime + Claude transport.
-        if is_tmux:
+        # Select session class based on persisted runtime + transport.
+        if is_codex_tmux:
+            SessionClass = CodexTmuxSession  # noqa: N806
+        elif is_tmux:
             SessionClass = TmuxSession  # noqa: N806
         elif is_codex:
             SessionClass = CodexSession  # noqa: N806
@@ -3032,7 +3037,7 @@ def create_api(
                 session_id=ss.id,
                 agent_name=agent_name,
                 session_label=label,
-                provider="tmux" if is_tmux else (runtime if is_codex else (resolved_provider_url or "default")),
+                provider="codex_tmux" if is_codex_tmux else ("tmux" if is_tmux else (runtime if is_codex else (resolved_provider_url or "default"))),
                 model=effective_model or "",
             )
             analytics.log_activity(
@@ -5786,6 +5791,14 @@ npm run build</pre>
         # — without this root the report 403s and the tailer never repoints
         # off its cold-start guess.
         allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
+        # #215: codex tmux agents tail rollouts under the codex session store
+        # (``$CODEX_HOME/sessions`` or ``~/.codex/sessions``), not ~/.claude.
+        _codex_home = os.environ.get("CODEX_HOME", "").strip()
+        allowed_roots.append(
+            (Path(_codex_home) / "sessions").resolve()
+            if _codex_home
+            else (Path.home() / ".codex" / "sessions").resolve()
+        )
         if getattr(agent, "isolation_mode", "local") == "container":
             wd = (agent.working_dir or "").strip()
             if wd and Path(wd).is_absolute():

@@ -144,3 +144,51 @@ transport/wake (5488) + transport/transcript-path (5617) already duck-typed (get
 - src/pinky_daemon/api.py
 - src/pinky_daemon/codex_app_server_tmux.py (reference: tmux-under-codex + _TmuxControl reuse)
 New: src/pinky_daemon/codex_tmux_session.py, src/pinky_daemon/codex_tmux_transcript.py, codex notify hook (model on data/agents/<name>/.claude/hook_tmux_session_start.py).
+
+## 10. PR2 BUILD RECORD (2026-06-17) — Option A chosen; make-or-break validated
+
+**Decision: Option A (subclass), NOT the tentatively-planned Option B (copy).**
+Recon showed the codex seams are cleanly isolated, so `CodexTmuxSession(TmuxSession)`
+overrides ONLY `_build_session_name`, `_build_claude_cmd` (codex cmd), `_build_repl_env`,
+`_project_dir`/`_has_prior_transcript`/`_discover_transcript_path`, `_start_tailer`
+(→ `CodexTmuxTranscriptTailer`), `_spawn_tmux_repl` (wraps super() + codex trust pre-seed
++ NUX dismissal + readiness), `_watch_for_oauth_url` (no-op), and injects a
+`_CodexTmuxControl` (paste settle 4000ms vs claude's 300ms — codex composer renders
+slower). ~330 lines vs ~2500 for a copy; inherits the battle-hardened state machine /
+worker / inflight watchdog / delivery + readiness gate / analytics / restart-survival
+verbatim (zero divergence risk). The plan's Option-B caution was right for PR1 (tailer-only)
+but is superseded now that the seams are known.
+
+**Make-or-break (send-keys into codex TUI) VALIDATED LIVE 2026-06-17:** bracketed-paste
+→ Enter drives a real codex 0.125.0 TUI to run a turn; rollout written with discoverable
+`session_meta.cwd`; the merged tailer parsed `task_complete` → TurnResponse(text="PONG",
+usage, duration). Plain `send-keys` does NOT submit — bracketed paste is required (paste_text
+already does it; `_CodexTmuxControl` just lengthens the settle to 4000ms).
+
+**Two cold-start NUX blockers found + handled** (the plan's §3/#3 was under-specified):
+1. Update-available prompt — dismissed via send-keys (Down→Enter to "Skip", never "Update now").
+2. Per-directory TRUST prompt — fires even WITH `--dangerously-bypass-approvals-and-sandbox`,
+   and is NOT inherited from a trusted parent → `_seed_codex_trust` pre-writes
+   `[projects."<cwd>"] trust_level="trusted"` to `config.toml` before launch (idempotent);
+   `_codex_dismiss_nux_and_ready` is the send-keys backstop. Readiness gate (`_session_ready_event`)
+   is opened when the composer renders (codex has no SessionStart hook, and the rollout only
+   appears AFTER the first paste — so readiness can't be transcript-gated; codex FIFO-queues
+   input so an early paste buffers).
+
+**Dispatch (api.py §5):** relaxed the transport gate (all 4 runtime×transport combos valid);
+added `is_codex_tmux` (selects `CodexTmuxSession` + "codex_tmux" provider stamp); `is_codex`
+stays True for both codex transports so MCP injection + no-auth-callback/stream-callback init
+already cover codex tmux. Extended the `/transport/transcript-path` `allowed_roots` to include
+`$CODEX_HOME/sessions` (else the rollout path 403s). `/transport/wake` (`notify_tail`) is
+duck-typed → inherited, no change.
+
+**Turn-done detection** rides the polling tailer (active cadence once a turn starts), so the
+low-latency `notify` hook is DEFERRED to PR3 — not required for correctness.
+
+**Tests:** `tests/test_codex_tmux_session.py` (20 unit tests on the seams) + a gated
+`PINKY_CODEX_TMUX_SMOKE=1` integration smoke (real codex+tmux round-trip, the make-or-break,
+codifies the manual proof). Full repo suite stays green.
+
+**Deferred to PR3:** notify low-latency wake hook (`hooks/hook_codex_notify.py`), idle-sleep
+save-prompt text, resume-UUID-capture diagnostics, resume --last reopen-vs-fork verification,
+container-agent codex tmux.
