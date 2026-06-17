@@ -65,7 +65,10 @@ def _set_total_tokens(ss: TmuxSession, total: int) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def test_effective_threshold_caps_at_400k_on_1m_model() -> None:
+def test_effective_threshold_caps_at_400k_on_1m_model(monkeypatch) -> None:
+    # Clear the env var so the default 33k-token buffer is used, not any
+    # ambient CLAUDE_AUTOCOMPACT_PCT_OVERRIDE (e.g. set by Claude Code).
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
     ss = _make_session(model=_MODEL_1M)
     # Effective max = 1_000_000 - 33_000 buffer = 967_000.
     # cap_pct = 400_000 / 967_000 * 100 ≈ 41.36, below the 80% default.
