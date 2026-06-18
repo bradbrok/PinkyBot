@@ -26,16 +26,15 @@ from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 
-from pinky_daemon.claude_runner import RunResult
-
-# Reuse the rails' first-run gate pre-seed (#112): without it a fresh
-# project dir wedges the REPL at the trust dialog / bypass-permissions
-# acceptance and the typed instruction is silently eaten (observed in the
-# #707 live smoke test). Same-package reuse of tested helpers, on purpose.
-from pinky_daemon.tmux_session import (
-    _resolve_claude_config_path,
-    _seed_claude_trust_file,
+from pinky_daemon.claude_config import (
+    migrate_claude_project_history,
+    resolve_agent_claude_config_dir,
+    resolve_claude_config_path,
+    resolve_claude_settings_path,
+    seed_claude_settings_file,
+    seed_claude_trust_file,
 )
+from pinky_daemon.claude_runner import RunResult
 
 _DEFAULT_CLAUDE_BIN = "/opt/homebrew/bin/claude"  # cc_autoupdate.sh manages this path
 
@@ -101,6 +100,10 @@ class TmuxDreamConfig:
     # Delay before checking the instruction actually submitted (re-Enter guard).
     submit_check_delay_s: float = 5.0
 
+    # Registry Agent row/config object. Used only for shared Claude config-dir
+    # derivation; optional for direct tests and legacy callers.
+    agent_config: object = None
+
 
 class TmuxDreamRunner:
     """Runs a one-shot dream in a detached tmux session.
@@ -153,6 +156,35 @@ class TmuxDreamRunner:
             return env_bin
         return shutil.which("claude") or _DEFAULT_CLAUDE_BIN
 
+    def _per_agent_claude_config_dir(self) -> Path | None:
+        return resolve_agent_claude_config_dir(
+            self._config.agent_config,
+            working_dir=self._config.working_dir,
+        )
+
+    def _per_agent_claude_env(self) -> dict[str, str]:
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is None:
+            return {}
+        env = {"CLAUDE_CONFIG_DIR": str(cfg_dir)}
+        agent = self._config.agent_config
+        if not (
+            getattr(agent, "provider_url", "") or getattr(agent, "provider_key", "")
+        ):
+            token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            if token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        return env
+
+    def _prepare_claude_config(self, project_dir: Path) -> None:
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is None:
+            return
+        if migrate_claude_project_history(project_dir, cfg_dir):
+            _log(f"tmux-dream: migrated claude transcript history into {cfg_dir}")
+        env = {"CLAUDE_CONFIG_DIR": str(cfg_dir)}
+        seed_claude_settings_file(resolve_claude_settings_path(env))
+
     # ── run ───────────────────────────────────────────────────
 
     async def run(self, prompt: str, *, system_prompt: str = "") -> RunResult:
@@ -175,6 +207,7 @@ class TmuxDreamRunner:
         # best-effort; agent dirs are normally already trusted by their main
         # session, but a first dream on a fresh box must not wedge.
         try:
+            self._prepare_claude_config(work_dir)
             if self._seed_trust(str(work_dir)):
                 _log(f"tmux-dream: seeded claude trust for {work_dir}")
         except Exception as e:
@@ -193,9 +226,12 @@ class TmuxDreamRunner:
         if self._config.disallowed_tools:
             cmd += ["--disallowedTools", ",".join(self._config.disallowed_tools)]
 
-        rc, out = await self._tmux(
-            "new-session", "-d", "-s", self.session_name, "-c", str(work_dir), *cmd
-        )
+        new_session_args = [
+            "new-session", "-d", "-s", self.session_name, "-c", str(work_dir),
+        ]
+        for key, value in self._per_agent_claude_env().items():
+            new_session_args.extend(["-e", f"{key}={value}"])
+        rc, out = await self._tmux(*new_session_args, *cmd)
         if rc != 0:
             return RunResult(
                 output="",
@@ -285,7 +321,8 @@ class TmuxDreamRunner:
 
     def _seed_trust(self, project_dir: str) -> bool:
         """Seed first-run trust flags; seam for tests."""
-        return _seed_claude_trust_file(_resolve_claude_config_path(), project_dir)
+        env = {**os.environ, **self._per_agent_claude_env()}
+        return seed_claude_trust_file(resolve_claude_config_path(env), project_dir)
 
     # ── waiting ───────────────────────────────────────────────
 

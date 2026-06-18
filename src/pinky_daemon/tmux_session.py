@@ -57,11 +57,8 @@ session stays alive.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
-import re
 import shlex
-import threading
 import time
 from collections import deque
 from dataclasses import dataclass, field, replace
@@ -69,6 +66,19 @@ from pathlib import Path
 
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_oauth_url, looks_like_login_wall
+from pinky_daemon.claude_config import (
+    claude_project_slug,
+    migrate_claude_project_history,
+    resolve_agent_claude_config_dir,
+    resolve_claude_settings_path,
+    seed_claude_settings_file,
+)
+from pinky_daemon.claude_config import (
+    resolve_claude_config_path as _resolve_claude_config_path,
+)
+from pinky_daemon.claude_config import (
+    seed_claude_trust_file as _seed_claude_trust_file,
+)
 from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
@@ -137,37 +147,6 @@ _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 # relevant flags before launch makes every new tmux agent boot clean on
 # any box without an operator manually clearing the prompts.
 
-# Serializes read-modify-write of the shared ``.claude.json`` across the
-# daemon's concurrent agent launches so two simultaneous seeds can't drop
-# each other's ``projects[...]`` entry (last-write-wins clobber).
-#
-# NOTE (cross-process race, accepted): this lock only serializes seeds
-# WITHIN the daemon process. On a box where many agents' ``claude``
-# processes share one ``.claude.json``, an already-running claude could
-# write its own per-session keys (``numStartups``, ``lastCost``, ...)
-# between our read and our ``os.replace`` — silently dropping that write.
-# Window is tiny and severity low (those keys are non-load-bearing
-# telemetry), so we accept it for now. A file lock (``fcntl.flock``)
-# around the read-modify-write is the proper fix if this ever matters.
-_CLAUDE_JSON_SEED_LOCK = threading.Lock()
-
-
-def _resolve_claude_config_path(env: dict[str, str] | None = None) -> Path:
-    """Resolve the path to Claude Code's global ``.claude.json``.
-
-    Mirrors the CLI's resolution: ``$CLAUDE_CONFIG_DIR/.claude.json`` when
-    ``CLAUDE_CONFIG_DIR`` is set, else ``$HOME/.claude.json``. ``env``
-    defaults to the daemon process environment, which the tmux REPL
-    inherits (``_build_repl_env`` only adds ``-e`` overrides on top, so
-    the effective HOME/CLAUDE_CONFIG_DIR the launched ``claude`` sees is
-    the daemon's unless explicitly overridden). Injectable for tests.
-    """
-    e = env if env is not None else os.environ
-    cfg_dir = (e.get("CLAUDE_CONFIG_DIR") or "").strip()
-    base = Path(cfg_dir) if cfg_dir else Path(e.get("HOME") or Path.home())
-    return base / ".claude.json"
-
-
 # Sentinel distinguishing "caller passed no agent" from "caller passed None
 # (= local)" in the container-aware helpers below.
 _UNSET = object()
@@ -208,59 +187,6 @@ def _is_dead_runtime_stderr(stderr: str) -> bool:
     # contiguous-substring needle can never match. Require both fragments.
     return "container" in low and "is not running" in low
 
-
-def _seed_claude_trust_file(config_path: Path, project_dir: str) -> bool:
-    """Idempotently pre-seed first-run trust/bypass flags in
-    ``config_path`` (Claude Code's ``.claude.json``) for ``project_dir``.
-
-    Sets top-level ``bypassPermissionsModeAccepted`` and, under
-    ``projects[<resolved project_dir>]``, ``hasTrustDialogAccepted`` +
-    ``hasCompletedProjectOnboarding`` — all to ``True``. Preserves every
-    other key (the file also holds oauth creds + per-project history).
-
-    Returns ``True`` if the file was modified, ``False`` if every flag was
-    already set (no write). Raises on a corrupt/non-object file rather than
-    clobbering it — callers treat seeding as best-effort and swallow.
-
-    Atomic: writes a sibling temp file and ``os.replace``s it in, so a
-    concurrent reader never sees a half-written config. Serialized
-    process-wide via ``_CLAUDE_JSON_SEED_LOCK``.
-    """
-    proj_key = str(Path(project_dir).resolve())
-    with _CLAUDE_JSON_SEED_LOCK:
-        data: dict = {}
-        if config_path.exists():
-            with config_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-            if not isinstance(data, dict):
-                raise ValueError(
-                    f"{config_path} root is not a JSON object "
-                    f"(got {type(data).__name__}) — refusing to overwrite"
-                )
-
-        changed = False
-        if data.get("bypassPermissionsModeAccepted") is not True:
-            data["bypassPermissionsModeAccepted"] = True
-            changed = True
-
-        projects = data.setdefault("projects", {})
-        if not isinstance(projects, dict):
-            raise ValueError(f"{config_path} 'projects' is not an object")
-        proj = projects.setdefault(proj_key, {})
-        if not isinstance(proj, dict):
-            raise ValueError(f"{config_path} projects[{proj_key!r}] is not an object")
-        for flag in ("hasTrustDialogAccepted", "hasCompletedProjectOnboarding"):
-            if proj.get(flag) is not True:
-                proj[flag] = True
-                changed = True
-
-        if changed:
-            config_path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = config_path.parent / f".claude.json.pinky-seed.{os.getpid()}.tmp"
-            with tmp.open("w", encoding="utf-8") as f:
-                json.dump(data, f, indent=2)
-            os.replace(tmp, config_path)
-        return changed
 
 # Transient-failure retry cadence for the worker loop. Fixed (not
 # exponential) — mirrors pulse-v2's poll cadence and keeps the
@@ -2163,6 +2089,7 @@ class TmuxSession:
         # ``_spawn()`` below (the container is running by now).
         if container_agent is None:
             try:
+                self._prepare_local_claude_config(cwd)
                 effective_env = {**os.environ, **self._build_repl_env()}
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
@@ -2508,6 +2435,52 @@ class TmuxSession:
             return ""
         return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
 
+    def _registry_agent(self):
+        """Best-effort registry row lookup for env/path derivation."""
+        if not self._registry or not self.agent_name:
+            return None
+        try:
+            return self._registry.get(self.agent_name)
+        except Exception:
+            return None
+
+    def _per_agent_claude_config_dir(self) -> Path | None:
+        return resolve_agent_claude_config_dir(
+            self._registry_agent(),
+            working_dir=self._config.working_dir,
+        )
+
+    def _per_agent_claude_env(self) -> dict[str, str]:
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is None:
+            return {}
+        env = {"CLAUDE_CONFIG_DIR": str(cfg_dir)}
+        # A fresh per-agent config dir has no .credentials.json. When the
+        # resolver permits the dir, the static token is present in the daemon
+        # env; pass it to this child unless this is a custom-provider session.
+        if not (self._config.provider_url or self._config.provider_key):
+            token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            if token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        return env
+
+    def _prepare_local_claude_config(self, project_dir: str) -> None:
+        """Idempotently prepare a local per-agent config dir before launch."""
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is None:
+            return
+        if migrate_claude_project_history(project_dir, cfg_dir):
+            _log(
+                f"tmux[{self.agent_name}]: migrated claude transcript history "
+                f"into {cfg_dir}"
+            )
+        settings_path = resolve_claude_settings_path({"CLAUDE_CONFIG_DIR": str(cfg_dir)})
+        if seed_claude_settings_file(settings_path):
+            _log(
+                f"tmux[{self.agent_name}]: pre-seeded claude settings in "
+                f"{settings_path}"
+            )
+
     def _build_repl_env(self) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
@@ -2548,6 +2521,7 @@ class TmuxSession:
         oauth_token = self._static_oauth_token()
         if oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+        env.update(self._per_agent_claude_env())
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
         # Surface the RESOLVED effort (#151): the drift hook compares this to
@@ -4321,9 +4295,9 @@ class TmuxSession:
         """
         cwd = Path(self._config.working_dir or ".").resolve()
         # Match Claude Code's encoder exactly: every non-alphanumeric char
-        # → '-'. For an absolute path the leading '/' yields the leading
+        # -> '-'. For an absolute path the leading '/' yields the leading
         # '-' on its own; do NOT prepend an extra dash (that was the bug).
-        encoded = re.sub(r"[^a-zA-Z0-9]", "-", str(cwd))
+        encoded = claude_project_slug(cwd)
         # Container agents (#638): claude runs with CLAUDE_CONFIG_DIR set to
         # <working_dir>/.claude-container INSIDE the container — and because
         # the working_dir is bind-mounted at the SAME absolute path, that
@@ -4339,6 +4313,9 @@ class TmuxSession:
                 from pinky_daemon.provisioning import container_config_dir
 
                 return Path(container_config_dir(wd)) / "projects" / encoded
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is not None:
+            return cfg_dir / "projects" / encoded
         return Path.home() / ".claude" / "projects" / encoded
 
     def _has_prior_transcript(self) -> bool:

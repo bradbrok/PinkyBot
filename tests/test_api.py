@@ -1131,6 +1131,33 @@ class TestAPI:
                 assert resp.status_code == 403
                 assert "projects" in resp.json()["detail"].lower()
 
+    def test_transcript_path_allows_flagged_per_agent_config_root(
+        self, monkeypatch
+    ):
+        """#797 P2: a flagged local agent's SessionStart hook reports
+        <working_dir>/.claude-config/projects/...; accept that root only when
+        the shared resolver would actually inject CLAUDE_CONFIG_DIR."""
+        monkeypatch.setenv("PINKY_PER_AGENT_CLAUDE_CONFIG", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-api")
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            work_dir = os.path.join(tmpdir, "agents", "plain")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                r = client.post("/agents", json={
+                    "name": "plain", "model": "sonnet", "working_dir": work_dir,
+                })
+                assert r.status_code == 200
+
+                candidate = os.path.join(
+                    work_dir, ".claude-config", "projects", "x", "s.jsonl"
+                )
+                resp = client.post(
+                    "/agents/plain/transport/transcript-path",
+                    json={"transcript_path": candidate},
+                )
+                assert resp.status_code == 200
+
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
         'unix_user' is accepted at registration but REFUSES to start (501)
@@ -2927,6 +2954,7 @@ class TestAPI:
         long_message = "A" * 620
 
         with tempfile.TemporaryDirectory() as tmpdir, \
+                patch.dict(os.environ, {"PINKY_DREAM_TRANSPORT": "sdk"}), \
                 patch("pinky_daemon.dream_runner.SDKRunner._ensure_sdk", return_value=None), \
                 patch("pinky_daemon.dream_runner.SDKRunner.run", new=fake_run):
             db_path = os.path.join(tmpdir, "test.db")

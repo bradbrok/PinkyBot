@@ -121,6 +121,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
+from pinky_daemon.claude_config import resolve_agent_claude_config_dir
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS
@@ -5853,6 +5854,12 @@ npm run build</pre>
                     (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
                     .resolve()
                 )
+        per_agent_cfg = resolve_agent_claude_config_dir(
+            agent,
+            working_dir=agent.working_dir,
+        )
+        if per_agent_cfg is not None:
+            allowed_roots.append((per_agent_cfg / "projects").resolve())
         try:
             normalised = path.resolve(strict=False)
         except (OSError, RuntimeError) as e:
