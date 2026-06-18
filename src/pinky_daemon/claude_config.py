@@ -10,6 +10,7 @@ import json
 import os
 import re
 import shutil
+import tempfile
 import threading
 from collections.abc import Mapping
 from pathlib import Path
@@ -104,11 +105,9 @@ def migrate_claude_project_history(project_dir: str | Path, config_dir: Path) ->
     if not src.exists() or dst.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
-    tmp = dst.parent / f".{dst.name}.pinky-copy.{os.getpid()}.tmp"
-    if tmp.exists():
-        shutil.rmtree(tmp)
+    tmp = Path(tempfile.mkdtemp(prefix=f".{dst.name}.pinky-copy.", dir=dst.parent))
     try:
-        shutil.copytree(src, tmp)
+        shutil.copytree(src, tmp, dirs_exist_ok=True)
         if dst.exists():
             shutil.rmtree(tmp, ignore_errors=True)
             return False

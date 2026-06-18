@@ -104,8 +104,8 @@ def test_migrate_claude_project_history_cleans_failed_tmp_copy(
     (src / "old.jsonl").write_text("history", encoding="utf-8")
     cfg = project_dir / ".claude-config"
 
-    def fail_copytree(_src: Path, dst: Path) -> None:
-        dst.mkdir(parents=True)
+    def fail_copytree(_src: Path, dst: Path, **_kwargs: object) -> None:
+        dst.mkdir(parents=True, exist_ok=True)
         (dst / "partial.jsonl").write_text("partial", encoding="utf-8")
         raise RuntimeError("copy interrupted")
 
@@ -116,6 +116,43 @@ def test_migrate_claude_project_history_cleans_failed_tmp_copy(
 
     assert not (cfg / "projects" / slug).exists()
     assert list((cfg / "projects").glob("*.pinky-copy.*.tmp")) == []
+
+
+def test_migrate_claude_project_history_uses_unique_tmp_for_concurrent_call(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    project_dir = tmp_path / "agents" / "kuzya"
+    project_dir.mkdir(parents=True)
+    slug = claude_project_slug(project_dir)
+    src = Path.home() / ".claude" / "projects" / slug
+    src.mkdir(parents=True)
+    (src / "old.jsonl").write_text("history", encoding="utf-8")
+    cfg = project_dir / ".claude-config"
+    dst = cfg / "projects" / slug
+    copied_to: list[Path] = []
+    inner_result: bool | None = None
+
+    def racing_copytree(_src: Path, tmp: Path, **_kwargs: object) -> None:
+        nonlocal inner_result
+        copied_to.append(tmp)
+        tmp.mkdir(parents=True, exist_ok=True)
+        marker = "outer" if len(copied_to) == 1 else "inner"
+        (tmp / "old.jsonl").write_text(marker, encoding="utf-8")
+        if len(copied_to) == 1:
+            inner_result = migrate_claude_project_history(project_dir, cfg)
+
+    monkeypatch.setattr(claude_config.shutil, "copytree", racing_copytree)
+
+    assert migrate_claude_project_history(project_dir, cfg) is False
+    assert inner_result is True
+    assert len(copied_to) == 2
+    assert copied_to[0] != copied_to[1]
+    assert not copied_to[0].exists()
+    assert not copied_to[1].exists()
+    assert dst.joinpath("old.jsonl").read_text(encoding="utf-8") == "inner"
+    assert list((cfg / "projects").glob("*.pinky-copy.*")) == []
 
 
 def test_seed_trust_and_settings_for_config_dir(tmp_path: Path) -> None:
