@@ -5,6 +5,9 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
+import pinky_daemon.claude_config as claude_config
 from pinky_daemon.claude_config import (
     claude_project_slug,
     migrate_claude_project_history,
@@ -86,6 +89,33 @@ def test_migrate_claude_project_history_copy_if_missing(
     (src / "old.jsonl").write_text("new-history", encoding="utf-8")
     assert migrate_claude_project_history(project_dir, cfg) is False
     assert (cfg / "projects" / slug / "old.jsonl").read_text() == "history"
+
+
+def test_migrate_claude_project_history_cleans_failed_tmp_copy(
+    monkeypatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path / "home"))
+    project_dir = tmp_path / "agents" / "kuzya"
+    project_dir.mkdir(parents=True)
+    slug = claude_project_slug(project_dir)
+    src = Path.home() / ".claude" / "projects" / slug
+    src.mkdir(parents=True)
+    (src / "old.jsonl").write_text("history", encoding="utf-8")
+    cfg = project_dir / ".claude-config"
+
+    def fail_copytree(_src: Path, dst: Path) -> None:
+        dst.mkdir(parents=True)
+        (dst / "partial.jsonl").write_text("partial", encoding="utf-8")
+        raise RuntimeError("copy interrupted")
+
+    monkeypatch.setattr(claude_config.shutil, "copytree", fail_copytree)
+
+    with pytest.raises(RuntimeError, match="copy interrupted"):
+        migrate_claude_project_history(project_dir, cfg)
+
+    assert not (cfg / "projects" / slug).exists()
+    assert list((cfg / "projects").glob("*.pinky-copy.*.tmp")) == []
 
 
 def test_seed_trust_and_settings_for_config_dir(tmp_path: Path) -> None:

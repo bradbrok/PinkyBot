@@ -104,7 +104,18 @@ def migrate_claude_project_history(project_dir: str | Path, config_dir: Path) ->
     if not src.exists() or dst.exists():
         return False
     dst.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copytree(src, dst)
+    tmp = dst.parent / f".{dst.name}.pinky-copy.{os.getpid()}.tmp"
+    if tmp.exists():
+        shutil.rmtree(tmp)
+    try:
+        shutil.copytree(src, tmp)
+        if dst.exists():
+            shutil.rmtree(tmp, ignore_errors=True)
+            return False
+        os.replace(tmp, dst)
+    except Exception:
+        shutil.rmtree(tmp, ignore_errors=True)
+        raise
     return True
 
 
