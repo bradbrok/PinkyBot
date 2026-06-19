@@ -9,6 +9,8 @@ They intentionally do NOT require ``slack_sdk`` — the SDK import is lazy insid
 from __future__ import annotations
 
 import asyncio
+import sys
+import types
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -150,4 +152,155 @@ class TestBrokerSlackPoller:
         await poller.start()
         assert poller._client is None
         assert poller._running is False
+        mock_broker.handle_inbound.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_start_refuses_without_bot_user_id(self, mock_broker):
+        """Fail closed: no user_id from auth.test => don't start (self-filter disarmed)."""
+        poller = _make_poller(mock_broker, bot_user_id="")
+        poller._adapter.get_bot_info.return_value = {"user": "x", "team": "T1"}  # no user_id
+        await poller.start()
+        assert poller._running is False
+        assert poller._client is None
+        mock_broker.handle_inbound.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_double_start_is_benign(self, mock_broker):
+        """A second start() on an already-running poller short-circuits (no client leak)."""
+        poller = _make_poller(mock_broker)
+        poller._running = True
+        sentinel = object()
+        poller._client = sentinel
+        await poller.start()
+        assert poller._client is sentinel  # not replaced
+
+    @pytest.mark.asyncio
+    async def test_event_callback_invoked_for_user_message(self, mock_broker):
+        from pinky_daemon.pollers import BrokerSlackPoller
+
+        adapter = MagicMock()
+        adapter.bot_token = "xoxb-test"
+        cb = AsyncMock()
+        poller = BrokerSlackPoller(
+            adapter, "barsik", mock_broker, registry=None,
+            app_token="xapp-test", event_callback=cb,
+        )
+        poller._bot_user_id = "UBOT"
+        await poller._handle_event(_event({
+            "type": "message", "user": "U123", "text": "hello",
+            "channel": "C999", "channel_type": "channel", "ts": "1.1",
+        }))
+        await asyncio.sleep(0)
+        cb.assert_awaited_once_with(
+            platform="slack", chat_id="C999", sender="U123", content="hello",
+        )
+
+    @pytest.mark.asyncio
+    async def test_start_connects_registers_listener_and_acks(self, monkeypatch, mock_broker):
+        """Happy path: start() resolves identity, builds the client, registers the
+        listener, connects; the listener ACKs an events_api envelope and routes it."""
+        captured = {}
+
+        class FakeSocketModeClient:
+            def __init__(self, app_token=None, web_client=None):
+                captured["app_token"] = app_token
+                captured["web_client"] = web_client
+                self.socket_mode_request_listeners = []
+                self.connected = False
+                self.responses = []
+
+            async def connect(self):
+                self.connected = True
+
+            async def send_socket_mode_response(self, resp):
+                self.responses.append(resp)
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id=None):
+                self.envelope_id = envelope_id
+
+        class FakeAsyncWebClient:
+            def __init__(self, token=None):
+                captured["web_token"] = token
+
+        # Inject fake slack_sdk modules (incl. parents) so the lazy imports in
+        # start() resolve to the fakes whether or not slack_sdk is installed.
+        for name in ("slack_sdk", "slack_sdk.socket_mode", "slack_sdk.web"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        aiohttp_mod = types.ModuleType("slack_sdk.socket_mode.aiohttp")
+        aiohttp_mod.SocketModeClient = FakeSocketModeClient
+        response_mod = types.ModuleType("slack_sdk.socket_mode.response")
+        response_mod.SocketModeResponse = FakeSocketModeResponse
+        web_mod = types.ModuleType("slack_sdk.web.async_client")
+        web_mod.AsyncWebClient = FakeAsyncWebClient
+        monkeypatch.setitem(sys.modules, "slack_sdk.socket_mode.aiohttp", aiohttp_mod)
+        monkeypatch.setitem(sys.modules, "slack_sdk.socket_mode.response", response_mod)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", web_mod)
+
+        poller = _make_poller(mock_broker)
+        poller._bot_user_id = ""  # let start() populate it from get_bot_info
+        await poller.start()
+
+        assert poller._bot_user_id == "UBOT"
+        assert poller._running is True
+        assert poller._client is not None
+        assert poller._client.connected is True
+        assert captured["app_token"] == "xapp-test"
+        assert captured["web_token"] == "xoxb-test"  # AsyncWebClient(token=adapter.bot_token)
+        assert len(poller._client.socket_mode_request_listeners) == 1
+
+        # Drive a fake events_api request through the listener -> ACK + _handle_event.
+        listener = poller._client.socket_mode_request_listeners[0]
+        req = MagicMock()
+        req.type = "events_api"
+        req.envelope_id = "env-123"
+        req.payload = _event({
+            "type": "message", "user": "U123", "text": "hi",
+            "channel": "C1", "channel_type": "channel", "ts": "9.9",
+        })
+        await listener(poller._client, req)
+        await asyncio.sleep(0)
+        assert len(poller._client.responses) == 1
+        assert poller._client.responses[0].envelope_id == "env-123"  # ACKed
+        mock_broker.handle_inbound.assert_called_once()
+
+    @pytest.mark.asyncio
+    async def test_non_events_api_request_ignored_by_listener(self, monkeypatch, mock_broker):
+        """The listener must ignore non-events_api envelopes (no ACK, no routing)."""
+
+        class FakeSocketModeClient:
+            def __init__(self, app_token=None, web_client=None):
+                self.socket_mode_request_listeners = []
+                self.responses = []
+
+            async def connect(self):
+                pass
+
+            async def send_socket_mode_response(self, resp):
+                self.responses.append(resp)
+
+        class FakeSocketModeResponse:
+            def __init__(self, envelope_id=None):
+                self.envelope_id = envelope_id
+
+        for name in ("slack_sdk", "slack_sdk.socket_mode", "slack_sdk.web"):
+            monkeypatch.setitem(sys.modules, name, types.ModuleType(name))
+        aiohttp_mod = types.ModuleType("slack_sdk.socket_mode.aiohttp")
+        aiohttp_mod.SocketModeClient = FakeSocketModeClient
+        response_mod = types.ModuleType("slack_sdk.socket_mode.response")
+        response_mod.SocketModeResponse = FakeSocketModeResponse
+        web_mod = types.ModuleType("slack_sdk.web.async_client")
+        web_mod.AsyncWebClient = lambda token=None: MagicMock()
+        monkeypatch.setitem(sys.modules, "slack_sdk.socket_mode.aiohttp", aiohttp_mod)
+        monkeypatch.setitem(sys.modules, "slack_sdk.socket_mode.response", response_mod)
+        monkeypatch.setitem(sys.modules, "slack_sdk.web.async_client", web_mod)
+
+        poller = _make_poller(mock_broker)
+        await poller.start()
+        listener = poller._client.socket_mode_request_listeners[0]
+        req = MagicMock()
+        req.type = "hello"  # not events_api
+        await listener(poller._client, req)
+        await asyncio.sleep(0)
+        assert poller._client.responses == []
         mock_broker.handle_inbound.assert_not_called()

@@ -841,6 +841,9 @@ class BrokerSlackPoller:
         background tasks, then returns — the connection stays alive as long as
         this poller (and thus ``self._client``) is referenced by the daemon.
         """
+        if self._running:
+            _log(f"slack-poller[{self._agent_name}]: already running, ignoring start()")
+            return
         if not self._app_token:
             _log(f"slack-poller[{self._agent_name}]: no app_token set, not starting")
             return
@@ -859,15 +862,23 @@ class BrokerSlackPoller:
         # Verify bot identity (auth.test via the sync httpx adapter) for self-filter.
         try:
             info = await loop.run_in_executor(None, self._adapter.get_bot_info)
-            self._bot_user_id = info.get("user_id", "") or ""
-            _log(
-                f"slack-poller[{self._agent_name}]: connected as "
-                f"{info.get('user', '?')} (id={self._bot_user_id}, "
-                f"team={info.get('team', '?')})"
-            )
         except Exception as e:
             _log(f"slack-poller[{self._agent_name}]: auth.test failed: {e}")
             return
+        self._bot_user_id = info.get("user_id", "") or ""
+        if not self._bot_user_id:
+            # Fail closed: without our own user id the self-filter is disarmed
+            # (we couldn't distinguish our own messages → self-reply loop), so
+            # refuse to start rather than run with the guard defeated.
+            _log(
+                f"slack-poller[{self._agent_name}]: auth.test returned no user_id; "
+                f"refusing to start (self-filter would be disarmed)"
+            )
+            return
+        _log(
+            f"slack-poller[{self._agent_name}]: connected as {info.get('user', '?')} "
+            f"(id={self._bot_user_id}, team={info.get('team', '?')})"
+        )
 
         client = SocketModeClient(
             app_token=self._app_token,
@@ -912,8 +923,9 @@ class BrokerSlackPoller:
         # Self-filter: never act on our own bot's messages (no self-reply loop).
         if user_id and self._bot_user_id and user_id == self._bot_user_id:
             return
-        # Bot-authored message we can't dedupe against ourselves → skip.
-        if event.get("bot_id") and not user_id:
+        # Bot-authored message we can't safely dedupe against ourselves → drop
+        # (fail closed): either it has no user id, or we never resolved our own.
+        if event.get("bot_id") and (not user_id or not self._bot_user_id):
             return
 
         channel = event.get("channel", "") or ""
@@ -943,8 +955,6 @@ class BrokerSlackPoller:
             "channel_type": channel_type,
             "thread_ts": thread_ts,
         }
-        if attachments:
-            meta["attachments"] = attachments
 
         broker_msg = self._BrokerMessage(
             platform="slack",
@@ -983,15 +993,24 @@ class BrokerSlackPoller:
                 _log(f"slack-poller[{self._agent_name}]: event callback error: {e}")
 
     def stop(self) -> None:
-        """Stop listening and close the websocket."""
+        """Stop listening; schedule a best-effort close of the websocket.
+
+        Sync to match the generic shutdown loop (``for p in _broker_pollers:
+        p.stop()``). The close is scheduled via ``_deliver_in_background`` so the
+        task is strongly referenced (not GC'd mid-flight) and any close error is
+        logged rather than silently dropped.
+        """
         self._running = False
         _log(f"slack-poller[{self._agent_name}]: stopping")
         client = self._client
         if client is not None:
             try:
-                asyncio.create_task(client.close())
+                _deliver_in_background(
+                    client.close(), f"slack-poller[{self._agent_name}] close"
+                )
             except RuntimeError:
-                # No running loop (shutdown path) — best-effort close.
+                # Fallback only: stop() called from a sync/no-loop context — no
+                # loop to schedule the close on; the transport is reaped at exit.
                 pass
 
 
