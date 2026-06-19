@@ -1067,6 +1067,59 @@ except Exception:
 '''
 
 
+class AgentDbConfigError(RuntimeError):
+    """Raised when conversations_agents.db cannot be confirmed in the required
+    rollback-journal (TRUNCATE) mode. We refuse to run the agents DB on WAL —
+    the WAL ``-shm`` mmap is the SIGBUS fault surface (#797/#220)."""
+
+
+def _configure_agents_db_connection(
+    conn: sqlite3.Connection, *, retries: int = 6, busy_ms: int = 5000
+) -> str:
+    """Put the agents-DB connection into rollback (TRUNCATE) journal mode.
+
+    Why not WAL (#797/#220): the WAL wal-index ``-shm`` is always memory-mapped
+    in WAL mode. Under the daemon's long-lived registry connection plus the
+    per-request read-only signing-key resolver churn, that mapped ``-shm`` page
+    went stale and a SQLite pager read SIGBUS'd the daemon (``si_addr`` confirmed
+    inside ``conversations_agents.db-shm``; ``mmap_size=0`` was already set, so
+    the main-db is not mapped — the ``-shm`` is the inherent fault surface).
+    Rollback journal mode has no ``-shm`` at all, so the daemon never maps it.
+
+    Must run BEFORE table init and before any local MCP / agent-session resume
+    can spawn stdio children that hold the DB.
+
+    Fails LOUD: if the connection cannot be confirmed in ``truncate`` mode after
+    bounded retries, raises :class:`AgentDbConfigError` rather than silently
+    running on WAL. Returns the effective journal mode (``"truncate"``).
+    """
+    conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
+    last: str | None = None
+    for attempt in range(retries):
+        # If still on WAL, drain it first so no hot WAL content is stranded
+        # before the wal-index is dropped. Busy here is non-fatal — the mode
+        # switch below retries.
+        try:
+            cur = conn.execute("PRAGMA journal_mode").fetchone()
+            if cur and str(cur[0]).lower() == "wal":
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            row = conn.execute("PRAGMA journal_mode=TRUNCATE").fetchone()
+            last = str(row[0]).lower() if row else None
+            if last == "truncate":
+                return last
+        except sqlite3.OperationalError as exc:
+            last = f"error:{exc}"
+        time.sleep(0.2 * (attempt + 1))
+    raise AgentDbConfigError(
+        f"conversations_agents.db refused to leave WAL: journal_mode={last!r} "
+        f"after {retries} attempts — refusing to run on the WAL -shm SIGBUS "
+        f"surface (#797/#220)."
+    )
+
+
 class AgentRegistry:
     """SQLite-backed agent registry."""
 
@@ -1077,7 +1130,14 @@ class AgentRegistry:
         # signing-key lookup (#641) rather than relying on their cwd.
         self._db_path = str(Path(db_path).resolve())
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        # #797/#220: the agents DB runs in ROLLBACK (TRUNCATE) journal mode, NOT
+        # WAL. The WAL wal-index (-shm) is always mmap'd; under the long-lived
+        # registry connection + per-request RO signing-key resolver churn, that
+        # mapped -shm went stale and a SQLite pager read SIGBUS'd the daemon
+        # (si_addr confirmed inside conversations_agents.db-shm). Rollback mode
+        # has no -shm, so the daemon never maps it. Runs before _init_tables and
+        # before any MCP/session resume spawns stdio children. Agents DB only.
+        _configure_agents_db_connection(self._db)
         self._db.execute("PRAGMA foreign_keys=ON")
         # Guard read-modify-write sequences (e.g. peer_fleet_acl mutation)
         # from concurrent admin-API requests. SQLite connection is shared

@@ -192,6 +192,13 @@ def make_db_signing_key_resolver(db_path: str):
         if not agent_name or not db_path or not _name_re.fullmatch(agent_name):
             return None
         try:
+            # #797/#220: the agents DB is now rollback-journal (no WAL), so a
+            # read-only reader can hit SQLITE_BUSY while a writer holds the lock
+            # (WAL allowed concurrent read+write; rollback does not). timeout=5 is
+            # the busy_timeout (Python maps the connect timeout -> busy_timeout),
+            # so the SELECT waits up to 5s; on timeout the except below keeps the
+            # resolver fail-soft (None -> global-secret fallback), never raising
+            # into the request path.
             conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
             try:
                 row = conn.execute(
