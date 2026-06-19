@@ -45,6 +45,7 @@ def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
     return task
 
 if TYPE_CHECKING:
+    from pinky_outreach.slack import SlackAdapter
     from pinky_outreach.types import Chat
 
 
@@ -780,6 +781,218 @@ class BrokerDiscordPoller:
         """Stop the polling loop."""
         self._running = False
         _log(f"discord-poller[{self._agent_name}]: stopping")
+
+
+class BrokerSlackPoller:
+    """Slack Socket Mode listener for one agent's bot; routes to MessageBroker.
+
+    Unlike the Telegram/Discord pollers (long-poll / REST poll), Slack uses
+    Socket Mode: a persistent OUTBOUND WebSocket over which Slack pushes events,
+    so no public ingress is needed. First true push listener in the fleet.
+    Requires a bot token (xoxb-, identity + Web API) AND an app-level token
+    (xapp-, the Socket Mode connection). slack_sdk's SocketModeClient handles
+    reconnect, ping/pong, and the 3s envelope ACK.
+
+    Behaviour:
+      - ACKs every events_api envelope immediately, then processes async.
+      - Delivers `message` events to broker.handle_inbound(); skips message
+        subtypes (edits/joins/bot_message/etc.), our own messages (no self-reply
+        loop), and bot-authored messages with no user id. Peer bots/agents DO
+        reach us (cross-fleet parity with the Discord poller).
+      - Channel-agnostic: receives events for every channel/IM the app is
+        subscribed to (no per-channel discovery/polling).
+    """
+
+    def __init__(
+        self,
+        adapter: "SlackAdapter",
+        agent_name: str,
+        broker,  # MessageBroker
+        registry=None,  # AgentRegistry — reserved
+        *,
+        app_token: str,
+        event_callback=None,
+    ) -> None:
+        from pinky_daemon.broker import BrokerMessage, MessageBroker
+        self._BrokerMessage = BrokerMessage
+
+        self._adapter = adapter
+        self._agent_name = agent_name
+        self._broker: MessageBroker = broker
+        self._registry = registry
+        self._app_token = app_token
+        self._event_callback = event_callback
+        self._running = False
+        self._bot_user_id = ""
+        self._client = None  # slack_sdk SocketModeClient, created in start()
+
+    @property
+    def agent_name(self) -> str:
+        return self._agent_name
+
+    @property
+    def is_running(self) -> bool:
+        return self._running
+
+    async def start(self) -> None:
+        """Connect to Slack Socket Mode and stream events until stopped.
+
+        slack_sdk's ``connect()`` establishes the websocket and spawns its own
+        background tasks, then returns — the connection stays alive as long as
+        this poller (and thus ``self._client``) is referenced by the daemon.
+        """
+        if not self._app_token:
+            _log(f"slack-poller[{self._agent_name}]: no app_token set, not starting")
+            return
+        try:
+            from slack_sdk.socket_mode.aiohttp import SocketModeClient
+            from slack_sdk.socket_mode.response import SocketModeResponse
+            from slack_sdk.web.async_client import AsyncWebClient
+        except ImportError as e:
+            _log(
+                f"slack-poller[{self._agent_name}]: slack_sdk unavailable ({e}); "
+                f"install the 'slack' extra"
+            )
+            return
+
+        loop = asyncio.get_running_loop()
+        # Verify bot identity (auth.test via the sync httpx adapter) for self-filter.
+        try:
+            info = await loop.run_in_executor(None, self._adapter.get_bot_info)
+            self._bot_user_id = info.get("user_id", "") or ""
+            _log(
+                f"slack-poller[{self._agent_name}]: connected as "
+                f"{info.get('user', '?')} (id={self._bot_user_id}, "
+                f"team={info.get('team', '?')})"
+            )
+        except Exception as e:
+            _log(f"slack-poller[{self._agent_name}]: auth.test failed: {e}")
+            return
+
+        client = SocketModeClient(
+            app_token=self._app_token,
+            web_client=AsyncWebClient(token=self._adapter.bot_token),
+        )
+        self._client = client
+
+        async def _on_request(smc, req) -> None:
+            if req.type != "events_api":
+                return
+            # ACK FIRST — Slack redelivers the envelope if not acked within 3s.
+            try:
+                await smc.send_socket_mode_response(
+                    SocketModeResponse(envelope_id=req.envelope_id)
+                )
+            except Exception as e:
+                _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
+            try:
+                await self._handle_event(req.payload or {})
+            except Exception as e:
+                _log(f"slack-poller[{self._agent_name}]: handle_event error: {e!r}")
+
+        client.socket_mode_request_listeners.append(_on_request)
+
+        self._running = True
+        try:
+            await client.connect()
+            _log(f"slack-poller[{self._agent_name}]: socket mode connected, listening")
+        except Exception as e:
+            _log(f"slack-poller[{self._agent_name}]: connect failed: {e}")
+            self._running = False
+
+    async def _handle_event(self, payload: dict) -> None:
+        event = (payload or {}).get("event") or {}
+        if event.get("type") != "message":
+            return
+        # Only fresh user text — a normal message (incl. a thread reply) has no
+        # subtype; edits/deletes/joins/bot_message/etc. all carry one.
+        if event.get("subtype"):
+            return
+        user_id = event.get("user", "") or ""
+        # Self-filter: never act on our own bot's messages (no self-reply loop).
+        if user_id and self._bot_user_id and user_id == self._bot_user_id:
+            return
+        # Bot-authored message we can't dedupe against ourselves → skip.
+        if event.get("bot_id") and not user_id:
+            return
+
+        channel = event.get("channel", "") or ""
+        text = event.get("text", "") or ""
+        ts = event.get("ts", "") or ""
+        thread_ts = event.get("thread_ts", "") or ""
+        channel_type = event.get("channel_type", "")  # im | channel | group | mpim
+        is_group = channel_type != "im"
+        # TODO(parity): resolve a display name via users.info (needs users:read).
+        # sender_id carries the real id (what approval keys on); name is cosmetic.
+        sender_name = user_id or "unknown"
+
+        attachments = [
+            {
+                "type": "file",
+                "file_id": f.get("id", ""),
+                "file_name": f.get("name", ""),
+                "url": f.get("url_private_download", ""),
+                "mime_type": f.get("mimetype", ""),
+                "file_size": f.get("size", 0),
+            }
+            for f in (event.get("files") or [])
+        ]
+
+        meta = {
+            "user_id": user_id,
+            "channel_type": channel_type,
+            "thread_ts": thread_ts,
+        }
+        if attachments:
+            meta["attachments"] = attachments
+
+        broker_msg = self._BrokerMessage(
+            platform="slack",
+            chat_id=channel,
+            sender_name=sender_name,
+            sender_id=user_id,
+            content=text,
+            agent_name=self._agent_name,
+            message_id=ts,
+            chat_title="",
+            is_group=is_group,
+            reply_to=thread_ts,
+            metadata=meta,
+            attachments=attachments,
+        )
+
+        _log(
+            f"slack-poller[{self._agent_name}]: message from {sender_name} "
+            f"in {channel}: {text[:50]}"
+        )
+
+        _deliver_in_background(
+            self._broker.handle_inbound(broker_msg),
+            f"slack-poller[{self._agent_name}]",
+        )
+
+        if self._event_callback:
+            try:
+                await self._event_callback(
+                    platform="slack",
+                    chat_id=str(channel),
+                    sender=sender_name,
+                    content=text,
+                )
+            except Exception as e:
+                _log(f"slack-poller[{self._agent_name}]: event callback error: {e}")
+
+    def stop(self) -> None:
+        """Stop listening and close the websocket."""
+        self._running = False
+        _log(f"slack-poller[{self._agent_name}]: stopping")
+        client = self._client
+        if client is not None:
+            try:
+                asyncio.create_task(client.close())
+            except RuntimeError:
+                # No running loop (shutdown path) — best-effort close.
+                pass
 
 
 def _log(msg: str) -> None:
