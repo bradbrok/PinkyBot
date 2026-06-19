@@ -2245,6 +2245,7 @@ local-embeddings = [
     { name = "sentence-transformers" },
 ]
 slack = [
+    { name = "aiohttp" },
     { name = "slack-sdk" },
 ]
 telegram = [
@@ -2269,6 +2270,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
+    { name = "aiohttp", marker = "extra == 'slack'", specifier = ">=3.9" },
     { name = "anthropic", marker = "extra == 'voice'", specifier = ">=0.98" },
     { name = "beautifulsoup4", marker = "extra == 'web'", specifier = ">=4.12" },
     { name = "caldav", marker = "extra == 'calendar'", specifier = ">=1.3" },

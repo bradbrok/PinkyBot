@@ -52,7 +52,8 @@ dependencies = [
 [project.optional-dependencies]
 telegram = ["python-telegram-bot[webhooks]>=21.0"]
 discord = ["discord.py>=2.3"]
-slack = ["slack-sdk>=3.0"]
+# slack-sdk's async Socket Mode client (slack_sdk.socket_mode.aiohttp) needs aiohttp.
+slack = ["slack-sdk>=3.0", "aiohttp>=3.9"]
 google = ["google-auth>=2.0", "google-api-python-client>=2.0"]
 calendar = [
     "google-api-python-client>=2.0",

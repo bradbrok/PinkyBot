@@ -794,11 +794,16 @@ class BrokerSlackPoller:
     reconnect, ping/pong, and the 3s envelope ACK.
 
     Behaviour:
-      - ACKs every events_api envelope immediately, then processes async.
-      - Delivers `message` events to broker.handle_inbound(); skips message
-        subtypes (edits/joins/bot_message/etc.), our own messages (no self-reply
-        loop), and bot-authored messages with no user id. Peer bots/agents DO
-        reach us (cross-fleet parity with the Discord poller).
+      - ACKs every Socket Mode envelope (events_api / slash_commands /
+        interactive) immediately, then processes async; non-message envelopes
+        are acked and dropped (only message events are wired up for #224).
+      - Delivers `message` events to broker.handle_inbound(): plain user text
+        AND bot-authored text (the `bot_message` subtype), so peer agents/bots
+        reach us (parity with the Discord poller). Our own messages are
+        self-filtered by user_id and bot_id (no self-reply loop); all other
+        subtypes (edits/joins/topic/…) are skipped. Fail-closed: a bot message
+        we can't distinguish from our own (bot_id present, our bot_id
+        unresolved) is dropped.
       - Channel-agnostic: receives events for every channel/IM the app is
         subscribed to (no per-channel discovery/polling).
     """
@@ -824,6 +829,7 @@ class BrokerSlackPoller:
         self._event_callback = event_callback
         self._running = False
         self._bot_user_id = ""
+        self._bot_id = ""  # our own bot_id (from auth.test) — filters our bot_message echoes
         self._client = None  # slack_sdk SocketModeClient, created in start()
 
     @property
@@ -875,9 +881,10 @@ class BrokerSlackPoller:
                 f"refusing to start (self-filter would be disarmed)"
             )
             return
+        self._bot_id = info.get("bot_id", "") or ""
         _log(
             f"slack-poller[{self._agent_name}]: connected as {info.get('user', '?')} "
-            f"(id={self._bot_user_id}, team={info.get('team', '?')})"
+            f"(id={self._bot_user_id}, bot_id={self._bot_id or '?'}, team={info.get('team', '?')})"
         )
 
         client = SocketModeClient(
@@ -887,15 +894,27 @@ class BrokerSlackPoller:
         self._client = client
 
         async def _on_request(smc, req) -> None:
+            # ACK FIRST — every Socket Mode request envelope (events_api,
+            # slash_commands, interactive, …) carries an envelope_id and must be
+            # acked within 3s or Slack redelivers it. (Control frames like
+            # hello/disconnect have no envelope_id and don't reach this listener.)
+            envelope_id = getattr(req, "envelope_id", None)
+            if envelope_id:
+                try:
+                    await smc.send_socket_mode_response(
+                        SocketModeResponse(envelope_id=envelope_id)
+                    )
+                except Exception as e:
+                    _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
+            # Only message events are wired up for #224; other (already-acked)
+            # envelope types are dropped so Slack doesn't keep retrying them.
             if req.type != "events_api":
+                if req.type:
+                    _log(
+                        f"slack-poller[{self._agent_name}]: dropping non-events_api "
+                        f"envelope ({req.type})"
+                    )
                 return
-            # ACK FIRST — Slack redelivers the envelope if not acked within 3s.
-            try:
-                await smc.send_socket_mode_response(
-                    SocketModeResponse(envelope_id=req.envelope_id)
-                )
-            except Exception as e:
-                _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
             try:
                 await self._handle_event(req.payload or {})
             except Exception as e:
@@ -915,17 +934,27 @@ class BrokerSlackPoller:
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
             return
-        # Only fresh user text — a normal message (incl. a thread reply) has no
-        # subtype; edits/deletes/joins/bot_message/etc. all carry one.
-        if event.get("subtype"):
+        # Keep fresh text only: a normal message (incl. a thread reply) has no
+        # subtype, and bot-authored messages carry the `bot_message` subtype —
+        # both are real inbound and must reach us (peer-agent parity with the
+        # Discord poller). Every other subtype (edits/deletes/joins/topic/…) is
+        # non-fresh → drop.
+        subtype = event.get("subtype") or ""
+        if subtype and subtype != "bot_message":
             return
         user_id = event.get("user", "") or ""
+        bot_id = event.get("bot_id", "") or ""
         # Self-filter: never act on our own bot's messages (no self-reply loop).
+        # Our own text surfaces as our user_id (rare) or — for bot-posted text —
+        # our bot_id; drop on either match.
         if user_id and self._bot_user_id and user_id == self._bot_user_id:
             return
-        # Bot-authored message we can't safely dedupe against ourselves → drop
-        # (fail closed): either it has no user id, or we never resolved our own.
-        if event.get("bot_id") and (not user_id or not self._bot_user_id):
+        if bot_id and self._bot_id and bot_id == self._bot_id:
+            return
+        # Fail closed: a bot-authored message we can't distinguish from our own
+        # (it has a bot_id but we never resolved our own bot_id) could be our own
+        # echo → drop rather than risk a self-reply loop.
+        if bot_id and not self._bot_id:
             return
 
         channel = event.get("channel", "") or ""
@@ -934,9 +963,11 @@ class BrokerSlackPoller:
         thread_ts = event.get("thread_ts", "") or ""
         channel_type = event.get("channel_type", "")  # im | channel | group | mpim
         is_group = channel_type != "im"
-        # TODO(parity): resolve a display name via users.info (needs users:read).
-        # sender_id carries the real id (what approval keys on); name is cosmetic.
-        sender_name = user_id or "unknown"
+        # Identity: humans carry `user`; bot-authored messages carry `bot_id`
+        # (and often `username`). sender_id is what approval keys on; name is
+        # cosmetic. TODO(parity): resolve a display name via users.info (users:read).
+        sender_id = user_id or bot_id
+        sender_name = user_id or event.get("username", "") or bot_id or "unknown"
 
         attachments = [
             {
@@ -952,6 +983,7 @@ class BrokerSlackPoller:
 
         meta = {
             "user_id": user_id,
+            "bot_id": bot_id,
             "channel_type": channel_type,
             "thread_ts": thread_ts,
         }
@@ -960,7 +992,7 @@ class BrokerSlackPoller:
             platform="slack",
             chat_id=channel,
             sender_name=sender_name,
-            sender_id=user_id,
+            sender_id=sender_id,
             content=text,
             agent_name=self._agent_name,
             message_id=ts,

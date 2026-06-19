@@ -23,15 +23,18 @@ def mock_broker():
     return broker
 
 
-def _make_poller(broker, *, app_token="xapp-test", bot_user_id="UBOT"):
+def _make_poller(broker, *, app_token="xapp-test", bot_user_id="UBOT", bot_id="B_SELF"):
     from pinky_daemon.pollers import BrokerSlackPoller
 
     adapter = MagicMock()
-    adapter.get_bot_info.return_value = {"user_id": "UBOT", "user": "testbot", "team": "T1"}
+    adapter.get_bot_info.return_value = {
+        "user_id": "UBOT", "bot_id": "B_SELF", "user": "testbot", "team": "T1",
+    }
     adapter.bot_token = "xoxb-test"
     poller = BrokerSlackPoller(adapter, "barsik", broker, registry=None, app_token=app_token)
     # Normally set during start() from auth.test; set directly for unit tests.
     poller._bot_user_id = bot_user_id
+    poller._bot_id = bot_id
     return poller
 
 
@@ -84,11 +87,41 @@ class TestBrokerSlackPoller:
         mock_broker.handle_inbound.assert_not_called()
 
     @pytest.mark.asyncio
-    async def test_bot_message_without_user_filtered(self, mock_broker):
-        poller = _make_poller(mock_broker)
+    async def test_peer_bot_message_delivered(self, mock_broker):
+        """A peer agent/bot (bot_message subtype, different bot_id) must reach us
+        (parity with the Discord poller)."""
+        poller = _make_poller(mock_broker, bot_id="B_SELF")
         await poller._handle_event(_event({
-            "type": "message", "bot_id": "B999", "text": "from a bot",
-            "channel": "C1", "ts": "1.1",
+            "type": "message", "subtype": "bot_message", "bot_id": "B_PEER",
+            "username": "peerbot", "text": "from a peer agent",
+            "channel": "C1", "channel_type": "channel", "ts": "1.1",
+        }))
+        await asyncio.sleep(0)
+        mock_broker.handle_inbound.assert_called_once()
+        bmsg = mock_broker.handle_inbound.call_args[0][0]
+        assert bmsg.sender_id == "B_PEER"  # bot_id used as sender id when no user
+        assert bmsg.content == "from a peer agent"
+
+    @pytest.mark.asyncio
+    async def test_own_bot_message_filtered(self, mock_broker):
+        """Our own bot's posts echo back as bot_message with our bot_id — drop
+        them (no self-reply loop)."""
+        poller = _make_poller(mock_broker, bot_id="B_SELF")
+        await poller._handle_event(_event({
+            "type": "message", "subtype": "bot_message", "bot_id": "B_SELF",
+            "text": "my own bot echo", "channel": "C1", "ts": "1.1",
+        }))
+        await asyncio.sleep(0)
+        mock_broker.handle_inbound.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_bot_message_dropped_when_self_bot_id_unknown(self, mock_broker):
+        """Fail closed: if we never resolved our own bot_id, we can't tell a peer
+        bot from our own echo, so drop all bot messages."""
+        poller = _make_poller(mock_broker, bot_id="")
+        await poller._handle_event(_event({
+            "type": "message", "subtype": "bot_message", "bot_id": "B_PEER",
+            "text": "from a bot", "channel": "C1", "ts": "1.1",
         }))
         await asyncio.sleep(0)
         mock_broker.handle_inbound.assert_not_called()
@@ -239,9 +272,11 @@ class TestBrokerSlackPoller:
 
         poller = _make_poller(mock_broker)
         poller._bot_user_id = ""  # let start() populate it from get_bot_info
+        poller._bot_id = ""
         await poller.start()
 
         assert poller._bot_user_id == "UBOT"
+        assert poller._bot_id == "B_SELF"
         assert poller._running is True
         assert poller._client is not None
         assert poller._client.connected is True
@@ -265,8 +300,10 @@ class TestBrokerSlackPoller:
         mock_broker.handle_inbound.assert_called_once()
 
     @pytest.mark.asyncio
-    async def test_non_events_api_request_ignored_by_listener(self, monkeypatch, mock_broker):
-        """The listener must ignore non-events_api envelopes (no ACK, no routing)."""
+    async def test_non_events_api_request_acked_but_not_routed(self, monkeypatch, mock_broker):
+        """A non-events_api envelope that carries an envelope_id (slash command /
+        interactive) must still be ACKed — so Slack stops retrying it — but must
+        NOT be routed to the broker (only message events are wired up)."""
 
         class FakeSocketModeClient:
             def __init__(self, app_token=None, web_client=None):
@@ -298,9 +335,13 @@ class TestBrokerSlackPoller:
         poller = _make_poller(mock_broker)
         await poller.start()
         listener = poller._client.socket_mode_request_listeners[0]
+
+        # slash_commands envelope: has an envelope_id → ACK, but don't route.
         req = MagicMock()
-        req.type = "hello"  # not events_api
+        req.type = "slash_commands"
+        req.envelope_id = "env-slash"
         await listener(poller._client, req)
         await asyncio.sleep(0)
-        assert poller._client.responses == []
-        mock_broker.handle_inbound.assert_not_called()
+        assert len(poller._client.responses) == 1
+        assert poller._client.responses[0].envelope_id == "env-slash"  # ACKed
+        mock_broker.handle_inbound.assert_not_called()  # not routed
