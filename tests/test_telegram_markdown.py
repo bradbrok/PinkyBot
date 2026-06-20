@@ -175,7 +175,106 @@ class TestBlockquoteWithInlineCode:
             "```python\nprint('hi')\n```",
             "# heading\n> quoted with `code`",
             "Visit [link](https://example.com) and run `cmd`.",
+            "secret ||token||",
+            ">! collapsed digest line",
+            ">! line one\n>! line two\n>! line three",
         ]
         for src in samples:
             result = md_to_tg_mdv2(src)
             assert "\x00" not in result, f"null byte leaked for: {src!r} → {result!r}"
+
+
+class TestSpoiler:
+    """``||text||`` → MarkdownV2 spoiler (tap-to-reveal)."""
+
+    def test_basic_spoiler(self):
+        result = md_to_tg_mdv2("The password is ||hunter2||")
+        # Spoiler delimiters survive un-escaped; inner text is intact.
+        assert "||hunter2||" in result
+        assert "\\|" not in result  # pipes not backslash-escaped
+        assert "\x00" not in result
+
+    def test_spoiler_inner_specials_escaped(self):
+        # Inner content is still escaped so MarkdownV2 stays valid.
+        result = md_to_tg_mdv2("||a.b!||")
+        assert "||a\\.b\\!||" in result
+
+    def test_two_spoilers_independent(self):
+        result = md_to_tg_mdv2("||a|| and ||b||")
+        assert "||a||" in result
+        assert "||b||" in result
+
+    def test_single_pipe_is_not_a_spoiler(self):
+        # A lone pipe (e.g. a table cell) must not start a spoiler; it is
+        # just an escaped special character.
+        result = md_to_tg_mdv2("col a | col b")
+        assert "||" not in result
+        assert "\\|" in result  # the single pipe is escaped
+
+    def test_spoiler_inside_code_untouched(self):
+        result = md_to_tg_mdv2("use `a||b` here")
+        assert "`a||b`" in result
+
+    def test_spoiler_with_surrounding_formatting(self):
+        result = md_to_tg_mdv2("**bold** then ||secret|| then *ital*")
+        assert "*bold*" in result
+        assert "||secret||" in result
+        assert "_ital_" in result
+        assert "\x00" not in result
+
+
+class TestExpandableBlockquote:
+    """Lines prefixed with ``>!`` → a collapsed-by-default expandable quote."""
+
+    def test_single_line_expandable(self):
+        result = md_to_tg_mdv2(">! just one collapsed line")
+        # First line opens with **> and the block ends with the || mark.
+        assert result.startswith("**>")
+        assert result.endswith("||")
+        assert "just one collapsed line" in result
+        assert "\x00" not in result
+
+    def test_multi_line_expandable(self):
+        result = md_to_tg_mdv2(">! line one\n>! line two\n>! line three")
+        assert result.startswith("**>line one")
+        # Middle/last lines are plain blockquote lines; last carries the mark.
+        assert "\n>line two" in result
+        assert result.endswith(">line three||")
+        assert "\x00" not in result
+
+    def test_expandable_then_normal_text(self):
+        # The block ends at the last >! line; following text stays separate.
+        result = md_to_tg_mdv2(">! collapsed digest\n>! more\nnormal after")
+        assert result.startswith("**>collapsed digest")
+        assert "||" in result
+        assert result.endswith("normal after")
+        assert "\x00" not in result
+
+    def test_expandable_inner_specials_escaped(self):
+        result = md_to_tg_mdv2(">! cost is $9.99!")
+        assert "\\." in result
+        assert "\\!" in result
+        assert result.startswith("**>")
+        assert result.endswith("||")
+
+    def test_normal_blockquote_unaffected_by_expandable_support(self):
+        # A regular '>' quote must NOT become expandable.
+        result = md_to_tg_mdv2("> regular quote\n> second line")
+        assert "**>" not in result
+        assert not result.endswith("||")
+        assert result.startswith(">")
+
+    def test_empty_marker_does_not_emit_malformed_quote(self):
+        # A bare '>!' (or '>! ') has no content; Telegram's expandable
+        # blockquote requires non-empty content, so we must NOT emit '**>||'.
+        for src in (">!", ">! "):
+            result = md_to_tg_mdv2(src)
+            assert "**>" not in result, f"malformed empty-body quote for {src!r}: {result!r}"
+            assert not result.endswith("||")
+            assert "\x00" not in result
+
+    def test_blank_expandable_lines_are_dropped(self):
+        # A blank '>!' line is dropped rather than rendered as an empty quote
+        # line, and a leading blank collapses to a single-line expandable.
+        assert md_to_tg_mdv2(">! a\n>!\n>! b") == "**>a\n>b||"
+        assert md_to_tg_mdv2(">!\n>! second") == "**>second||"

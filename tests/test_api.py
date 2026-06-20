@@ -2404,6 +2404,148 @@ class TestAPI:
                         f"{url} leaked raw file_path value into metadata payload"
                     )
 
+    def test_broker_send_photo_threads_caption_format_and_spoiler(self):
+        """/broker/send-photo formats the caption (MarkdownV2) and forwards
+        has_spoiler / show_caption_above_media to the adapter."""
+        from datetime import datetime, timezone
+
+        from pinky_outreach.telegram import TelegramAdapter
+        from pinky_outreach.types import Message, Platform
+
+        sent = Message(
+            platform=Platform.telegram, chat_id="6770805286", sender="bot",
+            content="x", timestamp=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            message_id="42", is_outbound=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                with patch.object(TelegramAdapter, "send_photo", return_value=sent) as mock_photo:
+                    resp = client.post(
+                        "/broker/send-photo",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "file_path": "/tmp/chart.png",
+                            "caption": "**bold** and ||secret||",
+                            "has_spoiler": True,
+                            "show_caption_above_media": True,
+                        },
+                    )
+                assert resp.status_code == 200, resp.text
+                kwargs = mock_photo.call_args.kwargs
+                assert kwargs["caption_parse_mode"] == "MarkdownV2"
+                assert kwargs["has_spoiler"] is True
+                assert kwargs["show_caption_above_media"] is True
+                # Caption was run through the MarkdownV2 converter, not sent raw.
+                assert "*bold*" in kwargs["caption"]
+                assert "||secret||" in kwargs["caption"]
+                assert "**bold**" not in kwargs["caption"]
+
+    def test_broker_send_threads_link_preview_options(self):
+        """/broker/send forwards link_preview_options to the adapter."""
+        from datetime import datetime, timezone
+
+        from pinky_outreach.telegram import TelegramAdapter
+        from pinky_outreach.types import Message, Platform
+
+        sent = Message(
+            platform=Platform.telegram, chat_id="6770805286", sender="bot",
+            content="x", timestamp=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            message_id="43", is_outbound=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                with patch.object(TelegramAdapter, "send_message", return_value=sent) as mock_send:
+                    resp = client.post(
+                        "/broker/send",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "content": "see https://example.com",
+                            "link_preview_options": {"is_disabled": True},
+                        },
+                    )
+                assert resp.status_code == 200, resp.text
+                assert mock_send.call_args.kwargs["link_preview_options"] == {"is_disabled": True}
+
+    def test_broker_send_photo_strict_bool_rejects_string_false(self):
+        """A JSON string "false" must NOT enable has_spoiler — bool("false") is
+        True, so the route must use strict identity (json-gate/bool-is-int)."""
+        from datetime import datetime, timezone
+
+        from pinky_outreach.telegram import TelegramAdapter
+        from pinky_outreach.types import Message, Platform
+
+        sent = Message(
+            platform=Platform.telegram, chat_id="6770805286", sender="bot",
+            content="x", timestamp=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            message_id="44", is_outbound=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                with patch.object(TelegramAdapter, "send_photo", return_value=sent) as mock_photo:
+                    resp = client.post(
+                        "/broker/send-photo",
+                        json={
+                            "agent_name": "barsik", "platform": "telegram",
+                            "chat_id": "6770805286", "file_path": "/tmp/x.png",
+                            "has_spoiler": "false", "show_caption_above_media": "false",
+                        },
+                    )
+                assert resp.status_code == 200, resp.text
+                kwargs = mock_photo.call_args.kwargs
+                assert kwargs["has_spoiler"] is False
+                assert kwargs["show_caption_above_media"] is False
+
+    def test_broker_send_drops_link_preview_url_injection(self):
+        """The model-controlled url override is stripped; only the bool
+        preview-shape flags reach Telegram (defense-in-depth)."""
+        from datetime import datetime, timezone
+
+        from pinky_outreach.telegram import TelegramAdapter
+        from pinky_outreach.types import Message, Platform
+
+        sent = Message(
+            platform=Platform.telegram, chat_id="6770805286", sender="bot",
+            content="x", timestamp=datetime(2026, 6, 20, tzinfo=timezone.utc),
+            message_id="45", is_outbound=True,
+        )
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                with patch.object(TelegramAdapter, "send_message", return_value=sent) as mock_send:
+                    resp = client.post(
+                        "/broker/send",
+                        json={
+                            "agent_name": "barsik", "platform": "telegram",
+                            "chat_id": "6770805286", "content": "hi",
+                            "link_preview_options": {
+                                "url": "https://attacker.example",
+                                "is_disabled": True,
+                                "show_above_text": False,
+                            },
+                        },
+                    )
+                assert resp.status_code == 200, resp.text
+                # url dropped (injection vector); False flag dropped; only the
+                # explicitly-True bool survives.
+                assert mock_send.call_args.kwargs["link_preview_options"] == {"is_disabled": True}
+
     def test_broker_send_document_404_on_telegram_error_returns_structured_502(self):
         """Issue #395 regression: when the Telegram client raises (e.g. 400 Bad Request
         on sendDocument), the broker route must translate it to a structured 502 instead

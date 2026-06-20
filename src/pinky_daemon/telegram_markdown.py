@@ -39,11 +39,19 @@ _ITALIC_STAR_RE = re.compile(r'(?<!\*)\*([^*]+?)\*(?!\*)')
 _STRIKE_RE = re.compile(r'~~(.+?)~~')
 _LINK_RE = re.compile(r'\[([^\]]+)\]\(([^)]+)\)')
 _BLOCKQUOTE_RE = re.compile(r'^(>{1,})\s?(.*)$', re.MULTILINE)
+# Spoiler: ``||hidden||`` → MarkdownV2 spoiler (tap-to-reveal). Non-greedy so
+# ``||a|| ||b||`` yields two spoilers, not one spanning both.
+_SPOILER_RE = re.compile(r'\|\|(.+?)\|\|')
+# Expandable blockquote: a contiguous run of lines each prefixed with ``>!``
+# becomes one collapsed-by-default quote (Bot API 7.4). Block-level, so it is
+# stashed before the per-line blockquote step (which would otherwise eat the
+# ``>`` and leave a literal ``!``).
+_EXPANDABLE_BQ_RE = re.compile(r'(?:^>![^\n]*(?:\n|$))+', re.MULTILINE)
 
 # Single regex that matches every placeholder sentinel we emit during the
 # transform. The two-letter prefix selects the placeholder kind; the
 # trailing index is shared across kinds (one flat list).
-_PLACEHOLDER_RE = re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK|BQ)(\d+)\x00')
+_PLACEHOLDER_RE = re.compile(r'\x00(CB|IC|HD|BD|ST|IT|IS|LK|BQ|SP|XB)(\d+)\x00')
 
 # Bounded restore-loop depth. The actual loop terminates as soon as a pass
 # is a no-op (``new_text == text``); this cap is purely a runaway guard.
@@ -68,7 +76,13 @@ def md_to_tg_mdv2(text: str) -> str:
 
     Handles bold, italic, strikethrough, inline code, fenced code blocks,
     headings (rendered as bold — Telegram has no native heading), links,
-    and blockquotes. Escapes all other special characters outside entities.
+    blockquotes, spoilers, and expandable blockquotes. Escapes all other
+    special characters outside entities.
+
+    Two PinkyBot-flavoured conventions extend standard Markdown:
+      * ``||text||`` → a tap-to-reveal spoiler.
+      * Lines prefixed with ``>!`` → a collapsed-by-default expandable
+        blockquote (ideal for long digests behind a single tap).
 
     Args:
         text: Standard markdown source.
@@ -96,6 +110,46 @@ def md_to_tg_mdv2(text: str) -> str:
         placeholders.append(f"`{m.group(1)}`")
         return f"\x00IC{idx}\x00"
     text = _INLINE_CODE_RE.sub(save_inline_code, text)
+
+    # Step 2b: expandable blockquotes. A run of ``>!`` lines collapses into one
+    # tap-to-expand quote. Built here (first line ``**>``, last line suffixed
+    # ``||``) and stashed whole so the per-line blockquote step never sees it.
+    # Inner text is escaped verbatim (no nested entities inside expandables).
+    def save_expandable_bq(m: re.Match) -> str:
+        block = m.group(0)
+        trailing_nl = "\n" if block.endswith("\n") else ""
+        bodies: list[str] = []
+        for line in block.rstrip("\n").split("\n"):
+            body = line[2:]  # strip leading '>!'
+            if body.startswith(" "):
+                body = body[1:]  # and at most one cosmetic space
+            if body:  # drop blank '>!' lines — an empty quote line is malformed
+                bodies.append(_escape(body))
+        idx = len(placeholders)
+        if not bodies:
+            # Only blank '>!' markers: emit the raw block escaped as plain text
+            # rather than a malformed empty-body expandable quote ('**>||').
+            placeholders.append(_escape(block.rstrip("\n")))
+            return f"\x00XB{idx}\x00{trailing_nl}"
+        if len(bodies) == 1:
+            built = f"**>{bodies[0]}||"
+        else:
+            built = f"**>{bodies[0]}\n"
+            if len(bodies) > 2:
+                built += "\n".join(f">{b}" for b in bodies[1:-1]) + "\n"
+            built += f">{bodies[-1]}||"
+        placeholders.append(built)
+        return f"\x00XB{idx}\x00{trailing_nl}"
+    text = _EXPANDABLE_BQ_RE.sub(save_expandable_bq, text)
+
+    # Step 2c: spoilers — ``||hidden||`` → MarkdownV2 spoiler. Stashed before
+    # the general escape so the literal ``||`` delimiters survive; inner text
+    # is escaped.
+    def save_spoiler(m: re.Match) -> str:
+        idx = len(placeholders)
+        placeholders.append(f"||{_escape(m.group(1))}||")
+        return f"\x00SP{idx}\x00"
+    text = _SPOILER_RE.sub(save_spoiler, text)
 
     # Step 3: headings → bold (TG has no heading support).
     def save_heading(m: re.Match) -> str:

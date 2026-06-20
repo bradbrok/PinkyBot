@@ -1406,6 +1406,21 @@ def create_api(
             return str(result.get("message_id") or result.get("ts") or result.get("id") or "")
         return str(result) if result else ""
 
+    def _sanitize_link_preview_options(raw) -> dict | None:
+        """Fail-closed allowlist for caller/model-controlled LinkPreviewOptions.
+
+        Only the boolean preview-shape fields are forwarded to Telegram. The
+        free-form ``url`` override is dropped on purpose — a prompt-injected
+        model could use it to render an arbitrary preview card on an outbound
+        message — as is any non-``True`` value (False == Telegram's default ==
+        omit). Returns None when nothing valid remains.
+        """
+        if not isinstance(raw, dict):
+            return None
+        allowed = ("is_disabled", "prefer_large_media", "prefer_small_media", "show_above_text")
+        clean = {k: v for k, v in raw.items() if k in allowed and v is True}
+        return clean or None
+
     def _send_text_message(
         agent_name: str,
         platform: str,
@@ -1415,8 +1430,14 @@ def create_api(
         reply_to: str = "",
         parse_mode: str = "",
         silent: bool = False,
+        link_preview_options: dict | None = None,
     ) -> SimpleNamespace:
-        """Send a text message and return SimpleNamespace(message_id=...)."""
+        """Send a text message and return SimpleNamespace(message_id=...).
+
+        ``link_preview_options`` (Telegram only) is the Bot API 7.0
+        ``LinkPreviewOptions`` object controlling the URL preview card; it is
+        ignored on other platforms.
+        """
         # iMessage has its own adapter factory; the generic lookup below
         # never constructs one and would 503 before this branch could run.
         if platform == "imessage":
@@ -1476,6 +1497,7 @@ def create_api(
                     reply_to_message_id=reply_to_id,
                     parse_mode=parse_mode,
                     disable_notification=silent,
+                    link_preview_options=link_preview_options,
                 )
                 return SimpleNamespace(message_id=_extract_message_id(result))
             try:
@@ -1486,6 +1508,7 @@ def create_api(
                     reply_to_message_id=reply_to_id,
                     parse_mode="MarkdownV2",
                     disable_notification=silent,
+                    link_preview_options=link_preview_options,
                 )
                 return SimpleNamespace(message_id=_extract_message_id(result))
             except Exception as e:
@@ -1495,6 +1518,7 @@ def create_api(
                     content,
                     reply_to_message_id=reply_to_id,
                     disable_notification=silent,
+                    link_preview_options=link_preview_options,
                 )
                 return SimpleNamespace(message_id=_extract_message_id(result))
 
@@ -1517,22 +1541,60 @@ def create_api(
         caption: str = "",
         reply_to: str = "",
         kind: str = "document",
+        has_spoiler: bool = False,
+        show_caption_above_media: bool = False,
     ) -> SimpleNamespace:
-        """Send a file/media message and return SimpleNamespace(message_id=...)."""
+        """Send a file/media message and return SimpleNamespace(message_id=...).
+
+        On Telegram the caption is formatted like the text path (converted to
+        MarkdownV2, with a plain-text fallback if Telegram rejects it), so media
+        captions get the same bold/italic/links/spoilers as ordinary messages.
+        ``has_spoiler`` / ``show_caption_above_media`` apply to visual media only
+        (photo/animation/video); they are not forwarded for documents.
+        """
         adapter = _get_platform_adapter(agent_name, platform)
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name}")
 
         if platform == "telegram":
             reply_to_id = int(reply_to) if reply_to else None
-            if kind == "photo":
-                result = adapter.send_photo(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
-            elif kind == "animation":
-                result = adapter.send_animation(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
-            elif kind == "video":
-                result = adapter.send_video(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
+
+            def _dispatch(cap: str, cap_pm: str | None):
+                if kind == "photo":
+                    return adapter.send_photo(
+                        chat_id, file_path, caption=cap, reply_to_message_id=reply_to_id,
+                        caption_parse_mode=cap_pm, has_spoiler=has_spoiler,
+                        show_caption_above_media=show_caption_above_media,
+                    )
+                if kind == "animation":
+                    return adapter.send_animation(
+                        chat_id, file_path, caption=cap, reply_to_message_id=reply_to_id,
+                        caption_parse_mode=cap_pm, has_spoiler=has_spoiler,
+                        show_caption_above_media=show_caption_above_media,
+                    )
+                if kind == "video":
+                    return adapter.send_video(
+                        chat_id, file_path, caption=cap, reply_to_message_id=reply_to_id,
+                        caption_parse_mode=cap_pm, has_spoiler=has_spoiler,
+                        show_caption_above_media=show_caption_above_media,
+                    )
+                return adapter.send_document(
+                    chat_id, file_path, caption=cap, reply_to_message_id=reply_to_id,
+                    caption_parse_mode=cap_pm,
+                )
+
+            if caption:
+                try:
+                    result = _dispatch(_md_to_tg_mdv2(caption), "MarkdownV2")
+                except FileNotFoundError:
+                    # Caller-side bad path — no send happened; let the route
+                    # bucket it as `rejected` instead of masking it with a retry.
+                    raise
+                except Exception as e:
+                    _log(f"broker-send-file: MarkdownV2 caption failed ({e}), trying plain")
+                    result = _dispatch(caption, None)
             else:
-                result = adapter.send_document(chat_id, file_path, caption=caption, reply_to_message_id=reply_to_id)
+                result = _dispatch(caption, None)
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         if platform == "discord":
@@ -1554,6 +1616,7 @@ def create_api(
         reply_to: str = "",
         parse_mode: str = "",
         silent: bool = False,
+        link_preview_options: dict | None = None,
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         loop = asyncio.get_running_loop()
@@ -1569,6 +1632,7 @@ def create_api(
                     reply_to=reply_to,
                     parse_mode=parse_mode,
                     silent=silent,
+                    link_preview_options=link_preview_options,
                 ),
             )
             # Once an outbound message lands, the typing indicator becomes noise —
@@ -1663,6 +1727,7 @@ def create_api(
         model: str = "",
         reply_to: str = "",
         include_text_copy: bool = False,
+        link_preview_options: dict | None = None,
     ) -> dict:
         """Generate TTS audio and send it as a voice message."""
         if platform != "telegram":
@@ -1770,7 +1835,10 @@ def create_api(
                     "chat_id": chat_id,
                 }
                 if include_text_copy:
-                    text_msg = _send_text_message(agent_name, platform, chat_id, text, reply_to=reply_to)
+                    text_msg = _send_text_message(
+                        agent_name, platform, chat_id, text, reply_to=reply_to,
+                        link_preview_options=link_preview_options,
+                    )
                     result["text_message_id"] = text_msg.message_id
                 return result
             finally:
@@ -7448,6 +7516,7 @@ npm run build</pre>
         content = req.get("content", "")
         reply_to = req.get("reply_to", "")
         parse_mode = req.get("parse_mode", "")
+        link_preview_options = _sanitize_link_preview_options(req.get("link_preview_options"))
         if not agent_name or not chat_id or not content:
             raise HTTPException(400, "agent_name, chat_id, and content are required")
         _deny_isolated_cross_actor(request, agent_name)
@@ -7459,6 +7528,7 @@ npm run build</pre>
                 content,
                 reply_to=reply_to,
                 parse_mode=parse_mode,
+                link_preview_options=link_preview_options,
             )
         except HTTPException:
             raise
@@ -7485,6 +7555,7 @@ npm run build</pre>
         source_message_id = req.get("message_id", "")
         content = req.get("content", "").strip()
         parse_mode = req.get("parse_mode", "")
+        link_preview_options = _sanitize_link_preview_options(req.get("link_preview_options"))
         if not agent_name or not source_message_id or not content:
             raise HTTPException(400, "agent_name, message_id, and content are required")
         _deny_isolated_cross_actor(request, agent_name)
@@ -7503,6 +7574,7 @@ npm run build</pre>
                 model=voice_settings["model"],
                 reply_to=ctx.message_id,
                 include_text_copy=True,
+                link_preview_options=link_preview_options,
             )
             _record_outbound_message(
                 agent_name,
@@ -7525,6 +7597,7 @@ npm run build</pre>
             content,
             reply_to=ctx.message_id,
             parse_mode=parse_mode,
+            link_preview_options=link_preview_options,
         )
         _record_outbound_message(
             agent_name,
@@ -7643,6 +7716,11 @@ npm run build</pre>
         chat_id = req.get("chat_id", "")
         file_path = req.get("file_path", "")
         caption = req.get("caption", "")
+        # Strict identity, not bool(): a JSON string "false" is truthy, so
+        # bool() would silently enable the flag the caller meant to disable
+        # (json-gate-strict-type-check / bool-is-int-hazard).
+        has_spoiler = req.get("has_spoiler") is True
+        show_caption_above_media = req.get("show_caption_above_media") is True
         reply_to = ""
         if source_message_id and not chat_id:
             ctx = _resolve_message_context(agent_name, source_message_id)
@@ -7659,6 +7737,8 @@ npm run build</pre>
                 lambda: _send_file_message(
                     agent_name, platform, chat_id, file_path,
                     caption=caption, reply_to=reply_to, kind=kind,
+                    has_spoiler=has_spoiler,
+                    show_caption_above_media=show_caption_above_media,
                 ),
             )
         except HTTPException:
