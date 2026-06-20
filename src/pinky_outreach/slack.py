@@ -49,6 +49,11 @@ class SlackAdapter:
     def close(self) -> None:
         self._client.close()
 
+    @property
+    def bot_token(self) -> str:
+        """The bot token (xoxb-) — e.g. to build a Socket Mode AsyncWebClient."""
+        return self._token
+
     def _request(self, method: str, **params) -> dict:
         """Make a Slack Web API request."""
         params = {k: v for k, v in params.items() if v is not None}

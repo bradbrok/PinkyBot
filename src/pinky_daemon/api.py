@@ -9599,6 +9599,7 @@ npm run build</pre>
         from pinky_daemon.pollers import (
             BrokerDiscordPoller,
             BrokeriMessagePoller,
+            BrokerSlackPoller,
             BrokerTelegramPoller,
         )
         from pinky_outreach.discord import DiscordAdapter
@@ -9668,6 +9669,46 @@ npm run build</pre>
                         )
                     except Exception as e:
                         _log(f"startup: discord poller failed for {agent.name}: {e}")
+
+            # Slack poller — Socket Mode (WebSocket push). Flag-gated (#224);
+            # needs an app-level token (xapp-) in the slack token's settings JSON
+            # alongside the bot token (xoxb-).
+            slack_token = agents.get_raw_token(agent.name, "slack")
+            slack_socket_on = os.getenv(
+                "PINKY_SLACK_SOCKET_MODE", "0"
+            ).strip().lower() in ("1", "true", "yes", "on")
+            if slack_token and slack_socket_on:
+                existing = any(
+                    isinstance(p, BrokerSlackPoller) and p._agent_name == agent.name
+                    for p in _broker_pollers
+                )
+                if existing:
+                    _log(f"startup: slack poller already exists for {agent.name}, skipping")
+                else:
+                    try:
+                        s_settings = {}
+                        for tok in agents.list_tokens(agent.name):
+                            if tok.platform == "slack":
+                                s_settings = tok.settings or {}
+                                break
+                        app_token = s_settings.get("app_token", "")
+                        if not app_token:
+                            _log(
+                                f"startup: slack app_token missing for {agent.name}, "
+                                f"skipping socket mode"
+                            )
+                        else:
+                            from pinky_outreach.slack import SlackAdapter
+                            s_adapter = SlackAdapter(slack_token)
+                            s_poller = BrokerSlackPoller(
+                                s_adapter, agent.name, broker, registry=agents,
+                                app_token=app_token,
+                            )
+                            _broker_pollers.append(s_poller)
+                            asyncio.create_task(s_poller.start())
+                            _log(f"startup: slack socket-mode poller started for {agent.name}")
+                    except Exception as e:
+                        _log(f"startup: slack poller failed for {agent.name}: {e}")
 
             # iMessage poller — check if agent has imessage enabled in DB
             if agents.get_raw_token(agent.name, "imessage"):
