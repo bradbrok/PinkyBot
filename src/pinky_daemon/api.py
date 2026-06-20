@@ -1652,8 +1652,23 @@ def create_api(
         # delivered is suppressed and the original result returned, so a tool
         # that retried after its own timeout doesn't deliver twice. Cancellation
         # vs failure handling lives in deliver_deduped.
+        #
+        # Presentation options that change the RENDERED message (parse_mode,
+        # link_preview_options) are folded into the dedupe identity as a
+        # canonical string so a retry with different formatting/preview settings
+        # is delivered rather than silently suppressed (#802 review). Plain sends
+        # keep key_extra="" — their historical dedupe behaviour is unchanged. The
+        # dict is serialized (never used raw) so the key stays hashable.
+        if parse_mode or link_preview_options:
+            key_extra = json.dumps(
+                {"pm": parse_mode or "", "lpo": link_preview_options or None},
+                sort_keys=True, separators=(",", ":"),
+            )
+        else:
+            key_extra = ""
         return await broker.deliver_deduped(
-            agent_name, platform, chat_id, content, _deliver, reply_to=reply_to
+            agent_name, platform, chat_id, content, _deliver,
+            reply_to=reply_to, key_extra=key_extra,
         )
 
     async def _broker_react(
