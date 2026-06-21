@@ -69,6 +69,7 @@ class TelegramAdapter:
         parse_mode: str | None = None,
         disable_notification: bool = False,
         link_preview_options: dict | None = None,
+        reply_parameters: dict | None = None,
     ) -> Message:
         """Send a text message.
 
@@ -77,12 +78,19 @@ class TelegramAdapter:
         ``{"prefer_large_media": True}`` for a big thumbnail, or
         ``{"show_above_text": True}`` to float the preview above the message.
         ``None`` leaves Telegram's default behaviour (``_request`` drops it).
+
+        ``reply_parameters`` (Bot API 7.0 ``ReplyParameters``) supersedes the
+        deprecated ``reply_to_message_id`` and additionally supports quoting a
+        specific passage of the replied-to message via its ``quote`` field.
+        When set, ``reply_to_message_id`` is not sent — Telegram rejects both.
         """
         result = self._request(
             "sendMessage",
             chat_id=chat_id,
             text=text,
-            reply_to_message_id=reply_to_message_id,
+            # reply_parameters supersedes reply_to_message_id; never send both.
+            reply_to_message_id=None if reply_parameters else reply_to_message_id,
+            reply_parameters=reply_parameters,
             parse_mode=parse_mode,
             disable_notification=disable_notification,
             link_preview_options=link_preview_options,

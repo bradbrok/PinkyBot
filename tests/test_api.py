@@ -2347,6 +2347,143 @@ class TestAPI:
                 assert history[-1].metadata["tool"] == "thread"
                 assert history[-1].metadata["source_message_id"] == "101"
 
+    def test_broker_thread_quote_builds_reply_parameters(self):
+        """thread(quote=...) builds ReplyParameters quoting the given passage."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram", chat_id="6770805286", sender_name="Brad",
+                        sender_id="u1", content="The deploy failed at step 3",
+                        agent_name="barsik", message_id="101",
+                    )
+                )
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="501"),
+                ) as mock:
+                    resp = client.post("/broker/thread", json={
+                        "agent_name": "barsik", "message_id": "101",
+                        "content": "looking now", "quote": "step 3",
+                    })
+                assert resp.status_code == 200, resp.text
+                assert mock.call_args.kwargs["reply_parameters"] == {
+                    "message_id": 101, "quote": "step 3"
+                }
+
+    def test_broker_thread_without_quote_has_no_reply_parameters(self):
+        """A plain thread() reply keeps reply_parameters=None (legacy path)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram", chat_id="6770805286", sender_name="Brad",
+                        sender_id="u1", content="hi", agent_name="barsik", message_id="101",
+                    )
+                )
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="501"),
+                ) as mock:
+                    resp = client.post("/broker/thread", json={
+                        "agent_name": "barsik", "message_id": "101", "content": "ok",
+                    })
+                assert resp.status_code == 200, resp.text
+                assert mock.call_args.kwargs["reply_parameters"] is None
+                assert mock.call_args.kwargs["reply_to_message_id"] == 101
+
+    def test_broker_thread_invalid_quote_degrades_to_plain_reply(self):
+        """An invalid quote (rejected by Telegram) degrades to a normal reply
+        instead of dropping the whole message (PR2 review high finding)."""
+        from pinky_outreach.telegram import TelegramError
+
+        calls = []
+
+        def _send(*args, **kwargs):
+            calls.append(kwargs.get("reply_parameters"))
+            if kwargs.get("reply_parameters") is not None:
+                raise TelegramError("Bad Request: QUOTE_TEXT_INVALID", 400)
+            return SimpleNamespace(message_id="777")
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram", chat_id="6770805286", sender_name="Brad",
+                        sender_id="u1", content="hello world", agent_name="barsik",
+                        message_id="101",
+                    )
+                )
+                with patch("pinky_outreach.telegram.TelegramAdapter.send_message", side_effect=_send):
+                    resp = client.post("/broker/thread", json={
+                        "agent_name": "barsik", "message_id": "101",
+                        "content": "looking", "quote": "not a substring",
+                    })
+                # The reply still lands (no 500), and the degrade dropped the quote.
+                assert resp.status_code == 200, resp.text
+                assert resp.json()["message_id"] == "777"
+                assert calls[0] == {"message_id": 101, "quote": "not a substring"}
+                assert calls[-1] is None
+
+    def test_broker_thread_whitespace_quote_is_dropped(self):
+        """A whitespace-only quote is stripped to empty → no reply_parameters."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram", chat_id="6770805286", sender_name="Brad",
+                        sender_id="u1", content="hi there", agent_name="barsik",
+                        message_id="101",
+                    )
+                )
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="501"),
+                ) as mock:
+                    resp = client.post("/broker/thread", json={
+                        "agent_name": "barsik", "message_id": "101",
+                        "content": "ok", "quote": "   ",
+                    })
+                assert resp.status_code == 200, resp.text
+                assert mock.call_args.kwargs["reply_parameters"] is None
+
+    def test_broker_thread_overlong_quote_is_capped(self):
+        """A quote longer than Telegram's 1024-char limit is capped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="telegram", chat_id="6770805286", sender_name="Brad",
+                        sender_id="u1", content="x" * 4000, agent_name="barsik",
+                        message_id="101",
+                    )
+                )
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="501"),
+                ) as mock:
+                    resp = client.post("/broker/thread", json={
+                        "agent_name": "barsik", "message_id": "101",
+                        "content": "ok", "quote": "x" * 2000,
+                    })
+                assert resp.status_code == 200, resp.text
+                assert len(mock.call_args.kwargs["reply_parameters"]["quote"]) == 1024
+
     def test_broker_media_endpoints_scrub_file_path_from_metadata(self):
         """Regression: /broker/send-photo, /send-document, /send-animation must not
         persist the raw file_path to conversation metadata. PR #244 scrubbed the

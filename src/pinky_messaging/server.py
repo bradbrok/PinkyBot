@@ -106,12 +106,17 @@ def create_server(
         disable_link_preview: bool = False,
         prefer_large_media: bool = False,
         link_preview_above: bool = False,
+        quote: str = "",
     ) -> str:
         """Quote-reply to a specific inbound message. The user sees your response linked to the original.
 
         Link-preview flags (Telegram): disable_link_preview suppresses the URL
         preview card; prefer_large_media forces a big thumbnail; link_preview_above
         floats the preview above your text.
+
+        quote (Telegram): an exact substring of the message you're replying to;
+        the reply then visibly quotes just that passage instead of the whole
+        message. Must match the original text exactly, or Telegram rejects it.
         """
         result = _api("POST", "/broker/thread", {
             "agent_name": agent_name,
@@ -121,6 +126,7 @@ def create_server(
             "link_preview_options": _link_preview_options(
                 disable_link_preview, prefer_large_media, link_preview_above
             ),
+            "quote": quote,
         })
         return json.dumps(result)
 
