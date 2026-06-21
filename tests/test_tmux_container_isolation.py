@@ -25,6 +25,8 @@ from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
     TmuxSession,
+    _claude_auth_mode,
+    _claude_auth_mode_env_for_agent,
     _claude_creds_state,
     _container_start_timeout_sec,
     _credential_fingerprint,
@@ -82,6 +84,41 @@ class _FakeRegistry:
 
     def get_or_create_signing_key(self, name):
         return f"key-{name}"
+
+
+class TestClaudeAuthMode:
+    def _clear(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_YARIK", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_AGENT_ONE", raising=False)
+
+    def test_default_is_shared_refresh_file(self, monkeypatch):
+        self._clear(monkeypatch)
+        assert _claude_auth_mode("dymok") == "shared_refresh_file"
+
+    def test_global_mode_applies_without_agent_override(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
+        assert _claude_auth_mode("dymok") == "per_agent_oauth"
+
+    def test_agent_override_wins_over_global(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_YARIK", "per_agent_oauth")
+        assert _claude_auth_mode("yarik") == "per_agent_oauth"
+        assert _claude_auth_mode("dymok") == "shared_refresh_file"
+
+    def test_agent_env_name_is_sanitized(self):
+        assert _claude_auth_mode_env_for_agent("agent-one") == (
+            "PINKY_CLAUDE_AUTH_MODE_AGENT_ONE"
+        )
+
+    def test_invalid_agent_override_falls_back_to_global(self, monkeypatch):
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", "nope")
+        assert _claude_auth_mode("dymok") == "per_agent_oauth"
 
 
 def _session(agent_name="dymok", registry=None, working_dir="/tmp/x"):
@@ -364,7 +401,8 @@ class TestSeedContainerHomeCreds:
 
     async def test_per_agent_oauth_probes_but_never_copies(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", "per_agent_oauth")
         ss = _session(registry=_FakeRegistry(
             _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
         ))
@@ -509,6 +547,7 @@ class TestSeedContainerClaudeCreds:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.delenv("PINKY_CONTAINER_SEED_CREDS", raising=False)
         monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", raising=False)
         host_cfg = tmp_path / "host-claude"
         host_cfg.mkdir()
         if host_creds is not None:
@@ -547,7 +586,8 @@ class TestSeedContainerClaudeCreds:
 
     def test_per_agent_oauth_never_seeds_shared_host_creds(self, monkeypatch, tmp_path):
         ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
-        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", "per_agent_oauth")
         ss._seed_container_claude_creds()
         assert not (wd / ".claude-container" / ".credentials.json").exists()
 
