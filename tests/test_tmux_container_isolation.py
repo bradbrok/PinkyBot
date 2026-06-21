@@ -25,7 +25,9 @@ from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
     TmuxSession,
+    _claude_creds_state,
     _container_start_timeout_sec,
+    _credential_fingerprint,
     _is_dead_runtime_stderr,
     _TmuxControl,
 )
@@ -339,6 +341,7 @@ class TestSeedContainerHomeCreds:
 
     async def test_execs_idempotent_copy_in_container(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
         ss = _session(registry=_FakeRegistry(
             _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
         ))
@@ -358,6 +361,25 @@ class TestSeedContainerHomeCreds:
         assert seed.startswith('test -f "$HOME/.claude/.credentials.json" ||')
         assert '"$CLAUDE_CONFIG_DIR/.credentials.json"' in seed
         assert 'chmod 600 "$HOME/.claude/.credentials.json"' in seed
+
+    async def test_per_agent_oauth_probes_but_never_copies(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _StubInner(stdout=b"home_creds_present=true home_creds_has_refresh=true\n")
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+
+        await ss._seed_container_home_creds()
+
+        assert len(inner.calls) == 1
+        cmd = inner.calls[0]
+        assert "python3" in cmd
+        assert "cp" not in cmd
 
     async def test_runner_failure_is_nonfatal(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
@@ -486,6 +508,7 @@ class TestSeedContainerClaudeCreds:
     def _creds_session(self, monkeypatch, tmp_path, *, host_creds=b'{"oauth": "tok"}'):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.delenv("PINKY_CONTAINER_SEED_CREDS", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
         host_cfg = tmp_path / "host-claude"
         host_cfg.mkdir()
         if host_creds is not None:
@@ -522,6 +545,12 @@ class TestSeedContainerClaudeCreds:
         ss._seed_container_claude_creds()
         assert not (wd / ".claude-container" / ".credentials.json").exists()
 
+    def test_per_agent_oauth_never_seeds_shared_host_creds(self, monkeypatch, tmp_path):
+        ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
+        ss._seed_container_claude_creds()
+        assert not (wd / ".claude-container" / ".credentials.json").exists()
+
     def test_missing_host_creds_nonfatal(self, monkeypatch, tmp_path):
         ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path, host_creds=None)
         ss._seed_container_claude_creds()  # must not raise
@@ -555,6 +584,29 @@ class TestSeedContainerClaudeCreds:
         monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
         ss._seed_container_claude_creds()
         assert not (wd / ".claude-container" / ".credentials.json").exists()
+
+
+class TestClaudeCredsTelemetry:
+    def test_missing_creds_state_is_non_secret(self, tmp_path):
+        assert _claude_creds_state(tmp_path / ".credentials.json") == (
+            "home_creds_present=false"
+        )
+
+    def test_creds_state_reports_refresh_fingerprint_only(self, tmp_path):
+        path = tmp_path / ".credentials.json"
+        path.write_text(
+            '{"claudeAiOauth": {"accessToken": "access-secret", '
+            '"refreshToken": "refresh-secret", "expiresAt": 12345}}'
+        )
+
+        state = _claude_creds_state(path)
+
+        assert "home_creds_present=true" in state
+        assert "home_creds_has_refresh=true" in state
+        assert "home_creds_expires_at=12345" in state
+        assert f"creds_fingerprint={_credential_fingerprint('refresh-secret')}" in state
+        assert "refresh-secret" not in state
+        assert "access-secret" not in state
 
 
 class TestStaticOAuthTokenForward:

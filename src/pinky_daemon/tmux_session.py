@@ -57,6 +57,7 @@ session stays alive.
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import os
 import re
@@ -150,6 +151,100 @@ _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 # telemetry), so we accept it for now. A file lock (``fcntl.flock``)
 # around the read-modify-write is the proper fix if this ever matters.
 _CLAUDE_JSON_SEED_LOCK = threading.Lock()
+
+_CLAUDE_AUTH_MODE_ENV = "PINKY_CLAUDE_AUTH_MODE"
+_CLAUDE_AUTH_MODE_SHARED_REFRESH = "shared_refresh_file"
+_CLAUDE_AUTH_MODE_PER_AGENT_OAUTH = "per_agent_oauth"
+_CLAUDE_AUTH_MODES = {
+    _CLAUDE_AUTH_MODE_SHARED_REFRESH,
+    _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH,
+}
+
+
+def _claude_auth_mode() -> str:
+    """Fleet auth mode for Claude Code tmux sessions.
+
+    The default preserves the historical bootstrap path: copy the daemon user's
+    Claude subscription OAuth credentials into container agents. ``per_agent_oauth``
+    is the durable interactive-container mode: each agent owns its own Claude
+    login in its container home volume, and the daemon must never import shared
+    host credentials on normal restart/update.
+    """
+    raw = os.environ.get(_CLAUDE_AUTH_MODE_ENV, _CLAUDE_AUTH_MODE_SHARED_REFRESH)
+    mode = raw.strip().lower() or _CLAUDE_AUTH_MODE_SHARED_REFRESH
+    if mode in _CLAUDE_AUTH_MODES:
+        return mode
+    _log(
+        f"tmux: unsupported {_CLAUDE_AUTH_MODE_ENV}={raw!r}; "
+        f"falling back to {_CLAUDE_AUTH_MODE_SHARED_REFRESH}"
+    )
+    return _CLAUDE_AUTH_MODE_SHARED_REFRESH
+
+
+def _credential_fingerprint(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()[:12]
+
+
+def _claude_creds_state(path: Path) -> str:
+    """Return non-secret telemetry for a Claude Code credentials file."""
+    if not path.exists():
+        return "home_creds_present=false"
+    try:
+        data = json.loads(path.read_text())
+    except Exception as e:
+        return (
+            "home_creds_present=true home_creds_parse_error="
+            f"{type(e).__name__}"
+        )
+    if not isinstance(data, dict):
+        return "home_creds_present=true home_creds_parse_error=not_object"
+    oauth = data.get("claudeAiOauth")
+    if not isinstance(oauth, dict):
+        return "home_creds_present=true home_creds_has_refresh=false"
+    refresh = oauth.get("refreshToken")
+    access = oauth.get("accessToken")
+    refresh_s = refresh if isinstance(refresh, str) else ""
+    access_s = access if isinstance(access, str) else ""
+    fp_token = refresh_s or access_s
+    parts = [
+        "home_creds_present=true",
+        f"home_creds_has_refresh={str(bool(refresh_s)).lower()}",
+    ]
+    expires_at = oauth.get("expiresAt")
+    if isinstance(expires_at, int):
+        parts.append(f"home_creds_expires_at={expires_at}")
+    if fp_token:
+        parts.append(f"creds_fingerprint={_credential_fingerprint(fp_token)}")
+    return " ".join(parts)
+
+
+_CONTAINER_CREDS_STATE_PY = (
+    "import hashlib,json,os,pathlib\n"
+    "p=pathlib.Path(os.environ.get('HOME') or '/')/'.claude'/'.credentials.json'\n"
+    "def fp(s): return hashlib.sha256(s.encode('utf-8')).hexdigest()[:12]\n"
+    "if not p.exists():\n"
+    "    print('home_creds_present=false')\n"
+    "    raise SystemExit(0)\n"
+    "try:\n"
+    "    d=json.loads(p.read_text())\n"
+    "except Exception as e:\n"
+    "    print('home_creds_present=true home_creds_parse_error='+type(e).__name__)\n"
+    "    raise SystemExit(0)\n"
+    "if not isinstance(d,dict):\n"
+    "    print('home_creds_present=true home_creds_parse_error=not_object')\n"
+    "    raise SystemExit(0)\n"
+    "o=d.get('claudeAiOauth')\n"
+    "if not isinstance(o,dict):\n"
+    "    print('home_creds_present=true home_creds_has_refresh=false')\n"
+    "    raise SystemExit(0)\n"
+    "r=o.get('refreshToken') if isinstance(o.get('refreshToken'),str) else ''\n"
+    "a=o.get('accessToken') if isinstance(o.get('accessToken'),str) else ''\n"
+    "parts=['home_creds_present=true','home_creds_has_refresh='+str(bool(r)).lower()]\n"
+    "if isinstance(o.get('expiresAt'),int): parts.append('home_creds_expires_at='+str(o['expiresAt']))\n"
+    "tok=r or a\n"
+    "if tok: parts.append('creds_fingerprint='+fp(tok))\n"
+    "print(' '.join(parts))\n"
+)
 
 
 def _resolve_claude_config_path(env: dict[str, str] | None = None) -> Path:
@@ -1250,6 +1345,14 @@ class TmuxSession:
             "0", "false", "no",
         ):
             return
+        mode = _claude_auth_mode()
+        if mode == _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH:
+            _log(
+                f"tmux[{self.agent_name}]: claude_auth_mode={mode} — "
+                f"skipping shared host credentials seed; existing per-agent "
+                f"container-home creds must be preserved"
+            )
+            return
         # #780: when static-token forwarding is enabled, claude authenticates
         # via CLAUDE_CODE_OAUTH_TOKEN (no refresh) — never seed the refresh-prone
         # .credentials.json. Keyed on the FLAG, not token presence: fail CLOSED
@@ -1281,6 +1384,10 @@ class TmuxSession:
                     f"login (non-fatal)"
                 )
                 return
+            _log(
+                f"tmux[{self.agent_name}]: claude_auth_mode={mode} "
+                f"host_seed_source_state={_claude_creds_state(src)}"
+            )
             dst_dir.mkdir(parents=True, exist_ok=True)
             # Create 0600 from the first byte (no write→chmod gap in a
             # bind-mounted dir): open with mode via os.open, then write.
@@ -1316,6 +1423,33 @@ class TmuxSession:
         block the spawn (worst case is the login prompt, not a regression)."""
         runner = self._select_command_runner()
         if not isinstance(runner, ContainerCommandRunner):
+            return
+        mode = _claude_auth_mode()
+        if mode == _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH:
+            try:
+                res = await runner.run(
+                    ["python3", "-c", _CONTAINER_CREDS_STATE_PY], timeout=15
+                )
+                if res.ok:
+                    state = res.stdout.decode("utf-8", "replace").strip()
+                    _log(
+                        f"tmux[{self.agent_name}]: claude_auth_mode={mode} "
+                        f"{state or 'home_creds_state=empty'} — "
+                        f"not copying shared credentials"
+                    )
+                else:
+                    _log(
+                        f"tmux[{self.agent_name}]: claude_auth_mode={mode} "
+                        f"home creds probe rc={res.returncode} "
+                        f"stderr={res.stderr.decode('utf-8', 'replace').strip()[:200]!r} "
+                        f"(non-fatal; not copying shared credentials)"
+                    )
+            except Exception as e:
+                _log(
+                    f"tmux[{self.agent_name}]: claude_auth_mode={mode} "
+                    f"home creds probe failed (non-fatal; not copying shared "
+                    f"credentials): {e}"
+                )
             return
         seed_sh = (
             'test -f "$HOME/.claude/.credentials.json" || { '
@@ -2144,6 +2278,10 @@ class TmuxSession:
         # raises → BOOT_FAILED, never a quiet local fallback.
         container_agent = self._container_agent(strict=True)
         self._tmux.set_command_runner(self._select_command_runner(container_agent))
+        _log(
+            f"tmux[{self.agent_name}]: claude_auth_mode={_claude_auth_mode()} "
+            f"container_agent={str(container_agent is not None).lower()}"
+        )
 
         # Container agents: provision + start the container BEFORE any
         # `podman exec tmux …`. Deliberately OUTSIDE the 60s cold-start
