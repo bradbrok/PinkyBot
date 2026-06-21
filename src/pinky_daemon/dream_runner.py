@@ -271,6 +271,7 @@ class DreamRunner:
                     system_prompt=system_prompt,
                     # SDK allowlist + Read/Write for the file-passing protocol
                     allowed_tools=["Read", "Write", *_DREAM_ALLOWED_TOOLS],
+                    agent_config=agent_config,
                 ),
                 agent_name=agent_name,
             )

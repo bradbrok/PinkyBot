@@ -31,6 +31,14 @@ class _FakeTmux:
         return [c for c in self.calls if c[0] == cmd]
 
 
+class _AgentConfig:
+    def __init__(self, working_dir: str, isolation_mode: str = "local") -> None:
+        self.working_dir = working_dir
+        self.isolation_mode = isolation_mode
+        self.provider_url = ""
+        self.provider_key = ""
+
+
 def _runner(tmp: str, fake: _FakeTmux, **overrides) -> TmuxDreamRunner:
     cfg = TmuxDreamConfig(
         working_dir=tmp,
@@ -57,6 +65,23 @@ def _runner(tmp: str, fake: _FakeTmux, **overrides) -> TmuxDreamRunner:
 
 
 class TestTmuxDreamRunner:
+    def test_per_agent_claude_env_flagged_local(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmp:
+            monkeypatch.setenv("PINKY_PER_AGENT_CLAUDE_CONFIG", "1")
+            monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-dream")
+            cfg = TmuxDreamConfig(
+                working_dir=tmp,
+                agent_config=_AgentConfig(tmp),
+            )
+            runner = TmuxDreamRunner(cfg, agent_name="ivan")
+
+            env = runner._per_agent_claude_env()
+
+            assert env["CLAUDE_CONFIG_DIR"] == str(
+                os.path.join(os.path.realpath(tmp), ".claude-config")
+            )
+            assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-dream"
+
     @pytest.mark.asyncio
     async def test_happy_path_prompt_file_instruction_result(self):
         with tempfile.TemporaryDirectory() as tmp:

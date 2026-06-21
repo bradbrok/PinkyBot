@@ -51,6 +51,7 @@ def test_seed_creates_missing_file(tmp_path: Path):
     assert cfg.exists()
     data = json.loads(cfg.read_text())
     assert data["bypassPermissionsModeAccepted"] is True
+    assert data["hasCompletedOnboarding"] is True
     entry = data["projects"][str(proj.resolve())]
     assert entry["hasTrustDialogAccepted"] is True
     assert entry["hasCompletedProjectOnboarding"] is True
@@ -100,13 +101,15 @@ def test_seed_completes_partial_flags(tmp_path: Path):
     cfg = tmp_path / ".claude.json"
     proj = tmp_path / "proj"
     proj.mkdir()
-    # Top-level bypass already accepted, but this project never trusted.
+    # Top-level bypass already accepted, but global onboarding and this
+    # project trust were missing.
     cfg.write_text(json.dumps({"bypassPermissionsModeAccepted": True, "projects": {}}))
 
     wrote = _seed_claude_trust_file(cfg, str(proj))
 
     assert wrote is True  # project flags were missing
     data = json.loads(cfg.read_text())
+    assert data["hasCompletedOnboarding"] is True
     entry = data["projects"][str(proj.resolve())]
     assert entry["hasTrustDialogAccepted"] is True
     assert entry["hasCompletedProjectOnboarding"] is True

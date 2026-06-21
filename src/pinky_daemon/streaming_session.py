@@ -13,11 +13,20 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.claude_config import (
+    migrate_claude_project_history,
+    resolve_agent_claude_config_dir,
+    resolve_claude_config_path,
+    resolve_claude_settings_path,
+    seed_claude_settings_file,
+    seed_claude_trust_file,
+)
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
@@ -308,6 +317,53 @@ class StreamingSession:
         self._turn_seq = 0  # Monotonic turn counter for analytics
         self._last_user_message = ""  # For analytics keyword classification
 
+    def _registry_agent(self):
+        if not self._registry or not self.agent_name:
+            return None
+        try:
+            return self._registry.get(self.agent_name)
+        except Exception:
+            return None
+
+    def _per_agent_claude_config_dir(self) -> Path | None:
+        return resolve_agent_claude_config_dir(
+            self._registry_agent(),
+            working_dir=self._config.working_dir,
+        )
+
+    def _per_agent_claude_env(self) -> dict[str, str]:
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is None:
+            return {}
+        env = {"CLAUDE_CONFIG_DIR": str(cfg_dir)}
+        if not (self._config.provider_url or self._config.provider_key):
+            token = os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
+            if token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = token
+        return env
+
+    def _prepare_claude_config(self) -> None:
+        cfg_dir = self._per_agent_claude_config_dir()
+        if cfg_dir is None:
+            return
+        project_dir = Path(self._config.working_dir or ".").resolve()
+        if migrate_claude_project_history(project_dir, cfg_dir):
+            _log(
+                f"streaming[{self.agent_name}]: migrated claude transcript "
+                f"history into {cfg_dir}"
+            )
+        env = {"CLAUDE_CONFIG_DIR": str(cfg_dir)}
+        if seed_claude_settings_file(resolve_claude_settings_path(env)):
+            _log(
+                f"streaming[{self.agent_name}]: pre-seeded claude settings "
+                f"in {cfg_dir}"
+            )
+        if seed_claude_trust_file(resolve_claude_config_path(env), project_dir):
+            _log(
+                f"streaming[{self.agent_name}]: pre-seeded claude trust flags "
+                f"in {cfg_dir} for project {project_dir}"
+            )
+
     async def connect(self) -> None:
         """Connect to Claude Code. Starts the reader loop.
 
@@ -414,6 +470,14 @@ class StreamingSession:
                 except Exception as e:
                     _log(f"streaming[{self.agent_name}]: failed to read .mcp.json: {e}")
 
+        try:
+            self._prepare_claude_config()
+        except Exception as e:
+            _log(
+                f"streaming[{self.agent_name}]: claude config prep failed "
+                f"(non-fatal): {e}"
+            )
+
         options = ClaudeAgentOptions(
             cwd=self._config.working_dir,
             allowed_tools=self._config.allowed_tools or DEFAULT_STREAMING_ALLOWED_TOOLS,
@@ -450,6 +514,7 @@ class StreamingSession:
         if self._config.provider_key:
             provider_env["ANTHROPIC_API_KEY"] = self._config.provider_key
             provider_env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
+        provider_env.update(self._per_agent_claude_env())
 
         # #429: surface configured effort + agent identity to CLI hooks so
         # hook_verify_effort.py can detect drift from PINKY_EXPECTED_EFFORT

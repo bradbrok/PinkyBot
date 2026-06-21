@@ -403,6 +403,50 @@ class TestProjectDir:
         )
         assert ss._project_dir() == Path.home() / ".claude" / "projects" / _claude_slug(wd)
 
+    def test_local_agent_uses_per_agent_config_when_flagged(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("PINKY_PER_AGENT_CLAUDE_CONFIG", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-local")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(_FakeAgent("dymok", "local", working_dir=wd)),
+            working_dir=wd,
+        )
+
+        cfg_dir = Path(wd) / ".claude-config"
+        assert ss._project_dir() == cfg_dir / "projects" / _claude_slug(wd)
+        env = ss._build_repl_env()
+        assert env["CLAUDE_CONFIG_DIR"] == str(cfg_dir)
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-local"
+
+    def test_per_agent_config_skips_when_token_missing(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("PINKY_PER_AGENT_CLAUDE_CONFIG", "1")
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(_FakeAgent("dymok", "local", working_dir=wd)),
+            working_dir=wd,
+        )
+
+        assert ss._project_dir() == Path.home() / ".claude" / "projects" / _claude_slug(wd)
+        assert "CLAUDE_CONFIG_DIR" not in ss._build_repl_env()
+
+    def test_per_agent_config_does_not_override_nonlocal_modes(
+        self, monkeypatch, tmp_path
+    ):
+        monkeypatch.setenv("PINKY_PER_AGENT_CLAUDE_CONFIG", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-local")
+        wd = str(tmp_path / "proj")
+        for mode in ("container", "unix_user"):
+            ss = _session(
+                registry=_FakeRegistry(_FakeAgent("dymok", mode, working_dir=wd)),
+                working_dir=wd,
+            )
+            assert "CLAUDE_CONFIG_DIR" not in ss._build_repl_env()
+
 
 class TestBuildReplEnv:
     """#638 hooks: inside the container netns, localhost is the container, so
