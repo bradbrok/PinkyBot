@@ -831,6 +831,14 @@ class BrokerSlackPoller:
         self._bot_user_id = ""
         self._bot_id = ""  # our own bot_id (from auth.test) — filters our bot_message echoes
         self._client = None  # slack_sdk SocketModeClient, created in start()
+        # Cosmetic identity resolution (users:read / channels:read). sender_id and
+        # approval routing always key on the raw id; only the display name and
+        # chat_title are enriched. Cached for the poller's lifetime (renames are
+        # rare); a missing users:read scope disables user resolution after the
+        # first failure so we don't hammer the API.
+        self._user_name_cache: dict[str, str] = {}
+        self._channel_title_cache: dict[str, str] = {}
+        self._users_read_ok = True
 
     @property
     def agent_name(self) -> str:
@@ -930,6 +938,74 @@ class BrokerSlackPoller:
             _log(f"slack-poller[{self._agent_name}]: connect failed: {e}")
             self._running = False
 
+    async def _resolve_user_name(self, user_id: str) -> str:
+        """Best-effort display name for a human Slack user id (users:read).
+
+        Cached; returns "" on any failure so the caller keeps the raw id.
+        A missing_scope failure disables further lookups (no API hammering).
+        Defensive about the return shape so a mocked/odd response degrades to "".
+        """
+        if not user_id or not self._users_read_ok:
+            return ""
+        cached = self._user_name_cache.get(user_id)
+        if cached is not None:
+            return cached
+        loop = asyncio.get_running_loop()
+        try:
+            info = await loop.run_in_executor(
+                None, self._adapter.get_user_info, user_id
+            )
+        except Exception as e:
+            if "missing_scope" in str(e):
+                self._users_read_ok = False
+                _log(
+                    f"slack-poller[{self._agent_name}]: users:read scope missing; "
+                    f"disabling user-name resolution"
+                )
+            else:
+                _log(
+                    f"slack-poller[{self._agent_name}]: users.info({user_id}) "
+                    f"failed: {e}"
+                )
+            return ""  # transient: not cached, retried on the next message
+        name = info.get("display_name", "") if isinstance(info, dict) else ""
+        if not isinstance(name, str):
+            name = ""
+        self._user_name_cache[user_id] = name
+        return name
+
+    async def _resolve_channel_title(self, channel_id: str) -> str:
+        """Best-effort channel name (channels:read via conversations.info).
+
+        Cached per channel; returns "" on failure. A scope failure for a given
+        channel (e.g. a DM with no im:read) is cached as "" for that channel
+        only — it won't change — so other channels still resolve. Transient
+        failures are not cached, so they retry.
+        """
+        if not channel_id:
+            return ""
+        cached = self._channel_title_cache.get(channel_id)
+        if cached is not None:
+            return cached
+        loop = asyncio.get_running_loop()
+        try:
+            chat = await loop.run_in_executor(
+                None, self._adapter.get_channel_info, channel_id
+            )
+        except Exception as e:
+            if "missing_scope" in str(e):
+                self._channel_title_cache[channel_id] = ""  # permanent for this channel
+            _log(
+                f"slack-poller[{self._agent_name}]: conversations.info({channel_id}) "
+                f"failed: {e}"
+            )
+            return ""
+        title = getattr(chat, "title", "") if chat is not None else ""
+        if not isinstance(title, str):
+            title = ""
+        self._channel_title_cache[channel_id] = title
+        return title
+
     async def _handle_event(self, payload: dict) -> None:
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
@@ -964,10 +1040,16 @@ class BrokerSlackPoller:
         channel_type = event.get("channel_type", "")  # im | channel | group | mpim
         is_group = channel_type != "im"
         # Identity: humans carry `user`; bot-authored messages carry `bot_id`
-        # (and often `username`). sender_id is what approval keys on; name is
-        # cosmetic. TODO(parity): resolve a display name via users.info (users:read).
+        # (and often `username`). sender_id is what approval keys on and ALWAYS
+        # stays the raw id; sender_name / chat_title are cosmetic and enriched
+        # best-effort via users:read / channels:read (cached, fall back to id).
         sender_id = user_id or bot_id
         sender_name = user_id or event.get("username", "") or bot_id or "unknown"
+        if user_id:
+            resolved = await self._resolve_user_name(user_id)
+            if resolved:
+                sender_name = resolved
+        chat_title = await self._resolve_channel_title(channel)
 
         attachments = [
             {
@@ -996,7 +1078,7 @@ class BrokerSlackPoller:
             content=text,
             agent_name=self._agent_name,
             message_id=ts,
-            chat_title="",
+            chat_title=chat_title,
             is_group=is_group,
             reply_to=thread_ts,
             metadata=meta,
