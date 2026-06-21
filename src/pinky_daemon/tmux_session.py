@@ -161,23 +161,47 @@ _CLAUDE_AUTH_MODES = {
 }
 
 
-def _claude_auth_mode() -> str:
-    """Fleet auth mode for Claude Code tmux sessions.
+def _claude_auth_mode_env_for_agent(agent_name: str | None) -> str | None:
+    if not agent_name:
+        return None
+    suffix = re.sub(r"[^A-Za-z0-9]", "_", agent_name).upper()
+    return f"{_CLAUDE_AUTH_MODE_ENV}_{suffix}"
 
-    The default preserves the historical bootstrap path: copy the daemon user's
-    Claude subscription OAuth credentials into container agents. ``per_agent_oauth``
-    is the durable interactive-container mode: each agent owns its own Claude
-    login in its container home volume, and the daemon must never import shared
-    host credentials on normal restart/update.
-    """
-    raw = os.environ.get(_CLAUDE_AUTH_MODE_ENV, _CLAUDE_AUTH_MODE_SHARED_REFRESH)
+
+def _resolve_claude_auth_mode(raw: str, *, source: str) -> str | None:
     mode = raw.strip().lower() or _CLAUDE_AUTH_MODE_SHARED_REFRESH
     if mode in _CLAUDE_AUTH_MODES:
         return mode
     _log(
-        f"tmux: unsupported {_CLAUDE_AUTH_MODE_ENV}={raw!r}; "
-        f"falling back to {_CLAUDE_AUTH_MODE_SHARED_REFRESH}"
+        f"tmux: unsupported {source}={raw!r}; "
+        f"falling back to {_CLAUDE_AUTH_MODE_ENV}"
     )
+    return None
+
+
+def _claude_auth_mode(agent_name: str | None = None) -> str:
+    """Auth mode for Claude Code tmux sessions.
+
+    The default preserves the historical bootstrap path: copy the daemon user's
+    Claude subscription OAuth credentials into container agents. A per-agent
+    ``PINKY_CLAUDE_AUTH_MODE_<AGENT>`` override wins over the fleet-wide
+    ``PINKY_CLAUDE_AUTH_MODE`` so one container can be canaried without putting
+    the whole daemon into ``per_agent_oauth``. ``per_agent_oauth`` is the durable
+    interactive-container mode: each agent owns its own Claude login in its
+    container home volume, and the daemon must never import shared host
+    credentials on normal restart/update.
+    """
+    agent_env = _claude_auth_mode_env_for_agent(agent_name)
+    if agent_env:
+        raw_agent = os.environ.get(agent_env)
+        if raw_agent is not None:
+            mode = _resolve_claude_auth_mode(raw_agent, source=agent_env)
+            if mode is not None:
+                return mode
+    raw = os.environ.get(_CLAUDE_AUTH_MODE_ENV, _CLAUDE_AUTH_MODE_SHARED_REFRESH)
+    mode = _resolve_claude_auth_mode(raw, source=_CLAUDE_AUTH_MODE_ENV)
+    if mode is not None:
+        return mode
     return _CLAUDE_AUTH_MODE_SHARED_REFRESH
 
 
@@ -1345,7 +1369,7 @@ class TmuxSession:
             "0", "false", "no",
         ):
             return
-        mode = _claude_auth_mode()
+        mode = _claude_auth_mode(self.agent_name)
         if mode == _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH:
             _log(
                 f"tmux[{self.agent_name}]: claude_auth_mode={mode} — "
@@ -1424,7 +1448,7 @@ class TmuxSession:
         runner = self._select_command_runner()
         if not isinstance(runner, ContainerCommandRunner):
             return
-        mode = _claude_auth_mode()
+        mode = _claude_auth_mode(self.agent_name)
         if mode == _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH:
             try:
                 res = await runner.run(
@@ -2279,7 +2303,7 @@ class TmuxSession:
         container_agent = self._container_agent(strict=True)
         self._tmux.set_command_runner(self._select_command_runner(container_agent))
         _log(
-            f"tmux[{self.agent_name}]: claude_auth_mode={_claude_auth_mode()} "
+            f"tmux[{self.agent_name}]: claude_auth_mode={_claude_auth_mode(self.agent_name)} "
             f"container_agent={str(container_agent is not None).lower()}"
         )
 
