@@ -74,6 +74,85 @@ class TestSlackAdapter:
         assert payload["thread_ts"] == "1711584000.000100"
         adapter.close()
 
+    def test_get_user_info_success(self):
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "user": {
+                "id": "U123", "name": "alice", "real_name": "Alice Adams",
+                "is_bot": False,
+                "profile": {
+                    "display_name": "Alice", "real_name": "Alice Adams",
+                    "email": "alice@example.com",
+                },
+            },
+        }
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        info = adapter.get_user_info("U123")
+        assert info["user_id"] == "U123"
+        assert info["display_name"] == "Alice"
+        assert info["real_name"] == "Alice Adams"
+        assert info["email"] == "alice@example.com"
+        assert info["is_bot"] is False
+        # called users.info with the user id
+        assert adapter._client.post.call_args[0][0] == "/users.info"
+        payload = adapter._client.post.call_args.kwargs["json"]
+        assert payload["user"] == "U123"
+        adapter.close()
+
+    def test_get_user_info_display_name_falls_back_to_real_then_handle(self):
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "user": {"id": "U9", "name": "bob", "real_name": "Bob B", "profile": {}},
+        }
+        adapter._client.post = MagicMock(return_value=mock_response)
+        info = adapter.get_user_info("U9")
+        assert info["display_name"] == "Bob B"  # no profile.display_name -> real_name
+        adapter.close()
+
+    def test_get_user_info_missing_scope_raises(self):
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ok": False, "error": "missing_scope"}
+        adapter._client.post = MagicMock(return_value=mock_response)
+        with pytest.raises(SlackError) as exc:
+            adapter.get_user_info("U123")
+        assert "missing_scope" in str(exc.value)
+        adapter.close()
+
+    def test_lookup_user_by_email_success(self):
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "user": {
+                "id": "U777", "name": "carol", "real_name": "Carol C",
+                "profile": {"display_name": "Carol", "email": "carol@example.com"},
+            },
+        }
+        adapter._client.post = MagicMock(return_value=mock_response)
+        info = adapter.lookup_user_by_email("carol@example.com")
+        assert info["user_id"] == "U777"
+        assert info["display_name"] == "Carol"
+        assert info["email"] == "carol@example.com"
+        assert adapter._client.post.call_args[0][0] == "/users.lookupByEmail"
+        payload = adapter._client.post.call_args.kwargs["json"]
+        assert payload["email"] == "carol@example.com"
+        adapter.close()
+
+    def test_lookup_user_by_email_not_found_raises(self):
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {"ok": False, "error": "users_not_found"}
+        adapter._client.post = MagicMock(return_value=mock_response)
+        with pytest.raises(SlackError):
+            adapter.lookup_user_by_email("nobody@example.com")
+        adapter.close()
+
     def test_send_message_error(self):
         adapter = self._make_adapter()
         mock_response = MagicMock()

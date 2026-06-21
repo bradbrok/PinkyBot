@@ -299,6 +299,106 @@ class TestBrokerSlackPoller:
         assert poller._client.responses[0].envelope_id == "env-123"  # ACKed
         mock_broker.handle_inbound.assert_called_once()
 
+    # ── Identity resolution (users:read / channels:read) ──────────────
+
+    @pytest.mark.asyncio
+    async def test_user_and_channel_names_resolved(self, mock_broker):
+        """users:read -> sender_name display name; channels:read -> chat_title.
+        sender_id always stays the raw id (approval keys on it)."""
+        poller = _make_poller(mock_broker)
+        poller._adapter.get_user_info.return_value = {
+            "user_id": "U123", "display_name": "Alice", "real_name": "Alice A",
+            "name": "alice", "email": "alice@example.com",
+        }
+        poller._adapter.get_channel_info.return_value = MagicMock(title="general")
+        await poller._handle_event(_event({
+            "type": "message", "user": "U123", "text": "hi",
+            "channel": "C999", "channel_type": "channel", "ts": "1.1",
+        }))
+        await asyncio.sleep(0)
+        bmsg = mock_broker.handle_inbound.call_args[0][0]
+        assert bmsg.sender_name == "Alice"
+        assert bmsg.sender_id == "U123"   # unchanged — raw id
+        assert bmsg.chat_title == "general"
+
+    @pytest.mark.asyncio
+    async def test_resolution_is_cached(self, mock_broker):
+        """Repeat messages from the same user/channel hit the cache, not the API."""
+        poller = _make_poller(mock_broker)
+        poller._adapter.get_user_info.return_value = {"display_name": "Bob"}
+        poller._adapter.get_channel_info.return_value = MagicMock(title="ops")
+        for _ in range(3):
+            await poller._handle_event(_event({
+                "type": "message", "user": "U7", "text": "x",
+                "channel": "C7", "channel_type": "channel", "ts": "1.1",
+            }))
+            await asyncio.sleep(0)
+        assert poller._adapter.get_user_info.call_count == 1
+        assert poller._adapter.get_channel_info.call_count == 1
+
+    @pytest.mark.asyncio
+    async def test_resolution_falls_back_to_raw_id_on_error(self, mock_broker):
+        """A transient API error must not break delivery: keep the raw id/empty title."""
+        poller = _make_poller(mock_broker)
+        poller._adapter.get_user_info.side_effect = Exception("network boom")
+        poller._adapter.get_channel_info.side_effect = Exception("network boom")
+        await poller._handle_event(_event({
+            "type": "message", "user": "U123", "text": "hi",
+            "channel": "C999", "channel_type": "channel", "ts": "1.1",
+        }))
+        await asyncio.sleep(0)
+        mock_broker.handle_inbound.assert_called_once()
+        bmsg = mock_broker.handle_inbound.call_args[0][0]
+        assert bmsg.sender_name == "U123"   # fell back to raw id
+        assert bmsg.sender_id == "U123"
+        assert bmsg.chat_title == ""
+
+    @pytest.mark.asyncio
+    async def test_missing_users_scope_disables_user_resolution(self, mock_broker):
+        """A missing_scope failure disables further users.info calls (no hammering)."""
+        poller = _make_poller(mock_broker)
+        poller._adapter.get_user_info.side_effect = Exception("missing_scope")
+        for uid in ("U1", "U2", "U3"):
+            await poller._handle_event(_event({
+                "type": "message", "user": uid, "text": "x",
+                "channel": "C1", "channel_type": "channel", "ts": "1.1",
+            }))
+            await asyncio.sleep(0)
+        assert poller._adapter.get_user_info.call_count == 1  # disabled after first
+        assert poller._users_read_ok is False
+
+    @pytest.mark.asyncio
+    async def test_channel_missing_scope_cached_per_channel(self, mock_broker):
+        """A channel scope failure is cached per-channel ("" title), not retried."""
+        poller = _make_poller(mock_broker)
+        poller._adapter.get_user_info.return_value = {"display_name": "Z"}
+        poller._adapter.get_channel_info.side_effect = Exception("missing_scope")
+        for _ in range(3):
+            await poller._handle_event(_event({
+                "type": "message", "user": "U9", "text": "x",
+                "channel": "C5", "channel_type": "channel", "ts": "1.1",
+            }))
+            await asyncio.sleep(0)
+        assert poller._adapter.get_channel_info.call_count == 1  # cached "" for C5
+        bmsg = mock_broker.handle_inbound.call_args[0][0]
+        assert bmsg.chat_title == ""
+
+    @pytest.mark.asyncio
+    async def test_bot_message_skips_user_resolution(self, mock_broker):
+        """Bot-authored messages (bot_id, no user) never call users.info."""
+        poller = _make_poller(mock_broker, bot_id="B_SELF")
+        poller._adapter.get_channel_info.return_value = MagicMock(title="general")
+        await poller._handle_event(_event({
+            "type": "message", "subtype": "bot_message", "bot_id": "B_PEER",
+            "username": "peerbot", "text": "hi", "channel": "C1",
+            "channel_type": "channel", "ts": "1.1",
+        }))
+        await asyncio.sleep(0)
+        poller._adapter.get_user_info.assert_not_called()
+        bmsg = mock_broker.handle_inbound.call_args[0][0]
+        assert bmsg.sender_name == "peerbot"  # username kept for bots
+        assert bmsg.chat_title == "general"
+
     @pytest.mark.asyncio
     async def test_non_events_api_request_acked_but_not_routed(self, monkeypatch, mock_broker):
         """A non-events_api envelope that carries an envelope_id (slash command /

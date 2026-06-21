@@ -9,6 +9,8 @@ Requires a Slack Bot Token (xoxb-...) with appropriate scopes:
 - reactions:write
 - files:write (for uploads)
 - channels:read (for channel info)
+- users:read (resolve user id -> display name)
+- users:read.email (resolve user id -> email; email lookup-by-email routing)
 """
 
 from __future__ import annotations
@@ -299,6 +301,63 @@ class SlackAdapter:
             title=ch.get("name", ""),
             chat_type=chat_type,
         )
+
+    def get_user_info(self, user_id: str) -> dict:
+        """Resolve a Slack user id (U...) to profile info.
+
+        Requires the ``users:read`` scope; ``email`` is only populated when
+        ``users:read.email`` is also granted (else it's an empty string).
+        Raises SlackError on API failure (e.g. ``missing_scope``,
+        ``user_not_found``) — callers should treat resolution as best-effort.
+
+        Returns a dict: user_id, name (handle), real_name, display_name
+        (best human label, never empty when the user resolves), email, is_bot.
+        """
+        result = self._request("users.info", user=user_id)
+        u = result.get("user", {}) or {}
+        prof = u.get("profile", {}) or {}
+        display = (
+            prof.get("display_name")
+            or prof.get("real_name")
+            or u.get("real_name")
+            or u.get("name")
+            or user_id
+        )
+        return {
+            "user_id": user_id,
+            "name": u.get("name", ""),
+            "real_name": u.get("real_name", "") or prof.get("real_name", ""),
+            "display_name": display,
+            "email": prof.get("email", ""),
+            "is_bot": bool(u.get("is_bot", False)),
+        }
+
+    def lookup_user_by_email(self, email: str) -> dict:
+        """Find a Slack user by email (requires ``users:read.email``).
+
+        Returns the same shape as ``get_user_info``. Raises SlackError on
+        failure (notably ``users_not_found`` when no member matches) — the
+        natural tool for routing a nudge to the right person by their Zoho/
+        directory email.
+        """
+        result = self._request("users.lookupByEmail", email=email)
+        u = result.get("user", {}) or {}
+        prof = u.get("profile", {}) or {}
+        display = (
+            prof.get("display_name")
+            or prof.get("real_name")
+            or u.get("real_name")
+            or u.get("name")
+            or u.get("id", "")
+        )
+        return {
+            "user_id": u.get("id", ""),
+            "name": u.get("name", ""),
+            "real_name": u.get("real_name", "") or prof.get("real_name", ""),
+            "display_name": display,
+            "email": prof.get("email", "") or email,
+            "is_bot": bool(u.get("is_bot", False)),
+        }
 
     # ── Reactions ────────────────────────────────────────────
 
