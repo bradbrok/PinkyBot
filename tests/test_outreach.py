@@ -210,6 +210,33 @@ class TestTelegramAdapter:
         assert "link_preview_options" not in payload
         adapter.close()
 
+    def test_send_message_reply_parameters_supersedes_reply_to(self):
+        # When reply_parameters is set (e.g. to quote a passage), the adapter
+        # sends it and DROPS reply_to_message_id — Telegram rejects both.
+        adapter = self._make_adapter()
+        adapter._client.post = MagicMock(return_value=self._ok_text_response())
+
+        adapter.send_message(
+            "12345", "looking now",
+            reply_to_message_id=101,
+            reply_parameters={"message_id": 101, "quote": "step 3"},
+        )
+        payload = adapter._client.post.call_args.kwargs["json"]
+        assert payload["reply_parameters"] == {"message_id": 101, "quote": "step 3"}
+        assert "reply_to_message_id" not in payload
+        adapter.close()
+
+    def test_send_message_reply_to_used_when_no_reply_parameters(self):
+        # Without reply_parameters, the legacy reply_to_message_id path is intact.
+        adapter = self._make_adapter()
+        adapter._client.post = MagicMock(return_value=self._ok_text_response())
+
+        adapter.send_message("12345", "hi", reply_to_message_id=101)
+        payload = adapter._client.post.call_args.kwargs["json"]
+        assert payload["reply_to_message_id"] == 101
+        assert "reply_parameters" not in payload
+        adapter.close()
+
     def _ok_media_response(self):
         mock_response = MagicMock()
         mock_response.json.return_value = {

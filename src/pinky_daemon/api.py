@@ -1431,12 +1431,17 @@ def create_api(
         parse_mode: str = "",
         silent: bool = False,
         link_preview_options: dict | None = None,
+        quote: str = "",
     ) -> SimpleNamespace:
         """Send a text message and return SimpleNamespace(message_id=...).
 
         ``link_preview_options`` (Telegram only) is the Bot API 7.0
         ``LinkPreviewOptions`` object controlling the URL preview card; it is
         ignored on other platforms.
+
+        ``quote`` (Telegram only) is an exact substring of the replied-to
+        message to quote in the reply (Bot API 7.0 ``ReplyParameters.quote``);
+        it requires ``reply_to`` and is ignored on other platforms.
         """
         # iMessage has its own adapter factory; the generic lookup below
         # never constructs one and would 503 before this branch could run.
@@ -1490,37 +1495,56 @@ def create_api(
 
         if platform == "telegram":
             reply_to_id = int(reply_to) if reply_to else None
-            if parse_mode:
-                result = adapter.send_message(
-                    chat_id,
-                    content,
-                    reply_to_message_id=reply_to_id,
-                    parse_mode=parse_mode,
-                    disable_notification=silent,
-                    link_preview_options=link_preview_options,
-                )
-                return SimpleNamespace(message_id=_extract_message_id(result))
+            # Quoting a specific passage uses Bot API 7.0 ReplyParameters; it
+            # supersedes reply_to_message_id (the adapter sends only one). The
+            # quote must be an exact substring of the replied-to message.
+            reply_parameters = None
+            if reply_to_id is not None and quote:
+                reply_parameters = {"message_id": reply_to_id, "quote": quote}
+
+            def _tg_send(rp):
+                # Send with the existing MarkdownV2->plain degradation; ``rp`` is
+                # the reply_parameters (or None for a normal/unquoted reply).
+                if parse_mode:
+                    return adapter.send_message(
+                        chat_id, content, reply_to_message_id=reply_to_id,
+                        parse_mode=parse_mode, disable_notification=silent,
+                        link_preview_options=link_preview_options, reply_parameters=rp,
+                    )
+                try:
+                    return adapter.send_message(
+                        chat_id, _md_to_tg_mdv2(content), reply_to_message_id=reply_to_id,
+                        parse_mode="MarkdownV2", disable_notification=silent,
+                        link_preview_options=link_preview_options, reply_parameters=rp,
+                    )
+                except Exception as e:
+                    _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
+                    return adapter.send_message(
+                        chat_id, content, reply_to_message_id=reply_to_id,
+                        disable_notification=silent,
+                        link_preview_options=link_preview_options, reply_parameters=rp,
+                    )
+
             try:
-                mdv2 = _md_to_tg_mdv2(content)
-                result = adapter.send_message(
-                    chat_id,
-                    mdv2,
-                    reply_to_message_id=reply_to_id,
-                    parse_mode="MarkdownV2",
-                    disable_notification=silent,
-                    link_preview_options=link_preview_options,
-                )
-                return SimpleNamespace(message_id=_extract_message_id(result))
+                result = _tg_send(reply_parameters)
             except Exception as e:
-                _log(f"broker-send: MarkdownV2 failed ({e}), trying plain")
-                result = adapter.send_message(
-                    chat_id,
-                    content,
-                    reply_to_message_id=reply_to_id,
-                    disable_notification=silent,
-                    link_preview_options=link_preview_options,
+                # An invalid quote (not an exact substring / too long) makes
+                # Telegram reject the send. Don't sink the whole reply — degrade
+                # to a normal threaded reply (no quote, reply_to preserved) so
+                # the message still lands. Scoped to quote errors so a transient
+                # failure on a VALID quote isn't silently downgraded.
+                from pinky_outreach.telegram import TelegramError
+                quote_rejected = (
+                    reply_parameters is not None
+                    and isinstance(e, TelegramError)
+                    and "quote" in (getattr(e, "description", "") or "").lower()
                 )
-                return SimpleNamespace(message_id=_extract_message_id(result))
+                if quote_rejected:
+                    _log(f"broker-send: reply quote rejected ({e.description}); resending without quote")
+                    result = _tg_send(None)
+                else:
+                    raise
+            return SimpleNamespace(message_id=_extract_message_id(result))
 
         if platform == "discord":
             result = adapter.send_message(chat_id, content, reply_to=reply_to or None)
@@ -1617,6 +1641,7 @@ def create_api(
         parse_mode: str = "",
         silent: bool = False,
         link_preview_options: dict | None = None,
+        quote: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         loop = asyncio.get_running_loop()
@@ -1633,6 +1658,7 @@ def create_api(
                     parse_mode=parse_mode,
                     silent=silent,
                     link_preview_options=link_preview_options,
+                    quote=quote,
                 ),
             )
             # Once an outbound message lands, the typing indicator becomes noise —
@@ -1654,14 +1680,15 @@ def create_api(
         # vs failure handling lives in deliver_deduped.
         #
         # Presentation options that change the RENDERED message (parse_mode,
-        # link_preview_options) are folded into the dedupe identity as a
-        # canonical string so a retry with different formatting/preview settings
-        # is delivered rather than silently suppressed (#802 review). Plain sends
-        # keep key_extra="" — their historical dedupe behaviour is unchanged. The
-        # dict is serialized (never used raw) so the key stays hashable.
-        if parse_mode or link_preview_options:
+        # link_preview_options, quote) are folded into the dedupe identity as a
+        # canonical string so a retry with different formatting/preview/quote
+        # settings is delivered rather than silently suppressed (#802 review).
+        # Plain sends keep key_extra="" — their historical dedupe behaviour is
+        # unchanged. The dict is serialized (never used raw) so the key stays
+        # hashable.
+        if parse_mode or link_preview_options or quote:
             key_extra = json.dumps(
-                {"pm": parse_mode or "", "lpo": link_preview_options or None},
+                {"pm": parse_mode or "", "lpo": link_preview_options or None, "q": quote or ""},
                 sort_keys=True, separators=(",", ":"),
             )
         else:
@@ -1743,6 +1770,7 @@ def create_api(
         reply_to: str = "",
         include_text_copy: bool = False,
         link_preview_options: dict | None = None,
+        quote: str = "",
     ) -> dict:
         """Generate TTS audio and send it as a voice message."""
         if platform != "telegram":
@@ -1836,6 +1864,10 @@ def create_api(
                 else:
                     raise HTTPException(400, f"Unknown TTS provider: {provider}")
 
+                # The voice (audio) half replies to the whole message; only the
+                # text copy below carries the `quote` passage. Keeping the audio
+                # bubble quote-free also makes it immune to an invalid-quote
+                # rejection (graceful-degrade lives in _send_text_message).
                 msg = adapter.send_voice(
                     chat_id,
                     audio_path,
@@ -1853,6 +1885,7 @@ def create_api(
                     text_msg = _send_text_message(
                         agent_name, platform, chat_id, text, reply_to=reply_to,
                         link_preview_options=link_preview_options,
+                        quote=quote,
                     )
                     result["text_message_id"] = text_msg.message_id
                 return result
@@ -7571,6 +7604,13 @@ npm run build</pre>
         content = req.get("content", "").strip()
         parse_mode = req.get("parse_mode", "")
         link_preview_options = _sanitize_link_preview_options(req.get("link_preview_options"))
+        quote = req.get("quote", "")
+        if not isinstance(quote, str):
+            quote = ""
+        # Telegram caps ReplyParameters.quote at 1024 chars; a whitespace-only
+        # quote is invalid. Strip+cap so those don't reach the API (the send
+        # path also degrades to an unquoted reply if the quote still mismatches).
+        quote = quote.strip()[:1024]
         if not agent_name or not source_message_id or not content:
             raise HTTPException(400, "agent_name, message_id, and content are required")
         _deny_isolated_cross_actor(request, agent_name)
@@ -7590,6 +7630,7 @@ npm run build</pre>
                 reply_to=ctx.message_id,
                 include_text_copy=True,
                 link_preview_options=link_preview_options,
+                quote=quote,
             )
             _record_outbound_message(
                 agent_name,
@@ -7613,6 +7654,7 @@ npm run build</pre>
             reply_to=ctx.message_id,
             parse_mode=parse_mode,
             link_preview_options=link_preview_options,
+            quote=quote,
         )
         _record_outbound_message(
             agent_name,
