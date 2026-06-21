@@ -79,18 +79,48 @@ def create_server(
         except Exception as e:
             return {"error": str(e)}
 
+    def _link_preview_options(
+        disable_link_preview: bool,
+        prefer_large_media: bool,
+        link_preview_above: bool,
+    ) -> dict | None:
+        """Build a Telegram LinkPreviewOptions object from convenience flags.
+
+        Returns None when no flag is set so the broker leaves Telegram's
+        default preview behaviour untouched.
+        """
+        opts: dict = {}
+        if disable_link_preview:
+            opts["is_disabled"] = True
+        if prefer_large_media:
+            opts["prefer_large_media"] = True
+        if link_preview_above:
+            opts["show_above_text"] = True
+        return opts or None
+
     @mcp.tool()
     def thread(
         message_id: str,
         text: str,
         parse_mode: str = "",
+        disable_link_preview: bool = False,
+        prefer_large_media: bool = False,
+        link_preview_above: bool = False,
     ) -> str:
-        """Quote-reply to a specific inbound message. The user sees your response linked to the original."""
+        """Quote-reply to a specific inbound message. The user sees your response linked to the original.
+
+        Link-preview flags (Telegram): disable_link_preview suppresses the URL
+        preview card; prefer_large_media forces a big thumbnail; link_preview_above
+        floats the preview above your text.
+        """
         result = _api("POST", "/broker/thread", {
             "agent_name": agent_name,
             "message_id": message_id,
             "content": text,
             "parse_mode": parse_mode,
+            "link_preview_options": _link_preview_options(
+                disable_link_preview, prefer_large_media, link_preview_above
+            ),
         })
         return json.dumps(result)
 
@@ -100,14 +130,25 @@ def create_server(
         platform: str,
         text: str,
         parse_mode: str = "",
+        disable_link_preview: bool = False,
+        prefer_large_media: bool = False,
+        link_preview_above: bool = False,
     ) -> str:
-        """Send a standalone message to a chat/channel. Use chat IDs, not display names."""
+        """Send a standalone message to a chat/channel. Use chat IDs, not display names.
+
+        Link-preview flags (Telegram): disable_link_preview suppresses the URL
+        preview card; prefer_large_media forces a big thumbnail; link_preview_above
+        floats the preview above your text.
+        """
         result = _api("POST", "/broker/send", {
             "agent_name": agent_name,
             "platform": platform,
             "chat_id": chat_id,
             "content": text,
             "parse_mode": parse_mode,
+            "link_preview_options": _link_preview_options(
+                disable_link_preview, prefer_large_media, link_preview_above
+            ),
         })
         return json.dumps(result)
 
@@ -131,8 +172,15 @@ def create_server(
         message_id: str = "",
         chat_id: str = "",
         platform: str = "telegram",
+        spoiler: bool = False,
+        caption_above: bool = False,
     ) -> str:
-        """Send an image file. Provide message_id to reply, or chat_id+platform for standalone."""
+        """Send an image file. Provide message_id to reply, or chat_id+platform for standalone.
+
+        Telegram: spoiler blurs the image behind a tap-to-reveal mask;
+        caption_above renders the caption above the image. The caption is
+        formatted (MarkdownV2) like a normal message.
+        """
         result = _api("POST", "/broker/send-photo", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -140,6 +188,8 @@ def create_server(
             "chat_id": chat_id,
             "file_path": file_path,
             "caption": caption,
+            "has_spoiler": spoiler,
+            "show_caption_above_media": caption_above,
         })
         return json.dumps(result)
 
@@ -169,8 +219,15 @@ def create_server(
         message_id: str = "",
         chat_id: str = "",
         platform: str = "telegram",
+        spoiler: bool = False,
+        caption_above: bool = False,
     ) -> str:
-        """Send a video that plays inline (autoplay/streaming), not as a file download. Use for .mp4 clips/screen recordings. Provide message_id to reply, or chat_id+platform for standalone."""
+        """Send a video that plays inline (autoplay/streaming), not as a file download. Use for .mp4 clips/screen recordings. Provide message_id to reply, or chat_id+platform for standalone.
+
+        Telegram: spoiler blurs the video behind a tap-to-reveal mask;
+        caption_above renders the caption above the player. The caption is
+        formatted (MarkdownV2) like a normal message.
+        """
         result = _api("POST", "/broker/send-video", {
             "agent_name": agent_name,
             "message_id": message_id,
@@ -178,6 +235,8 @@ def create_server(
             "chat_id": chat_id,
             "file_path": file_path,
             "caption": caption,
+            "has_spoiler": spoiler,
+            "show_caption_above_media": caption_above,
         })
         return json.dumps(result)
 

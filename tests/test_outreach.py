@@ -174,6 +174,102 @@ class TestTelegramAdapter:
         assert data["chat_id"] == "12345"
         adapter.close()
 
+    def _ok_text_response(self):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "result": {
+                "message_id": 42,
+                "chat": {"id": 12345, "type": "private"},
+                "date": 1711584000,
+                "text": "Hi",
+            },
+        }
+        return mock_response
+
+    def test_send_message_link_preview_options_forwarded(self):
+        adapter = self._make_adapter()
+        adapter._client.post = MagicMock(return_value=self._ok_text_response())
+
+        adapter.send_message(
+            "12345", "see https://x.com",
+            link_preview_options={"is_disabled": True},
+        )
+        payload = adapter._client.post.call_args.kwargs["json"]
+        assert payload["link_preview_options"] == {"is_disabled": True}
+        adapter.close()
+
+    def test_send_message_link_preview_options_omitted_when_none(self):
+        # _request drops None values, so a default send carries no
+        # link_preview_options key at all (preserves Telegram's default).
+        adapter = self._make_adapter()
+        adapter._client.post = MagicMock(return_value=self._ok_text_response())
+
+        adapter.send_message("12345", "plain")
+        payload = adapter._client.post.call_args.kwargs["json"]
+        assert "link_preview_options" not in payload
+        adapter.close()
+
+    def _ok_media_response(self):
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "result": {
+                "message_id": 42,
+                "chat": {"id": 12345, "type": "private"},
+                "date": 1711584000,
+            },
+        }
+        return mock_response
+
+    @pytest.mark.parametrize("method_name", ["send_photo", "send_animation", "send_video"])
+    def test_visual_media_spoiler_and_caption_params(self, method_name, tmp_path):
+        adapter = self._make_adapter()
+        media_path = tmp_path / "media.bin"
+        media_path.write_bytes(b"media")
+        adapter._client.post = MagicMock(return_value=self._ok_media_response())
+
+        getattr(adapter, method_name)(
+            "12345", str(media_path), caption="*hi*",
+            caption_parse_mode="MarkdownV2", has_spoiler=True,
+            show_caption_above_media=True,
+        )
+        data = adapter._client.post.call_args.kwargs["data"]
+        assert data["parse_mode"] == "MarkdownV2"
+        assert data["has_spoiler"] == "true"
+        assert data["show_caption_above_media"] == "true"
+        adapter.close()
+
+    @pytest.mark.parametrize("method_name", ["send_photo", "send_animation", "send_video"])
+    def test_visual_media_spoiler_omitted_by_default(self, method_name, tmp_path):
+        adapter = self._make_adapter()
+        media_path = tmp_path / "media.bin"
+        media_path.write_bytes(b"media")
+        adapter._client.post = MagicMock(return_value=self._ok_media_response())
+
+        getattr(adapter, method_name)("12345", str(media_path), caption="hi")
+        data = adapter._client.post.call_args.kwargs["data"]
+        # False bools and None parse_mode are stripped by _media_data.
+        assert "has_spoiler" not in data
+        assert "show_caption_above_media" not in data
+        assert "parse_mode" not in data
+        adapter.close()
+
+    def test_send_document_caption_parse_mode_but_no_spoiler(self, tmp_path):
+        # Documents take a formatted caption but Telegram rejects has_spoiler
+        # on sendDocument, so the adapter must not expose/forward it.
+        adapter = self._make_adapter()
+        doc = tmp_path / "f.pdf"
+        doc.write_bytes(b"%PDF-1.4")
+        adapter._client.post = MagicMock(return_value=self._ok_media_response())
+
+        adapter.send_document("12345", str(doc), caption="*hi*", caption_parse_mode="MarkdownV2")
+        data = adapter._client.post.call_args.kwargs["data"]
+        assert data["parse_mode"] == "MarkdownV2"
+        assert "has_spoiler" not in data
+        assert "show_caption_above_media" not in data
+        adapter.close()
+
     def test_get_updates_empty(self):
         adapter = self._make_adapter()
         mock_response = MagicMock()

@@ -355,8 +355,13 @@ class MessageBroker:
         chat_id: str,
         content: str,
         reply_to: str = "",
+        key_extra: str = "",
     ) -> tuple:
-        return (agent_name, platform, str(chat_id), reply_to or "", content)
+        # ``key_extra`` is a canonical serialization of presentation options
+        # (parse_mode, link_preview_options) so that two sends with identical
+        # text but different rendering are NOT treated as duplicates (#802).
+        # Defaults to "" so plain sends keep their historical key shape.
+        return (agent_name, platform, str(chat_id), reply_to or "", content, key_extra or "")
 
     def _prune_recent_sends(self, now: float | None = None) -> None:
         if now is None:
@@ -374,6 +379,7 @@ class MessageBroker:
         content: str,
         *,
         reply_to: str = "",
+        key_extra: str = "",
     ) -> dict | None:
         """Reserve an outbound send for dedupe.
 
@@ -388,7 +394,7 @@ class MessageBroker:
             return None
         now = time.monotonic()
         self._prune_recent_sends(now)
-        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to)
+        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to, key_extra)
         existing = self._recent_sends.get(key)
         if existing is not None:
             self._stats["deduped"] = self._stats.get("deduped", 0) + 1
@@ -423,12 +429,13 @@ class MessageBroker:
         result: dict,
         *,
         reply_to: str = "",
+        key_extra: str = "",
     ) -> None:
         """Attach the delivery result to a reserved outbound entry so a later
         duplicate within the window can return the original message_id."""
         if self._dedupe_window <= 0:
             return
-        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to)
+        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to, key_extra)
         entry = self._recent_sends.get(key)
         if entry is not None:
             entry["result"] = result
@@ -441,10 +448,11 @@ class MessageBroker:
         content: str,
         *,
         reply_to: str = "",
+        key_extra: str = "",
     ) -> None:
         """Release a reserved outbound entry — call when delivery fails so a
         legitimate retry is not mistaken for a duplicate and silently dropped."""
-        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to)
+        key = self._dedupe_key(agent_name, platform, chat_id, content, reply_to, key_extra)
         self._recent_sends.pop(key, None)
 
     async def deliver_deduped(
@@ -456,6 +464,7 @@ class MessageBroker:
         deliver,
         *,
         reply_to: str = "",
+        key_extra: str = "",
     ) -> dict:
         """Run ``deliver`` at most once per dedupe window.
 
@@ -475,7 +484,7 @@ class MessageBroker:
           reservation would reopen the duplicate window this guard closes.
         """
         dup = self.register_outbound(
-            agent_name, platform, chat_id, content, reply_to=reply_to
+            agent_name, platform, chat_id, content, reply_to=reply_to, key_extra=key_extra
         )
         if dup is not None:
             return dup
@@ -483,11 +492,11 @@ class MessageBroker:
             result = await deliver()
         except Exception:
             self.clear_outbound(
-                agent_name, platform, chat_id, content, reply_to=reply_to
+                agent_name, platform, chat_id, content, reply_to=reply_to, key_extra=key_extra
             )
             raise
         self.finalize_outbound(
-            agent_name, platform, chat_id, content, result, reply_to=reply_to
+            agent_name, platform, chat_id, content, result, reply_to=reply_to, key_extra=key_extra
         )
         return result
 

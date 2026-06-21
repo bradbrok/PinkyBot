@@ -68,8 +68,16 @@ class TelegramAdapter:
         reply_to_message_id: int | None = None,
         parse_mode: str | None = None,
         disable_notification: bool = False,
+        link_preview_options: dict | None = None,
     ) -> Message:
-        """Send a text message."""
+        """Send a text message.
+
+        ``link_preview_options`` (Bot API 7.0 ``LinkPreviewOptions``) controls
+        the URL preview card: e.g. ``{"is_disabled": True}`` to suppress it,
+        ``{"prefer_large_media": True}`` for a big thumbnail, or
+        ``{"show_above_text": True}`` to float the preview above the message.
+        ``None`` leaves Telegram's default behaviour (``_request`` drops it).
+        """
         result = self._request(
             "sendMessage",
             chat_id=chat_id,
@@ -77,6 +85,7 @@ class TelegramAdapter:
             reply_to_message_id=reply_to_message_id,
             parse_mode=parse_mode,
             disable_notification=disable_notification,
+            link_preview_options=link_preview_options,
         )
 
         return Message(
@@ -96,8 +105,17 @@ class TelegramAdapter:
         *,
         caption: str = "",
         reply_to_message_id: int | None = None,
+        caption_parse_mode: str | None = None,
+        has_spoiler: bool = False,
+        show_caption_above_media: bool = False,
     ) -> Message:
-        """Send a photo from a local file path."""
+        """Send a photo from a local file path.
+
+        ``caption_parse_mode`` formats the caption (e.g. ``"MarkdownV2"``).
+        ``has_spoiler`` (Bot API 6.6) blurs the photo behind a tap-to-reveal
+        mask. ``show_caption_above_media`` (Bot API 7.4) renders the caption
+        above the image instead of below.
+        """
         url = f"{self._base}/sendPhoto"
         with open(photo_path, "rb") as f:
             resp = self._client.post(
@@ -106,6 +124,13 @@ class TelegramAdapter:
                     chat_id=chat_id,
                     caption=caption,
                     reply_to_message_id=reply_to_message_id,
+                    # Telegram formats a media caption with `parse_mode`
+                    # (there is no `caption_parse_mode` field on send* methods).
+                    parse_mode=caption_parse_mode,
+                    # Telegram parses bools loosely from form data; send the
+                    # lowercase string and let _media_data drop it when False.
+                    has_spoiler="true" if has_spoiler else None,
+                    show_caption_above_media="true" if show_caption_above_media else None,
                 ),
                 files={"photo": f},
             )
@@ -134,8 +159,12 @@ class TelegramAdapter:
         *,
         caption: str = "",
         reply_to_message_id: int | None = None,
+        caption_parse_mode: str | None = None,
     ) -> Message:
-        """Send a document/file."""
+        """Send a document/file.
+
+        ``caption_parse_mode`` formats the caption (e.g. ``"MarkdownV2"``).
+        """
         url = f"{self._base}/sendDocument"
         with open(file_path, "rb") as f:
             resp = self._client.post(
@@ -144,6 +173,9 @@ class TelegramAdapter:
                     chat_id=chat_id,
                     caption=caption,
                     reply_to_message_id=reply_to_message_id,
+                    # Telegram formats a media caption with `parse_mode`
+                    # (there is no `caption_parse_mode` field on send* methods).
+                    parse_mode=caption_parse_mode,
                 ),
                 files={"document": f},
             )
@@ -172,8 +204,16 @@ class TelegramAdapter:
         *,
         caption: str = "",
         reply_to_message_id: int | None = None,
+        caption_parse_mode: str | None = None,
+        has_spoiler: bool = False,
+        show_caption_above_media: bool = False,
     ) -> Message:
-        """Send an animation (GIF) from a local file path."""
+        """Send an animation (GIF) from a local file path.
+
+        ``caption_parse_mode`` formats the caption; ``has_spoiler`` blurs the
+        animation behind a tap-to-reveal mask; ``show_caption_above_media``
+        renders the caption above the animation.
+        """
         url = f"{self._base}/sendAnimation"
         with open(file_path, "rb") as f:
             resp = self._client.post(
@@ -182,6 +222,11 @@ class TelegramAdapter:
                     chat_id=chat_id,
                     caption=caption,
                     reply_to_message_id=reply_to_message_id,
+                    # Telegram formats a media caption with `parse_mode`
+                    # (there is no `caption_parse_mode` field on send* methods).
+                    parse_mode=caption_parse_mode,
+                    has_spoiler="true" if has_spoiler else None,
+                    show_caption_above_media="true" if show_caption_above_media else None,
                 ),
                 files={"animation": f},
             )
@@ -214,6 +259,9 @@ class TelegramAdapter:
         width: int | None = None,
         height: int | None = None,
         duration: int | None = None,
+        caption_parse_mode: str | None = None,
+        has_spoiler: bool = False,
+        show_caption_above_media: bool = False,
     ) -> Message:
         """Send a video that plays inline (sendVideo), not as a downloadable file.
 
@@ -221,6 +269,10 @@ class TelegramAdapter:
         whole file is fetched. Optional ``width``/``height``/``duration`` let clients
         render the correct aspect ratio and scrubber before the video loads. This is
         the difference between an inline player and ``send_document``'s download chip.
+
+        ``caption_parse_mode`` formats the caption; ``has_spoiler`` blurs the
+        video behind a tap-to-reveal mask; ``show_caption_above_media`` renders
+        the caption above the player.
         """
         url = f"{self._base}/sendVideo"
         with open(file_path, "rb") as f:
@@ -236,6 +288,11 @@ class TelegramAdapter:
                     width=width,
                     height=height,
                     duration=duration,
+                    # Telegram formats a media caption with `parse_mode`
+                    # (there is no `caption_parse_mode` field on send* methods).
+                    parse_mode=caption_parse_mode,
+                    has_spoiler="true" if has_spoiler else None,
+                    show_caption_above_media="true" if show_caption_above_media else None,
                 ),
                 files={"video": f},
             )

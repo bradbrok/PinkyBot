@@ -848,6 +848,28 @@ class TestOutboundDedupe:
         finally:
             tmpdir.cleanup()
 
+    def test_different_presentation_options_not_deduped(self):
+        """#802: identical text with different presentation options (link
+        preview / parse mode) is NOT a duplicate — the second must deliver,
+        while the SAME options still dedupe."""
+        lpo = '{"lpo":{"is_disabled":true},"pm":""}'
+        tmpdir, broker = self._make_broker()
+        try:
+            # Plain send, then same text with a preview-suppress option: both fresh.
+            assert broker.register_outbound(
+                "barsik", "telegram", "111", "see https://x", key_extra=""
+            ) is None
+            assert broker.register_outbound(
+                "barsik", "telegram", "111", "see https://x", key_extra=lpo
+            ) is None
+            # The same text + same options still collapses to a duplicate.
+            dup = broker.register_outbound(
+                "barsik", "telegram", "111", "see https://x", key_extra=lpo
+            )
+            assert dup is not None and dup["deduped"] is True
+        finally:
+            tmpdir.cleanup()
+
     def test_reply_to_is_part_of_identity(self):
         tmpdir, broker = self._make_broker()
         try:
