@@ -1180,6 +1180,50 @@ class TestEventLoopOffload:
         finally:
             tmpdir.cleanup()
 
+    async def test_download_photo_attachments_slack_uses_url(self, monkeypatch):
+        """Slack tags every inbound attachment ``type="file"`` and downloads via
+        a ``url_private_download`` URL through the SlackAdapter -- NOT a file_id
+        through the TelegramAdapter. Regression for the Telegram-hardcoded
+        download path that left Chekov unable to read inbound Slack files."""
+        import os
+
+        from pinky_outreach.slack import SlackAdapter
+
+        tmpdir, registry, broker, _ = self._make_broker()
+        try:
+            registry.set_token("barsik", "slack", "xoxb-123")
+            seen: dict = {}
+
+            def fake_download(self, url, dest_dir=""):
+                seen["url"] = url
+                return os.path.join(dest_dir, "report.md")
+
+            monkeypatch.setattr(SlackAdapter, "download_file", fake_download)
+
+            url = "https://files.slack.com/files-pri/T-F123/download/report.md"
+            msg = BrokerMessage(
+                platform="slack",
+                chat_id="C0BBT4WAYVA",
+                sender_name="Brad",
+                sender_id="U1",
+                content="here's the doc",
+                agent_name="barsik",
+                attachments=[{
+                    "type": "file",
+                    "file_id": "F123",
+                    "url": url,
+                    "file_name": "report.md",
+                }],
+            )
+            await broker._download_photo_attachments("barsik", msg)
+
+            assert seen.get("url") == url, (
+                "Slack download must use url_private_download, not the file_id"
+            )
+            assert msg.attachments[0]["local_path"].endswith("report.md")
+        finally:
+            tmpdir.cleanup()
+
     @pytest.mark.asyncio
     async def test_try_voice_reply_uses_daemon_url_and_offloads(self, monkeypatch):
         """The voice-reply HTTP loopback targets THIS process: a sync urlopen

@@ -1323,7 +1323,30 @@ class MessageBroker:
         else:
             await self._send_message(agent_name, platform, chat_id, stripped)
 
-    _DOWNLOADABLE_TYPES = {"photo", "document", "video", "animation", "sticker"}
+    # "file" is what Slack and Discord tag every inbound attachment as; the
+    # rest are Telegram's media kinds. (Voice is handled separately.)
+    _DOWNLOADABLE_TYPES = {"photo", "document", "video", "animation", "sticker", "file"}
+
+    @staticmethod
+    def _attachment_download_adapter(platform: str, raw_token: str):
+        """Return ``(adapter, ref_key)`` for downloading inbound attachments.
+
+        Each platform's ``download_file()`` takes a different first argument:
+        Telegram resolves a ``file_id`` via getFile, while Slack and Discord
+        fetch a direct (token-authorized) URL. ``ref_key`` is the attachment
+        field holding that argument. Returns ``(None, "")`` for a platform with
+        no attachment-download support.
+        """
+        if platform == "telegram":
+            from pinky_outreach.telegram import TelegramAdapter
+            return TelegramAdapter(raw_token), "file_id"
+        if platform == "slack":
+            from pinky_outreach.slack import SlackAdapter
+            return SlackAdapter(raw_token), "url"
+        if platform == "discord":
+            from pinky_outreach.discord import DiscordAdapter
+            return DiscordAdapter(raw_token), "url"
+        return None, ""
 
     async def _download_photo_attachments(
         self, agent_name: str, message: BrokerMessage,
@@ -1334,7 +1357,7 @@ class MessageBroker:
 
         downloadable = [
             a for a in message.attachments
-            if a.get("type") in self._DOWNLOADABLE_TYPES and a.get("file_id")
+            if a.get("type") in self._DOWNLOADABLE_TYPES
         ]
         if not downloadable:
             return
@@ -1352,15 +1375,25 @@ class MessageBroker:
         dest_dir = os.path.join(agent.working_dir, "attachments")
         os.makedirs(dest_dir, exist_ok=True)
 
-        from pinky_outreach.telegram import TelegramAdapter
-        adapter = TelegramAdapter(raw_token)
+        adapter, ref_key = self._attachment_download_adapter(message.platform, raw_token)
+        if adapter is None:
+            _log(
+                f"broker: no attachment-download support for platform "
+                f"{message.platform}, skip attachments"
+            )
+            return
 
         for att in downloadable:
+            # Telegram needs a file_id; Slack/Discord need a url. Skip any
+            # attachment missing the identifier this platform's adapter wants.
+            ref = att.get(ref_key)
+            if not ref:
+                continue
             try:
                 # download_file is sync (blocking httpx GET) -- offload so a
                 # multi-MB download doesn't freeze the daemon event loop.
                 local_path = await asyncio.to_thread(
-                    adapter.download_file, att["file_id"], dest_dir=dest_dir,
+                    adapter.download_file, ref, dest_dir=dest_dir,
                 )
                 local_path = os.path.abspath(local_path)
                 att["local_path"] = local_path
