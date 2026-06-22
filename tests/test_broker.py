@@ -468,6 +468,55 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_slash_approve_preserves_uppercase_slack_id(self, monkeypatch):
+        """Regression: /approve_<id> must preserve the EXACT case of the target
+        id. Slack user ids are uppercase (U774M8XDE); lowercasing the whole
+        command token approved a phantom lowercased user, delivered 0 held
+        messages, and left the real user pending — so the channel reply never
+        went out. This exercises the real owner-notification flow end-to-end."""
+        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
+        try:
+            routed: list[BrokerMessage] = []
+
+            async def _fake_route(agent_name, message):
+                routed.append(message)
+
+            monkeypatch.setattr(broker, "_route_streaming", _fake_route)
+            owner = "owner-1"
+            registry.set_primary_user(owner, display_name="Brad")
+
+            channel = "C0A8WUU743F"
+            user = "U774M8XDE"
+            # PM messages in the channel → held pending under the exact id.
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id=channel, sender_name="Alex Ugrin",
+                    sender_id=user, content="Hi", agent_name="barsik", is_group=True,
+                )
+            )
+            assert registry.get_user_status("barsik", user) == "pending"
+
+            # Owner approves exactly as the notification prints it: /approve_U…
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id=owner, sender_name="Brad",
+                    sender_id=owner, content=f"/approve_{user}", agent_name="barsik",
+                )
+            )
+
+            # The exact uppercase id is approved — no lowercased phantom user.
+            assert registry.get_user_status("barsik", user) == "approved"
+            assert registry.get_user_status("barsik", user.lower()) is None
+            # The held channel message is delivered to the CHANNEL.
+            assert len(routed) == 1
+            assert routed[0].chat_id == channel
+            assert routed[0].content == "Hi"
+            # Owner saw a non-zero delivery count (not "0 pending message(s)").
+            assert any("1 pending message" in m[3] for m in sent_messages)
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
         """Regression: messages arriving during ``context_restart`` (where the
         streaming session object exists but ``state`` is briefly != CONNECTED

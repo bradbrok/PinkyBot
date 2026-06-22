@@ -715,13 +715,19 @@ class MessageBroker:
             return False
 
         text = message.content.strip()
-        cmd = text.split()[0].lower()
+        # Match the command prefix case-insensitively, but preserve the RAW case
+        # of the target id — Slack user ids are uppercase (e.g. U774M8XDE) and the
+        # pending row is keyed under the exact id. Lowercasing the whole token
+        # approved a phantom lowercased user, delivered 0 held messages, and left
+        # the real user pending (so the channel reply never went out).
+        raw_cmd = text.split()[0]
+        cmd = raw_cmd.lower()
 
         if cmd.startswith("/approve_"):
-            target_chat_id = cmd[len("/approve_"):]
+            target_chat_id = raw_cmd[len("/approve_"):]
             action = "approve"
         elif cmd.startswith("/deny_"):
-            target_chat_id = cmd[len("/deny_"):]
+            target_chat_id = raw_cmd[len("/deny_"):]
             action = "deny"
         else:
             return False
