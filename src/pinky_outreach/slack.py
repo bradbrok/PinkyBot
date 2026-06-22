@@ -57,9 +57,37 @@ class SlackAdapter:
         return self._token
 
     def _request(self, method: str, **params) -> dict:
-        """Make a Slack Web API request."""
+        """Make a Slack Web API request (JSON body).
+
+        Fine for write methods like chat.postMessage that accept a JSON body.
+        Read/info methods (users.info, conversations.info, users.lookupByEmail)
+        must use ``_request_form`` instead — see that method's docstring.
+        """
         params = {k: v for k, v in params.items() if v is not None}
         resp = self._client.post(f"/{method}", json=params)
+        data = resp.json()
+
+        if not data.get("ok"):
+            raise SlackError(data.get("error", "unknown_error"))
+
+        return data
+
+    def _request_form(self, method: str, **params) -> dict:
+        """Make a Slack Web API request with form-encoded args.
+
+        Required for Slack's read/info methods (users.info, conversations.info,
+        users.lookupByEmail): those ignore a JSON request body, so a JSON call
+        arrives argument-less and Slack returns ``invalid_arguments`` or
+        ``*_not_found`` even with a valid token and scopes. They only read args
+        from the query string or an ``application/x-www-form-urlencoded`` body.
+        The client's default Content-Type is JSON, so override it per-request.
+        """
+        params = {k: v for k, v in params.items() if v is not None}
+        resp = self._client.post(
+            f"/{method}",
+            data=params,
+            headers={"Content-Type": "application/x-www-form-urlencoded"},
+        )
         data = resp.json()
 
         if not data.get("ok"):
@@ -282,7 +310,7 @@ class SlackAdapter:
 
     def get_channel_info(self, channel: str) -> Chat:
         """Get channel information."""
-        result = self._request("conversations.info", channel=channel)
+        result = self._request_form("conversations.info", channel=channel)
         ch = result.get("channel", {})
 
         # Determine type
@@ -313,7 +341,7 @@ class SlackAdapter:
         Returns a dict: user_id, name (handle), real_name, display_name
         (best human label, never empty when the user resolves), email, is_bot.
         """
-        result = self._request("users.info", user=user_id)
+        result = self._request_form("users.info", user=user_id)
         u = result.get("user", {}) or {}
         prof = u.get("profile", {}) or {}
         display = (
@@ -340,7 +368,7 @@ class SlackAdapter:
         natural tool for routing a nudge to the right person by their Zoho/
         directory email.
         """
-        result = self._request("users.lookupByEmail", email=email)
+        result = self._request_form("users.lookupByEmail", email=email)
         u = result.get("user", {}) or {}
         prof = u.get("profile", {}) or {}
         display = (

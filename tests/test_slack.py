@@ -96,10 +96,18 @@ class TestSlackAdapter:
         assert info["real_name"] == "Alice Adams"
         assert info["email"] == "alice@example.com"
         assert info["is_bot"] is False
-        # called users.info with the user id
+        # called users.info with the user id, FORM-encoded: Slack read methods
+        # ignore a JSON body, so _request_form must send data= (not json=) with
+        # an x-www-form-urlencoded Content-Type. Regression guard for the bug
+        # where JSON-posted lookups returned user_not_found / invalid_arguments.
         assert adapter._client.post.call_args[0][0] == "/users.info"
-        payload = adapter._client.post.call_args.kwargs["json"]
+        assert "json" not in adapter._client.post.call_args.kwargs
+        payload = adapter._client.post.call_args.kwargs["data"]
         assert payload["user"] == "U123"
+        assert (
+            adapter._client.post.call_args.kwargs["headers"]["Content-Type"]
+            == "application/x-www-form-urlencoded"
+        )
         adapter.close()
 
     def test_get_user_info_display_name_falls_back_to_real_then_handle(self):
@@ -140,7 +148,8 @@ class TestSlackAdapter:
         assert info["display_name"] == "Carol"
         assert info["email"] == "carol@example.com"
         assert adapter._client.post.call_args[0][0] == "/users.lookupByEmail"
-        payload = adapter._client.post.call_args.kwargs["json"]
+        assert "json" not in adapter._client.post.call_args.kwargs
+        payload = adapter._client.post.call_args.kwargs["data"]
         assert payload["email"] == "carol@example.com"
         adapter.close()
 
@@ -151,6 +160,31 @@ class TestSlackAdapter:
         adapter._client.post = MagicMock(return_value=mock_response)
         with pytest.raises(SlackError):
             adapter.lookup_user_by_email("nobody@example.com")
+        adapter.close()
+
+    def test_get_channel_info_uses_form_encoding(self):
+        """conversations.info is a read method — must be form-encoded, not JSON.
+
+        Regression guard for the bug where a JSON body made Slack return
+        invalid_arguments (the channel arg never arrived), so chat_title fell
+        back to the raw C... id on every inbound message.
+        """
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "channel": {"id": "C123", "name": "orders-and-equipment"},
+        }
+        adapter._client.post = MagicMock(return_value=mock_response)
+        chat = adapter.get_channel_info("C123")
+        assert chat.title == "orders-and-equipment"
+        assert adapter._client.post.call_args[0][0] == "/conversations.info"
+        assert "json" not in adapter._client.post.call_args.kwargs
+        assert adapter._client.post.call_args.kwargs["data"]["channel"] == "C123"
+        assert (
+            adapter._client.post.call_args.kwargs["headers"]["Content-Type"]
+            == "application/x-www-form-urlencoded"
+        )
         adapter.close()
 
     def test_send_message_error(self):
