@@ -348,6 +348,126 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_group_pending_reply_routes_to_channel_not_sender_dm(self, monkeypatch):
+        """Regression (Chekov Slack channel leak follow-up): a held message that
+        arrived in a group/channel must, on approval, be re-delivered to the
+        CHANNEL — not the sender's DM. The pending row keys approval on the
+        sender's user id but must preserve the channel as the reply destination
+        (reply_chat_id). Before the fix, queue stored chat_id=sender_id and
+        re-delivery routed the reply to the sender's DM, so channel replies
+        silently vanished from the channel."""
+        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
+        try:
+            routed: list[BrokerMessage] = []
+
+            async def _fake_route(agent_name, message):
+                routed.append(message)
+
+            monkeypatch.setattr(broker, "_route_streaming", _fake_route)
+            registry.set_primary_user("owner-1", display_name="Brad")
+
+            channel = "C0A8WUU743F"
+            user = "U774M8XDE"
+            # A PM messages IN the channel: chat_id=channel, sender_id=user.
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack",
+                    chat_id=channel,
+                    sender_name="Alex Ugrin",
+                    sender_id=user,
+                    content="Hi",
+                    agent_name="barsik",
+                    is_group=True,
+                )
+            )
+
+            # Held pending under the sender's user id, not routed yet.
+            assert registry.get_user_status("barsik", user) == "pending"
+            assert routed == []
+            # The "waiting for approval" notice goes to the channel it arrived in.
+            assert any(
+                m[1] == "slack" and m[2] == channel and "Waiting for approval" in m[3]
+                for m in sent_messages
+            )
+            # The pending row separates the approval key from the destination.
+            pending = registry.get_pending_messages("barsik", user)
+            assert len(pending) == 1
+            assert pending[0]["chat_id"] == user           # approval key (sender)
+            assert pending[0]["reply_chat_id"] == channel  # reply destination
+
+            # Owner approves → held message re-delivers.
+            registry.approve_user("barsik", user, display_name="Alex Ugrin")
+            delivered = await broker.handle_approval("barsik", user)
+
+            assert delivered == 1
+            assert len(routed) == 1
+            # THE FIX: re-delivered to the channel, with the sender restored —
+            # NOT routed to the sender's DM (user id).
+            assert routed[0].chat_id == channel
+            assert routed[0].sender_id == user
+            assert routed[0].content == "Hi"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_dm_pending_reply_routes_back_to_sender(self, monkeypatch):
+        """DM (1:1): sender == destination. A held DM re-delivers to the same
+        chat on approval — reply_chat_id defaults to chat_id, so DM behavior is
+        unchanged by the group-routing fix."""
+        tmpdir, registry, broker, _sent, _ = self._make_broker()
+        try:
+            routed: list[BrokerMessage] = []
+
+            async def _fake_route(agent_name, message):
+                routed.append(message)
+
+            monkeypatch.setattr(broker, "_route_streaming", _fake_route)
+            registry.set_primary_user("owner-1", display_name="Brad")
+
+            dm_user = "999"
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id=dm_user,
+                    sender_name="Stranger",
+                    sender_id=dm_user,
+                    content="let me in",
+                    agent_name="barsik",
+                )
+            )
+            assert registry.get_user_status("barsik", dm_user) == "pending"
+            pending = registry.get_pending_messages("barsik", dm_user)
+            assert pending[0]["reply_chat_id"] == dm_user  # defaulted to chat_id
+
+            registry.approve_user("barsik", dm_user, display_name="Stranger")
+            delivered = await broker.handle_approval("barsik", dm_user)
+            assert delivered == 1
+            assert routed[0].chat_id == dm_user
+            assert routed[0].sender_id == dm_user
+        finally:
+            tmpdir.cleanup()
+
+    def test_queue_pending_message_preserves_reply_chat_id(self):
+        """reply_chat_id is stored distinctly from the approval-key chat_id, and
+        defaults to chat_id when omitted (the DM case)."""
+        tmpdir, registry, _broker, _sent, _ = self._make_broker()
+        try:
+            registry.queue_pending_message(
+                agent_name="barsik", platform="slack", chat_id="Uuser",
+                sender_name="Alex", content="hi", reply_chat_id="Cchan",
+            )
+            registry.queue_pending_message(
+                agent_name="barsik", platform="telegram", chat_id="999",
+                sender_name="Stranger", content="yo",
+            )
+            rows = registry.get_pending_messages("barsik")
+            by_user = {r["chat_id"]: r for r in rows}
+            assert by_user["Uuser"]["reply_chat_id"] == "Cchan"
+            assert by_user["999"]["reply_chat_id"] == "999"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_route_streaming_waits_for_in_flight_reconnect(self, monkeypatch):
         """Regression: messages arriving during ``context_restart`` (where the
         streaming session object exists but ``state`` is briefly != CONNECTED

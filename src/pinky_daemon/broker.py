@@ -928,6 +928,7 @@ class MessageBroker:
                     agent_name=agent_name,
                     platform=message.platform,
                     chat_id=user_id,
+                    reply_chat_id=message.chat_id,
                     sender_name=message.sender_name,
                     content=message.content,
                 )
@@ -1046,13 +1047,18 @@ class MessageBroker:
             _log(f"broker: delivered 0/0 pending messages for {chat_id} to {agent_name}")
             return 0
 
-        # Route pending messages through streaming
+        # Route pending messages through streaming. Deliver to reply_chat_id
+        # (the original destination — the channel for a group message), NOT the
+        # chat_id column, which is the per-user approval key (the sender's id).
+        # Using chat_id here would re-route a held channel reply to the sender's
+        # DM. sender_id is restored from the approval key so group context (and
+        # the reply hint) reflect the right surface.
         for msg in pending:
             broker_msg = BrokerMessage(
                 platform=msg["platform"],
-                chat_id=msg["chat_id"],
+                chat_id=msg["reply_chat_id"],
                 sender_name=msg["sender_name"],
-                sender_id="",
+                sender_id=msg["chat_id"],
                 content=msg["content"],
                 agent_name=agent_name,
                 timestamp=msg["created_at"],
