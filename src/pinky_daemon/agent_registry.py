@@ -1420,7 +1420,11 @@ class AgentRegistry:
         migrations = [
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
             ("heartbeat_interval", "INTEGER NOT NULL DEFAULT 0"),
-            ("plain_text_fallback", "INTEGER NOT NULL DEFAULT 1"),
+            # Off by default — must match the dataclass + CREATE TABLE default (0).
+            # A DEFAULT 1 here silently backfilled every pre-existing agent with
+            # fallback ON, which leaked their internal reasoning into chats (the
+            # broker also hard-gates fallback on group/public channels).
+            ("plain_text_fallback", "INTEGER NOT NULL DEFAULT 0"),
             ("role", "TEXT NOT NULL DEFAULT ''"),
             ("users", "TEXT NOT NULL DEFAULT ''"),
             ("boundaries", "TEXT NOT NULL DEFAULT ''"),
