@@ -15,6 +15,7 @@ Requires a Slack Bot Token (xoxb-...) with appropriate scopes:
 
 from __future__ import annotations
 
+import json
 import os
 from datetime import datetime, timezone
 
@@ -161,15 +162,16 @@ class SlackAdapter:
         filename = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
 
-        # Step 1: Get upload URL
-        resp = self._client.post(
-            "/files.getUploadURLExternal",
-            json={"filename": filename, "length": file_size},
+        # Step 1: Get an upload URL. files.getUploadURLExternal is a form/query
+        # method — like users.info / conversations.info it ignores a JSON request
+        # body and returns invalid_arguments, so it must be form-encoded (same
+        # root cause as #808). Sending JSON here was why uploads failed even on a
+        # minimal file.
+        url_data = self._request_form(
+            "files.getUploadURLExternal",
+            filename=filename,
+            length=str(file_size),
         )
-        url_data = resp.json()
-        if not url_data.get("ok"):
-            raise SlackError(url_data.get("error", "upload_url_failed"))
-
         upload_url = url_data["upload_url"]
         file_id = url_data["file_id"]
 
@@ -183,10 +185,12 @@ class SlackAdapter:
             if upload_resp.status_code >= 400:
                 raise SlackError(f"File upload failed: {upload_resp.status_code}")
 
-        # Step 3: Complete the upload
-        self._request(
+        # Step 3: Complete the upload. files.completeUploadExternal also takes
+        # form-encoded args; `files` is a JSON-encoded array string (the
+        # canonical uploadV2 shape), not a native JSON-body field.
+        self._request_form(
             "files.completeUploadExternal",
-            files=[{"id": file_id, "title": title or filename}],
+            files=json.dumps([{"id": file_id, "title": title or filename}]),
             channel_id=channel,
             initial_comment=initial_comment or None,
         )

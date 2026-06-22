@@ -187,6 +187,61 @@ class TestSlackAdapter:
         )
         adapter.close()
 
+    def test_upload_file_uses_form_encoding(self, tmp_path, monkeypatch):
+        """files.getUploadURLExternal + completeUploadExternal are form/query
+        methods: a JSON body makes Slack ignore the args and return
+        invalid_arguments, so uploads failed even on a minimal file. Regression
+        guard — both must be form-encoded (data=, not json=) with the uploadV2
+        argument shape (filename+length, then a JSON-encoded `files` array)."""
+        import json as _json
+
+        adapter = self._make_adapter()
+        f = tmp_path / "note.txt"
+        f.write_text("hello")  # 5 bytes
+
+        url_resp = MagicMock()
+        url_resp.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/xyz",
+            "file_id": "F123",
+        }
+        complete_resp = MagicMock()
+        complete_resp.json.return_value = {"ok": True, "files": [{"id": "F123"}]}
+        adapter._client.post = MagicMock(side_effect=[url_resp, complete_resp])
+
+        # Step 2 streams bytes to the returned upload_url via module-level httpx.
+        upload_resp = MagicMock(status_code=200)
+        monkeypatch.setattr(
+            "pinky_outreach.slack.httpx.post", MagicMock(return_value=upload_resp)
+        )
+
+        msg = adapter.upload_file("C123", str(f), title="Note", initial_comment="here")
+
+        calls = adapter._client.post.call_args_list
+        # Step 1: getUploadURLExternal — form-encoded, filename + length.
+        assert calls[0][0][0] == "/files.getUploadURLExternal"
+        assert "json" not in calls[0].kwargs
+        assert (
+            calls[0].kwargs["headers"]["Content-Type"]
+            == "application/x-www-form-urlencoded"
+        )
+        assert calls[0].kwargs["data"]["filename"] == "note.txt"
+        assert calls[0].kwargs["data"]["length"] == "5"
+        # Step 3: completeUploadExternal — form-encoded; files is a JSON string.
+        assert calls[1][0][0] == "/files.completeUploadExternal"
+        assert "json" not in calls[1].kwargs
+        assert (
+            calls[1].kwargs["headers"]["Content-Type"]
+            == "application/x-www-form-urlencoded"
+        )
+        assert calls[1].kwargs["data"]["channel_id"] == "C123"
+        files_arg = calls[1].kwargs["data"]["files"]
+        assert isinstance(files_arg, str)
+        assert _json.loads(files_arg) == [{"id": "F123", "title": "Note"}]
+
+        assert msg.message_id == "F123"
+        adapter.close()
+
     def test_send_message_error(self):
         adapter = self._make_adapter()
         mock_response = MagicMock()
