@@ -1255,6 +1255,7 @@ class AgentRegistry:
                 agent_name TEXT NOT NULL,
                 platform TEXT NOT NULL,
                 chat_id TEXT NOT NULL,
+                reply_chat_id TEXT NOT NULL DEFAULT '',
                 sender_name TEXT NOT NULL DEFAULT '',
                 content TEXT NOT NULL,
                 created_at REAL NOT NULL,
@@ -1545,6 +1546,25 @@ class AgentRegistry:
                 "ALTER TABLE agent_contexts ADD COLUMN wake_action TEXT NOT NULL DEFAULT ''"
             )
             _log("agent_registry: migrated — added wake_action to agent_contexts")
+
+        # Migrate pending_messages table — reply_chat_id preserves the true reply
+        # destination (e.g. the Slack/Telegram channel a group message arrived in).
+        # The chat_id column is the per-user approval key (the sender's id); in a
+        # group/channel that differs from the destination, so without a separate
+        # field a held message would be re-delivered to the sender's DM instead of
+        # the channel. Backfill to chat_id so pre-existing rows keep their prior
+        # (DM-correct) behavior.
+        pm_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(pending_messages)").fetchall()
+        }
+        if "reply_chat_id" not in pm_existing:
+            self._db.execute(
+                "ALTER TABLE pending_messages ADD COLUMN reply_chat_id TEXT NOT NULL DEFAULT ''"
+            )
+            self._db.execute(
+                "UPDATE pending_messages SET reply_chat_id=chat_id WHERE reply_chat_id=''"
+            )
+            _log("agent_registry: migrated — added reply_chat_id to pending_messages")
 
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
@@ -3447,15 +3467,23 @@ except Exception:
 
     def queue_pending_message(
         self, agent_name: str, platform: str, chat_id: str,
-        sender_name: str, content: str,
+        sender_name: str, content: str, reply_chat_id: str = "",
     ) -> int:
-        """Queue a message from a pending user. Returns the message ID."""
+        """Queue a message from a pending user. Returns the message ID.
+
+        ``chat_id`` is the per-user approval key (the sender's id) — pending
+        messages are looked up and approved by it. ``reply_chat_id`` is where
+        the eventual reply should be delivered; for a group/channel message
+        that's the channel id, which differs from the sender. Defaults to
+        ``chat_id`` (correct for 1:1 DMs where sender == destination).
+        """
         now = time.time()
+        dest = reply_chat_id or chat_id
         cursor = self._db.execute(
             """INSERT INTO pending_messages
-               (agent_name, platform, chat_id, sender_name, content, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            (agent_name, platform, chat_id, sender_name, content, now),
+               (agent_name, platform, chat_id, reply_chat_id, sender_name, content, created_at)
+               VALUES (?, ?, ?, ?, ?, ?, ?)""",
+            (agent_name, platform, chat_id, dest, sender_name, content, now),
         )
         self._db.commit()
         return cursor.lastrowid
@@ -3466,7 +3494,8 @@ except Exception:
         """Get undelivered pending messages. If chat_id given, filter by it."""
         if chat_id:
             rows = self._db.execute(
-                """SELECT id, agent_name, platform, chat_id, sender_name, content, created_at
+                """SELECT id, agent_name, platform, chat_id, reply_chat_id,
+                          sender_name, content, created_at
                    FROM pending_messages
                    WHERE agent_name=? AND chat_id=? AND delivered=0
                    ORDER BY created_at ASC""",
@@ -3474,7 +3503,8 @@ except Exception:
             ).fetchall()
         else:
             rows = self._db.execute(
-                """SELECT id, agent_name, platform, chat_id, sender_name, content, created_at
+                """SELECT id, agent_name, platform, chat_id, reply_chat_id,
+                          sender_name, content, created_at
                    FROM pending_messages
                    WHERE agent_name=? AND delivered=0
                    ORDER BY created_at ASC""",
@@ -3483,8 +3513,8 @@ except Exception:
         return [
             {
                 "id": r[0], "agent_name": r[1], "platform": r[2],
-                "chat_id": r[3], "sender_name": r[4], "content": r[5],
-                "created_at": r[6],
+                "chat_id": r[3], "reply_chat_id": r[4] or r[3],
+                "sender_name": r[5], "content": r[6], "created_at": r[7],
             }
             for r in rows
         ]
