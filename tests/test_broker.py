@@ -348,14 +348,12 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_group_pending_reply_routes_to_channel_not_sender_dm(self, monkeypatch):
-        """Regression (Chekov Slack channel leak follow-up): a held message that
-        arrived in a group/channel must, on approval, be re-delivered to the
-        CHANNEL — not the sender's DM. The pending row keys approval on the
-        sender's user id but must preserve the channel as the reply destination
-        (reply_chat_id). Before the fix, queue stored chat_id=sender_id and
-        re-delivery routed the reply to the sender's DM, so channel replies
-        silently vanished from the channel."""
+    async def test_group_message_gates_on_channel_and_routes_back(self, monkeypatch):
+        """A group/channel message gates on the CHANNEL (not the sender): it's
+        held pending under the channel id, the owner is notified with
+        /approve_<channel>, and the in-channel "waiting for approval" notice is
+        suppressed (it would be noise to every member). On approval the held
+        message re-delivers to the channel with is_group preserved."""
         tmpdir, registry, broker, sent_messages, _ = self._make_broker()
         try:
             routed: list[BrokerMessage] = []
@@ -364,11 +362,11 @@ class TestMessageBrokerRouting:
                 routed.append(message)
 
             monkeypatch.setattr(broker, "_route_streaming", _fake_route)
-            registry.set_primary_user("owner-1", display_name="Brad")
+            owner = "owner-1"
+            registry.set_primary_user(owner, display_name="Brad")
 
             channel = "C0A8WUU743F"
             user = "U774M8XDE"
-            # A PM messages IN the channel: chat_id=channel, sender_id=user.
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack",
@@ -381,31 +379,70 @@ class TestMessageBrokerRouting:
                 )
             )
 
-            # Held pending under the sender's user id, not routed yet.
-            assert registry.get_user_status("barsik", user) == "pending"
+            # Gated on the CHANNEL, not the individual sender.
+            assert registry.get_user_status("barsik", channel) == "pending"
+            assert registry.get_user_status("barsik", user) is None
             assert routed == []
-            # The "waiting for approval" notice goes to the channel it arrived in.
+            # No in-channel "waiting for approval" spam...
+            assert not any("Waiting for approval" in m[3] for m in sent_messages)
+            # ...but the owner gets a /approve_<channel> prompt.
             assert any(
-                m[1] == "slack" and m[2] == channel and "Waiting for approval" in m[3]
-                for m in sent_messages
+                m[2] == owner and f"/approve_{channel}" in m[3] for m in sent_messages
             )
-            # The pending row separates the approval key from the destination.
-            pending = registry.get_pending_messages("barsik", user)
+            # Pending row: approval key = channel, destination = channel, is_group.
+            pending = registry.get_pending_messages("barsik", channel)
             assert len(pending) == 1
-            assert pending[0]["chat_id"] == user           # approval key (sender)
-            assert pending[0]["reply_chat_id"] == channel  # reply destination
+            assert pending[0]["chat_id"] == channel
+            assert pending[0]["reply_chat_id"] == channel
+            assert pending[0]["is_group"] is True
 
-            # Owner approves → held message re-delivers.
-            registry.approve_user("barsik", user, display_name="Alex Ugrin")
-            delivered = await broker.handle_approval("barsik", user)
+            # Approve the channel → held message re-delivers to the channel.
+            registry.approve_user("barsik", channel, display_name=channel)
+            delivered = await broker.handle_approval("barsik", channel)
 
             assert delivered == 1
             assert len(routed) == 1
-            # THE FIX: re-delivered to the channel, with the sender restored —
-            # NOT routed to the sender's DM (user id).
             assert routed[0].chat_id == channel
             assert routed[0].sender_id == user
+            assert routed[0].is_group is True
             assert routed[0].content == "Hi"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_channel_approval_admits_all_members(self, monkeypatch):
+        """Core of #241: once a CHANNEL is approved, every member's messages
+        flow without per-user approval. A user who was never individually
+        approved routes straight through in an approved channel."""
+        tmpdir, registry, broker, sent_messages, _ = self._make_broker()
+        try:
+            routed: list[BrokerMessage] = []
+
+            async def _fake_route(agent_name, message):
+                routed.append(message)
+
+            monkeypatch.setattr(broker, "_route_streaming", _fake_route)
+            registry.set_primary_user("owner-1", display_name="Brad")
+
+            channel = "C0A8WUU743F"
+            # Channel is approved once.
+            registry.approve_user("barsik", channel, display_name=channel)
+
+            # A brand-new, never-approved member messages in the channel.
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id=channel, sender_name="Jake Hredzak",
+                    sender_id="U_NEVER_APPROVED", content="status?",
+                    agent_name="barsik", is_group=True,
+                )
+            )
+
+            # Routed straight through — no pending, no approval prompt.
+            assert len(routed) == 1
+            assert routed[0].chat_id == channel
+            assert routed[0].sender_id == "U_NEVER_APPROVED"
+            assert registry.get_pending_messages("barsik", channel) == []
+            assert not any("approve" in m[3].lower() for m in sent_messages)
         finally:
             tmpdir.cleanup()
 
@@ -447,33 +484,36 @@ class TestMessageBrokerRouting:
         finally:
             tmpdir.cleanup()
 
-    def test_queue_pending_message_preserves_reply_chat_id(self):
-        """reply_chat_id is stored distinctly from the approval-key chat_id, and
-        defaults to chat_id when omitted (the DM case)."""
+    def test_queue_pending_message_preserves_reply_chat_id_and_is_group(self):
+        """reply_chat_id is stored distinctly from the approval-key chat_id
+        (defaulting to chat_id when omitted), and is_group is persisted."""
         tmpdir, registry, _broker, _sent, _ = self._make_broker()
         try:
             registry.queue_pending_message(
-                agent_name="barsik", platform="slack", chat_id="Uuser",
+                agent_name="barsik", platform="slack", chat_id="Cchan",
                 sender_name="Alex", content="hi", reply_chat_id="Cchan",
+                is_group=True,
             )
             registry.queue_pending_message(
                 agent_name="barsik", platform="telegram", chat_id="999",
                 sender_name="Stranger", content="yo",
             )
             rows = registry.get_pending_messages("barsik")
-            by_user = {r["chat_id"]: r for r in rows}
-            assert by_user["Uuser"]["reply_chat_id"] == "Cchan"
-            assert by_user["999"]["reply_chat_id"] == "999"
+            by_key = {r["chat_id"]: r for r in rows}
+            assert by_key["Cchan"]["reply_chat_id"] == "Cchan"
+            assert by_key["Cchan"]["is_group"] is True
+            assert by_key["999"]["reply_chat_id"] == "999"   # defaulted to chat_id
+            assert by_key["999"]["is_group"] is False
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_slash_approve_preserves_uppercase_slack_id(self, monkeypatch):
+    async def test_slash_approve_preserves_uppercase_channel_id(self, monkeypatch):
         """Regression: /approve_<id> must preserve the EXACT case of the target
-        id. Slack user ids are uppercase (U774M8XDE); lowercasing the whole
-        command token approved a phantom lowercased user, delivered 0 held
-        messages, and left the real user pending — so the channel reply never
-        went out. This exercises the real owner-notification flow end-to-end."""
+        id. Slack channel ids are uppercase (C0A8WUU743F); lowercasing the whole
+        command token approved a phantom lowercased id, delivered 0 held
+        messages, and left the channel unapproved — so replies never went out.
+        Exercises the real owner-notification flow end-to-end at channel scope."""
         tmpdir, registry, broker, sent_messages, _ = self._make_broker()
         try:
             routed: list[BrokerMessage] = []
@@ -486,28 +526,28 @@ class TestMessageBrokerRouting:
             registry.set_primary_user(owner, display_name="Brad")
 
             channel = "C0A8WUU743F"
-            user = "U774M8XDE"
-            # PM messages in the channel → held pending under the exact id.
+            # A message in the channel → held pending under the exact channel id.
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack", chat_id=channel, sender_name="Alex Ugrin",
-                    sender_id=user, content="Hi", agent_name="barsik", is_group=True,
+                    sender_id="U774M8XDE", content="Hi", agent_name="barsik",
+                    is_group=True,
                 )
             )
-            assert registry.get_user_status("barsik", user) == "pending"
+            assert registry.get_user_status("barsik", channel) == "pending"
 
-            # Owner approves exactly as the notification prints it: /approve_U…
+            # Owner approves exactly as the notification prints it: /approve_C…
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack", chat_id=owner, sender_name="Brad",
-                    sender_id=owner, content=f"/approve_{user}", agent_name="barsik",
+                    sender_id=owner, content=f"/approve_{channel}", agent_name="barsik",
                 )
             )
 
-            # The exact uppercase id is approved — no lowercased phantom user.
-            assert registry.get_user_status("barsik", user) == "approved"
-            assert registry.get_user_status("barsik", user.lower()) is None
-            # The held channel message is delivered to the CHANNEL.
+            # The exact uppercase channel id is approved — no lowercased phantom.
+            assert registry.get_user_status("barsik", channel) == "approved"
+            assert registry.get_user_status("barsik", channel.lower()) is None
+            # The held message is delivered to the CHANNEL.
             assert len(routed) == 1
             assert routed[0].chat_id == channel
             assert routed[0].content == "Hi"

@@ -856,90 +856,115 @@ class MessageBroker:
             if handled:
                 return
 
-        # 1. Check sender status — always use the individual sender_id for approval,
-        #    not the chat_id (which is the group ID for group messages).
-        user_id = message.sender_id or message.chat_id
-        status = self._registry.get_user_status(agent_name, user_id)
+        # 1. Determine the approval key. For a group/channel message the trust
+        #    unit is the CHANNEL — an admin deliberately added the agent to it,
+        #    so one approval lets everyone in the channel talk to it (no
+        #    per-member gate). For a 1:1 DM the unit is the individual sender
+        #    (defense against strangers DMing the bot directly).
+        if message.is_group and message.chat_id:
+            approval_key = message.chat_id
+            is_channel = True
+        else:
+            approval_key = message.sender_id or message.chat_id
+            is_channel = False
+        status = self._registry.get_user_status(agent_name, approval_key)
 
         if status == "denied":
             self._stats["denied"] += 1
-            _log(f"broker: denied message from {message.sender_name} ({user_id}) for {agent_name}")
+            _log(f"broker: denied message from {message.sender_name} ({approval_key}) for {agent_name}")
             return
 
         if status is None or status == "pending":
             primary = self._registry.get_primary_user()
             # First-run ownership claim: if no primary user has ever been
-            # configured, the first person to message the bot is treated as the
-            # owner — set them as primary (which also auto-approves them across
-            # all agents). This removes the confusing "waiting for approval"
-            # message a fresh owner would otherwise get from their own bot.
-            # Tradeoff: whoever messages first claims ownership, so the owner
-            # should connect before sharing the bot. Only fires when primary is
-            # completely unset.
-            if not primary.get("chat_id"):
+            # configured, the first person to DM the bot is treated as the owner
+            # — set them as primary (which also auto-approves them across all
+            # agents). This removes the confusing "waiting for approval" message
+            # a fresh owner would otherwise get from their own bot. Tradeoff:
+            # whoever messages first claims ownership, so the owner should
+            # connect before sharing the bot. Only fires when primary is unset,
+            # and NEVER from a channel — a channel id must not become the owner.
+            if not primary.get("chat_id") and not is_channel:
                 self._registry.set_primary_user(
-                    user_id,
+                    approval_key,
                     display_name=message.sender_name or "",
                 )
                 _log(
-                    f"broker: no primary user configured — claimed {user_id} "
+                    f"broker: no primary user configured — claimed {approval_key} "
                     f"({message.sender_name}) as primary/owner for {agent_name}"
                 )
                 primary = self._registry.get_primary_user()
-            # Auto-approve primary user
-            if primary.get("chat_id") and user_id == primary["chat_id"]:
+            # Auto-approve primary user (DM only — approval_key is the sender).
+            if primary.get("chat_id") and approval_key == primary["chat_id"]:
                 self._registry.approve_user(
-                    agent_name, user_id,
+                    agent_name, approval_key,
                     display_name=primary.get("display_name") or message.sender_name,
                     approved_by="primary_user",
                 )
-                _log(f"broker: auto-approved primary user {user_id} for {agent_name}")
+                _log(f"broker: auto-approved primary user {approval_key} for {agent_name}")
                 # Fall through to routing below
             else:
-                # Unknown or pending user — queue message
+                # Unknown or pending key — queue message
                 if status is None:
                     self._registry.add_pending_user(
-                        agent_name, user_id,
-                        display_name=message.sender_name,
+                        agent_name, approval_key,
+                        display_name=(message.chat_id if is_channel else message.sender_name),
                     )
-                    # Onboarding: notify new user and primary user
+                    # Onboarding. For a 1:1 DM, ack the sender. For a channel,
+                    # stay silent in-channel — a "waiting for approval" notice
+                    # would be posted to everyone in the channel (noise);
+                    # approval is between the agent and its owner.
                     if self._send_callback:
-                        try:
-                            await self._send_callback(
-                                agent_name, message.platform, message.chat_id,
-                                "Request sent! Waiting for approval.",
-                            )
-                        except Exception as e:
-                            _log(f"broker: failed to send onboarding reply to {user_id}: {e}")
+                        if not is_channel:
+                            try:
+                                await self._send_callback(
+                                    agent_name, message.platform, message.chat_id,
+                                    "Request sent! Waiting for approval.",
+                                )
+                            except Exception as e:
+                                _log(f"broker: failed to send onboarding reply to {approval_key}: {e}")
                         primary = self._registry.get_primary_user()
                         if primary.get("chat_id"):
-                            name_display = message.sender_name or "Unknown"
-                            username = message.metadata.get("username", "")
-                            if username:
-                                name_display += f" (@{username})"
-                            notification = (
-                                f"🆕 New user wants to talk to {agent_name}:\n"
-                                f"{name_display} (ID: {user_id})\n\n"
-                                f"/approve_{user_id}\n"
-                                f"/deny_{user_id}"
-                            )
+                            if is_channel:
+                                notification = (
+                                    f"🆕 {agent_name} got a message in a new channel "
+                                    f"(ID: {approval_key}).\n\n"
+                                    f"Approve to let everyone in this channel talk to "
+                                    f"{agent_name}:\n"
+                                    f"/approve_{approval_key}\n"
+                                    f"/deny_{approval_key}"
+                                )
+                            else:
+                                name_display = message.sender_name or "Unknown"
+                                username = message.metadata.get("username", "")
+                                if username:
+                                    name_display += f" (@{username})"
+                                notification = (
+                                    f"🆕 New user wants to talk to {agent_name}:\n"
+                                    f"{name_display} (ID: {approval_key})\n\n"
+                                    f"/approve_{approval_key}\n"
+                                    f"/deny_{approval_key}"
+                                )
                             try:
                                 await self._send_callback(
                                     agent_name, message.platform, primary["chat_id"],
                                     notification,
                                 )
                             except Exception as e:
-                                _log(f"broker: failed to notify owner about new user {user_id}: {e}")
+                                kind = "channel" if is_channel else "user"
+                                _log(f"broker: failed to notify owner about new {kind} {approval_key}: {e}")
                 self._registry.queue_pending_message(
                     agent_name=agent_name,
                     platform=message.platform,
-                    chat_id=user_id,
+                    chat_id=approval_key,
                     reply_chat_id=message.chat_id,
                     sender_name=message.sender_name,
                     content=message.content,
+                    is_group=message.is_group,
+                    sender_id=message.sender_id,
                 )
                 self._stats["pending"] += 1
-                _log(f"broker: queued message from pending user {message.sender_name} ({user_id}) for {agent_name}")
+                _log(f"broker: queued pending message for {agent_name} (key={approval_key}, sender={message.sender_name})")
                 return
 
         # 2. Approved — route via streaming session
@@ -1064,10 +1089,11 @@ class MessageBroker:
                 platform=msg["platform"],
                 chat_id=msg["reply_chat_id"],
                 sender_name=msg["sender_name"],
-                sender_id=msg["chat_id"],
+                sender_id=msg.get("sender_id") or msg["chat_id"],
                 content=msg["content"],
                 agent_name=agent_name,
                 timestamp=msg["created_at"],
+                is_group=bool(msg.get("is_group")),
             )
             await self._route_streaming(agent_name, broker_msg)
 
