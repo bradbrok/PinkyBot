@@ -750,11 +750,21 @@ class MessageBroker:
                     display_name=display_name,
                     approved_by="primary_user",
                 )
+                # Is this a channel approval? Held group rows carry is_group=True.
+                # Must be checked BEFORE handle_approval marks them delivered.
+                pending_before = self._registry.get_pending_messages(
+                    agent_name, target_chat_id,
+                )
+                target_is_channel = any(p.get("is_group") for p in pending_before)
                 delivered = await self.handle_approval(agent_name, target_chat_id)
                 reply = f"✅ Approved. {delivered} pending message(s) delivered to {agent_name}."
 
-                # Notify the approved user
-                if self._send_callback:
+                # Notify the approved DM user — but NOT a channel: posting
+                # "you've been approved" into the channel would be the same
+                # in-channel noise the pending path deliberately suppresses. For
+                # a channel, the held-message delivery + the owner confirmation
+                # are enough.
+                if self._send_callback and not target_is_channel:
                     try:
                         await self._send_callback(
                             agent_name, message.platform, target_chat_id,

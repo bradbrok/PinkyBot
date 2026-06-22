@@ -553,6 +553,12 @@ class TestMessageBrokerRouting:
             assert routed[0].content == "Hi"
             # Owner saw a non-zero delivery count (not "0 pending message(s)").
             assert any("1 pending message" in m[3] for m in sent_messages)
+            # No approval notice posted INTO the channel — that would be the same
+            # in-channel noise the pending path suppresses (channel approval is
+            # owner business; the held-message delivery is the visible signal).
+            assert not any(
+                m[2] == channel and "approved" in m[3].lower() for m in sent_messages
+            )
         finally:
             tmpdir.cleanup()
 
