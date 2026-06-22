@@ -44,6 +44,20 @@ class TestMessageBrokerRouting:
     async def test_route_response_sends_plain_text_when_fallback_enabled(self):
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
+            # Fallback is fail-closed: it only delivers with a positive matching
+            # 1:1 DM context (stored at dispatch).
+            broker.remember_message_context(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="6770805286",
+                    sender_name="Brad",
+                    sender_id="u-1",
+                    content="ping",
+                    agent_name="barsik",
+                    message_id="42",
+                    is_group=False,
+                )
+            )
             await broker.route_response(
                 "barsik",
                 "telegram",
@@ -155,6 +169,82 @@ class TestMessageBrokerRouting:
 
             assert sent_messages == [
                 ("barsik", "telegram", "6770805286", "Replying in a DM via fallback"),
+            ]
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_response_suppresses_fallback_when_no_context(self):
+        # Fail-closed: with no positive DM context for an external platform, the
+        # fallback must NOT auto-deliver (absence is not authorization).
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            await broker.route_response(
+                "barsik",
+                "telegram",
+                "-100groupchat",
+                "reasoning with no stored context",
+                message_id="not-remembered",
+                used_outreach=False,
+                fallback_enabled=True,
+            )
+
+            assert sent_messages == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_response_suppresses_fallback_on_context_collision(self):
+        # Per-chat message ids collide: a DM context overwrites a group context
+        # with the same message_id. Routing the group turn must still suppress —
+        # the stored ctx.chat_id no longer matches the group chat (fail-closed).
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            broker.remember_message_context(
+                BrokerMessage(
+                    platform="telegram", chat_id="-100public", sender_name="x",
+                    sender_id="u-1", content="group msg", agent_name="barsik",
+                    message_id="42", is_group=True,
+                )
+            )
+            broker.remember_message_context(  # same message_id, overwrites
+                BrokerMessage(
+                    platform="telegram", chat_id="6770805286", sender_name="Brad",
+                    sender_id="u-2", content="dm msg", agent_name="barsik",
+                    message_id="42", is_group=False,
+                )
+            )
+            await broker.route_response(
+                "barsik",
+                "telegram",
+                "-100public",
+                "internal hold reasoning",
+                message_id="42",
+                used_outreach=False,
+                fallback_enabled=True,
+            )
+
+            assert sent_messages == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_response_allows_fallback_on_web_without_context(self):
+        # Owner-only surfaces (web/api/internal) are never public channels and
+        # carry no message context — the fallback convenience is preserved.
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            await broker.route_response(
+                "barsik",
+                "web",
+                "web",
+                "web console reply via fallback",
+                used_outreach=False,
+                fallback_enabled=True,
+            )
+
+            assert sent_messages == [
+                ("barsik", "web", "web", "web console reply via fallback"),
             ]
         finally:
             tmpdir.cleanup()
