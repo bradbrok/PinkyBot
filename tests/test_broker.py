@@ -95,6 +95,71 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_route_response_suppresses_fallback_on_group_chat(self):
+        # An agent's reasoning must NEVER auto-deliver to a group/public channel,
+        # even with fallback enabled — regression guard for the Chekov Slack leak.
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            broker.remember_message_context(
+                BrokerMessage(
+                    platform="slack",
+                    chat_id="C0PUBLIC",
+                    sender_name="teammate",
+                    sender_id="u-9",
+                    content="team chatter",
+                    agent_name="barsik",
+                    message_id="555",
+                    is_group=True,
+                )
+            )
+            await broker.route_response(
+                "barsik",
+                "slack",
+                "C0PUBLIC",
+                "This isn't directed at me, I'll hold and stay quiet.",
+                message_id="555",
+                used_outreach=False,
+                fallback_enabled=True,
+            )
+
+            assert sent_messages == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_response_allows_fallback_on_dm_context(self):
+        # Fallback convenience still works in a 1:1 DM (is_group False).
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            broker.remember_message_context(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="6770805286",
+                    sender_name="Brad",
+                    sender_id="u-1",
+                    content="hey",
+                    agent_name="barsik",
+                    message_id="556",
+                    is_group=False,
+                )
+            )
+            await broker.route_response(
+                "barsik",
+                "telegram",
+                "6770805286",
+                "Replying in a DM via fallback",
+                message_id="556",
+                used_outreach=False,
+                fallback_enabled=True,
+            )
+
+            assert sent_messages == [
+                ("barsik", "telegram", "6770805286", "Replying in a DM via fallback"),
+            ]
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_inject_agent_message_stamps_last_seen_on_success(self):
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:

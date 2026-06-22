@@ -1315,6 +1315,21 @@ class MessageBroker:
         if not stripped or not fallback_enabled or not chat_id:
             return
 
+        # Never auto-deliver the plain-text fallback to a group/public channel.
+        # When an agent decides to stay silent it often "thinks out loud" (emits
+        # reasoning text without calling an outreach tool); the fallback would
+        # then post that internal deliberation to a shared channel — exactly the
+        # leak seen with Chekov on Slack. The fallback is a convenience for owner
+        # DMs only. The inbound message's is_group is stored at dispatch time in
+        # remember_message_context(), so this has no cold-start gap.
+        ctx = self.get_message_context(agent_name, message_id) if message_id else None
+        if ctx and ctx.is_group:
+            _log(
+                f"broker: suppressed plain-text fallback for {agent_name} on "
+                f"group chat {platform}/{chat_id} (no leak to public channel)"
+            )
+            return
+
         voice_key = (agent_name, chat_id)
         if self._voice_pending.pop(voice_key, False):
             sent_voice = await self._try_voice_reply(agent_name, platform, chat_id, stripped)
