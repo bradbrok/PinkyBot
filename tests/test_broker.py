@@ -41,11 +41,13 @@ class TestMessageBrokerRouting:
         return tmpdir, registry, broker, sent_messages, reactions
 
     @pytest.mark.asyncio
-    async def test_route_response_sends_plain_text_when_fallback_enabled(self):
+    async def test_route_response_suppresses_fallback_on_external_dm(self):
+        # Owner rule (Brad, 2026-06-22): plain-text fallback NEVER auto-delivers
+        # to an outreach channel — not even a 1:1 owner DM with a valid stored
+        # context. Agents must call an explicit outreach tool to reach external
+        # channels; bare text only surfaces on internal surfaces (web/api/console).
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
-            # Fallback is fail-closed: it only delivers with a positive matching
-            # 1:1 DM context (stored at dispatch).
             broker.remember_message_context(
                 BrokerMessage(
                     platform="telegram",
@@ -68,9 +70,7 @@ class TestMessageBrokerRouting:
                 fallback_enabled=True,
             )
 
-            assert sent_messages == [
-                ("barsik", "telegram", "6770805286", "Ping from Barsik"),
-            ]
+            assert sent_messages == []
         finally:
             tmpdir.cleanup()
 
@@ -141,34 +141,22 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_response_allows_fallback_on_dm_context(self):
-        # Fallback convenience still works in a 1:1 DM (is_group False).
+    async def test_route_response_allows_fallback_on_api_surface(self):
+        # Internal surfaces (web/api/console) keep the fallback convenience and
+        # need no message context — they're owner-only, never public channels.
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
-            broker.remember_message_context(
-                BrokerMessage(
-                    platform="telegram",
-                    chat_id="6770805286",
-                    sender_name="Brad",
-                    sender_id="u-1",
-                    content="hey",
-                    agent_name="barsik",
-                    message_id="556",
-                    is_group=False,
-                )
-            )
             await broker.route_response(
                 "barsik",
-                "telegram",
-                "6770805286",
-                "Replying in a DM via fallback",
-                message_id="556",
+                "api",
+                "api",
+                "api console reply via fallback",
                 used_outreach=False,
                 fallback_enabled=True,
             )
 
             assert sent_messages == [
-                ("barsik", "telegram", "6770805286", "Replying in a DM via fallback"),
+                ("barsik", "api", "api", "api console reply via fallback"),
             ]
         finally:
             tmpdir.cleanup()
