@@ -113,8 +113,10 @@ class TestToolHintIsAlwaysPresent:
         # to call on cold start.
         assert "select:mcp__pinky-messaging__send,mcp__pinky-messaging__thread" in out
         assert "select:mcp__pinky-memory__reflect,mcp__pinky-memory__recall" in out
-        # The fallback note about Pinky plain-text delivery.
-        assert "Pinky may fall back to plain-text delivery" in out
+        # The plain-text fallback hint was removed: agents must use an explicit
+        # outreach tool, so the prompt must never advertise auto plain-text delivery.
+        assert "fall back to plain-text" not in out
+        assert "plain text automatically" not in out
 
     @pytest.mark.parametrize("reason", list(WakeReason))
     def test_messaging_tools_listed(self, reason: WakeReason):
@@ -203,8 +205,7 @@ class TestContractRegression:
         idx_lead = out.index("You're connected via Pinky's message broker")
         idx_msg = out.index("Users will message you through Telegram")
         idx_hint = out.index("If your tools are deferred")
-        idx_fallback = out.index("Pinky may fall back to plain-text")
-        assert idx_header < idx_lead < idx_msg < idx_hint < idx_fallback
+        assert idx_header < idx_lead < idx_msg < idx_hint
 
     def test_context_restart_with_body_snapshot(self):
         body = "Saved: do X\nThen Y"
