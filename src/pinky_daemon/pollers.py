@@ -8,6 +8,7 @@ message handler (legacy) or message broker (new).
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
@@ -783,6 +784,64 @@ class BrokerDiscordPoller:
         _log(f"discord-poller[{self._agent_name}]: stopping")
 
 
+# Slack mrkdwn ref tokens: <@U…>, <#C…|name>, <!here>, <https://…|label>, …
+# (Slack never nests these and escapes literal </>/& as entities, so a simple
+# non-greedy, no-angle-bracket body match is safe.)
+_SLACK_REF_RE = re.compile(r"<([^<>]+)>")
+
+
+async def _resolve_slack_ref(body: str, user_namer, channel_namer) -> str:
+    """Resolve a single Slack ref token body (the text between < and >)."""
+    raw = f"<{body}>"
+    if body.startswith("@"):  # user mention: <@U123> or <@U123|label>
+        uid, _, label = body[1:].partition("|")
+        if label:
+            return "@" + label
+        name = await user_namer(uid)
+        return "@" + (name or uid)
+    if body.startswith("#"):  # channel mention: <#C123|name> or <#C123>
+        cid, _, label = body[1:].partition("|")
+        if label:
+            return "#" + label
+        name = await channel_namer(cid)
+        return "#" + (name or cid)
+    if body.startswith("!"):  # special: <!here>, <!subteam^S1|@grp>, <!date^…|fb>
+        cmd, _, label = body[1:].partition("|")
+        if cmd in ("here", "channel", "everyone"):
+            return "@" + cmd
+        if cmd.startswith("subteam^"):
+            return "@" + (label.lstrip("@") if label else "group")
+        if cmd.startswith("date^"):
+            return label or raw
+        return label or raw
+    # link: <https://x|label> or <https://x> or <mailto:a@b|a@b>
+    url, _, label = body.partition("|")
+    return label or url
+
+
+async def resolve_slack_text_refs(text: str, *, user_namer, channel_namer) -> str:
+    """Rewrite Slack mrkdwn ref tokens in inbound text to human-readable form.
+
+    `<@U774M8XDE>` → `@Brett Jones`, `<#C1|orders>` → `#orders`, `<!here>` →
+    `@here`, `<https://x|click>` → `click`. ``user_namer``/``channel_namer`` are
+    async callables (id → name) returning "" on failure, in which case the raw
+    id is kept (no regression). After ref substitution, Slack HTML entities
+    (&lt; &gt; &amp;) are unescaped so the agent reads natural text.
+    """
+    if text and "<" in text:
+        parts: list[str] = []
+        last = 0
+        for m in _SLACK_REF_RE.finditer(text):
+            parts.append(text[last : m.start()])
+            parts.append(await _resolve_slack_ref(m.group(1), user_namer, channel_namer))
+            last = m.end()
+        parts.append(text[last:])
+        text = "".join(parts)
+    if text:
+        text = text.replace("&lt;", "<").replace("&gt;", ">").replace("&amp;", "&")
+    return text
+
+
 class BrokerSlackPoller:
     """Slack Socket Mode listener for one agent's bot; routes to MessageBroker.
 
@@ -1006,6 +1065,15 @@ class BrokerSlackPoller:
         self._channel_title_cache[channel_id] = title
         return title
 
+    async def _resolve_text_refs(self, text: str) -> str:
+        """Resolve in-text Slack mentions/links (<@U…>, <#C…>, <!here>, links)
+        to readable form, reusing the cached user/channel resolvers."""
+        return await resolve_slack_text_refs(
+            text,
+            user_namer=self._resolve_user_name,
+            channel_namer=self._resolve_channel_title,
+        )
+
     async def _handle_event(self, payload: dict) -> None:
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
@@ -1050,6 +1118,7 @@ class BrokerSlackPoller:
             if resolved:
                 sender_name = resolved
         chat_title = await self._resolve_channel_title(channel)
+        text = await self._resolve_text_refs(text)
 
         attachments = [
             {
