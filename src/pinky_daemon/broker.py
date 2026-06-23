@@ -1363,32 +1363,28 @@ class MessageBroker:
         if not stripped or not fallback_enabled or not chat_id:
             return
 
-        # Plain-text fallback must FAIL CLOSED on any platform that could be a
-        # shared/public channel. When an agent decides to stay silent it often
-        # "thinks out loud" (emits reasoning text without calling an outreach
-        # tool); blindly delivering that text leaks internal deliberation to the
-        # channel — the Chekov-on-Slack leak. So on external platforms we only
-        # auto-deliver when we have POSITIVE confirmation this is a 1:1 DM: a
-        # MessageContext (stored at dispatch in remember_message_context) that
-        # matches this platform+chat and is not a group. Absence, a
-        # platform/chat mismatch (e.g. a colliding per-chat message_id from
-        # another conversation), or a group context all suppress. Owner-only
-        # surfaces (web/api/internal) are never public channels and carry no
-        # message_id/context, so they keep the fallback convenience.
-        _non_public_platforms = {"web", "api", ""}
-        if platform not in _non_public_platforms:
-            ctx = self.get_message_context(agent_name, message_id) if message_id else None
-            if (
-                ctx is None
-                or ctx.platform != platform
-                or ctx.chat_id != chat_id
-                or ctx.is_group
-            ):
-                _log(
-                    f"broker: suppressed plain-text fallback for {agent_name} on "
-                    f"{platform}/{chat_id} — no positive 1:1 DM context (fail-closed)"
-                )
-                return
+        # Plain-text fallback is for INTERNAL / owner surfaces only — the web UI,
+        # API, and console. Owner rule (Brad, 2026-06-22): never auto-deliver an
+        # agent's bare plain text to an outreach channel (telegram/discord/slack),
+        # not even a 1:1 owner DM. When an agent stays silent it often "thinks
+        # out loud" (emits reasoning text without calling an outreach tool);
+        # pushing that to a real channel leaks internal deliberation (the
+        # Chekov-on-Slack leak) and trains lazy non-tool replies. To reach any
+        # external channel the agent MUST call an explicit pinky-messaging tool
+        # (send/thread). Errors still surface — they route back on their own
+        # paths (API-error content is suppressed upstream so raw error JSON never
+        # reaches chat; auth failures fire the operator alert), not through this
+        # fallback. (Supersedes the #810 1:1-DM allowance with a stricter
+        # fail-closed rule; the group-leak guard is subsumed — groups are
+        # external, so they're suppressed here too.)
+        _internal_surfaces = {"web", "api", ""}
+        if platform not in _internal_surfaces:
+            _log(
+                f"broker: suppressed plain-text fallback for {agent_name} on "
+                f"{platform}/{chat_id} — outreach channels are tool-only "
+                f"(fallback delivers to web UI / internal surfaces only)"
+            )
+            return
 
         voice_key = (agent_name, chat_id)
         if self._voice_pending.pop(voice_key, False):
