@@ -127,9 +127,10 @@ _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
 # ──────────────────────────────────────────────────────────────────────────
 #
 # A fresh ``claude`` REPL on a box that has never run Claude Code in this
-# agent-home wedges at two interactive first-run gates:
-#   1. "Do you trust the files in this folder?"
-#   2. "Bypass Permissions mode" acceptance
+# agent-home wedges at three interactive first-run gates:
+#   1. the login / onboarding wizard ("Welcome to Claude Code")
+#   2. "Do you trust the files in this folder?"
+#   3. "Bypass Permissions mode" acceptance
 # ``claude --dangerously-skip-permissions`` does NOT auto-accept either —
 # the pane parks at the prompt, no transcript is ever written, and the
 # session sits CONNECTED-but-mute with ``pending_responses=true`` forever
@@ -332,8 +333,9 @@ def _seed_claude_trust_file(config_path: Path, project_dir: str) -> bool:
     """Idempotently pre-seed first-run trust/bypass flags in
     ``config_path`` (Claude Code's ``.claude.json``) for ``project_dir``.
 
-    Sets top-level ``bypassPermissionsModeAccepted`` and, under
-    ``projects[<resolved project_dir>]``, ``hasTrustDialogAccepted`` +
+    Sets top-level ``bypassPermissionsModeAccepted`` +
+    ``hasCompletedOnboarding`` and, under ``projects[<resolved
+    project_dir>]``, ``hasTrustDialogAccepted`` +
     ``hasCompletedProjectOnboarding`` — all to ``True``. Preserves every
     other key (the file also holds oauth creds + per-project history).
 
@@ -358,9 +360,18 @@ def _seed_claude_trust_file(config_path: Path, project_dir: str) -> bool:
                 )
 
         changed = False
-        if data.get("bypassPermissionsModeAccepted") is not True:
-            data["bypassPermissionsModeAccepted"] = True
-            changed = True
+        # Top-level first-run gates, re-asserted on every launch.
+        # ``hasCompletedOnboarding`` skips the initial login/onboarding wizard
+        # ("Welcome to Claude Code"); ``bypassPermissionsModeAccepted`` skips
+        # the "Bypass Permissions mode" consent. Both persist globally in
+        # ``.claude.json`` — but when a shared-home fleet corrupts that file and
+        # the CLI recreates it BLANK, both vanish and every agent re-wedges at
+        # the wizard. Seeding them here makes the corruption self-heal: the next
+        # launch repairs the config instead of parking at an interactive prompt.
+        for flag in ("bypassPermissionsModeAccepted", "hasCompletedOnboarding"):
+            if data.get(flag) is not True:
+                data[flag] = True
+                changed = True
 
         projects = data.setdefault("projects", {})
         if not isinstance(projects, dict):

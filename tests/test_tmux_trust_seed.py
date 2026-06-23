@@ -51,6 +51,7 @@ def test_seed_creates_missing_file(tmp_path: Path):
     assert cfg.exists()
     data = json.loads(cfg.read_text())
     assert data["bypassPermissionsModeAccepted"] is True
+    assert data["hasCompletedOnboarding"] is True
     entry = data["projects"][str(proj.resolve())]
     assert entry["hasTrustDialogAccepted"] is True
     assert entry["hasCompletedProjectOnboarding"] is True
@@ -110,6 +111,67 @@ def test_seed_completes_partial_flags(tmp_path: Path):
     entry = data["projects"][str(proj.resolve())]
     assert entry["hasTrustDialogAccepted"] is True
     assert entry["hasCompletedProjectOnboarding"] is True
+
+
+def test_seed_restores_onboarding_flag_on_blanked_config(tmp_path: Path):
+    """Regression (TOD 2026-06-23): a shared-home fleet periodically corrupts
+    ``.claude.json``; the CLI then recreates it BLANK, dropping the global
+    ``hasCompletedOnboarding`` flag. Without it the next ``claude`` launch parks
+    at the login/onboarding wizard ("Welcome to Claude Code"). The seed must
+    re-assert it so the agent boots clean instead of wedging."""
+    cfg = tmp_path / ".claude.json"
+    # A freshly-recreated, near-blank config — no onboarding flag at all.
+    cfg.write_text(json.dumps({"projects": {}}))
+    proj = tmp_path / "agents" / "angel"
+    proj.mkdir(parents=True)
+
+    wrote = _seed_claude_trust_file(cfg, str(proj))
+
+    assert wrote is True
+    data = json.loads(cfg.read_text())
+    assert data["hasCompletedOnboarding"] is True
+    assert data["bypassPermissionsModeAccepted"] is True
+
+
+def test_seed_adds_onboarding_when_only_that_flag_missing(tmp_path: Path):
+    """The exact TOD gap: trust + bypass + per-project flags are all present,
+    yet the top-level ``hasCompletedOnboarding`` is missing — the agent still
+    wedged at the login wizard while trust was fine. The seed must detect this
+    and write."""
+    cfg = tmp_path / ".claude.json"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    proj_key = str(proj.resolve())
+    cfg.write_text(
+        json.dumps(
+            {
+                "bypassPermissionsModeAccepted": True,
+                "projects": {
+                    proj_key: {
+                        "hasTrustDialogAccepted": True,
+                        "hasCompletedProjectOnboarding": True,
+                    }
+                },
+            }
+        )
+    )
+
+    wrote = _seed_claude_trust_file(cfg, str(proj))
+
+    assert wrote is True  # only hasCompletedOnboarding was missing
+    data = json.loads(cfg.read_text())
+    assert data["hasCompletedOnboarding"] is True
+
+
+def test_seed_idempotent_includes_onboarding(tmp_path: Path):
+    """Once onboarding + trust + bypass are all set, a re-seed is a no-op."""
+    cfg = tmp_path / ".claude.json"
+    proj = tmp_path / "proj"
+    proj.mkdir()
+    assert _seed_claude_trust_file(cfg, str(proj)) is True
+    # Everything (incl. hasCompletedOnboarding) now set → second call writes
+    # nothing.
+    assert _seed_claude_trust_file(cfg, str(proj)) is False
 
 
 def test_seed_corrupt_file_raises_and_does_not_overwrite(tmp_path: Path):
