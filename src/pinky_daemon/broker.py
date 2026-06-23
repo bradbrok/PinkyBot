@@ -1781,7 +1781,6 @@ class MessageBroker:
         lines.append("- **broadcast(text)**: Send to every active channel")
         lines.append("")
         lines.append("## Delivery Model")
-        lines.append("- If you do not call an outreach tool, Pinky may deliver your plain text automatically")
         lines.append("- `send()` is the default tool for responding to inbound messages")
 
         return "\n".join(lines)

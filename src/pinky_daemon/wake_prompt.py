@@ -275,7 +275,7 @@ def build_wake_prompt(inp: WakePromptInput) -> str:
         {context_body}
         ──────────────────
 
-        {instruction_lead} {messaging_tool_reminder} {tools_hint} {fallback_note}
+        {instruction_lead} {messaging_tool_reminder} {tools_hint}
     """
     now = _resolve_now(inp.timezone, inp.now)
     time_str = _format_time(now)
@@ -290,5 +290,5 @@ def build_wake_prompt(inp: WakePromptInput) -> str:
         f"{lead} Users will message you through Telegram. "
         "Use send(chat_id, platform, text) for normal responses. "
         "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-        f"{_TOOLS_HINT} If you do not call an outreach tool, Pinky may fall back to plain-text delivery based on agent settings."
+        f"{_TOOLS_HINT}"
     )

@@ -385,15 +385,13 @@ class CodexSession:
             "Pick up where you left off. Users will message you through Telegram. "
             "Use send(chat_id, platform, text) for normal responses. "
             "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-            f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to "
-            "plain-text delivery based on agent settings."
+            f"{tools_hint}"
             if is_resume else
             f"New session started.{ctx_block}\n\n"
             "You're connected via Pinky's message broker. Users will message you through Telegram. "
             "Use send(chat_id, platform, text) for normal responses. "
             "Use thread(message_id, text) only when you want to quote/thread a specific message. "
-            f"{tools_hint} If you do not call an outreach tool, Pinky may fall back to "
-            "plain-text delivery based on agent settings."
+            f"{tools_hint}"
         )
 
         # #591 P1#2 (Murzik round-2): arm the post-delivery callback
