@@ -17,6 +17,13 @@ from pinky_daemon.message_handler import InboundMessage, MessageHandler
 from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 
+# Cross-repo contract with pos-spec-purchasing's blocks.py — the action_ids on
+# the Approve/Reject buttons of a purchase-proposal card. The Slack interactive
+# handler keys on these to route a click to approve_purchase/reject_purchase.
+# Changing either requires a coordinated change in pos-spec-purchasing.
+_PURCHASE_APPROVE_ACTION_ID = "pos_purchase_approve"
+_PURCHASE_REJECT_ACTION_ID = "pos_purchase_reject"
+
 # Threshold below which a "most recent message" found during channel-priming
 # is treated as a real first-test inbound rather than as a replay-prevention
 # floor. Discord first-contact UX: if a user sends a test message within this
@@ -973,6 +980,16 @@ class BrokerSlackPoller:
                     )
                 except Exception as e:
                     _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
+            # Interactive envelopes (block_actions button clicks) carry the
+            # purchase Approve/Reject buttons (#249). Handle them here; every
+            # other non-events_api envelope is dropped (already acked) so Slack
+            # doesn't keep retrying.
+            if req.type == "interactive":
+                try:
+                    await self._handle_interactive(req.payload or {})
+                except Exception as e:
+                    _log(f"slack-poller[{self._agent_name}]: handle_interactive error: {e!r}")
+                return
             # Only message events are wired up for #224; other (already-acked)
             # envelope types are dropped so Slack doesn't keep retrying them.
             if req.type != "events_api":
@@ -996,6 +1013,155 @@ class BrokerSlackPoller:
         except Exception as e:
             _log(f"slack-poller[{self._agent_name}]: connect failed: {e}")
             self._running = False
+
+    async def _handle_interactive(self, payload: dict) -> None:
+        """Handle a Slack interactive (block_actions) envelope — purchase buttons (#249).
+
+        SECURITY (financial boundary): the approver identity is taken from
+        ``payload['user']['id']`` — set and signed by Slack, NOT anything an LLM
+        provided. Only VERIFIED ids in the daemon-side purchase-approver
+        allowlist may approve/reject a spend; unauthorized clicks are refused
+        here and never reach the agent. The agent is told to act ONLY after this
+        gate passes, so the LLM is not the security boundary.
+        """
+        if (payload or {}).get("type") != "block_actions":
+            return
+        actions = payload.get("actions") or []
+        if not actions:
+            return
+        action = actions[0] or {}
+        action_id = action.get("action_id", "") or ""
+        if action_id == _PURCHASE_APPROVE_ACTION_ID:
+            decision = "approve"
+        elif action_id == _PURCHASE_REJECT_ACTION_ID:
+            decision = "reject"
+        else:
+            # Not a purchase button — nothing else is wired up. Already acked.
+            return
+
+        pending_id = (action.get("value") or "").strip()
+        user = payload.get("user") or {}
+        clicker_id = (user.get("id") or "").strip()
+        clicker_name = user.get("username") or user.get("name") or clicker_id
+        channel = ((payload.get("channel") or {}).get("id")) or ""
+        response_url = payload.get("response_url") or ""
+
+        if not pending_id or not clicker_id:
+            _log(
+                f"slack-poller[{self._agent_name}]: interactive {decision} missing "
+                f"pending_id/clicker — dropping"
+            )
+            return
+
+        # ── GATE: the verified clicker must be an allowlisted purchase approver ──
+        try:
+            authorized = bool(
+                self._registry and self._registry.is_purchase_approver(clicker_id)
+            )
+        except Exception as e:
+            _log(f"slack-poller[{self._agent_name}]: approver check failed ({e}); denying")
+            authorized = False  # fail-closed
+
+        if not authorized:
+            _log(
+                f"slack-poller[{self._agent_name}]: UNAUTHORIZED purchase {decision} "
+                f"by {clicker_id} on {pending_id} — refused"
+            )
+            await self._respond_url(
+                response_url,
+                {
+                    "response_type": "ephemeral",
+                    "replace_original": False,
+                    "text": (
+                        f"You are not authorized to {decision} purchases. Ask Brad to add "
+                        "your Slack user id to the purchase approver allowlist."
+                    ),
+                },
+            )
+            return
+
+        # Authorized — route to the owning agent to execute the state change via
+        # the purchasing MCP, passing the VERIFIED approver id straight through.
+        if decision == "approve":
+            instruction = (
+                f"Call approve_purchase(pending_id='{pending_id}', approver='{clicker_id}'). "
+                f"If it returns ok, post the returned cart_link and instruction to channel "
+                f"{channel} so the human can place the order on Amazon. Approve ONLY this "
+                "pending_id; do not approve anything else."
+            )
+        else:
+            instruction = (
+                f"Call reject_purchase(pending_id='{pending_id}', approver='{clicker_id}'). "
+                f"Then post a one-line confirmation to channel {channel}. Reject ONLY this "
+                "pending_id."
+            )
+        msg = (
+            f"[purchase-approval] VERIFIED Slack approver {clicker_name} (id={clicker_id}) "
+            f"clicked {decision.upper()} on purchase pending_id=`{pending_id}` in channel "
+            f"{channel}. The daemon has already verified the clicker's identity and confirmed "
+            f"they are an allowlisted purchase approver, so this {decision} is authorized.\n"
+            + instruction
+        )
+
+        try:
+            delivered = await self._broker.inject_agent_message(
+                "slack-approval", self._agent_name, msg
+            )
+        except Exception as e:
+            _log(f"slack-poller[{self._agent_name}]: inject approval to agent failed: {e}")
+            delivered = False
+
+        if delivered:
+            verb = "Approved" if decision == "approve" else "Rejected"
+            _log(
+                f"slack-poller[{self._agent_name}]: purchase {pending_id} "
+                f"{verb.lower()} by {clicker_id} — routed to agent"
+            )
+            await self._respond_url(
+                response_url,
+                {
+                    "replace_original": True,
+                    "text": f"{verb} by {clicker_name}",
+                    "blocks": self._decided_blocks(verb, clicker_name, pending_id),
+                },
+            )
+        else:
+            await self._respond_url(
+                response_url,
+                {
+                    "response_type": "ephemeral",
+                    "replace_original": False,
+                    "text": (
+                        "Couldn't reach the assistant to record this decision. The buttons "
+                        "are still active — please try again shortly."
+                    ),
+                },
+            )
+
+    @staticmethod
+    def _decided_blocks(verb: str, approver_name: str, pending_id: str) -> list[dict]:
+        """Replacement card shown after a decision — emoji-free, buttons removed."""
+        return [
+            {
+                "type": "section",
+                "text": {
+                    "type": "mrkdwn",
+                    "text": f"*Purchase `{pending_id}`* — {verb} by {approver_name}",
+                },
+            }
+        ]
+
+    async def _respond_url(self, response_url: str, payload: dict) -> None:
+        """POST to a Slack interaction ``response_url`` off the event loop."""
+        if not response_url:
+            return
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.run_in_executor(
+                None, lambda: self._adapter.respond_via_url(response_url, payload)
+            )
+        except Exception as e:
+            _log(f"slack-poller[{self._agent_name}]: response_url post failed: {e}")
 
     async def _resolve_user_name(self, user_id: str) -> str:
         """Best-effort display name for a human Slack user id (users:read).

@@ -115,14 +115,19 @@ class SlackAdapter:
         *,
         thread_ts: str = "",
         reply_broadcast: bool = False,
+        blocks: list | None = None,
     ) -> Message:
         """Send a message to a Slack channel or thread.
 
         Args:
             channel: Channel ID (C...), DM ID (D...), or group ID (G...).
-            text: Message text (supports Slack mrkdwn formatting).
+            text: Message text (supports Slack mrkdwn formatting). When ``blocks``
+                are present this is the notification fallback text.
             thread_ts: Thread timestamp to reply in-thread.
             reply_broadcast: Also post to channel when replying to thread.
+            blocks: optional Block Kit blocks (list of block dicts) for rich/
+                interactive messages. Sent via the JSON body (chat.postMessage);
+                ``_request`` drops it when None.
         """
         result = self._request(
             "chat.postMessage",
@@ -130,6 +135,7 @@ class SlackAdapter:
             text=text,
             thread_ts=thread_ts or None,
             reply_broadcast=reply_broadcast if thread_ts else None,
+            blocks=blocks or None,
         )
 
         msg_data = result.get("message", {})
@@ -145,6 +151,26 @@ class SlackAdapter:
             is_outbound=True,
             metadata={"thread_ts": thread_ts} if thread_ts else {},
         )
+
+    def respond_via_url(self, response_url: str, payload: dict) -> None:
+        """POST to a Slack interactive ``response_url`` to update/replace a message.
+
+        ``response_url`` is a short-lived (30-min, 5-use) capability URL Slack
+        delivers WITH an interaction payload (e.g. a block_actions button click).
+        It needs no bot token and no extra scope, and is the simplest way to
+        update the source message after a click (vs chat.update). ``payload`` is
+        a Slack message-response dict, e.g.
+        ``{"replace_original": True, "text": ..., "blocks": [...]}`` to replace
+        the card, or ``{"response_type": "ephemeral", "text": ...}`` to show the
+        clicker a private note without touching the card.
+        """
+        if not response_url:
+            return
+        # No auth header — the URL itself is the capability. Don't reuse the
+        # bot-token client; post directly.
+        resp = httpx.post(response_url, json=payload, timeout=10.0)
+        if resp.status_code >= 400:
+            raise SlackError(f"response_url post failed: {resp.status_code}")
 
     def upload_file(
         self,
