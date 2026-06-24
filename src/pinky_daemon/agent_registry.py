@@ -3745,6 +3745,55 @@ except Exception:
                 self.approve_user(agent.name, chat_id, display_name, "primary_user")
                 _log(f"agent_registry: auto-approved primary user {chat_id} for {agent.name}")
 
+    # ── Purchase Approvers (financial boundary, #249) ─────────
+    #
+    # Slack user ids permitted to approve a purchase (a money action). This is
+    # the AUTHORITATIVE gate: the daemon validates the VERIFIED clicker id from a
+    # Slack block_actions payload (set/signed by Slack, not LLM-provided) against
+    # this list before any approval propagates. Fail-closed — an empty/unset
+    # list denies all (no one can approve until an approver is configured).
+
+    def get_purchase_approvers(self) -> list[str]:
+        """Return the Slack user ids allowed to approve purchases (may be empty)."""
+        raw = self.get_setting("purchase_approver_slack_ids", "")
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, list):
+                return [str(x).strip() for x in parsed if str(x).strip()]
+        except Exception:
+            pass
+        return [p.strip() for p in raw.split(",") if p.strip()]
+
+    def set_purchase_approvers(self, slack_user_ids: list[str]) -> None:
+        """Set the purchase-approver allowlist (Slack user ids)."""
+        cleaned = [str(x).strip() for x in (slack_user_ids or []) if str(x).strip()]
+        self.set_setting("purchase_approver_slack_ids", json.dumps(cleaned))
+
+    def is_purchase_approver(self, slack_user_id: str) -> bool:
+        """Whether a VERIFIED Slack user id may approve a purchase (fail-closed).
+
+        Returns False for a blank id or when no allowlist is configured — a
+        money action requires an explicitly configured, matching approver.
+        """
+        if not slack_user_id:
+            return False
+        return slack_user_id in self.get_purchase_approvers()
+
+    def get_purchase_approval_secret(self) -> str:
+        """Shared secret for minting daemon-signed approval tokens (may be empty).
+
+        Must equal the pos-spec-purchasing MCP's POS_PURCHASING_APPROVAL_SECRET
+        for tokens to verify. Empty => the daemon cannot mint, so approvals are
+        refused (fail-closed). Set at deploy alongside the MCP env.
+        """
+        return self.get_setting("purchase_approval_secret", "")
+
+    def set_purchase_approval_secret(self, secret: str) -> None:
+        """Set the shared approval-token secret (must match the MCP env value)."""
+        self.set_setting("purchase_approval_secret", (secret or "").strip())
+
     # ── Owner Profile ────────────────────────────────────────
 
     def get_owner_profile(self) -> dict:

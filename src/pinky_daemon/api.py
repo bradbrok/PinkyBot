@@ -1432,6 +1432,7 @@ def create_api(
         silent: bool = False,
         link_preview_options: dict | None = None,
         quote: str = "",
+        blocks: str = "",
     ) -> SimpleNamespace:
         """Send a text message and return SimpleNamespace(message_id=...).
 
@@ -1442,6 +1443,11 @@ def create_api(
         ``quote`` (Telegram only) is an exact substring of the replied-to
         message to quote in the reply (Bot API 7.0 ``ReplyParameters.quote``);
         it requires ``reply_to`` and is ignored on other platforms.
+
+        ``blocks`` (Slack only) is a JSON-encoded array of Block Kit blocks for
+        rich/interactive messages; ``content`` is the notification fallback.
+        Malformed JSON or a non-list is logged and dropped (message sent
+        text-only). Ignored on other platforms.
         """
         # iMessage has its own adapter factory; the generic lookup below
         # never constructs one and would 503 before this branch could run.
@@ -1551,7 +1557,19 @@ def create_api(
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         if platform == "slack":
-            result = adapter.send_message(chat_id, content, thread_ts=reply_to or None)
+            parsed_blocks = None
+            if blocks:
+                try:
+                    pb = json.loads(blocks)
+                    if isinstance(pb, list):
+                        parsed_blocks = pb
+                    else:
+                        _log("broker-send: slack blocks not a JSON array, ignoring (text-only)")
+                except Exception as e:
+                    _log(f"broker-send: slack blocks JSON parse failed ({e}), sending text-only")
+            result = adapter.send_message(
+                chat_id, content, thread_ts=reply_to or None, blocks=parsed_blocks
+            )
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
@@ -1642,6 +1660,7 @@ def create_api(
         silent: bool = False,
         link_preview_options: dict | None = None,
         quote: str = "",
+        blocks: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         loop = asyncio.get_running_loop()
@@ -1659,6 +1678,7 @@ def create_api(
                     silent=silent,
                     link_preview_options=link_preview_options,
                     quote=quote,
+                    blocks=blocks,
                 ),
             )
             # Once an outbound message lands, the typing indicator becomes noise —
@@ -1686,9 +1706,14 @@ def create_api(
         # Plain sends keep key_extra="" — their historical dedupe behaviour is
         # unchanged. The dict is serialized (never used raw) so the key stays
         # hashable.
-        if parse_mode or link_preview_options or quote:
+        if parse_mode or link_preview_options or quote or blocks:
             key_extra = json.dumps(
-                {"pm": parse_mode or "", "lpo": link_preview_options or None, "q": quote or ""},
+                {
+                    "pm": parse_mode or "",
+                    "lpo": link_preview_options or None,
+                    "q": quote or "",
+                    "blk": blocks or "",
+                },
                 sort_keys=True, separators=(",", ":"),
             )
         else:
@@ -7565,6 +7590,14 @@ npm run build</pre>
         reply_to = req.get("reply_to", "")
         parse_mode = req.get("parse_mode", "")
         link_preview_options = _sanitize_link_preview_options(req.get("link_preview_options"))
+        blocks = req.get("blocks") or ""
+        if not isinstance(blocks, str):
+            # Tolerate a pre-serialized list (defensive) by JSON-encoding it; the
+            # send path parses a JSON string. Anything else -> drop to text-only.
+            try:
+                blocks = json.dumps(blocks)
+            except Exception:
+                blocks = ""
         if not agent_name or not chat_id or not content:
             raise HTTPException(400, "agent_name, chat_id, and content are required")
         _deny_isolated_cross_actor(request, agent_name)
@@ -7577,6 +7610,7 @@ npm run build</pre>
                 reply_to=reply_to,
                 parse_mode=parse_mode,
                 link_preview_options=link_preview_options,
+                blocks=blocks,
             )
         except HTTPException:
             raise

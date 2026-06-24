@@ -139,12 +139,19 @@ def create_server(
         disable_link_preview: bool = False,
         prefer_large_media: bool = False,
         link_preview_above: bool = False,
+        blocks: str = "",
     ) -> str:
         """Send a standalone message to a chat/channel. Use chat IDs, not display names.
 
         Link-preview flags (Telegram): disable_link_preview suppresses the URL
         preview card; prefer_large_media forces a big thumbnail; link_preview_above
         floats the preview above your text.
+
+        blocks (Slack only): a JSON-encoded array of Block Kit block objects
+        (e.g. an interactive approval card with buttons). Pass the `slack_blocks`
+        value returned by a tool verbatim as a JSON string. `text` is still sent
+        as the notification fallback. Ignored on non-Slack platforms; if the JSON
+        is malformed it is dropped and the message is sent text-only.
         """
         result = _api("POST", "/broker/send", {
             "agent_name": agent_name,
@@ -155,6 +162,7 @@ def create_server(
             "link_preview_options": _link_preview_options(
                 disable_link_preview, prefer_large_media, link_preview_above
             ),
+            "blocks": blocks or None,
         })
         return json.dumps(result)
 
