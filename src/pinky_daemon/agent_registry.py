@@ -3781,6 +3781,19 @@ except Exception:
             return False
         return slack_user_id in self.get_purchase_approvers()
 
+    def get_purchase_approval_secret(self) -> str:
+        """Shared secret for minting daemon-signed approval tokens (may be empty).
+
+        Must equal the pos-spec-purchasing MCP's POS_PURCHASING_APPROVAL_SECRET
+        for tokens to verify. Empty => the daemon cannot mint, so approvals are
+        refused (fail-closed). Set at deploy alongside the MCP env.
+        """
+        return self.get_setting("purchase_approval_secret", "")
+
+    def set_purchase_approval_secret(self, secret: str) -> None:
+        """Set the shared approval-token secret (must match the MCP env value)."""
+        self.set_setting("purchase_approval_secret", (secret or "").strip())
+
     # ── Owner Profile ────────────────────────────────────────
 
     def get_owner_profile(self) -> dict:

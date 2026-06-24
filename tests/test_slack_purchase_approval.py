@@ -9,6 +9,7 @@ Covers the three security-relevant layers:
 
 from __future__ import annotations
 
+import re
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -19,13 +20,18 @@ from pinky_daemon.pollers import (
     BrokerSlackPoller,
     _strip_emoji,
 )
+from pinky_daemon.purchase_approval import make_approval_token
 
 BRAD = "U7W8RJGP5"
 CHAN = "CMYGW146S"
 PID = "abc123def456"
+SECRET = "test-secret"
 
 
-def _make_poller(*, approver_ok=True, inject_ok=True, registry_raises=False, registry=None):
+def _make_poller(
+    *, approver_ok=True, inject_ok=True, registry_raises=False, registry=None,
+    approval_secret=SECRET,
+):
     adapter = MagicMock()
     adapter.bot_token = "xoxb-test"
     adapter.respond_via_url = MagicMock()
@@ -38,6 +44,7 @@ def _make_poller(*, approver_ok=True, inject_ok=True, registry_raises=False, reg
             registry.is_purchase_approver.side_effect = RuntimeError("db down")
         else:
             registry.is_purchase_approver.return_value = approver_ok
+        registry.get_purchase_approval_secret.return_value = approval_secret
 
     poller = BrokerSlackPoller(
         adapter, "chekov", broker,
@@ -185,6 +192,49 @@ class TestApproverGate:
         rendered = payload.get("text", "") + str(payload.get("blocks", ""))
         assert "\U0001f44d" not in rendered
         assert "brad" in rendered
+
+
+class TestApprovalToken:
+    @pytest.mark.asyncio
+    async def test_instruction_carries_verifiable_token(self):
+        poller = _make_poller(approver_ok=True, inject_ok=True, approval_secret=SECRET)
+        await poller._handle_interactive(_interactive(_PURCHASE_APPROVE_ACTION_ID))
+        _f, _t, msg = poller._broker.inject_agent_message.call_args[0]
+        token = re.search(r"approval_token='([0-9a-f]+)'", msg).group(1)
+        expires = int(re.search(r"token_expires=(\d+)", msg).group(1))
+        # The minted token must verify for exactly (approve, PID, clicker, expires).
+        expected = make_approval_token(
+            SECRET, decision="approve", pending_id=PID, approver=BRAD, expires=expires
+        )
+        assert token == expected
+
+    @pytest.mark.asyncio
+    async def test_reject_token_decision_bound(self):
+        poller = _make_poller(approver_ok=True, inject_ok=True, approval_secret=SECRET)
+        await poller._handle_interactive(_interactive(_PURCHASE_REJECT_ACTION_ID))
+        _f, _t, msg = poller._broker.inject_agent_message.call_args[0]
+        token = re.search(r"approval_token='([0-9a-f]+)'", msg).group(1)
+        expires = int(re.search(r"token_expires=(\d+)", msg).group(1))
+        assert token == make_approval_token(
+            SECRET, decision="reject", pending_id=PID, approver=BRAD, expires=expires
+        )
+
+    @pytest.mark.asyncio
+    async def test_no_secret_fails_closed(self):
+        poller = _make_poller(approver_ok=True, approval_secret="")
+        await poller._handle_interactive(_interactive(_PURCHASE_APPROVE_ACTION_ID))
+        # Authorized clicker, but no secret to mint a token -> refuse, don't route.
+        poller._broker.inject_agent_message.assert_not_awaited()
+        _url, payload = poller._adapter.respond_via_url.call_args[0]
+        assert payload.get("response_type") == "ephemeral"
+        assert "not configured" in payload.get("text", "").lower() or "secret" in payload.get("text", "").lower()
+
+    def test_daemon_golden_vector(self):
+        # Locked cross-repo contract — must equal pos-spec-purchasing's verifier.
+        assert make_approval_token(
+            "testsecret", decision="approve", pending_id="abc123",
+            approver="U7W8RJGP5", expires=1700000000,
+        ) == "8226a7515254d1640bc320eb2f9a57ca45cddcc8b920eaffa7044b82dbee0f3e"
 
 
 class TestStripEmoji:

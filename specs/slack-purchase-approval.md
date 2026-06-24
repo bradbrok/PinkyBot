@@ -38,42 +38,60 @@ instruction to the owning agent (chekov), which calls the purchasing MCP. (B1.)
    b. **GATE** — `registry.is_purchase_approver(clicker_id)`. Fail-closed: a
       blank id, an unconfigured allowlist, or any error → **deny**. Unauthorized
       clicks get an ephemeral refusal and never reach the agent.
-   c. Authorized → inject a synthetic instruction to the owning agent carrying
-      the verified `clicker_id` as the approver, telling it to call
-      `approve_purchase`/`reject_purchase` for that exact `pending_id` and post
-      the result. Update the card via `response_url` ("Approved/Rejected by X",
-      buttons removed). If the agent is unreachable, the card keeps its buttons
-      and the clicker gets an ephemeral retry note.
-5. The agent calls the MCP tool and posts the cart link / confirmation.
+   c. Authorized → **mint a daemon-signed approval token**
+      (`HMAC-SHA256(secret, decision \n pending_id \n clicker_id \n expires)`,
+      ~15-min TTL) and inject a synthetic instruction to the owning agent telling
+      it to call `approve_purchase`/`reject_purchase` for that exact `pending_id`
+      with the verified `clicker_id` **and the token + expiry**. Update the card
+      via `response_url` ("Approved/Rejected by X", buttons removed). If no secret
+      is configured, or the agent is unreachable, fail-closed (ephemeral note;
+      card keeps its buttons).
+5. The agent calls the MCP tool, relaying the token. The MCP verifies it before
+   any state change, then the agent posts the cart link / confirmation.
 
 ## Enforcement layers (defense in depth)
 
-1. **Daemon gate (authoritative)** — verified Slack id vs allowlist
-   (`purchase_approver_slack_ids` system setting). Fail-closed.
-2. **MCP allowlist (secondary)** — `POS_PURCHASING_APPROVERS`; `approve_purchase`
-   rejects an approver not on the list. Only as trustworthy as the `approver`
-   string the agent passes, so it is a guard, not the gate.
+1. **Daemon-signed token (authoritative).** The state transition (pending →
+   approved | rejected) requires an HMAC token only the daemon can mint, and only
+   after the verified-clicker gate (below) passes. The MCP verifies the token
+   (shared secret, exact `decision`/`pending_id`/`approver`/`expiry` tuple, not
+   expired) before touching the store. **An LLM cannot forge it**, so no prompt
+   path — including the legacy "type `approve`" text path — can drive the agent
+   into approving an order that was never clicked by a verified, allowlisted
+   approver. Fail-closed: missing secret / missing / invalid / expired token →
+   refused.
+2. **Daemon verified-clicker gate.** `registry.is_purchase_approver(clicker_id)`
+   on the Slack-signed `payload['user']['id']`. Fail-closed (blank id /
+   unconfigured allowlist / error → deny). This decides *whether* the daemon
+   mints a token at all.
+3. **MCP approver allowlist (secondary).** `POS_PURCHASING_APPROVERS`; even with a
+   valid token, the approver must be on the list when one is configured.
 
-## Known phase-1 gaps (closed in phase 2)
+The shared secret lives in two places that must match: the daemon's
+`purchase_approval_secret` system setting (signer) and the MCP's
+`POS_PURCHASING_APPROVAL_SECRET` env (verifier). Either side unset → no approvals
+(fail-closed).
 
-- The legacy "type `approve`" text path is **not** gated by the verified-clicker
-  check (the agent acts on channel text). In phase 1 `approve_purchase` only
-  returns a cart link — **no money moves** — so the residual risk is a spurious
-  cart link, not a spend.
-- **Phase 2 (pay-on-approval) closes this:** the daemon will record the verified
-  click (`pending_id` → verified `approver_id`) and the payment tool will refuse
-  to place/pay an order without a matching daemon-recorded verified approval.
-  That removes the LLM and the text path from the money path entirely. Do NOT
-  enable real payment before that record + check exist.
+## Phase 2 (pay-on-approval)
+
+`approve_purchase` returns only an Amazon cart link today — **no money moves**.
+Phase 2 adds real payment via the Amazon Business API. The token already proves a
+verified click; phase 2 extends it so the *payment* step is bound to the same
+proof (and may add a daemon-recorded click ledger for non-repudiation). **Do not
+enable real payment before that exists.**
 
 ## Deploy prerequisites (Pi / chekov)
 
 1. **Slack app**: enable *Interactivity & Shortcuts* (Socket Mode is already on,
    so no Request URL and no reinstall needed). Without it, clicks deliver no
    envelope and nothing happens.
-2. **Seed the allowlist** (fail-closed, else every click is refused):
+2. **Shared approval secret** (fail-closed, else every approval is refused):
+   generate one secret and set it on BOTH sides —
+   `registry.set_purchase_approval_secret("<secret>")` (daemon) **and**
+   `POS_PURCHASING_APPROVAL_SECRET=<same secret>` in chekov's pos-spec-purchasing
+   MCP env. They must be identical.
+3. **Seed the approver allowlist** (fail-closed):
    `registry.set_purchase_approvers(["U7W8RJGP5"])` (Brad). Stored in
-   `system_settings.purchase_approver_slack_ids`.
-3. **MCP allowlist (optional, recommended):** set `POS_PURCHASING_APPROVERS`
-   on chekov's pos-spec-purchasing MCP env.
+   `system_settings.purchase_approver_slack_ids`. Optionally also set
+   `POS_PURCHASING_APPROVERS` on the MCP env (secondary check).
 4. Restart is on the **Pi** (chekov's Slack poller). Heads-up to Brad first.

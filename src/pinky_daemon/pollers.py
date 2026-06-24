@@ -10,10 +10,12 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import time
 import unicodedata
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
+from pinky_daemon import purchase_approval
 from pinky_daemon.message_handler import InboundMessage, MessageHandler
 from pinky_outreach.discord import DiscordAdapter, DiscordError, DiscordRateLimited
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
@@ -1109,18 +1111,58 @@ class BrokerSlackPoller:
             )
             return
 
-        # Authorized — route to the owning agent to execute the state change via
-        # the purchasing MCP, passing the VERIFIED approver id straight through.
+        # Authorized — mint a daemon-signed token so the purchasing MCP can prove
+        # this call came from a verified Slack click (the agent cannot forge it).
+        # Fail-closed if the shared secret isn't configured.
+        try:
+            secret = self._registry.get_purchase_approval_secret() if self._registry else ""
+        except Exception as e:
+            _log(f"slack-poller[{self._agent_name}]: reading approval secret failed ({e})")
+            secret = ""
+        if not secret:
+            _log(
+                f"slack-poller[{self._agent_name}]: purchase_approval_secret not configured "
+                f"— refusing {decision} on {pending_id} (fail-closed)"
+            )
+            await self._respond_url(
+                response_url,
+                {
+                    "response_type": "ephemeral",
+                    "replace_original": False,
+                    "text": (
+                        "Purchase approvals aren't configured yet (missing approval secret). "
+                        "Ask Brad to finish the deploy step."
+                    ),
+                },
+            )
+            return
+
+        token_decision = (
+            purchase_approval.APPROVE if decision == "approve" else purchase_approval.REJECT
+        )
+        token_expires = int(time.time()) + purchase_approval.TOKEN_TTL_SECONDS
+        token = purchase_approval.make_approval_token(
+            secret,
+            decision=token_decision,
+            pending_id=pending_id,
+            approver=clicker_id,
+            expires=token_expires,
+        )
+
+        # Route to the owning agent to execute the state change via the purchasing
+        # MCP, passing the VERIFIED approver id + daemon token straight through.
         if decision == "approve":
             instruction = (
-                f"Call approve_purchase(pending_id='{pending_id}', approver='{clicker_id}'). "
+                f"Call approve_purchase(pending_id='{pending_id}', approver='{clicker_id}', "
+                f"approval_token='{token}', token_expires={token_expires}). "
                 f"If it returns ok, post the returned cart_link and instruction to channel "
                 f"{channel} so the human can place the order on Amazon. Approve ONLY this "
                 "pending_id; do not approve anything else."
             )
         else:
             instruction = (
-                f"Call reject_purchase(pending_id='{pending_id}', approver='{clicker_id}'). "
+                f"Call reject_purchase(pending_id='{pending_id}', approver='{clicker_id}', "
+                f"approval_token='{token}', token_expires={token_expires}). "
                 f"Then post a one-line confirmation to channel {channel}. Reject ONLY this "
                 "pending_id."
             )
