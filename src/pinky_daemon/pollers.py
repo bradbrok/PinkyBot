@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+import unicodedata
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -23,6 +24,28 @@ from pinky_outreach.telegram import TelegramAdapter, TelegramError
 # Changing either requires a coordinated change in pos-spec-purchasing.
 _PURCHASE_APPROVE_ACTION_ID = "pos_purchase_approve"
 _PURCHASE_REJECT_ACTION_ID = "pos_purchase_reject"
+
+# A purchase pending_id / Slack user id must be a clean opaque token. Validating
+# at the boundary (fail-closed) keeps quotes/whitespace/newlines out of the
+# instruction we hand the agent — defense-in-depth against prompt-injection,
+# even though the values arrive on a Slack-signed envelope.
+_APPROVAL_TOKEN_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
+
+
+def _strip_emoji(text: str) -> str:
+    """Remove emoji/pictographs from shipped-UI text (the NO-EMOJI rule).
+
+    Drops Unicode "symbol, other" (So) code points plus ZWJ / variation
+    selectors — that covers emoji and flags while preserving letters and marks,
+    so non-Latin names (e.g. Cyrillic) survive intact.
+    """
+    out = [
+        ch
+        for ch in text
+        if ch not in ("\u200d", "\ufe0f", "\ufe0e")
+        and unicodedata.category(ch) != "So"
+    ]
+    return "".join(out).strip()
 
 # Threshold below which a "most recent message" found during channel-priming
 # is treated as a real first-test inbound rather than as a replay-prevention
@@ -1042,13 +1065,19 @@ class BrokerSlackPoller:
         pending_id = (action.get("value") or "").strip()
         user = payload.get("user") or {}
         clicker_id = (user.get("id") or "").strip()
-        clicker_name = user.get("username") or user.get("name") or clicker_id
+        # Cosmetic only; sanitized so an emoji in a Slack display name can't leak
+        # into the shipped decided-card (NO-EMOJI rule). The id, not the name, is
+        # what the gate and the MCP key on.
+        clicker_name = _strip_emoji(user.get("username") or user.get("name") or "") or clicker_id
         channel = ((payload.get("channel") or {}).get("id")) or ""
         response_url = payload.get("response_url") or ""
 
-        if not pending_id or not clicker_id:
+        # Fail-closed boundary validation: pending_id and clicker_id must be clean
+        # opaque tokens. This both drops malformed clicks and guarantees the
+        # values are injection-safe before they go into the agent instruction.
+        if not _APPROVAL_TOKEN_RE.match(pending_id) or not _APPROVAL_TOKEN_RE.match(clicker_id):
             _log(
-                f"slack-poller[{self._agent_name}]: interactive {decision} missing "
+                f"slack-poller[{self._agent_name}]: interactive {decision} malformed "
                 f"pending_id/clicker — dropping"
             )
             return

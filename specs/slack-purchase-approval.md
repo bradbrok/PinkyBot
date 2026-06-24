@@ -31,7 +31,10 @@ instruction to the owning agent (chekov), which calls the purchasing MCP. (B1.)
    envelope over the existing Socket Mode connection.
 4. `BrokerSlackPoller._handle_interactive`:
    a. Parse verified `clicker_id`, `action_id`→decision, `value`→`pending_id`,
-      `channel`, `response_url`.
+      `channel`, `response_url`. `pending_id` and `clicker_id` are validated as
+      clean opaque tokens (fail-closed drop on malformed) so nothing
+      injection-shaped can reach the agent instruction; the approver display
+      name is emoji-stripped before it lands in the shipped card.
    b. **GATE** — `registry.is_purchase_approver(clicker_id)`. Fail-closed: a
       blank id, an unconfigured allowlist, or any error → **deny**. Unauthorized
       clicks get an ephemeral refusal and never reach the agent.

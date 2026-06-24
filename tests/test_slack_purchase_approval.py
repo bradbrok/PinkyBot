@@ -17,6 +17,7 @@ from pinky_daemon.pollers import (
     _PURCHASE_APPROVE_ACTION_ID,
     _PURCHASE_REJECT_ACTION_ID,
     BrokerSlackPoller,
+    _strip_emoji,
 )
 
 BRAD = "U7W8RJGP5"
@@ -155,6 +156,48 @@ class TestApproverGate:
         await poller._handle_interactive({"type": "view_submission"})
         poller._broker.inject_agent_message.assert_not_awaited()
         poller._adapter.respond_via_url.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_pending_id_dropped(self):
+        """An injection-shaped value (quotes/spaces) is rejected at the boundary."""
+        poller = _make_poller(approver_ok=True)
+        await poller._handle_interactive(
+            _interactive(_PURCHASE_APPROVE_ACTION_ID, value="abc'); drop()")
+        )
+        poller._broker.inject_agent_message.assert_not_awaited()
+        poller._adapter.respond_via_url.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_malformed_clicker_id_dropped(self):
+        poller = _make_poller(approver_ok=True)
+        await poller._handle_interactive(
+            _interactive(_PURCHASE_APPROVE_ACTION_ID, user_id="U7 OR 1=1")
+        )
+        poller._broker.inject_agent_message.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_emoji_in_approver_name_stripped_from_card(self):
+        poller = _make_poller(approver_ok=True, inject_ok=True)
+        await poller._handle_interactive(
+            _interactive(_PURCHASE_APPROVE_ACTION_ID, username="brad \U0001f44d")
+        )
+        _url, payload = poller._adapter.respond_via_url.call_args[0]
+        rendered = payload.get("text", "") + str(payload.get("blocks", ""))
+        assert "\U0001f44d" not in rendered
+        assert "brad" in rendered
+
+
+class TestStripEmoji:
+    def test_strips_emoji(self):
+        assert _strip_emoji("brad \U0001f44d") == "brad"
+        assert _strip_emoji("\U0001f7e2 ok \U0001f534") == "ok"
+
+    def test_preserves_cyrillic_and_accents(self):
+        assert _strip_emoji("Юлия") == "Юлия"
+        assert _strip_emoji("José") == "José"
+
+    def test_plain_ascii_unchanged(self):
+        assert _strip_emoji("Brad Brockman") == "Brad Brockman"
 
 
 class TestRegistryPurchaseApprovers:
