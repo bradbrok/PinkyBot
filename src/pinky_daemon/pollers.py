@@ -1315,13 +1315,16 @@ class BrokerSlackPoller:
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
             return
-        # Keep fresh text only: a normal message (incl. a thread reply) has no
-        # subtype, and bot-authored messages carry the `bot_message` subtype —
-        # both are real inbound and must reach us (peer-agent parity with the
-        # Discord poller). Every other subtype (edits/deletes/joins/topic/…) is
-        # non-fresh → drop.
+        # Keep fresh inbound only: a normal message (incl. a thread reply) has no
+        # subtype; bot-authored messages carry `bot_message`; and a file upload
+        # (a shared screenshot/document) carries `file_share` and brings the
+        # `files` we download below. All three are real inbound and must reach us
+        # (peer-agent parity with the Discord poller). Every other subtype
+        # (edits/deletes/joins/topic/…) is non-fresh → drop. NOTE: without
+        # `file_share` here, image/file messages are dropped *before* the
+        # attachment handling below ever runs — i.e. screenshots never arrive.
         subtype = event.get("subtype") or ""
-        if subtype and subtype != "bot_message":
+        if subtype and subtype not in ("bot_message", "file_share"):
             return
         user_id = event.get("user", "") or ""
         bot_id = event.get("bot_id", "") or ""

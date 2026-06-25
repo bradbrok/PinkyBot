@@ -161,8 +161,12 @@ class TestBrokerSlackPoller:
     @pytest.mark.asyncio
     async def test_file_attachment_normalized(self, mock_broker):
         poller = _make_poller(mock_broker)
+        # Real Slack file uploads carry subtype "file_share" — include it so the
+        # test exercises the same payload Slack actually sends (a bare `files`
+        # message with no subtype does not occur in practice).
         await poller._handle_event(_event({
-            "type": "message", "user": "U123", "text": "see file",
+            "type": "message", "subtype": "file_share",
+            "user": "U123", "text": "see file",
             "channel": "C1", "ts": "3.3",
             "files": [{
                 "id": "F1", "name": "doc.pdf",
@@ -178,6 +182,31 @@ class TestBrokerSlackPoller:
         assert att["file_name"] == "doc.pdf"
         assert att["mime_type"] == "application/pdf"
         assert att["file_size"] == 1234
+
+    @pytest.mark.asyncio
+    async def test_file_share_screenshot_no_caption_delivered(self, mock_broker):
+        """Regression: a screenshot (subtype `file_share`, often no text) must be
+        DELIVERED with its image attachment, not dropped by the subtype filter.
+        Before the fix, `file_share` was filtered out before attachment handling,
+        so screenshots never reached the agent at all."""
+        poller = _make_poller(mock_broker)
+        await poller._handle_event(_event({
+            "type": "message", "subtype": "file_share",
+            "user": "U123", "text": "",  # caption-less screenshot
+            "channel": "C1", "ts": "4.4",
+            "files": [{
+                "id": "F2", "name": "Screenshot.png",
+                "url_private_download": "https://files.slack.com/shot.png",
+                "mimetype": "image/png", "size": 5678,
+            }],
+        }))
+        await asyncio.sleep(0)
+        mock_broker.handle_inbound.assert_called_once()
+        bmsg = mock_broker.handle_inbound.call_args[0][0]
+        assert bmsg.content == ""
+        assert len(bmsg.attachments) == 1
+        assert bmsg.attachments[0]["mime_type"] == "image/png"
+        assert bmsg.attachments[0]["file_name"] == "Screenshot.png"
 
     @pytest.mark.asyncio
     async def test_start_without_app_token_is_noop(self, mock_broker):
