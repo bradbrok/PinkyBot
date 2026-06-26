@@ -476,6 +476,14 @@ class SessionWatchdog:
                 f"{snap.pending} pending message(s)."
             )
             _warn(msg)
+            log_watchdog_decision(
+                watchdog="session", agent=snap.agent_name, label=snap.label,
+                decision="warn", reason="stale_progress", state=snap.state,
+                pending=snap.pending, turns=snap.turns,
+                current_activity=snap.current_activity,
+                progress_stale_s=stale_seconds, warn_after_s=cfg.warn_after_seconds,
+                inflight_turns=snap.inflight_turns, inflight_active=False,
+            )
             if self._alert_fn:
                 try:
                     await self._alert_fn(snap.agent_name, msg)
@@ -493,6 +501,15 @@ class SessionWatchdog:
                 f"{snap.pending} pending message(s)"
             )
             _warn("watchdog recovering %s: %s", snap.agent_name, reason)
+            log_watchdog_decision(
+                watchdog="session", agent=snap.agent_name, label=snap.label,
+                decision="recover", reason="stale_progress", state=snap.state,
+                pending=snap.pending, turns=snap.turns,
+                current_activity=snap.current_activity,
+                progress_stale_s=stale_seconds,
+                recover_after_s=cfg.recover_after_seconds,
+                inflight_turns=snap.inflight_turns, inflight_active=False,
+            )
             if self._recover_fn:
                 try:
                     await self._recover_fn(snap.agent_name, snap.label, reason)

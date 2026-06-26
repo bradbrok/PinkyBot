@@ -829,6 +829,52 @@ class TestIdleSleepNonBlocking:
         ss.release.set()
         await asyncio.wait_for(scheduler._sleep_tasks[("ivan", "main")], timeout=2)
 
+    # #230 (Murzik #825 review) — _check_auto_sleep runs BEFORE
+    # _check_idle_sessions in _tick() and shares the stale-last_active threshold
+    # (auto_sleep_hours also feeds idle_timeout), so it needs the SAME carve-out.
+
+    @pytest.mark.asyncio
+    async def test_auto_sleep_fallback_skipped_when_inflight_active(self, registry):
+        registry.register("ivan", model="opus", auto_sleep_hours=1)
+        ss = _FakeIdleSession(idle_timeout=0, inflight_active=True)
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await scheduler._check_auto_sleep(time.time())
+        await asyncio.sleep(0)
+        assert ss.sleep_calls == 0
+        assert ("ivan", "main") not in scheduler._sleep_tasks
+
+    @pytest.mark.asyncio
+    async def test_auto_sleep_callback_skipped_when_inflight_active(self, registry):
+        registry.register("ivan", model="opus", auto_sleep_hours=1)
+        ss = _FakeIdleSession(idle_timeout=0, inflight_active=True)
+        calls = []
+
+        async def _cb(agent_name, reason):
+            calls.append(agent_name)
+
+        scheduler = AgentScheduler(
+            registry,
+            streaming_sessions_fn=lambda: {"ivan": {"main": ss}},
+            auto_sleep_callback=_cb,
+        )
+        await scheduler._check_auto_sleep(time.time())
+        assert calls == []
+
+    @pytest.mark.asyncio
+    async def test_auto_sleep_still_fires_when_inactive(self, registry):
+        registry.register("ivan", model="opus", auto_sleep_hours=1)
+        ss = _FakeIdleSession(idle_timeout=0, inflight_active=False)
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await asyncio.wait_for(scheduler._check_auto_sleep(time.time()), timeout=2)
+        await asyncio.wait_for(ss.started.wait(), timeout=2)
+        assert ss.sleep_calls == 1
+        ss.release.set()
+        await asyncio.wait_for(scheduler._sleep_tasks[("ivan", "main")], timeout=2)
+
 
 # ── Non-blocking dream/librarian fires (issue #702) ────────────────────────
 

@@ -22,7 +22,7 @@ _log = logging.getLogger("pinky.watchdog").info
 # Canonical field order. A path omits any field it doesn't have (None is dropped),
 # so every emitted line is a stable subset of this ordering.
 _FIELDS = (
-    "watchdog",  # session | idle_sleep | inflight — which watchdog acted
+    "watchdog",  # session | idle_sleep | auto_sleep | inflight — which acted
     "agent",
     "label",
     "decision",  # skip | warn | recover | sleep | restart | reconcile | no_op

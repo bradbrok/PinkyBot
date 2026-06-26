@@ -630,6 +630,13 @@ class AgentScheduler:
                         )
                         continue
                     _log(f"scheduler: {name}/{label} idle for {int(idle_seconds)}s (threshold: {idle_timeout}s) — auto-sleeping")
+                    log_watchdog_decision(
+                        watchdog="idle_sleep", agent=name, label=label,
+                        decision="sleep", reason="idle_timeout",
+                        state=getattr(ss.state, "value", str(ss.state)),
+                        last_active_age_s=idle_seconds,
+                        idle_timeout_s=idle_timeout, inflight_active=False,
+                    )
                     if self._activity:
                         try:
                             self._activity.log(name, "agent_sleep", f"{name} auto-slept (idle timeout)")
@@ -764,7 +771,39 @@ class AgentScheduler:
 
                 idle_seconds = now - ss.last_active
                 if idle_seconds >= threshold_seconds:
+                    # #230 — never auto-sleep a session running a live Workflow /
+                    # background turn. This path shares the stale-``last_active``
+                    # threshold with _check_idle_sessions AND runs BEFORE it in
+                    # _tick(), and ``auto_sleep_hours`` also feeds the tmux
+                    # session ``idle_timeout`` — so without the SAME carve-out it
+                    # would tear down an in-flight Workflow here first, before the
+                    # _check_idle_sessions guard ever runs (Murzik #825 review).
+                    # Releases the instant liveness stops (finished work sleeps).
+                    stats = getattr(ss, "stats", None) or {}
+                    state_val = getattr(ss.state, "value", str(ss.state))
+                    if stats.get("inflight_active"):
+                        log_watchdog_decision(
+                            watchdog="auto_sleep", agent=agent.name, label=label,
+                            decision="skip", reason="inflight_active",
+                            state=state_val, last_active_age_s=idle_seconds,
+                            idle_timeout_s=threshold_seconds,
+                            inflight_turns=stats.get("inflight_turns"),
+                            inflight_active=True,
+                            inflight_liveness_reason=stats.get(
+                                "inflight_liveness_reason"
+                            ),
+                            inflight_liveness_age_s=stats.get(
+                                "inflight_liveness_age_s"
+                            ),
+                        )
+                        continue
                     _log(f"scheduler: auto-sleep for '{agent.name}/{label}' — idle {idle_seconds / 3600:.1f}h (threshold: {agent.auto_sleep_hours}h)")
+                    log_watchdog_decision(
+                        watchdog="auto_sleep", agent=agent.name, label=label,
+                        decision="sleep", reason="auto_sleep_idle",
+                        state=state_val, last_active_age_s=idle_seconds,
+                        idle_timeout_s=threshold_seconds, inflight_active=False,
+                    )
                     if self._auto_sleep_callback:
                         try:
                             await self._auto_sleep_callback(
