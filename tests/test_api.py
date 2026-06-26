@@ -672,6 +672,33 @@ class TestAPI:
                 # Unchanged after the rejected update.
                 assert client.get("/agents/tenant").json()["isolation_mode"] == "container"
 
+    def test_update_heartbeat_interval_round_trips(self):
+        """PUT /agents/{name} can change heartbeat_interval. The field was
+        missing from UpdateAgentRequest, so a passive worker couldn't be flipped
+        to demand-woken (0) without a clobbering re-register — it just churned a
+        full force_restart every heartbeat. The registry merge already supports
+        the field by key-presence; this exposes it on the update model."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post(
+                    "/agents",
+                    json={"name": "worker", "model": "sonnet", "heartbeat_interval": 300},
+                )
+                assert client.get("/agents/worker").json()["heartbeat_interval"] == 300
+
+                # Flip to demand-woken (0) — now editable via the update model.
+                r = client.put("/agents/worker", json={"heartbeat_interval": 0})
+                assert r.status_code == 200
+                assert r.json()["heartbeat_interval"] == 0
+                assert client.get("/agents/worker").json()["heartbeat_interval"] == 0
+
+                # Merge-by-key-presence: an unrelated update must NOT resurrect
+                # the old cadence (heartbeat_interval absent => unchanged).
+                client.put("/agents/worker", json={"display_name": "Worker"})
+                assert client.get("/agents/worker").json()["heartbeat_interval"] == 0
+
     def test_container_agent_cannot_start_before_activation(self, monkeypatch):
         """Container isolation is opt-in but DORMANT by default: with the runtime
         gate OFF, a container agent registers fine yet REFUSES to start (501) —
