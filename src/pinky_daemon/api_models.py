@@ -403,6 +403,7 @@ class UpdateAgentRequest(BaseModel):
     plain_text_fallback: bool | None = None
     restart_threshold_pct: float | None = None
     context_nudge_threshold_pct: float | None = None  # Soft nudge %; 0=use global default (#614)
+    heartbeat_interval: int | None = None  # Seconds between heartbeats (0=disabled → demand-woken)
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
     clock_aligned: bool | None = None  # Align to wall clock boundaries
     auto_sleep_hours: int | None = None  # Auto-sleep after N hours idle (0=disabled)
