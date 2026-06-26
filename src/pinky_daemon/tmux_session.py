@@ -99,6 +99,7 @@ from pinky_daemon.wake_prompt import (
     build_idle_sleep_prompt,
     build_wake_prompt,
 )
+from pinky_daemon.watchdog_log import log_watchdog_decision
 
 # Soft context-watermark default (#614) — used when an agent's
 # ``context_nudge_threshold_pct`` is unset (0). Sits well below the
@@ -1683,6 +1684,13 @@ class TmuxSession:
         # a running turn there would warn/auto-recover mid-turn on any
         # long turn. ``inflight_turns`` exposes the pasted-awaiting-stop
         # span separately for busy-state consumers (UI badge).
+        #
+        # #230 — ``inflight_active`` is the live carve-out signal the OUTER
+        # watchdogs (daemon SessionWatchdog warn/recover + scheduler idle-sleep)
+        # read to avoid tearing down a session mid-Workflow. Computed live here
+        # so those paths don't recompute slightly-different truth; cheap when no
+        # turn is in flight (returns early before any filesystem stat).
+        live = self._watchdog_liveness(time.time())
         return {
             **self._stats,
             "state": self.state.value,
@@ -1692,6 +1700,9 @@ class TmuxSession:
             "state_entered_at": self._state_machine.state_entered_at,
             "pending_responses": self._message_queue.qsize(),
             "inflight_turns": len(self._inflight_metas),
+            "inflight_active": live["active"],
+            "inflight_liveness_reason": live["reason"],
+            "inflight_liveness_age_s": live["age_s"],
             "current_activity": self._current_activity,
             "current_thinking": self._current_thinking,
             "activity_log": list(self._activity_log[-20:]),
@@ -4800,6 +4811,24 @@ class TmuxSession:
             return False
         return result.ok and marker in (result.stdout or "")
 
+    def _main_transcript_age(self, now: float) -> float | None:
+        """Seconds since the main transcript was last written, or None.
+
+        None when the path is the cold-start placeholder, missing, or
+        unstattable — absence of evidence (callers treat None as "no growth"
+        so a real stall isn't masked). Single source of truth for both
+        ``_transcript_recently_grew`` (bool) and ``_watchdog_liveness`` (age).
+        """
+        tailer = self._tailer
+        path = getattr(tailer, "transcript_path", None) if tailer else None
+        if not path:
+            return None
+        try:
+            mtime = Path(path).stat().st_mtime
+        except OSError:
+            return None
+        return now - mtime
+
     def _transcript_recently_grew(self, now: float, window: float) -> bool:
         """True if the transcript file was written within ``window`` seconds.
 
@@ -4809,18 +4838,11 @@ class TmuxSession:
         absence of evidence is treated as "not growing" so the caller falls
         through to the idle/wedged checks rather than masking a real stall.
         """
-        tailer = self._tailer
-        path = getattr(tailer, "transcript_path", None) if tailer else None
-        if not path:
-            return False
-        try:
-            mtime = Path(path).stat().st_mtime
-        except OSError:
-            return False
-        return (now - mtime) < window
+        age = self._main_transcript_age(now)
+        return age is not None and age < window
 
-    def _background_tasks_recently_active(self, now: float, window: float) -> bool:
-        """True if a background task wrote a transcript within ``window`` seconds.
+    def _background_task_recent_age(self, now: float, window: float) -> float | None:
+        """Seconds since a background task last wrote a transcript, or None.
 
         A blocking turn can be legitimately busy with NO main-transcript output:
         the REPL is parked on a long-running background task (a Dynamic
@@ -4836,21 +4858,24 @@ class TmuxSession:
         and puts subagent/workflow transcripts under the sibling ``<session>/``
         directory (``subagents/`` and ``workflows/``). We derive that directory
         from the tailer's transcript path and look for any entry modified within
-        the window, short-circuiting on the first hit. Absence of evidence →
-        False (same convention as ``_transcript_recently_grew``: fall through to
-        the idle/wedged checks rather than masking a real stall).
+        the window, short-circuiting on (and returning the age of) the FIRST hit.
+        None when there is no recent background write (same convention as
+        ``_main_transcript_age``: absence of evidence, so the caller falls
+        through to the idle/wedged checks rather than masking a real stall).
+        Single source of truth for ``_background_tasks_recently_active`` (bool)
+        and ``_watchdog_liveness`` (age).
         """
         tailer = self._tailer
         path = getattr(tailer, "transcript_path", None) if tailer else None
         if not path:
-            return False
+            return None
         try:
             path = Path(path)
         except (TypeError, ValueError):
-            return False
+            return None
         name = path.name
         if not name.endswith(".jsonl"):
-            return False
+            return None
         # ``<session>.jsonl`` → sibling ``<session>/`` dir holding background work.
         session_dir = path.with_name(name[: -len(".jsonl")])
         cutoff = now - window
@@ -4861,13 +4886,22 @@ class TmuxSession:
                     continue
                 for entry in root.rglob("*"):
                     try:
-                        if entry.stat().st_mtime >= cutoff:
-                            return True
+                        mtime = entry.stat().st_mtime
                     except OSError:
                         continue
+                    if mtime >= cutoff:
+                        return now - mtime
             except OSError:
                 continue
-        return False
+        return None
+
+    def _background_tasks_recently_active(self, now: float, window: float) -> bool:
+        """True if a background task wrote a transcript within ``window`` seconds.
+
+        Thin bool wrapper over ``_background_task_recent_age`` (single source of
+        truth). See that method for the layout/convention rationale (#692).
+        """
+        return self._background_task_recent_age(now, window) is not None
 
     def _foreground_tool_in_flight(self, now: float) -> bool:
         """True if a FOREGROUND tool call is still running (#731).
@@ -4901,6 +4935,67 @@ class TmuxSession:
                 continue
             alive = True
         return alive
+
+    def _watchdog_liveness(self, now: float) -> dict:
+        """Live carve-out signal for the OUTER watchdogs (#230).
+
+        Answers "is this session's in-flight turn genuinely busy *right now*?"
+        for the daemon ``SessionWatchdog`` (warn/recover) and the scheduler
+        idle-sleep — the two teardown paths that, unlike the per-session
+        ``_inflight_watchdog`` (#692/#731), had no background/foreground
+        liveness awareness and would tear a session down mid-Workflow.
+
+        Returns ``{"active": bool, "reason": str, "age_s": float | None}``.
+        ``active`` is True ONLY when BOTH hold:
+
+          * there is an in-flight turn (``_inflight_metas`` non-empty), AND
+          * positive liveness evidence — a foreground tool in flight (#731), a
+            recently-written main transcript, or a recently-written subagent/
+            workflow transcript (#692), within
+            ``_BACKGROUND_TASK_ACTIVE_WINDOW_SEC``.
+
+        Computed LIVE on every call — never latched/persisted — so the carve-out
+        RELEASES the instant liveness stops (a finished workflow sleeps normally;
+        a turn that goes quiet is no longer exempt). Distinct from
+        ``_inflight_stall_verdict``, which is age-gated on
+        ``_TURN_DONE_TIMEOUT_SEC`` before it even looks: this answers "live now",
+        so B/C can act the moment liveness stops while their OWN stale clocks keep
+        aging behind the exemption (we never reset their timers — Murzik review).
+
+        A bare "recent subagent dir exists" is NOT credited without an in-flight
+        turn. Cheapest→costliest evidence order; first positive wins (``reason``
+        is diagnostic only — ``active`` is the same regardless of which fired).
+        """
+        if not self._inflight_metas:
+            return {"active": False, "reason": "no_inflight_turn", "age_s": None}
+        # (1) Foreground tool in flight — authoritative (hook-tracked), cheapest.
+        if self._foreground_tool_in_flight(now):
+            ages = [now - t for t in self._inflight_tool_calls.values()]
+            return {
+                "active": True,
+                "reason": "foreground_tool_in_flight",
+                "age_s": min(ages) if ages else None,
+            }
+        # (2) Main transcript recently written — one stat.
+        main_age = self._main_transcript_age(now)
+        if main_age is not None and main_age < _BACKGROUND_TASK_ACTIVE_WINDOW_SEC:
+            return {
+                "active": True,
+                "reason": "main_transcript_recent",
+                "age_s": main_age,
+            }
+        # (3) Background (subagent/workflow) transcript recently written — rglob,
+        # last because it's the costliest; the common long-Workflow case.
+        bg_age = self._background_task_recent_age(
+            now, _BACKGROUND_TASK_ACTIVE_WINDOW_SEC
+        )
+        if bg_age is not None:
+            return {
+                "active": True,
+                "reason": "background_transcript_recent",
+                "age_s": bg_age,
+            }
+        return {"active": False, "reason": "quiet", "age_s": None}
 
     def _inflight_stall_verdict(self, now: float) -> str:
         """Classify a possibly-stalled inflight head for the watchdog (#118).
@@ -5144,6 +5239,12 @@ class TmuxSession:
                         f"but transcript or background task still active — not "
                         f"wedged, extending window (deque depth={depth})"
                     )
+                    log_watchdog_decision(
+                        watchdog="inflight", agent=self.agent_name,
+                        decision="skip", reason="growing", state=self.state.value,
+                        progress_stale_s=age, inflight_turns=depth,
+                        inflight_active=True,
+                    )
                     continue
                 if verdict == "idle":
                     # #118: head aged out, transcript quiet, and the REPL last
@@ -5165,6 +5266,12 @@ class TmuxSession:
                         f"but REPL is idle — reconciled {len(drained)} phantom "
                         f"meta(s), NOT restarting (#118)"
                     )
+                    log_watchdog_decision(
+                        watchdog="inflight", agent=self.agent_name,
+                        decision="reconcile", reason="idle_phantom",
+                        state=self.state.value, progress_stale_s=age,
+                        inflight_turns=depth, inflight_active=False,
+                    )
                     continue
                 # verdict == "wedged": no output + REPL not idle → genuinely
                 # stuck. Fall through to the force_restart recovery path.
@@ -5173,6 +5280,12 @@ class TmuxSession:
                     f"> {_TURN_DONE_TIMEOUT_SEC}s, transcript quiet + REPL not "
                     f"idle — REPL stuck; scheduling force_restart "
                     f"(deque depth={depth})"
+                )
+                log_watchdog_decision(
+                    watchdog="inflight", agent=self.agent_name,
+                    decision="restart", reason="wedged", state=self.state.value,
+                    progress_stale_s=age, inflight_turns=depth,
+                    inflight_active=False,
                 )
                 # Snapshot deque state before mutation so this critical
                 # section is atomic from the outside (no awaits between

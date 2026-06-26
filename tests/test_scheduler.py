@@ -704,7 +704,9 @@ class TestHeartbeatResurrection:
 class _FakeIdleSession:
     """Streaming-session stand-in for idle/auto-sleep scheduling tests."""
 
-    def __init__(self, *, idle_timeout: int = 60) -> None:
+    def __init__(
+        self, *, idle_timeout: int = 60, inflight_active: bool = False
+    ) -> None:
         from types import SimpleNamespace
 
         from pinky_daemon.transport_state import SessionState
@@ -715,6 +717,21 @@ class _FakeIdleSession:
         self.sleep_calls = 0
         self.started = asyncio.Event()
         self.release = asyncio.Event()
+        self._inflight_active = inflight_active
+
+    @property
+    def stats(self) -> dict:
+        # #230 — the scheduler reads ``inflight_active`` to skip idle-sleeping a
+        # session running a live Workflow/background turn.
+        active = self._inflight_active
+        return {
+            "inflight_active": active,
+            "inflight_turns": 1 if active else 0,
+            "inflight_liveness_reason": (
+                "background_transcript_recent" if active else "quiet"
+            ),
+            "inflight_liveness_age_s": 5.0 if active else None,
+        }
 
     async def idle_sleep(self) -> bool:
         self.sleep_calls += 1
@@ -784,6 +801,33 @@ class TestIdleSleepNonBlocking:
         await asyncio.sleep(0)
         await scheduler.stop()
         assert scheduler._sleep_tasks == {}
+
+    @pytest.mark.asyncio
+    async def test_inflight_active_skips_idle_sleep(self, registry):
+        # A session running a live Workflow/background turn must NOT be
+        # idle-slept even though last_active is stale (#230).
+        ss = _FakeIdleSession(inflight_active=True)
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await scheduler._check_idle_sessions(time.time())
+        await asyncio.sleep(0)
+        assert ss.sleep_calls == 0
+        assert ("ivan", "main") not in scheduler._sleep_tasks
+
+    @pytest.mark.asyncio
+    async def test_inflight_inactive_still_sleeps(self, registry):
+        # The carve-out RELEASES when there's no live work: a quiet/finished
+        # session still sleeps normally (#230).
+        ss = _FakeIdleSession(inflight_active=False)
+        scheduler = AgentScheduler(
+            registry, streaming_sessions_fn=lambda: {"ivan": {"main": ss}}
+        )
+        await scheduler._check_idle_sessions(time.time())
+        await asyncio.wait_for(ss.started.wait(), timeout=2)
+        assert ss.sleep_calls == 1
+        ss.release.set()
+        await asyncio.wait_for(scheduler._sleep_tasks[("ivan", "main")], timeout=2)
 
 
 # ── Non-blocking dream/librarian fires (issue #702) ────────────────────────

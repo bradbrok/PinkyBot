@@ -17,8 +17,10 @@ from __future__ import annotations
 
 import asyncio
 import json as _json
+import os
 import re
 import time as _time
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -8019,3 +8021,118 @@ async def test_send_pane_keys_false_on_tmux_failure() -> None:
     tmux.send_keys = AsyncMock(return_value=_fail("no server running"))
 
     assert await session.send_pane_keys(key="Enter") is False
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #230 — _watchdog_liveness: live carve-out signal for the OUTER watchdogs
+# (daemon SessionWatchdog warn/recover + scheduler idle-sleep). Active ONLY
+# when an in-flight turn is genuinely busy right now; computed live (never
+# latched) so it releases the instant liveness stops.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _point_transcript(ss: TmuxSession, path) -> None:
+    """Point the session's tailer at ``path`` for liveness mtime checks."""
+    ss._tailer = SimpleNamespace(transcript_path=str(path))
+
+
+def _age_file(path, seconds: float) -> None:
+    """Backdate a file's mtime by ``seconds`` so it reads as 'old'."""
+    old = _time.time() - seconds
+    os.utime(path, (old, old))
+
+
+def test_watchdog_liveness_inactive_without_inflight_turn(tmp_path) -> None:
+    ss, _ = _make_session()
+    # Even with a freshly-written transcript, NO in-flight turn → not active:
+    # a session between turns must be sleepable/recoverable as normal.
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _point_transcript(ss, main)
+    live = ss._watchdog_liveness(_time.time())
+    assert live["active"] is False
+    assert live["reason"] == "no_inflight_turn"
+
+
+def test_watchdog_liveness_foreground_tool_in_flight(tmp_path) -> None:
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    ss._inflight_tool_calls = {"tool-1": _time.time()}
+    live = ss._watchdog_liveness(_time.time())
+    assert live["active"] is True
+    assert live["reason"] == "foreground_tool_in_flight"
+    assert live["age_s"] is not None
+
+
+def test_watchdog_liveness_main_transcript_recent(tmp_path) -> None:
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")  # just written → recent mtime
+    _point_transcript(ss, main)
+    live = ss._watchdog_liveness(_time.time())
+    assert live["active"] is True
+    assert live["reason"] == "main_transcript_recent"
+
+
+def test_watchdog_liveness_background_transcript_recent(tmp_path) -> None:
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _age_file(main, 1000)  # main quiet → fall through to background evidence
+    wf = tmp_path / "session" / "workflows"
+    wf.mkdir(parents=True)
+    (wf / "agent-1.jsonl").write_text("{}")  # recent subagent/workflow write
+    _point_transcript(ss, main)
+    live = ss._watchdog_liveness(_time.time())
+    assert live["active"] is True
+    assert live["reason"] == "background_transcript_recent"
+
+
+def test_watchdog_liveness_quiet_inflight_is_inactive(tmp_path) -> None:
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _age_file(main, 1000)  # main quiet, no fg tool, no background dir
+    _point_transcript(ss, main)
+    live = ss._watchdog_liveness(_time.time())
+    assert live["active"] is False
+    assert live["reason"] == "quiet"
+
+
+def test_watchdog_liveness_stale_background_no_longer_active(tmp_path) -> None:
+    # Murzik correctness point: a stale-but-present subagent dir must STOP
+    # masking once its writes age out of the window.
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _age_file(main, 1000)
+    wf = tmp_path / "session" / "workflows"
+    wf.mkdir(parents=True)
+    stale = wf / "agent-1.jsonl"
+    stale.write_text("{}")
+    _age_file(stale, 1000)  # background write aged out of the 180s window
+    _point_transcript(ss, main)
+    live = ss._watchdog_liveness(_time.time())
+    assert live["active"] is False
+    assert live["reason"] == "quiet"
+
+
+def test_watchdog_liveness_surfaced_in_stats(tmp_path) -> None:
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    ss._inflight_tool_calls = {"tool-1": _time.time()}
+    stats = ss.stats
+    assert stats["inflight_active"] is True
+    assert stats["inflight_liveness_reason"] == "foreground_tool_in_flight"
+    assert stats["inflight_turns"] == 1
+
+
+def test_stats_inflight_inactive_when_idle(tmp_path) -> None:
+    ss, _ = _make_session()
+    stats = ss.stats
+    assert stats["inflight_active"] is False
+    assert stats["inflight_liveness_reason"] == "no_inflight_turn"

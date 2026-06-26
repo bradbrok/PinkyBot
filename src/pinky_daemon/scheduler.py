@@ -22,6 +22,7 @@ from zoneinfo import ZoneInfo
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.transport_state import SessionState
+from pinky_daemon.watchdog_log import log_watchdog_decision
 
 
 def _log(msg: str) -> None:
@@ -600,6 +601,34 @@ class AgentScheduler:
 
                 idle_seconds = now - ss.last_active
                 if idle_seconds >= idle_timeout:
+                    # #230 — never idle-sleep a session running a live Workflow /
+                    # background turn. ``last_active`` is bumped only at turn
+                    # delivery, NOT by subagent/workflow progress, so a long
+                    # quiet-main-transcript Workflow looks "idle" and idle_sleep()
+                    # would tear the REPL down mid-flight, killing the work. The
+                    # transport's live ``inflight_active`` signal (reusing the
+                    # #692/#731 liveness plumbing) flips False the moment liveness
+                    # stops, so a FINISHED workflow still sleeps normally on a
+                    # later tick. Absent on codex/legacy stats → falsy → sleeps
+                    # exactly as before.
+                    stats = getattr(ss, "stats", None) or {}
+                    if stats.get("inflight_active"):
+                        log_watchdog_decision(
+                            watchdog="idle_sleep", agent=name, label=label,
+                            decision="skip", reason="inflight_active",
+                            state=getattr(ss.state, "value", str(ss.state)),
+                            last_active_age_s=idle_seconds,
+                            idle_timeout_s=idle_timeout,
+                            inflight_turns=stats.get("inflight_turns"),
+                            inflight_active=True,
+                            inflight_liveness_reason=stats.get(
+                                "inflight_liveness_reason"
+                            ),
+                            inflight_liveness_age_s=stats.get(
+                                "inflight_liveness_age_s"
+                            ),
+                        )
+                        continue
                     _log(f"scheduler: {name}/{label} idle for {int(idle_seconds)}s (threshold: {idle_timeout}s) — auto-sleeping")
                     if self._activity:
                         try:
