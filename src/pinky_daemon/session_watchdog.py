@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
 from pinky_daemon.transport_state import SessionState
+from pinky_daemon.watchdog_log import log_watchdog_decision
 
 _log = logging.getLogger("pinky.watchdog").info
 _warn = logging.getLogger("pinky.watchdog").warning
@@ -190,6 +191,17 @@ class _SessionSnapshot:
     # the transport's StateMachine (#206). 0.0 when the transport doesn't
     # expose it — the watchdog then falls back to its own sampled timing.
     state_entered_at: float = 0.0
+    # #230 — live in-flight carve-out signal (from the transport's
+    # ``stats["inflight_active"]``). True iff the session has an in-flight turn
+    # that is genuinely busy right now (foreground tool / main- or background-
+    # transcript growth). The progress watchdog skips warn+recover while True so
+    # a long Workflow isn't force-recovered mid-flight — WITHOUT resetting the
+    # stale clock, so it acts immediately once liveness stops. False/empty for
+    # transports that don't expose it (codex/streaming/legacy).
+    inflight_turns: int = 0
+    inflight_active: bool = False
+    inflight_liveness_reason: str = ""
+    inflight_liveness_age_s: float | None = None
 
 
 @dataclass
@@ -343,6 +355,10 @@ class SessionWatchdog:
             sample_time=time.time(),
             state=state,
             state_entered_at=stats.get("state_entered_at", 0.0) or 0.0,
+            inflight_turns=stats.get("inflight_turns", 0) or 0,
+            inflight_active=bool(stats.get("inflight_active", False)),
+            inflight_liveness_reason=stats.get("inflight_liveness_reason", "") or "",
+            inflight_liveness_age_s=stats.get("inflight_liveness_age_s"),
         )
 
     async def _evaluate(self, snap: _SessionSnapshot, now: float) -> None:
@@ -422,6 +438,31 @@ class SessionWatchdog:
         if cfg.require_backlog and snap.pending < cfg.min_pending:
             return
 
+        # #230 — in-flight Workflow/background carve-out. A session running a
+        # live Workflow/Agent emits nothing this progress logic sees (turns and
+        # current_activity stay static), so without this it would warn+recover
+        # mid-flight once a message queues behind the long turn. Skip warn+recover
+        # while the transport reports a genuinely-busy in-flight turn — but do
+        # NOT reset ``last_progress_at``: the stale clock keeps aging BEHIND the
+        # exemption, so the moment liveness stops (turn still not progressing) we
+        # act on the next sweep instead of granting a fresh full window. Parity
+        # for the daemon-level warn/recover path of what #692/#731 gave the
+        # per-session _inflight_watchdog's force_restart path.
+        if snap.inflight_active:
+            log_watchdog_decision(
+                watchdog="session", agent=snap.agent_name, label=snap.label,
+                decision="skip", reason="inflight_active", state=snap.state,
+                pending=snap.pending, turns=snap.turns,
+                current_activity=snap.current_activity,
+                progress_stale_s=stale_seconds,
+                warn_after_s=cfg.warn_after_seconds,
+                recover_after_s=cfg.recover_after_seconds,
+                inflight_turns=snap.inflight_turns, inflight_active=True,
+                inflight_liveness_reason=snap.inflight_liveness_reason,
+                inflight_liveness_age_s=snap.inflight_liveness_age_s,
+            )
+            return
+
         # Warn tier
         if (
             not state.warned
@@ -435,6 +476,14 @@ class SessionWatchdog:
                 f"{snap.pending} pending message(s)."
             )
             _warn(msg)
+            log_watchdog_decision(
+                watchdog="session", agent=snap.agent_name, label=snap.label,
+                decision="warn", reason="stale_progress", state=snap.state,
+                pending=snap.pending, turns=snap.turns,
+                current_activity=snap.current_activity,
+                progress_stale_s=stale_seconds, warn_after_s=cfg.warn_after_seconds,
+                inflight_turns=snap.inflight_turns, inflight_active=False,
+            )
             if self._alert_fn:
                 try:
                     await self._alert_fn(snap.agent_name, msg)
@@ -452,6 +501,15 @@ class SessionWatchdog:
                 f"{snap.pending} pending message(s)"
             )
             _warn("watchdog recovering %s: %s", snap.agent_name, reason)
+            log_watchdog_decision(
+                watchdog="session", agent=snap.agent_name, label=snap.label,
+                decision="recover", reason="stale_progress", state=snap.state,
+                pending=snap.pending, turns=snap.turns,
+                current_activity=snap.current_activity,
+                progress_stale_s=stale_seconds,
+                recover_after_s=cfg.recover_after_seconds,
+                inflight_turns=snap.inflight_turns, inflight_active=False,
+            )
             if self._recover_fn:
                 try:
                     await self._recover_fn(snap.agent_name, snap.label, reason)

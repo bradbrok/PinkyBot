@@ -299,6 +299,120 @@ class TestEvaluation:
         assert "stuck" in alerts[0][1]
 
 
+class TestInflightCarveOut:
+    """#230 — a session running a live Workflow/background turn must not be
+    warned or force-recovered, but the stale clock must keep aging so recovery
+    fires the moment liveness stops (no fresh window granted)."""
+
+    @pytest.mark.asyncio
+    async def test_take_snapshot_carries_inflight_fields(self, make_watchdog):
+        class TmuxLike:
+            @property
+            def stats(self):
+                return {
+                    "state": "connected",
+                    "turns": 3,
+                    "pending_responses": 2,
+                    "current_activity": "Workflow",
+                    "inflight_turns": 1,
+                    "inflight_active": True,
+                    "inflight_liveness_reason": "background_transcript_recent",
+                    "inflight_liveness_age_s": 4.2,
+                }
+
+        wd = make_watchdog()
+        snap = wd._take_snapshot("a", "main", TmuxLike())
+        assert snap.inflight_active is True
+        assert snap.inflight_turns == 1
+        assert snap.inflight_liveness_reason == "background_transcript_recent"
+        assert snap.inflight_liveness_age_s == 4.2
+
+    @pytest.mark.asyncio
+    async def test_inflight_active_skips_recover_and_keeps_clock(
+        self, make_watchdog
+    ):
+        recoveries = []
+
+        async def _recover(agent, label, reason):
+            recoveries.append((agent, label, reason))
+
+        wd = make_watchdog(recover_fn=_recover)
+        now = time.time()
+        stale_at = now - 1000  # past the 900s recover threshold
+        wd._states[("a", "main")] = _AgentState(
+            last_progress_turns=5,
+            last_progress_activity="Workflow",
+            last_progress_at=stale_at,
+            warned=True,
+        )
+        snap = _SessionSnapshot(
+            agent_name="a", label="main", connected=True,
+            turns=5, pending=3, current_activity="Workflow",
+            sample_time=now, inflight_active=True,
+            inflight_liveness_reason="background_transcript_recent",
+        )
+        await wd._evaluate(snap, now)
+        # No recovery while the workflow is live...
+        assert recoveries == []
+        # ...and the stale clock was NOT reset — it ages behind the exemption.
+        assert wd._states[("a", "main")].last_progress_at == stale_at
+
+    @pytest.mark.asyncio
+    async def test_inflight_active_skips_warn(self, make_watchdog):
+        alerts = []
+
+        async def _alert(agent, msg):
+            alerts.append(msg)
+
+        wd = make_watchdog(alert_fn=_alert)
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            last_progress_turns=5,
+            last_progress_activity="Workflow",
+            last_progress_at=now - 700,  # past the 600s warn threshold
+        )
+        snap = _SessionSnapshot(
+            agent_name="a", label="main", connected=True,
+            turns=5, pending=3, current_activity="Workflow",
+            sample_time=now, inflight_active=True,
+        )
+        await wd._evaluate(snap, now)
+        assert alerts == []
+
+    @pytest.mark.asyncio
+    async def test_recovers_immediately_when_liveness_stops(self, make_watchdog):
+        recoveries = []
+
+        async def _recover(agent, label, reason):
+            recoveries.append((agent, label, reason))
+
+        wd = make_watchdog(recover_fn=_recover)
+        now = time.time()
+        wd._states[("a", "main")] = _AgentState(
+            last_progress_turns=5,
+            last_progress_activity="Workflow",
+            last_progress_at=now - 1000,
+            warned=True,
+        )
+        # Sweep 1: workflow live → skip recover, clock preserved.
+        snap_live = _SessionSnapshot(
+            agent_name="a", label="main", connected=True,
+            turns=5, pending=3, current_activity="Workflow",
+            sample_time=now, inflight_active=True,
+        )
+        await wd._evaluate(snap_live, now)
+        assert recoveries == []
+        # Sweep 2: liveness stopped, same already-stale clock → recover at once,
+        # NOT after a fresh 900s window.
+        snap_quiet = _SessionSnapshot(
+            agent_name="a", label="main", connected=True,
+            turns=5, pending=3, current_activity="Workflow",
+            sample_time=now, inflight_active=False,
+        )
+        await wd._evaluate(snap_quiet, now)
+        assert len(recoveries) == 1
+
+
 class TestStatus:
     def test_status_empty(self, make_watchdog):
         wd = make_watchdog()
