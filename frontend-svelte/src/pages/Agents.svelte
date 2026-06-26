@@ -55,6 +55,7 @@
     let detailMaxSessions = '--';
     let detailGroups = '--';
     let detailWorkingDir = '';
+    let detailHeartbeatInterval = 0;
     let detailSoul = '';
     let detailUsers = '';
     let detailBoundaries = '';
@@ -692,6 +693,7 @@
             detailMaxSessions = agent.max_sessions;
             detailGroups = agent.groups.length ? agent.groups.join(', ') : '--';
             detailWorkingDir = agent.working_dir;
+            detailHeartbeatInterval = agent.heartbeat_interval ?? 0;
             // Prefer CLAUDE.md on disk (agent may have edited it) over DB soul
             try {
                 const file = await api('GET', `/agents/${agent.name}/files/CLAUDE.md`);
@@ -828,6 +830,7 @@
         toast('Thinking effort saved — restart session to apply');
     }
     async function saveWorkingDir() { if (!detailWorkingDir) { toast('Enter a path', 'error'); return; } await api('PUT', `/agents/${currentAgent}`, { working_dir: detailWorkingDir }); toast('Working directory saved'); refreshAgents(); }
+    async function saveHeartbeat() { const hb = Math.max(0, Math.floor(Number(detailHeartbeatInterval) || 0)); await api('PUT', `/agents/${currentAgent}`, { heartbeat_interval: hb }); detailHeartbeatInterval = hb; toast('Heartbeat interval saved'); refreshAgents(); }
 
     async function loadDirectives() { const req = openDetailSeq; const data = await api('GET', `/agents/${currentAgent}/directives?active_only=false`); if (req !== openDetailSeq) return; directives = data.directives || []; }
     async function addDirective() { if (!newDirective.trim()) { toast('Enter a directive', 'error'); return; } await api('POST', `/agents/${currentAgent}/directives`, { directive: newDirective.trim(), priority: newDirectivePriority }); newDirective = ''; toast('Directive added'); loadDirectives(); }
@@ -1789,6 +1792,11 @@
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_max')}:</span> {detailMaxSessions}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_effort')}:</span> {thinkingEffort}</span>
                 <span><span style="color:var(--gray-mid)">{$_('agents.meta_groups')}:</span> {detailGroups}</span>
+                <span style="display:flex;gap:0.3rem;align-items:center">
+                    <span style="color:var(--gray-mid)">{$_('agents_extra.wiz_summary_heartbeat')}</span>
+                    <input type="number" min="0" step="1" class="form-input" bind:value={detailHeartbeatInterval} title="0 = demand-woken (no idle heartbeat); otherwise seconds between heartbeat wakes" style="font-size:0.8rem;width:4.5rem;padding:0.2rem 0.4rem">
+                    <button class="btn btn-sm" on:click={saveHeartbeat}>{$_('common.save')}</button>
+                </span>
                 <span style="display:flex;gap:0.3rem;align-items:center;flex:1;min-width:200px">
                     <span style="color:var(--gray-mid)">{$_('agents.meta_dir')}:</span>
                     <input type="text" class="form-input" bind:value={detailWorkingDir} style="font-size:0.8rem;flex:1;padding:0.2rem 0.4rem">
