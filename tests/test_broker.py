@@ -393,6 +393,54 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_route_agent_reply_counts_failed_delivery(self):
+        """If comms.send raises, the turn is still consumed (handled True, never
+        re-injected) and the failure is counted so dropped replies are visible."""
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            class _BoomComms:
+                def send(self, *a, **k):
+                    raise RuntimeError("inbox down")
+
+            tr = TurnResponse(
+                agent_name="murzik", platform="agent", chat_id="barsik", text="x"
+            )
+            before = broker._stats["routed_failed"]
+            handled = await broker.route_agent_reply(_BoomComms(), tr)
+            assert handled is True  # loop-safe: never falls through / re-injects
+            assert broker._stats["routed_failed"] == before + 1
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_real_comms_lands_in_inbox(self):
+        """End-to-end return leg against a real AgentComms: the reply appears in
+        the requester's inbox via get_inbox, tagged auto_routed."""
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="LGTM - ship it",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("barsik")
+            assert len(inbox) == 1
+            assert inbox[0].from_session == "murzik"
+            assert inbox[0].content == "LGTM - ship it"
+            assert inbox[0].metadata.get("auto_routed") is True
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_first_inbound_claims_primary_on_fresh_install(self, monkeypatch):
         """Fresh install: no primary user configured. The first person to
         message the bot should be claimed as primary/owner and auto-approved,

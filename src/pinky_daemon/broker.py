@@ -206,7 +206,14 @@ class MessageBroker:
         self._activity = activity_store
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
-        self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "deduped": 0}
+        self._stats = {
+            "routed": 0,
+            "routed_failed": 0,
+            "pending": 0,
+            "denied": 0,
+            "errors": 0,
+            "deduped": 0,
+        }
 
         # Auth-relay (#205): wire the tmux login-relay coordinator to this
         # broker's outbound sender + owner resolver. Harmless when the
@@ -1457,6 +1464,11 @@ class MessageBroker:
                 f"({len(text)} chars)"
             )
         except Exception as e:
+            # Delivery failed — count it so dropped replies are monitorable
+            # (the whole point of #279 is that agent replies don't vanish
+            # silently). Still return True: this WAS an agent-reply turn, so it
+            # must not fall through to route_response / get re-injected.
+            self._stats["routed_failed"] += 1
             _log(
                 f"broker: auto-route agent reply {responder} -> {requester} "
                 f"failed: {e}"
