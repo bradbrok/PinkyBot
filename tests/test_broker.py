@@ -245,9 +245,9 @@ class TestMessageBrokerRouting:
 
             class _FakeStreaming:
                 state = SessionState.CONNECTED
-                sent: list[str] = []
+                sent: list = []
 
-                async def send(self, prompt: str) -> None:
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     _FakeStreaming.sent.append(prompt)
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
@@ -268,6 +268,175 @@ class TestMessageBrokerRouting:
             ok = await broker.inject_agent_message("pushok", "barsik", "hi")
             assert ok is False
             assert registry.get("barsik").last_seen_at == 0.0
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_agent_message_stamps_reply_routing_metadata(self):
+        """#279: an injected agent message carries platform='agent' + chat_id=
+        the requester, so the recipient's completed turn can route back."""
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            recorded: list[tuple[str, str]] = []
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    recorded.append((platform, chat_id))
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            ok = await broker.inject_agent_message("pushok", "barsik", "review please")
+            assert ok is True
+            assert recorded == [("agent", "pushok")]
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_agent_message_respects_routing_killswitch(self, monkeypatch):
+        """With PINKY_AGENT_REPLY_ROUTING off, no route-back metadata is stamped —
+        reverts to the legacy (drop-on-empty-chat_id) behavior."""
+        import pinky_daemon.broker as broker_mod
+
+        monkeypatch.setattr(broker_mod, "_AGENT_REPLY_ROUTING_ENABLED", False)
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            recorded: list[tuple[str, str]] = []
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    recorded.append((platform, chat_id))
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert ok is True
+            assert recorded == [("", "")]
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_delivers_to_requester_inbox(self):
+        """#279: a completed agent-reply turn is delivered to the requester's
+        inbox via comms.send — and ONLY that (loop-safe: no live inject)."""
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            sent: list = []
+
+            class _FakeComms:
+                def send(self, frm, to, content, **kw):
+                    sent.append((frm, to, content, kw.get("metadata")))
+
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="LGTM - ship it",
+            )
+            handled = await broker.route_agent_reply(_FakeComms(), tr)
+            assert handled is True
+            assert sent == [("murzik", "barsik", "LGTM - ship it", {"auto_routed": True})]
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_ignores_normal_platform_turns(self):
+        """A telegram turn is not an agent reply: returns False (caller falls
+        through to normal routing) and nothing is delivered to an inbox."""
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            sent: list = []
+
+            class _FakeComms:
+                def send(self, *a, **k):
+                    sent.append((a, k))
+
+            tr = TurnResponse(
+                agent_name="barsik", platform="telegram", chat_id="123", text="hi"
+            )
+            handled = await broker.route_agent_reply(_FakeComms(), tr)
+            assert handled is False
+            assert sent == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_skips_empty_text(self):
+        """A pure tool-call agent turn (no final text) is consumed but nothing is
+        delivered — no empty inbox entries."""
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            sent: list = []
+
+            class _FakeComms:
+                def send(self, *a, **k):
+                    sent.append((a, k))
+
+            tr = TurnResponse(
+                agent_name="murzik", platform="agent", chat_id="barsik", text="   "
+            )
+            handled = await broker.route_agent_reply(_FakeComms(), tr)
+            assert handled is True
+            assert sent == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_counts_failed_delivery(self):
+        """If comms.send raises, the turn is still consumed (handled True, never
+        re-injected) and the failure is counted so dropped replies are visible."""
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            class _BoomComms:
+                def send(self, *a, **k):
+                    raise RuntimeError("inbox down")
+
+            tr = TurnResponse(
+                agent_name="murzik", platform="agent", chat_id="barsik", text="x"
+            )
+            before = broker._stats["routed_failed"]
+            handled = await broker.route_agent_reply(_BoomComms(), tr)
+            assert handled is True  # loop-safe: never falls through / re-injects
+            assert broker._stats["routed_failed"] == before + 1
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_real_comms_lands_in_inbox(self):
+        """End-to-end return leg against a real AgentComms: the reply appears in
+        the requester's inbox via get_inbox, tagged auto_routed."""
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="LGTM - ship it",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("barsik")
+            assert len(inbox) == 1
+            assert inbox[0].from_session == "murzik"
+            assert inbox[0].content == "LGTM - ship it"
+            assert inbox[0].metadata.get("auto_routed") is True
         finally:
             tmpdir.cleanup()
 

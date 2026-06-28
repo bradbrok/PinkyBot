@@ -34,6 +34,18 @@ from pinky_daemon.transport_state import SessionState
 _INBOUND_RECONNECT_WAIT_SEC = 20.0
 _INBOUND_RECONNECT_POLL_SEC = 0.25
 
+# #279: agent-to-agent reply auto-routing. ``inject_agent_message`` stamps an
+# injected turn with ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the
+# requester agent name; when that turn completes, ``route_agent_reply`` delivers
+# the recipient's turn text to the requester's INBOX (loop-safe — an inbox write
+# never spawns a live turn, so the exchange can't ping-pong). Kill-switch
+# defaults ON; set ``PINKY_AGENT_REPLY_ROUTING=0`` to revert to the old
+# drop-on-empty-chat_id behavior without a code change.
+AGENT_REPLY_PLATFORM = "agent"
+_AGENT_REPLY_ROUTING_ENABLED = os.environ.get(
+    "PINKY_AGENT_REPLY_ROUTING", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -194,7 +206,14 @@ class MessageBroker:
         self._activity = activity_store
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
-        self._stats = {"routed": 0, "pending": 0, "denied": 0, "errors": 0, "deduped": 0}
+        self._stats = {
+            "routed": 0,
+            "routed_failed": 0,
+            "pending": 0,
+            "denied": 0,
+            "errors": 0,
+            "deduped": 0,
+        }
 
         # Auth-relay (#205): wire the tmux login-relay coordinator to this
         # broker's outbound sender + owner resolver. Harmless when the
@@ -1323,7 +1342,17 @@ class MessageBroker:
         from datetime import timezone as tz
         ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
-        await streaming.send(prompt)
+        if _AGENT_REPLY_ROUTING_ENABLED:
+            # #279: encode the requester as the route-back target so the
+            # recipient's completed turn auto-delivers to the requester's inbox
+            # (see ``route_agent_reply``). The ``platform="agent"`` sentinel is
+            # intercepted in the response callback before normal platform
+            # routing; ``chat_id`` carries the requester agent name.
+            await streaming.send(
+                prompt, platform=AGENT_REPLY_PLATFORM, chat_id=from_agent
+            )
+        else:
+            await streaming.send(prompt)
         # Server-side presence: successful delivery = agent is reachable
         try:
             self._registry.stamp_last_seen(to_agent)
@@ -1393,6 +1422,58 @@ class MessageBroker:
                 await self._send_message(agent_name, platform, chat_id, stripped)
         else:
             await self._send_message(agent_name, platform, chat_id, stripped)
+
+    async def route_agent_reply(self, comms, turn_result) -> bool:
+        """Auto-deliver a completed agent-to-agent turn to the requester's inbox.
+
+        #279: ``inject_agent_message`` stamps injected turns with
+        ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the requester
+        agent name. When such a turn finishes, the recipient's turn text is
+        delivered to the requester's inbox via ``comms.send`` — the missing
+        return leg that left review verdicts (and every other agent reply)
+        stranded in the recipient's transcript with nowhere to go.
+
+        Loop-safe by construction: this writes to the inbox only and never
+        injects a live turn, so an auto-routed reply cannot itself trigger
+        another routed turn — the exchange terminates.
+
+        Returns True when the turn was an agent reply (handled here, caller
+        should stop); False for normal platform turns so the caller falls
+        through to ``route_response``.
+        """
+        if not turn_result or turn_result.platform != AGENT_REPLY_PLATFORM:
+            return False
+        requester = (turn_result.chat_id or "").strip()
+        responder = (turn_result.agent_name or "").strip()
+        text = (turn_result.response_text or "").strip()
+        if not requester or not responder:
+            _log(
+                "broker: agent reply missing requester/responder "
+                f"(requester={requester!r} responder={responder!r}); dropping"
+            )
+            return True
+        if not text:
+            # A pure tool-call turn with no final text — nothing to relay.
+            _log(f"broker: agent reply {responder} -> {requester} had no text")
+            return True
+        try:
+            comms.send(responder, requester, text, metadata={"auto_routed": True})
+            self._stats["routed"] += 1
+            _log(
+                f"broker: auto-routed agent reply {responder} -> {requester} "
+                f"({len(text)} chars)"
+            )
+        except Exception as e:
+            # Delivery failed — count it so dropped replies are monitorable
+            # (the whole point of #279 is that agent replies don't vanish
+            # silently). Still return True: this WAS an agent-reply turn, so it
+            # must not fall through to route_response / get re-injected.
+            self._stats["routed_failed"] += 1
+            _log(
+                f"broker: auto-route agent reply {responder} -> {requester} "
+                f"failed: {e}"
+            )
+        return True
 
     # "file" is what Slack and Discord tag every inbound attachment as; the
     # rest are Telegram's media kinds. (Voice is handled separately.)

@@ -2577,6 +2577,13 @@ def create_api(
     async def _make_streaming_response_callback():
         """Create a response callback that routes through the broker."""
         async def _on_response(turn_result):
+            # #279: agent-to-agent reply auto-routing. If this completed turn was
+            # an injected agent message (platform == "agent"), deliver its text to
+            # the requesting agent's inbox and stop — loop-safe (inbox write, no
+            # live inject). Must run BEFORE the empty-chat_id early-return, which
+            # is what used to silently drop these turns.
+            if await broker.route_agent_reply(comms, turn_result):
+                return
             if not turn_result.chat_id:
                 return
             agent = agents.get(turn_result.agent_name)
