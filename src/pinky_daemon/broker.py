@@ -69,6 +69,28 @@ try:
 except (TypeError, ValueError):
     _AGENT_MSG_NUDGE_BACKOFF_SEC = 15.0
 
+# #280: auto-route is a FALLBACK, not a second delivery path. When the
+# recipient already replied explicitly via ``send_to_agent`` (which writes
+# straight to the requester's inbox through ``comms.send``), auto-routing the
+# same turn's final text would land the reply TWICE. ``route_agent_reply``
+# therefore suppresses the auto-route when an explicit (non-``auto_routed``)
+# message from the responder to the requester was recorded since the turn
+# began — the turn boundary captured at ``inject_agent_message`` time. This is
+# backend-agnostic (no reliance on ``tool_uses``, which codex turns omit) and
+# never content-matches, so it can't drop a genuinely new reply. If the turn
+# boundary is unknown (e.g. the marker was lost across a restart), it falls
+# back to delivering — a stray dup is acceptable; a dropped review verdict is
+# not. Kill-switch defaults ON; set ``PINKY_AGENT_REPLY_DEDUP=0`` to restore
+# the unconditional #279 delivery.
+_AGENT_REPLY_DEDUP_ENABLED = os.environ.get(
+    "PINKY_AGENT_REPLY_DEDUP", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+# How long an unconsumed turn-start marker lives before it's swept as an
+# orphan. Generous — an agent-reply turn (e.g. a code review) can run for
+# minutes — but bounded so a turn that dies before its callback can't leak a
+# marker forever. Only affects the dedup window, never delivery correctness.
+_AGENT_REPLY_MARKER_TTL = 3600.0
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -308,6 +330,14 @@ class MessageBroker:
         # Streaming sessions — persistent ClaudeSDKClient connections per agent
         # agent_name -> {label -> StreamingSession}
         self._streaming: dict[str, dict[str, object]] = {}
+
+        # #280: agent-reply turn boundaries — (responder, requester) -> start ts.
+        # Stamped when ``inject_agent_message`` delivers a route-back turn;
+        # consumed (popped) by ``route_agent_reply`` to bound the "did the
+        # responder already send an explicit reply this turn?" dedup window.
+        # Bounded by consume-on-use plus a TTL sweep on insert so orphaned
+        # markers (turns that error before the callback) can't accumulate.
+        self._agent_reply_turn_start: dict[tuple[str, str], float] = {}
 
         # Track voice-pending chats: (agent_name, chat_id) -> True when last inbound was voice
         self._voice_pending: dict[tuple[str, str], bool] = {}
@@ -1434,6 +1464,11 @@ class MessageBroker:
             # (see ``route_agent_reply``). The ``platform="agent"`` sentinel is
             # intercepted in the response callback before normal platform
             # routing; ``chat_id`` carries the requester agent name.
+            # #280: stamp the turn's start so route_agent_reply can tell whether
+            # the responder ALSO sent an explicit reply during this turn (→ a
+            # dup to suppress). Key is (responder, requester) = (to_agent,
+            # from_agent), matching how route_agent_reply reads it back.
+            self._mark_agent_reply_turn_start(to_agent, from_agent)
             handoff = await streaming.send(
                 prompt, platform=AGENT_REPLY_PLATFORM, chat_id=from_agent
             )
@@ -1575,6 +1610,24 @@ class MessageBroker:
         else:
             await self._send_message(agent_name, platform, chat_id, stripped)
 
+    def _mark_agent_reply_turn_start(self, responder: str, requester: str) -> None:
+        """#280: record when an agent-reply turn began, so ``route_agent_reply``
+        can scope its dup check to "did the responder send an explicit reply to
+        the requester *during this turn*?". Sweeps orphaned markers (turns that
+        died before their response callback) older than the TTL on each insert
+        so the dict can't grow unbounded. Only affects the dedup window — never
+        delivery correctness (a lost marker just means we deliver)."""
+        now = time.time()
+        if self._agent_reply_turn_start:
+            cutoff = now - _AGENT_REPLY_MARKER_TTL
+            stale = [
+                k for k, started in self._agent_reply_turn_start.items()
+                if started < cutoff
+            ]
+            for k in stale:
+                self._agent_reply_turn_start.pop(k, None)
+        self._agent_reply_turn_start[(responder, requester)] = now
+
     async def route_agent_reply(self, comms, turn_result) -> bool:
         """Auto-deliver a completed agent-to-agent turn to the requester's inbox.
 
@@ -1584,6 +1637,12 @@ class MessageBroker:
         delivered to the requester's inbox via ``comms.send`` — the missing
         return leg that left review verdicts (and every other agent reply)
         stranded in the recipient's transcript with nowhere to go.
+
+        #280: this is a FALLBACK for replies the responder produced but did not
+        send explicitly (e.g. an interrupted turn). When the responder already
+        called ``send_to_agent`` to the requester this turn, that message is in
+        the inbox; the auto-route is suppressed so the reply isn't duplicated
+        (see the dedup block + ``_mark_agent_reply_turn_start``).
 
         Loop-safe by construction: this writes to the inbox only and never
         injects a live turn, so an auto-routed reply cannot itself trigger
@@ -1608,6 +1667,36 @@ class MessageBroker:
             # A pure tool-call turn with no final text — nothing to relay.
             _log(f"broker: agent reply {responder} -> {requester} had no text")
             return True
+        # #280: auto-route is a FALLBACK, not a second delivery path. If the
+        # responder already replied to the requester explicitly this turn
+        # (send_to_agent -> comms.send, which lands straight in the inbox),
+        # auto-routing the same turn's final text would deliver it twice.
+        # Suppress when an explicit (non-auto_routed) responder->requester
+        # message exists since this turn began. Backend-agnostic (no reliance on
+        # tool_uses, which codex turns omit) and never content-matches, so a
+        # genuinely new reply can't be dropped. A missing marker (e.g. lost
+        # across a restart) falls through to delivery — a stray dup is
+        # acceptable, a dropped verdict is not.
+        since = self._agent_reply_turn_start.pop((responder, requester), None)
+        if _AGENT_REPLY_DEDUP_ENABLED and since is not None:
+            try:
+                already_sent = comms.has_message_since(
+                    responder, requester, since, exclude_auto_routed=True
+                )
+            except Exception as e:
+                # A dedup-probe failure must never drop a reply — deliver.
+                already_sent = False
+                _log(
+                    f"broker: agent-reply dedup probe failed "
+                    f"({responder} -> {requester}): {e}; delivering"
+                )
+            if already_sent:
+                self._stats["deduped"] += 1
+                _log(
+                    f"broker: suppressed dup auto-route {responder} -> "
+                    f"{requester} (explicit reply already sent this turn)"
+                )
+                return True
         try:
             comms.send(responder, requester, text, metadata={"auto_routed": True})
             self._stats["routed"] += 1

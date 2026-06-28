@@ -653,6 +653,151 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_route_agent_reply_suppresses_dup_when_explicit_send_this_turn(self):
+        """#280: if the responder already replied explicitly (send_to_agent ->
+        comms.send) during the turn, the auto-route is suppressed — the inbox
+        keeps the single explicit copy, not a duplicate."""
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            # Turn begins (inject_agent_message would stamp this marker).
+            broker._mark_agent_reply_turn_start("murzik", "barsik")
+            # Responder sends the verdict explicitly mid-turn.
+            comms.send("murzik", "barsik", "PR #277 LGTM")
+            before = broker._stats["deduped"]
+
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="PR #277 LGTM",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("barsik")
+            # Only the explicit send is present — no auto_routed duplicate.
+            assert len(inbox) == 1
+            assert inbox[0].metadata.get("auto_routed") is None
+            assert broker._stats["deduped"] == before + 1
+            # Marker is consumed.
+            assert ("murzik", "barsik") not in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_delivers_when_marker_but_no_explicit_send(self):
+        """#280: turn produced text but never sent it explicitly (e.g. an
+        interrupted reply) — the auto-route fallback still delivers."""
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            broker._mark_agent_reply_turn_start("murzik", "barsik")
+
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="LGTM but I never called send_to_agent",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("barsik")
+            assert len(inbox) == 1
+            assert inbox[0].metadata.get("auto_routed") is True
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_delivers_when_marker_missing(self):
+        """#280 safety: with no turn marker (e.g. lost across a restart) the
+        reply is DELIVERED even if an explicit send happens to exist — a stray
+        dup is acceptable, dropping a real reply is not."""
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            comms.send("murzik", "barsik", "explicit reply")
+            # No _mark_agent_reply_turn_start — marker is absent.
+            before = broker._stats["deduped"]
+
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="explicit reply",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("barsik")
+            # Both the explicit send and the (safe) auto-route are present.
+            assert len(inbox) == 2
+            assert broker._stats["deduped"] == before
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_route_agent_reply_dedup_killswitch_off_always_delivers(
+        self, monkeypatch
+    ):
+        """With PINKY_AGENT_REPLY_DEDUP off, the #279 unconditional delivery is
+        restored: even a marker + explicit send doesn't suppress the auto-route."""
+        import pinky_daemon.broker as broker_mod
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        monkeypatch.setattr(broker_mod, "_AGENT_REPLY_DEDUP_ENABLED", False)
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            broker._mark_agent_reply_turn_start("murzik", "barsik")
+            comms.send("murzik", "barsik", "verdict")
+
+            tr = TurnResponse(
+                agent_name="murzik",
+                platform="agent",
+                chat_id="barsik",
+                text="verdict",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("barsik")
+            assert len(inbox) == 2  # explicit + auto-route (no dedup)
+            # Marker is still consumed even with dedup disabled (no leak).
+            assert ("murzik", "barsik") not in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_agent_message_marks_turn_start(self):
+        """#280: a routed inject stamps the (responder, requester) turn-start
+        marker that route_agent_reply later consumes for dedup."""
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    pass
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            delivered, _ = await broker.inject_agent_message("pushok", "barsik", "review please")
+            assert delivered is True
+            # Key is (responder, requester) = (to_agent, from_agent).
+            assert ("barsik", "pushok") in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_first_inbound_claims_primary_on_fresh_install(self, monkeypatch):
         """Fresh install: no primary user configured. The first person to
         message the bot should be claimed as primary/owner and auto-approved,

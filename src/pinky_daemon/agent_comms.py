@@ -456,6 +456,38 @@ class AgentComms:
         ).fetchone()
         return row[0]
 
+    def has_message_since(
+        self,
+        from_session: str,
+        to_session: str,
+        since_ts: float,
+        *,
+        exclude_auto_routed: bool = True,
+    ) -> bool:
+        """Whether a direct message from ``from_session`` to ``to_session`` was
+        stored at or after ``since_ts``.
+
+        Backs the #280 agent-reply dedup: the broker asks "did the responder
+        already send the requester an explicit reply during this turn?" before
+        auto-routing the same turn's text. ``exclude_auto_routed`` skips the
+        broker's own auto-routed copies (metadata ``{"auto_routed": true}``) so
+        only deliberate ``send_to_agent`` sends count. Existence probe — returns
+        as soon as one match is found.
+        """
+        query = (
+            "SELECT 1 FROM messages "
+            "WHERE from_session = ? AND to_session = ? AND timestamp >= ?"
+        )
+        if exclude_auto_routed:
+            # COALESCE so rows with empty/legacy metadata (NULL json_extract)
+            # are treated as explicit (not auto-routed) and DO count.
+            query += " AND COALESCE(json_extract(metadata, '$.auto_routed'), 0) = 0"
+        query += " LIMIT 1"
+        row = self._conn.execute(
+            query, (from_session, to_session, since_ts)
+        ).fetchone()
+        return row is not None
+
     # ── Groups ───────────────────────────────────────────────
 
     def create_group(self, name: str, session_ids: list[str]) -> dict:
