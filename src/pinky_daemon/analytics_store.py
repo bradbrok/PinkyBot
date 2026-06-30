@@ -258,6 +258,12 @@ class AnalyticsStore:
     _LATEST_PRICING_ADDITIONS = [
         ("openai", "gpt-5.5", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
         ("openai", "gpt-5.3-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
+        # Sonnet 5 (2026-06): the current Sonnet tier. Standard $3/$15 (cached
+        # $0.30) — mirrors pinky_daemon.pricing.RATE_TABLE (_SONNET), pinned by
+        # test_seed_pricing_matches_rate_table. Introductory $2/$10 runs through
+        # 2026-08-31, then reverts; we seed the durable standard rate (see the
+        # RATE_TABLE comment for the rationale).
+        ("anthropic", "claude-sonnet-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
     ]
 
     def _seed_default_pricing(self, conn) -> None:
