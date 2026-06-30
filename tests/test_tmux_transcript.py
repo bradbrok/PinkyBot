@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import time
 from pathlib import Path
 
 import pytest
@@ -1115,3 +1117,97 @@ class TestSelfHealDiscovery:
             assert tailer.transcript_path == real_path
         finally:
             await tailer.stop()
+
+    # ── #291: self-heal mtime-floor (stale-clobber guard) ────────────────
+
+    @pytest.mark.asyncio
+    async def test_self_heal_skips_discovery_older_than_bind(self, tmp_path):
+        """#291: once a real path is bound (SessionStart hook), the self-heal
+        must NEVER repoint to a transcript whose mtime predates that bind — the
+        stale-previous-session clobber that wedged the tailer on a frozen file
+        (frozen ``transcript_mtime`` → watchdog false-wedge → force_restart)."""
+        cb = _Captor()
+        old = tmp_path / "old-session.jsonl"
+        _write_jsonl(old, [_assistant(text="prev session"), _stop_hook_summary()])
+        os.utime(old, (time.time() - 3600, time.time() - 3600))  # clearly stale
+        fresh = tmp_path / "fresh-session.jsonl"  # hook announced it; not on disk yet
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: old,
+        )
+        # SessionStart hook binds the fresh (not-yet-written) path → arms the floor.
+        tailer.set_transcript_path(fresh, seek_to_start=True)
+        assert tailer.transcript_path == fresh
+
+        # Next poll: fresh is missing → self-heal → discovery returns the OLD file.
+        tailer._try_self_heal_repoint()
+
+        assert tailer.transcript_path == fresh, "must not clobber to the stale file"
+        assert tailer.stats["self_heal_repoints"] == 0
+        assert tailer.stats["self_heal_stale_skips"] == 1
+
+    @pytest.mark.asyncio
+    async def test_self_heal_strict_floor_blocks_recent_previous_session(self, tmp_path):
+        """#291: the floor is STRICT (no slack). The clobber target is often the
+        *immediately* preceding session, whose last write can be only seconds
+        before the new bind — a positive slack window would re-admit it and the
+        fix would silently regress. A file only 5s older than the bind must
+        still be refused. (This test fails under a 60s slack and passes under a
+        strict ``<`` comparison.)"""
+        cb = _Captor()
+        recent = tmp_path / "recent-prev.jsonl"
+        _write_jsonl(recent, [_assistant(text="x"), _stop_hook_summary()])
+        os.utime(recent, (time.time() - 5, time.time() - 5))  # only 5s stale
+        fresh = tmp_path / "fresh.jsonl"
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: recent,
+        )
+        tailer.set_transcript_path(fresh)  # arms the floor at ~now
+        tailer._try_self_heal_repoint()
+
+        assert tailer.transcript_path == fresh
+        assert tailer.stats["self_heal_stale_skips"] == 1
+
+    @pytest.mark.asyncio
+    async def test_self_heal_unrestricted_before_first_real_bind(self, tmp_path):
+        """#291: the floor must NOT block cold-start (#515) discovery. Before any
+        explicit ``set_transcript_path``, ``_path_bound_at`` is the 0.0 sentinel,
+        so even a discovery whose mtime predates tailer construction heals — at
+        genuine cold start there is no live session to clobber to."""
+        cb = _Captor()
+        real = tmp_path / "real.jsonl"
+        _write_jsonl(real, [_assistant(text="cold-start"), _stop_hook_summary()])
+        os.utime(real, (time.time() - 3600, time.time() - 3600))  # old, yet valid here
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: real,
+        )
+        assert tailer._path_bound_at == 0.0
+        tailer._try_self_heal_repoint()
+
+        assert tailer.transcript_path == real, "#515 cold-start heal must still fire"
+        assert tailer.stats["self_heal_repoints"] == 1
+        assert tailer.stats["self_heal_stale_skips"] == 0
+
+    @pytest.mark.asyncio
+    async def test_self_heal_failsafe_on_unstattable_discovery(self, tmp_path):
+        """#291: if the discovered candidate can't be stat()'d (vanished between
+        glob and stat), fail SAFE — skip the repoint, never risk the clobber,
+        never raise."""
+        cb = _Captor()
+        ghost = tmp_path / "ghost.jsonl"  # never created
+        fresh = tmp_path / "fresh.jsonl"
+
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: ghost,
+        )
+        tailer.set_transcript_path(fresh)  # arms the floor
+        tailer._try_self_heal_repoint()  # ghost.stat() → OSError → skip, no crash
+
+        assert tailer.transcript_path == fresh
+        assert tailer.stats["self_heal_repoints"] == 0
