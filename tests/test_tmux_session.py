@@ -4124,6 +4124,193 @@ async def test_inflight_watchdog_restarts_over_ceiling_even_if_animating(monkeyp
             await task
         except asyncio.CancelledError:
             pass
+    # Over the ceiling, the rescue must short-circuit BEFORE sampling the pane —
+    # no point paying two capture-pane calls + a sample gap on a head we are about
+    # to tear down regardless.
+    assert tmux.capture_pane.await_count == 0, (
+        "over-ceiling head must not sample the pane (ceiling short-circuits first)"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_no_restart_when_head_completes_during_sampling(
+    monkeypatch,
+) -> None:
+    """#832 race guard: a stop hook can pop the head DURING the pane-liveness
+    sampling await (capture-pane twice + sample gap). The now-stale "wedged"
+    verdict must NOT force_restart, and must NOT ``popleft`` an emptied deque
+    (an IndexError there is swallowed by the watchdog's ``except`` and returns,
+    silently killing recovery for the session). Simulate the concurrent
+    completion by emptying the deque from inside the awaited capture_pane."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+
+    ss, tmux = _wedged_session()
+
+    calls = {"n": 0}
+
+    def _cap(**kw):
+        calls["n"] += 1
+        if calls["n"] == 1:
+            # Mimic ``_handle_turn_complete`` firing mid-sample: head completed,
+            # deque emptied out from under the watchdog.
+            ss._inflight_metas.clear()
+            ss._head_started_at = None
+        return _pane("> idle")  # frozen → _pane_is_animating False → fall through
+
+    tmux.capture_pane = AsyncMock(side_effect=_cap)
+
+    restarted = {"v": False}
+
+    async def _no_restart(*, bypass_guard: bool = False):
+        restarted["v"] = True
+        return True
+
+    ss.force_restart = _no_restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    await asyncio.sleep(0.2)  # let several ticks run
+    crashed = task.done()
+    crash_exc = task.exception() if crashed else None
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert restarted["v"] is False, (
+        "must not force_restart a head that completed during pane sampling"
+    )
+    assert not crashed, (
+        "watchdog must survive a head emptied mid-sample (no IndexError on an "
+        f"empty-deque popleft) — task exited early: {crash_exc!r}"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_ceiling_accumulates_across_animating_samples(
+    monkeypatch,
+) -> None:
+    """Regression for the #832 ceiling bug: a head that starts BELOW the ceiling
+    and animates continuously must STILL force_restart once cumulative wall-time
+    crosses the ceiling. The extend branch resets ``_head_started_at`` on every
+    sample, so the ceiling must be anchored to a clock that does NOT reset — else
+    ``age`` would reset each cycle and the bound is unreachable (a stuck-but-
+    animating REPL pinned alive forever). This fails on the pre-fix code (no
+    restart, anchor-less ``age < ceiling`` always true) and passes once the
+    ceiling is anchored to the head's first pane-liveness credit."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+    # Ceiling spans several timeout cycles, so the rescue extends the head
+    # multiple times BEFORE the absolute bound forces recovery — exactly the
+    # accumulation the buggy code never reached.
+    monkeypatch.setenv("PINKY_INFLIGHT_HARD_CEILING_SEC", "0.3")
+
+    ss, tmux = _wedged_session()
+    # Start the head FRESH (age ~0, well under the 0.3s ceiling) so the only way
+    # to reach the ceiling is genuine accumulation across animating samples.
+    ss._head_started_at = _time.time()
+
+    flip = {"n": 0}
+
+    def _alt(**kw):
+        flip["n"] += 1
+        return _pane("a" if flip["n"] % 2 else "b")  # always changing → animating
+
+    tmux.capture_pane = AsyncMock(side_effect=_alt)
+
+    fired = asyncio.Event()
+
+    async def _restart(*, bypass_guard: bool = False):
+        fired.set()
+        return True
+
+    ss.force_restart = _restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        # Must fire well after one timeout cycle (0.05s) — proving the head was
+        # extended repeatedly — but bounded by the 0.3s ceiling. 2s gives slack.
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail(
+            "continuously-animating head must STILL force_restart once cumulative "
+            "age crosses the ceiling (ceiling must not reset with _head_started_at)"
+        )
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    # The pane was sampled many times → the head was genuinely extended across
+    # multiple cycles before the ceiling won (not a tick-1 over-ceiling restart).
+    assert tmux.capture_pane.await_count >= 2, (
+        "head should have been extended (pane sampled) before the ceiling fired"
+    )
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_ceiling_anchor_keyed_to_head_identity(
+    monkeypatch,
+) -> None:
+    """The #832 ceiling anchor is keyed to the head meta's identity. When the
+    deque advances to a genuinely new head while a STALE anchor (from the prior
+    head) is still set, the rescue must re-anchor to the new head's own start —
+    NOT judge the fresh head against the previous head's already-elapsed clock
+    (which would force_restart a brand-new healthy turn almost immediately)."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+    monkeypatch.setenv("PINKY_INFLIGHT_HARD_CEILING_SEC", "0.3")
+
+    ss, tmux = _wedged_session()
+    head_b = ss._inflight_metas[0]
+    # A stale anchor from a PRIOR head (some other meta) that already burned far
+    # more than the ceiling. If the rescue keyed off this instead of head_b's
+    # identity, head_b would be judged over-ceiling on tick 1 and torn down.
+    ss._inflight_pane_ext_anchor = (object(), _time.time() - 999.0)
+    ss._head_started_at = _time.time()  # head_b just started
+
+    flip = {"n": 0}
+
+    def _alt(**kw):
+        flip["n"] += 1
+        return _pane("a" if flip["n"] % 2 else "b")  # animating
+
+    tmux.capture_pane = AsyncMock(side_effect=_alt)
+
+    restarted = {"v": False}
+
+    async def _no_restart(*, bypass_guard: bool = False):
+        restarted["v"] = True
+        return True
+
+    ss.force_restart = _no_restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    await asyncio.sleep(0.15)  # > timeout, < the 0.3s fresh ceiling
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+
+    assert restarted["v"] is False, (
+        "fresh head must get its OWN ceiling budget, not inherit a stale anchor"
+    )
+    anchor = ss._inflight_pane_ext_anchor
+    assert anchor is not None and anchor[0] is head_b, (
+        "anchor must be re-keyed to the current head's identity"
+    )
 
 
 @pytest.mark.asyncio

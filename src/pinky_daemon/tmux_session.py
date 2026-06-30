@@ -1177,6 +1177,16 @@ class TmuxSession:
         # gets its own ``_TURN_DONE_TIMEOUT_SEC`` window once it becomes
         # the head (Murzik review on PR for #560).
         self._head_started_at: float | None = None
+        # (#832) Absolute-ceiling anchor for the inflight pane-liveness rescue.
+        # The pane-animating branch resets ``_head_started_at`` on EVERY sample,
+        # so the ceiling can't be measured against it (age would reset each cycle
+        # and never reach the bound). Instead anchor to ``(head_meta, t0)``: ``t0``
+        # is when the CURRENT head first got pane-liveness credit, and it is NOT
+        # reset by subsequent samples — so ``now - t0`` truly accumulates toward
+        # ``_inflight_hard_ceiling_sec()``. Keyed by the head meta's identity so a
+        # genuinely new head (deque advanced) auto-starts a fresh ceiling budget
+        # without having to touch the out-of-loop head-start sites.
+        self._inflight_pane_ext_anchor: tuple[object, float] | None = None
         # Back-compat advisory signal. Pre-#560 this was the worker's
         # per-iteration gate (the bottleneck that broke steering).
         # Post-#560 the worker no longer awaits it between dispatches;
@@ -5291,11 +5301,23 @@ class TmuxSession:
                     continue
                 age = now - (self._head_started_at or now)
                 depth = len(self._inflight_metas)
+                # The head meta being judged this tick. ``verdict != "ok"``
+                # guarantees a non-empty deque (computed synchronously just above,
+                # no intervening await), so index 0 is safe here. Captured ONCE so
+                # the #832 pane-liveness anchor and the post-await staleness guard
+                # both key off the SAME identity — the pane-liveness rescue awaits
+                # (capture-pane + sample gap), during which a stop hook can pop or
+                # advance the head out from under us.
+                head_meta = self._inflight_metas[0]
                 if verdict == "growing":
                     # #118: head aged out BUT the transcript is still being
                     # written — a long/streaming turn, NOT a wedge. Extend
                     # the window instead of tearing the session down.
                     self._head_started_at = now
+                    # Real transcript/background progress → refresh the #832
+                    # pane-liveness ceiling budget (a later quiet-but-animating
+                    # stretch on this same head earns a fresh full ceiling).
+                    self._inflight_pane_ext_anchor = None
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
                         f"but transcript or background task still active — not "
@@ -5319,6 +5341,7 @@ class TmuxSession:
                     drained = list(self._inflight_metas)
                     self._inflight_metas.clear()
                     self._head_started_at = None
+                    self._inflight_pane_ext_anchor = None
                     for m in drained:
                         ev = m.completion_event
                         if ev is not None and not ev.is_set():
@@ -5344,22 +5367,55 @@ class TmuxSession:
                 # like the "growing" branch. Bounded by an absolute ceiling so an
                 # animating-but-genuinely-stuck REPL is still recovered, and
                 # flag-gated (PINKY_WATCHDOG_PANE_LIVENESS=0) for a kill switch.
-                if (
-                    _pane_liveness_enabled()
-                    and age < _inflight_hard_ceiling_sec()
-                    and await self._pane_is_animating()
-                ):
-                    self._head_started_at = now
+                if _pane_liveness_enabled():
+                    # Anchor the absolute ceiling to when THIS head FIRST reached
+                    # the pane-liveness rescue, NOT to ``_head_started_at`` — the
+                    # extend branch below resets ``_head_started_at = now`` on every
+                    # animating sample, so ``age`` measured against it would reset
+                    # each cycle and the ceiling could NEVER be reached (a genuinely
+                    # stuck-but-animating REPL would be pinned alive forever). The
+                    # anchor's ``t0`` is set once per head and is NOT reset by
+                    # samples, so ``now - t0`` truly accumulates. Keyed by the head
+                    # meta's identity so a real new head (deque advanced) restarts
+                    # the budget automatically — no need to touch head-start sites.
+                    anchor = self._inflight_pane_ext_anchor
+                    if anchor is None or anchor[0] is not head_meta:
+                        anchor = (head_meta, self._head_started_at or now)
+                        self._inflight_pane_ext_anchor = anchor
+                    ceiling = _inflight_hard_ceiling_sec()
+                    if (now - anchor[1]) < ceiling and await self._pane_is_animating():
+                        self._head_started_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                            f"but the pane is still animating (REPL generating) — "
+                            f"not wedged, extending window (#832; deque depth="
+                            f"{depth}, ceiling {now - anchor[1]:.1f}/{ceiling:.0f}s)"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="skip", reason="pane_active",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=True,
+                        )
+                        continue
+                # (#832 follow-up) The pane-liveness rescue above awaited
+                # (capture-pane twice + a sample gap). A turn-complete (stop hook)
+                # can land during that window and pop or advance the head via
+                # ``_handle_turn_complete``, leaving the deque empty or fronted by
+                # a DIFFERENT, healthy turn. Either way the "wedged" verdict is now
+                # stale: the force_restart below would ``popleft`` an empty deque
+                # (IndexError → the watchdog task dies for this session, silently
+                # dropping recovery) or tear down an innocent fresh head. Bail if
+                # the head we judged is no longer at the front. (Mirrors the guard
+                # ``_handle_turn_complete`` itself uses before its own popleft.)
+                if not self._inflight_metas or self._inflight_metas[0] is not head_meta:
+                    self._inflight_pane_ext_anchor = None
+                    if not self._inflight_metas:
+                        self._head_started_at = None
                     _log(
-                        f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
-                        f"but the pane is still animating (REPL generating) — not "
-                        f"wedged, extending window (#832; deque depth={depth})"
-                    )
-                    log_watchdog_decision(
-                        watchdog="inflight", agent=self.agent_name,
-                        decision="skip", reason="pane_active",
-                        state=self.state.value, progress_stale_s=age,
-                        inflight_turns=depth, inflight_active=True,
+                        f"tmux[{self.agent_name}]: inflight head completed/advanced "
+                        f"during pane-liveness sampling — stale wedged verdict, not "
+                        f"restarting (#832; deque depth={len(self._inflight_metas)})"
                     )
                     continue
                 # verdict == "wedged": no output + REPL not idle → genuinely
@@ -5383,6 +5439,7 @@ class TmuxSession:
                 tail_entries = list(self._inflight_metas)
                 self._inflight_metas.clear()
                 self._head_started_at = None
+                self._inflight_pane_ext_anchor = None
                 # Also capture any in-hand-but-not-pasted turn (e.g.
                 # worker mid context-lock retry). Cleared so the
                 # post-restart worker doesn't redeliver from the stale
