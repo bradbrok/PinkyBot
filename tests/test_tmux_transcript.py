@@ -1211,3 +1211,38 @@ class TestSelfHealDiscovery:
 
         assert tailer.transcript_path == fresh
         assert tailer.stats["self_heal_repoints"] == 0
+
+    @pytest.mark.asyncio
+    async def test_self_heal_forward_heal_with_carried_over_floor(self, tmp_path):
+        """#291: the tailer instance is retained across ``force_restart``, so a
+        respawn carries the PRIOR session's bind time in ``_path_bound_at``. A
+        genuinely NEW session transcript (created after the respawn, so newer
+        than the carried floor) must still heal FORWARD — the carried-over floor
+        only blocks true previous-session files, never the live one."""
+        cb = _Captor()
+        new = tmp_path / "new-session.jsonl"
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: new,
+        )
+        # Prior session: a real bind stamps _path_bound_at (the value that
+        # survives a force_restart respawn of the retained instance).
+        prior = tmp_path / "prior-session.jsonl"
+        prior.write_text("{}\n")
+        tailer.set_transcript_path(prior)
+        carried_floor = tailer._path_bound_at
+        assert carried_floor > 0.0
+
+        # Respawn: prior file is gone, the NEW session's JSONL appears, newer
+        # than the carried floor.
+        prior.unlink()
+        _write_jsonl(new, [_assistant(text="new session"), _stop_hook_summary()])
+        os.utime(new, (carried_floor + 10, carried_floor + 10))
+
+        # _path (prior) is now missing → self-heal fires → discovery returns the
+        # NEW (newer) file → floor ALLOWS the forward heal.
+        tailer._try_self_heal_repoint()
+
+        assert tailer.transcript_path == new, "must heal forward to the live file"
+        assert tailer.stats["self_heal_repoints"] == 1
+        assert tailer.stats["self_heal_stale_skips"] == 0
