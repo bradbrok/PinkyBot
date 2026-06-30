@@ -48,6 +48,7 @@ from __future__ import annotations
 import asyncio
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -274,6 +275,19 @@ class TmuxTranscriptTailer:
         path_discovery: Callable[[], Path | None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
+        # #291: wall-clock when ``_path`` was last bound via an explicit
+        # ``set_transcript_path`` call. Starts at 0.0 — the "no real bind yet"
+        # sentinel — so the self-heal mtime-floor (``_try_self_heal_repoint``)
+        # is UNRESTRICTED at cold start: the placeholder→fresh discovery is
+        # exactly what #515 is for, and at genuine cold start there is no live
+        # session yet to clobber to (any pre-existing JSONL is bound directly by
+        # ``_start_tailer`` and so already exists → self-heal never fires). The
+        # floor engages the moment a real path is bound (below + the hook path):
+        # from then on the self-heal refuses to repoint to any transcript OLDER
+        # than the current bind — a stale previous-session file surfacing
+        # because the freshly-bound JSONL hasn't hit disk yet. Re-stamped on
+        # every real path change in ``set_transcript_path``.
+        self._path_bound_at = 0.0
         self._on_turn_complete = on_turn_complete
         self._agent_name = agent_name or self._path.stem[:12]
         self._fallback_poll_sec = fallback_poll_sec
@@ -308,6 +322,9 @@ class TmuxTranscriptTailer:
             # surface "the tailer fell back to mtime-scan N times" in
             # diagnostics.
             "self_heal_repoints": 0,
+            # #291: count self-heal discoveries we REFUSED because the
+            # candidate predated the current bind (the stale-clobber guard).
+            "self_heal_stale_skips": 0,
         }
         # ``_active`` flips True after we see a user entry but before we see
         # the closing stop_hook_summary. Drives the tighter poll cadence so
@@ -393,6 +410,12 @@ class TmuxTranscriptTailer:
         """
         if Path(path) != self._path:
             self._path = Path(path)
+            # #291: re-stamp the bind clock on every real path change so the
+            # self-heal floor measures staleness against THIS bind, not a
+            # stale construction-time value — the tailer instance is retained
+            # across ``force_restart`` respawns, so a fresh launch rebinds
+            # through here and must reset the floor.
+            self._path_bound_at = time.time()
             self._swap_generation += 1
             if seek_to_start:
                 self._offset = 0
@@ -548,6 +571,38 @@ class TmuxTranscriptTailer:
         if discovered is None:
             return
         if Path(discovered) == self._path:
+            return
+        # #291: never repoint to a transcript whose mtime PREDATES the current
+        # bind. On a fresh launch (context_restart / new session) the
+        # SessionStart hook binds the new JSONL the instant Claude Code
+        # announces the session — before CC has flushed the file to disk. The
+        # next poll sees ``_path`` missing and lands here; ``path_discovery``
+        # (newest-existing-by-mtime) then returns the PREVIOUS session's file,
+        # and the pre-#291 code clobbered the correct bind with it. That wedges
+        # the tailer on a frozen file forever: the stale path EXISTS so this
+        # self-heal never re-fires, and the first-bind flag was already consumed
+        # so #565 won't either — leaving the watchdog blind (frozen
+        # ``transcript_mtime`` reads "quiet" + undetected stop hooks pile the
+        # inflight deque) until it force_restarts a perfectly healthy agent.
+        # The freshly-bound session's own JSONL, once it materialises, has
+        # mtime >= the bind; a strictly-older file is always a previous session
+        # and never a valid heal target. Strict ``<`` (no slack): the stale
+        # candidate is often the *immediately* preceding session, whose last
+        # write can be only seconds before the new bind — any positive slack
+        # would re-admit it. Fail-safe: if the candidate's mtime can't be read,
+        # skip rather than risk the clobber.
+        try:
+            discovered_mtime = Path(discovered).stat().st_mtime
+        except OSError:
+            return
+        if discovered_mtime < self._path_bound_at:
+            _log(
+                f"tmux_tailer[{self._agent_name}]: self-heal SKIP stale "
+                f"discovery {discovered} (mtime {discovered_mtime:.0f} predates "
+                f"bind {self._path_bound_at:.0f}) — awaiting bound path to "
+                f"materialise (#291)"
+            )
+            self._stats["self_heal_stale_skips"] += 1
             return
         _log(
             f"tmux_tailer[{self._agent_name}]: self-heal repointing "
