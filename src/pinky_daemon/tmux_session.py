@@ -952,6 +952,44 @@ _BACKGROUND_TASK_ACTIVE_WINDOW_SEC = 180.0
 # recovery) bounded.
 _FOREGROUND_TOOL_ACTIVE_CEILING_SEC = 1800.0
 
+# #832 — pane-content liveness for the inflight stall verdict. A long pure-
+# reasoning / slow-generation turn (common at ultracode/xhigh effort) writes
+# NOTHING to the JSONL transcript and has no foreground tool or background task
+# in flight, so the stall verdict reaches "wedged" even though the REPL is alive
+# — the Claude Code TUI's spinner / token counter / elapsed timer is still
+# animating. The inflight watchdog samples the pane twice ~_PANE_LIVENESS_SAMPLE_
+# GAP_SEC apart; a CHANGED pane is positive liveness (extend the window), a frozen
+# pane is a genuine wedge (force_restart). The gap is wider than the TUI's ~1s
+# redraw tick so a single tick is always observable; capturing the last N lines is
+# enough — the status/spinner line renders at the bottom.
+_PANE_LIVENESS_CAPTURE_LINES = 40
+_PANE_LIVENESS_SAMPLE_GAP_SEC = 1.5
+
+
+def _pane_liveness_enabled() -> bool:
+    """Whether the inflight watchdog credits an animating tmux pane as liveness
+    (#832). Default ON; ``PINKY_WATCHDOG_PANE_LIVENESS=0`` is the kill switch
+    (falls back to the pre-#832 transcript/tool-only verdict). Read per call so
+    it can be flipped without a daemon restart."""
+    return os.environ.get("PINKY_WATCHDOG_PANE_LIVENESS", "1").strip().lower() not in (
+        "0", "false", "no", "off",
+    )
+
+
+def _inflight_hard_ceiling_sec() -> float:
+    """Absolute upper bound on an inflight head's age (#832). Pane-liveness can
+    extend a long turn for as long as the TUI keeps animating; this ceiling
+    guarantees an animating-but-genuinely-stuck REPL (e.g. a live render loop over
+    a deadlocked agent loop) is still force_restarted. Env-overridable
+    (``PINKY_INFLIGHT_HARD_CEILING_SEC``); generous so a legitimately deep
+    ultracode turn is never cut off mid-flight. Never below the base timeout."""
+    raw = os.environ.get("PINKY_INFLIGHT_HARD_CEILING_SEC", "").strip()
+    try:
+        val = float(raw) if raw else 3600.0
+    except (TypeError, ValueError):
+        val = 3600.0
+    return max(val, _TURN_DONE_TIMEOUT_SEC)
+
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
 # reason.startswith("wake_")`` so the wake prompt's paste doesn't land while
@@ -1139,6 +1177,16 @@ class TmuxSession:
         # gets its own ``_TURN_DONE_TIMEOUT_SEC`` window once it becomes
         # the head (Murzik review on PR for #560).
         self._head_started_at: float | None = None
+        # (#832) Absolute-ceiling anchor for the inflight pane-liveness rescue.
+        # The pane-animating branch resets ``_head_started_at`` on EVERY sample,
+        # so the ceiling can't be measured against it (age would reset each cycle
+        # and never reach the bound). Instead anchor to ``(head_meta, t0)``: ``t0``
+        # is when the CURRENT head first got pane-liveness credit, and it is NOT
+        # reset by subsequent samples — so ``now - t0`` truly accumulates toward
+        # ``_inflight_hard_ceiling_sec()``. Keyed by the head meta's identity so a
+        # genuinely new head (deque advanced) auto-starts a fresh ceiling budget
+        # without having to touch the out-of-loop head-start sites.
+        self._inflight_pane_ext_anchor: tuple[object, float] | None = None
         # Back-compat advisory signal. Pre-#560 this was the worker's
         # per-iteration gate (the bottleneck that broke steering).
         # Post-#560 the worker no longer awaits it between dispatches;
@@ -4936,6 +4984,30 @@ class TmuxSession:
             alive = True
         return alive
 
+    async def _pane_is_animating(self) -> bool:
+        """True if the tmux pane's visible content changed across two samples
+        ~``_PANE_LIVENESS_SAMPLE_GAP_SEC`` apart — positive evidence the REPL is
+        actively rendering/generating (#832).
+
+        The Claude Code TUI animates a spinner + token counter + elapsed timer
+        every ~1s while a turn is in flight, INCLUDING a long pure-reasoning block
+        that has not yet written anything to the JSONL transcript. So a changing
+        pane means "alive, just quiet" while a frozen pane means a genuinely
+        wedged REPL. Self-contained (two captures, no persisted state): the
+        inflight watchdog calls this only on an otherwise-"wedged" verdict, so the
+        two extra ``capture-pane`` subprocesses run rarely. Any tmux failure (or a
+        non-ok capture) returns False — no liveness evidence, so the caller falls
+        through to the pre-#832 wedged/force_restart behavior."""
+        try:
+            first = await self._tmux.capture_pane(lines=_PANE_LIVENESS_CAPTURE_LINES)
+            await asyncio.sleep(_PANE_LIVENESS_SAMPLE_GAP_SEC)
+            second = await self._tmux.capture_pane(lines=_PANE_LIVENESS_CAPTURE_LINES)
+        except Exception:
+            return False
+        if not (first.ok and second.ok):
+            return False
+        return (first.stdout or "") != (second.stdout or "")
+
     def _watchdog_liveness(self, now: float) -> dict:
         """Live carve-out signal for the OUTER watchdogs (#230).
 
@@ -5229,11 +5301,23 @@ class TmuxSession:
                     continue
                 age = now - (self._head_started_at or now)
                 depth = len(self._inflight_metas)
+                # The head meta being judged this tick. ``verdict != "ok"``
+                # guarantees a non-empty deque (computed synchronously just above,
+                # no intervening await), so index 0 is safe here. Captured ONCE so
+                # the #832 pane-liveness anchor and the post-await staleness guard
+                # both key off the SAME identity — the pane-liveness rescue awaits
+                # (capture-pane + sample gap), during which a stop hook can pop or
+                # advance the head out from under us.
+                head_meta = self._inflight_metas[0]
                 if verdict == "growing":
                     # #118: head aged out BUT the transcript is still being
                     # written — a long/streaming turn, NOT a wedge. Extend
                     # the window instead of tearing the session down.
                     self._head_started_at = now
+                    # Real transcript/background progress → refresh the #832
+                    # pane-liveness ceiling budget (a later quiet-but-animating
+                    # stretch on this same head earns a fresh full ceiling).
+                    self._inflight_pane_ext_anchor = None
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
                         f"but transcript or background task still active — not "
@@ -5257,6 +5341,7 @@ class TmuxSession:
                     drained = list(self._inflight_metas)
                     self._inflight_metas.clear()
                     self._head_started_at = None
+                    self._inflight_pane_ext_anchor = None
                     for m in drained:
                         ev = m.completion_event
                         if ev is not None and not ev.is_set():
@@ -5271,6 +5356,66 @@ class TmuxSession:
                         decision="reconcile", reason="idle_phantom",
                         state=self.state.value, progress_stale_s=age,
                         inflight_turns=depth, inflight_active=False,
+                    )
+                    continue
+                # (#832) Last-chance liveness before tearing down a "wedged"
+                # head: a long pure-reasoning / slow-generation turn (common at
+                # ultracode/xhigh) writes nothing to the transcript and has no
+                # tool in flight, so it reaches here looking wedged — yet the CC
+                # TUI spinner/token-counter is still animating. Sample the pane
+                # twice; a changing pane is positive liveness → extend the window
+                # like the "growing" branch. Bounded by an absolute ceiling so an
+                # animating-but-genuinely-stuck REPL is still recovered, and
+                # flag-gated (PINKY_WATCHDOG_PANE_LIVENESS=0) for a kill switch.
+                if _pane_liveness_enabled():
+                    # Anchor the absolute ceiling to when THIS head FIRST reached
+                    # the pane-liveness rescue, NOT to ``_head_started_at`` — the
+                    # extend branch below resets ``_head_started_at = now`` on every
+                    # animating sample, so ``age`` measured against it would reset
+                    # each cycle and the ceiling could NEVER be reached (a genuinely
+                    # stuck-but-animating REPL would be pinned alive forever). The
+                    # anchor's ``t0`` is set once per head and is NOT reset by
+                    # samples, so ``now - t0`` truly accumulates. Keyed by the head
+                    # meta's identity so a real new head (deque advanced) restarts
+                    # the budget automatically — no need to touch head-start sites.
+                    anchor = self._inflight_pane_ext_anchor
+                    if anchor is None or anchor[0] is not head_meta:
+                        anchor = (head_meta, self._head_started_at or now)
+                        self._inflight_pane_ext_anchor = anchor
+                    ceiling = _inflight_hard_ceiling_sec()
+                    if (now - anchor[1]) < ceiling and await self._pane_is_animating():
+                        self._head_started_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                            f"but the pane is still animating (REPL generating) — "
+                            f"not wedged, extending window (#832; deque depth="
+                            f"{depth}, ceiling {now - anchor[1]:.1f}/{ceiling:.0f}s)"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="skip", reason="pane_active",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=True,
+                        )
+                        continue
+                # (#832 follow-up) The pane-liveness rescue above awaited
+                # (capture-pane twice + a sample gap). A turn-complete (stop hook)
+                # can land during that window and pop or advance the head via
+                # ``_handle_turn_complete``, leaving the deque empty or fronted by
+                # a DIFFERENT, healthy turn. Either way the "wedged" verdict is now
+                # stale: the force_restart below would ``popleft`` an empty deque
+                # (IndexError → the watchdog task dies for this session, silently
+                # dropping recovery) or tear down an innocent fresh head. Bail if
+                # the head we judged is no longer at the front. (Mirrors the guard
+                # ``_handle_turn_complete`` itself uses before its own popleft.)
+                if not self._inflight_metas or self._inflight_metas[0] is not head_meta:
+                    self._inflight_pane_ext_anchor = None
+                    if not self._inflight_metas:
+                        self._head_started_at = None
+                    _log(
+                        f"tmux[{self.agent_name}]: inflight head completed/advanced "
+                        f"during pane-liveness sampling — stale wedged verdict, not "
+                        f"restarting (#832; deque depth={len(self._inflight_metas)})"
                     )
                     continue
                 # verdict == "wedged": no output + REPL not idle → genuinely
@@ -5294,6 +5439,7 @@ class TmuxSession:
                 tail_entries = list(self._inflight_metas)
                 self._inflight_metas.clear()
                 self._head_started_at = None
+                self._inflight_pane_ext_anchor = None
                 # Also capture any in-hand-but-not-pasted turn (e.g.
                 # worker mid context-lock retry). Cleared so the
                 # post-restart worker doesn't redeliver from the stale
