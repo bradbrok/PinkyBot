@@ -104,6 +104,14 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-opus-4-5": _OPUS_STD,
     "claude-opus-4-1": _OPUS_LEGACY,
     "claude-opus-4": _OPUS_LEGACY,
+    # Sonnet 5 (2026-06): the current Sonnet tier. Standard pricing is
+    # $3/$15 per Mtok — identical to the flat ``_SONNET`` tier. NOTE:
+    # introductory pricing of $2/$10 applies through 2026-08-31, then
+    # reverts to standard. We deliberately use the durable standard rate
+    # here: this table only powers the tmux/subscription cost ESTIMATE
+    # (those agents aren't billed per-token), and a hard-coded intro rate
+    # would silently over-discount every turn after the revert date.
+    "claude-sonnet-5": _SONNET,
     "claude-sonnet-4-6": _SONNET,
     "claude-sonnet-4-5": _SONNET,
     "claude-sonnet-4": _SONNET,
