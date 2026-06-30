@@ -3939,6 +3939,235 @@ async def test_inflight_watchdog_drains_phantom_when_repl_idle(monkeypatch) -> N
     assert ss._head_started_at is None
 
 
+# ──────────────────────────────────────────────────────────────────────────
+# #832 — pane-content liveness (rescue a long pure-reasoning / slow-generation
+# turn the transcript/tool signals miss, esp. under ultracode/xhigh)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _pane(content: str) -> TmuxCommandResult:
+    return TmuxCommandResult(returncode=0, stdout=content, stderr="")
+
+
+@pytest.mark.asyncio
+async def test_pane_is_animating_true_when_pane_changes() -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(side_effect=[_pane("Thinking (44s)"), _pane("Thinking (46s)")])
+    assert await ss._pane_is_animating() is True
+
+
+@pytest.mark.asyncio
+async def test_pane_is_animating_false_when_pane_frozen() -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_pane("> frozen prompt"))
+    assert await ss._pane_is_animating() is False
+
+
+@pytest.mark.asyncio
+async def test_pane_is_animating_false_on_capture_failure() -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_fail("no pane"))
+    assert await ss._pane_is_animating() is False
+    tmux.capture_pane = AsyncMock(side_effect=RuntimeError("tmux gone"))
+    assert await ss._pane_is_animating() is False
+
+
+def test_pane_liveness_enabled_default_and_killswitch(monkeypatch) -> None:
+    from pinky_daemon import tmux_session
+
+    monkeypatch.delenv("PINKY_WATCHDOG_PANE_LIVENESS", raising=False)
+    assert tmux_session._pane_liveness_enabled() is True  # default ON
+    for off in ("0", "false", "no", "off", "OFF"):
+        monkeypatch.setenv("PINKY_WATCHDOG_PANE_LIVENESS", off)
+        assert tmux_session._pane_liveness_enabled() is False
+    monkeypatch.setenv("PINKY_WATCHDOG_PANE_LIVENESS", "1")
+    assert tmux_session._pane_liveness_enabled() is True
+
+
+def test_inflight_hard_ceiling_default_and_override(monkeypatch) -> None:
+    from pinky_daemon import tmux_session
+
+    monkeypatch.delenv("PINKY_INFLIGHT_HARD_CEILING_SEC", raising=False)
+    assert tmux_session._inflight_hard_ceiling_sec() == 3600.0
+    monkeypatch.setenv("PINKY_INFLIGHT_HARD_CEILING_SEC", "1200")
+    assert tmux_session._inflight_hard_ceiling_sec() == 1200.0
+    # Never below the base timeout, even if env asks for less.
+    monkeypatch.setenv("PINKY_INFLIGHT_HARD_CEILING_SEC", "1")
+    assert tmux_session._inflight_hard_ceiling_sec() == tmux_session._TURN_DONE_TIMEOUT_SEC
+    # Garbage falls back to the default.
+    monkeypatch.setenv("PINKY_INFLIGHT_HARD_CEILING_SEC", "nope")
+    assert tmux_session._inflight_hard_ceiling_sec() == 3600.0
+
+
+def _wedged_session():
+    """A CONNECTED session whose aged-out head would classify ``wedged``:
+    transcript quiet, no fg tool, REPL ``working`` (not idle)."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {"status": "working", "last_updated": _time.time()}
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._inflight_metas.append(_mk_inflight_meta())
+    ss._head_started_at = _time.time() - 1.0  # aged past the (monkeypatched) timeout
+    return ss, tmux
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_extends_when_pane_animating(monkeypatch) -> None:
+    """The #832 fix: a wedged-looking head whose pane is still animating is
+    EXTENDED, not force_restarted."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+
+    ss, tmux = _wedged_session()
+    flip = {"n": 0}
+
+    def _alt(**kw):
+        flip["n"] += 1
+        return _pane("frame-a" if flip["n"] % 2 else "frame-b")
+
+    tmux.capture_pane = AsyncMock(side_effect=_alt)
+
+    restarted = {"v": False}
+
+    async def _no_restart(*, bypass_guard: bool = False):
+        restarted["v"] = True
+        return True
+
+    ss.force_restart = _no_restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        await asyncio.sleep(0.25)  # several ticks
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+    assert restarted["v"] is False, "animating pane must NOT be force_restarted"
+    assert tmux.capture_pane.await_count >= 2, "pane must be sampled (twice)"
+    assert ss._head_started_at is not None, "window must be extended, not cleared"
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_restarts_when_pane_frozen(monkeypatch) -> None:
+    """A frozen pane (genuine wedge) still force_restarts."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+
+    ss, tmux = _wedged_session()
+    tmux.capture_pane = AsyncMock(return_value=_pane("> frozen"))
+
+    fired = asyncio.Event()
+
+    async def _restart(*, bypass_guard: bool = False):
+        fired.set()
+        return True
+
+    ss.force_restart = _restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("frozen pane must force_restart")
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_restarts_over_ceiling_even_if_animating(monkeypatch) -> None:
+    """The absolute ceiling beats pane-liveness: an animating-but-stuck REPL
+    past the ceiling still recovers."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+    monkeypatch.setenv("PINKY_INFLIGHT_HARD_CEILING_SEC", "0.1")  # head aged ~1s > ceiling
+
+    ss, tmux = _wedged_session()
+    flip = {"n": 0}
+
+    def _alt(**kw):
+        flip["n"] += 1
+        return _pane("a" if flip["n"] % 2 else "b")
+
+    tmux.capture_pane = AsyncMock(side_effect=_alt)
+
+    fired = asyncio.Event()
+
+    async def _restart(*, bypass_guard: bool = False):
+        fired.set()
+        return True
+
+    ss.force_restart = _restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("over-ceiling head must force_restart even if animating")
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+
+
+@pytest.mark.asyncio
+async def test_inflight_watchdog_killswitch_disables_pane_rescue(monkeypatch) -> None:
+    """PINKY_WATCHDOG_PANE_LIVENESS=0 restores the pre-#832 transcript/tool-only
+    verdict — an animating pane is no longer credited."""
+    from pinky_daemon import tmux_session
+
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+    monkeypatch.setattr(tmux_session, "_PANE_LIVENESS_SAMPLE_GAP_SEC", 0.0)
+    monkeypatch.setenv("PINKY_WATCHDOG_PANE_LIVENESS", "0")
+
+    ss, tmux = _wedged_session()
+    flip = {"n": 0}
+
+    def _alt(**kw):
+        flip["n"] += 1
+        return _pane("a" if flip["n"] % 2 else "b")
+
+    tmux.capture_pane = AsyncMock(side_effect=_alt)
+
+    fired = asyncio.Event()
+
+    async def _restart(*, bypass_guard: bool = False):
+        fired.set()
+        return True
+
+    ss.force_restart = _restart
+
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        await asyncio.wait_for(fired.wait(), timeout=2.0)
+    except asyncio.TimeoutError:
+        pytest.fail("kill switch must restore force_restart on a wedged head")
+    finally:
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+    assert tmux.capture_pane.await_count == 0, "kill switch must skip pane sampling"
+
+
 @pytest.mark.asyncio
 async def test_spawn_clears_turn_done_after_reconnect() -> None:
     """The turn_done invariant ("cleared between dispatches") must be
