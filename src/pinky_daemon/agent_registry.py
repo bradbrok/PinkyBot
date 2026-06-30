@@ -3938,6 +3938,7 @@ except Exception:
         ("anthropic", "claude-opus-4-8", "Claude Opus 4.8", "Newest Opus (2026-05-28). Sharper judgement, more honest progress reporting, longer independent runs. Effort defaults to high; adaptive thinking triggers only when needed.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 3),
         ("anthropic", "claude-opus-4-7", "Claude Opus 4.7", "Stricter instruction-following, xhigh effort, larger vision.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 5),
         ("anthropic", "claude-opus-4-6", "Claude Opus 4.6", "Maximum intelligence. Deep reasoning.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 10),
+        ("anthropic", "claude-sonnet-5", "Claude Sonnet 5", "Current Sonnet (2026-06). Best speed+intelligence balance — daily driver. 1M context; adaptive thinking, effort defaults to high. Intro pricing $2/$10 through Aug 2026.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 15),
         ("anthropic", "claude-sonnet-4-6", "Claude Sonnet 4.6", "Fast + smart. Daily driver.", "sonnet", 1_000_000, 1, 3.0, 15.0, 0.3, 1, 20),
         ("anthropic", "claude-haiku-4-5", "Claude Haiku 4.5", "Lightning fast. Simple tasks.", "haiku", 200_000, 0, 1.0, 5.0, 0.1, 1, 30),
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
