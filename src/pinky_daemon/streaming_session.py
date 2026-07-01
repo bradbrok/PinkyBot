@@ -29,10 +29,14 @@ from pinky_daemon.wake_prompt import (
     wake_reason_from_runtime,
 )
 
-# Models with native 1M context (SDK reports 200k incorrectly)
+# Models with native 1M context (SDK reports 200k incorrectly).
+# INVARIANT: must contain every model the registry flags is_1m=1
+# (agent_registry._MODEL_SEEDS) — pinned by
+# test_1m_models_set_matches_registry_is_1m so this can't drift again (#839).
 _1M_MODELS = {
     "claude-fable-5",
     "claude-mythos-5",
+    "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
     "claude-opus-4-7",
