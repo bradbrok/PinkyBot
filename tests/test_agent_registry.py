@@ -901,6 +901,26 @@ class TestModelSeeds:
             assert m["output_price"] == rate["output"], m["model_id"]
             assert m["cached_input_price"] == rate["cache_read"], m["model_id"]
 
+    def test_1m_models_set_matches_registry_is_1m(self, registry):
+        """#839 invariant: streaming_session._1M_MODELS (the hand-maintained set
+        that corrects the SDK's 200k report on the StreamingSession path) must
+        contain every model the registry flags is_1m=1. PR #837 added
+        claude-sonnet-5 to the three cost/registry tables but not to this set,
+        so a sonnet-5 SDK session capped context at 200k and compacted early.
+        Pin them together so the next 1M model add can't silently drift."""
+        from pinky_daemon.streaming_session import _1M_MODELS
+
+        registry_1m = {
+            m["model_id"]
+            for m in registry.list_models(provider="anthropic", active_only=False)
+            if m["is_1m"] == 1
+        }
+        missing = registry_1m - _1M_MODELS
+        assert not missing, (
+            f"models flagged is_1m=1 but absent from streaming_session._1M_MODELS "
+            f"(would cap context at 200k on the SDK path): {sorted(missing)}"
+        )
+
     def test_stale_prices_corrected_on_existing_rows(self, registry):
         """#741: rows already seeded with the stale tier are rewritten on the
         next seed pass (INSERT OR IGNORE alone never reaches existing DBs)."""
