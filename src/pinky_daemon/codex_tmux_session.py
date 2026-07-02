@@ -171,6 +171,29 @@ class CodexTmuxSession(TmuxSession):
         )
         return cmd
 
+    # ── seam: live REPL control ─────────────────────────────────────────────
+    # The inherited live-apply machinery types CLAUDE slash commands
+    # (/effort, /model) into the pane — the codex REPL doesn't speak them
+    # (effort is a -c launch flag; /model is an interactive picker). Stash
+    # only; the change lands on the next relaunch.
+
+    async def apply_effort_live(self, level: str) -> str:
+        from pinky_daemon.effort import resolve_cli_effort
+
+        self.set_effort(level)
+        # ultracode is Claude-native — resolve it so the codex launch flag
+        # never sees the literal (max→high still maps at build time).
+        self._reasoning_effort = resolve_cli_effort(self.effective_effort)
+        return "pending_restart"
+
+    async def apply_model_live(self, model: str) -> str:
+        model = (model or "").strip()
+        if not model:
+            return "rejected"
+        self._config.model = model
+        self._codex_model = model
+        return "pending_restart"
+
     # tmux-internal vars that must not leak into the nested REPL's children
     # (mirrors ``CodexAppServerSupervisor._ENV_DROP``).
     _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})

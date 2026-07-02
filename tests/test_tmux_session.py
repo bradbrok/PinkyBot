@@ -376,11 +376,15 @@ def test_build_claude_cmd_includes_dangerously_skip_when_no_transcript(
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def test_build_claude_cmd_omits_effort_for_medium(tmp_path, monkeypatch) -> None:
+def test_build_claude_cmd_passes_effort_for_medium(tmp_path, monkeypatch) -> None:
+    """Medium is passed EXPLICITLY (model/effort selector fix): the CLI
+    persists the last interactive /effort per project dir, so a flagless
+    launch would boot a medium-configured agent at whatever the previous
+    session ran at."""
     monkeypatch.setenv("HOME", str(tmp_path))
     ss, _ = _make_session()
     ss._config.thinking_effort = "medium"
-    assert "--effort" not in ss._build_claude_cmd()
+    assert "--effort medium" in ss._build_claude_cmd()
 
 
 def test_build_claude_cmd_passes_effort_for_xhigh(tmp_path, monkeypatch) -> None:
@@ -415,6 +419,167 @@ def test_set_effort_accepts_ultracode() -> None:
     ss.set_effort("ultracode")
     assert ss._effort_override == "ultracode"
     assert ss.effective_effort == "ultracode"
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Live per-session effort/model apply (model/effort selector fix).
+# apply_effort_live types the interactive /effort into an idle REPL,
+# auto-confirming the mid-session dialog; busy REPLs defer to next idle;
+# disconnected sessions stash for the relaunch --effort flag.
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _capture(text: str) -> TmuxCommandResult:
+    return TmuxCommandResult(returncode=0, stdout=text, stderr="")
+
+
+@pytest.fixture()
+def fast_settle(monkeypatch):
+    """Shrink the post-command settle so live-apply tests don't sleep
+    real wall-clock time."""
+    monkeypatch.setattr(tmux_session, "_REPL_COMMAND_SETTLE_SEC", 0.001)
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_idle_types_command(fast_settle) -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))
+    result = await ss.apply_effort_live("xhigh")
+    assert result == "live"
+    assert ss._effort_override == "xhigh"
+    tmux.send_keys.assert_awaited_once_with("/effort xhigh", enter=True)
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_types_ultracode_verbatim(fast_settle) -> None:
+    """Unlike the --effort flag, interactive /effort accepts the literal
+    ultracode tier — the live apply must not resolve it to xhigh."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))
+    result = await ss.apply_effort_live("ultracode")
+    assert result == "live"
+    tmux.send_keys.assert_awaited_once_with("/effort ultracode", enter=True)
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_busy_defers() -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _seed_inflight(ss)
+    result = await ss.apply_effort_live("high")
+    assert result == "deferred"
+    assert ss._pending_live_effort == "high"
+    assert ss._effort_override == "high"  # stash still lands
+    tmux.send_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_disconnected_pends_restart() -> None:
+    ss, tmux = _make_session()  # UNINITIALIZED
+    result = await ss.apply_effort_live("max")
+    assert result == "pending_restart"
+    assert ss._effort_override == "max"
+    tmux.send_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_confirms_dialog(fast_settle) -> None:
+    """Mid-session /effort pops the 'Change effort level?' confirmation —
+    the apply presses Enter to accept and reports live once it clears."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(
+        side_effect=[
+            _capture("Change effort level?\n> 1. Yes  2. No"),
+            _capture("> \n"),
+        ]
+    )
+    result = await ss.apply_effort_live("xhigh")
+    assert result == "live"
+    # /effort send + the Enter that confirmed the dialog.
+    assert tmux.send_keys.await_count == 2
+    assert tmux.send_keys.await_args_list[1].args == ("",)
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_escapes_stuck_dialog(fast_settle) -> None:
+    """If the dialog survives the confirm, Escape it (a modal left open
+    would wedge the next prompt paste) and fall back to the relaunch path."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(
+        return_value=_capture("Change effort level?\n> 1. Yes  2. No")
+    )
+    result = await ss.apply_effort_live("xhigh")
+    assert result == "pending_restart"
+    assert ss._effort_override == "xhigh"  # stash still applies on relaunch
+    escape_calls = [
+        c for c in tmux.send_keys.await_args_list if c.args == ("Escape",)
+    ]
+    assert len(escape_calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_apply_effort_live_auto_reverts_to_default(fast_settle) -> None:
+    """'auto' clears the override and pushes the agent DEFAULT live."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.thinking_effort = "high"
+    ss._effort_override = "xhigh"
+    tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))
+    result = await ss.apply_effort_live("auto")
+    assert result == "live"
+    assert ss._effort_override is None
+    tmux.send_keys.assert_awaited_once_with("/effort high", enter=True)
+
+
+@pytest.mark.asyncio
+async def test_turn_complete_consumes_pending_live_effort(fast_settle) -> None:
+    """A deferred live effort is typed once the in-flight work drains."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))
+    _seed_inflight(ss)
+    ss._pending_live_effort = "xhigh"
+    response = TurnResponse(text="done", stop_reason="stop_hook_summary")
+    await ss._handle_turn_complete(response)
+    # The apply runs as a fire-and-forget task — let it settle.
+    for _ in range(10):
+        await asyncio.sleep(0)
+        if tmux.send_keys.await_count:
+            break
+    assert ss._pending_live_effort is None
+    tmux.send_keys.assert_awaited_once_with("/effort xhigh", enter=True)
+
+
+@pytest.mark.asyncio
+async def test_apply_model_live_idle_types_command(fast_settle) -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))
+    result = await ss.apply_model_live("claude-opus-4-8")
+    assert result == "live"
+    assert ss._config.model == "claude-opus-4-8"
+    tmux.send_keys.assert_awaited_once_with("/model claude-opus-4-8", enter=True)
+
+
+@pytest.mark.asyncio
+async def test_apply_model_live_busy_pends_restart() -> None:
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _seed_inflight(ss)
+    result = await ss.apply_model_live("claude-opus-4-8")
+    assert result == "pending_restart"
+    # Config still updated → next relaunch boots with --model <new>.
+    assert ss._config.model == "claude-opus-4-8"
+    tmux.send_keys.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_apply_model_live_rejected_keeps_config(fast_settle) -> None:
+    """A CLI 'unknown model' rejection must NOT update config — a
+    relaunch with a bad --model flag would wedge the boot."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    old_model = ss._config.model
+    tmux.capture_pane = AsyncMock(
+        return_value=_capture("Unknown model: claude-bogus")
+    )
+    result = await ss.apply_model_live("claude-bogus")
+    assert result == "rejected"
+    assert ss._config.model == old_model
 
 
 # Native ultracode activation arming (#151). A fresh cold-start with ultracode

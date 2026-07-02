@@ -123,7 +123,7 @@ from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
-from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS
+from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.hooks import (
     AuditStore,
     HookEvent,
@@ -5784,6 +5784,33 @@ npm run build</pre>
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
+
+        # Stale-expectation guard: PINKY_EXPECTED_EFFORT is baked into the
+        # session env at spawn, so after a LIVE mid-session effort change
+        # (apply_effort_live) the hook keeps comparing against the old
+        # level. When the reported ACTUAL matches what the daemon currently
+        # wants, the "drift" is the env var lagging — record the readback
+        # and skip the drift event instead of spamming false positives.
+        ss = broker._get_streaming_session(name)
+        if ss is not None and req.actual:
+            if hasattr(ss, "last_reported_effort"):
+                ss.last_reported_effort = req.actual
+            effective = getattr(ss, "effective_effort", "") or ""
+            if req.actual == resolve_cli_effort(effective):
+                _log(
+                    f"api: effort-drift for {name} matches current effective "
+                    f"({req.actual}) — stale expected={req.expected}, skipping"
+                )
+                return {
+                    "ok": True,
+                    "agent": name,
+                    "event_id": 0,
+                    "expected": req.expected,
+                    "actual": req.actual,
+                    "strict": req.strict,
+                    "stale_expected": True,
+                }
+
         event_id = agents.record_effort_drift(
             name,
             expected=req.expected,
@@ -6053,6 +6080,13 @@ npm run build</pre>
         if session is None:
             return {"ok": True, "agent": name, "session": None}
 
+        # Actual-effort readback: the hook piggybacks $CLAUDE_EFFORT on
+        # every tool call, so this is the freshest signal for what the
+        # REPL is really running at (surfaced via GET /agents/{name}/effort
+        # and the session meta endpoint).
+        if req.effort and hasattr(session, "last_reported_effort"):
+            session.last_reported_effort = req.effort
+
         record = getattr(session, "record_tool_use_start", None)
         if callable(record):
             try:
@@ -6150,7 +6184,14 @@ npm run build</pre>
 
     @app.get("/agents/{name}/effort")
     async def get_agent_effort(name: str, label: str = "main"):
-        """Get an agent's thinking effort (default + session override)."""
+        """Get an agent's thinking effort (default + session override).
+
+        ``live`` is the runtime effort the session last REPORTED (hooks
+        piggyback ``$CLAUDE_EFFORT`` on their tool-use POSTs) — what the
+        CLI is actually running at, not what we asked for. Empty until
+        the first hook fires. ``pending_live`` is a level waiting to be
+        typed into a busy tmux REPL.
+        """
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -6168,6 +6209,8 @@ npm run build</pre>
             "default": default,
             "session_override": session_override,
             "effective": effective,
+            "live": getattr(ss, "last_reported_effort", "") or None,
+            "pending_live": getattr(ss, "_pending_live_effort", None),
         }
 
     @app.put("/agents/{name}/effort")
@@ -6186,7 +6229,18 @@ npm run build</pre>
 
     @app.post("/agents/{name}/sessions/{session_label}/effort")
     async def set_session_effort(name: str, session_label: str, req: dict):
-        """Set session-level thinking effort override (label-aware)."""
+        """Set session-level thinking effort override (label-aware).
+
+        ``applied`` reports how far the change actually got:
+
+        - ``live`` — pushed into the running tmux REPL (interactive
+          ``/effort``, confirmation dialog auto-accepted).
+        - ``deferred`` — tmux REPL is mid-turn; applies when the current
+          work drains.
+        - ``pending_restart`` — stashed only; takes effect on the next
+          session relaunch. Always the case for SDK sessions (the SDK
+          client exposes no mid-session effort control).
+        """
         level = req.get("effort", "medium")
         if level not in EFFORT_LEVELS:
             raise HTTPException(400, f"Invalid effort level: {level}")
@@ -6198,16 +6252,22 @@ npm run build</pre>
         ss = (sessions.get(session_label) or sessions.get("main")) if sessions else None
         if not ss or not hasattr(ss, "set_effort"):
             raise HTTPException(404, f"No active session '{session_label}' for '{name}'")
-        if level == "auto":
-            ss.clear_effort_override()
+        apply_live = getattr(ss, "apply_effort_live", None)
+        if callable(apply_live):
+            applied = await apply_live(level)
         else:
-            ss.set_effort(level)
+            if level == "auto":
+                ss.clear_effort_override()
+            else:
+                ss.set_effort(level)
+            applied = "pending_restart"
         default = agent.thinking_effort or "medium"
         effective = level if level != "auto" else default
         return {"agent": name, "label": session_label,
                 "default": default,
                 "session_override": None if level == "auto" else level,
-                "effective": effective}
+                "effective": effective,
+                "applied": applied}
 
     @app.get("/agents/{name}/presence")
     async def get_agent_presence(name: str):
@@ -8244,13 +8304,38 @@ npm run build</pre>
     async def set_streaming_model(name: str, req: SetModelRequest):
         """Change the model on a running streaming session.
 
-        If the context window size changes (e.g. 200k → 1M), automatically
-        saves state and restarts the session. Otherwise switches mid-session.
+        SDK sessions: if the context window class changes (200k ↔ 1M) the
+        session is saved + restarted, else hot-swapped via the SDK's
+        ``set_model`` control. Tmux sessions have no ``_client`` — they
+        hot-swap by typing the interactive ``/model`` into the REPL (the
+        CLI renegotiates the window itself, so no restart is forced);
+        ``applied`` in the response reports how far the change got.
         """
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
-        if ss.state != TransportSessionState.CONNECTED or not ss._client:
+        client = getattr(ss, "_client", None)
+
+        # Tmux path — interactive /model, no client, no forced restart.
+        apply_model_live = getattr(ss, "apply_model_live", None)
+        if client is None and callable(apply_model_live):
+            applied = await apply_model_live(req.model)
+            if applied == "rejected":
+                raise HTTPException(
+                    400, f"Model '{req.model}' rejected by the CLI"
+                )
+            # Persist only after the session accepted the change (config
+            # updated → relaunches use --model <new>).
+            agents.register(name, model=req.model)
+            return {
+                "updated": True,
+                "agent": name,
+                "model": req.model,
+                "restarted": False,
+                "applied": applied,
+            }
+
+        if ss.state != TransportSessionState.CONNECTED or not client:
             raise HTTPException(409, f"Streaming session for '{name}' not connected")
 
         # Check if context window would change
@@ -8315,6 +8400,7 @@ npm run build</pre>
                 "agent": name,
                 "model": req.model,
                 "restarted": True,
+                "applied": "restarted",
                 "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
                 "old_turns": old_turns,
             }
@@ -8328,7 +8414,8 @@ npm run build</pre>
 
             # Persist only after the live session actually switched
             agents.register(name, model=req.model)
-            return {"updated": True, "agent": name, "model": req.model, "restarted": False}
+            return {"updated": True, "agent": name, "model": req.model,
+                    "restarted": False, "applied": "live"}
 
     @app.post("/agents/{name}/streaming/compact")
     async def compact_streaming_session(name: str):
@@ -8492,6 +8579,9 @@ npm run build</pre>
             "default_effort": default_effort,
             "session_effort": session_effort,
             "effective_effort": effective_effort,
+            # Runtime effort last reported by hooks ($CLAUDE_EFFORT) — the
+            # REPL's actual level, empty until the first tool call fires.
+            "live_effort": getattr(ss, "last_reported_effort", "") or None,
         }
 
     @app.post("/agents/{name}/message")
