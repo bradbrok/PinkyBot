@@ -7768,6 +7768,269 @@ class TestInflightDequeConcurrentDispatch:
 
 
 # ──────────────────────────────────────────────────────────────────────────
+# #846 — inflight watchdog kill-switch (watchdog_config.enabled) + replay caps
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestInflightWatchdogKillSwitch:
+    """(b) ``watchdog_config.enabled=false`` disables the per-session inflight
+    watchdog's force_restart decision — the same operator kill-switch the
+    daemon SessionWatchdog already respects (#846)."""
+
+    def test_watchdog_enabled_defaults_true_and_fails_open(self):
+        ss, _ = _make_session()
+        # No fn wired → enabled (default True).
+        assert ss._config.watchdog_enabled_fn is None
+        assert ss._watchdog_enabled() is True
+        # Explicit False.
+        ss._config.watchdog_enabled_fn = lambda: False
+        assert ss._watchdog_enabled() is False
+        # Explicit True.
+        ss._config.watchdog_enabled_fn = lambda: True
+        assert ss._watchdog_enabled() is True
+
+        # A raising fn must fail OPEN (return True) — a wiring bug must never
+        # silently disable stuck-REPL recovery.
+        def _boom():
+            raise RuntimeError("config lookup exploded")
+
+        ss._config.watchdog_enabled_fn = _boom
+        assert ss._watchdog_enabled() is True
+
+    @pytest.mark.asyncio
+    async def test_disabled_watchdog_skips_force_restart(self, monkeypatch):
+        """enabled=false → aged-out head with NULL live-status (would be
+        'wedged') is NOT force_restarted, and the deque is left intact. The
+        task stays alive so re-enabling takes effect live."""
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        ss, _ = _make_session()
+        ss._config.watchdog_enabled_fn = lambda: False
+        await ss.connect()
+        # Isolate the watchdog from the worker.
+        ss._worker_task.cancel()
+        try:
+            await ss._worker_task
+        except asyncio.CancelledError:
+            pass
+
+        force_called = asyncio.Event()
+
+        async def _stub(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})
+        ss._head_started_at = 0.0  # ancient → would trip immediately
+        assert ss._config.live_status_fn is None  # verdict would be "wedged"
+
+        # Give the watchdog many ticks — it must NOT force_restart.
+        with pytest.raises(asyncio.TimeoutError):
+            await asyncio.wait_for(force_called.wait(), timeout=0.3)
+        assert not force_called.is_set()
+        assert len(ss._inflight_metas) == 1, "disabled watchdog must not drain"
+        assert ss._stats.get("turn_timeouts", 0) == 0
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_enabled_watchdog_still_fires(self, monkeypatch):
+        """enabled=true (explicit) → aged-out quiet head with null live-status
+        still force_restarts, as before. Confirms the gate doesn't break the
+        normal recovery path."""
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+        # Disable pane-liveness so the wedged path doesn't spend the ~1.5s
+        # capture-pane sampling gap (orthogonal to the kill-switch under test).
+        monkeypatch.setenv("PINKY_WATCHDOG_PANE_LIVENESS", "0")
+
+        ss, _ = _make_session()
+        ss._config.watchdog_enabled_fn = lambda: True
+        await ss.connect()
+        ss._worker_task.cancel()
+        try:
+            await ss._worker_task
+        except asyncio.CancelledError:
+            pass
+
+        force_called = asyncio.Event()
+
+        async def _stub(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})
+        ss._head_started_at = 0.0
+
+        try:
+            await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail("enabled watchdog must still force_restart a wedged head")
+        assert ss._stats.get("turn_timeouts", 0) == 1
+
+        await ss.disconnect()
+
+
+class TestInflightWatchdogReplayCaps:
+    """(c) replay-amplification defenses on the watchdog requeue path (#846)."""
+
+    async def _wedge_once(self, ss, monkeypatch):
+        """Shrink the watchdog timers, disable pane-liveness (orthogonal ~1.5s
+        capture-pane gap), cancel the worker so it can't re-pull the requeue,
+        and stub force_restart. Returns an Event set when force_restart fires."""
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+        monkeypatch.setenv("PINKY_WATCHDOG_PANE_LIVENESS", "0")
+        ss._worker_task.cancel()
+        try:
+            await ss._worker_task
+        except asyncio.CancelledError:
+            pass
+        force_called = asyncio.Event()
+
+        async def _stub(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub
+        return force_called
+
+    @pytest.mark.asyncio
+    async def test_single_wedge_requeues_and_bumps_replay_count(self, monkeypatch):
+        """Single wedge → tail requeued normally, replay_count → 1."""
+        ss, _ = _make_session()
+        await ss.connect()
+        force_called = await self._wedge_once(ss, monkeypatch)
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})  # head
+        b_entry = _seed_inflight(ss, prompt="B", meta={"chat_id": "B"})  # tail
+        ss._head_started_at = 0.0
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        assert ss._message_queue.qsize() == 1
+        b_replay = ss._message_queue.get_nowait()
+        assert b_replay.prompt == "B"
+        assert b_replay is b_entry.turn
+        assert b_replay.replay_count == 1, "each requeue bumps the counter"
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_turn_dropped_after_replay_cap(self, monkeypatch):
+        """A turn already replayed cap-many times is DROPPED (not requeued);
+        its completion_event fires so any waiter unblocks."""
+        monkeypatch.setenv("PINKY_INFLIGHT_REPLAY_CAP", "3")
+
+        ss, _ = _make_session()
+        await ss.connect()
+        force_called = await self._wedge_once(ss, monkeypatch)
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})  # head
+        b_event = asyncio.Event()
+        b_entry = _seed_inflight(
+            ss, prompt="B", meta={"chat_id": "B"}, completion_event=b_event
+        )
+        # B has already been replayed 3 times (== cap). This wedge bumps it to
+        # 4 > 3 → drop.
+        b_entry.turn.replay_count = 3
+        ss._head_started_at = 0.0
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        assert ss._message_queue.qsize() == 0, "over-cap turn must NOT be requeued"
+        assert b_event.is_set(), "dropped turn fires its completion_event"
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_replay_cap_zero_disables_drop(self, monkeypatch):
+        """PINKY_INFLIGHT_REPLAY_CAP=0 disables the cap — high replay_count
+        still requeues (ops revert lever, no deploy)."""
+        monkeypatch.setenv("PINKY_INFLIGHT_REPLAY_CAP", "0")
+
+        ss, _ = _make_session()
+        await ss.connect()
+        force_called = await self._wedge_once(ss, monkeypatch)
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})
+        b_entry = _seed_inflight(ss, prompt="B", meta={"chat_id": "B"})
+        b_entry.turn.replay_count = 99  # way past any cap
+        ss._head_started_at = 0.0
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        assert ss._message_queue.qsize() == 1, "cap=0 disables the drop"
+        assert ss._message_queue.get_nowait().prompt == "B"
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_completed_turn_not_requeued(self, monkeypatch):
+        """A tail turn whose completion_event is ALREADY set (answered) must not
+        be requeued — that is the murzik duplicate-ack amplification."""
+        ss, _ = _make_session()
+        await ss.connect()
+        force_called = await self._wedge_once(ss, monkeypatch)
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})  # head
+        done_event = asyncio.Event()
+        done_event.set()  # B already completed
+        b_entry = _seed_inflight(
+            ss, prompt="B", meta={"chat_id": "B"}, completion_event=done_event
+        )
+        ss._head_started_at = 0.0
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        assert ss._message_queue.qsize() == 0, "already-completed turn not requeued"
+        assert b_entry.turn.replay_count == 0, "skip is before the counter bump"
+
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_tail_cap_respected(self, monkeypatch):
+        """No more than PINKY_INFLIGHT_REPLAY_TAIL_CAP tail entries are requeued
+        per restart; the overflow is dropped with completion_events fired."""
+        monkeypatch.setenv("PINKY_INFLIGHT_REPLAY_TAIL_CAP", "2")
+
+        ss, _ = _make_session()
+        await ss.connect()
+        force_called = await self._wedge_once(ss, monkeypatch)
+
+        _seed_inflight(ss, prompt="A", meta={"chat_id": "A"})  # head
+        events = {}
+        for name in ("B", "C", "D", "E"):
+            ev = asyncio.Event()
+            events[name] = ev
+            _seed_inflight(ss, prompt=name, meta={"chat_id": name}, completion_event=ev)
+        ss._head_started_at = 0.0
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        # Only the first 2 tail entries (B, C) requeued.
+        assert ss._message_queue.qsize() == 2
+        assert ss._message_queue.get_nowait().prompt == "B"
+        assert ss._message_queue.get_nowait().prompt == "C"
+        # Dropped overflow (D, E) fired their completion_events; requeued ones
+        # (B, C) did NOT (they wait for the actual rerun).
+        assert not events["B"].is_set()
+        assert not events["C"].is_set()
+        assert events["D"].is_set()
+        assert events["E"].is_set()
+
+        await ss.disconnect()
+
+
+# ──────────────────────────────────────────────────────────────────────────
 # #108 — StopFailure POST resolves the in-flight turn (turn-end-detection gap)
 # ──────────────────────────────────────────────────────────────────────────
 

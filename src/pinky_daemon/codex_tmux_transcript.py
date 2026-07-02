@@ -469,16 +469,38 @@ class CodexTmuxTranscriptTailer:
                 )
 
     def _try_self_heal_repoint(self) -> None:
-        """If the watched path is missing and a discovery callback is
-        configured, scan for the real rollout and rebind.
+        """Scan for the real rollout and rebind if a strictly-newer one exists.
 
-        Called once per poll tick. Cheap when the path exists (single
-        stat). Discovery is only paid when the path is missing.
+        Called once per poll tick. Runs discovery on EVERY tick (not just
+        when the bound path is missing) because ``codex resume --last``
+        writes to a BRAND-NEW rollout file — new session_meta/uuid — while
+        the old file it resumed from still exists on disk (#846). The
+        pre-#846 "only self-heal when the bound path is MISSING" guard
+        early-returned in exactly that case, so ``task_complete`` markers
+        landed in a file nobody read: the inflight-meta head never popped,
+        the watchdog force_restarted every ``_TURN_DONE_TIMEOUT_SEC``, and
+        each restart's ``codex resume`` replayed rollout history — a
+        self-amplifying loop.
+
+        Repoint iff BOTH hold:
+          - the discovered path differs from the bound path, AND
+          - the discovered file's mtime is STRICTLY newer than the bound
+            file's (a missing bound file counts as infinitely old, so the
+            original placeholder→real cold-start heal still fires).
+
+        The strictly-newer guard is load-bearing: in normal operation the
+        bound file IS the newest rollout for this cwd, so discovery returns
+        it and we no-op — no flap. It mirrors #291's never-repoint-backward
+        rule, inverted for the codex resume-writes-a-NEW-file case.
+
+        Repoint seeks to byte 0 (``seek_to_start=True``) so the
+        task_complete markers already accumulated on the new file are
+        consumed, draining the wedged inflight deque. The ``is_empty``
+        guard in ``_read_and_dispatch`` prevents firing empty turns.
+
         Errors are swallowed; the next tick retries.
         """
         if self._path_discovery is None:
-            return
-        if self._path.exists():
             return
         try:
             discovered = self._path_discovery()
@@ -490,13 +512,32 @@ class CodexTmuxTranscriptTailer:
             return
         if discovered is None:
             return
-        if Path(discovered) == self._path:
+        discovered = Path(discovered)
+        if discovered == self._path:
+            return
+        # mtime comparison — only advance to a STRICTLY newer rollout. A
+        # missing/unreadable bound file is treated as infinitely old so the
+        # cold-start placeholder→real heal always fires.
+        try:
+            bound_mtime = self._path.stat().st_mtime if self._path.exists() else None
+        except OSError:
+            bound_mtime = None
+        try:
+            discovered_mtime = discovered.stat().st_mtime
+        except OSError:
+            # Discovered file vanished between glob and stat — retry next tick.
+            return
+        if bound_mtime is not None and discovered_mtime <= bound_mtime:
+            # Not newer than what we're already reading — normal operation
+            # (bound file is the active rollout) or a stale older file. Do
+            # not repoint; this prevents flap.
             return
         _log(
-            f"codex_tailer[{self._agent_name}]: self-heal repointing "
-            f"{self._path} → {discovered}"
+            f"codex_tailer[{self._agent_name}]: self-heal repointing to newer "
+            f"rollout {self._path} (mtime={bound_mtime}) → {discovered} "
+            f"(mtime={discovered_mtime})"
         )
-        self.set_transcript_path(Path(discovered), seek_to_start=True)
+        self.set_transcript_path(discovered, seek_to_start=True)
         self._stats["self_heal_repoints"] += 1
 
     async def _read_and_dispatch(self) -> int:

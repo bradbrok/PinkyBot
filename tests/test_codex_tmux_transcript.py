@@ -731,20 +731,120 @@ class TestSelfHealDiscovery:
         assert tailer.stats["self_heal_repoints"] == 0
 
     @pytest.mark.asyncio
-    async def test_discovery_not_called_when_path_exists(self, transcript, tmp_path):
+    async def test_discovery_runs_every_tick_even_when_path_exists(
+        self, transcript, tmp_path
+    ):
+        """#846: discovery now runs on EVERY tick, not only when the bound path
+        is missing — ``codex resume --last`` writes a BRAND-NEW rollout while
+        the old (bound) one still exists on disk. But a discovered path that is
+        not strictly newer (here it doesn't exist → unreadable) must NOT
+        repoint."""
         cb = _Captor()
         call_count = {"n": 0}
 
         def discover() -> Path | None:
             call_count["n"] += 1
-            return tmp_path / "other.jsonl"
+            return tmp_path / "other.jsonl"  # never created → stat fails
 
         tailer = CodexTmuxTranscriptTailer(
-            transcript, cb,  # path exists (touched by fixture)
+            transcript, cb,  # bound path exists (touched by fixture)
             path_discovery=discover,
         )
         tailer._try_self_heal_repoint()
-        assert call_count["n"] == 0
+        assert call_count["n"] == 1, "discovery is consulted every tick now (#846)"
+        assert tailer.stats["self_heal_repoints"] == 0
+        assert tailer.transcript_path == transcript
+
+    @pytest.mark.asyncio
+    async def test_repoint_to_strictly_newer_rollout(self, tmp_path):
+        """#846 PRIMARY: tailer bound to an OLDER file A; a NEWER rollout B
+        (session_meta + task_complete) appears — the file ``codex resume
+        --last`` wrote. A tick must repoint A→B, reset the offset to 0
+        (seek_to_start), and drain the accumulated task_complete through the
+        callback so the wedged inflight head resolves."""
+        cb = _Captor()
+        cwd = str(tmp_path)
+        old = tmp_path / "rollout-old.jsonl"
+        _write_jsonl(old, [
+            _session_meta(cwd=cwd, session_id="old-uuid"),
+            _agent_message("stale"),
+            _task_complete(last_agent_message="Old reply."),
+        ])
+        new = tmp_path / "rollout-new.jsonl"
+        _write_jsonl(new, [
+            _session_meta(cwd=cwd, session_id="new-uuid"),
+            _agent_message("fresh"),
+            _task_complete(last_agent_message="Resumed reply."),
+        ])
+        # B strictly newer than A.
+        old_t = time.time() - 100
+        new_t = time.time()
+        os.utime(old, (old_t, old_t))
+        os.utime(new, (new_t, new_t))
+
+        tailer = CodexTmuxTranscriptTailer(
+            old, cb,
+            path_discovery=lambda: new,
+        )
+        # Bind offset to A's EOF (as _start_tailer does on a warm resume) so we
+        # prove seek_to_start=True resets it to 0.
+        tailer.set_offset(old.stat().st_size)
+        assert tailer.offset > 0
+
+        tailer._try_self_heal_repoint()
+        assert tailer.transcript_path == new
+        assert tailer.offset == 0
+        assert tailer.stats["self_heal_repoints"] == 1
+
+        await tailer.read_once()
+        assert len(cb.responses) == 1
+        assert cb.responses[0].text == "Resumed reply."
+
+    @pytest.mark.asyncio
+    async def test_no_repoint_when_bound_is_newest(self, tmp_path):
+        """#846 regression: when the bound file IS the newest rollout (normal
+        operation — the active rollout is the one being written), discovery
+        returns it and we no-op. No flap."""
+        cb = _Captor()
+        bound = tmp_path / "rollout-bound.jsonl"
+        _write_jsonl(bound, [_session_meta(cwd=str(tmp_path))])
+        older = tmp_path / "rollout-older.jsonl"
+        _write_jsonl(older, [_session_meta(cwd=str(tmp_path))])
+        now = time.time()
+        os.utime(older, (now - 50, now - 50))
+        os.utime(bound, (now, now))
+
+        # Discovery returns the OLDER file — the bound one is strictly newer.
+        tailer = CodexTmuxTranscriptTailer(
+            bound, cb,
+            path_discovery=lambda: older,
+        )
+        tailer._try_self_heal_repoint()
+        assert tailer.transcript_path == bound
+        assert tailer.stats["self_heal_repoints"] == 0
+
+    @pytest.mark.asyncio
+    async def test_no_repoint_when_discovered_not_strictly_newer(self, tmp_path):
+        """#846 edge: discovered file EXISTS and differs from the bound path but
+        its mtime is EQUAL (or older) — do NOT repoint (strictly-newer guard,
+        the inverted #291 never-repoint-backward rule)."""
+        cb = _Captor()
+        bound = tmp_path / "rollout-a.jsonl"
+        _write_jsonl(bound, [_session_meta(cwd=str(tmp_path))])
+        other = tmp_path / "rollout-b.jsonl"
+        _write_jsonl(other, [_session_meta(cwd=str(tmp_path))])
+        # Identical mtimes → not strictly newer.
+        stamp = time.time() - 10
+        os.utime(bound, (stamp, stamp))
+        os.utime(other, (stamp, stamp))
+
+        tailer = CodexTmuxTranscriptTailer(
+            bound, cb,
+            path_discovery=lambda: other,
+        )
+        tailer._try_self_heal_repoint()
+        assert tailer.transcript_path == bound
+        assert tailer.stats["self_heal_repoints"] == 0
 
     @pytest.mark.asyncio
     async def test_discovery_rebinds_with_seek_to_start(self, tmp_path):
