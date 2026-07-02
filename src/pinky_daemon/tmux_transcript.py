@@ -110,6 +110,12 @@ class _TurnBuffer:
         self._assistant_count: int = 0
         self._turn_started_at: float | None = None  # epoch seconds
         self._turn_ended_at: float | None = None
+        # Monotonic counter bumped each time an assistant entry carries a
+        # real usage block. Lets the tailer detect "this entry refreshed
+        # the usage snapshot" without re-parsing the entry — the hook for
+        # mid-turn context surfacing. Never reset by drain(): callers
+        # compare before/after values, not absolutes.
+        self._usage_seq: int = 0
 
     def feed(self, entry: dict) -> bool:
         """Process one transcript entry. Return True iff this closes a turn."""
@@ -164,9 +170,13 @@ class _TurnBuffer:
         sr = msg.get("stop_reason")
         if sr:
             self._last_stop_reason = sr
+        # Non-empty guard: synthetic/error rows can carry ``"usage": {}``
+        # — letting that overwrite would erase the last real snapshot
+        # right before drain() ships it in the TurnResponse.
         usage = msg.get("usage")
-        if isinstance(usage, dict):
+        if isinstance(usage, dict) and usage:
             self._last_usage = usage
+            self._usage_seq += 1
         # Capture the model that produced this turn. The configured model
         # (``config.model``) can be empty when the agent relies on Claude
         # Code's default, so the transcript's own ``model`` field is the
@@ -206,6 +216,16 @@ class _TurnBuffer:
         self._turn_ended_at = None
 
         return resp
+
+    @property
+    def usage_seq(self) -> int:
+        """Bumped per assistant entry that carried a real usage block."""
+        return self._usage_seq
+
+    @property
+    def last_usage(self) -> dict:
+        """Most recent usage block seen this turn ({} after drain)."""
+        return self._last_usage
 
     @property
     def is_empty(self) -> bool:
@@ -273,6 +293,7 @@ class TmuxTranscriptTailer:
         fallback_poll_sec: float = _FALLBACK_POLL_SEC,
         active_poll_sec: float = _ACTIVE_POLL_SEC,
         path_discovery: Callable[[], Path | None] | None = None,
+        on_usage: Callable[[dict], None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
         # #291: wall-clock when ``_path`` was last bound via an explicit
@@ -299,6 +320,17 @@ class TmuxTranscriptTailer:
         # This makes the tailer correct without dependence on the
         # SessionStart hook firing at all. See ``TmuxSession._discover_transcript_path``.
         self._path_discovery = path_discovery
+        # Mid-turn usage hook: invoked (sync) with the usage dict every
+        # time an assistant entry carries a fresh usage block — i.e. once
+        # per API call inside the turn's tool loop, not just at turn end.
+        # This is what keeps the context gauge live during long agentic
+        # turns: before it, usage sat in the buffer until the closing
+        # stop_hook_summary and the gauge showed the PREVIOUS turn's
+        # value for the whole in-flight turn. Sync on purpose — an await
+        # here would add a mid-chunk suspension point and reopen the
+        # transcript-swap race that ``_swap_generation`` guards around
+        # turn callbacks.
+        self._on_usage = on_usage
 
         self._offset: int = 0
         # Bumped by every path-changing ``set_transcript_path``. Lets
@@ -325,6 +357,9 @@ class TmuxTranscriptTailer:
             # #291: count self-heal discoveries we REFUSED because the
             # candidate predated the current bind (the stale-clobber guard).
             "self_heal_stale_skips": 0,
+            # Mid-turn usage callbacks fired (one per assistant entry
+            # that carried a fresh usage block).
+            "usage_events": 0,
         }
         # ``_active`` flips True after we see a user entry but before we see
         # the closing stop_hook_summary. Drives the tighter poll cadence so
@@ -697,6 +732,7 @@ class TmuxTranscriptTailer:
 
                 closes_turn = False
                 prevented = False
+                usage_seq_before = self._buffer.usage_seq
                 try:
                     closes_turn = self._buffer.feed(entry)
                     if closes_turn:
@@ -709,6 +745,24 @@ class TmuxTranscriptTailer:
                     )
 
                 bytes_read += len(line.encode("utf-8")) + 1  # +1 for the \n
+
+                # Mid-turn context surfacing: this entry refreshed the
+                # usage snapshot — hand it to the consumer NOW rather
+                # than letting it age in the buffer until turn end.
+                # Copy so the consumer can't mutate buffer state.
+                if (
+                    self._on_usage is not None
+                    and self._buffer.usage_seq != usage_seq_before
+                ):
+                    self._stats["usage_events"] += 1
+                    try:
+                        self._on_usage(dict(self._buffer.last_usage))
+                    except Exception as e:
+                        self._stats["callback_errors"] += 1
+                        _log(
+                            f"tmux_tailer[{self._agent_name}]: on_usage raised "
+                            f"({type(e).__name__}: {e}); continuing"
+                        )
 
                 if closes_turn and not self._buffer.is_empty:
                     response = self._buffer.drain(prevented_continuation=prevented)

@@ -1135,6 +1135,14 @@ class TmuxSession:
         # context_restart), so it can fire once per window.
         self._soft_nudge_fired = False
 
+        # Mid-turn context gauge. The tailer surfaces every assistant
+        # entry's usage block as it lands (``on_usage`` hook), not just
+        # at turn end; ``_on_transcript_usage`` folds it into
+        # ``usage.last_usage`` and schedules a coalesced
+        # ``context_usage`` emit. Single-flight task ref so a burst of
+        # entries in one read chunk produces one SSE, not N.
+        self._ctx_usage_emit_task: asyncio.Task | None = None
+
         # Effort knob. The stashed override feeds ``--effort`` on the next
         # relaunch (see ``_build_claude_cmd``); ``apply_effort_live`` also
         # tries to push it into the RUNNING REPL by typing the interactive
@@ -3993,6 +4001,61 @@ class TmuxSession:
             "mcp_tools": [],
         }
 
+    def _on_transcript_usage(self, usage: dict) -> None:
+        """Tailer ``on_usage`` hook: an assistant entry carried a fresh
+        usage block — fold it into the live context snapshot NOW.
+
+        Fires once per API call while a turn is in flight. This is what
+        makes the context gauge real-time: before this hook, usage sat in
+        the tailer's turn buffer until the closing ``stop_hook_summary``,
+        so a long tool-loop turn showed the PREVIOUS turn's context for
+        its entire duration — the gauge lagged by a whole turn.
+
+        Sync on purpose (the tailer calls it between entries in its read
+        loop, where an await would reopen the mid-chunk transcript-swap
+        race). The state update lands immediately — pull-based readers
+        (the heartbeat reconciler's ``context_used_pct``, the
+        streaming-status endpoint's ``get_context_info``) see it on
+        their next read — while the push side (``context_usage`` SSE +
+        nudge evaluation) rides a fire-and-forget task.
+
+        Coalescing: if an emit task is already in flight we skip
+        scheduling another — the in-flight one reads current state at
+        each step, and the turn-complete emit always runs and carries
+        the final value, so nothing is lost. This also serializes
+        ``_emit_context_usage_event`` bodies, keeping the nudge latch
+        check-and-set free of concurrent interleavings.
+        """
+        if not isinstance(usage, dict) or not usage:
+            return
+        self.usage.last_usage = dict(usage)
+        if (
+            self._ctx_usage_emit_task is not None
+            and not self._ctx_usage_emit_task.done()
+        ):
+            return
+        self._ctx_usage_emit_task = asyncio.create_task(
+            self._guarded_context_usage_emit(),
+            name=f"tmux_ctx_emit:{self.agent_name}",
+        )
+
+    async def _guarded_context_usage_emit(self) -> None:
+        """Exception fence for the fire-and-forget mid-turn emit task.
+
+        ``_emit_stream_event`` swallows its own errors, but the nudge
+        paths (``_enqueue_autorestart_nudge`` / ``_enqueue_internal_prompt``)
+        can raise — an unobserved task exception would just splat into
+        the loop's default handler. Telemetry must never look like a
+        crash.
+        """
+        try:
+            await self._emit_context_usage_event()
+        except Exception as e:
+            _log(
+                f"tmux[{self.agent_name}]: mid-turn context emit raised "
+                f"({type(e).__name__}: {e})"
+            )
+
     async def _emit_context_usage_event(self) -> None:
         """Emit a ``context_usage`` SSE event and a ``restart_nudge``
         when the cumulative token total crosses the agent's
@@ -4521,6 +4584,11 @@ class TmuxSession:
                 # is covered by ``_attempt_first_bind_recovery``
                 # (issue #565).
                 path_discovery=self._discover_transcript_path,
+                # Mid-turn context gauge: surface each assistant
+                # entry's usage block as it lands so context% tracks
+                # the live window instead of freezing at the previous
+                # turn's value for the whole in-flight turn.
+                on_usage=self._on_transcript_usage,
             )
             await self._tailer.start()
             if guessed is None:
@@ -4718,6 +4786,14 @@ class TmuxSession:
         ):
             self._first_bind_recovery_task.cancel()
         self._first_bind_recovery_task = None
+        # Cancel any in-flight mid-turn context emit — it belongs to the
+        # session that just ended; the next spawn re-emits fresh state.
+        if (
+            self._ctx_usage_emit_task is not None
+            and not self._ctx_usage_emit_task.done()
+        ):
+            self._ctx_usage_emit_task.cancel()
+        self._ctx_usage_emit_task = None
         if self._tailer is not None:
             try:
                 await self._tailer.stop()
