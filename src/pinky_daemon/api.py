@@ -6181,7 +6181,10 @@ npm run build</pre>
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        agents.update(name, thinking_effort=level)
+        # AgentRegistry has no update(); register() is the upsert and handles
+        # the thinking_effort field on existing agents (#151 follow-up — the
+        # prior agents.update() call raised AttributeError → 500).
+        agents.register(name, thinking_effort=level)
         return {"agent": name, "default": level}
 
     @app.post("/agents/{name}/sessions/{session_label}/effort")
@@ -8204,6 +8207,17 @@ npm run build</pre>
         ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
+        # #151: refresh the persistent effort from the registry before relaunch.
+        # The live session reuses its boot-time _config, so an out-of-band
+        # default change (direct DB write, PUT /agents/{name}/effort) is
+        # otherwise invisible until a full daemon restart — which meant native
+        # ultracode arming in _build_claude_cmd evaluated a stale effort and
+        # silently skipped. A session-level override (_effort_override, set via
+        # set_thinking_effort) still wins in effective_effort, so this only
+        # makes the stored default authoritative, never clobbers an override.
+        fresh = agents.get(name)
+        if fresh:
+            ss._config.thinking_effort = fresh.thinking_effort or "medium"
         # PR for #543: explicit launch-behavior contract — the next
         # transport spawn must NOT resume the prior conversation. For
         # SDK this is implicit (resume_handle="" already accomplishes
