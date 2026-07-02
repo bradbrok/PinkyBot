@@ -158,6 +158,19 @@
         { value: 'claude-haiku-4-5', label: 'Haiku 4.5' },
     ];
     let availableModels = fallbackModels;
+
+    // Full effort vocabulary (matches the backend's EFFORT_LEVELS minus
+    // "auto"). The old hardcoded low/medium/high/max list could not even
+    // REPRESENT xhigh/ultracode — a session running at those rendered a
+    // blank select.
+    const effortOptions = [
+        { value: 'low', label: 'Low' },
+        { value: 'medium', label: 'Medium' },
+        { value: 'high', label: 'High' },
+        { value: 'xhigh', label: 'XHigh' },
+        { value: 'max', label: 'Max' },
+        { value: 'ultracode', label: 'Ultracode' },
+    ];
     async function loadModelRegistry() {
         try {
             const registry = await api('GET', '/models');
@@ -586,7 +599,9 @@
             const agentData = await api('GET', `/agents/${agentName}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
             if (agentData.model && !selectedModel) selectedModel = agentData.model;
-            if (agentData.thinking_effort) selectedEffort = agentData.thinking_effort;
+            // Don't clobber the dropdown while a save is in flight — the
+            // session-level GET below refines this with the effective value.
+            if (agentData.thinking_effort && !savingEffort) selectedEffort = agentData.thinking_effort;
             if (agentData.restart_threshold_pct != null) contextNudgePct = agentData.restart_threshold_pct;
             if (agentData.context_nudge_threshold_pct != null && agentData.context_nudge_threshold_pct > 0) softNudgePct = agentData.context_nudge_threshold_pct;
             if (agentData.model) infoModel = agentData.model;
@@ -597,7 +612,7 @@
             const refreshLabel = activeSessionRecord?._streaming_label || labelFromSessionId(sessionId, agentName);
             const effortData = await api('GET', `/agents/${agentName}/effort?label=${encodeURIComponent(refreshLabel)}`);
             if (requestSeq !== chatRefreshSeq || sessionId !== activeSession) return;
-            if (effortData.effective) selectedEffort = effortData.effective;
+            if (effortData.effective && !savingEffort) selectedEffort = effortData.effective;
         } catch { /* non-critical */ }
 
         let gotStreamingContext = false;
@@ -1082,6 +1097,8 @@
                 addLocalMessage({ role: 'system', content: `Model changed to ${selectedModel} \u2014 session restarted for new context window (${result.old_turns} turns saved)` });
                 await refreshChat();
                 await refreshSessions();
+            } else if (result.applied === 'pending_restart') {
+                addLocalMessage({ role: 'system', content: `Model set to ${selectedModel} \u2014 session busy, applies on next restart` });
             } else {
                 addLocalMessage({ role: 'system', content: `Model switched to ${selectedModel} (mid-session, no restart needed)` });
             }
@@ -1115,7 +1132,15 @@
         savingEffort = true;
         try {
             const label = activeSessionRecord?._streaming_label || labelFromSessionId(activeSession, activeAgent);
-            await api('POST', `/agents/${activeAgent}/sessions/${encodeURIComponent(label)}/effort`, { effort: selectedEffort });
+            const result = await api('POST', `/agents/${activeAgent}/sessions/${encodeURIComponent(label)}/effort`, { effort: selectedEffort });
+            const applied = result.applied || 'pending_restart';
+            if (applied === 'live') {
+                toast(`Effort set to ${result.effective} (applied live)`, 'success');
+            } else if (applied === 'deferred') {
+                toast(`Effort set to ${result.effective} — applies when the agent finishes its current task`, 'success');
+            } else {
+                toast(`Effort saved as ${result.effective} — takes effect on next session restart`, 'success');
+            }
         } catch (e) { toast(`Failed to update effort: ${e.message}`, 'error'); }
         savingEffort = false;
     }
@@ -1418,10 +1443,12 @@
                     <label class="setting-item">
                         <span>{$_('agents_extra.effort_label')}</span>
                         <select bind:value={selectedEffort} on:change={saveEffort} disabled={savingEffort}>
-                            <option value="low">Low</option>
-                            <option value="medium">Medium</option>
-                            <option value="high">High</option>
-                            <option value="max">Max</option>
+                            {#each effortOptions as opt}
+                                <option value={opt.value}>{opt.label}</option>
+                            {/each}
+                            {#if selectedEffort && !effortOptions.some(o => o.value === selectedEffort)}
+                                <option value={selectedEffort}>{selectedEffort}</option>
+                            {/if}
                         </select>
                     </label>
                     <label class="setting-item" title={$_('chat.restart_threshold_help')}>
@@ -1474,7 +1501,12 @@
                         {#if sessionMeta.effective_effort}
                         <div class="session-info-row">
                             <span class="session-info-label">Effort</span>
-                            <span class="session-info-value">{sessionMeta.effective_effort}{sessionMeta.session_effort ? ' (override)' : ''}</span>
+                            <span class="session-info-value">
+                                {sessionMeta.effective_effort}{sessionMeta.session_effort ? ' (override)' : ''}
+                                {#if sessionMeta.live_effort && sessionMeta.live_effort !== (sessionMeta.effective_effort === 'ultracode' ? 'xhigh' : sessionMeta.effective_effort)}
+                                    <span class="session-info-warn" title="Runtime effort reported by the session's hooks differs from the configured level">(repl: {sessionMeta.live_effort})</span>
+                                {/if}
+                            </span>
                         </div>
                         {/if}
                     {/if}

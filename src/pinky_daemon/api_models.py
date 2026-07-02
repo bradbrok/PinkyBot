@@ -976,6 +976,10 @@ class TransportToolUseRequest(BaseModel):
     tool_input: dict = {}
     session_id: str = ""
     label: str = "main"
+    # Runtime thinking effort ($CLAUDE_EFFORT) piggybacked by the hook —
+    # lets the daemon track the REPL's actual effort without an extra
+    # request. Empty on CLIs predating the env var.
+    effort: str = ""
 
 
 class TransportToolResultRequest(BaseModel):

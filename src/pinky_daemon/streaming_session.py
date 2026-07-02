@@ -309,6 +309,10 @@ class StreamingSession:
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
+        # Runtime effort last reported by hooks ($CLAUDE_EFFORT via the
+        # effort-drift endpoint) — the CLI's actual level, "" until a hook
+        # reports. Read side of the effort knob (model/effort selector).
+        self.last_reported_effort: str = ""
         self._turn_seq = 0  # Monotonic turn counter for analytics
         self._last_user_message = ""  # For analytics keyword classification
 
@@ -442,9 +446,12 @@ class StreamingSession:
 
         # Apply thinking effort. ultracode resolves to xhigh (#151) — the SDK
         # forwards options.effort to the CLI's --effort flag, which rejects
-        # the literal "ultracode".
+        # the literal "ultracode". Medium is passed EXPLICITLY: the CLI
+        # persists the last effort per project dir, so omitting the option
+        # for medium-configured agents boots them at whatever the previous
+        # session ran at instead of medium.
         effort = resolve_cli_effort(self.effective_effort)
-        if effort and effort != "medium":
+        if effort and effort != "auto":
             options.effort = effort
 
         # Build provider env overrides (Ollama / custom compatible endpoints)

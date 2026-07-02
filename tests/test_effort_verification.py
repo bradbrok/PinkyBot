@@ -341,6 +341,15 @@ class TestHookInstaller:
         assert "sys.stdin.read()" in pre.read_text()
         assert "sys.stdin.read()" in post.read_text()
 
+    def test_pre_tool_hook_piggybacks_runtime_effort(self, tmp_path):
+        """The PreToolUse hook must carry $CLAUDE_EFFORT in its POST body so
+        the daemon can surface the REPL's ACTUAL effort per session (the
+        read side of the model/effort selector)."""
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        pre = (tmp_path / ".claude" / "hook_tmux_pre_tool.py").read_text()
+        assert 'os.environ.get("CLAUDE_EFFORT"' in pre
+        assert '"effort"' in pre
+
     def test_setup_settings_wires_pre_and_post_tool_use(self, tmp_path):
         AgentRegistry._setup_hooks(tmp_path, "alpha")
         settings = json.loads(

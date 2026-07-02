@@ -1025,6 +1025,20 @@ _AUTH_LOGIN_SETTLE_SEC = 2.5
 # slack between two send paths into the same pane.
 _NATIVE_ULTRACODE_SETTLE_SEC = 0.4
 
+# Live REPL control commands (/effort, /model — issue: model/effort selector).
+# Settle after typing a slash command so the CLI processes it (and renders a
+# confirmation dialog, if any) before the pane is inspected or reused.
+_REPL_COMMAND_SETTLE_SEC = 0.8
+# Case-insensitive substrings that identify the mid-session /effort
+# confirmation dialog ("Change effort level?" — the prompt-cache re-read
+# warning) in a pane capture. Deliberately narrow: the idle input line also
+# renders selector-ish glyphs, so generic markers would false-positive.
+_EFFORT_DIALOG_NEEDLES = ("change effort", "effort level?")
+# Same idea for a mid-session /model switch dialog, plus failure needles the
+# CLI prints for an unknown model id.
+_MODEL_DIALOG_NEEDLES = ("change model", "switch model?")
+_MODEL_ERROR_NEEDLES = ("unknown model", "invalid model", "not a valid model")
+
 
 class TmuxSession:
     """Agent session backed by an interactive ``claude`` REPL in tmux.
@@ -1121,12 +1135,25 @@ class TmuxSession:
         # context_restart), so it can fire once per window.
         self._soft_nudge_fired = False
 
-        # Effort knob. tmux's claude REPL doesn't currently honor a
-        # per-session effort override (CLAUDE_EFFORT env is set at
-        # spawn time and we'd have to relaunch to change it). We accept
-        # the call to keep the Transport contract consistent and log a
-        # warning when it's used.
+        # Effort knob. The stashed override feeds ``--effort`` on the next
+        # relaunch (see ``_build_claude_cmd``); ``apply_effort_live`` also
+        # tries to push it into the RUNNING REPL by typing the interactive
+        # ``/effort`` command when the pane is idle.
         self._effort_override: str | None = None
+        # Serializes typed REPL control commands (/effort, /model) against
+        # turn-prompt pastes — two send paths into the same pane. Held by
+        # ``_type_repl_command`` and by ``_deliver_turn`` around its sends.
+        self._repl_control_lock = asyncio.Lock()
+        # Effort level (CLI vocabulary) waiting to be typed into the REPL
+        # once the current work drains — armed by ``apply_effort_live`` when
+        # the pane is busy, consumed by ``_handle_turn_complete`` at idle.
+        self._pending_live_effort: str | None = None
+        # Actual runtime effort as last reported by hooks ($CLAUDE_EFFORT
+        # piggybacked on the PreToolUse tool-use POST, or a drift report).
+        # Empty until the first hook fires. This is the READ side of the
+        # effort knob — what the REPL is really running at, not what we
+        # asked for.
+        self.last_reported_effort: str = ""
 
         # Resume-handle update callback (e.g. AgentRegistry persistence).
         # For tmux the resume_handle is stable from construction (= session
@@ -1968,9 +1995,13 @@ class TmuxSession:
         )
 
     def set_effort(self, level: str) -> None:
-        """Accept the call for protocol parity. tmux's claude REPL doesn't
-        honor mid-session effort changes — log a warning and stash the
-        value. A force_restart picks it up on the relaunched REPL."""
+        """Stash a per-session effort override (Transport protocol parity).
+
+        The stash feeds ``--effort`` on the next REPL relaunch. Callers that
+        want the change pushed into the RUNNING REPL should use
+        ``apply_effort_live`` instead — it stashes AND types the interactive
+        ``/effort`` command into the pane.
+        """
         valid = set(EFFORT_LEVELS)
         if level not in valid:
             raise ValueError(
@@ -1978,12 +2009,173 @@ class TmuxSession:
             )
         self._effort_override = None if level == "auto" else level
         _log(
-            f"tmux[{self.agent_name}]: set_effort({level!r}) stashed — "
-            f"takes effect on next force_restart (REPL relaunch)"
+            f"tmux[{self.agent_name}]: set_effort({level!r}) stashed for "
+            f"next relaunch"
         )
 
     def clear_effort_override(self) -> None:
         self._effort_override = None
+
+    def _repl_busy(self) -> bool:
+        """True when typing a slash command into the pane is unsafe —
+        a turn is in flight (queued, pasted, or a foreground tool call
+        is running). Typed text would land in the input buffer and be
+        submitted as a MESSAGE instead of executed as a command."""
+        return bool(
+            self._inflight_metas
+            or not self._message_queue.empty()
+            or self._inflight_tool_calls
+        )
+
+    async def _type_repl_command(
+        self, command: str, *, dialog_needles: tuple[str, ...] = ()
+    ) -> bool:
+        """Type a slash command into the REPL and settle it (caller holds
+        ``_repl_control_lock``).
+
+        Mid-session, some commands (notably ``/effort``) pop a confirmation
+        dialog (the prompt-cache full re-read warning). When the post-send
+        pane tail matches one of ``dialog_needles``, press Enter to accept
+        the highlighted default. If the dialog survives the confirm, press
+        Escape to cancel — leaving a modal dialog open would wedge the next
+        pasted prompt — and report failure so the caller falls back to the
+        relaunch path.
+        """
+        res = await self._tmux.send_keys(command, enter=True)
+        if not res.ok:
+            _log(
+                f"tmux[{self.agent_name}]: repl command {command!r} send "
+                f"failed (rc={res.returncode})"
+            )
+            return False
+        await asyncio.sleep(_REPL_COMMAND_SETTLE_SEC)
+        if not dialog_needles:
+            return True
+
+        async def _pane_tail() -> str:
+            cap = await self._tmux.capture_pane(lines=25, join=True)
+            return (cap.stdout or "").lower() if cap.ok else ""
+
+        tail = await _pane_tail()
+        if not any(n in tail for n in dialog_needles):
+            return True
+        # Confirmation dialog — Enter accepts the highlighted default (Yes).
+        await self._tmux.send_keys("", enter=True)
+        await asyncio.sleep(_REPL_COMMAND_SETTLE_SEC)
+        tail = await _pane_tail()
+        if any(n in tail for n in dialog_needles):
+            # Dialog survived the confirm — cancel it rather than leave a
+            # modal open under the next prompt paste.
+            await self._tmux.send_keys("Escape", enter=False)
+            _log(
+                f"tmux[{self.agent_name}]: repl command {command!r} dialog "
+                f"did not clear — cancelled"
+            )
+            return False
+        return True
+
+    async def apply_effort_live(self, level: str) -> str:
+        """Set the per-session effort AND push it into the running REPL.
+
+        Returns how far the change got:
+
+        - ``"live"`` — ``/effort <level>`` was typed into the idle REPL
+          (confirmation dialog auto-accepted if one appeared).
+        - ``"deferred"`` — the REPL is mid-turn; the command is armed and
+          ``_handle_turn_complete`` types it when the work drains.
+        - ``"pending_restart"`` — the session isn't connected or the typed
+          command failed; the stashed override applies on the next
+          relaunch (``--effort`` flag).
+
+        The override is stashed in all three cases, so relaunches and
+        ``effective_effort`` readers agree with the requested level even
+        when the live push fails.
+        """
+        self.set_effort(level)  # validates + stashes ("auto" clears)
+        # Type the EFFECTIVE level verbatim — unlike the --effort flag, the
+        # interactive /effort accepts "ultracode" (that's how the native
+        # activation path types it too). effective_effort never returns
+        # "auto".
+        cli_level = self.effective_effort
+        if self.state != SessionState.CONNECTED or not cli_level:
+            return "pending_restart"
+        if self._repl_busy():
+            self._pending_live_effort = cli_level
+            return "deferred"
+        async with self._repl_control_lock:
+            # Re-check under the lock: a turn paste may have grabbed the
+            # lock (and appended its inflight meta) while we waited.
+            if self._repl_busy():
+                self._pending_live_effort = cli_level
+                return "deferred"
+            ok = await self._type_repl_command(
+                f"/effort {cli_level}",
+                dialog_needles=_EFFORT_DIALOG_NEEDLES,
+            )
+        if ok:
+            _log(f"tmux[{self.agent_name}]: /effort {cli_level} applied live")
+            return "live"
+        return "pending_restart"
+
+    async def _apply_pending_effort(self, cli_level: str) -> None:
+        """Type an armed ``/effort`` into the REPL at idle (task spawned by
+        ``_handle_turn_complete``). Re-arms if a new turn slipped in."""
+        async with self._repl_control_lock:
+            if self._repl_busy():
+                self._pending_live_effort = cli_level
+                return
+            ok = await self._type_repl_command(
+                f"/effort {cli_level}",
+                dialog_needles=_EFFORT_DIALOG_NEEDLES,
+            )
+        _log(
+            f"tmux[{self.agent_name}]: deferred /effort {cli_level} "
+            f"{'applied live' if ok else 'failed — applies on next relaunch'}"
+        )
+
+    async def apply_model_live(self, model: str) -> str:
+        """Switch the running REPL's model via the interactive ``/model``.
+
+        Unlike the SDK transport, the REPL handles a window-class change
+        (200k ↔ 1M) itself, so no restart is forced for it. Returns:
+
+        - ``"live"`` — typed into the idle REPL, no error printed.
+        - ``"pending_restart"`` — REPL busy / not connected / send failed;
+          ``_config.model`` is updated so the next relaunch boots with
+          ``--model <model>`` (and the context-cap math follows now).
+        - ``"rejected"`` — the CLI reported the model id as unknown;
+          config is left untouched so a relaunch can't wedge on a bad
+          ``--model`` flag.
+        """
+        model = (model or "").strip()
+        if not model:
+            return "rejected"
+        if self.state != SessionState.CONNECTED or self._repl_busy():
+            self._config.model = model
+            return "pending_restart"
+        async with self._repl_control_lock:
+            # Re-check under the lock: a turn paste may have grabbed the
+            # lock (and appended its inflight meta) while we waited.
+            if self._repl_busy():
+                self._config.model = model
+                return "pending_restart"
+            ok = await self._type_repl_command(
+                f"/model {model}", dialog_needles=_MODEL_DIALOG_NEEDLES
+            )
+            if not ok:
+                self._config.model = model
+                return "pending_restart"
+            cap = await self._tmux.capture_pane(lines=25, join=True)
+            tail = (cap.stdout or "").lower() if cap.ok else ""
+        if any(n in tail for n in _MODEL_ERROR_NEEDLES):
+            _log(
+                f"tmux[{self.agent_name}]: /model {model} rejected by CLI — "
+                f"config unchanged"
+            )
+            return "rejected"
+        self._config.model = model
+        _log(f"tmux[{self.agent_name}]: /model {model} applied live")
+        return "live"
 
     # ── Lifecycle methods ───────────────────────────────────────────────
 
@@ -2421,6 +2613,10 @@ class TmuxSession:
         # ``_has_completed_turn = True``. force_restart / attempt_reconnect
         # both flow through here, so this is the structural reset point.
         self._has_completed_turn = False
+        # A deferred live /effort armed against the PREVIOUS REPL is moot:
+        # the fresh launch carries the stashed override via --effort, and
+        # typing into the new pane's splash phase would get eaten anyway.
+        self._pending_live_effort = None
 
         # If a stale session is left over from a previous daemon run (e.g.
         # crash without graceful disconnect), reap it. We're the cold-start
@@ -2662,13 +2858,16 @@ class TmuxSession:
             parts.extend(["--model", self._config.model])
         # Thinking effort (#151). tmux historically never passed --effort, so a
         # configured effort was only hook-detected, never actually applied.
-        # Mirror the SDK contract — set --effort for any explicit non-medium
-        # level. ultracode resolves to xhigh because the CLI flag rejects the
-        # literal "ultracode" (it's only reachable via interactive /effort);
-        # the workflow-orchestration half is carried by ULTRACODE_DIRECTIVE in
+        # Pass the flag for EVERY resolved level — including medium. The CLI
+        # persists the last interactive /effort choice per project dir, so a
+        # flagless launch inherits whatever the previous session ran at; an
+        # explicit medium config must not boot at a stale xhigh. ultracode
+        # resolves to xhigh because the CLI flag rejects the literal
+        # "ultracode" (it's only reachable via interactive /effort); the
+        # workflow-orchestration half is carried by ULTRACODE_DIRECTIVE in
         # the system prompt.
         cli_effort = resolve_cli_effort(self.effective_effort)
-        if cli_effort and cli_effort not in ("medium", "auto"):
+        if cli_effort and cli_effort != "auto":
             parts.extend(["--effort", cli_effort])
 
         # #151 native ultracode activation. ultracode boots at --effort xhigh
@@ -4143,6 +4342,17 @@ class TmuxSession:
         self._current_activity = ""
         self._current_thinking = ""
         self._activity_log = []
+
+        # Deferred live effort (model/effort selector): an
+        # ``apply_effort_live`` call that arrived mid-turn armed
+        # ``_pending_live_effort``. The work just drained — type it into
+        # the now-idle REPL. Fire-and-forget task: the apply sequence
+        # sleeps between sends, and this callback runs on the tailer's
+        # read loop, which must not stall.
+        if self._pending_live_effort and not self._repl_busy():
+            pending = self._pending_live_effort
+            self._pending_live_effort = None
+            asyncio.create_task(self._apply_pending_effort(pending))
 
     async def handle_stop_failure(
         self,
@@ -5784,7 +5994,11 @@ class TmuxSession:
         # fresh session doesn't get wedged in claude's input buffer.
         # Wake-prompt timing is additionally protected by the readiness
         # gate above (#570 / Murzik #571 review).
-        result = await self._tmux.paste_text(turn.prompt, enter=True)
+        # Held under the REPL-control lock so a live /effort or /model
+        # apply (which sends, settles, and may confirm a dialog) can't
+        # interleave with this paste — two send paths into one pane.
+        async with self._repl_control_lock:
+            result = await self._tmux.paste_text(turn.prompt, enter=True)
         if not result.ok:
             # Send failed — no response will arrive. Re-arm turn_done
             # (back-compat) and unblock any wait_for_completion caller

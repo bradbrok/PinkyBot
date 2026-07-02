@@ -828,6 +828,10 @@ body = {{
     "tool_use_id": payload_in.get("tool_use_id", ""),
     "tool_name": tool_name,
     "tool_input": payload_in.get("tool_input") or {{}},
+    # Piggyback the runtime thinking effort (Claude Code v2.1.133+) so the
+    # daemon can surface what the REPL is ACTUALLY running at — the read
+    # side of the model/effort selector. Empty on older CLIs.
+    "effort": os.environ.get("CLAUDE_EFFORT", ""),
 }}
 
 req = urllib.request.Request(
