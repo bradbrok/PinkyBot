@@ -1246,3 +1246,120 @@ class TestSelfHealDiscovery:
         assert tailer.transcript_path == new, "must heal forward to the live file"
         assert tailer.stats["self_heal_repoints"] == 1
         assert tailer.stats["self_heal_stale_skips"] == 0
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# Mid-turn usage callback (real-time context gauge)
+# ──────────────────────────────────────────────────────────────────────────
+
+
+class TestMidTurnUsageCallback:
+    """``on_usage`` fires per assistant entry that carries a fresh usage
+    block — the hook that keeps context% live during long tool-loop
+    turns instead of freezing at the previous turn's value."""
+
+    @pytest.mark.asyncio
+    async def test_fires_per_assistant_entry_mid_turn(self, transcript):
+        cb = _Captor()
+        seen: list[dict] = []
+        tailer = TmuxTranscriptTailer(transcript, cb, on_usage=seen.append)
+        # A turn IN FLIGHT: three API calls, no stop_hook_summary yet.
+        _write_jsonl(transcript, [
+            _user(text="do a big thing"),
+            _assistant(text="", tool_use={"name": "Bash"},
+                       usage={"input_tokens": 1000, "output_tokens": 50}),
+            _assistant(text="", tool_use={"name": "Read"},
+                       usage={"input_tokens": 2000, "output_tokens": 60}),
+            _assistant(text="done",
+                       usage={"input_tokens": 3000, "output_tokens": 70}),
+        ])
+        await tailer.read_once()
+        # Turn hasn't closed — no turn callback yet — but usage surfaced
+        # three times, tracking the live window per API call.
+        assert cb.responses == []
+        assert [u["input_tokens"] for u in seen] == [1000, 2000, 3000]
+        assert tailer.stats["usage_events"] == 3
+
+    @pytest.mark.asyncio
+    async def test_not_fired_for_entries_without_usage(self, transcript):
+        cb = _Captor()
+        seen: list[dict] = []
+        tailer = TmuxTranscriptTailer(transcript, cb, on_usage=seen.append)
+        no_usage = _assistant(text="synthetic")
+        no_usage["message"]["usage"] = {}
+        del_usage = _assistant(text="missing")
+        del del_usage["message"]["usage"]
+        _write_jsonl(transcript, [_user(), no_usage, del_usage])
+        await tailer.read_once()
+        assert seen == []
+        assert tailer.stats["usage_events"] == 0
+
+    @pytest.mark.asyncio
+    async def test_empty_usage_does_not_clobber_last_real_snapshot(self, transcript):
+        """A trailing ``"usage": {}`` row must not erase the last real
+        usage block from the TurnResponse."""
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+        empty = _assistant(text="")
+        empty["message"]["usage"] = {}
+        _write_jsonl(transcript, [
+            _user(),
+            _assistant(text="real", usage={"input_tokens": 500, "output_tokens": 5}),
+            empty,
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
+        assert len(cb.responses) == 1
+        assert cb.responses[0].usage == {"input_tokens": 500, "output_tokens": 5}
+
+    @pytest.mark.asyncio
+    async def test_on_usage_exception_swallowed_and_turn_still_fires(self, transcript):
+        cb = _Captor()
+
+        def boom(usage: dict) -> None:
+            raise RuntimeError("gauge exploded")
+
+        tailer = TmuxTranscriptTailer(transcript, cb, on_usage=boom)
+        _write_jsonl(transcript, [
+            _user(),
+            _assistant(text="reply", usage={"input_tokens": 100, "output_tokens": 10}),
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
+        # Callback error is counted, tailing continues, turn completes.
+        assert len(cb.responses) == 1
+        assert cb.responses[0].text == "reply"
+        assert tailer.stats["callback_errors"] == 1
+
+    @pytest.mark.asyncio
+    async def test_callback_receives_copy_not_buffer_state(self, transcript):
+        cb = _Captor()
+        seen: list[dict] = []
+
+        def mutate(usage: dict) -> None:
+            seen.append(dict(usage))
+            usage["input_tokens"] = -999  # must not corrupt the buffer
+
+        tailer = TmuxTranscriptTailer(transcript, cb, on_usage=mutate)
+        _write_jsonl(transcript, [
+            _user(),
+            _assistant(text="reply", usage={"input_tokens": 100, "output_tokens": 10}),
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
+        assert seen == [{"input_tokens": 100, "output_tokens": 10}]
+        assert cb.responses[0].usage["input_tokens"] == 100
+
+    @pytest.mark.asyncio
+    async def test_no_callback_configured_is_no_op(self, transcript):
+        cb = _Captor()
+        tailer = TmuxTranscriptTailer(transcript, cb)
+        _write_jsonl(transcript, [
+            _user(),
+            _assistant(text="reply", usage={"input_tokens": 100, "output_tokens": 10}),
+            _stop_hook_summary(),
+        ])
+        await tailer.read_once()
+        assert len(cb.responses) == 1
+        # Stat counts CALLBACKS fired, not usage sightings — stays 0.
+        assert tailer.stats["usage_events"] == 0
