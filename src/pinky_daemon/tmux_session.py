@@ -791,6 +791,13 @@ class _QueuedTurn:
     # non-wake turns and for any internal turn whose enqueuer doesn't
     # care about post-delivery hooks.
     on_delivered: object = None  # Callable() -> None — fires on paste-success
+    # #846 — replay-amplification guard. Incremented each time the inflight
+    # watchdog requeues this turn for replay after a stuck-head force_restart.
+    # Once it exceeds ``_inflight_replay_cap()`` the watchdog DROPS the turn
+    # (fires its completion_event, logs loudly) instead of requeuing it again,
+    # so a never-clearing wedge can't replay the same turn forever and grow
+    # the deque unboundedly (the murzik #846 loop).
+    replay_count: int = 0
 
 
 @dataclass
@@ -989,6 +996,38 @@ def _inflight_hard_ceiling_sec() -> float:
     except (TypeError, ValueError):
         val = 3600.0
     return max(val, _TURN_DONE_TIMEOUT_SEC)
+
+
+# #846 — replay-amplification defense for the inflight watchdog. Each
+# force_restart requeues the stuck head's tail (and any in-hand) turn for
+# replay; codex resume then replays rollout history. If the underlying wedge
+# never clears, the same turns get replayed every ``_TURN_DONE_TIMEOUT_SEC``
+# and the deque GROWS unboundedly (the #846 murzik loop: 3→6→7). These caps
+# bound the blast radius so a stuck agent degrades instead of amplifying.
+def _inflight_replay_cap() -> int:
+    """Max times a single turn may be requeued for replay before it is DROPPED
+    (with a loud log) instead of replayed again (#846). Default 3;
+    ``PINKY_INFLIGHT_REPLAY_CAP=0`` disables the cap (revert to unbounded
+    replay without a deploy). Read per call so ops can flip it live."""
+    raw = os.environ.get("PINKY_INFLIGHT_REPLAY_CAP", "").strip()
+    try:
+        val = int(raw) if raw else 3
+    except (TypeError, ValueError):
+        val = 3
+    return max(0, val)
+
+
+def _inflight_replay_tail_cap() -> int:
+    """Max number of TAIL entries requeued for replay in a single force_restart
+    (#846). Bounds a pathological deque (amplified across prior cycles) from
+    all being replayed at once. Default 20; ``PINKY_INFLIGHT_REPLAY_TAIL_CAP=0``
+    disables the cap. Read per call so ops can flip it live."""
+    raw = os.environ.get("PINKY_INFLIGHT_REPLAY_TAIL_CAP", "").strip()
+    try:
+        val = int(raw) if raw else 20
+    except (TypeError, ValueError):
+        val = 20
+    return max(0, val)
 
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
@@ -5518,6 +5557,24 @@ class TmuxSession:
             f"inflight_tools={len(self._inflight_tool_calls)}"
         )
 
+    def _watchdog_enabled(self) -> bool:
+        """Whether this session's inflight watchdog is allowed to act (#846).
+
+        Reads ``self._config.watchdog_enabled_fn`` (wired in api.py to the
+        agent's ``watchdog_config.enabled``, evaluated per tick so a live
+        ``PUT /agents/{name}`` toggle takes effect without a respawn).
+        Default-ON: ``None`` fn, a fn that raises, or a non-callable all
+        return True — the watchdog fails OPEN so a wiring gap can't silently
+        disable stuck-REPL recovery.
+        """
+        fn = getattr(self._config, "watchdog_enabled_fn", None)
+        if fn is None:
+            return True
+        try:
+            return bool(fn())
+        except Exception:
+            return True
+
     async def _inflight_watchdog(self) -> None:
         """Age the ``_inflight_metas`` head; force_restart if it sticks.
 
@@ -5525,6 +5582,16 @@ class TmuxSession:
         worker used to enforce. With concurrent dispatch the worker no
         longer waits between turns, so the "stop hook never fires"
         failure mode needs a separate watcher.
+
+        **Kill-switch** (#846). ``watchdog_config.enabled=false`` now
+        disables BOTH the daemon ``SessionWatchdog`` (existing behavior,
+        session_watchdog.py:127,158,371,395) AND this per-session inflight
+        recovery — one operator kill-switch for all watchdog force_restarts.
+        When disabled we ``continue`` at the TOP of the loop (skip the
+        force_restart decision) but KEEP the task alive, so re-enabling
+        takes effect on the next tick with no respawn. Before #846 the
+        inflight watchdog ignored the toggle entirely, so an agent with
+        ``enabled: false`` (murzik) still got force_restarted in a loop.
 
         **Head-age, not paste-age** (Murzik review point #1). When a
         turn becomes the deque head (either by being the first append
@@ -5581,6 +5648,12 @@ class TmuxSession:
         try:
             while self.state == SessionState.CONNECTED:
                 await asyncio.sleep(_WATCHDOG_TICK_SEC)
+                # #846 kill-switch: if watchdog_config.enabled=false, skip the
+                # force_restart decision but keep the loop alive so re-enabling
+                # takes effect live (no respawn). Checked at the TOP so nothing
+                # below (verdict, pane-liveness sampling, force_restart) runs.
+                if not self._watchdog_enabled():
+                    continue
                 now = time.time()
                 verdict = self._inflight_stall_verdict(now)
                 if verdict == "ok":
@@ -5769,9 +5842,63 @@ class TmuxSession:
                 # B then C. (Pre-paste-retry edge: deque empty, in_hand
                 # is the sole entry — ``tail_entries`` is empty, so
                 # in_hand becomes the lone replay entry, correct.)
+                # #846 replay-amplification defense (defense-in-depth):
+                #  - skip requeue of any turn whose completion_event is
+                #    already SET (it was answered — replaying re-processes an
+                #    answered turn, the murzik duplicate-ack amplification),
+                #  - increment a per-turn replay counter and DROP a turn once
+                #    it exceeds ``_inflight_replay_cap()`` (default 3) instead
+                #    of requeuing it forever,
+                #  - cap the number of TAIL entries requeued per restart at
+                #    ``_inflight_replay_tail_cap()`` (default 20) so a deque
+                #    already amplified across prior cycles can't all replay.
+                # Dropped turns fire their completion_event so any
+                # wait_for_completion caller unblocks (definitively abandoned).
+                replay_cap = _inflight_replay_cap()
+                tail_cap = _inflight_replay_tail_cap()
+
+                def _consider_replay(t: _QueuedTurn, *, kind: str) -> bool:
+                    ev = t.completion_event
+                    if ev is not None and ev.is_set():
+                        _log(
+                            f"tmux[{self.agent_name}]: skipping replay of "
+                            f"already-completed {kind} turn "
+                            f"(completion_event set) — #846"
+                        )
+                        return False
+                    t.replay_count += 1
+                    if replay_cap and t.replay_count > replay_cap:
+                        _log(
+                            f"tmux[{self.agent_name}]: DROPPING {kind} turn "
+                            f"after {t.replay_count - 1} replay(s) "
+                            f"(cap={replay_cap}) instead of requeuing — #846 "
+                            f"replay-amplification guard"
+                        )
+                        if ev is not None and not ev.is_set():
+                            ev.set()
+                        return False
+                    return True
+
                 replay: list[_QueuedTurn] = []
-                replay.extend(entry.turn for entry in tail_entries)
-                if in_hand is not None:
+                tail_replayed = 0
+                for i, entry in enumerate(tail_entries):
+                    if tail_cap and tail_replayed >= tail_cap:
+                        remaining = tail_entries[i:]
+                        _log(
+                            f"tmux[{self.agent_name}]: tail replay cap "
+                            f"{tail_cap} reached — dropping {len(remaining)} "
+                            f"remaining tail turn(s) (#846); firing their "
+                            f"completion_events"
+                        )
+                        for dropped in remaining:
+                            de = dropped.turn.completion_event
+                            if de is not None and not de.is_set():
+                                de.set()
+                        break
+                    if _consider_replay(entry.turn, kind="tail"):
+                        replay.append(entry.turn)
+                        tail_replayed += 1
+                if in_hand is not None and _consider_replay(in_hand, kind="in_hand"):
                     replay.append(in_hand)
                 if replay:
                     # Prepend ``replay`` to ``_message_queue``: drain
@@ -5792,7 +5919,8 @@ class TmuxSession:
                     _log(
                         f"tmux[{self.agent_name}]: requeued "
                         f"{len(replay)} turn(s) for replay after "
-                        f"force_restart (tail={len(tail_entries)}, "
+                        f"force_restart (tail={tail_replayed}/"
+                        f"{len(tail_entries)}, "
                         f"in_hand={'yes' if in_hand else 'no'})"
                     )
 

@@ -3135,6 +3135,13 @@ def create_api(
             on_wake_delivered=_log_agent_wake_event,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             live_status_fn=lambda _agent_name=agent_name: _agent_live_status.get(_agent_name),
+            # #846 — expose watchdog_config.enabled to the tmux inflight
+            # watchdog so it honors the same operator kill-switch the daemon
+            # SessionWatchdog already respects. Deferred (called per watchdog
+            # tick) so a live PUT /agents/{name} toggle takes effect without a
+            # session respawn. Mirrors live_status_fn's per-tick closure and
+            # reuses the _get_watchdog_config merge (single source of truth).
+            watchdog_enabled_fn=lambda _agent_name=agent_name: _get_watchdog_config(_agent_name).enabled,
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
             timezone=agents.get_owner_profile().get("timezone", "America/Los_Angeles"),
