@@ -64,6 +64,7 @@ calendar = [
     "cryptography>=41.0",
 ]
 web = ["camoufox>=0.4", "markdownify>=1.0", "beautifulsoup4>=4.12"]
+qbo = ["requests>=2.32"]
 voice = ["twilio>=9.0", "anthropic>=0.98"]
 local-embeddings = ["sentence-transformers>=2.0"]
 all = [
@@ -79,7 +80,7 @@ dev = [
 pinky = "pinky_cli.__main__:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub", "src/pinky_web", "src/pinky_federation", "src/pinky_identity"]
+packages = ["src/pinky_memory", "src/pinky_outreach", "src/pinky_messaging", "src/pinky_daemon", "src/pinky_cli", "src/pinky_self", "src/pinky_calendar", "src/pinky_hub", "src/pinky_web", "src/pinky_federation", "src/pinky_identity", "src/pinky_qbo"]
 
 [tool.ruff]
 target-version = "py311"
