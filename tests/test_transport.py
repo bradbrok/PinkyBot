@@ -58,7 +58,8 @@ class _StubTransport:
         chat_id: str = "",
         message_id: str = "",
         agent_hint: str = "",
-    ) -> None: ...
+    ) -> bool:
+        return True
 
     async def force_restart(self) -> bool:
         return True

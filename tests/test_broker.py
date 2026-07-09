@@ -249,12 +249,16 @@ class TestMessageBrokerRouting:
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     _FakeStreaming.sent.append(prompt)
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
             assert registry.get("barsik").last_seen_at == 0.0
 
-            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert ok is True
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            # Handoff succeeded but the fake advertises no capability →
+            # fail-closed unconfirmed.
+            assert confirmed is False
             assert registry.get("barsik").last_seen_at > 0.0
             assert _FakeStreaming.sent  # delivery happened
         finally:
@@ -265,8 +269,9 @@ class TestMessageBrokerRouting:
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             # No streaming session registered — inject should fail without stamping.
-            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert ok is False
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is False
+            assert confirmed is False
             assert registry.get("barsik").last_seen_at == 0.0
         finally:
             tmpdir.cleanup()
@@ -286,10 +291,11 @@ class TestMessageBrokerRouting:
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     recorded.append((platform, chat_id))
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
-            ok = await broker.inject_agent_message("pushok", "barsik", "review please")
-            assert ok is True
+            delivered, _ = await broker.inject_agent_message("pushok", "barsik", "review please")
+            assert delivered is True
             assert recorded == [("agent", "pushok")]
         finally:
             tmpdir.cleanup()
@@ -312,11 +318,217 @@ class TestMessageBrokerRouting:
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     recorded.append((platform, chat_id))
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
-            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert ok is True
+            delivered, _ = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
             assert recorded == [("", "")]
+        finally:
+            tmpdir.cleanup()
+
+    # ── Fail-closed delivery + check-inbox nudge (#215 PR3) ────────
+    # Confirmation is per-inject: computed by inject_agent_message on the SAME
+    # session object it injected through — transport capability AND the
+    # per-call send() handoff (Murzik #853 P1).
+
+    @pytest.mark.asyncio
+    async def test_inject_result_fail_closed_without_session(self):
+        """No live session → (delivered=False, confirmed=False): never retire
+        the durable copy."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            result = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert result == (False, False)
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_unconfirmed_for_tmux_transport(self):
+        """A tmux-style transport (capability False) never confirms even on a
+        successful enqueue handoff — its inject is best-effort behind an
+        external pane → (True, False)."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _Tmuxish:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = False
+
+                async def send(self, *a, **k):
+                    return True  # enqueue succeeded — still not consumption
+
+            broker.register_streaming("barsik", _Tmuxish(), label="main")
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            assert confirmed is False
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_confirmed_for_sdk_transport_success(self):
+        """SDK-style transport (capability True) + successful per-call handoff
+        → (True, True): the durable copy may be retired."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _Sdkish:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = True
+
+                async def send(self, *a, **k):
+                    return True  # client.query() accepted this message
+
+            broker.register_streaming("barsik", _Sdkish(), label="main")
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            assert confirmed is True
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_unconfirmed_when_sdk_handoff_fails(self):
+        """#853 P1: capability True must NOT overrule a failed per-call
+        handoff. An SDK send whose client.query() raised internally (swallowed
+        + reconnect, returns False) → (True, False): the exact message that
+        failed stays unretired."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _SdkishFailing:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = True
+
+                async def send(self, *a, **k):
+                    return False  # query raised; exception swallowed upstream
+
+            broker.register_streaming("barsik", _SdkishFailing(), label="main")
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            assert confirmed is False
+        finally:
+            tmpdir.cleanup()
+
+    class _NudgeComms:
+        def __init__(self, unread: int):
+            self._unread = unread
+
+        def unread_count(self, session_id: str) -> int:
+            return self._unread
+
+    def _tmux_nudge_session(self):
+        from pinky_daemon.transport_state import SessionState
+
+        class _TmuxNudge:
+            state = SessionState.CONNECTED
+            injection_confirms_consumption = False
+
+            def __init__(self):
+                self.nudges: list[tuple[str, str]] = []
+
+            async def send(self, *a, **k):
+                pass
+
+            async def _enqueue_internal_prompt(self, prompt, *, reason, **kw):
+                self.nudges.append((prompt, reason))
+
+        return _TmuxNudge()
+
+    @pytest.mark.asyncio
+    async def test_notify_unread_enqueues_nudge_for_tmux(self):
+        """A tmux target with unread messages gets one readiness-gated nudge
+        via the internal-prompt queue."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            session = self._tmux_nudge_session()
+            broker.register_streaming("barsik", session, label="main")
+            fired = await broker.notify_unread_agent_messages(self._NudgeComms(2), "barsik")
+            assert fired is True
+            assert len(session.nudges) == 1
+            prompt, reason = session.nudges[0]
+            assert reason == "agent_msg_notify"
+            assert "2 unread agent messages" in prompt
+            assert "check_inbox" in prompt
+            assert broker._stats["nudged"] == 1
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_notify_unread_coalesces_within_window(self):
+        """A burst collapses to a single nudge (no storm)."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            session = self._tmux_nudge_session()
+            broker.register_streaming("barsik", session, label="main")
+            comms = self._NudgeComms(3)
+            assert await broker.notify_unread_agent_messages(comms, "barsik") is True
+            # Second delivery in the same burst → coalesced, no new nudge.
+            assert await broker.notify_unread_agent_messages(comms, "barsik") is False
+            assert len(session.nudges) == 1
+            assert broker._stats["nudged"] == 1
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_notify_unread_flag_off_no_nudge(self, monkeypatch):
+        """PINKYBOT_AGENT_MSG_NOTIFY off → no nudge (kill-switch)."""
+        import pinky_daemon.broker as broker_mod
+
+        monkeypatch.setattr(broker_mod, "_AGENT_MSG_NOTIFY_ENABLED", False)
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            session = self._tmux_nudge_session()
+            broker.register_streaming("barsik", session, label="main")
+            fired = await broker.notify_unread_agent_messages(self._NudgeComms(5), "barsik")
+            assert fired is False
+            assert session.nudges == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_notify_unread_noop_for_non_tmux_transport(self):
+        """An SDK-style session (no internal-prompt queue) is never nudged —
+        its live-inject already confirmed consumption."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _Sdkish:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = True
+
+                async def send(self, *a, **k):
+                    pass
+
+            broker.register_streaming("barsik", _Sdkish(), label="main")
+            fired = await broker.notify_unread_agent_messages(self._NudgeComms(2), "barsik")
+            assert fired is False
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_notify_unread_noop_when_nothing_unread(self):
+        """Nothing unread → no nudge."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            session = self._tmux_nudge_session()
+            broker.register_streaming("barsik", session, label="main")
+            fired = await broker.notify_unread_agent_messages(self._NudgeComms(0), "barsik")
+            assert fired is False
+            assert session.nudges == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_notify_unread_noop_without_session(self):
+        """No live session → no nudge (durable unread row is the backstop)."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            fired = await broker.notify_unread_agent_messages(self._NudgeComms(4), "barsik")
+            assert fired is False
         finally:
             tmpdir.cleanup()
 

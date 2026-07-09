@@ -8608,7 +8608,7 @@ npm run build</pre>
             parent_message_id=req.parent_message_id,
             priority=req.priority,
         )
-        delivered = await broker.inject_agent_message(
+        delivered, confirmed = await broker.inject_agent_message(
             req.from_agent, name, req.message,
         )
         # Auto-wake sleeping agents on inter-agent messages
@@ -8617,19 +8617,42 @@ npm run build</pre>
             try:
                 streaming = await _ensure_streaming_session(name, label="main")
                 if streaming and streaming.state == TransportSessionState.CONNECTED:
-                    delivered = await broker.inject_agent_message(
+                    delivered, confirmed = await broker.inject_agent_message(
                         req.from_agent, name, req.message,
                     )
                     if delivered:
                         _log(f"api: agent message delivered after auto-wake {name}")
             except Exception as e:
                 _log(f"api: auto-wake failed for {name}: {e}")
-        if delivered:
-            # Agent saw it live — mark as read so it doesn't repeat on wake
+        # Fail-closed retire: only mark the durable inbox copy read when the
+        # inject POSITIVELY confirmed consumption. ``confirmed`` comes from the
+        # inject call itself — computed by the broker on the exact session
+        # object that performed the inject (per-call send() handoff AND the
+        # transport capability; Murzik #853 P1 — no second session lookup that
+        # could race a swap, and a transport-static capability can't overrule a
+        # failed handoff, e.g. an SDK query that raised). ``delivered`` alone
+        # (attempt-level) is exactly what black-holed codex-tmux messages: the
+        # row went read=1 while the paste vanished, so check_inbox (unread-only)
+        # never surfaced it. Unconfirmed → the row stays unread+queued and
+        # check_inbox remains the durable backstop.
+        if confirmed:
             comms.mark_read(name, [msg.id])
+        else:
+            # Left durably queued (unread). Nudge tmux targets to check their
+            # inbox (best-effort, coalesced, PINKYBOT_AGENT_MSG_NOTIFY). No-op
+            # for SDK / offline / unknown transports.
+            try:
+                await broker.notify_unread_agent_messages(comms, name)
+            except Exception as e:
+                _log(f"api: check-inbox nudge for {name} failed: {e}")
+        # ``queued`` stays ``not delivered`` (unchanged tool semantics): it flags
+        # "no live session — will see on wake". A live-injected-but-unconfirmed
+        # tmux delivery is NOT reported as offline; ``confirmed`` carries the
+        # honest "was the durable copy retired?" signal for observability.
         return {
             "delivered": delivered,
             "queued": not delivered,
+            "confirmed": confirmed,
             "message_id": msg.id,
             "from": req.from_agent,
             "to": name,

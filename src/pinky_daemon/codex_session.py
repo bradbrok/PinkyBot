@@ -86,6 +86,14 @@ class CodexSession:
     interface so the broker/API can treat them interchangeably.
     """
 
+    # ``send`` only appends to the in-memory ``_message_queue``; a worker
+    # later runs ``codex exec`` out-of-process. Enqueue is NOT consumption,
+    # so an inject through this transport never confirms — the durable comms
+    # inbox copy stays unread until check_inbox. (Explicit for clarity; the
+    # broker's getattr default is False anyway.) See
+    # MessageBroker.inject_agent_message / InjectResult.
+    injection_confirms_consumption: bool = False
+
     def __init__(
         self,
         config: StreamingSessionConfig,
@@ -421,7 +429,7 @@ class CodexSession:
         chat_id: str = "",
         message_id: str = "",
         agent_hint: str = "",
-    ) -> None:
+    ) -> bool:
         """Send a message to the agent. Non-blocking — queued for processing.
 
         Args:
@@ -433,13 +441,18 @@ class CodexSession:
                 stored in conversation history (e.g. reply-platform hints).
                 Mirrors StreamingSession.send so the broker can call both
                 session types polymorphically.
+
+        Returns the per-call handoff bool of the Transport ``send`` contract
+        (#853 P1): ``True`` on successful enqueue, ``False`` on drop. Enqueue
+        is not consumption — ``injection_confirms_consumption`` is False, so
+        the broker never confirms an inject off this value alone.
         """
         if self.state != SessionState.CONNECTED:
             _log(
                 f"codex[{self.agent_name}]: not connected "
                 f"(state={self.state.value}), dropping message"
             )
-            return
+            return False
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
@@ -466,6 +479,7 @@ class CodexSession:
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         await self._message_queue.put((queued_prompt, platform, chat_id, message_id))
         _log(f"codex[{self.agent_name}]: queued message (chat={chat_id})")
+        return True
 
     async def _message_worker(self) -> None:
         """Process queued messages sequentially via codex exec."""

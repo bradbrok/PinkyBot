@@ -228,7 +228,7 @@ class Transport(Protocol):
         chat_id: str = "",
         message_id: str = "",
         agent_hint: str = "",
-    ) -> None:
+    ) -> bool:
         """Send a message to the agent. Non-blocking.
 
         Args:
@@ -240,6 +240,18 @@ class Transport(Protocol):
             agent_hint: Reply-platform context appended to the query but
                 NOT stored in conversation history. Lets the agent know
                 where to reply without polluting the persistent record.
+
+        Returns:
+            Per-call handoff bool (#853): ``True`` when the transport
+            accepted THIS message (SDK ``client.query`` succeeded / turn
+            enqueued for a pane worker), ``False`` when it was dropped or
+            the handoff failed. Handoff is NOT consumption — whether a
+            truthy handoff also confirms consumption is declared by the
+            transport's ``injection_confirms_consumption`` class attr
+            (``True`` only for in-process SDK streams; ``False`` for
+            external-pane tmux/codex transports). The broker combines
+            both into ``InjectResult.confirmed``; only a confirmed inject
+            may retire the durable comms inbox copy.
 
         **Caller contract.** Callers must ensure the transport is in
         ``SessionState.CONNECTED`` before invoking ``send``. ``send`` itself
@@ -253,11 +265,12 @@ class Transport(Protocol):
         is either CONNECTED or terminally DEAD, then call ``send``.
 
         Behavior when called while NOT CONNECTED is **unspecified by this
-        Protocol**:
+        Protocol** beyond the return value:
 
-        - Current ``StreamingSession`` drops silently (legacy; see
-          ``streaming_session.py:send``).
-        - Future backends MAY raise instead.
+        - Current ``StreamingSession`` drops silently and returns ``False``
+          (see ``streaming_session.py:send``).
+        - Future backends MAY raise instead; if they return, a dropped
+          message MUST be reported as ``False``, never ``True``.
 
         Callers must not depend on the drop-vs-raise behavior; if you need
         delivery guarantees during non-CONNECTED windows, drive the

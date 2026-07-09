@@ -14,6 +14,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pinky_daemon.broker import InjectResult
 from pinky_daemon.pollers import (
     _PURCHASE_APPROVE_ACTION_ID,
     _PURCHASE_REJECT_ACTION_ID,
@@ -36,7 +37,11 @@ def _make_poller(
     adapter.bot_token = "xoxb-test"
     adapter.respond_via_url = MagicMock()
     broker = MagicMock()
-    broker.inject_agent_message = AsyncMock(return_value=inject_ok)
+    # inject_agent_message returns an InjectResult; the poller destructures
+    # (delivered, _confirmed) and keys the Slack card feedback off delivered.
+    broker.inject_agent_message = AsyncMock(
+        return_value=InjectResult(delivered=inject_ok, confirmed=False)
+    )
 
     if registry is None and registry is not False:
         registry = MagicMock()
