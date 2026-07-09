@@ -230,10 +230,12 @@ class StreamingSession:
     """
 
     # An in-process transport: ``send`` calls ``client.query`` which enqueues
-    # straight into the live turn stream. A successful inject is a positive
-    # handoff, so the broker may retire (mark read) the durable comms inbox
-    # copy on inject. Contrast TmuxSession (external pane) which sets this
-    # False. See MessageBroker.injection_confirms_consumption.
+    # straight into the live turn stream, and returns a PER-CALL handoff bool
+    # (False when the query raised — swallowed + reconnect, #853 P1). The
+    # broker confirms an inject only when this capability AND that per-call
+    # handoff are both true, and only then retires (marks read) the durable
+    # comms inbox copy. Contrast TmuxSession (external pane) which sets this
+    # False. See MessageBroker.inject_agent_message / InjectResult.
     injection_confirms_consumption: bool = True
 
     def __init__(
@@ -648,7 +650,7 @@ class StreamingSession:
         chat_id: str = "",
         message_id: str = "",
         agent_hint: str = "",
-    ) -> None:
+    ) -> bool:
         """Send a message to the agent. Non-blocking — returns immediately.
 
         Args:
@@ -658,10 +660,18 @@ class StreamingSession:
             message_id: The source message_id to route reactions back to.
             agent_hint: Extra context appended to the query but NOT stored in
                 conversation history (e.g. reply-platform hints).
+
+        Returns:
+            Per-call handoff bool (#853 P1): ``True`` when ``client.query()``
+            accepted THIS message; ``False`` when it was dropped (not
+            connected) or the query raised. The exception path is unchanged —
+            swallowed, reconnect attempted, no raise — it just reports the
+            failed handoff so the broker never treats this exact message as
+            consumed (the capability attr alone must not confirm).
         """
         if self.state != SessionState.CONNECTED or not self._client:
             _log(f"streaming[{self.agent_name}]: not connected, dropping message")
-            return
+            return False
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
@@ -689,11 +699,13 @@ class StreamingSession:
             # system/internal turn can't consume a user turn's routing.
             self._pending_chats.append((platform, chat_id, message_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
+            return True
         except Exception as e:
             self._stats["errors"] += 1
             _log(f"streaming[{self.agent_name}]: send error: {e}")
             # Try to reconnect
             await self.attempt_reconnect()
+            return False
 
     async def _reader_loop(self) -> None:
         """Background loop that reads responses and fires callbacks."""

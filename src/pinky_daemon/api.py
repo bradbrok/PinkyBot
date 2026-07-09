@@ -8608,7 +8608,7 @@ npm run build</pre>
             parent_message_id=req.parent_message_id,
             priority=req.priority,
         )
-        delivered = await broker.inject_agent_message(
+        delivered, confirmed = await broker.inject_agent_message(
             req.from_agent, name, req.message,
         )
         # Auto-wake sleeping agents on inter-agent messages
@@ -8617,7 +8617,7 @@ npm run build</pre>
             try:
                 streaming = await _ensure_streaming_session(name, label="main")
                 if streaming and streaming.state == TransportSessionState.CONNECTED:
-                    delivered = await broker.inject_agent_message(
+                    delivered, confirmed = await broker.inject_agent_message(
                         req.from_agent, name, req.message,
                     )
                     if delivered:
@@ -8625,16 +8625,16 @@ npm run build</pre>
             except Exception as e:
                 _log(f"api: auto-wake failed for {name}: {e}")
         # Fail-closed retire: only mark the durable inbox copy read when the
-        # target's transport POSITIVELY confirms the injected message will be
-        # consumed. ``delivered`` (inject returned True) only means the session
-        # was CONNECTED and ``send`` didn't raise — for a tmux/codex agent that
-        # is a best-effort enqueue behind an external pane, so a dead / busy /
-        # mid-turn / restarted pane silently drops it. Marking read on that bare
-        # bool is exactly what black-holed codex-tmux messages: the row went
-        # read=1, so check_inbox (unread-only) never surfaced it. Keep the row
-        # unread+queued unless consumption is confirmed (SDK in-process query),
-        # so check_inbox remains the durable backstop.
-        confirmed = delivered and broker.injection_confirms_consumption(name)
+        # inject POSITIVELY confirmed consumption. ``confirmed`` comes from the
+        # inject call itself — computed by the broker on the exact session
+        # object that performed the inject (per-call send() handoff AND the
+        # transport capability; Murzik #853 P1 — no second session lookup that
+        # could race a swap, and a transport-static capability can't overrule a
+        # failed handoff, e.g. an SDK query that raised). ``delivered`` alone
+        # (attempt-level) is exactly what black-holed codex-tmux messages: the
+        # row went read=1 while the paste vanished, so check_inbox (unread-only)
+        # never surfaced it. Unconfirmed → the row stays unread+queued and
+        # check_inbox remains the durable backstop.
         if confirmed:
             comms.mark_read(name, [msg.id])
         else:

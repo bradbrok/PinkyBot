@@ -1175,7 +1175,11 @@ class BrokerSlackPoller:
         )
 
         try:
-            delivered = await self._broker.inject_agent_message(
+            # InjectResult: attempt-level ``delivered`` is the right signal
+            # here (the Slack card feedback means "routed to agent");
+            # ``confirmed`` is comms-inbox retire semantics and this path has
+            # no comms row to retire.
+            delivered, _confirmed = await self._broker.inject_agent_message(
                 "slack-approval", self._agent_name, msg
             )
         except Exception as e:

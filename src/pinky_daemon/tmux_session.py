@@ -3226,20 +3226,26 @@ class TmuxSession:
         chat_id: str = "",
         message_id: str = "",
         agent_hint: str = "",
-    ) -> None:
+    ) -> bool:
         """Queue a turn for delivery to the in-pane claude REPL.
 
         Non-blocking. Callers must ensure ``state == CONNECTED`` before
         calling (per Transport contract). Behavior when called while
         non-CONNECTED: drop with a log line (matches StreamingSession's
         legacy behavior).
+
+        Returns the per-call handoff bool of the Transport ``send`` contract
+        (#853 P1): ``True`` on successful ENQUEUE, ``False`` on drop. Note
+        for this transport an enqueue is still not consumption — the class
+        sets ``injection_confirms_consumption = False``, so the broker never
+        confirms off this value alone.
         """
         if self.state != SessionState.CONNECTED:
             _log(
                 f"tmux[{self.agent_name}]: not connected (state={self.state.value}), "
                 f"dropping message"
             )
-            return
+            return False
 
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
@@ -3263,6 +3269,7 @@ class TmuxSession:
             message_id=message_id,
         ))
         _log(f"tmux[{self.agent_name}]: queued message (chat={chat_id})")
+        return True
 
     async def _enqueue_internal_prompt(
         self,

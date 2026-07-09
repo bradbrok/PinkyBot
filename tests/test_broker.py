@@ -249,12 +249,16 @@ class TestMessageBrokerRouting:
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     _FakeStreaming.sent.append(prompt)
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
             assert registry.get("barsik").last_seen_at == 0.0
 
-            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert ok is True
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            # Handoff succeeded but the fake advertises no capability →
+            # fail-closed unconfirmed.
+            assert confirmed is False
             assert registry.get("barsik").last_seen_at > 0.0
             assert _FakeStreaming.sent  # delivery happened
         finally:
@@ -265,8 +269,9 @@ class TestMessageBrokerRouting:
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             # No streaming session registered — inject should fail without stamping.
-            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert ok is False
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is False
+            assert confirmed is False
             assert registry.get("barsik").last_seen_at == 0.0
         finally:
             tmpdir.cleanup()
@@ -286,10 +291,11 @@ class TestMessageBrokerRouting:
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     recorded.append((platform, chat_id))
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
-            ok = await broker.inject_agent_message("pushok", "barsik", "review please")
-            assert ok is True
+            delivered, _ = await broker.inject_agent_message("pushok", "barsik", "review please")
+            assert delivered is True
             assert recorded == [("agent", "pushok")]
         finally:
             tmpdir.cleanup()
@@ -312,29 +318,36 @@ class TestMessageBrokerRouting:
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
                     recorded.append((platform, chat_id))
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
-            ok = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert ok is True
+            delivered, _ = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
             assert recorded == [("", "")]
         finally:
             tmpdir.cleanup()
 
     # ── Fail-closed delivery + check-inbox nudge (#215 PR3) ────────
+    # Confirmation is per-inject: computed by inject_agent_message on the SAME
+    # session object it injected through — transport capability AND the
+    # per-call send() handoff (Murzik #853 P1).
 
     @pytest.mark.asyncio
-    async def test_injection_confirms_consumption_fail_closed_without_session(self):
-        """No live session → not confirmed (never retire the durable copy)."""
+    async def test_inject_result_fail_closed_without_session(self):
+        """No live session → (delivered=False, confirmed=False): never retire
+        the durable copy."""
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
-            assert broker.injection_confirms_consumption("barsik") is False
+            result = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert result == (False, False)
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_injection_confirms_consumption_false_for_tmux_transport(self):
-        """A tmux-style transport (advertises False) does NOT confirm — its
-        live-inject is a best-effort enqueue behind an external pane."""
+    async def test_inject_unconfirmed_for_tmux_transport(self):
+        """A tmux-style transport (capability False) never confirms even on a
+        successful enqueue handoff — its inject is best-effort behind an
+        external pane → (True, False)."""
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
             from pinky_daemon.transport_state import SessionState
@@ -344,16 +357,19 @@ class TestMessageBrokerRouting:
                 injection_confirms_consumption = False
 
                 async def send(self, *a, **k):
-                    pass
+                    return True  # enqueue succeeded — still not consumption
 
             broker.register_streaming("barsik", _Tmuxish(), label="main")
-            assert broker.injection_confirms_consumption("barsik") is False
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            assert confirmed is False
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_injection_confirms_consumption_true_for_sdk_transport(self):
-        """An SDK-style in-process transport (advertises True) confirms."""
+    async def test_inject_confirmed_for_sdk_transport_success(self):
+        """SDK-style transport (capability True) + successful per-call handoff
+        → (True, True): the durable copy may be retired."""
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
             from pinky_daemon.transport_state import SessionState
@@ -363,10 +379,36 @@ class TestMessageBrokerRouting:
                 injection_confirms_consumption = True
 
                 async def send(self, *a, **k):
-                    pass
+                    return True  # client.query() accepted this message
 
             broker.register_streaming("barsik", _Sdkish(), label="main")
-            assert broker.injection_confirms_consumption("barsik") is True
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            assert confirmed is True
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_unconfirmed_when_sdk_handoff_fails(self):
+        """#853 P1: capability True must NOT overrule a failed per-call
+        handoff. An SDK send whose client.query() raised internally (swallowed
+        + reconnect, returns False) → (True, False): the exact message that
+        failed stays unretired."""
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _SdkishFailing:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = True
+
+                async def send(self, *a, **k):
+                    return False  # query raised; exception swallowed upstream
+
+            broker.register_streaming("barsik", _SdkishFailing(), label="main")
+            delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
+            assert delivered is True
+            assert confirmed is False
         finally:
             tmpdir.cleanup()
 

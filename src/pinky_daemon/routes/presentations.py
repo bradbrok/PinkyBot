@@ -362,7 +362,9 @@ async def generate_presentation_from_research(req: GeneratePresentationRequest):
     agent_cfg = _agents.get_agent(req.agent_name)
     if not agent_cfg:
         raise HTTPException(404, f"Agent '{req.agent_name}' not found")
-    # Route through the broker to the agent's active session
+    # Route through the broker to the agent's active session. The InjectResult
+    # is deliberately discarded: this endpoint reports queued unconditionally
+    # (pre-existing semantics) and has no durable comms copy to retire.
     await _broker.inject_agent_message("system", req.agent_name, prompt)
     return {"queued": True, "agent": req.agent_name, "topic_id": req.topic_id}
 

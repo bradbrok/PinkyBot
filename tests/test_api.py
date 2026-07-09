@@ -218,6 +218,35 @@ class TestStreamingSession:
         session.attempt_reconnect.assert_awaited_once()
 
     @pytest.mark.asyncio
+    async def test_send_returns_per_call_handoff(self):
+        """#853 P1: StreamingSession.send() reports THIS call's handoff —
+        True when client.query() succeeded, False when the exception path was
+        taken (swallow + reconnect preserved, no raise). The broker ANDs this
+        with the transport capability to decide whether an injected agent
+        message may retire its durable inbox copy."""
+        from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
+        from pinky_daemon.transport_state import SessionState
+
+        session = StreamingSession(StreamingSessionConfig(agent_name="test-agent"))
+        session._state_machine._state = SessionState.CONNECTED
+
+        class OkClient:
+            async def query(self, prompt):
+                pass
+
+        session._client = OkClient()
+        assert await session.send("hello", platform="web", chat_id="c1") is True
+
+        class FailingClient:
+            async def query(self, prompt):
+                raise RuntimeError("boom")
+
+        session._client = FailingClient()
+        session.attempt_reconnect = AsyncMock()
+        assert await session.send("hello2", platform="web", chat_id="c1") is False
+        session.attempt_reconnect.assert_awaited_once()
+
+    @pytest.mark.asyncio
     async def test_send_video_is_classified_as_outreach_tool(self):
         """send_video must be in the outreach set so a video-send turn is marked
         used_outreach_tools=True — otherwise plain_text_fallback could deliver the
@@ -486,6 +515,8 @@ class TestAPI:
 
         async def send(self, prompt: str, platform: str = "", chat_id: str = ""):
             self.sent.append((prompt, platform, chat_id))
+            # Transport send contract (#853 P1): per-call handoff bool.
+            return True
 
         async def disconnect(self):
             self.disconnect_calls += 1
@@ -643,6 +674,45 @@ class TestAPI:
                 assert body["confirmed"] is True
                 # Confirmed handoff → durable copy retired.
                 assert app.state.comms.unread_count("gemma") == 0
+
+    def test_agent_message_sdk_failed_handoff_stays_unread(self):
+        """#853 P1 regression: the SDK capability is transport-static, but
+        StreamingSession.send() swallows a failed client.query() (reconnect,
+        no raise) and reports handoff=False. That exact message must NOT be
+        retired: durable row stays unread, response says confirmed=false, and
+        the nudge no-ops for SDK (no internal-prompt queue)."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "gemma", "model": "sonnet"})
+
+                session = self._FakeStreamingSession("gemma", "main")
+                session.injection_confirms_consumption = True
+
+                async def _failing_send(prompt, platform="", chat_id=""):
+                    # SDK-fidelity: client.query() raised; StreamingSession
+                    # swallowed it, scheduled reconnect, and reports the
+                    # failed per-call handoff.
+                    return False
+
+                session.send = _failing_send
+                app.state.broker.register_streaming("gemma", session, label="main")
+
+                resp = client.post("/agents/gemma/message", json={
+                    "from_agent": "barsik", "message": "important verdict",
+                })
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["delivered"] is True   # attempt-level unchanged
+                assert body["confirmed"] is False  # handoff failed → no retire
+                # No mark_read — the message is still visible to check_inbox.
+                assert app.state.comms.unread_count("gemma") == 1
+                inbox = client.get("/sessions/gemma/inbox?unread_only=true").json()
+                assert len(inbox["messages"]) == 1
+                assert "important verdict" in inbox["messages"][0]["content"]
+                # SDK session has no tmux internal-prompt queue → no nudge.
+                assert app.state.broker._stats["nudged"] == 0
 
     def test_register_isolation_mode_round_trips(self):
         """#149 phase-3: POST /agents carries isolation_mode through to the

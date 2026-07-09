@@ -18,6 +18,7 @@ import tempfile
 import time
 import urllib.request
 from dataclasses import dataclass, field
+from typing import NamedTuple
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.auth_relay import coordinator as _auth_relay
@@ -71,6 +72,28 @@ except (TypeError, ValueError):
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+class InjectResult(NamedTuple):
+    """Outcome of a live agent-message injection attempt.
+
+    ``delivered`` — attempt-level: the target had a CONNECTED session and the
+    inject was handed to its transport (legacy bool semantics; drives the
+    offline auto-wake path and the API's ``queued`` flag).
+
+    ``confirmed`` — outcome-level: THIS message's handoff was positively
+    confirmed by the exact session object that performed the inject (the
+    transport's ``injection_confirms_consumption`` capability AND the
+    per-call ``send()`` handoff bool). Only a confirmed inject may retire the
+    durable comms inbox copy (mark it read); anything less keeps the row
+    unread so ``check_inbox`` remains the backstop. (Murzik #853 P1: a
+    transport-static capability alone must never overrule a failed handoff,
+    and confirmation must not come from a second session lookup that can
+    race a session swap.)
+    """
+
+    delivered: bool
+    confirmed: bool
 
 
 def _make_gif_preview(src_path: str) -> str | None:
@@ -1358,12 +1381,24 @@ class MessageBroker:
 
     async def inject_agent_message(
         self, from_agent: str, to_agent: str, message: str,
-    ) -> bool:
-        """Inject a message from one agent into another's streaming session."""
+    ) -> InjectResult:
+        """Inject a message from one agent into another's streaming session.
+
+        Returns an :class:`InjectResult`. ``confirmed`` is computed HERE, on
+        the exact session object that performed the inject, in the same call:
+        the transport's ``injection_confirms_consumption`` capability ANDed
+        with the per-call handoff bool returned by that session's ``send()``.
+        This closes both halves of Murzik's #853 P1: a transport-static
+        capability can't overrule a failed handoff (e.g. StreamingSession's
+        swallowed ``client.query`` exception now returns handoff=False), and
+        there is no second session lookup that could race a session swap.
+        Fail-closed: a transport that doesn't advertise the capability, or a
+        ``send()`` that doesn't report a truthy handoff, never confirms.
+        """
         streaming = self._get_streaming_session(to_agent)
         if not streaming or streaming.state != SessionState.CONNECTED:
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
-            return False
+            return InjectResult(delivered=False, confirmed=False)
 
         from datetime import datetime
         from datetime import timezone as tz
@@ -1375,40 +1410,25 @@ class MessageBroker:
             # (see ``route_agent_reply``). The ``platform="agent"`` sentinel is
             # intercepted in the response callback before normal platform
             # routing; ``chat_id`` carries the requester agent name.
-            await streaming.send(
+            handoff = await streaming.send(
                 prompt, platform=AGENT_REPLY_PLATFORM, chat_id=from_agent
             )
         else:
-            await streaming.send(prompt)
+            handoff = await streaming.send(prompt)
+        confirmed = bool(handoff) and bool(
+            getattr(streaming, "injection_confirms_consumption", False)
+        )
         # Server-side presence: successful delivery = agent is reachable
         try:
             self._registry.stamp_last_seen(to_agent)
         except Exception as e:
             _log(f"broker: stamp_last_seen failed for {to_agent}: {e}")
         self._stats["routed"] += 1
-        _log(f"broker: injected agent message {from_agent} -> {to_agent}")
-        return True
-
-    def injection_confirms_consumption(self, to_agent: str) -> bool:
-        """Does the target's live transport positively confirm that an injected
-        agent message will actually be consumed?
-
-        ``inject_agent_message`` returning ``True`` only means "session was
-        CONNECTED and ``send`` didn't raise". For an in-process transport (SDK
-        ``StreamingSession``) that IS a positive handoff — ``send`` enqueues
-        straight into the live turn stream. For a tmux/codex transport it is
-        NOT: ``send`` merely appends to a volatile in-memory queue drained by a
-        worker that pastes into an EXTERNAL pane; a dead / mid-turn / restarted
-        or stale-CONNECTED pane silently drops the paste and the queue is lost
-        on teardown. So the durable comms inbox copy may only be retired
-        (marked read) on inject when this returns ``True``.
-
-        Fail-closed: an unknown / missing session (or a transport that doesn't
-        advertise the capability) returns ``False`` — never retire the durable
-        copy on an unconfirmed inject.
-        """
-        session = self._get_streaming_session(to_agent)
-        return bool(getattr(session, "injection_confirms_consumption", False))
+        _log(
+            f"broker: injected agent message {from_agent} -> {to_agent} "
+            f"(confirmed={confirmed})"
+        )
+        return InjectResult(delivered=True, confirmed=confirmed)
 
     async def notify_unread_agent_messages(self, comms, to_agent: str) -> bool:
         """Best-effort nudge (#215 PR3): tell a tmux-transport agent it has
