@@ -1090,6 +1090,16 @@ class TmuxSession:
     (the response capture pipeline is the principal remaining gap).
     """
 
+    # ``send`` only appends a turn to the in-memory ``_message_queue``; a
+    # worker later pastes it into an EXTERNAL tmux pane. A dead / mid-turn /
+    # restarted or stale-CONNECTED pane silently drops the paste and the queue
+    # is lost on teardown, so a successful inject is NOT a positive handoff.
+    # The durable comms inbox stays the source of truth (fail-closed): the
+    # broker must never mark an agent message read merely because it was
+    # injected here. Inherited by CodexTmuxSession. See
+    # MessageBroker.injection_confirms_consumption.
+    injection_confirms_consumption: bool = False
+
     def __init__(
         self,
         config: StreamingSessionConfig,

@@ -8624,12 +8624,35 @@ npm run build</pre>
                         _log(f"api: agent message delivered after auto-wake {name}")
             except Exception as e:
                 _log(f"api: auto-wake failed for {name}: {e}")
-        if delivered:
-            # Agent saw it live — mark as read so it doesn't repeat on wake
+        # Fail-closed retire: only mark the durable inbox copy read when the
+        # target's transport POSITIVELY confirms the injected message will be
+        # consumed. ``delivered`` (inject returned True) only means the session
+        # was CONNECTED and ``send`` didn't raise — for a tmux/codex agent that
+        # is a best-effort enqueue behind an external pane, so a dead / busy /
+        # mid-turn / restarted pane silently drops it. Marking read on that bare
+        # bool is exactly what black-holed codex-tmux messages: the row went
+        # read=1, so check_inbox (unread-only) never surfaced it. Keep the row
+        # unread+queued unless consumption is confirmed (SDK in-process query),
+        # so check_inbox remains the durable backstop.
+        confirmed = delivered and broker.injection_confirms_consumption(name)
+        if confirmed:
             comms.mark_read(name, [msg.id])
+        else:
+            # Left durably queued (unread). Nudge tmux targets to check their
+            # inbox (best-effort, coalesced, PINKYBOT_AGENT_MSG_NOTIFY). No-op
+            # for SDK / offline / unknown transports.
+            try:
+                await broker.notify_unread_agent_messages(comms, name)
+            except Exception as e:
+                _log(f"api: check-inbox nudge for {name} failed: {e}")
+        # ``queued`` stays ``not delivered`` (unchanged tool semantics): it flags
+        # "no live session — will see on wake". A live-injected-but-unconfirmed
+        # tmux delivery is NOT reported as offline; ``confirmed`` carries the
+        # honest "was the durable copy retired?" signal for observability.
         return {
             "delivered": delivered,
             "queued": not delivered,
+            "confirmed": confirmed,
             "message_id": msg.id,
             "from": req.from_agent,
             "to": name,

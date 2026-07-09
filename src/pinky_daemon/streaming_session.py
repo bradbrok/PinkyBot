@@ -229,6 +229,13 @@ class StreamingSession:
     - Response callback fires when agent finishes a turn
     """
 
+    # An in-process transport: ``send`` calls ``client.query`` which enqueues
+    # straight into the live turn stream. A successful inject is a positive
+    # handoff, so the broker may retire (mark read) the durable comms inbox
+    # copy on inject. Contrast TmuxSession (external pane) which sets this
+    # False. See MessageBroker.injection_confirms_consumption.
+    injection_confirms_consumption: bool = True
+
     def __init__(
         self,
         config: StreamingSessionConfig,

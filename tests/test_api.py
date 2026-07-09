@@ -576,6 +576,74 @@ class TestAPI:
                 assert len(data) == 1
                 assert data[0]["id"] == "adhoc"
 
+    def test_agent_message_tmux_stays_unread_and_nudges(self):
+        """Fail-closed inter-agent delivery (#215 PR3): a tmux-transport
+        target's live-inject does NOT retire the durable inbox copy. The
+        message stays unread, check_inbox still surfaces it, and the target is
+        nudged to read its inbox. This is the codex-tmux black-hole fix."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "murzik", "model": "sonnet"})
+
+                # tmux-style transport: inject is best-effort (not confirmed),
+                # and it exposes the internal-prompt queue used for the nudge.
+                session = self._FakeStreamingSession("murzik", "main")
+                session.injection_confirms_consumption = False
+                nudges: list[tuple[str, str]] = []
+
+                async def _enqueue_internal_prompt(prompt, *, reason, **kw):
+                    nudges.append((prompt, reason))
+
+                session._enqueue_internal_prompt = _enqueue_internal_prompt
+                app.state.broker.register_streaming("murzik", session, label="main")
+
+                resp = client.post("/agents/murzik/message", json={
+                    "from_agent": "barsik", "message": "review chez#104 please",
+                })
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["delivered"] is True   # live-inject happened
+                assert body["confirmed"] is False  # but not confirmed → not retired
+
+                # Durable copy remains UNREAD — the whole point of the fix.
+                assert app.state.comms.unread_count("murzik") == 1
+                # ... so check_inbox (unread-only) still returns it.
+                inbox = client.get("/sessions/murzik/inbox?unread_only=true").json()
+                msgs = inbox["messages"]
+                assert len(msgs) == 1
+                assert "review chez#104" in msgs[0]["content"]
+                assert msgs[0]["read"] == 0
+                # ... and the target was nudged (once) to check its inbox.
+                assert len(nudges) == 1
+                assert nudges[0][1] == "agent_msg_notify"
+                assert "check_inbox" in nudges[0][0]
+
+    def test_agent_message_sdk_confirmed_marks_read(self):
+        """An in-process (SDK) transport confirms consumption, so the durable
+        copy IS retired (marked read) — preserves the working path's
+        no-repeat-on-wake behavior and avoids duplicates."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "gemma", "model": "sonnet"})
+
+                session = self._FakeStreamingSession("gemma", "main")
+                session.injection_confirms_consumption = True
+                app.state.broker.register_streaming("gemma", session, label="main")
+
+                resp = client.post("/agents/gemma/message", json={
+                    "from_agent": "barsik", "message": "fyi heads up",
+                })
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["delivered"] is True
+                assert body["confirmed"] is True
+                # Confirmed handoff → durable copy retired.
+                assert app.state.comms.unread_count("gemma") == 0
+
     def test_register_isolation_mode_round_trips(self):
         """#149 phase-3: POST /agents carries isolation_mode through to the
         stored agent; default is 'local'."""

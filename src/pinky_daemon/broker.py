@@ -46,6 +46,28 @@ _AGENT_REPLY_ROUTING_ENABLED = os.environ.get(
     "PINKY_AGENT_REPLY_ROUTING", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
 
+# #215 PR3 / fail-closed inter-agent delivery: when an agent message is left
+# durably queued (unread) for a tmux-transport target, nudge that target to
+# call ``check_inbox`` so it retrieves the message promptly. The nudge is
+# best-effort — the DURABLE truth is the unread comms row; this only makes
+# retrieval timely when the pane is alive. Coalesced (one per burst) and
+# readiness-gated (can't corrupt a mid-turn pane). Default ON; disable with
+# ``PINKYBOT_AGENT_MSG_NOTIFY=0`` to kill a bad interaction without a rollback.
+# NOTE: the fail-closed mark-read fix in the API handler is deliberately NOT
+# gated by this flag — only the notify nudge is.
+_AGENT_MSG_NOTIFY_ENABLED = os.environ.get(
+    "PINKYBOT_AGENT_MSG_NOTIFY", "1"
+).strip().lower() not in ("0", "false", "no", "off")
+
+# Coalesce window for the check-inbox nudge: at most one nudge per target per
+# window, so a burst of messages collapses to a single nudge (never a storm).
+try:
+    _AGENT_MSG_NUDGE_BACKOFF_SEC = float(
+        os.environ.get("PINKYBOT_AGENT_MSG_NUDGE_BACKOFF", "15")
+    )
+except (TypeError, ValueError):
+    _AGENT_MSG_NUDGE_BACKOFF_SEC = 15.0
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -213,6 +235,7 @@ class MessageBroker:
             "denied": 0,
             "errors": 0,
             "deduped": 0,
+            "nudged": 0,
         }
 
         # Auth-relay (#205): wire the tmux login-relay coordinator to this
@@ -267,6 +290,10 @@ class MessageBroker:
         self._voice_pending: dict[tuple[str, str], bool] = {}
         self._message_contexts: dict[tuple[str, str], MessageContext] = {}
         self._message_context_order: dict[str, list[str]] = {}
+
+        # #215 PR3: last check-inbox nudge time per agent (monotonic seconds),
+        # used to coalesce a burst of inter-agent messages into one nudge.
+        self._agent_msg_nudge_at: dict[str, float] = {}
 
         # Active typing indicator tasks: (agent_name, chat_id) -> asyncio.Task
         self._typing_tasks: dict[tuple[str, str], asyncio.Task] = {}
@@ -1360,6 +1387,87 @@ class MessageBroker:
             _log(f"broker: stamp_last_seen failed for {to_agent}: {e}")
         self._stats["routed"] += 1
         _log(f"broker: injected agent message {from_agent} -> {to_agent}")
+        return True
+
+    def injection_confirms_consumption(self, to_agent: str) -> bool:
+        """Does the target's live transport positively confirm that an injected
+        agent message will actually be consumed?
+
+        ``inject_agent_message`` returning ``True`` only means "session was
+        CONNECTED and ``send`` didn't raise". For an in-process transport (SDK
+        ``StreamingSession``) that IS a positive handoff — ``send`` enqueues
+        straight into the live turn stream. For a tmux/codex transport it is
+        NOT: ``send`` merely appends to a volatile in-memory queue drained by a
+        worker that pastes into an EXTERNAL pane; a dead / mid-turn / restarted
+        or stale-CONNECTED pane silently drops the paste and the queue is lost
+        on teardown. So the durable comms inbox copy may only be retired
+        (marked read) on inject when this returns ``True``.
+
+        Fail-closed: an unknown / missing session (or a transport that doesn't
+        advertise the capability) returns ``False`` — never retire the durable
+        copy on an unconfirmed inject.
+        """
+        session = self._get_streaming_session(to_agent)
+        return bool(getattr(session, "injection_confirms_consumption", False))
+
+    async def notify_unread_agent_messages(self, comms, to_agent: str) -> bool:
+        """Best-effort nudge (#215 PR3): tell a tmux-transport agent it has
+        unread inbox messages so it calls ``check_inbox``.
+
+        The durable unread comms rows are the real delivery guarantee; this
+        just makes retrieval timely when the pane is alive. No-op when:
+        - the notify flag (``PINKYBOT_AGENT_MSG_NOTIFY``) is off;
+        - the target has no live tmux session (SDK / offline / unknown
+          transport — nothing to nudge, or its live-inject already confirmed);
+        - there is nothing unread;
+        - a recent nudge is still inside the coalesce window (one nudge per
+          burst, simple backoff).
+
+        The nudge rides the session's readiness-gated internal-prompt queue
+        (``_enqueue_internal_prompt``), so it can't corrupt a half-typed /
+        mid-turn pane, and it is a daemon-internal prompt (not a comms
+        message), so it never enqueues another agent message → no nudge loop.
+        Returns ``True`` iff a nudge was actually enqueued.
+        """
+        if not _AGENT_MSG_NOTIFY_ENABLED:
+            return False
+        session = self._get_streaming_session(to_agent)
+        enqueue = getattr(session, "_enqueue_internal_prompt", None)
+        if session is None or not callable(enqueue):
+            return False  # SDK / offline / unknown transport — no tmux pane
+        if getattr(session, "state", None) != SessionState.CONNECTED:
+            return False
+        try:
+            unread = comms.unread_count(to_agent)
+        except Exception as e:
+            _log(f"broker: unread_count for {to_agent} failed: {e}")
+            return False
+        if unread <= 0:
+            return False
+        now = time.monotonic()
+        last = self._agent_msg_nudge_at.get(to_agent, 0.0)
+        if now - last < _AGENT_MSG_NUDGE_BACKOFF_SEC:
+            return False  # coalesce: a nudge already fired this window
+        # Reserve the window BEFORE the await so concurrent deliveries in the
+        # same burst don't each enqueue a nudge.
+        self._agent_msg_nudge_at[to_agent] = now
+        plural = "s" if unread != 1 else ""
+        nudge = (
+            f"[pinky] {unread} unread agent message{plural} — "
+            f"call check_inbox to read {'them' if unread != 1 else 'it'}."
+        )
+        try:
+            await enqueue(nudge, reason="agent_msg_notify")
+        except Exception as e:
+            # Roll back the reservation so a transient failure can retry.
+            self._agent_msg_nudge_at.pop(to_agent, None)
+            _log(f"broker: check-inbox nudge for {to_agent} failed: {e}")
+            return False
+        self._stats["nudged"] += 1
+        _log(
+            f"broker: nudged {to_agent} — {unread} unread agent "
+            f"message{plural} (check_inbox)"
+        )
         return True
 
     # ── Response Routing ───────────────────────────────────
