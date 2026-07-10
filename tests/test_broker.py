@@ -886,14 +886,75 @@ class TestMessageBrokerRouting:
 
     def test_unmark_is_identity_guarded(self):
         """An older failed injection's unmark must not pop a NEWER concurrent
-        injection's marker for the same pair."""
+        injection's marker — even when both carry the SAME wall-clock stamp
+        (time.time() repeats at clock resolution; equality is not ownership)."""
+        from pinky_daemon.broker import _ReplyTurnMarker
+
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
-            broker._agent_reply_turn_start[("barsik", "pushok")] = 123.0
-            broker._unmark_agent_reply_turn_start("barsik", "pushok", 100.0)
-            assert broker._agent_reply_turn_start[("barsik", "pushok")] == 123.0
-            broker._unmark_agent_reply_turn_start("barsik", "pushok", 123.0)
+            old = _ReplyTurnMarker(123.0)
+            new = _ReplyTurnMarker(123.0)  # equal timestamp, distinct identity
+            broker._agent_reply_turn_start[("barsik", "pushok")] = new
+            broker._unmark_agent_reply_turn_start("barsik", "pushok", old)
+            assert broker._agent_reply_turn_start[("barsik", "pushok")] is new
+            broker._unmark_agent_reply_turn_start("barsik", "pushok", new)
             assert ("barsik", "pushok") not in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_overlapping_injects_same_timestamp_newer_marker_survives(
+        self, monkeypatch
+    ):
+        """Murzik #831 P1 follow-up, end-to-end: wall clock frozen so both
+        injects stamp EQUAL timestamps; the older inject's handoff fails while
+        the newer succeeds — the newer marker must survive the older cleanup."""
+        import asyncio
+
+        import pinky_daemon.broker as broker_mod
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            monkeypatch.setattr(broker_mod.time, "time", lambda: 123.0)
+            release_a = asyncio.Event()
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+                calls = 0
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    _FakeStreaming.calls += 1
+                    if _FakeStreaming.calls == 1:
+                        await release_a.wait()
+                        return False  # older inject A: failed handoff
+                    return True  # newer inject B: success
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            task_a = asyncio.create_task(
+                broker.inject_agent_message("pushok", "barsik", "first")
+            )
+            for _ in range(1000):
+                if _FakeStreaming.calls:
+                    break
+                await asyncio.sleep(0)
+            assert _FakeStreaming.calls == 1, "inject A never reached its send"
+
+            delivered_b, _ = await broker.inject_agent_message(
+                "pushok", "barsik", "second"
+            )
+            assert delivered_b is True
+            marker_after_b = broker._agent_reply_turn_start.get(("barsik", "pushok"))
+            assert marker_after_b is not None
+
+            release_a.set()
+            await task_a
+            # A's failed-handoff cleanup must not have popped B's marker.
+            assert (
+                broker._agent_reply_turn_start.get(("barsik", "pushok"))
+                is marker_after_b
+            )
         finally:
             tmpdir.cleanup()
 

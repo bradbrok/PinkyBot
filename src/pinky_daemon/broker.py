@@ -96,6 +96,23 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+class _ReplyTurnMarker:
+    """#280 dedup marker: the turn-start boundary plus its ownership identity.
+
+    ``started_at`` is the dedup window boundary route_agent_reply compares
+    messages against. OWNERSHIP is the record's object identity — never the
+    timestamp: ``time.time()`` repeats at clock resolution, so two overlapping
+    injections for the same pair can stamp EQUAL floats, and an equality-based
+    unmark would let the older failed call pop the newer successful marker
+    (Murzik #831 P1 follow-up). Each ``_mark`` allocates a fresh instance;
+    ``_unmark`` compares with ``is``."""
+
+    __slots__ = ("started_at",)
+
+    def __init__(self, started_at: float) -> None:
+        self.started_at = started_at
+
+
 class InjectResult(NamedTuple):
     """Outcome of a live agent-message injection attempt.
 
@@ -1623,7 +1640,9 @@ class MessageBroker:
         else:
             await self._send_message(agent_name, platform, chat_id, stripped)
 
-    def _mark_agent_reply_turn_start(self, responder: str, requester: str) -> float:
+    def _mark_agent_reply_turn_start(
+        self, responder: str, requester: str
+    ) -> _ReplyTurnMarker:
         """#280: record when an agent-reply turn began, so ``route_agent_reply``
         can scope its dup check to "did the responder send an explicit reply to
         the requester *during this turn*?". Sweeps orphaned markers (turns that
@@ -1631,22 +1650,24 @@ class MessageBroker:
         so the dict can't grow unbounded. Only affects the dedup window — never
         delivery correctness (a lost marker just means we deliver).
 
-        Returns the stamped timestamp: the caller's identity token for
-        ``_unmark_agent_reply_turn_start`` when its handoff fails."""
+        Returns the freshly allocated marker record: the caller's ownership
+        handle for ``_unmark_agent_reply_turn_start`` when its handoff fails.
+        Identity lives in the OBJECT, not the timestamp — see _ReplyTurnMarker."""
         now = time.time()
         if self._agent_reply_turn_start:
             cutoff = now - _AGENT_REPLY_MARKER_TTL
             stale = [
-                k for k, started in self._agent_reply_turn_start.items()
-                if started < cutoff
+                k for k, marker in self._agent_reply_turn_start.items()
+                if marker.started_at < cutoff
             ]
             for k in stale:
                 self._agent_reply_turn_start.pop(k, None)
-        self._agent_reply_turn_start[(responder, requester)] = now
-        return now
+        marker = _ReplyTurnMarker(now)
+        self._agent_reply_turn_start[(responder, requester)] = marker
+        return marker
 
     def _unmark_agent_reply_turn_start(
-        self, responder: str, requester: str, marker: float
+        self, responder: str, requester: str, marker: _ReplyTurnMarker
     ) -> None:
         """Remove ONLY the marker instance stamped by the caller's injection.
 
@@ -1654,11 +1675,12 @@ class MessageBroker:
         stamp would let any unrelated explicit responder→requester message
         suppress a DIFFERENT injection's distinct route-back for up to the
         marker TTL (Murzik #831 P1 — a dropped verdict, not a stray dup). The
-        equality guard keeps this safe under concurrency: a newer injection
-        for the same pair owns a newer timestamp, which an older failed call
-        must not pop."""
+        ``is`` guard keeps this safe under concurrency even when two markers
+        carry EQUAL wall-clock timestamps: a newer injection for the same pair
+        owns a distinct record object, which an older failed call can never
+        pop."""
         key = (responder, requester)
-        if self._agent_reply_turn_start.get(key) == marker:
+        if self._agent_reply_turn_start.get(key) is marker:
             self._agent_reply_turn_start.pop(key, None)
 
     async def route_agent_reply(self, comms, turn_result) -> bool:
@@ -1710,11 +1732,11 @@ class MessageBroker:
         # genuinely new reply can't be dropped. A missing marker (e.g. lost
         # across a restart) falls through to delivery — a stray dup is
         # acceptable, a dropped verdict is not.
-        since = self._agent_reply_turn_start.pop((responder, requester), None)
-        if _AGENT_REPLY_DEDUP_ENABLED and since is not None:
+        marker = self._agent_reply_turn_start.pop((responder, requester), None)
+        if _AGENT_REPLY_DEDUP_ENABLED and marker is not None:
             try:
                 already_sent = comms.has_message_since(
-                    responder, requester, since, exclude_auto_routed=True
+                    responder, requester, marker.started_at, exclude_auto_routed=True
                 )
             except Exception as e:
                 # A dedup-probe failure must never drop a reply — deliver.
