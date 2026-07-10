@@ -2191,6 +2191,95 @@ class TestAPI:
                 assert fake.codex_session_id == ""
                 assert fake.resume_handle == ""
 
+    def test_streaming_model_restart_refreshes_retained_launch_config(self):
+        """#856: a context-window rebuild uses current registry defaults.
+
+        A retained Codex object can predate durable provider/effort changes.
+        The model endpoint must refresh both StreamingSessionConfig and the
+        Codex launch caches before reconnecting it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                app.state.agents.register(
+                    "murzik",
+                    model="claude-opus-4-7",
+                    runtime="codex_cli",
+                    transport="tmux",
+                    provider_url="codex_cli",
+                    provider_key="old-key",
+                    thinking_effort="low",
+                    working_dir=os.path.join(tmpdir, "murzik"),
+                )
+                fake = self._FakeStreamingSession(
+                    "murzik", "main", max_tokens=1_000_000
+                )
+                fake._config.model = "claude-opus-4-7"
+                fake._config.provider_url = "codex_cli"
+                fake._config.provider_key = "old-key"
+                fake._config.thinking_effort = "low"
+                fake._config.strict_effort_enforcement = False
+                fake._codex_model = "claude-opus-4-7"
+                fake._openai_api_key = "old-key"
+                fake._reasoning_effort = "low"
+                fake._effort_override = None
+                app.state.broker.register_streaming("murzik", fake, label="main")
+
+                app.state.agents.set_context(
+                    "murzik",
+                    task="Testing registry-backed context-window rebuild",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                updated = client.put(
+                    "/agents/murzik",
+                    json={"provider_key": "new-key", "thinking_effort": "xhigh"},
+                )
+                assert updated.status_code == 200, updated.text
+                # The retained object is intentionally stale until a rebuild.
+                assert fake._openai_api_key == "old-key"
+                assert fake._reasoning_effort == "low"
+
+                observed = {}
+
+                async def connect_with_snapshot():
+                    observed.update(
+                        config_model=fake._config.model,
+                        config_provider_url=fake._config.provider_url,
+                        config_provider_key=fake._config.provider_key,
+                        config_effort=fake._config.thinking_effort,
+                        codex_model=fake._codex_model,
+                        openai_api_key=fake._openai_api_key,
+                        reasoning_effort=fake._reasoning_effort,
+                    )
+                    fake.connect_calls += 1
+                    fake._state = fake._TS.CONNECTED
+
+                fake.connect = connect_with_snapshot
+                response = client.post(
+                    "/agents/murzik/streaming/model",
+                    json={"model": "gpt-5.6-sol"},
+                )
+
+                assert response.status_code == 200, response.text
+                assert response.json()["restarted"] is True
+                assert observed == {
+                    "config_model": "gpt-5.6-sol",
+                    "config_provider_url": "codex_cli",
+                    "config_provider_key": "new-key",
+                    "config_effort": "xhigh",
+                    "codex_model": "gpt-5.6-sol",
+                    "openai_api_key": "new-key",
+                    "reasoning_effort": "xhigh",
+                }
+                durable = app.state.agents.get("murzik")
+                assert durable.model == "gpt-5.6-sol"
+                assert durable.provider_key == "new-key"
+                assert durable.thinking_effort == "xhigh"
+
     def test_streaming_archive_clears_codex_session_id(self):
         """/streaming/archive must clear codex_session_id alongside session_id —
         same bug pattern as /streaming/restart."""
@@ -2358,6 +2447,254 @@ class TestAPI:
                 # Only main restarts on boot — sub-sessions are on-demand
                 assert "main" in labels
                 assert "worker" not in labels
+
+    def test_restart_manifest_reconciles_live_sibling_with_registry_config(self):
+        """#856: daemon restart restores previously-live sibling panes only.
+
+        The rebuilt Codex/tmux session must take model + effort from the
+        durable registry, while a dormant sibling with only a historical
+        session id remains on-demand. One failed sibling may not abort startup.
+        """
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        async def fake_connect(self):
+            if self.agent_name == "broken":
+                raise RuntimeError("disposable startup failure")
+            self._state_machine._state = TransportState.CONNECTED
+
+        async def fake_disconnect(self):
+            self._state_machine._state = TransportState.DEAD
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.codex_tmux_session.CodexTmuxSession.connect", new=fake_connect), \
+                patch("pinky_daemon.codex_tmux_session.CodexTmuxSession.disconnect", new=fake_disconnect), \
+                patch("pinky_daemon.api.SHARED_MCP_ENABLED", False):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            for name, model, effort in (
+                ("main", "gpt-5.5", "medium"),
+                ("murzik", "gpt-5.6-sol", "xhigh"),
+                ("dormant", "gpt-5.5", "high"),
+                ("broken", "gpt-5.5", "high"),
+            ):
+                app.state.agents.register(
+                    name,
+                    model=model,
+                    provider_model="gpt-5.5" if name == "murzik" else "",
+                    thinking_effort=effort,
+                    runtime="codex_cli",
+                    transport="tmux",
+                    working_dir=os.path.join(tmpdir, name),
+                )
+                app.state.agents.set_streaming_session_id(
+                    name, f"resume-{name}", label="main"
+                )
+            app.state.agents.set_main_agent("main")
+            Path(tmpdir, "restart_manifest.json").write_text(json.dumps({
+                "restart_time": datetime.now(timezone.utc).isoformat(),
+                "planned": True,
+                "agents": {
+                    "murzik": {"label": "main"},
+                    "broken": {"label": "main"},
+                },
+            }))
+
+            with TestClient(app) as client:
+                assert client.get("/admin/watchdog").status_code == 200
+                assert "main" in app.state.broker._streaming
+                assert "murzik" in app.state.broker._streaming
+                assert "dormant" not in app.state.broker._streaming
+                assert "broken" not in app.state.broker._streaming
+
+                rebuilt = app.state.broker._streaming["murzik"]["main"]
+                assert rebuilt._config.model == "gpt-5.6-sol"
+                assert rebuilt._config.thinking_effort == "xhigh"
+                assert rebuilt._codex_model == "gpt-5.6-sol"
+                assert rebuilt._reasoning_effort == "xhigh"
+
+    def test_retained_rebuild_refreshes_model_and_effort_from_registry(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register(
+                "murzik",
+                model="gpt-5.6-sol",
+                provider_model="gpt-5.5",
+                thinking_effort="xhigh",
+                runtime="codex_cli",
+                transport="tmux",
+                working_dir=os.path.join(tmpdir, "murzik"),
+            )
+            config = SimpleNamespace(
+                model="gpt-5.5",
+                provider_url="",
+                provider_key="",
+                thinking_effort="high",
+                strict_effort_enforcement=False,
+            )
+            retained = SimpleNamespace(
+                _config=config,
+                _codex_model="gpt-5.5",
+                _reasoning_effort="high",
+                _openai_api_key="",
+                _effort_override=None,
+            )
+
+            app.state._refresh_streaming_launch_config("murzik", retained)
+
+            assert config.model == "gpt-5.6-sol"
+            assert config.thinking_effort == "xhigh"
+            assert retained._codex_model == "gpt-5.6-sol"
+            assert retained._reasoning_effort == "xhigh"
+
+    @pytest.mark.asyncio
+    async def test_inbound_idle_wake_refreshes_retained_launch_config(self):
+        """#856: broker idle auto-wake must route through the API ensurer."""
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register(
+                "murzik",
+                model="gpt-5.6-sol",
+                provider_model="gpt-5.5",
+                thinking_effort="xhigh",
+                runtime="codex_cli",
+                transport="tmux",
+                working_dir=os.path.join(tmpdir, "murzik"),
+            )
+
+            class _RetainedSleepingSession:
+                def __init__(self):
+                    self.state = TransportState.IDLE_SLEEPING
+                    self.resume_handle = "codex-resume"
+                    self._config = SimpleNamespace(
+                        model="gpt-5.5",
+                        provider_url="codex_cli",
+                        provider_key="",
+                        thinking_effort="high",
+                        strict_effort_enforcement=False,
+                    )
+                    self._codex_model = "gpt-5.5"
+                    self._reasoning_effort = "high"
+                    self._openai_api_key = ""
+                    self._effort_override = None
+                    self.sent = []
+
+                async def connect(self):
+                    self.state = TransportState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append((prompt, kwargs))
+
+            retained = _RetainedSleepingSession()
+            app.state.broker.register_streaming("murzik", retained, label="main")
+            message = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="wake with current defaults",
+                agent_name="murzik",
+            )
+
+            await app.state.broker._route_streaming("murzik", message)
+
+            assert retained.state == TransportState.CONNECTED
+            assert retained.sent
+            assert retained._config.model == "gpt-5.6-sol"
+            assert retained._config.thinking_effort == "xhigh"
+            assert retained._codex_model == "gpt-5.6-sol"
+            assert retained._reasoning_effort == "xhigh"
+
+    def test_shutdown_manifest_excludes_idle_sleeping_siblings(self):
+        from pathlib import Path
+
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        class _ManifestSession:
+            def __init__(self, state):
+                self.state = state
+                self.stats = {
+                    "current_activity": "",
+                    "activity_log": [],
+                    "pending_responses": 0,
+                }
+
+            async def disconnect(self):
+                self.state = TransportState.DEAD
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.api.SHARED_MCP_ENABLED", False):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app):
+                app.state.agents.register(
+                    "idle", working_dir=os.path.join(tmpdir, "idle")
+                )
+                app.state.agents.register(
+                    "active", working_dir=os.path.join(tmpdir, "active")
+                )
+                app.state.broker.register_streaming(
+                    "idle",
+                    _ManifestSession(TransportState.IDLE_SLEEPING),
+                    label="main",
+                )
+                app.state.broker.register_streaming(
+                    "active",
+                    _ManifestSession(TransportState.CONNECTED),
+                    label="main",
+                )
+
+            manifest = json.loads(
+                Path(tmpdir, "restart_manifest.json").read_text()
+            )
+            assert set(manifest["agents"]) == {"active"}
+
+    def test_put_effort_is_partial_and_durable(self):
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.api.SHARED_MCP_ENABLED", False):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                app.state.agents.register(
+                    "murzik",
+                    display_name="Murzik",
+                    model="gpt-5.6-sol",
+                    thinking_effort="high",
+                    runtime="codex_cli",
+                    transport="tmux",
+                    groups=["reviewers"],
+                    working_dir=os.path.join(tmpdir, "murzik"),
+                )
+
+                response = client.put(
+                    "/agents/murzik/effort", json={"effort": "xhigh"}
+                )
+                assert response.status_code == 200
+                assert response.json() == {"agent": "murzik", "default": "xhigh"}
+                current = client.get("/agents/murzik/effort").json()
+                assert current["default"] == "xhigh"
+
+                unchanged = app.state.agents.get("murzik")
+                assert unchanged.display_name == "Murzik"
+                assert unchanged.model == "gpt-5.6-sol"
+                assert unchanged.runtime == "codex_cli"
+                assert unchanged.transport == "tmux"
+                assert unchanged.groups == ["reviewers"]
+                registry_path = app.state.agents._db.execute(
+                    "PRAGMA database_list"
+                ).fetchone()[2]
+
+            with sqlite3.connect(registry_path) as reopened:
+                row = reopened.execute(
+                    "SELECT thinking_effort FROM agents WHERE name=?", ("murzik",)
+                ).fetchone()
+            assert row == ("xhigh",)
 
     def test_get_session(self):
         client = self._make_client()
