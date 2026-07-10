@@ -995,3 +995,65 @@ class TestModelSeeds:
             if m["id"] == "anthropic/claude-opus-4-8"
         )
         assert opus["input_price"] == 12.34
+
+    def test_gpt_56_sol_seeded_at_frontier_rates(self, registry):
+        """#860: gpt-5.6-sol (the codex fleet model since 2026-07) must be in
+        the catalog at the official $5/$30 (cached $0.50)."""
+        models = {
+            m["model_id"]: m
+            for m in registry.list_models(provider="openai", active_only=False)
+        }
+        assert "gpt-5.6-sol" in models
+        sol = models["gpt-5.6-sol"]
+        assert (sol["input_price"], sol["output_price"],
+                sol["cached_input_price"]) == (5.0, 30.0, 0.5)
+        assert sol["tier"] == "flagship"
+
+    def test_openai_seed_prices_match_pricing_rate_table(self, registry):
+        """#860 extends the #741 invariant to the OpenAI family: catalog
+        display prices must agree with pricing.py (the actual cost engine)
+        for every openai model both tables know."""
+        from pinky_daemon.pricing import RATE_TABLE
+
+        checked = 0
+        for m in registry.list_models(provider="openai", active_only=False):
+            rate = RATE_TABLE.get(m["model_id"])
+            if rate is None:
+                continue
+            assert m["input_price"] == rate["input"], m["model_id"]
+            assert m["output_price"] == rate["output"], m["model_id"]
+            assert m["cached_input_price"] == rate["cache_read"], m["model_id"]
+            checked += 1
+        # Guard the guard: gpt-5.6-sol + gpt-5.5 must both be intersecting.
+        assert checked >= 2
+
+    def test_stale_gpt55_price_corrected_on_existing_rows(self, registry):
+        """#860: deployed DBs seeded gpt-5.5 at the gpt-5.2-tier $1.75/$14;
+        the next seed pass realigns existing rows to the official $5/$30
+        (INSERT OR IGNORE alone never reaches them)."""
+        registry._db.execute(
+            "UPDATE models SET input_price=1.75, output_price=14.0,"
+            " cached_input_price=0.175 WHERE id='openai/gpt-5.5'"
+        )
+        registry._db.commit()
+        registry._seed_models()
+        gpt = next(
+            m for m in registry.list_models(provider="openai", active_only=False)
+            if m["id"] == "openai/gpt-5.5"
+        )
+        assert (gpt["input_price"], gpt["output_price"],
+                gpt["cached_input_price"]) == (5.0, 30.0, 0.5)
+
+    def test_operator_customized_gpt55_price_survives_reseed(self, registry):
+        """Same exact-stale-triple gate as the Anthropic corrections — an
+        operator-priced gpt-5.5 row must not be clobbered."""
+        registry._db.execute(
+            "UPDATE models SET input_price=9.99 WHERE id='openai/gpt-5.5'"
+        )
+        registry._db.commit()
+        registry._seed_models()
+        gpt = next(
+            m for m in registry.list_models(provider="openai", active_only=False)
+            if m["id"] == "openai/gpt-5.5"
+        )
+        assert gpt["input_price"] == 9.99

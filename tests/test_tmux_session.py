@@ -5419,6 +5419,83 @@ async def test_cost_callback_failure_is_swallowed() -> None:
     assert ss.usage.total_turns == 1
 
 
+# ── #860 — transport-truthful provider attribution + usage normalization ──
+
+
+def _make_usage_session_of(
+    cls, *, analytics=None, cost_cb=None, model: str = "claude-opus-4-8"
+) -> TmuxSession:
+    """_make_usage_session for a TmuxSession SUBCLASS (transport variants)."""
+    cfg = StreamingSessionConfig(
+        agent_name="dymok",
+        working_dir="/tmp/tmux-session-test",
+        model=model,
+    )
+    ss = cls(
+        cfg,
+        tmux_control=_make_mock_tmux(),
+        analytics_store=analytics,
+        cost_callback=cost_cb,
+    )
+    ss._skip_wake_prompt_for_tests = True
+    ss._state_machine._state = SessionState.CONNECTED
+    return ss
+
+
+@pytest.mark.asyncio
+async def test_analytics_provider_comes_from_class_attr() -> None:
+    """#860: the provider on analytics rows must read _ANALYTICS_PROVIDER —
+    not a hardcoded literal — so transport subclasses (CodexTmuxSession)
+    attribute their turns truthfully. The hardcoded "anthropic" landed every
+    codex turn as anthropic/gpt-*, which no pricing row can match ($0)."""
+
+    class _OtherTransport(TmuxSession):
+        _ANALYTICS_PROVIDER = "other_provider"
+
+    analytics = MagicMock()
+    ss = _make_usage_session_of(_OtherTransport, analytics=analytics)
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response())
+    assert analytics.log_turn_usage.call_args.kwargs["provider"] == "other_provider"
+
+
+def test_base_normalize_turn_usage_is_identity() -> None:
+    """The Claude transport already emits the daemon's disjoint convention,
+    so the base hook must pass the dict through untouched (same object)."""
+    u = {"input_tokens": 10_000, "cache_read_input_tokens": 2_000}
+    assert TmuxSession._normalize_turn_usage(u) is u
+
+
+@pytest.mark.asyncio
+async def test_normalize_hook_runs_before_all_consumers() -> None:
+    """#860: _normalize_turn_usage must rewrite response.usage ONCE, before
+    ANY consumer — accumulation (SessionUsage), pricing, and analytics all
+    see the normalized dict. A partial conversion spread across consumers is
+    how the cached split got silently dropped in the first place."""
+
+    class _NormalizingTransport(TmuxSession):
+        @staticmethod
+        def _normalize_turn_usage(u: dict) -> dict:
+            out = dict(u)
+            out["input_tokens"] = 7_777
+            return out
+
+    analytics = MagicMock()
+    cost_cb = MagicMock()
+    ss = _make_usage_session_of(
+        _NormalizingTransport, analytics=analytics, cost_cb=cost_cb
+    )
+    _seed_inflight(ss)
+    await ss._handle_turn_complete(_usage_turn_response(input_tokens=999))
+    # Analytics row: normalized, not the raw 999.
+    assert analytics.log_turn_usage.call_args.kwargs["input_tokens"] == 7_777
+    # SessionUsage accumulation: normalized.
+    assert ss.usage.input_tokens == 7_777
+    # Cost: priced off the normalized count (opus $5/Mtok input).
+    expected = 7_777 / 1e6 * 5 + 500 / 1e6 * 25 + 2_000 / 1e6 * 0.5
+    assert cost_cb.call_args.args[1] == pytest.approx(expected)
+
+
 @pytest.mark.asyncio
 async def test_emits_context_usage_event_with_sdk_shape(monkeypatch) -> None:
     """``context_usage`` SSE event must carry the SDK-compatible fields

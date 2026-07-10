@@ -477,7 +477,7 @@ class AnalyticsStore:
             )
 
     def _migrate_codex_provider_attribution(self, conn) -> None:
-        """Reattribute codex turns mislogged as ``anthropic`` (#860).
+        """Reattribute + reprice codex turns mislogged as ``anthropic`` (#860).
 
         ``TmuxSession._log_turn_cost_and_analytics`` hardcoded
         ``provider="anthropic"``, so every CodexTmuxSession turn landed as
@@ -487,13 +487,35 @@ class AnalyticsStore:
         new codex turns record and the SDK path's default — which aliases onto
         the openai rate rows at read time.
 
+        The provider flip alone would over-bill history: pre-#860 rows also
+        predate ``_normalize_turn_usage``, so their ``input_tokens`` is
+        codex's INCLUSIVE count with the cached span invisible
+        (``cached_input_tokens=0`` — the old extraction read only the
+        Anthropic cache keys). Repricing that at the full input rate
+        overstates ~7x (measured across the fleet's 2026-07 rollouts: 97.5%
+        of codex input is cached reads). The per-turn split is unrecoverable
+        from the DB, so rows carrying that signature move the whole count to
+        the cached column: error bounded at roughly -20% (the true-uncached
+        share priced at 10x the cached rate), failing toward the visible
+        undercount — the same direction ``_normalize_turn_usage`` chooses.
+
         Follows the ``_migrate_opus_haiku_seed_pricing`` precedent: idempotent
-        (the predicate matches only the misattributed pairs, so a second run is
-        a no-op) and narrow (a ``gpt-*`` model under ``anthropic`` cannot be
-        legitimate — Anthropic serves no gpt model — so no honest row can
-        match). Touches turn usage AND session facts so per-session rollups
-        group consistently.
+        (both predicates match only misattributed ``anthropic`` pairs, gone
+        after the first run) and narrow (a ``gpt-*`` model under ``anthropic``
+        cannot be legitimate — Anthropic serves no gpt model — so no honest
+        row can match). Touches turn usage AND session facts so per-session
+        rollups group consistently.
         """
+        conn.execute(
+            """
+            UPDATE analytics_turn_usage
+            SET provider = 'codex_cli',
+                cached_input_tokens = input_tokens,
+                input_tokens = 0
+            WHERE provider = 'anthropic' AND model LIKE 'gpt-%'
+              AND cached_input_tokens = 0
+            """
+        )
         for table in ("analytics_turn_usage", "analytics_session_facts"):
             conn.execute(
                 f"""
