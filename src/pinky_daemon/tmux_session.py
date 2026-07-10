@@ -3804,6 +3804,27 @@ class TmuxSession:
             pass
         return DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT
 
+    # Provider recorded on analytics_turn_usage rows (#860). Class-level so
+    # transport subclasses that ride this same cost/analytics path attribute
+    # their turns truthfully — CodexTmuxSession overrides with "codex_cli"
+    # (analytics_store._provider_alias maps it to the openai rate rows).
+    _ANALYTICS_PROVIDER: str = "anthropic"
+
+    @staticmethod
+    def _normalize_turn_usage(u: dict) -> dict:
+        """Transport-specific usage normalization hook (#860).
+
+        The base (Claude) transport already emits the daemon's disjoint
+        convention, so this is the identity. CodexTmuxSession overrides it to
+        convert the codex schema (``input_tokens`` INCLUSIVE of the cached
+        prefix, cached span under ``cached_input_tokens``) before any
+        consumer — usage accumulation, pricing, analytics, context gauge —
+        reads the dict. ONE conversion point by design: a partial conversion
+        spread across consumers is how the cached split got silently dropped
+        in the first place.
+        """
+        return u
+
     def _record_turn_usage(self, response: TurnResponse) -> None:
         """Fold a turn's usage block into ``self.usage`` (SessionUsage).
 
@@ -3929,7 +3950,10 @@ class TmuxSession:
                     session_id=self.id,
                     agent_name=self.agent_name,
                     turn_seq=turn_seq,
-                    provider="anthropic",
+                    # #860: was hardcoded "anthropic", which mispriced every
+                    # CodexTmuxSession turn to $0 (anthropic/gpt-* never
+                    # matches the openai rate rows).
+                    provider=self._ANALYTICS_PROVIDER,
                     model=model,
                     input_tokens=input_tokens,
                     output_tokens=output_tokens,
@@ -4380,6 +4404,10 @@ class TmuxSession:
         # tailer already pulled the usage dict out of each assistant
         # entry's ``usage`` block; we just need to fold it into the
         # session-level dataclass and emit it.
+        # #860: normalize transport-specific usage schemas ONCE, before any
+        # consumer (accumulation, pricing, analytics, context gauge) reads it.
+        if isinstance(response.usage, dict):
+            response.usage = self._normalize_turn_usage(response.usage)
         self._record_turn_usage(response)
         # #648 — forward per-turn usage to analytics + cost tracking so
         # tmux agents reach live Analytics / lifetime-cost parity with the

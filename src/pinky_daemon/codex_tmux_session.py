@@ -86,6 +86,43 @@ class _CodexTmuxControl(_TmuxControl):
 class CodexTmuxSession(TmuxSession):
     """Interactive codex-CLI REPL in a detached tmux pane (see module docstring)."""
 
+    # #860: analytics rows must not claim "anthropic" for codex turns — the
+    # pricing lookup keys on (provider, model) and never crosses providers, so
+    # anthropic/gpt-* priced every turn at $0. "codex_cli" matches the SDK
+    # path's default (CodexSession._analytics_log_turn_usage) and
+    # analytics_store._provider_alias maps it onto the openai rate rows.
+    _ANALYTICS_PROVIDER = "codex_cli"
+
+    @staticmethod
+    def _normalize_turn_usage(u: dict) -> dict:
+        """Codex usage schema → the daemon's disjoint convention (#860).
+
+        Codex reports ``input_tokens`` INCLUSIVE of the cached prefix, with the
+        cached span under ``cached_input_tokens`` — while every consumer here
+        (SessionUsage accumulation, ``compute_cost_from_usage``, analytics
+        ``log_turn_usage``, the context gauge's window reconstruction) follows
+        the Anthropic convention: ``input_tokens`` is the uncached remainder
+        and the cached span rides ``cache_read_input_tokens``. Mirrors
+        ``CodexSession.uncached_input_tokens`` on the SDK path; pricing the
+        inclusive number at the full input rate would overstate review-heavy
+        sessions roughly 10x. The ambiguous source key is consumed, not
+        forwarded. A dict without ``cached_input_tokens`` (or with malformed
+        counts) passes through untouched — fail toward the visible undercount,
+        never a silent double-bill.
+        """
+        if "cached_input_tokens" not in u:
+            return u
+        try:
+            cached = max(0, int(u.get("cached_input_tokens") or 0))
+            inclusive = max(0, int(u.get("input_tokens") or 0))
+        except (TypeError, ValueError):
+            return u
+        out = dict(u)
+        out.pop("cached_input_tokens", None)
+        out["input_tokens"] = max(0, inclusive - cached)
+        out["cache_read_input_tokens"] = cached
+        return out
+
     def __init__(
         self,
         config: StreamingSessionConfig,

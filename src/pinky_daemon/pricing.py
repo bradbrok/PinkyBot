@@ -93,6 +93,28 @@ _HAIKU_35 = {
     "cache_write_5m": 1.00,
     "cache_write_1h": 1.60,
 }
+# OpenAI / Codex family (#860): powers the live tmux cost path for codex
+# agents (CodexTmuxSession rides the same _log_turn_cost_and_analytics as
+# Claude tmux). Official OpenAI API rates (developers.openai.com, verified
+# 2026-07-10); codex agents run on sign-in subscription, so as with CC
+# subscription agents these are notional usage-value figures (#648). OpenAI
+# bills no cache WRITE — write rates are 0; cached reads use the published
+# cached-input rate. Must mirror the analytics openai seeds
+# (test_seed_pricing_matches_rate_table, #669).
+_GPT_FRONTIER = {  # gpt-5.5 / gpt-5.6-sol tier
+    "input": 5.00,
+    "output": 30.00,
+    "cache_read": 0.50,
+    "cache_write_5m": 0.0,
+    "cache_write_1h": 0.0,
+}
+_GPT_53_CODEX = {
+    "input": 1.75,
+    "output": 14.00,
+    "cache_read": 0.175,
+    "cache_write_5m": 0.0,
+    "cache_write_1h": 0.0,
+}
 
 # Bare-model-id → rate dict. Add new model ids here on each release.
 RATE_TABLE: dict[str, dict[str, float]] = {
@@ -117,6 +139,12 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-sonnet-4": _SONNET,
     "claude-haiku-4-5": _HAIKU_45,
     "claude-haiku-3-5": _HAIKU_35,
+    # Codex fleet models (#860). gpt-5.6-sol is the current fleet model
+    # (2026-07-09→); gpt-5.5 the previous one; gpt-5.3-codex kept because the
+    # analytics seed carries it (parity-pinned).
+    "gpt-5.6-sol": _GPT_FRONTIER,
+    "gpt-5.5": _GPT_FRONTIER,
+    "gpt-5.3-codex": _GPT_53_CODEX,
 }
 
 

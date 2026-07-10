@@ -221,6 +221,7 @@ class AnalyticsStore:
             self._migrate_opus_haiku_seed_pricing(conn)
             self._migrate_legacy_dotted_model_ids(conn)
             self._ensure_pricing_rows(conn)
+            self._migrate_codex_provider_attribution(conn)
             # Schema migration: add user_message_snippet to turn_usage
             cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(analytics_turn_usage)").fetchall()
@@ -258,6 +259,11 @@ class AnalyticsStore:
     _LATEST_PRICING_ADDITIONS = [
         ("openai", "gpt-5.5", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
         ("openai", "gpt-5.3-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
+        # gpt-5.6-sol (#860): codex fleet model since 2026-07-09. Official
+        # rates identical to gpt-5.5 (developers.openai.com, verified
+        # 2026-07-10). Mirrors pricing.RATE_TABLE (_GPT_FRONTIER), parity-pinned
+        # by test_seed_pricing_matches_rate_table.
+        ("openai", "gpt-5.6-sol", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
         # Sonnet 5 (2026-06): the current Sonnet tier. Standard $3/$15 (cached
         # $0.30) — mirrors pinky_daemon.pricing.RATE_TABLE (_SONNET), pinned by
         # test_seed_pricing_matches_rate_table. Introductory $2/$10 runs through
@@ -468,6 +474,33 @@ class AnalyticsStore:
                 )
                 """,
                 (*r, r[0], r[1]),
+            )
+
+    def _migrate_codex_provider_attribution(self, conn) -> None:
+        """Reattribute codex turns mislogged as ``anthropic`` (#860).
+
+        ``TmuxSession._log_turn_cost_and_analytics`` hardcoded
+        ``provider="anthropic"``, so every CodexTmuxSession turn landed as
+        ``anthropic/gpt-*`` — a (provider, model) pair the pricing lookup can
+        never match (``_provider_alias`` never crosses providers), pricing all
+        codex history at $0. Heal deployed rows to ``codex_cli`` — the value
+        new codex turns record and the SDK path's default — which aliases onto
+        the openai rate rows at read time.
+
+        Follows the ``_migrate_opus_haiku_seed_pricing`` precedent: idempotent
+        (the predicate matches only the misattributed pairs, so a second run is
+        a no-op) and narrow (a ``gpt-*`` model under ``anthropic`` cannot be
+        legitimate — Anthropic serves no gpt model — so no honest row can
+        match). Touches turn usage AND session facts so per-session rollups
+        group consistently.
+        """
+        for table in ("analytics_turn_usage", "analytics_session_facts"):
+            conn.execute(
+                f"""
+                UPDATE {table}
+                SET provider = 'codex_cli'
+                WHERE provider = 'anthropic' AND model LIKE 'gpt-%'
+                """
             )
 
     def ensure_session_fact(
