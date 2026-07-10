@@ -777,8 +777,9 @@ class TestMessageBrokerRouting:
 
     @pytest.mark.asyncio
     async def test_inject_agent_message_marks_turn_start(self):
-        """#280: a routed inject stamps the (responder, requester) turn-start
-        marker that route_agent_reply later consumes for dedup."""
+        """#280: a routed inject with a SUCCESSFUL handoff stamps the
+        (responder, requester) turn-start marker that route_agent_reply later
+        consumes for dedup."""
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             from pinky_daemon.transport_state import SessionState
@@ -787,13 +788,112 @@ class TestMessageBrokerRouting:
                 state = SessionState.CONNECTED
 
                 async def send(self, prompt, *, platform="", chat_id="", message_id=""):
-                    pass
+                    return True
 
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
             delivered, _ = await broker.inject_agent_message("pushok", "barsik", "review please")
             assert delivered is True
             # Key is (responder, requester) = (to_agent, from_agent).
             assert ("barsik", "pushok") in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_failed_handoff_leaves_no_marker(self):
+        """Murzik #831 P1: a FAILED handoff produces no route-back turn, so its
+        marker must not survive — an orphan would suppress a distinct later
+        route-back for the same pair once any unrelated explicit message lands."""
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    return False
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            delivered, confirmed = await broker.inject_agent_message(
+                "pushok", "barsik", "review please"
+            )
+            assert delivered is True and confirmed is False
+            assert ("barsik", "pushok") not in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_inject_raising_send_removes_marker_and_propagates(self):
+        """A send that raises has no route-back turn either — the marker is
+        removed in the except path and the exception still propagates."""
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    raise RuntimeError("transport exploded")
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            with pytest.raises(RuntimeError, match="transport exploded"):
+                await broker.inject_agent_message("pushok", "barsik", "review please")
+            assert ("barsik", "pushok") not in broker._agent_reply_turn_start
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_failed_handoff_cannot_suppress_distinct_later_route_back(self):
+        """Murzik #831 P1 end-to-end repro, inverted: failed-handoff inject,
+        then an unrelated explicit responder->requester message, then a DISTINCT
+        routed turn text — the route-back must DELIVER, not dedup-suppress."""
+        from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.turn_response import TurnResponse
+
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    return False
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
+            await broker.inject_agent_message("pushok", "barsik", "review please")
+            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            # Unrelated explicit message AFTER the failed stamp would have
+            # satisfied has-message-since against an orphaned marker.
+            comms.send("barsik", "pushok", "unrelated status note")
+            before = broker._stats["deduped"]
+
+            tr = TurnResponse(
+                agent_name="barsik",
+                platform="agent",
+                chat_id="pushok",
+                text="distinct in-flight verdict",
+            )
+            handled = await broker.route_agent_reply(comms, tr)
+            assert handled is True
+            inbox = comms.get_inbox("pushok")
+            contents = [m.content for m in inbox]
+            assert "distinct in-flight verdict" in contents
+            assert broker._stats["deduped"] == before
+        finally:
+            tmpdir.cleanup()
+
+    def test_unmark_is_identity_guarded(self):
+        """An older failed injection's unmark must not pop a NEWER concurrent
+        injection's marker for the same pair."""
+        tmpdir, registry, broker, _, _ = self._make_broker()
+        try:
+            broker._agent_reply_turn_start[("barsik", "pushok")] = 123.0
+            broker._unmark_agent_reply_turn_start("barsik", "pushok", 100.0)
+            assert broker._agent_reply_turn_start[("barsik", "pushok")] == 123.0
+            broker._unmark_agent_reply_turn_start("barsik", "pushok", 123.0)
+            assert ("barsik", "pushok") not in broker._agent_reply_turn_start
         finally:
             tmpdir.cleanup()
 

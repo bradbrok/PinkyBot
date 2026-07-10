@@ -1467,11 +1467,24 @@ class MessageBroker:
             # #280: stamp the turn's start so route_agent_reply can tell whether
             # the responder ALSO sent an explicit reply during this turn (→ a
             # dup to suppress). Key is (responder, requester) = (to_agent,
-            # from_agent), matching how route_agent_reply reads it back.
-            self._mark_agent_reply_turn_start(to_agent, from_agent)
-            handoff = await streaming.send(
-                prompt, platform=AGENT_REPLY_PLATFORM, chat_id=from_agent
-            )
+            # from_agent), matching how route_agent_reply reads it back. The
+            # stamp precedes the await so the window covers the whole turn, but
+            # it must not outlive a failed handoff — no turn routes back for
+            # this injection, and an orphaned marker would suppress a distinct
+            # LATER route-back for the same pair once any unrelated explicit
+            # message lands (Murzik #831 P1). Unmark is identity-guarded, and
+            # dedup fails open to delivery, so an unconfirmed-but-live turn at
+            # worst duplicates; it can never drop.
+            marker = self._mark_agent_reply_turn_start(to_agent, from_agent)
+            try:
+                handoff = await streaming.send(
+                    prompt, platform=AGENT_REPLY_PLATFORM, chat_id=from_agent
+                )
+            except BaseException:
+                self._unmark_agent_reply_turn_start(to_agent, from_agent, marker)
+                raise
+            if not handoff:
+                self._unmark_agent_reply_turn_start(to_agent, from_agent, marker)
         else:
             handoff = await streaming.send(prompt)
         confirmed = bool(handoff) and bool(
@@ -1610,13 +1623,16 @@ class MessageBroker:
         else:
             await self._send_message(agent_name, platform, chat_id, stripped)
 
-    def _mark_agent_reply_turn_start(self, responder: str, requester: str) -> None:
+    def _mark_agent_reply_turn_start(self, responder: str, requester: str) -> float:
         """#280: record when an agent-reply turn began, so ``route_agent_reply``
         can scope its dup check to "did the responder send an explicit reply to
         the requester *during this turn*?". Sweeps orphaned markers (turns that
         died before their response callback) older than the TTL on each insert
         so the dict can't grow unbounded. Only affects the dedup window — never
-        delivery correctness (a lost marker just means we deliver)."""
+        delivery correctness (a lost marker just means we deliver).
+
+        Returns the stamped timestamp: the caller's identity token for
+        ``_unmark_agent_reply_turn_start`` when its handoff fails."""
         now = time.time()
         if self._agent_reply_turn_start:
             cutoff = now - _AGENT_REPLY_MARKER_TTL
@@ -1627,6 +1643,23 @@ class MessageBroker:
             for k in stale:
                 self._agent_reply_turn_start.pop(k, None)
         self._agent_reply_turn_start[(responder, requester)] = now
+        return now
+
+    def _unmark_agent_reply_turn_start(
+        self, responder: str, requester: str, marker: float
+    ) -> None:
+        """Remove ONLY the marker instance stamped by the caller's injection.
+
+        A failed/raised handoff produces no route-back turn, so its retained
+        stamp would let any unrelated explicit responder→requester message
+        suppress a DIFFERENT injection's distinct route-back for up to the
+        marker TTL (Murzik #831 P1 — a dropped verdict, not a stray dup). The
+        equality guard keeps this safe under concurrency: a newer injection
+        for the same pair owns a newer timestamp, which an older failed call
+        must not pop."""
+        key = (responder, requester)
+        if self._agent_reply_turn_start.get(key) == marker:
+            self._agent_reply_turn_start.pop(key, None)
 
     async def route_agent_reply(self, comms, turn_result) -> bool:
         """Auto-deliver a completed agent-to-agent turn to the requester's inbox.
