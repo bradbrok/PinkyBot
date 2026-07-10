@@ -2461,6 +2461,111 @@ class TestAPI:
             assert retained._codex_model == "gpt-5.6-sol"
             assert retained._reasoning_effort == "xhigh"
 
+    @pytest.mark.asyncio
+    async def test_inbound_idle_wake_refreshes_retained_launch_config(self):
+        """#856: broker idle auto-wake must route through the API ensurer."""
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            app.state.agents.register(
+                "murzik",
+                model="gpt-5.6-sol",
+                provider_model="gpt-5.5",
+                thinking_effort="xhigh",
+                runtime="codex_cli",
+                transport="tmux",
+                working_dir=os.path.join(tmpdir, "murzik"),
+            )
+
+            class _RetainedSleepingSession:
+                def __init__(self):
+                    self.state = TransportState.IDLE_SLEEPING
+                    self.resume_handle = "codex-resume"
+                    self._config = SimpleNamespace(
+                        model="gpt-5.5",
+                        provider_url="codex_cli",
+                        provider_key="",
+                        thinking_effort="high",
+                        strict_effort_enforcement=False,
+                    )
+                    self._codex_model = "gpt-5.5"
+                    self._reasoning_effort = "high"
+                    self._openai_api_key = ""
+                    self._effort_override = None
+                    self.sent = []
+
+                async def connect(self):
+                    self.state = TransportState.CONNECTED
+
+                async def send(self, prompt, **kwargs):
+                    self.sent.append((prompt, kwargs))
+
+            retained = _RetainedSleepingSession()
+            app.state.broker.register_streaming("murzik", retained, label="main")
+            message = BrokerMessage(
+                platform="telegram",
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="wake with current defaults",
+                agent_name="murzik",
+            )
+
+            await app.state.broker._route_streaming("murzik", message)
+
+            assert retained.state == TransportState.CONNECTED
+            assert retained.sent
+            assert retained._config.model == "gpt-5.6-sol"
+            assert retained._config.thinking_effort == "xhigh"
+            assert retained._codex_model == "gpt-5.6-sol"
+            assert retained._reasoning_effort == "xhigh"
+
+    def test_shutdown_manifest_excludes_idle_sleeping_siblings(self):
+        from pathlib import Path
+
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        class _ManifestSession:
+            def __init__(self, state):
+                self.state = state
+                self.stats = {
+                    "current_activity": "",
+                    "activity_log": [],
+                    "pending_responses": 0,
+                }
+
+            async def disconnect(self):
+                self.state = TransportState.DEAD
+
+        with tempfile.TemporaryDirectory() as tmpdir, \
+                patch("pinky_daemon.api.SHARED_MCP_ENABLED", False):
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app):
+                app.state.agents.register(
+                    "idle", working_dir=os.path.join(tmpdir, "idle")
+                )
+                app.state.agents.register(
+                    "active", working_dir=os.path.join(tmpdir, "active")
+                )
+                app.state.broker.register_streaming(
+                    "idle",
+                    _ManifestSession(TransportState.IDLE_SLEEPING),
+                    label="main",
+                )
+                app.state.broker.register_streaming(
+                    "active",
+                    _ManifestSession(TransportState.CONNECTED),
+                    label="main",
+                )
+
+            manifest = json.loads(
+                Path(tmpdir, "restart_manifest.json").read_text()
+            )
+            assert set(manifest["agents"]) == {"active"}
+
     def test_put_effort_is_partial_and_durable(self):
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.api.SHARED_MCP_ENABLED", False):

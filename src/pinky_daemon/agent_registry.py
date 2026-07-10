@@ -2095,6 +2095,10 @@ except Exception:
         existing = self.get(name)
         if not existing:
             raise KeyError(f"Agent '{name}' not found")
+        if "working_dir" in kwargs:
+            raise ValueError(
+                "working_dir is not supported by partial update; use register()"
+            )
 
         updates = {}
         for key in ("display_name", "model", "soul", "users", "boundaries",
@@ -2119,14 +2123,6 @@ except Exception:
             updates["provider_key"] = kwargs["provider_key"]
         elif kwargs.get("clear_provider_key"):
             updates["provider_key"] = ""
-
-        # Keep the create-path workspace invariants on partial update.
-        if kwargs.get("working_dir"):
-            upd_dir = Path(kwargs["working_dir"])
-            upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
-            if str(upd_dir_abs) != existing.working_dir:
-                self._init_workspace(upd_dir_abs, agent_name=name)
-            updates["working_dir"] = str(upd_dir_abs)
 
         for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
             if key in kwargs:
@@ -2166,7 +2162,30 @@ except Exception:
         existing = self.get(name)
 
         if existing:
-            updated = self.update(name, **kwargs)
+            # Keep the legacy workspace mutation on register(), whose admin
+            # callers and path-handling contract predate the partial update
+            # API. AgentRegistry.update() is intentionally path-free.
+            updated_working_dir = ""
+            if kwargs.get("working_dir"):
+                upd_dir = Path(kwargs["working_dir"])
+                upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
+                if str(upd_dir_abs) != existing.working_dir:
+                    self._init_workspace(upd_dir_abs, agent_name=name)
+                updated_working_dir = str(upd_dir_abs)
+
+            update_kwargs = dict(kwargs)
+            update_kwargs.pop("working_dir", None)
+            updated = self.update(name, **update_kwargs)
+            if updated_working_dir:
+                self._db.execute(
+                    "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
+                    (updated_working_dir, time.time(), name),
+                )
+                self._db.commit()
+                refreshed = self.get(name)
+                if not refreshed:  # Defensive against a concurrent delete.
+                    raise KeyError(f"Agent '{name}' not found")
+                updated = refreshed
             # Preserve register()'s historical signing-key backfill contract
             # for legacy rows even though the field mutation is delegated.
             self.get_or_create_signing_key(name)

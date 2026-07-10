@@ -315,6 +315,16 @@ class TestAgentCRUD:
             registry.update("ghost", thinking_effort="high")
         assert registry.get("ghost") is None
 
+    def test_update_rejects_working_dir_path_mutation(self, registry, tmp_path):
+        original = tmp_path / "original"
+        registry.register("murzik", working_dir=str(original))
+
+        with pytest.raises(ValueError, match="working_dir"):
+            registry.update("murzik", working_dir=str(tmp_path / "other"))
+
+        assert registry.get("murzik").working_dir == str(original)
+        assert not (tmp_path / "other").exists()
+
     def test_get(self, registry):
         registry.register("test")
         agent = registry.get("test")

@@ -1438,10 +1438,10 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_streaming_uses_existing_disconnected_session_before_ensurer(self):
+    async def test_route_streaming_uses_ensurer_for_existing_idle_session(self):
         """If a session object exists with a persisted session_id but is
-        disconnected, the existing auto-wake (reconnect) path must run
-        first — the ensurer is only for the cold-start case.
+        idle-sleeping, production routes its reconnect through the ensurer so
+        registry-backed launch configuration is refreshed first (#856).
         """
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
@@ -1469,7 +1469,8 @@ class TestMessageBrokerRouting:
 
             async def fake_ensurer(agent_name, *, label):
                 ensure_calls.append((agent_name, label))
-                return None  # would fail if called — we expect it NOT to be
+                await ss.connect()
+                return ss
 
             broker.set_ensure_session_callback(fake_ensurer)
 
@@ -1483,13 +1484,9 @@ class TestMessageBrokerRouting:
             )
             await broker._route_streaming("lera", msg)
 
-            # Existing session's connect() was called once.
+            # The ensurer owns the existing session's one reconnect.
             assert _FakeStreaming.connect_calls == 1
-            # Ensurer was NOT called — existing session won.
-            assert ensure_calls == [], (
-                f"ensurer should not be called when an existing session is "
-                f"reconnectable, got: {ensure_calls}"
-            )
+            assert ensure_calls == [("lera", "main")]
             assert _FakeStreaming.sent, "reconnected session received no message"
         finally:
             tmpdir.cleanup()

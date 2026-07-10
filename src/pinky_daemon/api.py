@@ -10234,10 +10234,30 @@ npm run build</pre>
             sessions = broker._streaming.get(name, {})
             if not sessions:
                 continue
+            restartable_sessions = {}
+            for session_label, session in sessions.items():
+                try:
+                    if session.state == TransportSessionState.IDLE_SLEEPING:
+                        _log(
+                            f"shutdown: skipping idle-sleeping session "
+                            f"{name}/{session_label} in restart manifest"
+                        )
+                        continue
+                except Exception:
+                    # Snapshotting is best-effort; an older compatible session
+                    # without a readable state keeps the historical behavior.
+                    pass
+                restartable_sessions[session_label] = session
+            if not restartable_sessions:
+                continue
             # One entry per agent; prefer the main session's state so a
             # multi-label agent does not overwrite it with a sub-session's.
-            label = "main" if "main" in sessions else next(iter(sessions))
-            ss = sessions[label]
+            label = (
+                "main"
+                if "main" in restartable_sessions
+                else next(iter(restartable_sessions))
+            )
+            ss = restartable_sessions[label]
             try:
                 s = ss.stats
                 manifest["agents"][name] = {

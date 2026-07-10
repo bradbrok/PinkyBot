@@ -1226,6 +1226,7 @@ class MessageBroker:
         ``fix/inbound-msg-cold-wake``.
         """
         streaming = self._get_streaming_session(agent_name, message.chat_id)
+        idle_ensurer_attempted = False
 
         # Auto-wake: deliberate idle-sleep with a retained resume_handle can be
         # woken in-line by calling connect(). Per @murzik on PR #492 review,
@@ -1250,8 +1251,27 @@ class MessageBroker:
             else:
                 _log(f"broker: {agent_name} is idle-sleeping — auto-waking for inbound message")
                 try:
-                    await streaming.connect()
-                    _log(f"broker: {agent_name} auto-woke successfully")
+                    if self._ensure_session_callback:
+                        # Production wires the API ensurer, which refreshes the
+                        # retained object's registry-backed launch config before
+                        # connect(). Direct connect here resurrected stale
+                        # model/provider/effort after idle sleep (#856).
+                        labels = self._streaming.get(agent_name, {})
+                        label = next(
+                            (key for key, session in labels.items() if session is streaming),
+                            "main",
+                        )
+                        idle_ensurer_attempted = True
+                        streaming = await self._ensure_session_callback(
+                            agent_name, label=label
+                        )
+                    else:
+                        await streaming.connect()
+                    if streaming and streaming.state == SessionState.CONNECTED:
+                        _log(f"broker: {agent_name} auto-woke successfully")
+                    else:
+                        _log(f"broker: {agent_name} auto-wake did not connect")
+                        streaming = None
                 except Exception as e:
                     _log(f"broker: {agent_name} auto-wake failed: {e}")
                     streaming = None
@@ -1264,7 +1284,11 @@ class MessageBroker:
         # in-flight-reconnect cases (streaming exists but state != CONNECTED)
         # fall through to the wait-for-reconnect block below; cold-starting
         # over them would race the in-flight reconnect.
-        if streaming is None and self._ensure_session_callback:
+        if (
+            streaming is None
+            and self._ensure_session_callback
+            and not idle_ensurer_attempted
+        ):
             label = "main"
             try:
                 if message.chat_id:
