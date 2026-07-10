@@ -8461,7 +8461,11 @@ npm run build</pre>
                 if ss.codex_session_id:
                     _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
                 ss.codex_session_id = ""
-            ss._config.model = req.model
+            # This is a retained-object rebuild, so refresh every durable
+            # launch setting (not just the newly-persisted model). Provider,
+            # effort, and Codex's transport-level caches may have changed in
+            # the registry since the object was constructed.
+            _refresh_streaming_launch_config(name, ss)
             try:
                 await ss.connect()
                 _log(f"api: restarted {name} with model {req.model}")

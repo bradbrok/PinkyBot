@@ -2191,6 +2191,95 @@ class TestAPI:
                 assert fake.codex_session_id == ""
                 assert fake.resume_handle == ""
 
+    def test_streaming_model_restart_refreshes_retained_launch_config(self):
+        """#856: a context-window rebuild uses current registry defaults.
+
+        A retained Codex object can predate durable provider/effort changes.
+        The model endpoint must refresh both StreamingSessionConfig and the
+        Codex launch caches before reconnecting it.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                app.state.agents.register(
+                    "murzik",
+                    model="claude-opus-4-7",
+                    runtime="codex_cli",
+                    transport="tmux",
+                    provider_url="codex_cli",
+                    provider_key="old-key",
+                    thinking_effort="low",
+                    working_dir=os.path.join(tmpdir, "murzik"),
+                )
+                fake = self._FakeStreamingSession(
+                    "murzik", "main", max_tokens=1_000_000
+                )
+                fake._config.model = "claude-opus-4-7"
+                fake._config.provider_url = "codex_cli"
+                fake._config.provider_key = "old-key"
+                fake._config.thinking_effort = "low"
+                fake._config.strict_effort_enforcement = False
+                fake._codex_model = "claude-opus-4-7"
+                fake._openai_api_key = "old-key"
+                fake._reasoning_effort = "low"
+                fake._effort_override = None
+                app.state.broker.register_streaming("murzik", fake, label="main")
+
+                app.state.agents.set_context(
+                    "murzik",
+                    task="Testing registry-backed context-window rebuild",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                updated = client.put(
+                    "/agents/murzik",
+                    json={"provider_key": "new-key", "thinking_effort": "xhigh"},
+                )
+                assert updated.status_code == 200, updated.text
+                # The retained object is intentionally stale until a rebuild.
+                assert fake._openai_api_key == "old-key"
+                assert fake._reasoning_effort == "low"
+
+                observed = {}
+
+                async def connect_with_snapshot():
+                    observed.update(
+                        config_model=fake._config.model,
+                        config_provider_url=fake._config.provider_url,
+                        config_provider_key=fake._config.provider_key,
+                        config_effort=fake._config.thinking_effort,
+                        codex_model=fake._codex_model,
+                        openai_api_key=fake._openai_api_key,
+                        reasoning_effort=fake._reasoning_effort,
+                    )
+                    fake.connect_calls += 1
+                    fake._state = fake._TS.CONNECTED
+
+                fake.connect = connect_with_snapshot
+                response = client.post(
+                    "/agents/murzik/streaming/model",
+                    json={"model": "gpt-5.6-sol"},
+                )
+
+                assert response.status_code == 200, response.text
+                assert response.json()["restarted"] is True
+                assert observed == {
+                    "config_model": "gpt-5.6-sol",
+                    "config_provider_url": "codex_cli",
+                    "config_provider_key": "new-key",
+                    "config_effort": "xhigh",
+                    "codex_model": "gpt-5.6-sol",
+                    "openai_api_key": "new-key",
+                    "reasoning_effort": "xhigh",
+                }
+                durable = app.state.agents.get("murzik")
+                assert durable.model == "gpt-5.6-sol"
+                assert durable.provider_key == "new-key"
+                assert durable.thinking_effort == "xhigh"
+
     def test_streaming_archive_clears_codex_session_id(self):
         """/streaming/archive must clear codex_session_id alongside session_id —
         same bug pattern as /streaming/restart."""
