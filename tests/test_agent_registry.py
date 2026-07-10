@@ -288,6 +288,33 @@ class TestAgentCRUD:
         agent = registry.register("oleg", model="opus")
         assert agent.model == "opus"
 
+    def test_update_is_partial_and_preserves_unset_fields(self, registry):
+        registry.register(
+            "murzik",
+            display_name="Murzik",
+            model="gpt-5.6-sol",
+            thinking_effort="high",
+            runtime="codex_cli",
+            transport="tmux",
+            groups=["reviewers"],
+            allowed_tools=["Read", "Grep"],
+        )
+
+        updated = registry.update("murzik", thinking_effort="xhigh")
+
+        assert updated.thinking_effort == "xhigh"
+        assert updated.display_name == "Murzik"
+        assert updated.model == "gpt-5.6-sol"
+        assert updated.runtime == "codex_cli"
+        assert updated.transport == "tmux"
+        assert updated.groups == ["reviewers"]
+        assert updated.allowed_tools == ["Read", "Grep"]
+
+    def test_update_never_creates_a_missing_agent(self, registry):
+        with pytest.raises(KeyError, match="not found"):
+            registry.update("ghost", thinking_effort="high")
+        assert registry.get("ghost") is None
+
     def test_get(self, registry):
         registry.register("test")
         agent = registry.get("test")

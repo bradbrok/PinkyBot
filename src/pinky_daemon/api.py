@@ -2254,6 +2254,52 @@ def create_api(
             _log(f"api: could not resolve provider config for {agent.name}: {e}")
             return agent.provider_url or "", agent.provider_key or "", agent.provider_model or ""
 
+    def _refresh_streaming_launch_config(agent_name: str, ss) -> None:
+        """Refresh process-launch settings on a retained session object.
+
+        Reconnect paths reuse the object in ``broker._streaming``.  Without
+        this refresh, its constructor-time model/effort can outlive registry
+        changes and a rebuilt tmux pane starts with stale defaults.
+        """
+        agent = agents.get(agent_name)
+        if not agent or not agent.enabled:
+            raise RuntimeError(f"Agent '{agent_name}' is missing or disabled")
+
+        provider_url, provider_key, provider_model = _resolve_agent_provider(agent)
+        runtime = (getattr(agent, "runtime", "") or "").strip()
+        if not runtime:
+            runtime = "codex_cli" if (agent.provider_url or "").strip() == "codex_cli" else "claude_sdk"
+        if runtime == "codex_cli":
+            provider_url = "codex_cli"
+
+        # Codex's canonical selection is agents.model (what agent-card and the
+        # live /streaming/model control persist). provider_model may retain an
+        # older provider-era value; letting it win reproduced murzik's
+        # gpt-5.6-sol registry -> gpt-5.5 rebuilt pane mismatch (#856). An
+        # explicit provider_ref remains an intentional provider-model override.
+        if runtime == "codex_cli" and not (agent.provider_ref or "").strip():
+            model = agent.model or provider_model
+        else:
+            model = provider_model or agent.model
+        effort = agent.thinking_effort or "medium"
+        ss._config.model = model
+        ss._config.provider_url = provider_url
+        ss._config.provider_key = provider_key
+        ss._config.thinking_effort = effort
+        ss._config.strict_effort_enforcement = bool(
+            getattr(agent, "strict_effort_enforcement", False)
+        )
+
+        # Codex transports cache launch values outside StreamingSessionConfig.
+        if hasattr(ss, "_codex_model"):
+            ss._codex_model = model
+        if hasattr(ss, "_openai_api_key"):
+            ss._openai_api_key = provider_key or os.environ.get("OPENAI_API_KEY", "")
+        if hasattr(ss, "_reasoning_effort") and not getattr(ss, "_effort_override", None):
+            ss._reasoning_effort = effort
+
+    app.state._refresh_streaming_launch_config = _refresh_streaming_launch_config
+
     def _get_streaming_restart_guard(agent_name: str, ss) -> dict:
         """Build a restart guard for a live streaming session."""
         guard = _build_restart_guard(
@@ -3074,7 +3120,15 @@ def create_api(
         resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
         if is_codex:
             resolved_provider_url = "codex_cli"
-        effective_model = resolved_provider_model or agent.model
+        # For Codex, agents.model is the operator-facing canonical model and
+        # must win over a stale provider_model left by older provider config.
+        # An explicit provider_ref (and all non-Codex custom providers) retains
+        # its intentional provider-model override.
+        effective_model = (
+            agent.model or resolved_provider_model
+            if is_codex and not (agent.provider_ref or "").strip()
+            else resolved_provider_model or agent.model
+        )
 
         # Build MCP server config for Codex agents (injected via -c flags)
         codex_mcp_servers = {}
@@ -3346,6 +3400,7 @@ def create_api(
                 # object — guard it too, else a local→unix_user update could wake
                 # the old local session under the daemon uid (Murzik #642 review).
                 _enforce_isolation_runnable(agent_name)
+                _refresh_streaming_launch_config(agent_name, ss)
                 await ss.connect()
                 return ss
 
@@ -6232,6 +6287,17 @@ npm run build</pre>
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
         agents.update(name, thinking_effort=level)
+        # Retained session objects are also used by watchdog/context rebuilds.
+        # Refresh their durable default now so an internal tmux relaunch cannot
+        # resurrect the constructor-time effort. Explicit session overrides
+        # remain effective until that session ends.
+        for ss in broker._streaming.get(name, {}).values():
+            try:
+                _refresh_streaming_launch_config(name, ss)
+            except Exception as exc:
+                # The durable update already succeeded; a malformed retained
+                # object must not turn the API response into a false failure.
+                _log(f"effort: live config refresh skipped for {name}: {exc}")
         return {"agent": name, "default": level}
 
     @app.post("/agents/{name}/sessions/{session_label}/effort")
@@ -8268,6 +8334,7 @@ npm run build</pre>
         agents.set_streaming_session_id(name, "", label="main")
 
         # Refresh wake context and reconnect fresh
+        _refresh_streaming_launch_config(name, ss)
         ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "context_restart"
@@ -8477,6 +8544,7 @@ npm run build</pre>
         agents.set_streaming_session_id(name, "", label="main")
 
         ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
+        _refresh_streaming_launch_config(name, ss)
         ss._config.resume_handle = ""
         ss.resume_handle = ""
         if hasattr(ss, "codex_session_id"):
@@ -9545,6 +9613,7 @@ npm run build</pre>
             return
         _log(f"api: watchdog resurrection — reconnecting {agent_name}")
         try:
+            _refresh_streaming_launch_config(agent_name, ss)
             # #202: serialize the fresh boot behind the process-global cold-start
             # gate so a watchdog batch-resurrection doesn't race the shared
             # single-use OAuth refresh token (no-op unless PINKY_COLDSTART_SERIALIZE).
@@ -9751,6 +9820,7 @@ npm run build</pre>
         except Exception:
             pass
         ss._config.wake_context = _build_streaming_wake_context(agent_name, commit=False)
+        _refresh_streaming_launch_config(agent_name, ss)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "mcp_epoch_unbound"
         ss._config.force_fresh_context_once = True
@@ -9787,6 +9857,44 @@ npm run build</pre>
 
     # Shared MCP server (started in on_startup if enabled)
     shared_mcp_manager: SharedMcpManager | None = None
+
+    def _restart_manifest_sessions() -> dict[str, str]:
+        """Return fresh, previously-live agent/label pairs for reconciliation.
+
+        The manifest is written before shutdown disconnects transports.  Reading
+        it is deliberately non-consuming: each session consumes its own wake
+        context only after a successful connect.  Corrupt/stale state is a
+        startup warning, never a daemon-start failure.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        manifest_path = Path(db_path).parent / "restart_manifest.json"
+        if not manifest_path.exists():
+            return {}
+        try:
+            manifest = json.loads(manifest_path.read_text())
+            restart_time = manifest.get("restart_time", "")
+            if restart_time:
+                parsed = datetime.fromisoformat(restart_time)
+                if parsed.tzinfo is None:
+                    parsed = parsed.replace(tzinfo=timezone.utc)
+                if datetime.now(timezone.utc) - parsed >= timedelta(hours=2):
+                    _log("startup: restart manifest is stale; skipping sibling reconciliation")
+                    return {}
+
+            entries = manifest.get("agents", {})
+            if not isinstance(entries, dict):
+                raise ValueError("agents must be an object")
+            return {
+                str(name): str(entry.get("label") or "main")
+                for name, entry in entries.items()
+                if isinstance(entry, dict) and name
+            }
+        except Exception as exc:
+            _log(f"startup: restart manifest reconciliation skipped ({exc})")
+            return {}
+
+    app.state._restart_manifest_sessions = _restart_manifest_sessions
 
     @app.on_event("startup")
     async def on_startup():
@@ -9882,16 +9990,21 @@ npm run build</pre>
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
 
-        # Boot policy (2026-05-11): only the **main agent** auto-resumes at boot.
-        # Sibling agents stay dormant until something triggers them — an inbound
-        # message, an agent-to-agent message, or a scheduled wake firing. Their
-        # autonomy loop + streaming session are created lazily on first dispatch
-        # (see `_ensure_streaming_session` and `autonomy.push_event`).
+        # Boot policy: the main agent always starts. Enabled siblings start only
+        # when the shutdown manifest proves they had a live streaming transport;
+        # all other siblings stay dormant until an inbound/scheduled wake.
         #
         # `auto_start_agents` is no longer used to gate boot startup. The
         # `agent.auto_start` flag is preserved for compat (`/admin/auto-start`
         # endpoint still reports it) but does not control which agents come up.
         main_name_for_boot = agents.get_main_agent()
+        # Belt-and-suspenders around a fail-safe parser: reconciliation must
+        # never prevent the daemon from reaching its normal startup path.
+        try:
+            restart_sessions = _restart_manifest_sessions()
+        except Exception as exc:  # pragma: no cover - helper already guards
+            _log(f"startup: restart reconciler failed open ({exc})")
+            restart_sessions = {}
 
         # Start broker pollers and streaming sessions for all enabled agents.
         from pinky_daemon.pollers import (
@@ -10022,14 +10135,14 @@ npm run build</pre>
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
 
-            # Boot policy: only the main agent auto-resumes its streaming session.
-            # Sibling sessions are created on-demand via `_ensure_streaming_session`
-            # when an inbound message / agent-to-agent message / scheduled wake
-            # routes through the autonomy event queue. Persisted session IDs are
-            # kept in the DB so resume-by-id still works when siblings later wake.
-            if agent.name != main_name_for_boot:
+            # Resume the main agent plus any enabled sibling that was connected
+            # immediately before shutdown. Persisted IDs alone are not enough:
+            # they may be old/dormant and must retain the on-demand policy.
+            restart_label = restart_sessions.get(agent.name)
+            if agent.name != main_name_for_boot and restart_label is None:
                 _log(f"startup: skipping streaming session for {agent.name} (on-demand only)")
                 continue
+            label = "main" if agent.name == main_name_for_boot else restart_label or "main"
 
             # Validate working_dir exists — stale paths from a different machine
             # (e.g. migrating from Mac Mini to RPi) would cause Fatal errors.
@@ -10041,20 +10154,20 @@ npm run build</pre>
                         agents.set_streaming_session_id(agent.name, "", label=entry["label"])
                 continue
 
-            main_resume = agents.get_streaming_session_id(agent.name, label="main")
+            resume_id = agents.get_streaming_session_id(agent.name, label=label)
             try:
-                await _start_streaming_session(agent.name, label="main", resume_id=main_resume)
+                await _start_streaming_session(agent.name, label=label, resume_id=resume_id)
                 streaming_count += 1
-                if main_resume:
-                    _log(f"startup: streaming session resumed for {agent.name}/main (session {main_resume[:12]})")
+                if resume_id:
+                    _log(f"startup: streaming session resumed for {agent.name}/{label} (session {resume_id[:12]})")
                 else:
-                    _log(f"startup: streaming session connected for {agent.name}/main (new)")
+                    _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
             except Exception as e:
-                _log(f"startup: streaming session failed for {agent.name}/main: {e}")
+                _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
                 # If resume failed, clear the stale session ID and try fresh on next boot
-                if main_resume:
-                    _log(f"startup: clearing stale session ID for {agent.name}/main")
-                    agents.set_streaming_session_id(agent.name, "", label="main")
+                if resume_id:
+                    _log(f"startup: clearing stale session ID for {agent.name}/{label}")
+                    agents.set_streaming_session_id(agent.name, "", label=label)
 
         # Clean up restored legacy SDK sessions: those superseded by a live
         # streaming session, plus unowned ghosts (blank agent_name) that would
@@ -10727,6 +10840,7 @@ npm run build</pre>
         agents.set_streaming_session_id(name, "", label="main")
 
         ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
+        _refresh_streaming_launch_config(name, ss)
         ss._config.resume_handle = ""
         ss._config.restart_reason = "force_restart"
         ss._config.force_fresh_context_once = True

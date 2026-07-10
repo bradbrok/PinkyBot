@@ -2083,6 +2083,77 @@ except Exception:
 
     # ── Agent CRUD ──────────────────────────────────────────
 
+    def update(self, name: str, **kwargs) -> Agent:
+        """Partially update an existing agent without creating one.
+
+        Only explicitly supplied, allowlisted fields are changed.  This is
+        intentionally distinct from :meth:`register`: callers that mean to
+        mutate durable defaults must not accidentally create a half-populated
+        agent or reset fields omitted from a PATCH-like request.
+        """
+        name = _validate_agent_name(name)
+        existing = self.get(name)
+        if not existing:
+            raise KeyError(f"Agent '{name}' not found")
+
+        updates = {}
+        for key in ("display_name", "model", "soul", "users", "boundaries",
+                    "system_prompt",
+                    "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
+                    "context_nudge_threshold_pct",
+                    "auto_restart", "parent", "max_sessions", "enabled",
+                    "auto_start", "heartbeat_interval", "wake_interval",
+                    "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
+                    "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
+                    "librarian_enabled", "librarian_schedule",
+                    "runtime", "transport", "provider_url", "provider_model", "provider_ref",
+                    "thinking_effort", "strict_effort_enforcement", "isolated",
+                    "isolation_mode", "container_image"):
+            if key in kwargs:
+                updates[key] = kwargs[key]
+
+        # Secret: empty/absent means "unchanged" so callers round-tripping
+        # the redacted to_dict() (provider_key_set) can't wipe the key.
+        # Wiping requires the explicit clear_provider_key flag.
+        if kwargs.get("provider_key"):
+            updates["provider_key"] = kwargs["provider_key"]
+        elif kwargs.get("clear_provider_key"):
+            updates["provider_key"] = ""
+
+        # Keep the create-path workspace invariants on partial update.
+        if kwargs.get("working_dir"):
+            upd_dir = Path(kwargs["working_dir"])
+            upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
+            if str(upd_dir_abs) != existing.working_dir:
+                self._init_workspace(upd_dir_abs, agent_name=name)
+            updates["working_dir"] = str(upd_dir_abs)
+
+        for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
+            if key in kwargs:
+                updates[key] = json.dumps(kwargs[key])
+
+        for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
+                    "plain_text_fallback", "dream_enabled", "dream_notify",
+                    "librarian_enabled", "strict_effort_enforcement", "isolated"):
+            if key in updates:
+                updates[key] = int(updates[key])
+        if "voice_config" in updates and isinstance(updates["voice_config"], dict):
+            updates["voice_config"] = json.dumps(updates["voice_config"])
+
+        if updates:
+            updates["updated_at"] = time.time()
+            set_clause = ", ".join(f"{key}=?" for key in updates)
+            self._db.execute(
+                f"UPDATE agents SET {set_clause} WHERE name=?",
+                list(updates.values()) + [name],
+            )
+            self._db.commit()
+
+        updated = self.get(name)
+        if not updated:  # Defensive against a concurrent delete.
+            raise KeyError(f"Agent '{name}' not found")
+        return updated
+
     def register(self, name: str, **kwargs) -> Agent:
         """Register a new agent or update an existing one."""
         # Sanitize before any path is constructed downstream. Same regex as
@@ -2095,83 +2166,11 @@ except Exception:
         existing = self.get(name)
 
         if existing:
-            # Merge: only update provided fields
-            updates = {}
-            for key in ("display_name", "model", "soul", "users", "boundaries",
-                        "system_prompt",
-                        "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
-                        "context_nudge_threshold_pct",
-                        "auto_restart", "parent", "max_sessions", "enabled",
-                        "auto_start", "heartbeat_interval", "wake_interval",
-                        "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
-                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
-                        "librarian_enabled", "librarian_schedule",
-                        "runtime", "transport", "provider_url", "provider_model", "provider_ref",
-                        "thinking_effort", "strict_effort_enforcement", "isolated",
-                        "isolation_mode", "container_image"):
-                if key in kwargs:
-                    updates[key] = kwargs[key]
-
-            # Secret: empty/absent means "unchanged" so callers round-tripping
-            # the redacted to_dict() (provider_key_set) can't wipe the key.
-            # Wiping requires the explicit clear_provider_key flag, which the
-            # routes set when a caller sends provider_key="".
-            if kwargs.get("provider_key"):
-                updates["provider_key"] = kwargs["provider_key"]
-            elif kwargs.get("clear_provider_key"):
-                updates["provider_key"] = ""
-
-            # working_dir keeps the create-path invariants on update: empty
-            # means "unchanged" (POST /agents upserts always pass it, default
-            # ""), relative paths are absolutized so they don't break when the
-            # daemon CWD differs from the install dir, and the workspace is
-            # initialized for the new directory.
-            if kwargs.get("working_dir"):
-                upd_dir = Path(kwargs["working_dir"])
-                upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
-                if str(upd_dir_abs) != existing.working_dir:
-                    self._init_workspace(upd_dir_abs, agent_name=name)
-                updates["working_dir"] = str(upd_dir_abs)
-
-            if "watchdog_config" in kwargs:
-                updates["watchdog_config"] = json.dumps(kwargs["watchdog_config"])
-            if "allowed_tools" in kwargs:
-                updates["allowed_tools"] = json.dumps(kwargs["allowed_tools"])
-            if "disallowed_tools" in kwargs:
-                updates["disallowed_tools"] = json.dumps(kwargs["disallowed_tools"])
-            if "groups" in kwargs:
-                updates["groups"] = json.dumps(kwargs["groups"])
-            if "auto_restart" in updates:
-                updates["auto_restart"] = int(updates["auto_restart"])
-            if "enabled" in updates:
-                updates["enabled"] = int(updates["enabled"])
-            if "auto_start" in updates:
-                updates["auto_start"] = int(updates["auto_start"])
-            if "clock_aligned" in updates:
-                updates["clock_aligned"] = int(updates["clock_aligned"])
-            if "plain_text_fallback" in updates:
-                updates["plain_text_fallback"] = int(updates["plain_text_fallback"])
-            if "voice_config" in updates and isinstance(updates["voice_config"], dict):
-                updates["voice_config"] = json.dumps(updates["voice_config"])
-            if "dream_enabled" in updates:
-                updates["dream_enabled"] = int(updates["dream_enabled"])
-            if "dream_notify" in updates:
-                updates["dream_notify"] = int(updates["dream_notify"])
-            if "librarian_enabled" in updates:
-                updates["librarian_enabled"] = int(updates["librarian_enabled"])
-            if "strict_effort_enforcement" in updates:
-                updates["strict_effort_enforcement"] = int(updates["strict_effort_enforcement"])
-            if "isolated" in updates:
-                updates["isolated"] = int(updates["isolated"])
-
-            if updates:
-                updates["updated_at"] = now
-                set_clause = ", ".join(f"{k}=?" for k in updates)
-                self._db.execute(
-                    f"UPDATE agents SET {set_clause} WHERE name=?",
-                    list(updates.values()) + [name],
-                )
-                self._db.commit()
+            updated = self.update(name, **kwargs)
+            # Preserve register()'s historical signing-key backfill contract
+            # for legacy rows even though the field mutation is delegated.
+            self.get_or_create_signing_key(name)
+            return updated
         else:
             # Set up workspace — always store absolute path for portability.
             # Relative paths break when daemon CWD differs from install dir.
