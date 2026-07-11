@@ -420,6 +420,291 @@ def _refresh_1m_models(registry) -> None:
         pass  # Keep fallback
 
 
+_GRANDFATHER_MARKER = "migration:grandfather_approved_users"
+_GRANDFATHER_DIGEST_PENDING = f"{_GRANDFATHER_MARKER}:digest_pending"
+_GRANDFATHER_PLATFORMS = ("telegram", "discord", "slack", "imessage")
+
+
+def _grandfather_candidates(store, registry, agent_name: str) -> list[tuple[str, str]]:
+    """Collect prior-participation evidence without crossing store boundaries.
+
+    Active group membership comes from the registry. Authoritative tool-send
+    history is queried here, in the API composition root that already owns the
+    conversations store.
+    """
+    candidates: dict[str, str] = {}
+    for group in registry.list_group_chats(agent_name, active_only=True):
+        chat_id = str(group.get("chat_id") or "").strip()
+        if chat_id:
+            candidates[chat_id] = str(group.get("chat_title") or "").strip()
+
+    placeholders = ",".join("?" for _ in _GRANDFATHER_PLATFORMS)
+    rows = store._conn.execute(  # API composition root intentionally owns this query.
+        f"""SELECT chat_id
+            FROM messages
+            WHERE role='assistant' AND chat_id != ''
+              AND json_valid(metadata)
+              AND json_extract(metadata, '$.tool') IS NOT NULL
+              AND lower(platform) IN ({placeholders})
+              AND session_id = ?
+            GROUP BY chat_id
+            ORDER BY MIN(timestamp), chat_id""",
+        (*_GRANDFATHER_PLATFORMS, f"{agent_name}-main"),
+    ).fetchall()
+    for row in rows:
+        chat_id = str(row[0] or "").strip()
+        if chat_id:
+            candidates.setdefault(chat_id, "")
+    return list(candidates.items())
+
+
+def _run_grandfather_approved_users_migration(store, registry) -> list[dict]:
+    """Run the one-shot additive migration, leaving broker work for startup."""
+    if registry.get_setting(_GRANDFATHER_MARKER) == "1":
+        return []
+
+    try:
+        raw_pending = registry.get_setting(_GRANDFATHER_DIGEST_PENDING, "")
+        if raw_pending:
+            digest = json.loads(raw_pending)
+            if not isinstance(digest, dict) or not isinstance(digest.get("agents"), list):
+                raise ValueError("pending grandfather digest is invalid")
+        else:
+            planned_agents: list[dict] = []
+            for agent in registry.list():
+                planned_chats: list[dict] = []
+                for chat_id, display_name in _grandfather_candidates(
+                    store, registry, agent.name,
+                ):
+                    status = registry.get_user_status(agent.name, chat_id)
+                    if status not in (None, "pending"):
+                        continue
+                    planned_chats.append({
+                        "chat_id": chat_id,
+                        "display_name": (
+                            display_name
+                            or registry.get_user_display_name(agent.name, chat_id)
+                        ),
+                        "pending_to_approved": status == "pending",
+                    })
+                if planned_chats:
+                    planned_agents.append({
+                        "agent_name": agent.name,
+                        "count": len(planned_chats),
+                        "chats": planned_chats,
+                    })
+            digest = {
+                "version": 1,
+                "seeded_at": time.time(),
+                "agents": planned_agents,
+            }
+            # Journal the exact plan before the first row mutation. If the
+            # process dies between committed rows, the next boot resumes the
+            # same plan and still produces one complete owner receipt.
+            if planned_agents:
+                registry.set_setting(
+                    _GRANDFATHER_DIGEST_PENDING,
+                    json.dumps(digest, separators=(",", ":"), sort_keys=True),
+                )
+
+        seeded_agents: list[dict] = []
+        complete = True
+        for planned_agent in digest["agents"]:
+            agent_name = str(planned_agent.get("agent_name") or "").strip()
+            planned_chats = planned_agent.get("chats", [])
+            registry.grandfather_approved_users(
+                agent_name,
+                [
+                    (str(chat.get("chat_id") or ""), str(chat.get("display_name") or ""))
+                    for chat in planned_chats
+                ],
+            )
+
+            # A crash can occur after approve_user commits but before the
+            # pending request is settled. Finish that half-completed row on the
+            # journal replay before deciding the migration is complete.
+            approved_rows = {
+                user.chat_id: user for user in registry.list_approved_users(agent_name)
+            }
+            for chat in planned_chats:
+                if not chat.get("pending_to_approved"):
+                    continue
+                chat_id = str(chat.get("chat_id") or "")
+                approved = approved_rows.get(chat_id)
+                request = registry.get_approval_request(agent_name, chat_id)
+                if (
+                    approved
+                    and approved.status == "approved"
+                    and approved.approved_by == "grandfather-migration"
+                    and request
+                    and request["gate_state"] == "pending"
+                ):
+                    registry.settle_approval_request(agent_name, chat_id, "approved")
+
+            seeded_chats: list[dict] = []
+            for chat in planned_chats:
+                chat_id = str(chat.get("chat_id") or "")
+                approved = approved_rows.get(chat_id)
+                request = registry.get_approval_request(agent_name, chat_id)
+                pending_settled = (
+                    not chat.get("pending_to_approved")
+                    or request is None
+                    or request["gate_state"] == "approved"
+                )
+                if not (
+                    approved
+                    and approved.status == "approved"
+                    and approved.approved_by == "grandfather-migration"
+                    and pending_settled
+                ):
+                    complete = False
+                    continue
+                seeded_chats.append({
+                    "chat_id": chat_id,
+                    "display_name": approved.display_name,
+                    "pending_to_approved": bool(chat.get("pending_to_approved")),
+                })
+            if seeded_chats:
+                seeded_agents.append({
+                    "agent_name": agent_name,
+                    "count": len(seeded_chats),
+                    "chats": seeded_chats,
+                })
+
+        if not complete:
+            _log(
+                "ERROR startup: grandfather approval migration incomplete; "
+                "leaving marker unset for retry"
+            )
+            return seeded_agents
+
+        if seeded_agents:
+            digest["agents"] = seeded_agents
+            registry.set_setting(
+                _GRANDFATHER_DIGEST_PENDING,
+                json.dumps(digest, separators=(",", ":"), sort_keys=True),
+            )
+        registry.set_setting(_GRANDFATHER_MARKER, "1")
+        return seeded_agents
+    except Exception as exc:
+        # Migration evidence may be temporarily unreadable on a legacy DB.
+        # Keep the marker unset so the next boot retries; never brick startup.
+        _log(f"ERROR startup: grandfather approval migration failed: {exc}")
+        return []
+
+
+def _format_grandfather_digest(digest: dict) -> str:
+    """Render the durable one-time owner receipt."""
+    lines = ["Grandfather approval migration completed.", ""]
+    total = 0
+    for agent in digest.get("agents", []):
+        chats = agent.get("chats", [])
+        total += len(chats)
+        lines.append(f"{agent.get('agent_name', 'unknown')}: {len(chats)} chat(s)")
+        for chat in chats:
+            chat_id = str(chat.get("chat_id") or "")
+            display_name = str(chat.get("display_name") or "").strip()
+            label = f"{display_name} ({chat_id})" if display_name else chat_id
+            if chat.get("pending_to_approved"):
+                label += " - pending -> approved"
+            lines.append(f"- {label}")
+        lines.append("")
+    lines.append(
+        f"Seeded {total} prior conversation(s) from active groups and "
+        "authoritative outbound-send history."
+    )
+    return "\n".join(lines)
+
+
+async def _resume_grandfather_migration(registry, broker) -> bool:
+    """Flush healed pending chats and deliver the durable owner digest."""
+    if registry.get_setting(_GRANDFATHER_MARKER) != "1":
+        return False
+    raw_digest = registry.get_setting(_GRANDFATHER_DIGEST_PENDING, "")
+    if not raw_digest:
+        return False
+    try:
+        digest = json.loads(raw_digest)
+        if not isinstance(digest, dict) or not isinstance(digest.get("agents"), list):
+            raise ValueError("digest payload is not an object with agents")
+    except (TypeError, ValueError, json.JSONDecodeError) as exc:
+        _log(f"ERROR startup: grandfather migration digest is invalid: {exc}")
+        return False
+
+    flush_failed = False
+    preferred_agents: list[str] = []
+    for agent in digest["agents"]:
+        agent_name = str(agent.get("agent_name") or "").strip()
+        if not agent_name:
+            continue
+        preferred_agents.append(agent_name)
+        for chat in agent.get("chats", []):
+            if not chat.get("pending_to_approved"):
+                continue
+            chat_id = str(chat.get("chat_id") or "").strip()
+            try:
+                await broker.handle_approval(agent_name, chat_id)
+            except Exception as exc:
+                flush_failed = True
+                _log(
+                    "ERROR startup: grandfather pending-message flush failed "
+                    f"for {agent_name}/{chat_id}: {exc}"
+                )
+    if flush_failed:
+        # Retain the digest as the durable retry signal for both operations.
+        return False
+
+    send_callback = broker.send_callback
+    destinations = registry.get_owner_notification_destinations()
+    if not send_callback or not destinations:
+        _log(
+            "ERROR startup: grandfather migration digest pending; owner "
+            "notification destination or send callback is not configured"
+        )
+        return False
+
+    all_agent_names = preferred_agents + [
+        agent.name for agent in registry.list() if agent.name not in preferred_agents
+    ]
+    notification = _format_grandfather_digest(digest)
+    last_error = "no destination has an exactly bound token"
+    for destination in destinations:
+        sender_agent = next((
+            agent_name
+            for agent_name in all_agent_names
+            if registry.get_raw_token_for_account(
+                agent_name,
+                destination["platform"],
+                destination["account_id"],
+            )
+        ), "")
+        if not sender_agent:
+            continue
+        try:
+            result = await send_callback(
+                sender_agent,
+                destination["platform"],
+                destination["conversation_id"],
+                notification,
+                account_id=destination["account_id"],
+            )
+            if not isinstance(result, dict) or result.get("sent") is not True:
+                raise RuntimeError("send callback did not confirm delivery")
+        except Exception as exc:
+            last_error = f"{type(exc).__name__}: {exc}"
+            continue
+        registry.delete_setting(_GRANDFATHER_DIGEST_PENDING)
+        _log(
+            "startup: grandfather migration digest delivered via "
+            f"{destination['platform']}/{destination['account_id']}/"
+            f"{destination['conversation_id']}"
+        )
+        return True
+
+    _log(f"ERROR startup: grandfather migration digest delivery failed: {last_error}")
+    return False
+
+
 # ── Research Pipeline Models ──────────────────────────────────
 
 
@@ -1275,6 +1560,7 @@ def create_api(
     store = ConversationStore(db_path=db_path)
     analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
     agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    _run_grandfather_approved_users_migration(store, agents)
     _refresh_1m_models(agents)
     audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
     hooks = HookManager(audit_store=audit)
@@ -10063,6 +10349,13 @@ npm run build</pre>
             )
             await shared_mcp_manager.start()
             _log(f"startup: shared MCP server started on {shared_mcp_manager.url}")
+
+        # The migration settled qualifying approval requests synchronously in
+        # create_api. Flush their held messages only after shared MCP is ready
+        # (so a cold-started session can really accept them), but before any
+        # platform poller can ingest new traffic. The same durable journal then
+        # carries the one-time owner digest until confirmed delivery.
+        await _resume_grandfather_migration(agents, broker)
 
         # Boot policy: the main agent always starts. Enabled siblings start only
         # when the shutdown manifest proves they had a live streaming transport;

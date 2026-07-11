@@ -1325,6 +1325,11 @@ class MessageBroker:
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
         """When a pending user is approved, deliver their held messages.
 
+        Successful rows are checkpointed individually so a later-row failure
+        retries only the undelivered suffix. Delivery remains at-least-once
+        across a process crash between the route handoff and its checkpoint;
+        closing that narrow window requires end-to-end idempotency support.
+
         Returns the number of messages delivered.
         """
         pending = self._registry.get_pending_messages(agent_name, chat_id)
@@ -1351,8 +1356,12 @@ class MessageBroker:
             )
             await self._route_streaming(agent_name, broker_msg)
 
-        # Mark as delivered
-        self._registry.mark_pending_delivered(agent_name, chat_id)
+            # Checkpoint each successful handoff before attempting the next
+            # row. A later-row failure can then retry without deterministically
+            # duplicating the already-routed prefix. A process crash between
+            # route and this write remains intentionally at-least-once; closing
+            # that final window requires an end-to-end idempotency key/claim.
+            self._registry.mark_pending_message_delivered(msg["id"])
 
         _log(f"broker: queued {len(pending)} pending messages for delivery to {agent_name}")
         return len(pending)

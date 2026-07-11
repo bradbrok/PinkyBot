@@ -3502,6 +3502,53 @@ except Exception:
         ).fetchone()
         return row[0] if row else None
 
+    def grandfather_approved_users(
+        self, agent_name: str, candidates: list[tuple[str, str]],
+    ) -> list[dict]:
+        """Approve chats with durable evidence of prior agent participation.
+
+        Existing approved and denied decisions are authoritative and are never
+        changed. A qualifying pending row is healed as well: its approval
+        request is settled here, while the broker-dependent held-message flush
+        is resumed by the API startup migration handler.
+
+        Each candidate is isolated so a malformed legacy row cannot brick
+        daemon startup. The caller owns cross-store candidate discovery and the
+        one-shot migration marker.
+        """
+        seeded: list[dict] = []
+        seen: set[str] = set()
+        for raw_chat_id, raw_display_name in candidates:
+            chat_id = str(raw_chat_id or "").strip()
+            if not chat_id or chat_id in seen:
+                continue
+            seen.add(chat_id)
+            display_name = str(raw_display_name or "").strip()
+            try:
+                previous_status = self.get_user_status(agent_name, chat_id)
+                if previous_status not in (None, "pending"):
+                    continue
+                approved = self.approve_user(
+                    agent_name,
+                    chat_id,
+                    display_name,
+                    approved_by="grandfather-migration",
+                )
+                was_pending = previous_status == "pending"
+                if was_pending:
+                    self.settle_approval_request(agent_name, chat_id, "approved")
+                seeded.append({
+                    "chat_id": chat_id,
+                    "display_name": approved.display_name,
+                    "pending_to_approved": was_pending,
+                })
+            except Exception as exc:
+                _log(
+                    "ERROR agent_registry: grandfather migration skipped "
+                    f"{agent_name}/{chat_id}: {exc}"
+                )
+        return seeded
+
     def get_user_timezone(self, agent_name: str, chat_id: str) -> str:
         """Get a user's timezone. Returns IANA timezone string or empty."""
         row = self._db.execute(
@@ -3637,6 +3684,15 @@ except Exception:
         )
         self._db.commit()
         return cursor.rowcount
+
+    def mark_pending_message_delivered(self, message_id: int) -> bool:
+        """Mark one held message delivered immediately after its route succeeds."""
+        cursor = self._db.execute(
+            "UPDATE pending_messages SET delivered=1 WHERE id=? AND delivered=0",
+            (message_id,),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
 
     def delete_pending_messages(self, agent_name: str, chat_id: str = "") -> int:
         """Delete pending messages. If chat_id given, only for that chat."""
