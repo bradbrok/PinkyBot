@@ -789,11 +789,29 @@ class MessageBroker:
             )
         return True
 
-    async def _handle_approval_command(self, message: BrokerMessage) -> bool:
-        """Intercept /approve_<id> and /deny_<id> commands from the owner."""
-        primary = self._registry.get_primary_user()
+    def _is_owner_approval_authorized(self, message: BrokerMessage) -> bool:
+        """Require an exact configured owner DM destination + principal."""
         sender_id = message.sender_id or message.chat_id
-        if not primary.get("chat_id") or sender_id != primary["chat_id"]:
+        if message.is_group or not sender_id or not message.chat_id:
+            return False
+        for destination in self._registry.get_owner_notification_destinations():
+            if (
+                destination["platform"] != message.platform
+                or destination["conversation_id"] != message.chat_id
+                or destination["principal_id"] != sender_id
+            ):
+                continue
+            if self._registry.get_raw_token_for_account(
+                message.agent_name,
+                message.platform,
+                destination["account_id"],
+            ):
+                return True
+        return False
+
+    async def _handle_approval_command(self, message: BrokerMessage) -> bool:
+        """Intercept owner approval commands from a configured secure DM."""
+        if not self._is_owner_approval_authorized(message):
             return False
 
         text = message.content.strip()
@@ -1178,7 +1196,11 @@ class MessageBroker:
                                 )
                             except Exception as e:
                                 _log(f"broker: failed to send onboarding reply to {approval_key}: {e}")
-                self._registry.queue_pending_message(
+                target_name = message.chat_id if is_channel else message.sender_name
+                username = message.metadata.get("username", "")
+                if username and not is_channel:
+                    target_name = f"{target_name or 'Unknown'} (@{username})"
+                _, approval_request = self._registry.queue_pending_message_with_approval_request(
                     agent_name=agent_name,
                     platform=message.platform,
                     chat_id=approval_key,
@@ -1187,16 +1209,7 @@ class MessageBroker:
                     content=message.content,
                     is_group=message.is_group,
                     sender_id=message.sender_id,
-                )
-                target_name = message.chat_id if is_channel else message.sender_name
-                username = message.metadata.get("username", "")
-                if username and not is_channel:
-                    target_name = f"{target_name or 'Unknown'} (@{username})"
-                approval_request = self._registry.record_approval_hold(
-                    agent_name,
-                    approval_key,
                     target_name=target_name,
-                    is_channel=is_channel,
                     held_at=message.timestamp,
                 )
                 await self._notify_approval_request(approval_request)

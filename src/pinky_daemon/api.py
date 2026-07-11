@@ -1326,15 +1326,21 @@ def create_api(
     }
 
     # Message broker — routes platform messages through approval checks to agent sessions
-    _platform_adapters: dict[tuple[str, str], object] = {}
+    _platform_adapters: dict[tuple[str, ...], object] = {}
 
-    def _get_platform_adapter(agent_name: str, platform: str):
+    def _get_platform_adapter(
+        agent_name: str, platform: str, *, account_id: str = "",
+    ):
         """Get or create a platform adapter for an agent."""
-        key = (agent_name, platform)
+        key = (agent_name, platform, account_id)
         if key in _platform_adapters:
             return _platform_adapters[key]
 
-        token = agents.get_raw_token(agent_name, platform)
+        token = (
+            agents.get_raw_token_for_account(agent_name, platform, account_id)
+            if account_id
+            else agents.get_raw_token(agent_name, platform)
+        )
         if not token:
             return None
 
@@ -1352,6 +1358,12 @@ def create_api(
         if adapter:
             _platform_adapters[key] = adapter
         return adapter
+
+    def _evict_platform_adapters(agent_name: str, platform: str) -> None:
+        """Drop generic and account-bound adapters after token mutation."""
+        for key in list(_platform_adapters):
+            if len(key) >= 2 and key[0] == agent_name and key[1] == platform:
+                _platform_adapters.pop(key, None)
 
     def _get_imessage_adapter(agent_name: str = ""):
         """Get or create the iMessage adapter for an agent."""
@@ -1427,6 +1439,7 @@ def create_api(
         chat_id: str,
         content: str,
         *,
+        account_id: str = "",
         reply_to: str = "",
         parse_mode: str = "",
         silent: bool = False,
@@ -1495,7 +1508,9 @@ def create_api(
                 raise HTTPException(502, f"ferry send failed: {result.error}")
             return SimpleNamespace(message_id=envelope.id)
 
-        adapter = _get_platform_adapter(agent_name, platform)
+        adapter = _get_platform_adapter(
+            agent_name, platform, account_id=account_id,
+        )
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name}")
 
@@ -1664,20 +1679,13 @@ def create_api(
         blocks: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
-        if account_id:
-            token_config = agents.get_token(agent_name, platform)
-            settings = token_config.settings if token_config else {}
-            configured_account = str(
-                settings.get("account_id")
-                or settings.get("team_id")
-                or settings.get("workspace_id")
-                or ""
-            ).strip()
-            if configured_account and configured_account != account_id:
-                raise HTTPException(
-                    409,
-                    f"Configured {platform} account does not match destination account",
-                )
+        if account_id and not agents.get_raw_token_for_account(
+            agent_name, platform, account_id,
+        ):
+            raise HTTPException(
+                409,
+                f"No {platform} token bound to destination account {account_id}",
+            )
         loop = asyncio.get_running_loop()
 
         async def _deliver() -> dict:
@@ -1688,6 +1696,7 @@ def create_api(
                     platform,
                     chat_id,
                     content,
+                    account_id=account_id,
                     reply_to=reply_to,
                     parse_mode=parse_mode,
                     silent=silent,
@@ -1722,9 +1731,10 @@ def create_api(
         # Plain sends keep key_extra="" — their historical dedupe behaviour is
         # unchanged. The dict is serialized (never used raw) so the key stays
         # hashable.
-        if parse_mode or link_preview_options or quote or blocks:
+        if account_id or parse_mode or link_preview_options or quote or blocks:
             key_extra = json.dumps(
                 {
+                    "acct": account_id or "",
                     "pm": parse_mode or "",
                     "lpo": link_preview_options or None,
                     "q": quote or "",
@@ -6973,7 +6983,7 @@ npm run build</pre>
 
         # Evict the cached outbound adapter so sends pick up the new token
         # immediately (adapters bind the token at construction).
-        _platform_adapters.pop((name, platform), None)
+        _evict_platform_adapters(name, platform)
         if platform == "imessage":
             _platform_adapters.pop(("__global__", "imessage"), None)
 
@@ -7060,7 +7070,7 @@ npm run build</pre>
             raise HTTPException(404, "Token not found")
 
         # Evict the cached outbound adapter so sends stop using the removed token
-        _platform_adapters.pop((name, platform), None)
+        _evict_platform_adapters(name, platform)
         if platform == "imessage":
             _platform_adapters.pop(("__global__", "imessage"), None)
 

@@ -2834,6 +2834,27 @@ except Exception:
             return ref_row[0] if ref_row else ""
         return ""
 
+    def get_token_account_id(self, agent_name: str, platform: str) -> str:
+        """Return the explicit provider account/team/workspace binding."""
+        token = self.get_token(agent_name, platform)
+        if not token or not token.enabled or not token.token_set:
+            return ""
+        return str(
+            token.settings.get("account_id")
+            or token.settings.get("team_id")
+            or token.settings.get("workspace_id")
+            or ""
+        ).strip()
+
+    def get_raw_token_for_account(
+        self, agent_name: str, platform: str, account_id: str,
+    ) -> str:
+        """Resolve a token only when its explicit account binding is exact."""
+        requested = str(account_id or "").strip()
+        if not requested or self.get_token_account_id(agent_name, platform) != requested:
+            return ""
+        return self.get_raw_token(agent_name, platform)
+
     def list_tokens(self, agent_name: str) -> list[AgentToken]:
         """List all tokens for an agent."""
         rows = self._db.execute(
@@ -3549,6 +3570,20 @@ except Exception:
         message arrived in a group/channel so it re-delivers with the right
         context on approval.
         """
+        cursor = self._queue_pending_message_uncommitted(
+            agent_name=agent_name, platform=platform, chat_id=chat_id,
+            sender_name=sender_name, content=content, reply_chat_id=reply_chat_id,
+            is_group=is_group, sender_id=sender_id,
+        )
+        self._db.commit()
+        return cursor
+
+    def _queue_pending_message_uncommitted(
+        self, *, agent_name: str, platform: str, chat_id: str,
+        sender_name: str, content: str, reply_chat_id: str = "",
+        is_group: bool = False, sender_id: str = "",
+    ) -> int:
+        """Insert one held row without committing (transaction helper)."""
         now = time.time()
         dest = reply_chat_id or chat_id
         sid = sender_id or chat_id
@@ -3558,7 +3593,6 @@ except Exception:
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
             (agent_name, platform, chat_id, dest, int(is_group), sid, sender_name, content, now),
         )
-        self._db.commit()
         return cursor.lastrowid
 
     def get_pending_messages(
@@ -3656,6 +3690,18 @@ except Exception:
         is_channel: bool = False, held_at: float | None = None,
     ) -> dict:
         """Create or aggregate one approval request on the legacy gate key."""
+        self._record_approval_hold_uncommitted(
+            agent_name, chat_id, target_name=target_name,
+            is_channel=is_channel, held_at=held_at,
+        )
+        self._db.commit()
+        return self.get_approval_request(agent_name, chat_id)  # type: ignore[return-value]
+
+    def _record_approval_hold_uncommitted(
+        self, agent_name: str, chat_id: str, *, target_name: str = "",
+        is_channel: bool = False, held_at: float | None = None,
+    ) -> None:
+        """Upsert the legacy aggregate without committing (transaction helper)."""
         now = held_at if held_at is not None else time.time()
         self._db.execute(
             """INSERT INTO approval_requests
@@ -3673,8 +3719,40 @@ except Exception:
                    updated_at=excluded.updated_at""",
             (agent_name, chat_id, target_name, int(is_channel), now, now, now),
         )
-        self._db.commit()
-        return self.get_approval_request(agent_name, chat_id)  # type: ignore[return-value]
+
+    def queue_pending_message_with_approval_request(
+        self, *, agent_name: str, platform: str, chat_id: str,
+        sender_name: str, content: str, reply_chat_id: str = "",
+        is_group: bool = False, sender_id: str = "", target_name: str = "",
+        held_at: float | None = None,
+    ) -> tuple[int, dict]:
+        """Atomically persist a held row and its legacy approval aggregate.
+
+        The explicit transaction closes the #863 crash boundary: after commit,
+        a durable held row always has the request discovered by the restart
+        retry loop; before commit, neither side survives.
+        """
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                message_id = self._queue_pending_message_uncommitted(
+                    agent_name=agent_name, platform=platform, chat_id=chat_id,
+                    sender_name=sender_name, content=content,
+                    reply_chat_id=reply_chat_id, is_group=is_group,
+                    sender_id=sender_id,
+                )
+                self._record_approval_hold_uncommitted(
+                    agent_name, chat_id, target_name=target_name,
+                    is_channel=is_group, held_at=held_at,
+                )
+                self._db.commit()
+            except BaseException:
+                self._db.rollback()
+                raise
+        request = self.get_approval_request(agent_name, chat_id)
+        if request is None:  # defensive invariant check after successful commit
+            raise RuntimeError("approval request missing after atomic hold commit")
+        return message_id, request
 
     def begin_approval_notification(self, request_id: int, *, reset_attempts: bool) -> None:
         """Mark a notification cycle active, optionally resetting re-notify attempts."""
@@ -3964,11 +4042,12 @@ except Exception:
                 or ""
             ).strip(),
             "conversation_id": str(destination.get("conversation_id") or "").strip(),
+            "principal_id": str(destination.get("principal_id") or "").strip(),
         }
         if not all(normalized.values()):
             raise ValueError(
                 "owner notification destination requires platform, "
-                "account_id/team_id/workspace_id, and conversation_id"
+                "account_id/team_id/workspace_id, conversation_id, and principal_id"
             )
         return normalized
 
@@ -4017,6 +4096,7 @@ except Exception:
                 "platform": platform,
                 "account_id": account_id,
                 "conversation_id": primary_chat_id,
+                "principal_id": primary_chat_id,
             }
         ])
 

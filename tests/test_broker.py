@@ -784,6 +784,7 @@ class TestMessageBrokerRouting:
                     "platform": "telegram",
                     "account_id": "owner-bot",
                     "conversation_id": owner,
+                    "principal_id": owner,
                 }
             ])
 
@@ -852,11 +853,13 @@ class TestMessageBrokerRouting:
                     "platform": "slack",
                     "account_id": "T_OWNER",
                     "conversation_id": "D_OWNER",
+                    "principal_id": "U_OWNER",
                 },
                 {
                     "platform": "telegram",
                     "account_id": "owner-telegram-account",
                     "conversation_id": "owner-conversation",
+                    "principal_id": "legacy-owner-id",
                 }
             ])
             channel = "C_GATED"
@@ -892,6 +895,116 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
+    async def test_fallback_recipient_can_approve_and_deny_fail_closed(
+        self, monkeypatch,
+    ):
+        """Fallback DM principal gets usable commands; wrong authority gets none."""
+        tmpdir, registry, broker, _sent, _ = self._make_broker()
+        sends: list[tuple[str, str, str, str]] = []
+        routed: list[BrokerMessage] = []
+
+        async def send(
+            agent_name, platform, chat_id, content, *, account_id="",
+        ):
+            if account_id == "tg-owner-account":
+                raise RuntimeError("telegram owner destination unavailable")
+            sends.append((platform, account_id, chat_id, content))
+
+        async def route(agent_name, message):
+            routed.append(message)
+
+        broker._send_callback = send
+        monkeypatch.setattr(broker, "_route_streaming", route)
+        try:
+            registry.set_primary_user("legacy-telegram-owner", display_name="Brad")
+            registry.set_token(
+                "barsik", "telegram", "tg-token",
+                settings={"account_id": "tg-owner-account"},
+            )
+            registry.set_token(
+                "barsik", "slack", "xoxb-token",
+                settings={"team_id": "T_OWNER"},
+            )
+            registry.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "tg-owner-account",
+                    "conversation_id": "legacy-telegram-owner",
+                    "principal_id": "legacy-telegram-owner",
+                },
+                {
+                    "platform": "slack",
+                    "account_id": "T_OWNER",
+                    "conversation_id": "D_OWNER",
+                    "principal_id": "U_OWNER",
+                },
+            ])
+
+            approve_channel = "C_APPROVE"
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id=approve_channel, sender_name="Alex",
+                    sender_id="U_ALEX", content="approve me", agent_name="barsik",
+                    is_group=True,
+                )
+            )
+            request = registry.get_approval_request("barsik", approve_channel)
+            assert request["notification_destination"] == {
+                "platform": "slack", "account_id": "T_OWNER",
+                "conversation_id": "D_OWNER", "principal_id": "U_OWNER",
+            }
+            assert sends[0][0:3] == ("slack", "T_OWNER", "D_OWNER")
+
+            command = BrokerMessage(
+                platform="slack", chat_id="D_OWNER", sender_name="Brad",
+                sender_id="U_OWNER", content=f"/approve_{approve_channel}",
+                agent_name="barsik",
+            )
+            # Public-channel and wrong-principal copies are never authorized.
+            public_command = BrokerMessage(**{**command.__dict__, "is_group": True})
+            wrong_principal = BrokerMessage(**{**command.__dict__, "sender_id": "U_EVIL"})
+            assert await broker._handle_approval_command(public_command) is False
+            assert await broker._handle_approval_command(wrong_principal) is False
+            assert registry.get_user_status("barsik", approve_channel) == "pending"
+
+            # Token/account drift after delivery also fails closed with zero
+            # gate mutation. Restoring the exact binding makes the command usable.
+            registry.set_token(
+                "barsik", "slack", "xoxb-token",
+                settings={"team_id": "T_OTHER"},
+            )
+            assert await broker._handle_approval_command(command) is False
+            assert registry.get_user_status("barsik", approve_channel) == "pending"
+            registry.set_token(
+                "barsik", "slack", "xoxb-token",
+                settings={"team_id": "T_OWNER"},
+            )
+            await broker.handle_inbound(command)
+            assert registry.get_user_status("barsik", approve_channel) == "approved"
+            assert [message.content for message in routed] == ["approve me"]
+
+            deny_channel = "C_DENY"
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id=deny_channel, sender_name="Alex",
+                    sender_id="U_ALEX", content="deny me", agent_name="barsik",
+                    is_group=True,
+                )
+            )
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id="D_OWNER", sender_name="Brad",
+                    sender_id="U_OWNER", content=f"/deny_{deny_channel}",
+                    agent_name="barsik",
+                )
+            )
+            assert registry.get_user_status("barsik", deny_channel) == "denied"
+            assert registry.get_approval_request("barsik", deny_channel)["gate_state"] == "denied"
+            assert len(routed) == 1
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
     async def test_owner_notification_failure_retries_and_is_operator_visible(
         self, monkeypatch,
     ):
@@ -917,6 +1030,7 @@ class TestMessageBrokerRouting:
                     "platform": "telegram",
                     "account_id": "owner-account",
                     "conversation_id": "owner",
+                    "principal_id": "owner",
                 }
             ])
             await broker.handle_inbound(
@@ -964,6 +1078,7 @@ class TestMessageBrokerRouting:
                     "platform": "telegram",
                     "account_id": "owner-account",
                     "conversation_id": "owner",
+                    "principal_id": "owner",
                 }
             ])
             channel = "C_BURST"
@@ -1105,11 +1220,16 @@ class TestMessageBrokerRouting:
             monkeypatch.setattr(broker, "_route_streaming", _fake_route)
             owner = "owner-1"
             registry.set_primary_user(owner, display_name="Brad")
+            registry.set_token(
+                "barsik", "slack", "xoxb-test",
+                settings={"team_id": "T_OWNER"},
+            )
             registry.set_owner_notification_destinations([
                 {
                     "platform": "slack",
                     "account_id": "T_OWNER",
                     "conversation_id": owner,
+                    "principal_id": owner,
                 }
             ])
 
