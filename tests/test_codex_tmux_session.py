@@ -13,6 +13,7 @@ validated live 2026-06-17.
 """
 import asyncio
 import os
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -24,7 +25,15 @@ from pinky_daemon.codex_tmux_session import (
 )
 from pinky_daemon.codex_tmux_transcript import CodexTmuxTranscriptTailer
 from pinky_daemon.streaming_session import StreamingSessionConfig
-from pinky_daemon.tmux_session import TmuxCommandResult, _TmuxControl
+from pinky_daemon.tmux_session import (
+    TmuxCommandResult,
+    TmuxSession,
+    _InflightMeta,
+    _QueuedTurn,
+    _TmuxControl,
+)
+from pinky_daemon.tmux_transcript import TurnResponse
+from pinky_daemon.transport_state import SessionState
 
 
 def _ok(stdout: str = "") -> TmuxCommandResult:
@@ -369,6 +378,133 @@ def test_container_isolation_transport_checked_before_runtime():
         transport="sdk", runtime="codex_cli", agent_name="ctr"
     )
     assert status == 400
+
+
+# ── #860 — cost attribution + usage normalization ───────────────────────────
+# The codex transport shares TmuxSession._log_turn_cost_and_analytics; its two
+# seams are _ANALYTICS_PROVIDER (truthful provider on analytics rows) and
+# _normalize_turn_usage (codex's inclusive input_tokens + cached_input_tokens
+# → the daemon's disjoint convention, once, before any consumer).
+
+
+def test_analytics_provider_is_codex_cli():
+    """Codex turns must not claim "anthropic": the pricing lookup keys on
+    (provider, model) and _provider_alias never crosses providers, so
+    anthropic/gpt-* rows price at $0. "codex_cli" matches the SDK path's
+    default and aliases onto the openai rate rows."""
+    assert CodexTmuxSession._ANALYTICS_PROVIDER == "codex_cli"
+    assert TmuxSession._ANALYTICS_PROVIDER == "anthropic"
+
+
+def test_normalize_converts_codex_schema_to_disjoint():
+    """Codex reports input_tokens INCLUSIVE of the cached prefix; the daemon
+    convention is disjoint (input = uncached remainder, cached span under
+    cache_read_input_tokens). The ambiguous source key is consumed."""
+    u = {"input_tokens": 100_000, "cached_input_tokens": 90_000,
+         "output_tokens": 500}
+    out = CodexTmuxSession._normalize_turn_usage(u)
+    assert out["input_tokens"] == 10_000
+    assert out["cache_read_input_tokens"] == 90_000
+    assert "cached_input_tokens" not in out
+    assert out["output_tokens"] == 500
+    # The source dict is copied, never mutated in place.
+    assert u["input_tokens"] == 100_000
+    assert u["cached_input_tokens"] == 90_000
+
+
+def test_normalize_without_cached_key_passes_through():
+    """No cached_input_tokens ⇒ nothing to convert; the dict passes through
+    untouched (fail toward the visible undercount, never a double-bill)."""
+    u = {"input_tokens": 5_000, "output_tokens": 100}
+    assert CodexTmuxSession._normalize_turn_usage(u) is u
+
+
+def test_normalize_malformed_counts_pass_through():
+    u = {"input_tokens": 5_000, "cached_input_tokens": "garbage"}
+    assert CodexTmuxSession._normalize_turn_usage(u) is u
+
+
+def test_normalize_clamps_cached_larger_than_inclusive():
+    """cached > inclusive shouldn't happen, but must clamp to 0 rather than
+    log a negative input count."""
+    u = {"input_tokens": 1_000, "cached_input_tokens": 2_000}
+    out = CodexTmuxSession._normalize_turn_usage(u)
+    assert out["input_tokens"] == 0
+    assert out["cache_read_input_tokens"] == 2_000
+
+
+def _seed_inflight(ss: CodexTmuxSession) -> None:
+    """Minimal _InflightMeta seed so _handle_turn_complete has a head entry
+    (mirrors tests/test_tmux_session.py's helper)."""
+    ss._inflight_metas.append(
+        _InflightMeta(
+            meta={},
+            completion_event=None,
+            internal=False,
+            dispatched_at=time.time(),
+            turn=_QueuedTurn(prompt=""),
+        )
+    )
+    ss._head_started_at = time.time()
+
+
+@pytest.mark.asyncio
+async def test_turn_complete_prices_codex_turn_correctly():
+    """#860 end-to-end: a codex-schema turn (usage exactly as the tailer
+    snapshots token_count.info.last_token_usage) must log provider=codex_cli,
+    the DISJOINT token split, and the openai-rate dollar figure. Pre-#860 this
+    row logged as anthropic/gpt-* at $0 — and had a rate row existed, the
+    inclusive input count would have over-billed the cached span ~10x on
+    review-heavy sessions."""
+    analytics = MagicMock()
+    cost_cb = MagicMock()
+    cfg = StreamingSessionConfig(
+        agent_name="murzik",
+        working_dir="/tmp/codex-tmux-test",
+        model="gpt-5.6-sol",
+        provider_key="sk-test",
+    )
+    ss = CodexTmuxSession(
+        cfg,
+        tmux_control=_mock_tmux(),
+        analytics_store=analytics,
+        cost_callback=cost_cb,
+    )
+    ss._skip_wake_prompt_for_tests = True
+    ss._state_machine._state = SessionState.CONNECTED
+    _seed_inflight(ss)
+
+    await ss._handle_turn_complete(
+        TurnResponse(
+            text="ok",
+            stop_reason="end_turn",
+            model="gpt-5.6-sol",
+            usage={
+                "input_tokens": 100_000,       # inclusive of cached (codex)
+                "cached_input_tokens": 90_000,
+                "output_tokens": 1_000,
+            },
+            duration_ms=100,
+            assistant_entry_count=1,
+            tool_uses=[],
+        )
+    )
+
+    analytics.log_turn_usage.assert_called_once()
+    kwargs = analytics.log_turn_usage.call_args.kwargs
+    assert kwargs["provider"] == "codex_cli"
+    assert kwargs["model"] == "gpt-5.6-sol"
+    assert kwargs["input_tokens"] == 10_000        # uncached remainder
+    assert kwargs["cached_input_tokens"] == 90_000  # cache-READ column
+    assert kwargs["output_tokens"] == 1_000
+
+    # 10k uncached @ $5 + 1k out @ $30 + 90k cached @ $0.50 (per Mtok).
+    expected = 10_000 / 1e6 * 5 + 1_000 / 1e6 * 30 + 90_000 / 1e6 * 0.5
+    assert cost_cb.call_args.args[1] == pytest.approx(expected)
+    assert ss.usage.total_cost_usd == pytest.approx(expected)
+    # Accumulation saw the disjoint split too (context gauge correctness).
+    assert ss.usage.input_tokens == 10_000
+    assert ss.usage.cache_read_tokens == 90_000
 
 
 # ── gated integration smoke (the make-or-break; opt-in) ─────────────────────

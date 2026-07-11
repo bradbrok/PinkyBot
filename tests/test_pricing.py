@@ -183,3 +183,79 @@ def test_cost_from_usage_tolerates_malformed() -> None:
 
 def test_zero_usage_is_zero_cost() -> None:
     assert compute_cost_from_usage("claude-opus-4-8", {}) == 0.0
+
+
+# ── OpenAI / Codex family (#860) ───────────────────────────────────────────
+# Powers the live tmux cost path for codex agents (CodexTmuxSession rides the
+# same _log_turn_cost_and_analytics as Claude tmux). Official API rates
+# (developers.openai.com, verified 2026-07-10): gpt-5.6-sol / gpt-5.5 at
+# $5/$30 (cached input $0.50), gpt-5.3-codex at $1.75/$14 (cached $0.175).
+# Cache-write tariffs differ per model page: sol bills 1.25x input ($6.25);
+# the gpt-5.5 and gpt-5.3-codex pages list no write tariff (murzik #861 P2).
+
+
+def test_gpt_frontier_rates() -> None:
+    # 1M input @ $5 + 1M output @ $30 + 1M cached-read @ $0.50 = $35.50
+    for model in ("gpt-5.6-sol", "gpt-5.5"):
+        cost = compute_turn_cost_usd(
+            model,
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=1_000_000,
+            cache_creation_5m_tokens=0,
+            cache_creation_1h_tokens=0,
+        )
+        assert cost == pytest.approx(35.5), model
+
+
+def test_gpt_53_codex_rates() -> None:
+    # 1M input @ $1.75 + 1M output @ $14 + 1M cached-read @ $0.175 = $15.925
+    cost = compute_turn_cost_usd(
+        "gpt-5.3-codex",
+        input_tokens=1_000_000,
+        output_tokens=1_000_000,
+        cache_read_tokens=1_000_000,
+        cache_creation_5m_tokens=0,
+        cache_creation_1h_tokens=0,
+    )
+    assert cost == pytest.approx(15.925)
+
+
+def test_gpt_56_sol_cache_write_billed_at_1_25x_input() -> None:
+    """The sol model page documents cache writes at 1.25x the uncached input
+    rate ($6.25/Mtok). OpenAI has no 5m/1h TTL split, so both positions carry
+    the same tariff (murzik #861 P2 — was wrongly $0)."""
+    rate = lookup_rate("gpt-5.6-sol")
+    assert rate["cache_write_5m"] == 6.25
+    assert rate["cache_write_1h"] == 6.25
+    cost = compute_turn_cost_usd(
+        "gpt-5.6-sol",
+        input_tokens=0,
+        output_tokens=0,
+        cache_read_tokens=0,
+        cache_creation_5m_tokens=1_000_000,
+        cache_creation_1h_tokens=1_000_000,
+    )
+    assert cost == pytest.approx(12.5)
+    # Usage-dict entry point (aggregate falls back to the 1h position).
+    usage = {"input_tokens": 0, "output_tokens": 0,
+             "cache_creation_input_tokens": 1_000_000}
+    assert compute_cost_from_usage("gpt-5.6-sol", usage) == pytest.approx(6.25)
+
+
+def test_gpt_55_and_codex_cache_write_bills_zero() -> None:
+    """The gpt-5.5 and gpt-5.3-codex model pages list no cache-write tariff —
+    cache_creation tokens contribute $0 at both positions."""
+    for model in ("gpt-5.5", "gpt-5.3-codex"):
+        cost = compute_turn_cost_usd(
+            model,
+            input_tokens=0,
+            output_tokens=0,
+            cache_read_tokens=0,
+            cache_creation_5m_tokens=1_000_000,
+            cache_creation_1h_tokens=1_000_000,
+        )
+        assert cost == 0.0, model
+        usage = {"input_tokens": 0, "output_tokens": 0,
+                 "cache_creation_input_tokens": 1_000_000}
+        assert compute_cost_from_usage(model, usage) == 0.0, model

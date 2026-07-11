@@ -456,25 +456,38 @@ class TestSeedRateTableParity:
     per-turn). They must agree for the same model, or the same usage reports
     different dollar figures. This pins them together as a drift guard."""
 
+    # RATE_TABLE keys are bare model ids; the Analytics seed keys on
+    # (provider, model). #860 added the OpenAI/codex family to RATE_TABLE, so
+    # the guard is provider-aware: each family must be seeded under the RIGHT
+    # provider (a gpt row seeded as anthropic would be unpriceable at read
+    # time — _provider_alias never crosses providers).
+    @staticmethod
+    def _expected_provider(model: str) -> str:
+        return "anthropic" if model.startswith("claude-") else "openai"
+
     def test_seed_pricing_matches_rate_table(self, tmp_path):
         store = _store(tmp_path)
         with store._connect() as conn:
             rows = conn.execute(
-                "SELECT model, input_usd_per_mtok, output_usd_per_mtok, "
-                "cached_input_usd_per_mtok FROM analytics_model_pricing "
-                "WHERE provider = 'anthropic'"
+                "SELECT provider, model, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok FROM analytics_model_pricing"
             ).fetchall()
         # Seed ids are canonical (hyphenated) since #759, so they line up with
         # RATE_TABLE directly — no normalization. A dotted-id regression would
         # drop the matching RATE_TABLE key out of `seeded` and fail the check.
-        seeded = {r["model"]: r for r in rows}
+        seeded = {(r["provider"], r["model"]): r for r in rows}
 
-        missing = [m for m in RATE_TABLE if m not in seeded]
-        assert not missing, f"models in RATE_TABLE but absent from Analytics seed: {missing}"
+        missing = [
+            m for m in RATE_TABLE if (self._expected_provider(m), m) not in seeded
+        ]
+        assert not missing, (
+            f"models in RATE_TABLE but absent from the Analytics seed "
+            f"(under their expected provider): {missing}"
+        )
 
         mismatches = []
         for model, rates in RATE_TABLE.items():
-            row = seeded[model]
+            row = seeded[(self._expected_provider(model), model)]
             if (
                 row["input_usd_per_mtok"] != rates["input"]
                 or row["output_usd_per_mtok"] != rates["output"]
@@ -586,6 +599,130 @@ class TestSeedPricingMigration:
                 "WHERE model='claude-opus-4-8' AND notes='operator'"
             ).fetchone()
         assert row is not None and row[0] == 15.00
+
+
+class TestCodexProviderAttributionMigration:
+    """#860: TmuxSession hardcoded provider="anthropic" at the log_turn_usage
+    call, so every CodexTmuxSession turn landed as anthropic/gpt-* — a
+    (provider, model) pair the pricing lookup can never match, costing all
+    codex tmux history at $0. _migrate_codex_provider_attribution heals
+    deployed rows to codex_cli on init (turn usage AND session facts), and
+    moves the pre-normalization INCLUSIVE input count to the cached column
+    (pricing it at the full input rate would overstate ~7x; see migration
+    docstring)."""
+
+    def _log_mislogged_codex_turn(self, store: AnalyticsStore) -> None:
+        """One turn exactly as the pre-#860 tmux path wrote it: inclusive
+        input count, cached span invisible (cached_input_tokens=0)."""
+        store.ensure_session_fact(
+            session_id="codex1", agent_name="murzik", session_label="test",
+            provider="anthropic", model="gpt-5.5",
+        )
+        store.log_turn_usage(
+            session_id="codex1", agent_name="murzik", turn_seq=1,
+            provider="anthropic", model="gpt-5.5",
+            input_tokens=1_000_000, output_tokens=0, cached_input_tokens=0,
+        )
+
+    def test_heals_both_tables_and_restores_pricing(self, tmp_path):
+        db = str(tmp_path / "analytics.db")
+        store = AnalyticsStore(db)
+        self._log_mislogged_codex_turn(store)
+        # The bug as deployed: anthropic/gpt-5.5 matches no rate row → $0.
+        overview = store.get_overview(range_name="7d")
+        assert overview["totals"]["cost_usd"] == pytest.approx(0.0)
+
+        store2 = AnalyticsStore(db)  # init runs the migration
+        with store2._connect() as conn:
+            tu = conn.execute(
+                "SELECT provider, input_tokens, cached_input_tokens "
+                "FROM analytics_turn_usage WHERE session_id='codex1'"
+            ).fetchall()
+            sf = conn.execute(
+                "SELECT provider FROM analytics_session_facts WHERE session_id='codex1'"
+            ).fetchall()
+        assert [r["provider"] for r in tu] == ["codex_cli"]
+        assert [r["provider"] for r in sf] == ["codex_cli"]
+        # The inclusive input count moved to the cached column.
+        assert tu[0]["input_tokens"] == 0
+        assert tu[0]["cached_input_tokens"] == 1_000_000
+        # History is repriced, not just relabeled: 1M cached @ $0.50/Mtok.
+        overview = store2.get_overview(range_name="7d")
+        assert overview["totals"]["cost_usd"] == pytest.approx(0.5)
+
+    def test_row_with_cached_split_gets_provider_flip_only(self, tmp_path):
+        """A mislogged row that somehow carries a real cached split doesn't
+        match the pre-normalization signature — its tokens are already
+        disjoint, so only the provider is healed."""
+        db = str(tmp_path / "analytics.db")
+        store = AnalyticsStore(db)
+        store.ensure_session_fact(
+            session_id="codex2", agent_name="murzik", session_label="test",
+            provider="anthropic", model="gpt-5.5",
+        )
+        store.log_turn_usage(
+            session_id="codex2", agent_name="murzik", turn_seq=1,
+            provider="anthropic", model="gpt-5.5",
+            input_tokens=10_000, output_tokens=0, cached_input_tokens=90_000,
+        )
+        store2 = AnalyticsStore(db)
+        with store2._connect() as conn:
+            row = conn.execute(
+                "SELECT provider, input_tokens, cached_input_tokens "
+                "FROM analytics_turn_usage WHERE session_id='codex2'"
+            ).fetchone()
+        assert row["provider"] == "codex_cli"
+        assert row["input_tokens"] == 10_000
+        assert row["cached_input_tokens"] == 90_000
+
+    def test_narrow_leaves_honest_rows_alone(self, tmp_path):
+        """A gpt-* model under anthropic cannot be legitimate, but every
+        honest (provider, model) combination must survive untouched."""
+        db = str(tmp_path / "analytics.db")
+        store = AnalyticsStore(db)
+        _seed_session(store)
+        honest = [
+            ("a1", "anthropic", "claude-opus-4-8"),
+            ("c1", "codex_cli", "gpt-5.5"),
+            ("o1", "openai", "gpt-5.5"),
+        ]
+        for i, (sid, provider, model) in enumerate(honest, start=1):
+            store.log_turn_usage(
+                session_id=sid, agent_name="barsik", turn_seq=i,
+                provider=provider, model=model,
+                input_tokens=100, output_tokens=10, cached_input_tokens=0,
+            )
+        store2 = AnalyticsStore(db)
+        with store2._connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id, provider FROM analytics_turn_usage"
+            ).fetchall()
+        providers = {r["session_id"]: r["provider"] for r in rows}
+        assert providers == {"a1": "anthropic", "c1": "codex_cli", "o1": "openai"}
+        # The seeded session fact (anthropic/claude-sonnet-4) is honest too.
+        with store2._connect() as conn:
+            fact = conn.execute(
+                "SELECT provider FROM analytics_session_facts WHERE session_id='sess1'"
+            ).fetchone()
+        assert fact["provider"] == "anthropic"
+
+    def test_idempotent_on_reopen(self, tmp_path):
+        """Both heal predicates key on provider='anthropic', gone after the
+        first run — a second init must not re-shift tokens or duplicate."""
+        db = str(tmp_path / "analytics.db")
+        store = AnalyticsStore(db)
+        self._log_mislogged_codex_turn(store)
+        AnalyticsStore(db)  # heals
+        store3 = AnalyticsStore(db)  # second run must be a no-op
+        with store3._connect() as conn:
+            rows = conn.execute(
+                "SELECT provider, model, input_tokens, cached_input_tokens "
+                "FROM analytics_turn_usage WHERE session_id='codex1'"
+            ).fetchall()
+        assert len(rows) == 1
+        assert (rows[0]["provider"], rows[0]["model"]) == ("codex_cli", "gpt-5.5")
+        assert rows[0]["input_tokens"] == 0
+        assert rows[0]["cached_input_tokens"] == 1_000_000
 
 
 class TestLegacyDottedIdMigration:
