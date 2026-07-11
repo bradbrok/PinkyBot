@@ -40,6 +40,49 @@ class TestMessageBrokerRouting:
         )
         return tmpdir, registry, broker, sent_messages, reactions
 
+    def test_format_prompt_includes_thread_provenance_for_child_reply(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            prompt = broker._format_prompt(
+                BrokerMessage(
+                    platform="slack", chat_id="C123", sender_name="Alex",
+                    sender_id="U123", content="in thread", agent_name="barsik",
+                    message_id="1711584001.000200",
+                    reply_to="1711584000.000100",
+                    is_group=True,
+                    timestamp=0,
+                )
+            )
+            header = prompt.splitlines()[0]
+            assert "thread_root_ts:1711584000.000100" in header
+            assert "is_thread_reply:true" in header
+        finally:
+            tmpdir.cleanup()
+
+    def test_format_prompt_top_level_header_is_unchanged(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            prompt = broker._format_prompt(
+                BrokerMessage(
+                    platform="slack", chat_id="C123", sender_name="Alex",
+                    sender_id="U123", content="top level", agent_name="barsik",
+                    message_id="1711584000.000100",
+                    is_group=True,
+                    timestamp=0,
+                )
+            )
+            header = prompt.splitlines()[0]
+            assert "thread_root_ts:" not in header
+            assert "is_thread_reply:" not in header
+            assert header == (
+                "[slack | group | C123 | Alex | C123 | "
+                "1970-01-01 00:00:00 UTC | msg_id:1711584000.000100]"
+            )
+        finally:
+            tmpdir.cleanup()
+
     @pytest.mark.asyncio
     async def test_route_response_suppresses_fallback_on_external_dm(self):
         # Owner rule (Brad, 2026-06-22): plain-text fallback NEVER auto-delivers

@@ -1108,12 +1108,16 @@ class MessageBroker:
         except Exception:
             ts = datetime.fromtimestamp(message.timestamp, tz=tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         msg_id = f" | msg_id:{message.message_id}" if message.message_id else ""
+        thread_provenance = (
+            f" | thread_root_ts:{message.reply_to} | is_thread_reply:true"
+            if message.reply_to else ""
+        )
         if message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
-            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]"
+            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
         else:
-            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}]"
+            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
 
         body = message.content
 

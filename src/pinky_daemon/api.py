@@ -7790,6 +7790,7 @@ npm run build</pre>
         _deny_isolated_cross_actor(request, agent_name)
 
         ctx = _resolve_message_context(agent_name, source_message_id)
+        effective_thread_root = ctx.reply_to or ctx.message_id
         voice_settings = _get_voice_reply_settings(agent_name, ctx.platform)
 
         if ctx.source_was_voice and voice_settings:
@@ -7801,7 +7802,7 @@ npm run build</pre>
                 provider=voice_settings["provider"],
                 voice=voice_settings["voice"],
                 model=voice_settings["model"],
-                reply_to=ctx.message_id,
+                reply_to=effective_thread_root,
                 include_text_copy=True,
                 link_preview_options=link_preview_options,
                 quote=quote,
@@ -7825,7 +7826,7 @@ npm run build</pre>
             ctx.platform,
             ctx.chat_id,
             content,
-            reply_to=ctx.message_id,
+            reply_to=effective_thread_root,
             parse_mode=parse_mode,
             link_preview_options=link_preview_options,
             quote=quote,

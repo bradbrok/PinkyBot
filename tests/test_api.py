@@ -2849,6 +2849,36 @@ class TestAPI:
                 assert history[-1].metadata["tool"] == "thread"
                 assert history[-1].metadata["source_message_id"] == "101"
 
+    def test_broker_thread_child_reply_uses_stored_root_ts(self):
+        """A reply to a Slack child stays on the original thread root."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "slack", "xoxb-test")
+                app.state.broker.remember_message_context(
+                    BrokerMessage(
+                        platform="slack", chat_id="C123", sender_name="Alex",
+                        sender_id="U123", content="child reply", agent_name="barsik",
+                        message_id="1711584001.000200",
+                        reply_to="1711584000.000100",
+                        is_group=True,
+                    )
+                )
+
+                with patch(
+                    "pinky_outreach.slack.SlackAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="1711584002.000300"),
+                ) as mock:
+                    resp = client.post("/broker/thread", json={
+                        "agent_name": "barsik",
+                        "message_id": "1711584001.000200",
+                        "content": "on the same thread",
+                    })
+
+                assert resp.status_code == 200, resp.text
+                assert mock.call_args.kwargs["thread_ts"] == "1711584000.000100"
+
     def test_broker_thread_quote_builds_reply_parameters(self):
         """thread(quote=...) builds ReplyParameters quoting the given passage."""
         with tempfile.TemporaryDirectory() as tmpdir:
