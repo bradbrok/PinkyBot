@@ -20,6 +20,51 @@ def registry():
     os.unlink(path)
 
 
+class TestOwnerNotificationDestinations:
+    def test_explicit_migration_seeds_legacy_primary_chat_id(self, registry):
+        registry.set_primary_user("6770805286", "Brad")
+
+        destinations = registry.migrate_primary_user_notification_destination(
+            platform="telegram",
+            account_id="primary-telegram-bot",
+        )
+
+        assert destinations == [
+            {
+                "platform": "telegram",
+                "account_id": "primary-telegram-bot",
+                "conversation_id": "6770805286",
+            }
+        ]
+
+    def test_migration_never_infers_platform_or_account(self, registry):
+        registry.set_primary_user("6770805286", "Brad")
+
+        with pytest.raises(ValueError, match="requires platform"):
+            registry.migrate_primary_user_notification_destination(
+                platform="", account_id="",
+            )
+
+        assert registry.get_owner_notification_destinations() == []
+
+    def test_primary_and_ordered_fallbacks_round_trip(self, registry):
+        destinations = registry.set_owner_notification_destinations([
+            {
+                "platform": "telegram",
+                "account_id": "tg-owner",
+                "conversation_id": "6770805286",
+            },
+            {
+                "platform": "slack",
+                "team_id": "T_FALLBACK",
+                "conversation_id": "D_FALLBACK",
+            },
+        ])
+
+        assert destinations[1]["account_id"] == "T_FALLBACK"
+        assert registry.get_owner_notification_destinations() == destinations
+
+
 class TestSigningKeys:
     """Per-agent signing keys (#623)."""
 

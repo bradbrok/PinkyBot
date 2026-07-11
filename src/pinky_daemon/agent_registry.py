@@ -1269,6 +1269,29 @@ class AgentRegistry:
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS approval_requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                chat_id TEXT NOT NULL,
+                target_name TEXT NOT NULL DEFAULT '',
+                is_channel INTEGER NOT NULL DEFAULT 0,
+                gate_state TEXT NOT NULL DEFAULT 'pending',
+                held_count INTEGER NOT NULL DEFAULT 0,
+                oldest_held_at REAL NOT NULL DEFAULT 0,
+                notification_state TEXT NOT NULL DEFAULT 'retrying',
+                notification_attempts INTEGER NOT NULL DEFAULT 0,
+                notified_held_count INTEGER NOT NULL DEFAULT 0,
+                last_notified_at REAL NOT NULL DEFAULT 0,
+                next_retry_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                notification_destination TEXT NOT NULL DEFAULT '{}',
+                fallback_path TEXT NOT NULL DEFAULT '[]',
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(agent_name, chat_id)
+            );
+
             CREATE TABLE IF NOT EXISTS group_chats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
@@ -1338,6 +1361,8 @@ class AgentRegistry:
                 ON agent_schedules(agent_name);
             CREATE INDEX IF NOT EXISTS idx_pending_messages_agent_chat
                 ON pending_messages(agent_name, chat_id, delivered);
+            CREATE INDEX IF NOT EXISTS idx_approval_requests_retry
+                ON approval_requests(gate_state, notification_state, next_retry_at);
             CREATE INDEX IF NOT EXISTS idx_group_chats_agent
                 ON group_chats(agent_name);
             CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
@@ -3592,6 +3617,163 @@ except Exception:
         self._db.commit()
         return cursor.rowcount
 
+    # ── Approval Requests (#863 emergency lane) ─────────────
+
+    @staticmethod
+    def _approval_request_dict(row) -> dict:
+        return {
+            "id": row[0], "agent_name": row[1], "chat_id": row[2],
+            "target_name": row[3], "is_channel": bool(row[4]),
+            "gate_state": row[5], "held_count": row[6],
+            "oldest_held_at": row[7], "notification_state": row[8],
+            "notification_attempts": row[9], "notified_held_count": row[10],
+            "last_notified_at": row[11], "next_retry_at": row[12],
+            "last_error": row[13],
+            "notification_destination": json.loads(row[14] or "{}"),
+            "fallback_path": json.loads(row[15] or "[]"),
+            "created_at": row[16], "updated_at": row[17],
+        }
+
+    def get_approval_request(self, agent_name: str, chat_id: str) -> dict | None:
+        """Return the stable request for a legacy ``(agent, chat_id)`` gate.
+
+        Inc 0 deliberately does not accept platform/team/conversation here.
+        Those composite approval keys belong to Inc 1 after row-key migration.
+        """
+        row = self._db.execute(
+            """SELECT id, agent_name, chat_id, target_name, is_channel,
+                      gate_state, held_count, oldest_held_at, notification_state,
+                      notification_attempts, notified_held_count, last_notified_at,
+                      next_retry_at, last_error, notification_destination,
+                      fallback_path, created_at, updated_at
+               FROM approval_requests WHERE agent_name=? AND chat_id=?""",
+            (agent_name, chat_id),
+        ).fetchone()
+        return self._approval_request_dict(row) if row else None
+
+    def record_approval_hold(
+        self, agent_name: str, chat_id: str, *, target_name: str = "",
+        is_channel: bool = False, held_at: float | None = None,
+    ) -> dict:
+        """Create or aggregate one approval request on the legacy gate key."""
+        now = held_at if held_at is not None else time.time()
+        self._db.execute(
+            """INSERT INTO approval_requests
+               (agent_name, chat_id, target_name, is_channel, gate_state,
+                held_count, oldest_held_at, notification_state, created_at, updated_at)
+               VALUES (?, ?, ?, ?, 'pending', 1, ?, 'retrying', ?, ?)
+               ON CONFLICT(agent_name, chat_id) DO UPDATE SET
+                   target_name=CASE WHEN excluded.target_name != ''
+                                    THEN excluded.target_name ELSE target_name END,
+                   is_channel=excluded.is_channel,
+                   gate_state='pending',
+                   held_count=held_count + 1,
+                   oldest_held_at=CASE WHEN oldest_held_at=0
+                                      THEN excluded.oldest_held_at ELSE oldest_held_at END,
+                   updated_at=excluded.updated_at""",
+            (agent_name, chat_id, target_name, int(is_channel), now, now, now),
+        )
+        self._db.commit()
+        return self.get_approval_request(agent_name, chat_id)  # type: ignore[return-value]
+
+    def begin_approval_notification(self, request_id: int, *, reset_attempts: bool) -> None:
+        """Mark a notification cycle active, optionally resetting re-notify attempts."""
+        reset_sql = ", notification_attempts=0" if reset_attempts else ""
+        self._db.execute(
+            f"""UPDATE approval_requests
+                SET notification_state='retrying', last_error='', updated_at=?
+                    {reset_sql}
+                WHERE id=? AND gate_state='pending'""",
+            (time.time(), request_id),
+        )
+        self._db.commit()
+
+    def record_approval_notification_failure(
+        self, request_id: int, *, error: str, next_retry_at: float,
+        failed: bool, fallback_path: list[dict],
+    ) -> None:
+        state = "failed" if failed else "retrying"
+        self._db.execute(
+            """UPDATE approval_requests
+               SET notification_state=?, notification_attempts=notification_attempts+1,
+                   next_retry_at=?, last_error=?, fallback_path=?, updated_at=?
+               WHERE id=? AND gate_state='pending'""",
+            (
+                state, next_retry_at, error[:1000],
+                json.dumps(fallback_path, separators=(",", ":")), time.time(), request_id,
+            ),
+        )
+        self._db.commit()
+
+    def record_approval_notification_delivered(
+        self, request_id: int, *, destination: dict, fallback_path: list[dict],
+    ) -> None:
+        now = time.time()
+        self._db.execute(
+            """UPDATE approval_requests
+               SET notification_state='delivered', notification_attempts=0,
+                   notified_held_count=held_count, last_notified_at=?, next_retry_at=0,
+                   last_error='', notification_destination=?, fallback_path=?, updated_at=?
+               WHERE id=? AND gate_state='pending'""",
+            (
+                now, json.dumps(destination, separators=(",", ":")),
+                json.dumps(fallback_path, separators=(",", ":")), now, request_id,
+            ),
+        )
+        self._db.commit()
+
+    def settle_approval_request(self, agent_name: str, chat_id: str, state: str) -> None:
+        if state not in ("approved", "denied"):
+            raise ValueError(f"invalid approval gate state: {state}")
+        self._db.execute(
+            """UPDATE approval_requests
+               SET gate_state=?, next_retry_at=0, updated_at=?
+               WHERE agent_name=? AND chat_id=?""",
+            (state, time.time(), agent_name, chat_id),
+        )
+        self._db.commit()
+
+    def list_due_approval_notifications(self, now: float | None = None) -> list[dict]:
+        due_at = time.time() if now is None else now
+        rows = self._db.execute(
+            """SELECT id, agent_name, chat_id, target_name, is_channel,
+                      gate_state, held_count, oldest_held_at, notification_state,
+                      notification_attempts, notified_held_count, last_notified_at,
+                      next_retry_at, last_error, notification_destination,
+                      fallback_path, created_at, updated_at
+               FROM approval_requests
+               WHERE gate_state='pending' AND notification_state='retrying'
+                 AND next_retry_at <= ? ORDER BY next_retry_at, id""",
+            (due_at,),
+        ).fetchall()
+        return [self._approval_request_dict(row) for row in rows]
+
+    def get_approval_notification_health(self, agent_name: str) -> dict:
+        rows = self._db.execute(
+            """SELECT id, chat_id, held_count, oldest_held_at, notification_state,
+                      notification_attempts, next_retry_at, last_error
+               FROM approval_requests
+               WHERE agent_name=? AND gate_state='pending'
+                 AND notification_state IN ('retrying', 'failed')
+               ORDER BY created_at""",
+            (agent_name,),
+        ).fetchall()
+        requests = [
+            {
+                "request_id": r[0], "chat_id": r[1], "held_count": r[2],
+                "oldest_age_seconds": max(0, int(time.time() - r[3])) if r[3] else 0,
+                "notification_state": r[4], "attempts": r[5],
+                "next_retry_at": r[6], "last_error": r[7],
+            }
+            for r in rows
+        ]
+        return {
+            "healthy": not requests,
+            "retrying": sum(r[4] == "retrying" for r in rows),
+            "failed": sum(r[4] == "failed" for r in rows),
+            "requests": requests,
+        }
+
     # ── Group Chats ─────────────────────────────────────────
 
     def upsert_group_chat(
@@ -3766,6 +3948,77 @@ except Exception:
             if status != "approved":
                 self.approve_user(agent.name, chat_id, display_name, "primary_user")
                 _log(f"agent_registry: auto-approved primary user {chat_id} for {agent.name}")
+
+    # ── Owner notification destinations (#863) ─────────────
+
+    @staticmethod
+    def _normalize_owner_destination(destination: dict) -> dict:
+        if not isinstance(destination, dict):
+            raise ValueError("owner notification destination must be an object")
+        normalized = {
+            "platform": str(destination.get("platform") or "").strip().lower(),
+            "account_id": str(
+                destination.get("account_id")
+                or destination.get("team_id")
+                or destination.get("workspace_id")
+                or ""
+            ).strip(),
+            "conversation_id": str(destination.get("conversation_id") or "").strip(),
+        }
+        if not all(normalized.values()):
+            raise ValueError(
+                "owner notification destination requires platform, "
+                "account_id/team_id/workspace_id, and conversation_id"
+            )
+        return normalized
+
+    def get_owner_notification_destinations(self) -> list[dict]:
+        """Return the primary destination followed by ordered fallbacks."""
+        raw = self.get_setting("owner_notification_destinations", "")
+        if not raw:
+            return []
+        try:
+            parsed = json.loads(raw)
+            if not isinstance(parsed, list):
+                raise ValueError("must be a list")
+            return [self._normalize_owner_destination(item) for item in parsed]
+        except (TypeError, ValueError, json.JSONDecodeError) as exc:
+            _log(f"agent_registry: invalid owner_notification_destinations: {exc}")
+            return []
+
+    def set_owner_notification_destinations(self, destinations: list[dict]) -> list[dict]:
+        """Store a canonical primary destination and ordered fallback list."""
+        if not isinstance(destinations, list) or not destinations:
+            raise ValueError("at least one owner notification destination is required")
+        normalized = [self._normalize_owner_destination(item) for item in destinations]
+        self.set_setting(
+            "owner_notification_destinations",
+            json.dumps(normalized, separators=(",", ":")),
+        )
+        return normalized
+
+    def migrate_primary_user_notification_destination(
+        self, *, platform: str, account_id: str,
+    ) -> list[dict]:
+        """Seed the destination tuple from the legacy primary-user chat id.
+
+        ``platform`` and ``account_id`` are mandatory migration inputs. They
+        are never guessed from inbound traffic or the shape of the legacy id.
+        Existing canonical configuration is preserved unchanged.
+        """
+        existing = self.get_owner_notification_destinations()
+        if existing:
+            return existing
+        primary_chat_id = self.get_setting("primary_user_chat_id", "").strip()
+        if not primary_chat_id:
+            raise ValueError("primary_user_chat_id is not configured")
+        return self.set_owner_notification_destinations([
+            {
+                "platform": platform,
+                "account_id": account_id,
+                "conversation_id": primary_chat_id,
+            }
+        ])
 
     # ── Purchase Approvers (financial boundary, #249) ─────────
     #

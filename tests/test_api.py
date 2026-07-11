@@ -4407,6 +4407,30 @@ class TestAgentCRUD:
         assert "session" in data
         assert "tasks" in data
 
+    def test_agent_health_surfaces_failed_owner_notification(self):
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "alice", "model": "sonnet"})
+        request = registry.record_approval_hold(
+            "alice", "C_GATED", target_name="C_GATED", is_channel=True,
+        )
+        registry.record_approval_notification_failure(
+            request["id"],
+            error="RuntimeError: channel_not_found",
+            next_retry_at=0,
+            failed=True,
+            fallback_path=[],
+        )
+
+        resp = client.get("/agents/alice/health")
+
+        assert resp.status_code == 200
+        check = resp.json()["checks"]["approval_notifications"]
+        assert check["healthy"] is False
+        assert check["failed"] == 1
+        assert check["requests"][0]["notification_state"] == "failed"
+        assert "channel_not_found" in check["requests"][0]["last_error"]
+        assert resp.json()["recommendation"] == "needs_attention"
+
     def test_agent_health_not_found(self):
         client = self._make_client()
         resp = client.get("/agents/nobody/health")

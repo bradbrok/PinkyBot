@@ -20,7 +20,10 @@ class TestMessageBrokerRouting:
         sent_messages: list[tuple[str, str, str, str]] = []
         reactions: list[tuple[str, str, str, str, str]] = []
 
-        async def send_callback(agent_name: str, platform: str, chat_id: str, content: str):
+        async def send_callback(
+            agent_name: str, platform: str, chat_id: str, content: str,
+            *, account_id: str = "",
+        ):
             sent_messages.append((agent_name, platform, chat_id, content))
 
         async def reaction_callback(
@@ -776,6 +779,13 @@ class TestMessageBrokerRouting:
             monkeypatch.setattr(broker, "_route_streaming", _fake_route)
             owner = "owner-1"
             registry.set_primary_user(owner, display_name="Brad")
+            registry.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "owner-bot",
+                    "conversation_id": owner,
+                }
+            ])
 
             channel = "C0A8WUU743F"
             user = "U774M8XDE"
@@ -818,6 +828,165 @@ class TestMessageBrokerRouting:
             assert routed[0].sender_id == user
             assert routed[0].is_group is True
             assert routed[0].content == "Hi"
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_owner_notification_uses_full_tuple_with_legacy_gate_key(self):
+        """#863: destination identity is composite; approval rows are not yet."""
+        tmpdir, registry, broker, _sent, _ = self._make_broker()
+        deliveries: list[tuple[str, str, str, str]] = []
+
+        async def capture(
+            agent_name, platform, chat_id, content, *, account_id="",
+        ):
+            if platform == "slack":
+                raise RuntimeError("owner primary unavailable")
+            deliveries.append((platform, account_id, chat_id, content))
+
+        broker._send_callback = capture
+        try:
+            registry.set_primary_user("legacy-owner-id", display_name="Brad")
+            registry.set_owner_notification_destinations([
+                {
+                    "platform": "slack",
+                    "account_id": "T_OWNER",
+                    "conversation_id": "D_OWNER",
+                },
+                {
+                    "platform": "telegram",
+                    "account_id": "owner-telegram-account",
+                    "conversation_id": "owner-conversation",
+                }
+            ])
+            channel = "C_GATED"
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id=channel, sender_name="Alex",
+                    sender_id="U_ALEX", content="hello", agent_name="barsik",
+                    is_group=True,
+                )
+            )
+
+            assert len(deliveries) == 1
+            assert deliveries[0][:3] == (
+                "telegram", "owner-telegram-account", "owner-conversation",
+            )
+            assert f"/approve_{channel}" in deliveries[0][3]
+
+            request = registry.get_approval_request("barsik", channel)
+            assert request is not None
+            assert request["chat_id"] == channel
+            assert request["notification_destination"]["platform"] == "telegram"
+            assert request["fallback_path"][0]["destination"]["platform"] == "slack"
+            columns = {
+                row[1]
+                for row in registry._db.execute(
+                    "PRAGMA table_info(approval_requests)"
+                ).fetchall()
+            }
+            assert "platform" not in columns
+            assert "account_id" not in columns
+            assert "conversation_id" not in columns
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_owner_notification_failure_retries_and_is_operator_visible(
+        self, monkeypatch,
+    ):
+        import pinky_daemon.broker as broker_mod
+
+        monkeypatch.setattr(broker_mod, "_APPROVAL_NOTIFY_RETRY_BASE_SEC", 0)
+        tmpdir, registry, broker, _sent, _ = self._make_broker()
+        attempts = 0
+
+        async def flaky(
+            agent_name, platform, chat_id, content, *, account_id="",
+        ):
+            nonlocal attempts
+            attempts += 1
+            if attempts == 1:
+                raise RuntimeError("channel_not_found")
+
+        broker._send_callback = flaky
+        try:
+            registry.set_primary_user("owner", display_name="Brad")
+            registry.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "owner-account",
+                    "conversation_id": "owner",
+                }
+            ])
+            await broker.handle_inbound(
+                BrokerMessage(
+                    platform="slack", chat_id="C_RETRY", sender_name="Alex",
+                    sender_id="U_ALEX", content="hello", agent_name="barsik",
+                    is_group=True,
+                )
+            )
+
+            request = registry.get_approval_request("barsik", "C_RETRY")
+            assert request["notification_state"] == "retrying"
+            health = registry.get_approval_notification_health("barsik")
+            assert health["healthy"] is False
+            assert health["retrying"] == 1
+            assert "channel_not_found" in health["requests"][0]["last_error"]
+
+            assert await broker.retry_due_approval_notifications() == 1
+            request = registry.get_approval_request("barsik", "C_RETRY")
+            assert request["notification_state"] == "delivered"
+            assert attempts == 2
+            assert registry.get_approval_notification_health("barsik")["healthy"] is True
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    async def test_repeat_contacts_aggregate_with_bounded_renotify(self, monkeypatch):
+        import pinky_daemon.broker as broker_mod
+
+        monkeypatch.setattr(broker_mod, "_APPROVAL_RENOTIFY_HELD_COUNT", 2)
+        monkeypatch.setattr(broker_mod, "_APPROVAL_RENOTIFY_INTERVAL_SEC", 999999)
+        tmpdir, registry, broker, _sent, _ = self._make_broker()
+        notifications: list[str] = []
+
+        async def capture(
+            agent_name, platform, chat_id, content, *, account_id="",
+        ):
+            notifications.append(content)
+
+        broker._send_callback = capture
+        try:
+            registry.set_primary_user("owner", display_name="Brad")
+            registry.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "owner-account",
+                    "conversation_id": "owner",
+                }
+            ])
+            channel = "C_BURST"
+            request_ids: list[int] = []
+            for index in range(3):
+                await broker.handle_inbound(
+                    BrokerMessage(
+                        platform="slack", chat_id=channel, sender_name="Alex",
+                        sender_id="U_ALEX", content=f"message {index}",
+                        agent_name="barsik", is_group=True,
+                    )
+                )
+                request_ids.append(
+                    registry.get_approval_request("barsik", channel)["id"]
+                )
+
+            request = registry.get_approval_request("barsik", channel)
+            assert len(set(request_ids)) == 1
+            assert request["held_count"] == 3
+            assert len(registry.get_pending_messages("barsik", channel)) == 3
+            assert len(notifications) == 2
+            assert "Held messages: 1" in notifications[0]
+            assert "Held messages: 3" in notifications[1]
         finally:
             tmpdir.cleanup()
 
@@ -936,6 +1105,13 @@ class TestMessageBrokerRouting:
             monkeypatch.setattr(broker, "_route_streaming", _fake_route)
             owner = "owner-1"
             registry.set_primary_user(owner, display_name="Brad")
+            registry.set_owner_notification_destinations([
+                {
+                    "platform": "slack",
+                    "account_id": "T_OWNER",
+                    "conversation_id": owner,
+                }
+            ])
 
             channel = "C0A8WUU743F"
             # A message in the channel → held pending under the exact channel id.
