@@ -3582,12 +3582,14 @@ except Exception:
         self, *, agent_name: str, platform: str, chat_id: str,
         sender_name: str, content: str, reply_chat_id: str = "",
         is_group: bool = False, sender_id: str = "",
+        db: sqlite3.Connection | None = None,
     ) -> int:
         """Insert one held row without committing (transaction helper)."""
+        connection = db or self._db
         now = time.time()
         dest = reply_chat_id or chat_id
         sid = sender_id or chat_id
-        cursor = self._db.execute(
+        cursor = connection.execute(
             """INSERT INTO pending_messages
                (agent_name, platform, chat_id, reply_chat_id, is_group, sender_id, sender_name, content, created_at)
                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
@@ -3700,10 +3702,12 @@ except Exception:
     def _record_approval_hold_uncommitted(
         self, agent_name: str, chat_id: str, *, target_name: str = "",
         is_channel: bool = False, held_at: float | None = None,
+        db: sqlite3.Connection | None = None,
     ) -> None:
         """Upsert the legacy aggregate without committing (transaction helper)."""
+        connection = db or self._db
         now = held_at if held_at is not None else time.time()
-        self._db.execute(
+        connection.execute(
             """INSERT INTO approval_requests
                (agent_name, chat_id, target_name, is_channel, gate_state,
                 held_count, oldest_held_at, notification_state, created_at, updated_at)
@@ -3732,23 +3736,29 @@ except Exception:
         a durable held row always has the request discovered by the restart
         retry loop; before commit, neither side survives.
         """
-        with self._rmw_lock:
-            try:
-                self._db.execute("BEGIN IMMEDIATE")
-                message_id = self._queue_pending_message_uncommitted(
-                    agent_name=agent_name, platform=platform, chat_id=chat_id,
-                    sender_name=sender_name, content=content,
-                    reply_chat_id=reply_chat_id, is_group=is_group,
-                    sender_id=sender_id,
-                )
-                self._record_approval_hold_uncommitted(
-                    agent_name, chat_id, target_name=target_name,
-                    is_channel=is_group, held_at=held_at,
-                )
-                self._db.commit()
-            except BaseException:
-                self._db.rollback()
-                raise
+        transaction_db = sqlite3.connect(
+            self._db_path, timeout=5.0, check_same_thread=False,
+        )
+        transaction_db.execute("PRAGMA busy_timeout=5000")
+        transaction_db.execute("PRAGMA foreign_keys=ON")
+        try:
+            transaction_db.execute("BEGIN IMMEDIATE")
+            message_id = self._queue_pending_message_uncommitted(
+                agent_name=agent_name, platform=platform, chat_id=chat_id,
+                sender_name=sender_name, content=content,
+                reply_chat_id=reply_chat_id, is_group=is_group,
+                sender_id=sender_id, db=transaction_db,
+            )
+            self._record_approval_hold_uncommitted(
+                agent_name, chat_id, target_name=target_name,
+                is_channel=is_group, held_at=held_at, db=transaction_db,
+            )
+            transaction_db.commit()
+        except BaseException:
+            transaction_db.rollback()
+            raise
+        finally:
+            transaction_db.close()
         request = self.get_approval_request(agent_name, chat_id)
         if request is None:  # defensive invariant check after successful commit
             raise RuntimeError("approval request missing after atomic hold commit")

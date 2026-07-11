@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 
 import pytest
 
@@ -74,30 +75,68 @@ class TestOwnerNotificationDestinations:
         db_path = tmp_path / "agents.db"
         registry = AgentRegistry(db_path=str(db_path))
         registry.register("barsik", model="sonnet", working_dir=str(tmp_path))
-        original = registry._record_approval_hold_uncommitted
+        at_boundary = threading.Event()
+        release_crash = threading.Event()
+        writer_done = threading.Event()
+        atomic_errors: list[BaseException] = []
+        writer_errors: list[BaseException] = []
 
         def crash_between_writes(*args, **kwargs):
             # Exact boundary proof: the pending row exists inside the open
             # transaction, but the aggregate has not been written yet.
-            held_inside_tx = registry._db.execute(
+            transaction_db = kwargs["db"]
+            held_inside_tx = transaction_db.execute(
                 "SELECT COUNT(*) FROM pending_messages WHERE agent_name='barsik'"
             ).fetchone()[0]
-            request_inside_tx = registry._db.execute(
+            request_inside_tx = transaction_db.execute(
                 "SELECT COUNT(*) FROM approval_requests WHERE agent_name='barsik'"
             ).fetchone()[0]
             assert held_inside_tx == 1
             assert request_inside_tx == 0
+            at_boundary.set()
+            assert release_crash.wait(2), "test did not release crash boundary"
             raise RuntimeError("simulated crash after held insert")
+
+        def persist_hold():
+            try:
+                registry.queue_pending_message_with_approval_request(
+                    agent_name="barsik", platform="slack", chat_id="C_CRASH",
+                    reply_chat_id="C_CRASH", sender_name="Alex", content="hello",
+                    is_group=True, sender_id="U_ALEX", target_name="C_CRASH",
+                )
+            except BaseException as exc:
+                atomic_errors.append(exc)
+
+        def unrelated_writer():
+            try:
+                registry.set_setting("concurrent_writer", "committed")
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                writer_done.set()
 
         monkeypatch.setattr(
             registry, "_record_approval_hold_uncommitted", crash_between_writes,
         )
-        with pytest.raises(RuntimeError, match="after held insert"):
-            registry.queue_pending_message_with_approval_request(
-                agent_name="barsik", platform="slack", chat_id="C_CRASH",
-                reply_chat_id="C_CRASH", sender_name="Alex", content="hello",
-                is_group=True, sender_id="U_ALEX", target_name="C_CRASH",
-            )
+        atomic_thread = threading.Thread(target=persist_hold)
+        atomic_thread.start()
+        assert at_boundary.wait(2), "atomic transaction never reached crash boundary"
+
+        writer_thread = threading.Thread(target=unrelated_writer)
+        writer_thread.start()
+        # Dedicated BEGIN IMMEDIATE owns the DB write lock. The unrelated
+        # shared-connection commit must block, never commit the half-transaction.
+        assert writer_done.wait(0.1) is False
+        release_crash.set()
+        atomic_thread.join(2)
+        writer_thread.join(2)
+        assert not atomic_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert len(atomic_errors) == 1
+        assert isinstance(atomic_errors[0], RuntimeError)
+        assert "after held insert" in str(atomic_errors[0])
+        assert writer_errors == []
+        assert registry.get_setting("concurrent_writer") == "committed"
         registry.close()
 
         restarted = AgentRegistry(db_path=str(db_path))
@@ -107,14 +146,10 @@ class TestOwnerNotificationDestinations:
             assert restarted.get_pending_messages("barsik", "C_CRASH") == []
             assert restarted.get_approval_request("barsik", "C_CRASH") is None
             assert restarted.list_due_approval_notifications() == []
+            assert restarted.get_setting("concurrent_writer") == "committed"
 
             # Provider redelivery after restart commits both sides together;
             # the request is immediately discoverable by the retry loop.
-            monkeypatch.setattr(
-                restarted, "_record_approval_hold_uncommitted", original.__func__.__get__(
-                    restarted, AgentRegistry,
-                ),
-            )
             _, request = restarted.queue_pending_message_with_approval_request(
                 agent_name="barsik", platform="slack", chat_id="C_CRASH",
                 reply_chat_id="C_CRASH", sender_name="Alex", content="hello",
