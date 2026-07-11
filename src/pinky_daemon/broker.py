@@ -35,6 +35,17 @@ from pinky_daemon.transport_state import SessionState
 _INBOUND_RECONNECT_WAIT_SEC = 20.0
 _INBOUND_RECONNECT_POLL_SEC = 0.25
 
+# #863 approval-notification policy. A delivered request is re-notified after
+# four hours OR ten newly held messages, whichever arrives first. Failures retry
+# exponentially (30s..30m) and become operator-visible terminal ``failed`` after
+# five cycles; every cycle walks the canonical primary + ordered fallbacks.
+_APPROVAL_RENOTIFY_INTERVAL_SEC = 4 * 60 * 60
+_APPROVAL_RENOTIFY_HELD_COUNT = 10
+_APPROVAL_NOTIFY_RETRY_BASE_SEC = 30
+_APPROVAL_NOTIFY_RETRY_MAX_SEC = 30 * 60
+_APPROVAL_NOTIFY_MAX_ATTEMPTS = 5
+_APPROVAL_NOTIFY_POLL_SEC = 5
+
 # #279: agent-to-agent reply auto-routing. ``inject_agent_message`` stamps an
 # injected turn with ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the
 # requester agent name; when that turn completes, ``route_agent_reply`` delivers
@@ -324,6 +335,8 @@ class MessageBroker:
         # Strong refs to background cleanup tasks (e.g. disconnecting a
         # displaced streaming session) so the GC can't collect them mid-flight.
         self._background_tasks: set[asyncio.Task] = set()
+        self._approval_notification_task: asyncio.Task | None = None
+        self._approval_notification_locks: dict[int, asyncio.Lock] = {}
 
     @property
     def send_callback(self):
@@ -776,11 +789,29 @@ class MessageBroker:
             )
         return True
 
-    async def _handle_approval_command(self, message: BrokerMessage) -> bool:
-        """Intercept /approve_<id> and /deny_<id> commands from the owner."""
-        primary = self._registry.get_primary_user()
+    def _is_owner_approval_authorized(self, message: BrokerMessage) -> bool:
+        """Require an exact configured owner DM destination + principal."""
         sender_id = message.sender_id or message.chat_id
-        if not primary.get("chat_id") or sender_id != primary["chat_id"]:
+        if message.is_group or not sender_id or not message.chat_id:
+            return False
+        for destination in self._registry.get_owner_notification_destinations():
+            if (
+                destination["platform"] != message.platform
+                or destination["conversation_id"] != message.chat_id
+                or destination["principal_id"] != sender_id
+            ):
+                continue
+            if self._registry.get_raw_token_for_account(
+                message.agent_name,
+                message.platform,
+                destination["account_id"],
+            ):
+                return True
+        return False
+
+    async def _handle_approval_command(self, message: BrokerMessage) -> bool:
+        """Intercept owner approval commands from a configured secure DM."""
+        if not self._is_owner_approval_authorized(message):
             return False
 
         text = message.content.strip()
@@ -819,6 +850,9 @@ class MessageBroker:
                     display_name=display_name,
                     approved_by="primary_user",
                 )
+                self._registry.settle_approval_request(
+                    agent_name, target_chat_id, "approved",
+                )
                 # Is this a channel approval? Held group rows carry is_group=True.
                 # Must be checked BEFORE handle_approval marks them delivered.
                 pending_before = self._registry.get_pending_messages(
@@ -843,6 +877,9 @@ class MessageBroker:
                         _log(f"broker: failed to notify approved user {target_chat_id}: {e}")
         else:
             self._registry.deny_user(agent_name, target_chat_id)
+            self._registry.settle_approval_request(
+                agent_name, target_chat_id, "denied",
+            )
             reply = f"🚫 User {target_chat_id} denied."
 
         if self._send_callback:
@@ -904,6 +941,163 @@ class MessageBroker:
                 f'Got it — signing "{agent_name}" in.',
             )
         return True
+
+    @staticmethod
+    def _format_approval_notification(request: dict) -> str:
+        approval_key = request["chat_id"]
+        agent_name = request["agent_name"]
+        held_count = request["held_count"]
+        oldest_age = max(0, int(time.time() - request["oldest_held_at"]))
+        if request["is_channel"]:
+            subject = (
+                f"{agent_name} has messages held from a new channel "
+                f"(ID: {approval_key})."
+            )
+            action = f"Approve to let everyone in this channel talk to {agent_name}:"
+        else:
+            name_display = request["target_name"] or "Unknown"
+            subject = (
+                f"New user wants to talk to {agent_name}:\n"
+                f"{name_display} (ID: {approval_key})"
+            )
+            action = "Review the request:"
+        return (
+            f"🆕 {subject}\n\n"
+            f"Held messages: {held_count}; oldest: {oldest_age}s\n"
+            f"{action}\n"
+            f"/approve_{approval_key}\n"
+            f"/deny_{approval_key}"
+        )
+
+    @staticmethod
+    def _approval_request_needs_notification(request: dict, now: float) -> bool:
+        if request["gate_state"] != "pending":
+            return False
+        if request["notification_state"] == "retrying":
+            return request["next_retry_at"] <= now
+        if request["notification_state"] == "failed":
+            return False
+        new_holds = request["held_count"] - request["notified_held_count"]
+        elapsed = now - request["last_notified_at"]
+        return (
+            new_holds >= _APPROVAL_RENOTIFY_HELD_COUNT
+            or (new_holds > 0 and elapsed >= _APPROVAL_RENOTIFY_INTERVAL_SEC)
+        )
+
+    async def _notify_approval_request(self, request: dict) -> None:
+        """Deliver one durable approval notification over ordered fallbacks."""
+        request_id = request["id"]
+        lock = self._approval_notification_locks.setdefault(request_id, asyncio.Lock())
+        async with lock:
+            current = self._registry.get_approval_request(
+                request["agent_name"], request["chat_id"],
+            )
+            now = time.time()
+            if not current or not self._approval_request_needs_notification(current, now):
+                return
+
+            reset_attempts = current["notification_state"] == "delivered"
+            self._registry.begin_approval_notification(
+                request_id, reset_attempts=reset_attempts,
+            )
+            current = self._registry.get_approval_request(
+                current["agent_name"], current["chat_id"],
+            )
+            if not current:
+                return
+
+            destinations = self._registry.get_owner_notification_destinations()
+            fallback_path: list[dict] = []
+            notification = self._format_approval_notification(current)
+            last_error = "owner notification destination is not configured"
+
+            if self._send_callback:
+                for destination in destinations:
+                    try:
+                        await self._send_callback(
+                            current["agent_name"],
+                            destination["platform"],
+                            destination["conversation_id"],
+                            notification,
+                            account_id=destination["account_id"],
+                        )
+                    except Exception as exc:
+                        last_error = f"{type(exc).__name__}: {exc}"
+                        fallback_path.append({
+                            "destination": destination,
+                            "error": last_error[:500],
+                        })
+                        continue
+                    self._registry.record_approval_notification_delivered(
+                        request_id,
+                        destination=destination,
+                        fallback_path=fallback_path,
+                    )
+                    _log(
+                        "broker: owner approval notification delivered "
+                        f"request={request_id} via "
+                        f"{destination['platform']}/{destination['account_id']}/"
+                        f"{destination['conversation_id']}"
+                    )
+                    return
+            elif destinations:
+                last_error = "broker send callback is not configured"
+
+            attempt = current["notification_attempts"] + 1
+            failed = attempt >= _APPROVAL_NOTIFY_MAX_ATTEMPTS or not destinations
+            delay = min(
+                _APPROVAL_NOTIFY_RETRY_BASE_SEC * (2 ** max(0, attempt - 1)),
+                _APPROVAL_NOTIFY_RETRY_MAX_SEC,
+            )
+            self._registry.record_approval_notification_failure(
+                request_id,
+                error=last_error,
+                next_retry_at=0 if failed else now + delay,
+                failed=failed,
+                fallback_path=fallback_path,
+            )
+            state = "failed" if failed else "retrying"
+            _log(
+                f"broker: owner approval notification {state} request={request_id} "
+                f"attempt={attempt}: {last_error}"
+            )
+
+    async def retry_due_approval_notifications(self) -> int:
+        """Attempt every due durable notification; return requests examined."""
+        due = self._registry.list_due_approval_notifications()
+        for request in due:
+            await self._notify_approval_request(request)
+        return len(due)
+
+    async def run_approval_notification_retries(self) -> None:
+        """Daemon loop that resumes retrying receipts after process restarts."""
+        while True:
+            try:
+                await self.retry_due_approval_notifications()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log(f"broker: approval notification retry loop error: {exc}")
+            await asyncio.sleep(_APPROVAL_NOTIFY_POLL_SEC)
+
+    def start_approval_notification_retries(self) -> asyncio.Task:
+        if self._approval_notification_task and not self._approval_notification_task.done():
+            return self._approval_notification_task
+        self._approval_notification_task = asyncio.create_task(
+            self.run_approval_notification_retries()
+        )
+        return self._approval_notification_task
+
+    async def stop_approval_notification_retries(self) -> None:
+        task = self._approval_notification_task
+        self._approval_notification_task = None
+        if not task:
+            return
+        task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
 
     async def handle_inbound(self, message: BrokerMessage) -> None:
         """Handle an incoming platform message. Non-blocking."""
@@ -1002,37 +1196,11 @@ class MessageBroker:
                                 )
                             except Exception as e:
                                 _log(f"broker: failed to send onboarding reply to {approval_key}: {e}")
-                        primary = self._registry.get_primary_user()
-                        if primary.get("chat_id"):
-                            if is_channel:
-                                notification = (
-                                    f"🆕 {agent_name} got a message in a new channel "
-                                    f"(ID: {approval_key}).\n\n"
-                                    f"Approve to let everyone in this channel talk to "
-                                    f"{agent_name}:\n"
-                                    f"/approve_{approval_key}\n"
-                                    f"/deny_{approval_key}"
-                                )
-                            else:
-                                name_display = message.sender_name or "Unknown"
-                                username = message.metadata.get("username", "")
-                                if username:
-                                    name_display += f" (@{username})"
-                                notification = (
-                                    f"🆕 New user wants to talk to {agent_name}:\n"
-                                    f"{name_display} (ID: {approval_key})\n\n"
-                                    f"/approve_{approval_key}\n"
-                                    f"/deny_{approval_key}"
-                                )
-                            try:
-                                await self._send_callback(
-                                    agent_name, message.platform, primary["chat_id"],
-                                    notification,
-                                )
-                            except Exception as e:
-                                kind = "channel" if is_channel else "user"
-                                _log(f"broker: failed to notify owner about new {kind} {approval_key}: {e}")
-                self._registry.queue_pending_message(
+                target_name = message.chat_id if is_channel else message.sender_name
+                username = message.metadata.get("username", "")
+                if username and not is_channel:
+                    target_name = f"{target_name or 'Unknown'} (@{username})"
+                _, approval_request = self._registry.queue_pending_message_with_approval_request(
                     agent_name=agent_name,
                     platform=message.platform,
                     chat_id=approval_key,
@@ -1041,7 +1209,10 @@ class MessageBroker:
                     content=message.content,
                     is_group=message.is_group,
                     sender_id=message.sender_id,
+                    target_name=target_name,
+                    held_at=message.timestamp,
                 )
+                await self._notify_approval_request(approval_request)
                 self._stats["pending"] += 1
                 _log(f"broker: queued pending message for {agent_name} (key={approval_key}, sender={message.sender_name})")
                 return

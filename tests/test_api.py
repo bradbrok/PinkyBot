@@ -2879,6 +2879,70 @@ class TestAPI:
                 assert resp.status_code == 200, resp.text
                 assert mock.call_args.kwargs["thread_ts"] == "1711584000.000100"
 
+    @pytest.mark.asyncio
+    async def test_broker_send_binds_account_before_delivery_and_dedupe(self):
+        """#863: requested account must select the token and dedupe identity."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            agents = app.state.agents
+            agents.register("barsik", model="sonnet", working_dir=tmpdir)
+            callback = app.state.broker.send_callback
+
+            with patch(
+                "pinky_outreach.slack.SlackAdapter.send_message",
+                return_value=SimpleNamespace(message_id="1711584000.000100"),
+            ) as send:
+                # Missing binding: fail before adapter construction/delivery.
+                agents.set_token("barsik", "slack", "xoxb-test", settings={})
+                with pytest.raises(Exception) as missing:
+                    await callback(
+                        "barsik", "slack", "D_OWNER", "approve?",
+                        account_id="T_OWNER_A",
+                    )
+                assert missing.value.status_code == 409
+                assert send.call_count == 0
+
+                # Mismatched binding: also zero delivery.
+                agents.set_token(
+                    "barsik", "slack", "xoxb-test",
+                    settings={"team_id": "T_OTHER"},
+                )
+                with pytest.raises(Exception) as mismatch:
+                    await callback(
+                        "barsik", "slack", "D_OWNER", "approve?",
+                        account_id="T_OWNER_A",
+                    )
+                assert mismatch.value.status_code == 409
+                assert send.call_count == 0
+
+                # Exact account A sends. Rotating the explicit binding to B and
+                # repeating the same payload sends again (account is in dedupe).
+                agents.set_token(
+                    "barsik", "slack", "xoxb-test",
+                    settings={"team_id": "T_OWNER_A"},
+                )
+                first = await callback(
+                    "barsik", "slack", "D_OWNER", "approve?",
+                    account_id="T_OWNER_A",
+                )
+                agents.set_token(
+                    "barsik", "slack", "xoxb-test",
+                    settings={"team_id": "T_OWNER_B"},
+                )
+                second = await callback(
+                    "barsik", "slack", "D_OWNER", "approve?",
+                    account_id="T_OWNER_B",
+                )
+                duplicate = await callback(
+                    "barsik", "slack", "D_OWNER", "approve?",
+                    account_id="T_OWNER_B",
+                )
+
+                assert first["account_id"] == "T_OWNER_A"
+                assert second["account_id"] == "T_OWNER_B"
+                assert duplicate["deduped"] is True
+                assert send.call_count == 2
+
     def test_broker_thread_quote_builds_reply_parameters(self):
         """thread(quote=...) builds ReplyParameters quoting the given passage."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -4406,6 +4470,30 @@ class TestAgentCRUD:
         data = resp.json()
         assert "session" in data
         assert "tasks" in data
+
+    def test_agent_health_surfaces_failed_owner_notification(self):
+        client, registry = self._make_client_with_registry()
+        client.post("/agents", json={"name": "alice", "model": "sonnet"})
+        request = registry.record_approval_hold(
+            "alice", "C_GATED", target_name="C_GATED", is_channel=True,
+        )
+        registry.record_approval_notification_failure(
+            request["id"],
+            error="RuntimeError: channel_not_found",
+            next_retry_at=0,
+            failed=True,
+            fallback_path=[],
+        )
+
+        resp = client.get("/agents/alice/health")
+
+        assert resp.status_code == 200
+        check = resp.json()["checks"]["approval_notifications"]
+        assert check["healthy"] is False
+        assert check["failed"] == 1
+        assert check["requests"][0]["notification_state"] == "failed"
+        assert "channel_not_found" in check["requests"][0]["last_error"]
+        assert resp.json()["recommendation"] == "needs_attention"
 
     def test_agent_health_not_found(self):
         client = self._make_client()

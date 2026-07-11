@@ -1326,15 +1326,21 @@ def create_api(
     }
 
     # Message broker — routes platform messages through approval checks to agent sessions
-    _platform_adapters: dict[tuple[str, str], object] = {}
+    _platform_adapters: dict[tuple[str, ...], object] = {}
 
-    def _get_platform_adapter(agent_name: str, platform: str):
+    def _get_platform_adapter(
+        agent_name: str, platform: str, *, account_id: str = "",
+    ):
         """Get or create a platform adapter for an agent."""
-        key = (agent_name, platform)
+        key = (agent_name, platform, account_id)
         if key in _platform_adapters:
             return _platform_adapters[key]
 
-        token = agents.get_raw_token(agent_name, platform)
+        token = (
+            agents.get_raw_token_for_account(agent_name, platform, account_id)
+            if account_id
+            else agents.get_raw_token(agent_name, platform)
+        )
         if not token:
             return None
 
@@ -1352,6 +1358,12 @@ def create_api(
         if adapter:
             _platform_adapters[key] = adapter
         return adapter
+
+    def _evict_platform_adapters(agent_name: str, platform: str) -> None:
+        """Drop generic and account-bound adapters after token mutation."""
+        for key in list(_platform_adapters):
+            if len(key) >= 2 and key[0] == agent_name and key[1] == platform:
+                _platform_adapters.pop(key, None)
 
     def _get_imessage_adapter(agent_name: str = ""):
         """Get or create the iMessage adapter for an agent."""
@@ -1427,6 +1439,7 @@ def create_api(
         chat_id: str,
         content: str,
         *,
+        account_id: str = "",
         reply_to: str = "",
         parse_mode: str = "",
         silent: bool = False,
@@ -1495,7 +1508,9 @@ def create_api(
                 raise HTTPException(502, f"ferry send failed: {result.error}")
             return SimpleNamespace(message_id=envelope.id)
 
-        adapter = _get_platform_adapter(agent_name, platform)
+        adapter = _get_platform_adapter(
+            agent_name, platform, account_id=account_id,
+        )
         if not adapter:
             raise HTTPException(503, f"No {platform} adapter for {agent_name}")
 
@@ -1655,6 +1670,7 @@ def create_api(
         chat_id: str,
         content: str,
         *,
+        account_id: str = "",
         reply_to: str = "",
         parse_mode: str = "",
         silent: bool = False,
@@ -1663,6 +1679,13 @@ def create_api(
         blocks: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
+        if account_id and not agents.get_raw_token_for_account(
+            agent_name, platform, account_id,
+        ):
+            raise HTTPException(
+                409,
+                f"No {platform} token bound to destination account {account_id}",
+            )
         loop = asyncio.get_running_loop()
 
         async def _deliver() -> dict:
@@ -1673,6 +1696,7 @@ def create_api(
                     platform,
                     chat_id,
                     content,
+                    account_id=account_id,
                     reply_to=reply_to,
                     parse_mode=parse_mode,
                     silent=silent,
@@ -1690,6 +1714,7 @@ def create_api(
                 "sent": True,
                 "agent": agent_name,
                 "platform": platform,
+                "account_id": account_id,
                 "chat_id": chat_id,
                 "message_id": msg.message_id,
             }
@@ -1706,9 +1731,10 @@ def create_api(
         # Plain sends keep key_extra="" — their historical dedupe behaviour is
         # unchanged. The dict is serialized (never used raw) so the key stays
         # hashable.
-        if parse_mode or link_preview_options or quote or blocks:
+        if account_id or parse_mode or link_preview_options or quote or blocks:
             key_extra = json.dumps(
                 {
+                    "acct": account_id or "",
                     "pm": parse_mode or "",
                     "lpo": link_preview_options or None,
                     "q": quote or "",
@@ -5532,12 +5558,47 @@ npm run build</pre>
         return agents.get_primary_user()
 
     @app.put("/system/primary-user")
-    async def set_primary_user(chat_id: str, display_name: str = ""):
+    async def set_primary_user(
+        chat_id: str,
+        display_name: str = "",
+        notification_platform: str = "",
+        notification_account_id: str = "",
+    ):
         """Set the primary user — auto-approved for all agents."""
         if not chat_id.strip():
             raise HTTPException(400, "chat_id is required")
+        if bool(notification_platform.strip()) != bool(notification_account_id.strip()):
+            raise HTTPException(
+                400,
+                "notification_platform and notification_account_id must be provided together",
+            )
         agents.set_primary_user(chat_id.strip(), display_name.strip())
+        if notification_platform.strip():
+            try:
+                agents.migrate_primary_user_notification_destination(
+                    platform=notification_platform.strip(),
+                    account_id=notification_account_id.strip(),
+                )
+            except ValueError as exc:
+                raise HTTPException(400, str(exc)) from exc
         return {"updated": True, **agents.get_primary_user()}
+
+    @app.get("/system/owner-notification-destinations")
+    async def get_owner_notification_destinations():
+        """Return canonical owner destination followed by ordered fallbacks."""
+        destinations = agents.get_owner_notification_destinations()
+        return {"destinations": destinations, "count": len(destinations)}
+
+    @app.put("/system/owner-notification-destinations")
+    async def set_owner_notification_destinations(req: dict):
+        """Replace the canonical owner destination and ordered fallbacks."""
+        try:
+            destinations = agents.set_owner_notification_destinations(
+                req.get("destinations", []),
+            )
+        except (AttributeError, ValueError) as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"updated": True, "destinations": destinations}
 
     @app.get("/system/api-keys")
     async def get_api_keys():
@@ -6922,7 +6983,7 @@ npm run build</pre>
 
         # Evict the cached outbound adapter so sends pick up the new token
         # immediately (adapters bind the token at construction).
-        _platform_adapters.pop((name, platform), None)
+        _evict_platform_adapters(name, platform)
         if platform == "imessage":
             _platform_adapters.pop(("__global__", "imessage"), None)
 
@@ -7009,7 +7070,7 @@ npm run build</pre>
             raise HTTPException(404, "Token not found")
 
         # Evict the cached outbound adapter so sends stop using the removed token
-        _platform_adapters.pop((name, platform), None)
+        _evict_platform_adapters(name, platform)
         if platform == "imessage":
             _platform_adapters.pop(("__global__", "imessage"), None)
 
@@ -7193,6 +7254,7 @@ npm run build</pre>
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
         user = agents.approve_user(name, req.chat_id, req.display_name or "", req.approved_by or "admin")
+        agents.settle_approval_request(name, req.chat_id, "approved")
         # Deliver pending messages in background
         delivered = 0
         try:
@@ -7207,6 +7269,7 @@ npm run build</pre>
     async def deny_user(name: str, chat_id: str):
         """Deny a user."""
         agents.deny_user(name, chat_id)
+        agents.settle_approval_request(name, chat_id, "denied")
         return {"denied": True, "chat_id": chat_id}
 
     @app.delete("/agents/{name}/approved-users/{chat_id}")
@@ -9915,6 +9978,12 @@ npm run build</pre>
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
 
+        # #863: resume durable owner-approval notification retries before
+        # pollers can accept more inbound messages.
+        app.state.approval_notification_retry_task = (
+            broker.start_approval_notification_retries()
+        )
+
         # Rotate the daemon console log (logs/api.log): daily + size-capped,
         # gzipped 0600 archives with Telegram tokens redacted, pruned past the
         # retention window. copytruncate keeps launchd's open fd valid (it does
@@ -10226,6 +10295,8 @@ npm run build</pre>
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
         import json as _json
         from datetime import datetime, timezone
+
+        await broker.stop_approval_notification_retries()
 
         # Write restart manifest before disconnecting — captures each agent's in-progress state
         # so it can be injected into the wake prompt on next startup.
@@ -11329,6 +11400,10 @@ npm run build</pre>
 
         # Cost
         cost_info = audit.get_costs(agent_name=agent_name)
+        approval_notification_health = agents.get_approval_notification_health(
+            agent_name,
+        )
+        checks = {"approval_notifications": approval_notification_health}
 
         return {
             "agent": agent_name,
@@ -11343,11 +11418,14 @@ npm run build</pre>
                 "pending_events": pending_events,
             },
             "costs": cost_info,
+            "checks": checks,
             "recent_errors": [e.to_dict() for e in errors],
-            "recommendation": _health_recommendation(session_info, heartbeat_info, task_info, errors),
+            "recommendation": _health_recommendation(
+                session_info, heartbeat_info, task_info, errors, checks,
+            ),
         }
 
-    def _health_recommendation(session, heartbeat, tasks, errors) -> str:
+    def _health_recommendation(session, heartbeat, tasks, errors, checks=None) -> str:
         """Generate a health recommendation based on metrics."""
         issues = []
         if session and session.get("needs_restart"):
@@ -11360,6 +11438,11 @@ npm run build</pre>
             issues.append("tasks_blocked")
         if len(errors) >= 3:
             issues.append("high_error_rate")
+        approval_check = (checks or {}).get("approval_notifications", {})
+        if approval_check.get("failed"):
+            issues.append("owner_notification_failed")
+        elif approval_check.get("retrying"):
+            issues.append("owner_notification_retrying")
 
         if not issues:
             return "healthy"
@@ -11369,6 +11452,8 @@ npm run build</pre>
             return "needs_attention"
         if "high_error_rate" in issues:
             return "unstable"
+        if "owner_notification_failed" in issues:
+            return "needs_attention"
         return "degraded"
 
     # time is imported at module level

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import tempfile
+import threading
 
 import pytest
 
@@ -18,6 +19,149 @@ def registry():
     yield r
     r.close()
     os.unlink(path)
+
+
+class TestOwnerNotificationDestinations:
+    def test_explicit_migration_seeds_legacy_primary_chat_id(self, registry):
+        registry.set_primary_user("6770805286", "Brad")
+
+        destinations = registry.migrate_primary_user_notification_destination(
+            platform="telegram",
+            account_id="primary-telegram-bot",
+        )
+
+        assert destinations == [
+            {
+                "platform": "telegram",
+                "account_id": "primary-telegram-bot",
+                "conversation_id": "6770805286",
+                "principal_id": "6770805286",
+            }
+        ]
+
+    def test_migration_never_infers_platform_or_account(self, registry):
+        registry.set_primary_user("6770805286", "Brad")
+
+        with pytest.raises(ValueError, match="requires platform"):
+            registry.migrate_primary_user_notification_destination(
+                platform="", account_id="",
+            )
+
+        assert registry.get_owner_notification_destinations() == []
+
+    def test_primary_and_ordered_fallbacks_round_trip(self, registry):
+        destinations = registry.set_owner_notification_destinations([
+            {
+                "platform": "telegram",
+                "account_id": "tg-owner",
+                "conversation_id": "6770805286",
+                "principal_id": "6770805286",
+            },
+            {
+                "platform": "slack",
+                "team_id": "T_FALLBACK",
+                "conversation_id": "D_FALLBACK",
+                "principal_id": "U_FALLBACK",
+            },
+        ])
+
+        assert destinations[1]["account_id"] == "T_FALLBACK"
+        assert registry.get_owner_notification_destinations() == destinations
+
+    def test_atomic_hold_rolls_back_exact_crash_boundary_and_restart_recovers(
+        self, tmp_path, monkeypatch,
+    ):
+        """Crash after held INSERT/before request UPSERT leaves no orphan."""
+        db_path = tmp_path / "agents.db"
+        registry = AgentRegistry(db_path=str(db_path))
+        registry.register("barsik", model="sonnet", working_dir=str(tmp_path))
+        at_boundary = threading.Event()
+        release_crash = threading.Event()
+        writer_done = threading.Event()
+        atomic_errors: list[BaseException] = []
+        writer_errors: list[BaseException] = []
+
+        def crash_between_writes(*args, **kwargs):
+            # Exact boundary proof: the pending row exists inside the open
+            # transaction, but the aggregate has not been written yet.
+            transaction_db = kwargs["db"]
+            held_inside_tx = transaction_db.execute(
+                "SELECT COUNT(*) FROM pending_messages WHERE agent_name='barsik'"
+            ).fetchone()[0]
+            request_inside_tx = transaction_db.execute(
+                "SELECT COUNT(*) FROM approval_requests WHERE agent_name='barsik'"
+            ).fetchone()[0]
+            assert held_inside_tx == 1
+            assert request_inside_tx == 0
+            at_boundary.set()
+            assert release_crash.wait(2), "test did not release crash boundary"
+            raise RuntimeError("simulated crash after held insert")
+
+        def persist_hold():
+            try:
+                registry.queue_pending_message_with_approval_request(
+                    agent_name="barsik", platform="slack", chat_id="C_CRASH",
+                    reply_chat_id="C_CRASH", sender_name="Alex", content="hello",
+                    is_group=True, sender_id="U_ALEX", target_name="C_CRASH",
+                )
+            except BaseException as exc:
+                atomic_errors.append(exc)
+
+        def unrelated_writer():
+            try:
+                registry.set_setting("concurrent_writer", "committed")
+            except BaseException as exc:
+                writer_errors.append(exc)
+            finally:
+                writer_done.set()
+
+        monkeypatch.setattr(
+            registry, "_record_approval_hold_uncommitted", crash_between_writes,
+        )
+        atomic_thread = threading.Thread(target=persist_hold)
+        atomic_thread.start()
+        assert at_boundary.wait(2), "atomic transaction never reached crash boundary"
+
+        writer_thread = threading.Thread(target=unrelated_writer)
+        writer_thread.start()
+        # Dedicated BEGIN IMMEDIATE owns the DB write lock. The unrelated
+        # shared-connection commit must block, never commit the half-transaction.
+        assert writer_done.wait(0.1) is False
+        release_crash.set()
+        atomic_thread.join(2)
+        writer_thread.join(2)
+        assert not atomic_thread.is_alive()
+        assert not writer_thread.is_alive()
+        assert len(atomic_errors) == 1
+        assert isinstance(atomic_errors[0], RuntimeError)
+        assert "after held insert" in str(atomic_errors[0])
+        assert writer_errors == []
+        assert registry.get_setting("concurrent_writer") == "committed"
+        registry.close()
+
+        restarted = AgentRegistry(db_path=str(db_path))
+        try:
+            # Rollback survived restart: never a durable held row invisible to
+            # the retry loop.
+            assert restarted.get_pending_messages("barsik", "C_CRASH") == []
+            assert restarted.get_approval_request("barsik", "C_CRASH") is None
+            assert restarted.list_due_approval_notifications() == []
+            assert restarted.get_setting("concurrent_writer") == "committed"
+
+            # Provider redelivery after restart commits both sides together;
+            # the request is immediately discoverable by the retry loop.
+            _, request = restarted.queue_pending_message_with_approval_request(
+                agent_name="barsik", platform="slack", chat_id="C_CRASH",
+                reply_chat_id="C_CRASH", sender_name="Alex", content="hello",
+                is_group=True, sender_id="U_ALEX", target_name="C_CRASH",
+            )
+            assert len(restarted.get_pending_messages("barsik", "C_CRASH")) == 1
+            assert restarted.get_approval_request("barsik", "C_CRASH")["id"] == request["id"]
+            assert [row["id"] for row in restarted.list_due_approval_notifications()] == [
+                request["id"]
+            ]
+        finally:
+            restarted.close()
 
 
 class TestSigningKeys:
