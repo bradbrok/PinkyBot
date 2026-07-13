@@ -3113,6 +3113,26 @@ class TmuxSession:
             )
         elif secret:
             env["PINKY_SESSION_SECRET"] = secret
+
+        # ChatGPT-sub Codex models: tell Claude Code the true 272k upstream
+        # window so it auto-compacts before the backend 502s (see
+        # _CODEX_SUB_CONTEXT_WINDOW). The "[1m]" suffix otherwise lets CC ride
+        # context toward ~1M and overflow the sub's real cap (2026-07-13 solik
+        # wedge). SCOPED to the ChatGPT-sub PROXY route (trusted loopback
+        # :18765): the SAME model slug on a paid/custom API gateway has the
+        # model's real 1.05M window and must NOT be capped (Brad's paid-API
+        # alternative). An operator's ambient CLAUDE_CODE_AUTO_COMPACT_WINDOW
+        # wins — _build_repl_env's result becomes explicit tmux -e flags (the
+        # parent env is otherwise dropped), so we must forward it explicitly;
+        # a tuning escape hatch while the sub's allocation can change.
+        from pinky_daemon.pricing import strip_tier
+
+        auto_window = self._CODEX_SUB_CONTEXT_WINDOW.get(
+            strip_tier(self._config.model or ""), 0
+        )
+        if auto_window and self._is_codex_sub_proxy(self._config.provider_url or ""):
+            ambient = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "").strip()
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = ambient or str(auto_window)
         return env
 
     async def disconnect(self) -> None:
@@ -3662,6 +3682,40 @@ class TmuxSession:
     # the percentage-based threshold (always true on 1M, never on 200k
     # since 400k exceeds that window entirely).
     _RESTART_TOKENS_CAP_1M = 400_000
+
+    # ChatGPT-subscription Codex models exposed to Claude Code via the local
+    # codex proxy. Their "[1m]" model suffix hints CC a 1M window, but the
+    # ChatGPT-sub Codex backend caps context at 272k (per ~/.codex/
+    # models_cache.json + the GPT-5.6 subscription update). Without
+    # CLAUDE_CODE_AUTO_COMPACT_WINDOW, CC rides context toward 1M and the
+    # backend 502s "input exceeds the context window" (the 2026-07-13 solik
+    # wedge). Map each to its true upstream window so CC auto-compacts before
+    # the limit. Real 1M Claude agents are absent — they must NOT be capped.
+    # (raine/claude-code-proxy README recommends
+    # CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 for gpt-5.6-sol[1m].)
+    _CODEX_SUB_CONTEXT_WINDOW = {
+        "gpt-5.6-sol": 272_000,
+    }
+
+    @staticmethod
+    def _is_codex_sub_proxy(provider_url: str) -> bool:
+        """True if provider_url is the local ChatGPT-sub Codex proxy (trusted
+        http(s) loopback on :18765). The 272k auto-compact cap applies ONLY to
+        this route — the same model slug on a paid/custom API gateway keeps the
+        model's real 1.05M window and must not be capped. Total/fail-closed: a
+        malformed url (incl. a non-numeric or out-of-range port, which raises
+        only when ``parsed.port`` is accessed) returns False, never raises."""
+        import urllib.parse
+
+        try:
+            parsed = urllib.parse.urlparse((provider_url or "").strip())
+            return (
+                parsed.scheme in {"http", "https"}
+                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                and parsed.port == 18765
+            )
+        except ValueError:
+            return False
 
     def _raw_max_tokens_for_model(self) -> int:
         """Return the model's **raw** context-window cap (no buffer).
