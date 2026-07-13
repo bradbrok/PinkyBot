@@ -47,6 +47,24 @@ _1M_MODELS = {
     "gpt-5.6-sol",
 }
 
+
+def is_1m_model(model_id: str, model_set: "set[str] | None" = None) -> bool:
+    """True if ``model_id`` is a 1M-context model, tolerant of a trailing
+    ``[tier]`` suffix (e.g. ``gpt-5.6-sol[1m]`` → ``gpt-5.6-sol``).
+
+    The ``[tier]`` suffix is a legacy way to request a 1M window. An exact
+    membership test against ``_1M_MODELS`` misses the suffixed form and
+    silently caps the model at 200k — which force-restarted solik
+    (registered ``gpt-5.6-sol[1m]``) at ~50% of 167k despite the #873 fix.
+    Strip the suffix first (reusing pricing's canonical ``strip_tier``).
+    Defaults to the static ``_1M_MODELS`` set; callers on the api path pass
+    their DB-refreshed set.
+    """
+    from pinky_daemon.pricing import strip_tier
+    base = strip_tier(model_id or "")
+    return base in (_1M_MODELS if model_set is None else model_set)
+
+
 DEFAULT_STREAMING_ALLOWED_TOOLS = [
     "Read",
     "Glob",
@@ -1166,7 +1184,7 @@ class StreamingSession:
 
             # Fix: SDK reports 200k for 1M models — use actual window
             max_t = reported_max
-            if self._config.model in _1M_MODELS and reported_max <= 200_000:
+            if is_1m_model(self._config.model or "") and reported_max <= 200_000:
                 max_t = 1_000_000
 
             pct = round(total / max_t * 100) if max_t > 0 else 0

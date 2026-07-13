@@ -171,3 +171,58 @@ async def test_kill_switch_keeps_sse_but_suppresses_nudge(monkeypatch) -> None:
     assert len(nudge_events) == 1
     # ...but the agent-facing directive is suppressed.
     ss._enqueue_internal_prompt.assert_not_called()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# [1m] tier-suffix tolerance (#873 follow-up)
+#
+# solik was registered as ``gpt-5.6-sol[1m]`` (legacy suffix requesting a 1M
+# window). The old exact-match against _1M_MODELS (bare ids) missed the suffix
+# → the model resolved to 200k → the sanity-restart fired at ~50% of the 167k
+# effective window (observed live at 83,705/167,000). Stripping the tier suffix
+# before the membership test fixes it.
+# ──────────────────────────────────────────────────────────────────────────
+
+_MODEL_1M_SUFFIXED = "gpt-5.6-sol[1m]"  # a 1M model carrying the legacy [1m] tag
+
+
+def test_is_1m_model_strips_tier_suffix() -> None:
+    from pinky_daemon.streaming_session import is_1m_model
+
+    # bare 1M id and the exact solik regression ([1m]-suffixed 1M id)
+    assert is_1m_model("gpt-5.6-sol") is True
+    assert is_1m_model("gpt-5.6-sol[1m]") is True
+    assert is_1m_model("claude-opus-4-8[1m]") is True
+    # a non-1M base: the tag must NOT fabricate a 1M window
+    assert is_1m_model("gpt-5.5") is False
+    assert is_1m_model("gpt-5.5[1m]") is False
+    # empty / junk
+    assert is_1m_model("") is False
+    # explicit model_set arg overrides the default _1M_MODELS
+    assert is_1m_model("foo[bar]", {"foo"}) is True
+    assert is_1m_model("gpt-5.6-sol", set()) is False
+
+
+def test_raw_max_tokens_honors_1m_tier_suffix() -> None:
+    ss = _make_session(model=_MODEL_1M_SUFFIXED)
+    assert ss._raw_max_tokens_for_model() == 1_000_000
+
+
+def test_effective_threshold_caps_at_400k_on_suffixed_1m_model(monkeypatch) -> None:
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    suffixed = _make_session(model=_MODEL_1M_SUFFIXED)
+    bare = _make_session(model="gpt-5.6-sol")
+    # The [1m] tag must not change the threshold vs the bare 1M id, and it must
+    # sit well below the old 80% point (the whole point of the fix).
+    assert suffixed._effective_restart_threshold_pct() == pytest.approx(
+        bare._effective_restart_threshold_pct(), rel=1e-6
+    )
+    assert suffixed._effective_restart_threshold_pct() < 80.0
+
+
+def test_non_1m_model_with_tier_suffix_stays_200k() -> None:
+    """The tier tag does not fabricate a 1M window for a non-1M base model:
+    gpt-5.5[1m] strips to gpt-5.5, which is not in _1M_MODELS → 200k."""
+    ss = _make_session(model="gpt-5.5[1m]")
+    assert ss._raw_max_tokens_for_model() == 200_000
+    assert ss._effective_restart_threshold_pct() == pytest.approx(80.0)
