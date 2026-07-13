@@ -987,6 +987,70 @@ class TestAgentIsolationScoping:
         assert resp.status_code != 403
         os.unlink(path)
 
+    # ── #637: isolated teammates in the SAME group may message each other ──
+
+    def _make_client_grouped(self, monkeypatch, tmp_path):
+        """Two isolated teammates (chekov, geordi) share the 'support' group;
+        a third isolated agent (sasha) sits in a different group."""
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(max_sessions=10, default_working_dir=str(tmp_path), db_path=path)
+        reg = app.state.agents
+        reg.register("chekov", model="opus", isolated=True, groups=["support"],
+                     working_dir=str(tmp_path / "chekov"))
+        reg.register("geordi", model="opus", isolated=True, groups=["support"],
+                     working_dir=str(tmp_path / "geordi"))
+        reg.register("sasha", model="opus", isolated=True, groups=["sales"],
+                     working_dir=str(tmp_path / "sasha"))
+        return TestClient(app), path
+
+    def test_isolated_same_group_peer_message_allowed(self, monkeypatch, tmp_path):
+        # geordi → chekov /message, shared group → isolation guard lets it
+        # through (handler runs; the guard's own signal is "not 403").
+        client, path = self._make_client_grouped(monkeypatch, tmp_path)
+        resp = self._signed_post(
+            client, "geordi", "/agents/chekov/message",
+            {"from_agent": "geordi", "message": "calendar for site X?"},
+        )
+        assert resp.status_code != 403, resp.text
+        os.unlink(path)
+
+    def test_isolated_no_shared_group_peer_message_denied(self, monkeypatch, tmp_path):
+        # geordi (support) → sasha (sales) /message: no shared group → 403.
+        client, path = self._make_client_grouped(monkeypatch, tmp_path)
+        resp = self._signed_post(
+            client, "geordi", "/agents/sasha/message",
+            {"from_agent": "geordi", "message": "hi"},
+        )
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("error", "").lower()
+        os.unlink(path)
+
+    def test_isolated_same_group_non_message_path_still_denied(self, monkeypatch, tmp_path):
+        # Shared group does NOT open admin/read surfaces — only /message.
+        client, path = self._make_client_grouped(monkeypatch, tmp_path)
+        resp = self._signed_get(client, "geordi", "/agents/chekov")
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("error", "").lower()
+        os.unlink(path)
+
+    def test_isolated_same_group_message_spoofed_sender_denied(self, monkeypatch, tmp_path):
+        # geordi may reach chekov/message, but naming a THIRD agent as sender
+        # is blocked by the body-actor guard (act only as yourself).
+        client, path = self._make_client_grouped(monkeypatch, tmp_path)
+        resp = self._signed_post(
+            client, "geordi", "/agents/chekov/message",
+            {"from_agent": "sasha", "message": "spoofed"},
+        )
+        assert resp.status_code == 403
+        # handler-level guard raises HTTPException → {"detail": ...} (the
+        # middleware deny uses {"error": ...}); accept either shape.
+        body = resp.json()
+        assert "isolated" in (body.get("detail") or body.get("error") or "").lower()
+        os.unlink(path)
+
     # ── PATH-target: /autonomy/{name}/* (middleware) ──────────────────────
 
     def test_isolated_agent_denied_cross_agent_autonomy(self, monkeypatch, tmp_path):

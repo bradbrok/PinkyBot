@@ -944,6 +944,35 @@ def _isolation_path_target(path: str) -> str | None:
     return None
 
 
+def _isolated_peer_message_allowed(
+    path: str, target: str, caller_groups, peer_groups
+) -> bool:
+    """#637 tenant-grouping: the ONE narrow exception to the #149 isolation
+    deny — teammate coordination.
+
+    An isolated agent is otherwise barred from every ``/agents/{other}/*``
+    surface. This predicate carves out a single case: an isolated caller may
+    reach ``target`` **only** at ``target``'s inter-agent message-delivery
+    endpoint (``POST /agents/{target}/message``), and **only** when the two
+    agents share at least one explicit group. Everything else stays denied —
+    admin, config, autonomy, session, file, even a ``/message/<sub>`` path
+    (the match is exact, so nothing nested slips through).
+
+    Groups are membership-only: co-membership already does NOT grant
+    cross-agent memory access (see the isolation note near the group
+    endpoints), so this widens the tenant boundary strictly to message
+    delivery between agents an operator has deliberately grouped together
+    (e.g. a support team). Message delivery injects a prompt into the peer,
+    so shared-group co-membership IS the trust signal that authorizes it.
+
+    Pure (no I/O) so the isolation policy is unit-testable on its own; the
+    caller resolves the two group lists and passes them in.
+    """
+    if path != f"/agents/{target}/message":
+        return False
+    return bool(set(caller_groups or []) & set(peer_groups or []))
+
+
 def _container_isolation_block_reason(
     *, transport: str, runtime: str, agent_name: str
 ) -> tuple[int, str] | None:
@@ -4463,6 +4492,32 @@ def create_api(
             )
             return True
         if caller and getattr(caller, "isolated", False):
+            # #637: an isolated agent may still MESSAGE a peer it shares a
+            # group with (teammate coordination) — the inter-agent message
+            # endpoint ONLY, never admin/config/autonomy. Only a message-path
+            # target pays the extra peer lookup; every other cross-agent
+            # attempt short-circuits to the deny below. Fail CLOSED if the peer
+            # can't be resolved.
+            if request.url.path == f"/agents/{target}/message":
+                try:
+                    peer = agents.get(target)
+                except Exception as e:
+                    _log(
+                        f"isolation-check: peer lookup failed for '{target}' "
+                        f"on {request.url.path}: {e} — failing closed (deny)"
+                    )
+                    return True
+                if _isolated_peer_message_allowed(
+                    request.url.path,
+                    target,
+                    getattr(caller, "groups", None),
+                    getattr(peer, "groups", None) if peer else None,
+                ):
+                    _log(
+                        f"isolation: allowed isolated '{caller_name}' -> peer "
+                        f"'{target}' message (shared group)"
+                    )
+                    return False
             _log(
                 f"isolation: denied isolated agent '{caller_name}' cross-agent "
                 f"access to {request.url.path}"
@@ -9040,7 +9095,9 @@ npm run build</pre>
         }
 
     @app.post("/agents/{name}/message")
-    async def send_agent_message_direct(name: str, req: AgentMessageRequest):
+    async def send_agent_message_direct(
+        name: str, req: AgentMessageRequest, request: Request
+    ):
         """Send a message from one agent directly into another's streaming context.
 
         Always stores in comms DB for audit trail. If the target agent is
@@ -9048,6 +9105,12 @@ npm run build</pre>
         """
         if not agents.get(name):
             raise HTTPException(404, f"Agent '{name}' not found")
+        # #149/#637 body-actor guard: an isolated caller is now permitted to
+        # reach a same-group peer's message endpoint (path-level, above), so it
+        # must still act AS ITSELF here — block ``from_agent`` spoofing on this
+        # cross-agent surface. No-op for non-isolated callers and for
+        # operator/browser sessions (no verified internal-agent header).
+        _deny_isolated_cross_actor(request, req.from_agent)
         # Always store in comms DB for audit/visibility
         msg = comms.send(
             req.from_agent, name, req.message,
