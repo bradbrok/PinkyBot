@@ -3700,19 +3700,22 @@ class TmuxSession:
     @staticmethod
     def _is_codex_sub_proxy(provider_url: str) -> bool:
         """True if provider_url is the local ChatGPT-sub Codex proxy (trusted
-        loopback on :18765). The 272k auto-compact cap applies ONLY to this
-        route — the same model slug on a paid/custom API gateway keeps the
-        model's real 1.05M window and must not be capped."""
+        http(s) loopback on :18765). The 272k auto-compact cap applies ONLY to
+        this route — the same model slug on a paid/custom API gateway keeps the
+        model's real 1.05M window and must not be capped. Total/fail-closed: a
+        malformed url (incl. a non-numeric or out-of-range port, which raises
+        only when ``parsed.port`` is accessed) returns False, never raises."""
         import urllib.parse
 
         try:
             parsed = urllib.parse.urlparse((provider_url or "").strip())
+            return (
+                parsed.scheme in {"http", "https"}
+                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+                and parsed.port == 18765
+            )
         except ValueError:
             return False
-        return (
-            parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-            and parsed.port == 18765
-        )
 
     def _raw_max_tokens_for_model(self) -> int:
         """Return the model's **raw** context-window cap (no buffer).

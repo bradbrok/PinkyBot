@@ -460,6 +460,33 @@ def test_build_repl_env_autocompact_honors_ambient_override(monkeypatch) -> None
     assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "240000"
 
 
+def test_is_codex_sub_proxy_classifier_is_total() -> None:
+    """The route classifier matches only the trusted http(s) loopback :18765 and
+    is total — malformed / non-numeric / out-of-range ports fail closed (return
+    False) rather than raising (parsed.port raises ValueError only on access)."""
+    match = TmuxSession._is_codex_sub_proxy
+    assert match("http://localhost:18765") is True
+    assert match("http://127.0.0.1:18765/v1") is True
+    assert match("https://[::1]:18765") is True
+    assert match("https://paid-api-gateway.example/anthropic") is False
+    assert match("http://localhost:9999") is False
+    assert match("http://localhost.example:18765") is False  # subdomain
+    assert match("") is False
+    assert match("http://localhost:not-a-port") is False  # non-numeric port
+    assert match("http://localhost:99999") is False  # out-of-range port
+    assert match("ftp://localhost:18765") is False  # wrong scheme
+
+
+def test_build_repl_env_fails_closed_on_malformed_provider_url() -> None:
+    """A malformed provider_url must not crash _build_repl_env or cap — it fails
+    closed (no CLAUDE_CODE_AUTO_COMPACT_WINDOW), never raises."""
+    ss, _ = _make_session()
+    ss._config.model = "gpt-5.6-sol[1m]"
+    ss._config.provider_url = "http://localhost:not-a-port"
+    env = ss._build_repl_env()  # must not raise
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
+
+
 def test_set_effort_accepts_ultracode() -> None:
     ss, _ = _make_session()
     ss.set_effort("ultracode")
