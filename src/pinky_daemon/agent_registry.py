@@ -4392,6 +4392,23 @@ except Exception:
         ("openai/gpt-5.5", (1.75, 14.0, 0.175), (5.0, 30.0, 0.5)),
     ]
 
+    # One-time context-window / 1M-flag corrections for rows already seeded
+    # with the wrong window. Same INSERT OR IGNORE gap as _PRICE_CORRECTIONS:
+    # fixing _MODEL_SEEDS alone never migrates an existing install. Each entry
+    # rewrites one model id ONLY while the row still carries the exact stale
+    # ``(context_window, is_1m)`` pair — an operator-customized window is left
+    # untouched.
+    _CONTEXT_CORRECTIONS = [
+        # (id, (stale_ctx, stale_is_1m), (correct_ctx, correct_is_1m))
+        # #873: gpt-5.6-sol has a native 1M window but deployed DBs seeded it
+        # at 200k/is_1m=0 before that was known. The tmux harness reads is_1m
+        # (api._refresh_1m_models rebinds streaming_session._1M_MODELS from the
+        # DB set), so a stale row caps context at 200k and the sanity watchdog
+        # force-restarts at ~55% of ~167k — thrashing on long tasks. Realign
+        # existing rows to 1M so all three read paths converge.
+        ("openai/gpt-5.6-sol", (200_000, 0), (1_000_000, 1)),
+    ]
+
     def _seed_models(self) -> None:
         """Ensure default models exist (idempotent).
 
@@ -4430,11 +4447,25 @@ except Exception:
                  mid, old_in, old_out, old_cached),
             )
             corrected += cur.rowcount
+        ctx_corrected = 0
+        for mid, (old_ctx, old_1m), (new_ctx, new_1m) in self._CONTEXT_CORRECTIONS:
+            cur = self._db.execute(
+                """UPDATE models
+                   SET context_window=?, is_1m=?, updated_at=?
+                   WHERE id=? AND context_window=? AND is_1m=?""",
+                (new_ctx, new_1m, now, mid, old_ctx, old_1m),
+            )
+            ctx_corrected += cur.rowcount
         self._db.commit()
         if added:
             _log(f"agent_registry: seeded {added} model(s)")
         if corrected:
             _log(f"agent_registry: corrected stale prices on {corrected} model(s)")
+        if ctx_corrected:
+            _log(
+                "agent_registry: corrected stale context windows on "
+                f"{ctx_corrected} model(s)"
+            )
 
     def list_models(self, *, provider: str = "", active_only: bool = True) -> list[dict]:
         """List available models, optionally filtered by provider."""
