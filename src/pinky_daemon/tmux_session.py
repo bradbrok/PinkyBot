@@ -3676,12 +3676,11 @@ class TmuxSession:
         autocompact buffer subtracted).
         """
         try:
-            from pinky_daemon.streaming_session import _1M_MODELS
-            big_models = _1M_MODELS  # noqa: N806 - alias for readability
+            from pinky_daemon.streaming_session import is_1m_model
+            big = is_1m_model(self._config.model or "")
         except Exception:
-            big_models = set()
-        model = (self._config.model or "").strip()
-        return 1_000_000 if model in big_models else 200_000
+            big = False
+        return 1_000_000 if big else 200_000
 
     def _max_tokens_for_model(self) -> int:
         """Return the model's **effective** context-window cap.

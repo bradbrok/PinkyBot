@@ -159,13 +159,16 @@ RATE_TABLE: dict[str, dict[str, float]] = {
 }
 
 
-def _strip_tier(model_id: str) -> str:
+def strip_tier(model_id: str) -> str:
+    """Strip a trailing ``[tier]`` suffix (e.g. ``gpt-5.6-sol[1m]`` →
+    ``gpt-5.6-sol``). Public so other modules (e.g. streaming_session's
+    1M-window check) share this one canonical suffix rule."""
     return _TIER_RE.sub("", (model_id or "").strip())
 
 
 def lookup_rate(model_id: str) -> dict[str, float] | None:
     """Resolve a (possibly tiered) model id to its rate dict, or None."""
-    return RATE_TABLE.get(_strip_tier(model_id))
+    return RATE_TABLE.get(strip_tier(model_id))
 
 
 def compute_turn_cost_usd(

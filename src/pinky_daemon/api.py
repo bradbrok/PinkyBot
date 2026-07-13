@@ -163,7 +163,7 @@ from pinky_daemon.shared_mcp import (
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
-from pinky_daemon.streaming_session import _1M_MODELS
+from pinky_daemon.streaming_session import _1M_MODELS, is_1m_model
 from pinky_daemon.task_store import TaskStore
 
 # Alias: pinky_daemon.sessions.SessionState (imported above) is the
@@ -3218,7 +3218,7 @@ def create_api(
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
             actual_max = reported_max
-            if (ss._config.model or "") in _1M_MODELS and reported_max <= 200_000:
+            if is_1m_model(ss._config.model or "", _1M_MODELS) and reported_max <= 200_000:
                 actual_max = 1_000_000
             # rawMaxTokens (SDK ≥ 0.1.x) is the raw model cap; maxTokens
             # is effective (autocompact buffer subtracted). Pass both
@@ -8770,13 +8770,13 @@ npm run build</pre>
         except Exception:
             pass
 
-        new_is_1m = req.model in _1M_MODELS
+        new_is_1m = is_1m_model(req.model, _1M_MODELS)
         if old_max > 0:
             old_is_1m = old_max > 500_000  # Current window is 1M-class
         else:
             # Usage fetch failed: fall back to the configured model class so a
             # 1M -> 200k switch still forces the context-window restart.
-            old_is_1m = (ss._config.model or "") in _1M_MODELS
+            old_is_1m = is_1m_model(ss._config.model or "", _1M_MODELS)
 
         needs_restart = new_is_1m != old_is_1m
 
