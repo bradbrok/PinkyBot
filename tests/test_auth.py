@@ -1051,6 +1051,21 @@ class TestAgentIsolationScoping:
         assert "isolated" in (body.get("detail") or body.get("error") or "").lower()
         os.unlink(path)
 
+    @pytest.mark.parametrize("from_agent", ["", "   "])
+    def test_isolated_same_group_message_blank_sender_denied(
+        self, monkeypatch, tmp_path, from_agent
+    ):
+        # Empty/blank is not self. The generic body-actor guard must deny it,
+        # never treat a falsey actor as an operator/no-op identity.
+        client, path = self._make_client_grouped(monkeypatch, tmp_path)
+        resp = self._signed_post(
+            client, "geordi", "/agents/chekov/message",
+            {"from_agent": from_agent, "message": "anonymous spoof"},
+        )
+        assert resp.status_code == 403
+        assert "isolated" in resp.json().get("detail", "").lower()
+        os.unlink(path)
+
     # ── PATH-target: /autonomy/{name}/* (middleware) ──────────────────────
 
     def test_isolated_agent_denied_cross_agent_autonomy(self, monkeypatch, tmp_path):

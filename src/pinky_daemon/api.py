@@ -944,8 +944,24 @@ def _isolation_path_target(path: str) -> str | None:
     return None
 
 
+def _clean_group_set(groups) -> set[str]:
+    """Return explicit non-blank names from the persisted group-list shape.
+
+    Any other container shape is corrupt and therefore empty.  In particular,
+    ``set("support")`` would split a legacy JSON string into characters and
+    could authorize an unrelated group such as ``"sales"`` via shared ``"s"``.
+    """
+    if not isinstance(groups, (list, tuple)):
+        return set()
+    return {
+        group.strip()
+        for group in groups
+        if isinstance(group, str) and group.strip()
+    }
+
+
 def _isolated_peer_message_allowed(
-    path: str, target: str, caller_groups, peer_groups
+    method: str, path: str, target: str, caller_groups, peer_groups
 ) -> bool:
     """#637 tenant-grouping: the ONE narrow exception to the #149 isolation
     deny — teammate coordination.
@@ -968,9 +984,9 @@ def _isolated_peer_message_allowed(
     Pure (no I/O) so the isolation policy is unit-testable on its own; the
     caller resolves the two group lists and passes them in.
     """
-    if path != f"/agents/{target}/message":
+    if method != "POST" or path != f"/agents/{target}/message":
         return False
-    return bool(set(caller_groups or []) & set(peer_groups or []))
+    return bool(_clean_group_set(caller_groups) & _clean_group_set(peer_groups))
 
 
 def _container_isolation_block_reason(
@@ -4498,7 +4514,10 @@ def create_api(
             # target pays the extra peer lookup; every other cross-agent
             # attempt short-circuits to the deny below. Fail CLOSED if the peer
             # can't be resolved.
-            if request.url.path == f"/agents/{target}/message":
+            if (
+                request.method == "POST"
+                and request.url.path == f"/agents/{target}/message"
+            ):
                 try:
                     peer = agents.get(target)
                 except Exception as e:
@@ -4508,6 +4527,7 @@ def create_api(
                     )
                     return True
                 if _isolated_peer_message_allowed(
+                    request.method,
                     request.url.path,
                     target,
                     getattr(caller, "groups", None),
@@ -4584,7 +4604,7 @@ def create_api(
         browser request has no such header and is left untouched here.
         """
         caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
-        if not caller or not body_agent or body_agent == caller:
+        if not caller or body_agent == caller:
             return
         if _is_isolated_agent(caller):
             _log(
