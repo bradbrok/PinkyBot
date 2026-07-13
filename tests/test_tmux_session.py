@@ -414,6 +414,22 @@ def test_build_repl_env_expects_resolved_effort_for_ultracode() -> None:
     assert env["PINKY_EXPECTED_EFFORT"] == "xhigh"
 
 
+def test_build_repl_env_sets_autocompact_window_for_codex_sub_model() -> None:
+    """gpt-5.6-sol (ChatGPT-sub Codex) gets CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
+    so Claude Code compacts before the sub's real 272k backend cap — the "[1m]"
+    suffix otherwise makes CC ride toward 1M and 502 (the 2026-07-13 solik wedge).
+    Tier-suffix tolerant; real 1M Claude agents must NOT be capped."""
+    ss, _ = _make_session()
+    ss._config.model = "gpt-5.6-sol[1m]"
+    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "272000"
+    ss._config.model = "gpt-5.6-sol"  # bare id too
+    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "272000"
+    ss._config.model = "claude-opus-4-8"  # real 1M Claude — NOT capped
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
+    ss._config.model = "claude-opus-4-8[1m]"  # 1M-suffixed Claude — NOT capped
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
+
+
 def test_set_effort_accepts_ultracode() -> None:
     ss, _ = _make_session()
     ss.set_effort("ultracode")
