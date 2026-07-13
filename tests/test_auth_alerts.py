@@ -4,8 +4,12 @@ from __future__ import annotations
 from types import SimpleNamespace
 
 from pinky_daemon.auth_alerts import (
+    CODEX_PROXY_AUTH_PROBLEM,
+    CODEX_PROXY_AUTH_REMEDY,
+    DEFAULT_AUTH_REMEDY,
     TRANSPORT_FAILURE_POLICIES,
     AuthFailureTracker,
+    auth_alert_copy_for_provider,
     format_alert_message,
     resolve_operator_chat,
 )
@@ -382,6 +386,32 @@ def test_format_alert_uses_no_markdown_so_plain_text_renders_clean():
     # Sanity: still actually informative.
     assert "sasha" in msg
     assert "authentication_failed" in msg
+
+
+def test_auth_alert_copy_for_local_codex_proxy_uses_proxy_oauth_remedy():
+    for url in (
+        "http://localhost:18765",
+        "http://127.0.0.1:18765/v1",
+        "http://[::1]:18765",
+    ):
+        problem, remedy = auth_alert_copy_for_provider(url)
+        assert problem == CODEX_PROXY_AUTH_PROBLEM
+        assert remedy == CODEX_PROXY_AUTH_REMEDY
+        assert "ChatGPT subscription OAuth" in remedy
+        assert "Do NOT run 'claude /login'" in remedy
+
+
+def test_auth_alert_copy_does_not_misclassify_other_or_spoofed_providers():
+    for url in (
+        "",
+        "https://api.anthropic.com",
+        "http://localhost:9999",
+        "http://localhost.example:18765",
+        "http://[broken",
+    ):
+        problem, remedy = auth_alert_copy_for_provider(url)
+        assert problem == "Claude auth broken"
+        assert remedy == DEFAULT_AUTH_REMEDY
 
 
 # ── /admin/watchdog integration ───────────────────────────────────

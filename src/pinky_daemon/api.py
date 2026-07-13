@@ -1594,6 +1594,7 @@ def create_api(
     from pinky_daemon.auth_alerts import (
         TRANSPORT_FAILURE_POLICIES,
         AuthFailureTracker,
+        auth_alert_copy_for_provider,
         format_alert_message,
         resolve_operator_chat,
     )
@@ -3014,11 +3015,25 @@ def create_api(
         except Exception:
             host_label = ""
 
+        problem = "Claude auth broken"
+        remedy = None
+        try:
+            affected_agent = agents.get(agent_name)
+            if affected_agent is not None:
+                provider_url, _, _ = _resolve_agent_provider(affected_agent)
+                problem, remedy = auth_alert_copy_for_provider(provider_url)
+        except Exception as e:
+            _log(f"auth_alerts: provider-aware remedy lookup raised: {e}")
+
+        format_kwargs = {}
+        if remedy is not None:
+            format_kwargs = {"problem": problem, "remedy": remedy}
         body = format_alert_message(
             agent_name=agent_name,
             decision=decision,
             error=error,
             host_label=host_label,
+            **format_kwargs,
         )
 
         try:
@@ -6270,6 +6285,13 @@ npm run build</pre>
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
 
+        # A main-thread Stop is positive proof that Claude completed a turn.
+        # Keep tmux/CLI auth tracking symmetric with StreamingSession's
+        # ``auth_success_callback``. Subagent successes deliberately do not
+        # clear a prior main-thread failure; Claude marks those with agent_id.
+        if req.event == "stop_hook_summary" and not req.agent_id.strip():
+            _on_auth_success(name)
+
         session = broker.get_streaming_session(name, label=req.label)
         if session is None:
             # Hook fired before the daemon registered the session, or
@@ -6292,13 +6314,15 @@ npm run build</pre>
 
         Claude Code fires ``StopFailure`` when a turn ends due to an API
         error, carrying a typed ``error_type``. Every failure is logged for
-        observability. Auth-class failures (``authentication_failed`` /
+        observability. Main-thread auth failures (``authentication_failed`` /
         ``oauth_org_not_allowed``) are routed into the shared
         ``AuthFailureTracker`` via ``_on_auth_failure`` — the same
         threshold + cooldown + operator-resolution path the SDK reader loop
-        uses. tmux/CLI agents have no SDK reader loop, so this hook is the
-        only thing that surfaces a dead token before the agent goes
-        silently dark.
+        uses. A fan-out child's terminal failure is still observable but is
+        not host-auth evidence: the parent may retry and complete normally.
+        tmux/CLI agents have no SDK reader loop, so this terminal boundary is
+        the only reliable way to surface a genuinely dead token before the
+        agent goes silently dark.
 
         Fire-and-forget: returns 200 even with no live session so the
         hook's ``|| true`` never fails the model turn. Runtime-agnostic —
@@ -6327,7 +6351,8 @@ npm run build</pre>
         # Auth-class failures → shared auth-alert path (tracker decides
         # whether the threshold + cooldown warrant an operator DM).
         auth_failure = error_type in _STOP_FAILURE_AUTH_TYPES
-        if auth_failure:
+        is_subagent = bool((req.agent_id or "").strip())
+        if auth_failure and not is_subagent:
             try:
                 await _on_auth_failure(name, error_type)
             except Exception as e:
@@ -6338,7 +6363,7 @@ npm run build</pre>
         # stays log-only. ``alert_routed`` reflects whether the failure was
         # sent to any alert tracker (auth or class) — not whether a DM fired
         # (that's the tracker's threshold/cooldown decision downstream).
-        alert_routed = auth_failure
+        alert_routed = auth_failure and not is_subagent
         if not auth_failure and error_type in TRANSPORT_FAILURE_POLICIES:
             alert_routed = True
             try:
@@ -6360,7 +6385,7 @@ npm run build</pre>
         # forget like the rest of this hook — never fail the model turn.
         turn_resolved = False
         session = broker.get_streaming_session(name, label=req.label)
-        if session is not None:
+        if session is not None and not is_subagent:
             resolver = getattr(session, "handle_stop_failure", None)
             if callable(resolver):
                 try:
@@ -6377,6 +6402,7 @@ npm run build</pre>
             "agent": name,
             "error_type": error_type,
             "auth_failure": auth_failure,
+            "subagent": is_subagent,
             "alert_routed": alert_routed,
             "turn_resolved": turn_resolved,
         }

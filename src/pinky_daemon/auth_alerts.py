@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import time
+import urllib.parse
 from collections import Counter, defaultdict
 from dataclasses import dataclass, field
 from typing import Iterable
@@ -51,6 +52,15 @@ DEFAULT_AUTH_REMEDY = (
     "Re-auth needed: SSH to the host, run 'claude' to log back in, "
     "then 'sudo systemctl restart pinkybot' (or equivalent)."
 )
+CODEX_PROXY_AUTH_PROBLEM = "Codex proxy auth broken"
+CODEX_PROXY_AUTH_REMEDY = (
+    "The affected credential is the proxy's ChatGPT subscription OAuth, "
+    "not Claude OAuth. On the host, run "
+    "'~/.local/bin/claude-code-proxy-patched codex auth status'; if needed, "
+    "run the same command with 'login' instead of 'status', then restart "
+    "the com.claude-code-proxy launch agent. Do NOT run 'claude /login' — "
+    "that changes the wrong credential."
+)
 BILLING_REMEDY = (
     "Billing/credits issue — the agent is blocked until it's resolved. "
     "Check the provider account's payment/credit status "
@@ -62,6 +72,26 @@ RATE_LIMIT_REMEDY = (
     "Often transient, but if it persists, check the account's usage/plan "
     "limits; turns will keep failing until capacity frees up."
 )
+
+
+def auth_alert_copy_for_provider(provider_url: str) -> tuple[str, str]:
+    """Return provider-aware auth-alert copy.
+
+    Solik's Claude Code harness talks to the local Codex translation proxy on
+    port 18765. Its 401s concern the proxy's Keychain-backed ChatGPT OAuth,
+    so the default Claude ``/login`` remedy is actively misleading. Keep the
+    match narrow: arbitrary local/custom Anthropic-compatible providers may
+    have entirely different authentication and recovery procedures.
+    """
+    try:
+        parsed = urllib.parse.urlparse((provider_url or "").strip())
+        is_loopback = parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+        if is_loopback and parsed.port == 18765:
+            return CODEX_PROXY_AUTH_PROBLEM, CODEX_PROXY_AUTH_REMEDY
+    except ValueError:
+        # Invalid/malformed URLs fall back to the long-standing Claude copy.
+        pass
+    return "Claude auth broken", DEFAULT_AUTH_REMEDY
 
 
 @dataclass(frozen=True)
