@@ -4365,7 +4365,7 @@ except Exception:
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
         ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
         # OpenAI / Codex CLI
-        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
+        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. 1M context. Codex sign-in auth only (API pending).", "flagship", 1_000_000, 1, 5.0, 30.0, 0.5, 0, 54),
         ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
         ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
         ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
