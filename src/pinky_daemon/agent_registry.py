@@ -755,6 +755,12 @@ secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_
 if not secret:
     sys.exit(0)
 
+try:
+    raw = sys.stdin.read()
+    payload_in = json.loads(raw) if raw else {{}}
+except Exception:
+    payload_in = {{}}
+
 agent = "{agent_name}"
 path = "/agents/{agent_name}/transport/wake"
 ts = int(time.time())
@@ -764,7 +770,12 @@ sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 req = urllib.request.Request(
     os.environ.get("PINKY_DAEMON_URL", "http://localhost:8888").rstrip("/") + path,
-    data=json.dumps({{"event": "stop_hook_summary"}}).encode(),
+    data=json.dumps({{
+        "event": "stop_hook_summary",
+        "session_id": payload_in.get("session_id", ""),
+        "agent_id": payload_in.get("agent_id", ""),
+        "agent_type": payload_in.get("agent_type", ""),
+    }}).encode(),
     method="POST",
 )
 req.add_header("Content-Type", "application/json")
@@ -989,6 +1000,8 @@ body = {{
     "error_type": error_type,
     "message": message,
     "session_id": payload_in.get("session_id", ""),
+    "agent_id": payload_in.get("agent_id", ""),
+    "agent_type": payload_in.get("agent_type", ""),
 }}
 
 req = urllib.request.Request(

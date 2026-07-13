@@ -5,11 +5,13 @@ Claude Code fires ``StopFailure`` when a turn ends due to an API error,
 carrying a typed ``error_type``. The hook forwards it so the daemon can:
 
   - log every failure for observability (all classes), and
-  - route auth-class failures (authentication_failed / oauth_org_not_allowed)
-    into the shared ``AuthFailureTracker`` — the same proactive operator-alert
-    path the SDK reader loop uses. tmux/CLI agents have no SDK reader loop, so
-    this hook is the only thing that surfaces a dead token before the agent
-    goes silently dark.
+  - route terminal main-thread auth failures
+    (authentication_failed / oauth_org_not_allowed) into the shared
+    ``AuthFailureTracker`` — the same proactive operator-alert path the SDK
+    reader loop uses. Fan-out-child failures stay observable but do not count
+    as independent host-auth evidence. tmux/CLI agents have no SDK reader
+    loop, so this hook is the only thing that surfaces a dead token before the
+    agent goes silently dark.
 
 The tracker's threshold/cooldown/host-wide logic and alert formatting are
 covered by ``test_auth_alerts.py`` — here we pin that the endpoint *routes*
@@ -187,6 +189,26 @@ class TestStopFailureEndpoint:
             )
         assert calls == [("dymok", "authentication_failed")] * 3
 
+    def test_subagent_auth_failure_is_observed_but_not_paged(self):
+        """A fan-out child has its own terminal StopFailure, but it does not
+        prove the agent's shared credential is broken. Claude's main thread
+        may still retry and finish successfully, as in #355."""
+        client, calls = self._client_with_agent()
+        r = client.post(
+            "/agents/dymok/transport/stop-failure",
+            json={
+                "error_type": "authentication_failed",
+                "agent_id": "child-a1b2",
+                "agent_type": "Explore",
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["auth_failure"] is True
+        assert body["subagent"] is True
+        assert body["alert_routed"] is False
+        assert calls == []
+
 
 # ── Observability ──────────────────────────────────────────────
 
@@ -348,6 +370,18 @@ class TestStopFailureHookPayloadContract:
         # message prefers the rendered error text CC surfaces
         assert captured["body"]["message"] == "API Error: authentication_failed"
 
+    def test_subagent_identity_is_forwarded(self):
+        captured = self._run_hook(
+            {
+                "error": "authentication_failed",
+                "session_id": "session-1",
+                "agent_id": "child-a1b2",
+                "agent_type": "Explore",
+            }
+        )
+        assert captured["body"]["agent_id"] == "child-a1b2"
+        assert captured["body"]["agent_type"] == "Explore"
+
     def test_error_details_used_when_no_last_message(self):
         captured = self._run_hook(
             {"error": "rate_limit", "error_details": "429 Too Many Requests"}
@@ -461,6 +495,27 @@ class TestStopFailureTurnResolve:
         # #108 path also ran.
         assert fake.calls and fake.calls[0][0] == "authentication_failed"
 
+    def test_subagent_failure_does_not_resolve_parent_turn(self):
+        """A child hook shares the Pinky agent endpoint but is not the
+        parent tmux turn-end marker. Resolving here would pop the live parent
+        turn while Claude Code is still retrying it."""
+        client, app, calls = self._client()
+        fake = _FakeTmuxSession(resolved=True)
+        app.state.broker._streaming["dymok"] = {"main": fake}
+        r = client.post(
+            "/agents/dymok/transport/stop-failure",
+            json={
+                "error_type": "authentication_failed",
+                "agent_id": "child-a1b2",
+            },
+        )
+        assert r.status_code == 200
+        body = r.json()
+        assert body["subagent"] is True
+        assert body["turn_resolved"] is False
+        assert calls == []
+        assert fake.calls == []
+
     def test_session_without_method_degrades(self):
         """An SDK/Codex session lacking handle_stop_failure → turn_resolved
         False, hook still 200 (duck-typed, tolerated absence)."""
@@ -489,3 +544,131 @@ class TestStopFailureTurnResolve:
         )
         assert r.status_code == 200
         assert r.json()["turn_resolved"] is False
+
+
+# ── Main-thread success clear ──────────────────────────────────
+
+
+class TestStopSuccessAuthClear:
+    def setup_method(self):
+        self._tmpdir = tempfile.mkdtemp()
+        self._db = os.path.join(self._tmpdir, "test.db")
+
+    def _client(self):
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": "dymok", "model": "sonnet"})
+        assert r.status_code == 200
+        calls: list[str] = []
+        app.state.auth_tracker.record_success = calls.append
+        return client, calls
+
+    def test_main_stop_clears_tmux_auth_failures_even_without_live_session(self):
+        client, calls = self._client()
+        r = client.post(
+            "/agents/dymok/transport/wake",
+            json={"event": "stop_hook_summary", "session_id": "main-session"},
+        )
+        assert r.status_code == 200
+        assert r.json()["session"] is None
+        assert calls == ["dymok"]
+
+    def test_subagent_stop_does_not_clear_main_auth_failure_state(self):
+        client, calls = self._client()
+        r = client.post(
+            "/agents/dymok/transport/wake",
+            json={
+                "event": "stop_hook_summary",
+                "agent_id": "child-a1b2",
+                "agent_type": "Explore",
+            },
+        )
+        assert r.status_code == 200
+        assert calls == []
+
+    def test_main_success_breaks_terminal_auth_failure_streak(self):
+        """Two isolated failed turns around a successful turn are not a
+        sustained three-failure outage. The Stop hook must clear the first
+        pair before the next terminal failure is recorded."""
+        app = _make_app(self._db)
+        client = TestClient(app)
+        r = client.post("/agents", json={"name": "dymok", "model": "sonnet"})
+        assert r.status_code == 200
+
+        for _ in range(2):
+            r = client.post(
+                "/agents/dymok/transport/stop-failure",
+                json={"error_type": "authentication_failed"},
+            )
+            assert r.status_code == 200
+        before = app.state.auth_tracker.status()
+        assert before["status"] == "degraded"
+        assert before["agents_failing"][0]["failures_in_window"] == 2
+
+        r = client.post(
+            "/agents/dymok/transport/wake",
+            json={"event": "stop_hook_summary", "session_id": "main-session"},
+        )
+        assert r.status_code == 200
+        assert app.state.auth_tracker.status()["status"] == "ok"
+
+        r = client.post(
+            "/agents/dymok/transport/stop-failure",
+            json={"error_type": "authentication_failed"},
+        )
+        assert r.status_code == 200
+        after = app.state.auth_tracker.status()
+        assert after["status"] == "degraded"
+        assert after["agents_failing"][0]["failures_in_window"] == 1
+
+
+class TestStopHookPayloadContract:
+    def _run_hook(self, payload: dict) -> dict:
+        import io
+        import sys
+        import urllib.request
+
+        from pinky_daemon.agent_registry import _tmux_wake_hook_source
+
+        src = _tmux_wake_hook_source("dymok")
+        captured: dict = {}
+
+        def _fake_urlopen(req, timeout=0):
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data.decode())
+            return None
+
+        real_stdin, real_urlopen = sys.stdin, urllib.request.urlopen
+        real_secret = os.environ.get("PINKY_SESSION_SECRET")
+        try:
+            sys.stdin = io.StringIO(json.dumps(payload))
+            urllib.request.urlopen = _fake_urlopen
+            os.environ["PINKY_SESSION_SECRET"] = "test-secret"
+            exec(
+                compile(src, "<stop_hook>", "exec"),
+                {"__name__": "__main__"},
+            )
+        finally:
+            sys.stdin = real_stdin
+            urllib.request.urlopen = real_urlopen
+            if real_secret is None:
+                os.environ.pop("PINKY_SESSION_SECRET", None)
+            else:
+                os.environ["PINKY_SESSION_SECRET"] = real_secret
+        return captured
+
+    def test_forwards_main_and_subagent_identity_fields(self):
+        captured = self._run_hook(
+            {
+                "session_id": "session-1",
+                "agent_id": "child-a1b2",
+                "agent_type": "Explore",
+            }
+        )
+        assert captured["url"].endswith("/agents/dymok/transport/wake")
+        assert captured["body"] == {
+            "event": "stop_hook_summary",
+            "session_id": "session-1",
+            "agent_id": "child-a1b2",
+            "agent_type": "Explore",
+        }

@@ -940,6 +940,9 @@ class TransportWakeRequest(BaseModel):
 
     event: Literal["stop_hook_summary", "compact", "manual"] = "stop_hook_summary"
     label: str = "main"
+    session_id: str = ""
+    agent_id: str = ""
+    agent_type: str = ""
 
 
 class TransportTranscriptPathRequest(BaseModel):
@@ -1018,6 +1021,11 @@ class TransportStopFailureRequest(BaseModel):
     message: str = ""
     session_id: str = ""
     label: str = "main"
+    # Claude Code includes ``agent_id`` only when a hook fires inside a
+    # subagent call. Forwarding it lets the daemon avoid treating a burst of
+    # failed fan-out children as independent host-auth outages.
+    agent_id: str = ""
+    agent_type: str = ""
 
 
 class FederationPeerUpsertRequest(BaseModel):
