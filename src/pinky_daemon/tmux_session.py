@@ -3118,15 +3118,21 @@ class TmuxSession:
         # window so it auto-compacts before the backend 502s (see
         # _CODEX_SUB_CONTEXT_WINDOW). The "[1m]" suffix otherwise lets CC ride
         # context toward ~1M and overflow the sub's real cap (2026-07-13 solik
-        # wedge). Only these proxied codex models — real 1M Claude agents are
-        # untouched. setdefault so an explicit ambient override still wins.
+        # wedge). SCOPED to the ChatGPT-sub PROXY route (trusted loopback
+        # :18765): the SAME model slug on a paid/custom API gateway has the
+        # model's real 1.05M window and must NOT be capped (Brad's paid-API
+        # alternative). An operator's ambient CLAUDE_CODE_AUTO_COMPACT_WINDOW
+        # wins — _build_repl_env's result becomes explicit tmux -e flags (the
+        # parent env is otherwise dropped), so we must forward it explicitly;
+        # a tuning escape hatch while the sub's allocation can change.
         from pinky_daemon.pricing import strip_tier
 
         auto_window = self._CODEX_SUB_CONTEXT_WINDOW.get(
             strip_tier(self._config.model or ""), 0
         )
-        if auto_window:
-            env.setdefault("CLAUDE_CODE_AUTO_COMPACT_WINDOW", str(auto_window))
+        if auto_window and self._is_codex_sub_proxy(self._config.provider_url or ""):
+            ambient = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "").strip()
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = ambient or str(auto_window)
         return env
 
     async def disconnect(self) -> None:
@@ -3690,6 +3696,23 @@ class TmuxSession:
     _CODEX_SUB_CONTEXT_WINDOW = {
         "gpt-5.6-sol": 272_000,
     }
+
+    @staticmethod
+    def _is_codex_sub_proxy(provider_url: str) -> bool:
+        """True if provider_url is the local ChatGPT-sub Codex proxy (trusted
+        loopback on :18765). The 272k auto-compact cap applies ONLY to this
+        route — the same model slug on a paid/custom API gateway keeps the
+        model's real 1.05M window and must not be capped."""
+        import urllib.parse
+
+        try:
+            parsed = urllib.parse.urlparse((provider_url or "").strip())
+        except ValueError:
+            return False
+        return (
+            parsed.hostname in {"localhost", "127.0.0.1", "::1"}
+            and parsed.port == 18765
+        )
 
     def _raw_max_tokens_for_model(self) -> int:
         """Return the model's **raw** context-window cap (no buffer).

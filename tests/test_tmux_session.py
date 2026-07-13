@@ -414,20 +414,50 @@ def test_build_repl_env_expects_resolved_effort_for_ultracode() -> None:
     assert env["PINKY_EXPECTED_EFFORT"] == "xhigh"
 
 
-def test_build_repl_env_sets_autocompact_window_for_codex_sub_model() -> None:
-    """gpt-5.6-sol (ChatGPT-sub Codex) gets CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000
-    so Claude Code compacts before the sub's real 272k backend cap — the "[1m]"
-    suffix otherwise makes CC ride toward 1M and 502 (the 2026-07-13 solik wedge).
-    Tier-suffix tolerant; real 1M Claude agents must NOT be capped."""
+def test_build_repl_env_caps_autocompact_for_codex_sub_proxy(monkeypatch) -> None:
+    """gpt-5.6-sol on the ChatGPT-sub proxy (trusted loopback :18765) gets
+    CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 so CC compacts before the sub's real
+    272k cap — the "[1m]" suffix otherwise makes CC ride toward 1M and 502 (the
+    2026-07-13 solik wedge). Tier-suffix tolerant; loopback host + path OK."""
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
     ss, _ = _make_session()
+    ss._config.provider_url = "http://localhost:18765"
     ss._config.model = "gpt-5.6-sol[1m]"
     assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "272000"
     ss._config.model = "gpt-5.6-sol"  # bare id too
     assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "272000"
-    ss._config.model = "claude-opus-4-8"  # real 1M Claude — NOT capped
+    ss._config.provider_url = "http://127.0.0.1:18765/v1"  # 127.0.0.1 + path
+    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "272000"
+
+
+def test_build_repl_env_does_not_cap_paid_api_or_claude(monkeypatch) -> None:
+    """The 272k cap is scoped to the ChatGPT-sub proxy route ONLY. The SAME
+    gpt-5.6-sol slug on a paid API gateway keeps the model's real 1.05M window
+    (Brad's paid-API alternative); real 1M Claude agents are never capped."""
+    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
+    ss, _ = _make_session()
+    ss._config.model = "gpt-5.6-sol[1m]"
+    ss._config.provider_url = "https://paid-api-gateway.example/anthropic"
     assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
-    ss._config.model = "claude-opus-4-8[1m]"  # 1M-suffixed Claude — NOT capped
+    ss._config.provider_url = ""  # no provider → not the sub proxy
     assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
+    ss._config.provider_url = "http://localhost:18765"  # on the proxy, but...
+    ss._config.model = "claude-opus-4-8"  # ...real 1M Claude → NOT capped
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
+    ss._config.model = "claude-opus-4-8[1m]"
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
+
+
+def test_build_repl_env_autocompact_honors_ambient_override(monkeypatch) -> None:
+    """An operator's ambient CLAUDE_CODE_AUTO_COMPACT_WINDOW wins over the mapped
+    default — a tuning escape hatch while the sub allocation can change.
+    (_build_repl_env starts empty and becomes explicit -e flags, so the ambient
+    value must be forwarded, not merely defaulted.)"""
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "240000")
+    ss, _ = _make_session()
+    ss._config.provider_url = "http://localhost:18765"
+    ss._config.model = "gpt-5.6-sol[1m]"
+    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "240000"
 
 
 def test_set_effort_accepts_ultracode() -> None:
