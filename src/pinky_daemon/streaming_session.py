@@ -41,6 +41,10 @@ _1M_MODELS = {
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
+    # Codex fleet (proxy). gpt-5.6-sol has a native 1M window; without this the
+    # tmux harness caps it at 200k and force-restarts far too early (~55% of
+    # ~167k), thrashing on long tasks.
+    "gpt-5.6-sol",
 }
 
 DEFAULT_STREAMING_ALLOWED_TOOLS = [

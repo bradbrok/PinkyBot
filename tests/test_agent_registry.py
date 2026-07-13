@@ -1088,12 +1088,16 @@ class TestModelSeeds:
         contain every model the registry flags is_1m=1. PR #837 added
         claude-sonnet-5 to the three cost/registry tables but not to this set,
         so a sonnet-5 SDK session capped context at 200k and compacted early.
-        Pin them together so the next 1M model add can't silently drift."""
+        Pin them together so the next 1M model add can't silently drift.
+
+        Spans EVERY provider (not just anthropic) — #873 added an OpenAI 1M
+        model (gpt-5.6-sol); an anthropic-only filter would have stayed green
+        while an OpenAI 1M model drifted out of the set."""
         from pinky_daemon.streaming_session import _1M_MODELS
 
         registry_1m = {
             m["model_id"]
-            for m in registry.list_models(provider="anthropic", active_only=False)
+            for m in registry.list_models(active_only=False)
             if m["is_1m"] == 1
         }
         missing = registry_1m - _1M_MODELS
@@ -1201,3 +1205,41 @@ class TestModelSeeds:
             if m["id"] == "openai/gpt-5.5"
         )
         assert gpt["input_price"] == 9.99
+
+    def test_stale_gpt56_sol_context_corrected_on_existing_rows(self, registry):
+        """#873: deployed DBs seeded gpt-5.6-sol at 200k/is_1m=0 before its
+        native 1M window was known. The next seed pass migrates existing rows
+        to 1M (INSERT OR IGNORE alone never reaches them), so the tmux harness
+        stops capping context at 200k and force-restarting far too early."""
+        registry._db.execute(
+            "UPDATE models SET context_window=200000, is_1m=0"
+            " WHERE id='openai/gpt-5.6-sol'"
+        )
+        registry._db.commit()
+        registry._seed_models()
+        sol = next(
+            m for m in registry.list_models(provider="openai", active_only=False)
+            if m["id"] == "openai/gpt-5.6-sol"
+        )
+        assert sol["context_window"] == 1_000_000
+        assert sol["is_1m"] == 1
+        # The DB-derived 1M set (what api._refresh_1m_models rebinds from) now
+        # carries it, so the API context-window path converges with the DB too.
+        assert "gpt-5.6-sol" in registry.get_1m_models()
+
+    def test_operator_customized_gpt56_sol_context_survives_reseed(self, registry):
+        """Same exact-stale-pair gate as the price corrections — an operator
+        who intentionally pinned gpt-5.6-sol to a non-default window must not
+        be clobbered by the 1M migration."""
+        registry._db.execute(
+            "UPDATE models SET context_window=400000, is_1m=0"
+            " WHERE id='openai/gpt-5.6-sol'"
+        )
+        registry._db.commit()
+        registry._seed_models()
+        sol = next(
+            m for m in registry.list_models(provider="openai", active_only=False)
+            if m["id"] == "openai/gpt-5.6-sol"
+        )
+        assert sol["context_window"] == 400_000
+        assert sol["is_1m"] == 0

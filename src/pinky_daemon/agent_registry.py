@@ -4365,7 +4365,7 @@ except Exception:
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
         ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
         # OpenAI / Codex CLI
-        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
+        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. 1M context. Codex sign-in auth only (API pending).", "flagship", 1_000_000, 1, 5.0, 30.0, 0.5, 0, 54),
         ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
         ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
         ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
@@ -4390,6 +4390,23 @@ except Exception:
         # official rate is $5/$30 (cached $0.50) — analytics_store and
         # pricing.RATE_TABLE always had it right; this realigns the catalog.
         ("openai/gpt-5.5", (1.75, 14.0, 0.175), (5.0, 30.0, 0.5)),
+    ]
+
+    # One-time context-window / 1M-flag corrections for rows already seeded
+    # with the wrong window. Same INSERT OR IGNORE gap as _PRICE_CORRECTIONS:
+    # fixing _MODEL_SEEDS alone never migrates an existing install. Each entry
+    # rewrites one model id ONLY while the row still carries the exact stale
+    # ``(context_window, is_1m)`` pair — an operator-customized window is left
+    # untouched.
+    _CONTEXT_CORRECTIONS = [
+        # (id, (stale_ctx, stale_is_1m), (correct_ctx, correct_is_1m))
+        # #873: gpt-5.6-sol has a native 1M window but deployed DBs seeded it
+        # at 200k/is_1m=0 before that was known. The tmux harness reads is_1m
+        # (api._refresh_1m_models rebinds streaming_session._1M_MODELS from the
+        # DB set), so a stale row caps context at 200k and the sanity watchdog
+        # force-restarts at ~55% of ~167k — thrashing on long tasks. Realign
+        # existing rows to 1M so all three read paths converge.
+        ("openai/gpt-5.6-sol", (200_000, 0), (1_000_000, 1)),
     ]
 
     def _seed_models(self) -> None:
@@ -4430,11 +4447,25 @@ except Exception:
                  mid, old_in, old_out, old_cached),
             )
             corrected += cur.rowcount
+        ctx_corrected = 0
+        for mid, (old_ctx, old_1m), (new_ctx, new_1m) in self._CONTEXT_CORRECTIONS:
+            cur = self._db.execute(
+                """UPDATE models
+                   SET context_window=?, is_1m=?, updated_at=?
+                   WHERE id=? AND context_window=? AND is_1m=?""",
+                (new_ctx, new_1m, now, mid, old_ctx, old_1m),
+            )
+            ctx_corrected += cur.rowcount
         self._db.commit()
         if added:
             _log(f"agent_registry: seeded {added} model(s)")
         if corrected:
             _log(f"agent_registry: corrected stale prices on {corrected} model(s)")
+        if ctx_corrected:
+            _log(
+                "agent_registry: corrected stale context windows on "
+                f"{ctx_corrected} model(s)"
+            )
 
     def list_models(self, *, provider: str = "", active_only: bool = True) -> list[dict]:
         """List available models, optionally filtered by provider."""
