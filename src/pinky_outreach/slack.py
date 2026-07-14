@@ -116,6 +116,8 @@ class SlackAdapter:
         thread_ts: str = "",
         reply_broadcast: bool = False,
         blocks: list | None = None,
+        unfurl_links: bool | None = None,
+        unfurl_media: bool | None = None,
     ) -> Message:
         """Send a message to a Slack channel or thread.
 
@@ -128,6 +130,9 @@ class SlackAdapter:
             blocks: optional Block Kit blocks (list of block dicts) for rich/
                 interactive messages. Sent via the JSON body (chat.postMessage);
                 ``_request`` drops it when None.
+            unfurl_links / unfurl_media: Slack's link-preview controls
+                (text-content unfurls / media unfurls). None leaves Slack's
+                defaults untouched; pass False to suppress preview cards.
         """
         result = self._request(
             "chat.postMessage",
@@ -136,6 +141,8 @@ class SlackAdapter:
             thread_ts=thread_ts or None,
             reply_broadcast=reply_broadcast if thread_ts else None,
             blocks=blocks or None,
+            unfurl_links=unfurl_links,
+            unfurl_media=unfurl_media,
         )
 
         msg_data = result.get("message", {})

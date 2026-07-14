@@ -1914,8 +1914,14 @@ def create_api(
                         _log("broker-send: slack blocks not a JSON array, ignoring (text-only)")
                 except Exception as e:
                     _log(f"broker-send: slack blocks JSON parse failed ({e}), sending text-only")
+            # Honor the cross-platform "no preview" intent on Slack too:
+            # link_preview_options.is_disabled → suppress both link and media
+            # unfurls. None leaves Slack's defaults untouched.
+            no_unfurl = bool((link_preview_options or {}).get("is_disabled"))
             result = adapter.send_message(
-                chat_id, content, thread_ts=reply_to or None, blocks=parsed_blocks
+                chat_id, content, thread_ts=reply_to or None, blocks=parsed_blocks,
+                unfurl_links=False if no_unfurl else None,
+                unfurl_media=False if no_unfurl else None,
             )
             return SimpleNamespace(message_id=_extract_message_id(result))
 
