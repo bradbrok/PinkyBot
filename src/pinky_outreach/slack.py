@@ -179,10 +179,16 @@ class SlackAdapter:
         *,
         title: str = "",
         initial_comment: str = "",
+        thread_ts: str = "",
     ) -> Message:
         """Upload a file to a Slack channel.
 
         Uses the files.uploadV2 flow: get upload URL, upload, then complete.
+
+        ``thread_ts`` threads the file under an existing message (a Slack reply);
+        empty posts it as a new root. Mirrors ``send_message``'s threading so
+        send_photo/send_document/send_video with a ``message_id`` reply in-thread
+        instead of spawning a new root message.
         """
         import os
         filename = os.path.basename(file_path)
@@ -219,6 +225,7 @@ class SlackAdapter:
             files=json.dumps([{"id": file_id, "title": title or filename}]),
             channel_id=channel,
             initial_comment=initial_comment or None,
+            thread_ts=thread_ts or None,
         )
 
         return Message(
@@ -229,7 +236,8 @@ class SlackAdapter:
             timestamp=datetime.now(timezone.utc),
             message_id=file_id,
             is_outbound=True,
-            metadata={"type": "file", "filename": filename},
+            metadata={"type": "file", "filename": filename,
+                      **({"thread_ts": thread_ts} if thread_ts else {})},
         )
 
     # ── Downloading ──────────────────────────────────────────

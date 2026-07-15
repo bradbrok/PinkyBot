@@ -242,6 +242,70 @@ class TestSlackAdapter:
         assert msg.message_id == "F123"
         adapter.close()
 
+    def test_upload_file_threads_when_thread_ts(self, tmp_path, monkeypatch):
+        """A file uploaded with thread_ts must thread under that parent (a Slack
+        reply), not spawn a new root. Regression guard: the file-upload path
+        silently dropped reply_to, so send_photo/document/video replies posted a
+        new root instead of threading (Pi-fleet RMA screenshot flow, 2026-07)."""
+        adapter = self._make_adapter()
+        f = tmp_path / "shot.png"
+        f.write_bytes(b"\x89PNG\r\n")
+
+        url_resp = MagicMock()
+        url_resp.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/xyz",
+            "file_id": "F777",
+        }
+        complete_resp = MagicMock()
+        complete_resp.json.return_value = {"ok": True, "files": [{"id": "F777"}]}
+        adapter._client.post = MagicMock(side_effect=[url_resp, complete_resp])
+        monkeypatch.setattr(
+            "pinky_outreach.slack.httpx.post",
+            MagicMock(return_value=MagicMock(status_code=200)),
+        )
+
+        msg = adapter.upload_file(
+            "C123", str(f), initial_comment="approved",
+            thread_ts="1784133332.936979",
+        )
+
+        # completeUploadExternal must carry thread_ts so Slack threads the file.
+        complete_call = adapter._client.post.call_args_list[1]
+        assert complete_call[0][0] == "/files.completeUploadExternal"
+        assert complete_call.kwargs["data"]["thread_ts"] == "1784133332.936979"
+        # and the returned Message records the thread it landed in.
+        assert msg.metadata.get("thread_ts") == "1784133332.936979"
+        adapter.close()
+
+    def test_upload_file_no_thread_ts_omits_it(self, tmp_path, monkeypatch):
+        """Standalone upload (no thread_ts) must NOT send a thread_ts arg —
+        _request_form drops None, so the file posts as a new root as before."""
+        adapter = self._make_adapter()
+        f = tmp_path / "note.txt"
+        f.write_text("hi")
+
+        url_resp = MagicMock()
+        url_resp.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/xyz",
+            "file_id": "F888",
+        }
+        complete_resp = MagicMock()
+        complete_resp.json.return_value = {"ok": True, "files": [{"id": "F888"}]}
+        adapter._client.post = MagicMock(side_effect=[url_resp, complete_resp])
+        monkeypatch.setattr(
+            "pinky_outreach.slack.httpx.post",
+            MagicMock(return_value=MagicMock(status_code=200)),
+        )
+
+        msg = adapter.upload_file("C123", str(f), initial_comment="hi")
+
+        complete_call = adapter._client.post.call_args_list[1]
+        assert "thread_ts" not in complete_call.kwargs["data"]
+        assert "thread_ts" not in msg.metadata
+        adapter.close()
+
     def test_send_message_error(self):
         adapter = self._make_adapter()
         mock_response = MagicMock()
