@@ -1991,7 +1991,13 @@ def create_api(
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         if platform == "slack":
-            result = adapter.upload_file(chat_id, file_path, initial_comment=caption)
+            # reply_to is the parent's ts on Slack — thread the file under it,
+            # same as the text path passes reply_to as thread_ts. Without this
+            # a send_photo/document/video reply spawned a new root instead of
+            # threading (the file-upload path silently dropped reply_to).
+            result = adapter.upload_file(
+                chat_id, file_path, initial_comment=caption, thread_ts=reply_to,
+            )
             return SimpleNamespace(message_id=_extract_message_id(result))
 
         raise HTTPException(400, f"Unsupported platform: {platform}")
