@@ -1229,3 +1229,39 @@ class TestConsolidateBatch:
         assert store.get(ref.id).superseded_by == winner.id
         # ...and must not have gone on to archive the weaker active memory
         assert store.get(weak.id).active is True
+
+
+class TestLegacySalienceCoercion:
+    """Rows written by early builds carry 0-1 float salience; hydration must
+    coerce them onto the 1-5 int scale instead of raising ValidationError
+    and poisoning every recall()/query that touches the row (#834)."""
+
+    @pytest.mark.parametrize(
+        "raw,expected",
+        [
+            (0.7, 4),     # legacy 0-1 scale -> x5, rounded
+            (0.9, 4),     # round-half-even: 4.5 -> 4
+            (1.0, 5),     # boundary of legacy scale maps high, not to 1
+            (0.0, 1),     # clamped to lower bound
+            (3, 3),       # modern ints pass through
+            (4.4, 4),     # stray float on modern scale just rounds
+            (99, 5),      # clamped to upper bound
+            (None, 3),    # garbage falls back to default
+            ("high", 3),  # garbage falls back to default
+        ],
+    )
+    def test_coerce_salience(self, raw, expected):
+        assert ReflectionStore._coerce_salience(raw) == expected
+
+    def test_recall_survives_legacy_float_salience_row(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("legacy row", salience=3))
+        # Corrupt the row the way early builds wrote it: 0-1 float scale
+        with store._lock:
+            store._conn.execute(
+                "UPDATE reflections SET salience = 0.7 WHERE id = ?", (r.id,)
+            )
+            store._conn.commit()
+        got = store.get(r.id)
+        assert got is not None
+        assert got.salience == 4
