@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from pinky_daemon.agent_registry import DEFAULT_HEARTBEAT_PROMPT
 from pinky_daemon.broker import BrokerMessage
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.message_context_store import MessageContextStore
 from pinky_daemon.sessions import (
     Checkpoint,
     ContextStatus,
@@ -2853,6 +2854,93 @@ class TestAPI:
                 assert history[-1].metadata["tool"] == "thread"
                 assert history[-1].metadata["source_message_id"] == "101"
 
+    def test_broker_send_registers_context_for_outbound_self_thread(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message",
+                    side_effect=[
+                        SimpleNamespace(message_id="501"),
+                        SimpleNamespace(message_id="502"),
+                    ],
+                ) as send:
+                    first = client.post(
+                        "/broker/send",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "telegram",
+                            "chat_id": "6770805286",
+                            "content": "First outbound",
+                        },
+                    )
+                    second = client.post(
+                        "/broker/thread",
+                        json={
+                            "agent_name": "barsik",
+                            "message_id": "501",
+                            "content": "Reply to myself",
+                        },
+                    )
+
+                assert first.status_code == 200, first.text
+                assert second.status_code == 200, second.text
+                context = app.state.broker.get_message_context("barsik", "501")
+                assert context is not None
+                assert context.platform == "telegram"
+                assert context.chat_id == "6770805286"
+                assert context.metadata == {"direction": "outbound"}
+                stored = app.state.message_context_store.get("barsik", "501")
+                assert stored is not None
+                assert stored["platform"] == "telegram"
+                assert stored["chat_id"] == "6770805286"
+                assert stored["metadata"] == {"direction": "outbound"}
+                assert send.call_args_list[1].kwargs["reply_to_message_id"] == 501
+
+    def test_broker_thread_fails_closed_on_chat_scoped_message_id_collision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            context_db_path = db_path.replace(".db", "_message_context.db")
+            durable = MessageContextStore(context_db_path)
+            durable.put({
+                "agent_name": "barsik",
+                "message_id": "1",
+                "platform": "telegram",
+                "chat_id": "CHAT_A",
+                "timestamp": time.time(),
+            })
+            durable.close()
+
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                assert app.state.broker._message_contexts == {}
+                app.state.broker.remember_outbound_message_context(
+                    "barsik", "1", platform="telegram", chat_id="CHAT_B"
+                )
+                assert len(app.state.broker._message_contexts) == 1
+                assert app.state.message_context_store.get("barsik", "1") is None
+
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message"
+                ) as send:
+                    response = client.post(
+                        "/broker/thread",
+                        json={
+                            "agent_name": "barsik",
+                            "message_id": "1",
+                            "content": "must not route to either chat",
+                        },
+                    )
+
+                assert response.status_code == 404
+                assert "Message context '1' not found" in response.json()["detail"]
+                send.assert_not_called()
+
     def test_broker_thread_child_reply_uses_stored_root_ts(self):
         """A reply to a Slack child stays on the original thread root."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -3140,6 +3228,10 @@ class TestAPI:
                     assert file_path not in _json.dumps(entry.metadata), (
                         f"{url} leaked raw file_path value into metadata payload"
                     )
+                    context = app.state.broker.get_message_context("barsik", "999")
+                    assert context is not None, f"{url} did not register its outbound message"
+                    assert context.platform == "telegram"
+                    assert context.chat_id == "6770805286"
 
     def test_broker_send_photo_threads_caption_format_and_spoiler(self):
         """/broker/send-photo formats the caption (MarkdownV2) and forwards

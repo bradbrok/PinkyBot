@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -23,6 +24,7 @@ from typing import NamedTuple
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_auth_code
+from pinky_daemon.message_context_store import MessageContextStore
 from pinky_daemon.transport_state import SessionState
 
 # Bounded wait for an in-flight reconnect/restart to complete before we drop an
@@ -253,6 +255,7 @@ class MessageBroker:
         stop_callback=None,  # async fn(agent_name) → force-stop agent
         stop_all_callback=None,  # async fn() → force-stop all agents
         activity_store=None,  # ActivityStore — for logging message events
+        message_context_store: MessageContextStore | None = None,
     ) -> None:
         self._registry = registry
         self._sessions = session_manager
@@ -260,6 +263,7 @@ class MessageBroker:
         self._reaction_callback = reaction_callback
         self._typing_callback = typing_callback
         self._activity = activity_store
+        self._message_context_store = message_context_store
         self._stop_callback = stop_callback
         self._stop_all_callback = stop_all_callback
         self._stats = {
@@ -322,8 +326,10 @@ class MessageBroker:
 
         # Track voice-pending chats: (agent_name, chat_id) -> True when last inbound was voice
         self._voice_pending: dict[tuple[str, str], bool] = {}
-        self._message_contexts: dict[tuple[str, str], MessageContext] = {}
-        self._message_context_order: dict[str, list[str]] = {}
+        self._message_contexts: dict[tuple[str, str, str, str], MessageContext] = {}
+        self._message_context_stored_at: dict[tuple[str, str, str, str], float] = {}
+        self._message_context_order: dict[str, list[tuple[str, str, str, str]]] = {}
+        self._message_context_lock = threading.RLock()
 
         # #215 PR3: last check-inbox nudge time per agent (monotonic seconds),
         # used to coalesce a burst of inter-agent messages into one nudge.
@@ -613,12 +619,67 @@ class MessageBroker:
         await self._reaction_callback(agent_name, platform, chat_id, message_id, emoji)
         return True
 
-    def remember_message_context(self, message: BrokerMessage, *, source_was_voice: bool = False) -> None:
+    @staticmethod
+    def _message_context_key(context: MessageContext) -> tuple[str, str, str, str]:
+        return (context.agent_name, context.platform, context.chat_id, context.message_id)
+
+    def _evict_message_context(self, key: tuple[str, str, str, str]) -> None:
+        self._message_contexts.pop(key, None)
+        self._message_context_stored_at.pop(key, None)
+        order = self._message_context_order.get(key[0])
+        if order is not None and key in order:
+            order.remove(key)
+
+    def _prune_expired_message_contexts(self, now: float) -> None:
+        retention = (
+            self._message_context_store.retention_seconds
+            if self._message_context_store is not None
+            else 30 * 86400
+        )
+        for key, stored_at in list(self._message_context_stored_at.items()):
+            if stored_at < now - retention:
+                self._evict_message_context(key)
+
+    def _cache_message_context(
+        self,
+        context: MessageContext,
+        *,
+        stored_at: float | None = None,
+    ) -> None:
+        key = self._message_context_key(context)
+        self._message_contexts[key] = context
+        self._message_context_stored_at[key] = time.time() if stored_at is None else stored_at
+        order = self._message_context_order.setdefault(context.agent_name, [])
+        if key in order:
+            order.remove(key)
+        order.append(key)
+        if len(order) > 1000:
+            stale_key = order.pop(0)
+            self._message_contexts.pop(stale_key, None)
+            self._message_context_stored_at.pop(stale_key, None)
+
+    def _remember_context(self, context: MessageContext) -> None:
+        """Cache immediately and persist best-effort for restart survival."""
+        stored_at = time.time()
+        with self._message_context_lock:
+            self._cache_message_context(context, stored_at=stored_at)
+            if self._message_context_store is None:
+                return
+            try:
+                self._message_context_store.put(context.to_dict(), stored_at=stored_at)
+            except Exception as exc:  # noqa: BLE001 — routing must survive store faults
+                _log(f"message-context persistence failed: {type(exc).__name__}")
+
+    def remember_message_context(
+        self,
+        message: BrokerMessage,
+        *,
+        source_was_voice: bool = False,
+    ) -> None:
         """Store inbound routing context for later reply()/react() resolution."""
         if not message.message_id:
             return
-        key = (message.agent_name, message.message_id)
-        self._message_contexts[key] = MessageContext(
+        self._remember_context(MessageContext(
             agent_name=message.agent_name,
             message_id=message.message_id,
             platform=message.platform,
@@ -629,18 +690,62 @@ class MessageBroker:
             source_was_voice=source_was_voice,
             attachments=list(message.attachments or []),
             metadata=dict(message.metadata or {}),
-        )
-        order = self._message_context_order.setdefault(message.agent_name, [])
-        if message.message_id in order:
-            order.remove(message.message_id)
-        order.append(message.message_id)
-        if len(order) > 1000:
-            stale_id = order.pop(0)
-            self._message_contexts.pop((message.agent_name, stale_id), None)
+        ))
+
+    def remember_outbound_message_context(
+        self,
+        agent_name: str,
+        message_id: str,
+        *,
+        platform: str,
+        chat_id: str,
+        reply_to: str = "",
+    ) -> None:
+        """Register a delivered outbound message so agents can self-thread."""
+        if not message_id:
+            return
+        self._remember_context(MessageContext(
+            agent_name=agent_name,
+            message_id=message_id,
+            platform=platform,
+            chat_id=chat_id,
+            timestamp=time.time(),
+            reply_to=reply_to,
+            metadata={"direction": "outbound"},
+        ))
 
     def get_message_context(self, agent_name: str, message_id: str) -> MessageContext | None:
-        """Resolve an inbound message context by agent and message ID."""
-        return self._message_contexts.get((agent_name, message_id))
+        """Resolve one context, failing closed when a chat-scoped ID is ambiguous."""
+        with self._message_context_lock:
+            self._prune_expired_message_contexts(time.time())
+            matches = {
+                key: (context, self._message_context_stored_at[key])
+                for key, context in self._message_contexts.items()
+                if key[0] == agent_name and key[3] == message_id
+            }
+            if self._message_context_store is None:
+                return next(iter(matches.values()))[0] if len(matches) == 1 else None
+            try:
+                stored_contexts = self._message_context_store.find(
+                    agent_name,
+                    message_id,
+                    include_stored_at=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — preserve historical 404 behavior
+                _log(f"message-context load failed: {type(exc).__name__}")
+                return None
+            for stored in stored_contexts:
+                stored_at = float(stored.pop("_stored_at"))
+                context = MessageContext(**stored)
+                key = self._message_context_key(context)
+                cached = matches.get(key)
+                if cached is None or stored_at > cached[1]:
+                    matches[key] = (context, stored_at)
+            if len(matches) != 1:
+                return None
+            context, stored_at = next(iter(matches.values()))
+            self._cache_message_context(context, stored_at=stored_at)
+            return context
 
     async def _handle_stop_command(self, message: BrokerMessage) -> bool:
         """Intercept /stop commands from the owner. Returns True if handled."""

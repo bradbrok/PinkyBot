@@ -136,6 +136,7 @@ from pinky_daemon.hooks import (
 from pinky_daemon.kb_store import KBStore
 from pinky_daemon.librarian_runner import LibrarianRunner
 from pinky_daemon.mesh_store import MeshStore
+from pinky_daemon.message_context_store import MessageContextStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
 from pinky_daemon.presentation_store import PresentationStore
@@ -1727,13 +1728,23 @@ def create_api(
         content: str,
         metadata: dict | None = None,
     ) -> None:
+        meta = metadata or {}
+        message_id = _extract_message_id(meta.get("delivery"))
+        if message_id:
+            broker.remember_outbound_message_context(
+                agent_name,
+                message_id,
+                platform=platform,
+                chat_id=chat_id,
+                reply_to=str(meta.get("reply_to") or ""),
+            )
         store.append(
             _session_id_for_agent(agent_name),
             "assistant",
             content,
             platform=platform,
             chat_id=chat_id,
-            metadata=metadata or None,
+            metadata=meta or None,
         )
 
     def _resolve_message_context(agent_name: str, message_id: str):
@@ -2322,7 +2333,11 @@ def create_api(
         return result
 
     activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
+    message_context_store = MessageContextStore(
+        db_path=db_path.replace(".db", "_message_context.db")
+    )
     app.state.activity = activity
+    app.state.message_context_store = message_context_store
     # Exposed for unit-test reach-in (#591 P1#1 — verifying commit=False
     # preserves inbox state). Not part of the public API.
     app.state.comms = comms
@@ -2368,6 +2383,7 @@ def create_api(
         stop_callback=_broker_stop_agent,
         stop_all_callback=_broker_stop_all,
         activity_store=activity,
+        message_context_store=message_context_store,
     )
     _broker_pollers: list = []  # Track active broker pollers
 
@@ -8271,6 +8287,7 @@ npm run build</pre>
                 metadata={
                     "tool": "thread",
                     "source_message_id": ctx.message_id,
+                    "reply_to": effective_thread_root,
                     "delivery_mode": "voice_auto_reply",
                     "delivery": result,
                 },
@@ -8295,6 +8312,7 @@ npm run build</pre>
             metadata={
                 "tool": "thread",
                 "source_message_id": ctx.message_id,
+                "reply_to": effective_thread_root,
                 "delivery": result,
             },
         )
@@ -8496,7 +8514,13 @@ npm run build</pre>
             content=caption or content_default,
             # PII-safe: record argument key names only, not the raw file_path.
             # Matches the arg_keys pattern used in codex_session.py / streaming_session.py.
-            metadata={"tool": method, "source_message_id": source_message_id, "arg_keys": ["file_path"], "delivery": result},
+            metadata={
+                "tool": method,
+                "source_message_id": source_message_id,
+                "reply_to": reply_to,
+                "arg_keys": ["file_path"],
+                "delivery": result,
+            },
         )
         return result
 
@@ -8663,7 +8687,13 @@ npm run build</pre>
             platform=platform,
             chat_id=chat_id,
             content=caption or f"[gif] {query}",
-            metadata={"tool": "send_gif", "source_message_id": source_message_id, "query": query, "delivery": result},
+            metadata={
+                "tool": "send_gif",
+                "source_message_id": source_message_id,
+                "reply_to": reply_to,
+                "query": query,
+                "delivery": result,
+            },
         )
         return result
 
@@ -8719,7 +8749,12 @@ npm run build</pre>
             platform=platform,
             chat_id=chat_id,
             content=text,
-            metadata={"tool": "send_voice", "source_message_id": source_message_id, "delivery": result},
+            metadata={
+                "tool": "send_voice",
+                "source_message_id": source_message_id,
+                "reply_to": reply_to,
+                "delivery": result,
+            },
         )
         return result
 
@@ -10778,6 +10813,7 @@ npm run build</pre>
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
+        message_context_store.close()
 
     # ── Admin: Session Watchdog ─────────────────────────
 
