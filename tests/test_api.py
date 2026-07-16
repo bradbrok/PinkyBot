@@ -2899,6 +2899,35 @@ class TestAPI:
                 assert stored["metadata"] == {"direction": "outbound"}
                 assert send.call_args_list[1].kwargs["reply_to_message_id"] == 501
 
+    def test_broker_thread_fails_closed_on_chat_scoped_message_id_collision(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "telegram", "bot123")
+                app.state.broker.remember_outbound_message_context(
+                    "barsik", "1", platform="telegram", chat_id="CHAT_A"
+                )
+                app.state.broker.remember_outbound_message_context(
+                    "barsik", "1", platform="telegram", chat_id="CHAT_B"
+                )
+
+                with patch(
+                    "pinky_outreach.telegram.TelegramAdapter.send_message"
+                ) as send:
+                    response = client.post(
+                        "/broker/thread",
+                        json={
+                            "agent_name": "barsik",
+                            "message_id": "1",
+                            "content": "must not route to either chat",
+                        },
+                    )
+
+                assert response.status_code == 404
+                assert "Message context '1' not found" in response.json()["detail"]
+                send.assert_not_called()
+
     def test_broker_thread_child_reply_uses_stored_root_ts(self):
         """A reply to a Slack child stays on the original thread root."""
         with tempfile.TemporaryDirectory() as tmpdir:
