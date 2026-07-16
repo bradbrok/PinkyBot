@@ -226,7 +226,7 @@ class MessageContextStore:
                 self._db.rollback()
                 raise
 
-    def get(
+    def find(
         self,
         agent_name: str,
         message_id: str,
@@ -234,8 +234,8 @@ class MessageContextStore:
         platform: str | None = None,
         chat_id: str | None = None,
         include_stored_at: bool = False,
-    ) -> dict[str, Any] | None:
-        """Return one unambiguous, unexpired context for the owning agent."""
+    ) -> list[dict[str, Any]]:
+        """Return every unexpired full identity matching an agent/message ID."""
         cutoff = time.time() - self.retention_seconds
         identity_filter = ""
         params: list[Any] = [agent_name, message_id, cutoff]
@@ -251,28 +251,46 @@ class MessageContextStore:
                 FROM message_contexts
                 WHERE agent_name=? AND message_id=? AND stored_at>=?{identity_filter}
                 ORDER BY stored_at DESC, rowid DESC
-                LIMIT 2
                 """,
                 params,
             ).fetchall()
-        if len(rows) != 1:
-            return None
-        row = rows[0]
-        context = {
-            "agent_name": row["agent_name"],
-            "message_id": row["message_id"],
-            "platform": row["platform"],
-            "chat_id": row["chat_id"],
-            "timestamp": row["message_ts"],
-            "reply_to": row["reply_to"],
-            "is_group": bool(row["is_group"]),
-            "source_was_voice": bool(row["source_was_voice"]),
-            "attachments": self._json_list(row["attachments_json"]),
-            "metadata": self._json_dict(row["metadata_json"]),
-        }
-        if include_stored_at:
-            context["_stored_at"] = float(row["stored_at"])
-        return context
+        contexts: list[dict[str, Any]] = []
+        for row in rows:
+            context = {
+                "agent_name": row["agent_name"],
+                "message_id": row["message_id"],
+                "platform": row["platform"],
+                "chat_id": row["chat_id"],
+                "timestamp": row["message_ts"],
+                "reply_to": row["reply_to"],
+                "is_group": bool(row["is_group"]),
+                "source_was_voice": bool(row["source_was_voice"]),
+                "attachments": self._json_list(row["attachments_json"]),
+                "metadata": self._json_dict(row["metadata_json"]),
+            }
+            if include_stored_at:
+                context["_stored_at"] = float(row["stored_at"])
+            contexts.append(context)
+        return contexts
+
+    def get(
+        self,
+        agent_name: str,
+        message_id: str,
+        *,
+        platform: str | None = None,
+        chat_id: str | None = None,
+        include_stored_at: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return one unambiguous, unexpired context for the owning agent."""
+        contexts = self.find(
+            agent_name,
+            message_id,
+            platform=platform,
+            chat_id=chat_id,
+            include_stored_at=include_stored_at,
+        )
+        return contexts[0] if len(contexts) == 1 else None
 
     def _sweep_retention_locked(self, now: float) -> int:
         """Prune rows while the caller owns ``_lock`` and the transaction."""

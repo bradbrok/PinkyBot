@@ -17,6 +17,7 @@ from fastapi.testclient import TestClient
 from pinky_daemon.agent_registry import DEFAULT_HEARTBEAT_PROMPT
 from pinky_daemon.broker import BrokerMessage
 from pinky_daemon.claude_runner import RunResult
+from pinky_daemon.message_context_store import MessageContextStore
 from pinky_daemon.sessions import (
     Checkpoint,
     ContextStatus,
@@ -2901,16 +2902,28 @@ class TestAPI:
 
     def test_broker_thread_fails_closed_on_chat_scoped_message_id_collision(self):
         with tempfile.TemporaryDirectory() as tmpdir:
-            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            db_path = os.path.join(tmpdir, "test.db")
+            context_db_path = db_path.replace(".db", "_message_context.db")
+            durable = MessageContextStore(context_db_path)
+            durable.put({
+                "agent_name": "barsik",
+                "message_id": "1",
+                "platform": "telegram",
+                "chat_id": "CHAT_A",
+                "timestamp": time.time(),
+            })
+            durable.close()
+
+            app = self._make_app(db_path)
             with TestClient(app) as client:
                 client.post("/agents", json={"name": "barsik", "model": "sonnet"})
                 app.state.agents.set_token("barsik", "telegram", "bot123")
-                app.state.broker.remember_outbound_message_context(
-                    "barsik", "1", platform="telegram", chat_id="CHAT_A"
-                )
+                assert app.state.broker._message_contexts == {}
                 app.state.broker.remember_outbound_message_context(
                     "barsik", "1", platform="telegram", chat_id="CHAT_B"
                 )
+                assert len(app.state.broker._message_contexts) == 1
+                assert app.state.message_context_store.get("barsik", "1") is None
 
                 with patch(
                     "pinky_outreach.telegram.TelegramAdapter.send_message"

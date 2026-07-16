@@ -157,6 +157,7 @@ def test_chat_scoped_message_id_collision_is_ambiguous_but_exact_rows_survive(tm
     store.put(second)
 
     assert store.get("barsik", "1") is None
+    assert len(store.find("barsik", "1")) == 2
     assert store.get(
         "barsik", "1", platform="telegram", chat_id="6770805286"
     )["chat_id"] == "6770805286"

@@ -15,6 +15,7 @@ import json
 import os
 import sys
 import tempfile
+import threading
 import time
 import urllib.request
 from dataclasses import dataclass, field
@@ -328,6 +329,7 @@ class MessageBroker:
         self._message_contexts: dict[tuple[str, str, str, str], MessageContext] = {}
         self._message_context_stored_at: dict[tuple[str, str, str, str], float] = {}
         self._message_context_order: dict[str, list[tuple[str, str, str, str]]] = {}
+        self._message_context_lock = threading.RLock()
 
         # #215 PR3: last check-inbox nudge time per agent (monotonic seconds),
         # used to coalesce a burst of inter-agent messages into one nudge.
@@ -659,13 +661,14 @@ class MessageBroker:
     def _remember_context(self, context: MessageContext) -> None:
         """Cache immediately and persist best-effort for restart survival."""
         stored_at = time.time()
-        self._cache_message_context(context, stored_at=stored_at)
-        if self._message_context_store is None:
-            return
-        try:
-            self._message_context_store.put(context.to_dict(), stored_at=stored_at)
-        except Exception as exc:  # noqa: BLE001 — routing must survive store faults
-            _log(f"message-context persistence failed: {type(exc).__name__}")
+        with self._message_context_lock:
+            self._cache_message_context(context, stored_at=stored_at)
+            if self._message_context_store is None:
+                return
+            try:
+                self._message_context_store.put(context.to_dict(), stored_at=stored_at)
+            except Exception as exc:  # noqa: BLE001 — routing must survive store faults
+                _log(f"message-context persistence failed: {type(exc).__name__}")
 
     def remember_message_context(
         self,
@@ -713,33 +716,36 @@ class MessageBroker:
 
     def get_message_context(self, agent_name: str, message_id: str) -> MessageContext | None:
         """Resolve one context, failing closed when a chat-scoped ID is ambiguous."""
-        self._prune_expired_message_contexts(time.time())
-        cached = [
-            context
-            for key, context in self._message_contexts.items()
-            if key[0] == agent_name and key[3] == message_id
-        ]
-        if len(cached) > 1:
-            return None
-        if len(cached) == 1:
-            return cached[0]
-        if self._message_context_store is None:
-            return None
-        try:
-            stored = self._message_context_store.get(
-                agent_name,
-                message_id,
-                include_stored_at=True,
-            )
-        except Exception as exc:  # noqa: BLE001 — preserve historical 404 behavior
-            _log(f"message-context load failed: {type(exc).__name__}")
-            return None
-        if stored is None:
-            return None
-        stored_at = float(stored.pop("_stored_at"))
-        context = MessageContext(**stored)
-        self._cache_message_context(context, stored_at=stored_at)
-        return context
+        with self._message_context_lock:
+            self._prune_expired_message_contexts(time.time())
+            matches = {
+                key: (context, self._message_context_stored_at[key])
+                for key, context in self._message_contexts.items()
+                if key[0] == agent_name and key[3] == message_id
+            }
+            if self._message_context_store is None:
+                return next(iter(matches.values()))[0] if len(matches) == 1 else None
+            try:
+                stored_contexts = self._message_context_store.find(
+                    agent_name,
+                    message_id,
+                    include_stored_at=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — preserve historical 404 behavior
+                _log(f"message-context load failed: {type(exc).__name__}")
+                return None
+            for stored in stored_contexts:
+                stored_at = float(stored.pop("_stored_at"))
+                context = MessageContext(**stored)
+                key = self._message_context_key(context)
+                cached = matches.get(key)
+                if cached is None or stored_at > cached[1]:
+                    matches[key] = (context, stored_at)
+            if len(matches) != 1:
+                return None
+            context, stored_at = next(iter(matches.values()))
+            self._cache_message_context(context, stored_at=stored_at)
+            return context
 
     async def _handle_stop_command(self, message: BrokerMessage) -> bool:
         """Intercept /stop commands from the owner. Returns True if handled."""
