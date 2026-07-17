@@ -4378,7 +4378,7 @@ except Exception:
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
         ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
         # OpenAI / Codex CLI
-        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. 1M context. Codex sign-in auth only (API pending).", "flagship", 1_000_000, 1, 5.0, 30.0, 0.5, 0, 54),
+        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. 200k-class context; ChatGPT-sub proxy compacts at 150k below its observed ~167k backend limit. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
         ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
         ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
         ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
@@ -4413,13 +4413,11 @@ except Exception:
     # untouched.
     _CONTEXT_CORRECTIONS = [
         # (id, (stale_ctx, stale_is_1m), (correct_ctx, correct_is_1m))
-        # #873: gpt-5.6-sol has a native 1M window but deployed DBs seeded it
-        # at 200k/is_1m=0 before that was known. The tmux harness reads is_1m
-        # (api._refresh_1m_models rebinds streaming_session._1M_MODELS from the
-        # DB set), so a stale row caps context at 200k and the sanity watchdog
-        # force-restarts at ~55% of ~167k — thrashing on long tasks. Realign
-        # existing rows to 1M so all three read paths converge.
-        ("openai/gpt-5.6-sol", (200_000, 0), (1_000_000, 1)),
+        # #356 supersedes #873's inferred 1M designation: live ChatGPT-sub
+        # backend evidence puts gpt-5.6-sol near 167k. Treat it as 200k-class so
+        # the 400k-only restart logic never applies; tmux independently compacts
+        # the subscription proxy at 150k. Correct only the exact stale 1M pair.
+        ("openai/gpt-5.6-sol", (1_000_000, 1), (200_000, 0)),
     ]
 
     def _seed_models(self) -> None:

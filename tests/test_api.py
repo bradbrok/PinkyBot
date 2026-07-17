@@ -2203,13 +2203,12 @@ class TestAPI:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
-                # Cross window classes so the change forces the rebuild path:
-                # gpt-5.5 is 200k, gpt-5.6-sol is native 1M (#873). A same-class
-                # swap (both 1M) takes the hot-swap branch instead — not what
-                # this #856 rebuild test is exercising.
+                # Cross window classes so the change forces the rebuild path.
+                # Start from a genuine 1M class and switch to 200k-class Sol;
+                # #356 removed Sol's stale inferred-1M designation.
                 app.state.agents.register(
                     "murzik",
-                    model="gpt-5.5",
+                    model="claude-opus-4-8",
                     runtime="codex_cli",
                     transport="tmux",
                     provider_url="codex_cli",
@@ -2218,14 +2217,14 @@ class TestAPI:
                     working_dir=os.path.join(tmpdir, "murzik"),
                 )
                 fake = self._FakeStreamingSession(
-                    "murzik", "main", max_tokens=200_000
+                    "murzik", "main", max_tokens=1_000_000
                 )
-                fake._config.model = "gpt-5.5"
+                fake._config.model = "claude-opus-4-8"
                 fake._config.provider_url = "codex_cli"
                 fake._config.provider_key = "old-key"
                 fake._config.thinking_effort = "low"
                 fake._config.strict_effort_enforcement = False
-                fake._codex_model = "gpt-5.5"
+                fake._codex_model = "claude-opus-4-8"
                 fake._openai_api_key = "old-key"
                 fake._reasoning_effort = "low"
                 fake._effort_override = None
