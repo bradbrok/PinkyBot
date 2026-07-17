@@ -176,22 +176,21 @@ async def test_kill_switch_keeps_sse_but_suppresses_nudge(monkeypatch) -> None:
 # ──────────────────────────────────────────────────────────────────────────
 # [1m] tier-suffix tolerance (#873 follow-up)
 #
-# solik was registered as ``gpt-5.6-sol[1m]`` (legacy suffix requesting a 1M
-# window). The old exact-match against _1M_MODELS (bare ids) missed the suffix
-# → the model resolved to 200k → the sanity-restart fired at ~50% of the 167k
-# effective window (observed live at 83,705/167,000). Stripping the tier suffix
-# before the membership test fixes it.
+# A trailing ``[tier]`` suffix is normalized before the reviewed-set lookup, but
+# it must never fabricate a 1M window. #356 established that gpt-5.6-sol is
+# 200k-class despite solik's legacy ``[1m]`` suffix; its subscription backend is
+# near 167k and receives a separate 150k tmux autocompact cap.
 # ──────────────────────────────────────────────────────────────────────────
 
-_MODEL_1M_SUFFIXED = "gpt-5.6-sol[1m]"  # a 1M model carrying the legacy [1m] tag
+_MODEL_SOL_SUFFIXED = "gpt-5.6-sol[1m]"
 
 
 def test_is_1m_model_strips_tier_suffix() -> None:
     from pinky_daemon.streaming_session import is_1m_model
 
-    # bare 1M id and the exact solik regression ([1m]-suffixed 1M id)
-    assert is_1m_model("gpt-5.6-sol") is True
-    assert is_1m_model("gpt-5.6-sol[1m]") is True
+    # A suffix does not promote a 200k-class base model.
+    assert is_1m_model("gpt-5.6-sol") is False
+    assert is_1m_model("gpt-5.6-sol[1m]") is False
     assert is_1m_model("claude-opus-4-8[1m]") is True
     # a non-1M base: the tag must NOT fabricate a 1M window
     assert is_1m_model("gpt-5.5") is False
@@ -203,21 +202,22 @@ def test_is_1m_model_strips_tier_suffix() -> None:
     assert is_1m_model("gpt-5.6-sol", set()) is False
 
 
-def test_raw_max_tokens_honors_1m_tier_suffix() -> None:
-    ss = _make_session(model=_MODEL_1M_SUFFIXED)
-    assert ss._raw_max_tokens_for_model() == 1_000_000
+def test_sol_suffix_stays_200k_class() -> None:
+    ss = _make_session(model=_MODEL_SOL_SUFFIXED)
+    assert ss._raw_max_tokens_for_model() == 200_000
+    assert ss._effective_restart_threshold_pct() == pytest.approx(80.0)
 
 
-def test_effective_threshold_caps_at_400k_on_suffixed_1m_model(monkeypatch) -> None:
+def test_sol_never_uses_the_400k_1m_restart_class(monkeypatch) -> None:
     monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
-    suffixed = _make_session(model=_MODEL_1M_SUFFIXED)
+    suffixed = _make_session(model=_MODEL_SOL_SUFFIXED)
     bare = _make_session(model="gpt-5.6-sol")
-    # The [1m] tag must not change the threshold vs the bare 1M id, and it must
-    # sit well below the old 80% point (the whole point of the fix).
+    # The [1m] tag must not change the threshold or activate the absolute 400k
+    # cap. Both forms use the ordinary 200k-class percentage threshold.
     assert suffixed._effective_restart_threshold_pct() == pytest.approx(
         bare._effective_restart_threshold_pct(), rel=1e-6
     )
-    assert suffixed._effective_restart_threshold_pct() < 80.0
+    assert suffixed._effective_restart_threshold_pct() == pytest.approx(80.0)
 
 
 def test_non_1m_model_with_tier_suffix_stays_200k() -> None:

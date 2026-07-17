@@ -1090,9 +1090,8 @@ class TestModelSeeds:
         so a sonnet-5 SDK session capped context at 200k and compacted early.
         Pin them together so the next 1M model add can't silently drift.
 
-        Spans EVERY provider (not just anthropic) — #873 added an OpenAI 1M
-        model (gpt-5.6-sol); an anthropic-only filter would have stayed green
-        while an OpenAI 1M model drifted out of the set."""
+        Spans EVERY provider (not just anthropic), so a future non-Anthropic 1M
+        model cannot drift out of the set unnoticed."""
         from pinky_daemon.streaming_session import _1M_MODELS
 
         registry_1m = {
@@ -1156,6 +1155,9 @@ class TestModelSeeds:
         assert (sol["input_price"], sol["output_price"],
                 sol["cached_input_price"]) == (5.0, 30.0, 0.5)
         assert sol["tier"] == "flagship"
+        assert sol["context_window"] == 200_000
+        assert sol["is_1m"] == 0
+        assert "gpt-5.6-sol" not in registry.get_1m_models()
 
     def test_openai_seed_prices_match_pricing_rate_table(self, registry):
         """#860 extends the #741 invariant to the OpenAI family: catalog
@@ -1207,12 +1209,11 @@ class TestModelSeeds:
         assert gpt["input_price"] == 9.99
 
     def test_stale_gpt56_sol_context_corrected_on_existing_rows(self, registry):
-        """#873: deployed DBs seeded gpt-5.6-sol at 200k/is_1m=0 before its
-        native 1M window was known. The next seed pass migrates existing rows
-        to 1M (INSERT OR IGNORE alone never reaches them), so the tmux harness
-        stops capping context at 200k and force-restarting far too early."""
+        """#356: deployed DBs carry #873's stale 1M designation. The next seed
+        pass restores the live-evidenced 200k class so 400k-only logic cannot
+        suppress compaction/restart below the real ~167k backend limit."""
         registry._db.execute(
-            "UPDATE models SET context_window=200000, is_1m=0"
+            "UPDATE models SET context_window=1000000, is_1m=1"
             " WHERE id='openai/gpt-5.6-sol'"
         )
         registry._db.commit()
@@ -1221,16 +1222,15 @@ class TestModelSeeds:
             m for m in registry.list_models(provider="openai", active_only=False)
             if m["id"] == "openai/gpt-5.6-sol"
         )
-        assert sol["context_window"] == 1_000_000
-        assert sol["is_1m"] == 1
-        # The DB-derived 1M set (what api._refresh_1m_models rebinds from) now
-        # carries it, so the API context-window path converges with the DB too.
-        assert "gpt-5.6-sol" in registry.get_1m_models()
+        assert sol["context_window"] == 200_000
+        assert sol["is_1m"] == 0
+        # The DB-derived set used by api._refresh_1m_models must drop it too.
+        assert "gpt-5.6-sol" not in registry.get_1m_models()
 
     def test_operator_customized_gpt56_sol_context_survives_reseed(self, registry):
         """Same exact-stale-pair gate as the price corrections — an operator
         who intentionally pinned gpt-5.6-sol to a non-default window must not
-        be clobbered by the 1M migration."""
+        be clobbered by the #356 context correction."""
         registry._db.execute(
             "UPDATE models SET context_window=400000, is_1m=0"
             " WHERE id='openai/gpt-5.6-sol'"

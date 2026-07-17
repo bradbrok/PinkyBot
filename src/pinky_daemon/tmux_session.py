@@ -3114,17 +3114,16 @@ class TmuxSession:
         elif secret:
             env["PINKY_SESSION_SECRET"] = secret
 
-        # ChatGPT-sub Codex models: tell Claude Code the true 272k upstream
+        # ChatGPT-sub Codex models: tell Claude Code the safe 150k upstream
         # window so it auto-compacts before the backend 502s (see
         # _CODEX_SUB_CONTEXT_WINDOW). The "[1m]" suffix otherwise lets CC ride
-        # context toward ~1M and overflow the sub's real cap (2026-07-13 solik
-        # wedge). SCOPED to the ChatGPT-sub PROXY route (trusted loopback
-        # :18765): the SAME model slug on a paid/custom API gateway has the
-        # model's real 1.05M window and must NOT be capped (Brad's paid-API
-        # alternative). An operator's ambient CLAUDE_CODE_AUTO_COMPACT_WINDOW
-        # wins — _build_repl_env's result becomes explicit tmux -e flags (the
-        # parent env is otherwise dropped), so we must forward it explicitly;
-        # a tuning escape hatch while the sub's allocation can change.
+        # context toward ~1M and overflow the sub's real ~167k cap (2026-07-16
+        # solik wedge; the prior 272k assumption left his pane dead for 13h).
+        # SCOPED to the ChatGPT-sub PROXY route (trusted loopback
+        # :18765): paid/custom API gateways are outside this measured cap and
+        # must not inherit the subscription override. An operator's smaller
+        # ambient CLAUDE_CODE_AUTO_COMPACT_WINDOW remains a tuning escape hatch,
+        # but a larger/malformed value cannot raise the live-evidenced ceiling.
         from pinky_daemon.pricing import strip_tier
 
         auto_window = self._CODEX_SUB_CONTEXT_WINDOW.get(
@@ -3132,7 +3131,14 @@ class TmuxSession:
         )
         if auto_window and self._is_codex_sub_proxy(self._config.provider_url or ""):
             ambient = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "").strip()
-            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = ambient or str(auto_window)
+            if ambient:
+                try:
+                    ambient_window = int(ambient)
+                except ValueError:
+                    ambient_window = 0
+                if ambient_window > 0:
+                    auto_window = min(auto_window, ambient_window)
+            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_window)
         return env
 
     async def disconnect(self) -> None:
@@ -3684,25 +3690,23 @@ class TmuxSession:
     _RESTART_TOKENS_CAP_1M = 400_000
 
     # ChatGPT-subscription Codex models exposed to Claude Code via the local
-    # codex proxy. Their "[1m]" model suffix hints CC a 1M window, but the
-    # ChatGPT-sub Codex backend caps context at 272k (per ~/.codex/
-    # models_cache.json + the GPT-5.6 subscription update). Without
-    # CLAUDE_CODE_AUTO_COMPACT_WINDOW, CC rides context toward 1M and the
-    # backend 502s "input exceeds the context window" (the 2026-07-13 solik
-    # wedge). Map each to its true upstream window so CC auto-compacts before
-    # the limit. Real 1M Claude agents are absent — they must NOT be capped.
-    # (raine/claude-code-proxy README recommends
-    # CLAUDE_CODE_AUTO_COMPACT_WINDOW=272000 for gpt-5.6-sol[1m].)
+    # codex proxy. The legacy "[1m]" model suffix hints CC a 1M window, but
+    # live #356 evidence puts solik's real backend window near 167k: the prior
+    # #877 272k value overflowed and wedged his pane for 13 hours on 2026-07-16.
+    # Compact at 150k for headroom below that observed limit. This map is scoped
+    # to the subscription proxy; paid/custom gateways retain their own window.
+    # Do not restore 272k from the older cache/README evidence without a new
+    # live backend measurement.
     _CODEX_SUB_CONTEXT_WINDOW = {
-        "gpt-5.6-sol": 272_000,
+        "gpt-5.6-sol": 150_000,
     }
 
     @staticmethod
     def _is_codex_sub_proxy(provider_url: str) -> bool:
         """True if provider_url is the local ChatGPT-sub Codex proxy (trusted
-        http(s) loopback on :18765). The 272k auto-compact cap applies ONLY to
-        this route — the same model slug on a paid/custom API gateway keeps the
-        model's real 1.05M window and must not be capped. Total/fail-closed: a
+        http(s) loopback on :18765). The 150k auto-compact cap applies ONLY to
+        this route — the same model slug on a paid/custom API gateway does not
+        inherit the subscription override. Total/fail-closed: a
         malformed url (incl. a non-numeric or out-of-range port, which raises
         only when ``parsed.port`` is accessed) returns False, never raises."""
         import urllib.parse

@@ -41,10 +41,6 @@ _1M_MODELS = {
     "claude-opus-4-6",
     "claude-opus-4-7",
     "claude-opus-4-8",
-    # Codex fleet (proxy). gpt-5.6-sol has a native 1M window; without this the
-    # tmux harness caps it at 200k and force-restarts far too early (~55% of
-    # ~167k), thrashing on long tasks.
-    "gpt-5.6-sol",
 }
 
 
@@ -54,9 +50,11 @@ def is_1m_model(model_id: str, model_set: "set[str] | None" = None) -> bool:
 
     The ``[tier]`` suffix is a legacy way to request a 1M window. An exact
     membership test against ``_1M_MODELS`` misses the suffixed form and
-    silently caps the model at 200k — which force-restarted solik
-    (registered ``gpt-5.6-sol[1m]``) at ~50% of 167k despite the #873 fix.
-    Strip the suffix first (reusing pricing's canonical ``strip_tier``).
+    silently caps a genuine 1M model at 200k. Strip the suffix first (reusing
+    pricing's canonical ``strip_tier``), then require the base model to be in
+    the reviewed 1M set. A suffix does not fabricate a 1M window; in particular,
+    #356 established that ``gpt-5.6-sol[1m]`` is 200k-class with a real
+    subscription-backend limit near 167k.
     Defaults to the static ``_1M_MODELS`` set; callers on the api path pass
     their DB-refreshed set.
     """
