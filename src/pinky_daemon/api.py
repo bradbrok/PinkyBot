@@ -2491,6 +2491,7 @@ def create_api(
         ),
         owner_provider=lambda: agents.get_owner_profile(),
         setting_provider=lambda key: agents.get_setting(key, ""),
+        signing_key_provider=agents.get_signing_key,
     )
     app.state.dream_runner = dream_runner
     app.state.agent_history_resolver = _resolve_agent_history

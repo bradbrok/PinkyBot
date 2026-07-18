@@ -9,9 +9,12 @@ import time
 import urllib.error
 import urllib.request
 from datetime import datetime
+from urllib.parse import urlsplit
 
 import pytest
+from fastapi.testclient import TestClient
 
+from pinky_daemon.api import create_api
 from pinky_daemon.dream_runner import DreamRunner
 
 
@@ -57,6 +60,90 @@ class TestDreamRunner:
             assert watermark == 300.0
         finally:
             os.unlink(path)
+
+
+@pytest.mark.real_auth
+@pytest.mark.parametrize(
+    ("isolated", "force_global_fallback"),
+    [(False, True), (True, False)],
+    ids=("global-fallback", "isolated-agent-key"),
+)
+def test_skill_proposal_uses_signed_headers_against_auth_gate(
+    tmp_path, monkeypatch, isolated, force_global_fallback
+):
+    """Dream-created skills authenticate; the same bare API POST is denied.
+
+    Non-isolated agents retain the shared-secret fallback. Isolated agents use
+    their per-agent key because the auth gate deliberately rejects that shared
+    secret for isolated identities.
+    """
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "dream-test-session-secret")
+    app = create_api(
+        max_sessions=10,
+        default_working_dir=str(tmp_path),
+        db_path=str(tmp_path / "pinky.db"),
+    )
+    app.state.agents.register(
+        "test-agent",
+        model="opus",
+        working_dir=str(tmp_path / "test-agent"),
+        isolated=isolated,
+    )
+
+    # Keep the route's persistent skill write inside this test's temp tree.
+    from pinky_daemon.routes import skills as skills_routes
+
+    monkeypatch.setattr(skills_routes, "_pinky_root", tmp_path)
+
+    client = TestClient(app)
+    bare = client.post(
+        "/skills/from-md",
+        json={
+            "content": "---\nname: bare-skill\ndescription: bare\n---\n\n# Bare\n",
+            "agent_name": "test-agent",
+        },
+    )
+    assert bare.status_code == 401
+
+    class _UrlResponse:
+        def __init__(self, content: bytes) -> None:
+            self._content = content
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self) -> bytes:
+            return self._content
+
+    def _urlopen(req, timeout=None):
+        response = client.request(
+            req.get_method(),
+            urlsplit(req.full_url).path,
+            headers=dict(req.header_items()),
+            content=req.data,
+        )
+        assert response.status_code == 200, response.text
+        return _UrlResponse(response.content)
+
+    monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    runner = app.state.dream_runner
+    if force_global_fallback:
+        runner._signing_key_provider = lambda _agent_name: None
+    dream_output = """<proposed_skills>
+    [{
+      "skill_name": "test-dream-skill",
+      "description": "Use this skill for a repeated test workflow.",
+      "task_summary": "Run the workflow and verify its output.",
+      "source_pattern": "Repeated test workflow"
+    }]
+    </proposed_skills>"""
+
+    assert runner._extract_proposed_skills(dream_output, "test-agent") == 1
+
+    assert (tmp_path / "skills" / "test-dream-skill" / "SKILL.md").exists()
 
 
 class TestBuildKGLLMCaller:
