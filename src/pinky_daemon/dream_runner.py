@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import re
 import sqlite3
 import sys
@@ -25,6 +26,10 @@ from pathlib import Path
 
 import numpy as np
 
+from pinky_daemon.auth import (
+    build_internal_auth_headers,
+    resolve_request_signing_secret,
+)
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
@@ -41,8 +46,6 @@ def _kg_proactive_enabled() -> bool:
     flipping it off fully suppresses surfacing — including any digest that was
     already computed while it was on.
     """
-    import os
-
     return os.environ.get("PINKY_KG_PROACTIVE", "0").strip() == "1"
 
 
@@ -83,6 +86,7 @@ class DreamRunner:
         history_provider: Callable[[str, float, int, str], list[dict]] | None = None,
         owner_provider: Callable[[], dict] | None = None,
         setting_provider: Callable[[str], str] | None = None,
+        signing_key_provider: Callable[[str], str | None] | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
@@ -94,6 +98,9 @@ class DreamRunner:
         # env does NOT carry ANTHROPIC_API_KEY (it lives in system_settings), so
         # KG extraction's LLM caller must resolve the key through this. May be None.
         self._setting_provider = setting_provider
+        # Optional agent_name -> per-agent signing key resolver for daemon-internal
+        # API calls. Isolated agents cannot authenticate with the fleet-wide secret.
+        self._signing_key_provider = signing_key_provider
         self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
 
@@ -907,15 +914,25 @@ class DreamRunner:
                 import urllib.parse
                 import urllib.request
 
-                api_url = "http://127.0.0.1:8888/skills/from-md"
+                request_path = "/skills/from-md"
+                api_url = f"http://127.0.0.1:8888{request_path}"
                 payload = json.dumps({
                     "content": skill_md,
                     "agent_name": agent_name,
                 }).encode()
+                headers = {"Content-Type": "application/json"}
+                headers.update(build_internal_auth_headers(
+                    resolve_request_signing_secret(
+                        agent_name, self._signing_key_provider
+                    ),
+                    agent_name=agent_name,
+                    method="POST",
+                    path=request_path,
+                ))
                 req = urllib.request.Request(
                     api_url,
                     data=payload,
-                    headers={"Content-Type": "application/json"},
+                    headers=headers,
                     method="POST",
                 )
                 with urllib.request.urlopen(req, timeout=10) as resp:
