@@ -70,6 +70,9 @@ _DREAM_ALLOWED_TOOLS = [
 # Keeps the dream prompt under a reasonable context budget.
 _MAX_HISTORY_CHARS = 200_000
 
+# Bare alias only: dated Haiku 4.5 snapshots return 404 from Anthropic.
+_KG_EXTRACTION_MODEL_DEFAULT = "claude-haiku-4-5"
+
 
 class DreamRunner:
     """Runs nightly dream consolidation sessions for agents.
@@ -1064,9 +1067,19 @@ class DreamRunner:
         if not api_key:
             return None
 
-        # Use a fast, cheap model for extraction — sonnet is good enough.
-        # Use the bare alias (no date suffix); dated Sonnet 4.6 snapshots 404.
-        model = "claude-sonnet-4-6"
+        # Resolve the extraction model from durable settings first, then the
+        # process environment, with a cheap bare-alias default. Keep provider
+        # failures non-fatal so an unavailable settings DB cannot stop dreams.
+        model = ""
+        if self._setting_provider:
+            try:
+                model = (self._setting_provider("KG_EXTRACTION_MODEL") or "").strip()
+            except Exception:
+                model = ""
+        if not model:
+            model = os.environ.get("KG_EXTRACTION_MODEL", "").strip()
+        if not model:
+            model = _KG_EXTRACTION_MODEL_DEFAULT
 
         # 30s was too short once #686 raised max_tokens 2048->8192: the heaviest
         # reflections now generate longer responses that blew past it, losing

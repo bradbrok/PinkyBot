@@ -174,10 +174,10 @@ class TestBuildKGLLMCaller:
         finally:
             os.unlink(path)
 
-    def test_calls_api_with_alias_model_and_resolved_key(self, monkeypatch):
-        # End-to-end: proves both the key-resolution fix and the corrected
-        # model alias (a dated Sonnet 4.6 snapshot would 404).
+    def test_calls_api_with_default_model_when_override_absent(self, monkeypatch):
+        # End-to-end: absent model settings fall back to the cheap bare alias.
         monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+        monkeypatch.delenv("KG_EXTRACTION_MODEL", raising=False)
         captured: dict = {}
 
         class _FakeResp:
@@ -203,8 +203,53 @@ class TestBuildKGLLMCaller:
             caller = runner._build_kg_llm_caller(_FakeAgentConfig())
             assert caller is not None
             assert caller("extract triples") == "ok"
-            assert captured["body"]["model"] == "claude-sonnet-4-6"
+            assert captured["body"]["model"] == "claude-haiku-4-5"
             assert captured["headers"]["x-api-key"] == "sk-from-settings"
+        finally:
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        ("settings_model", "env_model", "expected"),
+        [
+            ("claude-settings-model", "claude-env-model", "claude-settings-model"),
+            ("", "claude-env-model", "claude-env-model"),
+            ("  ", "  ", "claude-haiku-4-5"),
+        ],
+        ids=("settings-override", "environment-fallback", "blank-default"),
+    )
+    def test_resolves_configurable_model(
+        self, monkeypatch, settings_model, env_model, expected
+    ):
+        monkeypatch.setenv("KG_EXTRACTION_MODEL", env_model)
+        captured: dict = {}
+
+        class _FakeResp:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+            def read(self):
+                return json.dumps({"content": [{"type": "text", "text": "ok"}]}).encode()
+
+        def _fake_urlopen(req, timeout=None):
+            captured["body"] = json.loads(req.data.decode())
+            return _FakeResp()
+
+        def _setting_provider(key):
+            return {
+                "ANTHROPIC_API_KEY": "sk-from-settings",
+                "KG_EXTRACTION_MODEL": settings_model,
+            }.get(key, "")
+
+        monkeypatch.setattr(urllib.request, "urlopen", _fake_urlopen)
+        runner, path = _new_runner(setting_provider=_setting_provider)
+        try:
+            caller = runner._build_kg_llm_caller(_FakeAgentConfig())
+            assert caller is not None
+            assert caller("extract triples") == "ok"
+            assert captured["body"]["model"] == expected
         finally:
             os.unlink(path)
 
