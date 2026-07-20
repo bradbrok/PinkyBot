@@ -19,6 +19,7 @@ import asyncio
 import json as _json
 import os
 import re
+import shlex
 import time as _time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -403,6 +404,37 @@ def test_build_claude_cmd_resolves_ultracode_to_xhigh(tmp_path, monkeypatch) -> 
     cmd = ss._build_claude_cmd()
     assert "--effort xhigh" in cmd
     assert "ultracode" not in cmd
+
+
+@pytest.mark.parametrize("has_prior", [False, True])
+def test_build_claude_cmd_passes_workspace_mcp_config_when_present(
+    tmp_path, monkeypatch, has_prior
+) -> None:
+    """Fresh and resumed tmux launches explicitly load the workspace MCP file."""
+    working_dir = tmp_path / "agent workspace"
+    working_dir.mkdir()
+    mcp_config = working_dir / ".mcp.json"
+    mcp_config.write_text("{}")
+    cfg = StreamingSessionConfig(agent_name="dymok", working_dir=str(working_dir))
+    ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
+    monkeypatch.setattr(ss, "_has_prior_transcript", lambda: has_prior)
+
+    parts = shlex.split(ss._build_claude_cmd())
+
+    assert ("--continue" in parts) is has_prior
+    assert parts[parts.index("--mcp-config") + 1] == str(mcp_config)
+    assert "--strict-mcp-config" not in parts
+
+
+def test_build_claude_cmd_omits_mcp_config_when_workspace_file_missing(
+    tmp_path,
+) -> None:
+    working_dir = tmp_path / "agent-workspace"
+    working_dir.mkdir()
+    cfg = StreamingSessionConfig(agent_name="dymok", working_dir=str(working_dir))
+    ss = TmuxSession(cfg, tmux_control=_make_mock_tmux())
+
+    assert "--mcp-config" not in shlex.split(ss._build_claude_cmd())
 
 
 def test_build_repl_env_expects_resolved_effort_for_ultracode() -> None:

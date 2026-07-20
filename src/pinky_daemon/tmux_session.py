@@ -2927,6 +2927,15 @@ class TmuxSession:
         if cli_effort and cli_effort != "auto":
             parts.extend(["--effort", cli_effort])
 
+        # Claude Code 2.1.215 does not reliably discover project or local-scope
+        # MCP configuration when the daemon launches its tmux REPL. Pass the
+        # agent workspace config explicitly when present so both fresh and
+        # ``--continue`` launches retain Pinky's MCP tools. Deliberately omit
+        # ``--strict-mcp-config``: desktop-provided servers must remain active.
+        mcp_config = Path(self._config.working_dir or ".") / ".mcp.json"
+        if mcp_config.is_file():
+            parts.extend(["--mcp-config", str(mcp_config)])
+
         # #151 native ultracode activation. ultracode boots at --effort xhigh
         # (above) because the CLI flag rejects the literal "ultracode". The
         # real tier — xhigh + the CLI's own standing dynamic-workflow
