@@ -8,6 +8,7 @@ Requires a Slack Bot Token (xoxb-...) with appropriate scopes:
 - channels:history / groups:history / im:history
 - reactions:write
 - files:write (for uploads)
+- im:write (resolve U-prefixed user IDs to DM conversations for file uploads)
 - channels:read (for channel info)
 - users:read (resolve user id -> display name)
 - users:read.email (resolve user id -> email; email lookup-by-email routing)
@@ -48,6 +49,7 @@ class SlackAdapter:
             timeout=timeout,
         )
         self._bot_info: dict | None = None
+        self._dm_conversation_ids: dict[str, str] = {}
 
     def close(self) -> None:
         self._client.close()
@@ -172,6 +174,41 @@ class SlackAdapter:
         if resp.status_code >= 400:
             raise SlackError(f"response_url post failed: {resp.status_code}")
 
+    def _ensure_conversation_id(self, channel: str) -> str:
+        """Resolve a U-prefixed user ID to the D-prefixed DM conversation ID.
+
+        ``chat.postMessage`` accepts a user ID and opens the DM implicitly, but
+        ``files.completeUploadExternal(channel_id=...)`` requires a conversation
+        ID. Resolve before starting the external upload so a missing ``im:write``
+        scope fails without creating an upload ticket or transferring bytes.
+        Successful U→D mappings are stable and cached for this adapter/token.
+        Existing C/D/G conversation IDs pass through without an API call.
+        """
+        if not channel.startswith("U"):
+            return channel
+
+        cached = self._dm_conversation_ids.get(channel)
+        if cached:
+            return cached
+
+        try:
+            result = self._request_form("conversations.open", users=channel)
+        except SlackError as exc:
+            if exc.error == "missing_scope":
+                raise SlackError(
+                    "im:write is required to resolve U-prefixed user IDs "
+                    "for Slack DM file uploads"
+                ) from exc
+            raise
+
+        conversation_id = str((result.get("channel") or {}).get("id") or "")
+        if not conversation_id.startswith("D"):
+            raise SlackError(
+                "conversations.open returned no valid DM conversation ID"
+            )
+        self._dm_conversation_ids[channel] = conversation_id
+        return conversation_id
+
     def upload_file(
         self,
         channel: str,
@@ -193,6 +230,7 @@ class SlackAdapter:
         import os
         filename = os.path.basename(file_path)
         file_size = os.path.getsize(file_path)
+        conversation_id = self._ensure_conversation_id(channel)
 
         # Step 1: Get an upload URL. files.getUploadURLExternal is a form/query
         # method — like users.info / conversations.info it ignores a JSON request
@@ -223,7 +261,7 @@ class SlackAdapter:
         self._request_form(
             "files.completeUploadExternal",
             files=json.dumps([{"id": file_id, "title": title or filename}]),
-            channel_id=channel,
+            channel_id=conversation_id,
             initial_comment=initial_comment or None,
             thread_ts=thread_ts or None,
         )

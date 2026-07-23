@@ -21,6 +21,7 @@ class TestSlackAdapter:
         adapter = self._make_adapter()
         assert adapter._token == "xoxb-fake-slack-token"
         assert adapter._bot_info is None
+        assert adapter._dm_conversation_ids == {}
         adapter.close()
 
     def test_headers(self):
@@ -72,6 +73,25 @@ class TestSlackAdapter:
         call_kwargs = adapter._client.post.call_args
         payload = call_kwargs.kwargs.get("json", call_kwargs[1].get("json", {}))
         assert payload["thread_ts"] == "1711584000.000100"
+        adapter.close()
+
+    def test_send_message_keeps_user_id_path_unchanged(self):
+        """Slack already accepts U-prefixed IDs on chat.postMessage."""
+        adapter = self._make_adapter()
+        mock_response = MagicMock()
+        mock_response.json.return_value = {
+            "ok": True,
+            "channel": "D12345",
+            "message": {"text": "Hello", "ts": "1711584000.000100"},
+        }
+        adapter._client.post = MagicMock(return_value=mock_response)
+
+        msg = adapter.send_message("U12345", "Hello")
+
+        assert msg.chat_id == "U12345"
+        assert adapter._client.post.call_args[0][0] == "/chat.postMessage"
+        assert adapter._client.post.call_args.kwargs["json"]["channel"] == "U12345"
+        assert adapter._dm_conversation_ids == {}
         adapter.close()
 
     def test_get_user_info_success(self):
@@ -304,6 +324,170 @@ class TestSlackAdapter:
         complete_call = adapter._client.post.call_args_list[1]
         assert "thread_ts" not in complete_call.kwargs["data"]
         assert "thread_ts" not in msg.metadata
+        adapter.close()
+
+    def test_upload_file_resolves_user_id_before_upload(self, tmp_path, monkeypatch):
+        """U-prefixed destinations are opened as D-prefixed conversations first."""
+        adapter = self._make_adapter()
+        f = tmp_path / "rma.png"
+        f.write_bytes(b"\x89PNG\r\n")
+
+        open_resp = MagicMock()
+        open_resp.json.return_value = {"ok": True, "channel": {"id": "D456"}}
+        url_resp = MagicMock()
+        url_resp.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/xyz",
+            "file_id": "F123",
+        }
+        complete_resp = MagicMock()
+        complete_resp.json.return_value = {"ok": True, "files": [{"id": "F123"}]}
+        adapter._client.post = MagicMock(
+            side_effect=[open_resp, url_resp, complete_resp]
+        )
+        monkeypatch.setattr(
+            "pinky_outreach.slack.httpx.post",
+            MagicMock(return_value=MagicMock(status_code=200)),
+        )
+
+        msg = adapter.upload_file("U123", str(f), initial_comment="RMA")
+
+        calls = adapter._client.post.call_args_list
+        assert [call.args[0] for call in calls] == [
+            "/conversations.open",
+            "/files.getUploadURLExternal",
+            "/files.completeUploadExternal",
+        ]
+        assert calls[0].kwargs["data"] == {"users": "U123"}
+        assert (
+            calls[0].kwargs["headers"]["Content-Type"]
+            == "application/x-www-form-urlencoded"
+        )
+        assert calls[2].kwargs["data"]["channel_id"] == "D456"
+        assert adapter._dm_conversation_ids == {"U123": "D456"}
+        assert msg.chat_id == "U123"
+        adapter.close()
+
+    def test_upload_file_threads_after_user_id_resolution(self, tmp_path, monkeypatch):
+        """The U→D resolution also covers photo/document replies in a DM."""
+        adapter = self._make_adapter()
+        f = tmp_path / "reply.png"
+        f.write_bytes(b"\x89PNG\r\n")
+
+        open_resp = MagicMock()
+        open_resp.json.return_value = {"ok": True, "channel": {"id": "D456"}}
+        url_resp = MagicMock()
+        url_resp.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/xyz",
+            "file_id": "F456",
+        }
+        complete_resp = MagicMock()
+        complete_resp.json.return_value = {"ok": True, "files": [{"id": "F456"}]}
+        adapter._client.post = MagicMock(
+            side_effect=[open_resp, url_resp, complete_resp]
+        )
+        monkeypatch.setattr(
+            "pinky_outreach.slack.httpx.post",
+            MagicMock(return_value=MagicMock(status_code=200)),
+        )
+
+        msg = adapter.upload_file(
+            "U123",
+            str(f),
+            thread_ts="1784133332.936979",
+        )
+
+        complete_call = adapter._client.post.call_args_list[2]
+        assert complete_call.kwargs["data"]["channel_id"] == "D456"
+        assert complete_call.kwargs["data"]["thread_ts"] == "1784133332.936979"
+        assert msg.metadata["thread_ts"] == "1784133332.936979"
+        adapter.close()
+
+    def test_user_id_resolution_is_cached_per_adapter(self):
+        adapter = self._make_adapter()
+        open_resp = MagicMock()
+        open_resp.json.return_value = {"ok": True, "channel": {"id": "D456"}}
+        adapter._client.post = MagicMock(return_value=open_resp)
+
+        assert adapter._ensure_conversation_id("U123") == "D456"
+        assert adapter._ensure_conversation_id("U123") == "D456"
+
+        adapter._client.post.assert_called_once()
+        adapter.close()
+
+    def test_user_id_resolution_missing_scope_fails_before_upload(
+        self,
+        tmp_path,
+        monkeypatch,
+    ):
+        adapter = self._make_adapter()
+        f = tmp_path / "rma.png"
+        f.write_bytes(b"\x89PNG\r\n")
+        missing_scope = MagicMock()
+        missing_scope.json.return_value = {
+            "ok": False,
+            "error": "missing_scope",
+            "needed": "im:write",
+        }
+        adapter._client.post = MagicMock(return_value=missing_scope)
+        upload_post = MagicMock()
+        monkeypatch.setattr("pinky_outreach.slack.httpx.post", upload_post)
+
+        with pytest.raises(SlackError, match="im:write"):
+            adapter.upload_file("U123", str(f))
+
+        adapter._client.post.assert_called_once()
+        assert adapter._client.post.call_args.args[0] == "/conversations.open"
+        upload_post.assert_not_called()
+        assert adapter._dm_conversation_ids == {}
+        adapter.close()
+
+    def test_user_id_resolution_rejects_missing_dm_id(self):
+        adapter = self._make_adapter()
+        invalid_response = MagicMock()
+        invalid_response.json.return_value = {"ok": True, "channel": {}}
+        adapter._client.post = MagicMock(return_value=invalid_response)
+
+        with pytest.raises(SlackError, match="no valid DM conversation ID"):
+            adapter._ensure_conversation_id("U123")
+
+        assert adapter._dm_conversation_ids == {}
+        adapter.close()
+
+    @pytest.mark.parametrize("channel", ["D123", "G123"])
+    def test_upload_file_preserves_existing_conversation_ids(
+        self,
+        channel,
+        tmp_path,
+        monkeypatch,
+    ):
+        """D/G uploads bypass conversations.open; C is covered above."""
+        adapter = self._make_adapter()
+        f = tmp_path / "note.txt"
+        f.write_text("hello")
+        url_resp = MagicMock()
+        url_resp.json.return_value = {
+            "ok": True,
+            "upload_url": "https://files.slack.com/upload/xyz",
+            "file_id": "F123",
+        }
+        complete_resp = MagicMock()
+        complete_resp.json.return_value = {"ok": True, "files": [{"id": "F123"}]}
+        adapter._client.post = MagicMock(side_effect=[url_resp, complete_resp])
+        monkeypatch.setattr(
+            "pinky_outreach.slack.httpx.post",
+            MagicMock(return_value=MagicMock(status_code=200)),
+        )
+
+        adapter.upload_file(channel, str(f))
+
+        calls = adapter._client.post.call_args_list
+        assert [call.args[0] for call in calls] == [
+            "/files.getUploadURLExternal",
+            "/files.completeUploadExternal",
+        ]
+        assert calls[1].kwargs["data"]["channel_id"] == channel
         adapter.close()
 
     def test_send_message_error(self):
