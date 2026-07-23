@@ -10228,7 +10228,7 @@ npm run build</pre>
         except Exception as exc:
             _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
 
-    async def _watchdog_alert(agent_name: str, message: str) -> None:
+    async def _watchdog_alert(agent_name: str, message: str) -> bool:
         """Alert callback: notify the owner over configured destinations."""
         _log(f"watchdog: alert for {agent_name} — {message}")
         try:
@@ -10247,7 +10247,7 @@ npm run build</pre>
                 f"ERROR watchdog: owner alert for {agent_name} not delivered; "
                 "owner notification destination or send callback is not configured"
             )
-            return
+            return False
 
         last_error = "no configured destination accepted the alert"
         for destination in destinations:
@@ -10269,17 +10269,18 @@ npm run build</pre>
                 f"{destination['platform']}/{destination['account_id']}/"
                 f"{destination['conversation_id']}"
             )
-            return
+            return True
         _log(
             f"ERROR watchdog: owner alert delivery failed for {agent_name}: "
             f"{last_error}"
         )
+        return False
 
     async def _watchdog_tmux_liveness(
         agent_name: str,
         label: str,
         session: Any,
-    ) -> bool | None:
+    ) -> tuple[bool, str] | None:
         """Return tmux resource liveness for an eligible active registration.
 
         ``None`` is an intentional skip for disabled, retired, or non-tmux
@@ -10301,7 +10302,12 @@ npm run build</pre>
             raise RuntimeError(
                 f"active tmux transport {agent_name}/{label} has no tmux control"
             )
-        return bool(await has_session())
+        session_name = (
+            str(getattr(tmux, "session_name", "") or "")
+            or str(getattr(session, "_session_name", "") or "")
+            or f"pinky-{agent_name}"
+        )
+        return bool(await has_session()), session_name
 
     def _watchdog_mcp_bind_status(agent_name: str) -> dict:
         """Bind-status for the watchdog's #663 MCP-recover check.

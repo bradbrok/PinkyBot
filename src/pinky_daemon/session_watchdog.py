@@ -79,6 +79,10 @@ DEFAULT_MCP_PROBE_DEADLINE = 120
 # stays checkable through detection, but bounded so a long-quiet agent stops
 # being a recovery target (and can't be falsely force-restarted).
 DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE = 1800  # 30 min
+# Failed owner pages retry at most once per normal sweep. The mismatch decision
+# and critical log remain latched separately, so a transient destination outage
+# cannot suppress delivery forever or spam the log (#902 review).
+DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER = 60
 # #902: after a dead-registered tmux mismatch alerts, require this much
 # continuously observed health before re-arming.  A pane that flickers in and
 # out across adjacent 60s sweeps therefore produces one page, while a genuinely
@@ -240,9 +244,13 @@ class _AgentState:
 class _TmuxLivenessState:
     """Debounce state for one registered-active tmux agent (#902)."""
 
+    session_name: str = ""
     missing_since: float = 0.0
     healthy_since: float = 0.0
+    mismatch_logged: bool = False
     notified: bool = False
+    last_notify_attempt_at: float = 0.0
+    notification_attempts: int = 0
     last_checked_at: float = 0.0
 
 
@@ -254,12 +262,13 @@ class SessionWatchdog:
         *,
         streaming_sessions_fn: Callable[[], dict[str, dict[str, Any]]],
         recover_fn: Callable[[str, str, str], Coroutine] | None = None,
-        alert_fn: Callable[[str, str], Coroutine] | None = None,
+        alert_fn: Callable[[str, str], Coroutine[Any, Any, bool | None]] | None = None,
         agent_config_fn: Callable[[str], WatchdogConfig] | None = None,
         mcp_bind_status_fn: Callable[[str], dict] | None = None,
         mcp_recover_fn: Callable[[str, str, str], Coroutine] | None = None,
         tmux_liveness_fn: Callable[
-            [str, str, Any], Coroutine[Any, Any, bool | None]
+            [str, str, Any],
+            Coroutine[Any, Any, bool | tuple[bool, str] | None],
         ] | None = None,
         check_interval: int = DEFAULT_CHECK_INTERVAL,
     ) -> None:
@@ -272,17 +281,20 @@ class SessionWatchdog:
                 ``async (agent_name, label, reason) -> None``.  Called when
                 a session is deemed stuck and mode == "recover".
             alert_fn:
-                ``async (agent_name, message) -> None``.  Called to send
-                a warning to the owner.
+                ``async (agent_name, message) -> bool | None``. Called to send
+                a warning to the owner. The tmux-liveness branch requires
+                ``True`` to confirm delivery and rate-limits retries otherwise;
+                legacy watchdog branches ignore the return value.
             agent_config_fn:
                 ``(agent_name) -> WatchdogConfig``.  Returns merged
                 per-agent config.  Falls back to global defaults if None.
             tmux_liveness_fn:
-                ``async (agent_name, label, session) -> bool | None``. Returns
-                whether the tmux session exists for an eligible enabled,
-                active, tmux-transport agent. ``None`` skips non-tmux agents.
-                Detection is alert-only; this callback is never used to
-                respawn or otherwise mutate a session.
+                ``async (agent_name, label, session) -> (alive, session_name)
+                | bool | None``. Returns whether the tmux session exists, plus
+                its actual resource name, for an eligible enabled, active,
+                tmux-transport agent. ``None`` skips non-tmux agents. Detection
+                is alert-only; this callback is never used to respawn or
+                otherwise mutate a session.
             check_interval:
                 Seconds between sweeps.
         """
@@ -397,7 +409,7 @@ class SessionWatchdog:
         if not snap.connected:
             return False
         try:
-            alive = await self._tmux_liveness_fn(
+            result = await self._tmux_liveness_fn(
                 snap.agent_name, snap.label, ss,
             )
         except Exception as exc:
@@ -408,15 +420,24 @@ class SessionWatchdog:
                 snap.agent_name, snap.label, exc,
             )
             return True
-        if alive is None:
+        if result is None:
             # The callback rejected this agent (disabled/retired/non-tmux).
             # Clear any old mismatch using the same stable-health debounce.
             await self._evaluate_tmux_liveness(
                 snap.agent_name, alive=True, now=now,
             )
             return True
+        if isinstance(result, tuple):
+            alive, session_name = result
+        else:
+            # Compatibility for simple/test callbacks. Production returns the
+            # actual control name so Codex-over-tmux reports pinky-codex-*.
+            alive, session_name = result, f"pinky-{snap.agent_name}"
         await self._evaluate_tmux_liveness(
-            snap.agent_name, alive=bool(alive), now=now,
+            snap.agent_name,
+            alive=bool(alive),
+            now=now,
+            session_name=session_name,
         )
         return True
 
@@ -426,23 +447,22 @@ class SessionWatchdog:
         *,
         alive: bool,
         now: float,
+        session_name: str = "",
     ) -> None:
-        """Latch one alert per dead-registered mismatch and debounce flaps."""
+        """Log once, retry owner delivery, and debounce tmux mismatch flaps."""
         state = self._tmux_liveness_states.get(agent_name)
         if alive:
             if state is None:
                 return
             state.last_checked_at = now
+            if session_name:
+                state.session_name = session_name
             if state.missing_since:
                 state.missing_since = 0.0
                 state.healthy_since = now
             elif not state.healthy_since:
                 state.healthy_since = now
-            if (
-                state.notified
-                and (now - state.healthy_since)
-                >= DEFAULT_TMUX_LIVENESS_REARM_AFTER
-            ):
+            if (now - state.healthy_since) >= DEFAULT_TMUX_LIVENESS_REARM_AFTER:
                 # A continuously healthy window makes a later mismatch a new
                 # incident. Drop the state entirely so the next miss pages
                 # immediately and starts a fresh duration clock.
@@ -452,33 +472,52 @@ class SessionWatchdog:
         if state is None:
             state = _TmuxLivenessState()
             self._tmux_liveness_states[agent_name] = state
+        state.session_name = session_name or state.session_name or f"pinky-{agent_name}"
         state.last_checked_at = now
         state.healthy_since = 0.0
         if not state.missing_since:
             state.missing_since = now
 
-        # Continuous misses and short healthy/missing flaps stay latched.
-        if state.notified:
-            return
-        state.notified = True
         dead_registered_for = max(0, int(now - state.missing_since))
         message = (
             f"🚨 Session liveness mismatch: {agent_name} is registered active, "
-            f"but tmux session 'pinky-{agent_name}' is missing "
+            f"but tmux session '{state.session_name}' is missing "
             f"(dead-registered for at least {dead_registered_for}s). "
             "Detection only; no restart was attempted."
         )
-        # Exactly one loud line for this mismatch; the notification callback
-        # may add delivery diagnostics, but never another mismatch decision.
-        _critical(message)
-        if self._alert_fn:
-            try:
-                await self._alert_fn(agent_name, message)
-            except Exception as exc:
-                _warn(
-                    "watchdog tmux liveness alert failed for %s: %s",
-                    agent_name, exc,
-                )
+        # The mismatch decision/log and the owner-delivery confirmation are
+        # independent. Log exactly once, but do not let a transient outage in
+        # every configured destination permanently suppress the page.
+        if not state.mismatch_logged:
+            state.mismatch_logged = True
+            _critical(message)
+
+        if state.notified or self._alert_fn is None:
+            return
+        if (
+            state.last_notify_attempt_at
+            and (now - state.last_notify_attempt_at)
+            < DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER
+        ):
+            return
+
+        state.last_notify_attempt_at = now
+        state.notification_attempts += 1
+        try:
+            delivered = await self._alert_fn(agent_name, message)
+        except Exception as exc:
+            _warn(
+                "watchdog tmux liveness alert failed for %s: %s",
+                agent_name, exc,
+            )
+            return
+        if delivered is True:
+            state.notified = True
+            return
+        _warn(
+            "watchdog tmux liveness alert unconfirmed for %s; retrying in %ds",
+            agent_name, DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
+        )
 
     def _take_snapshot(
         self, agent_name: str, label: str, ss: Any
@@ -949,12 +988,15 @@ class SessionWatchdog:
             }
         tmux_liveness = {
             agent_name: {
+                "session_name": state.session_name,
                 "missing": bool(state.missing_since),
                 "dead_registered_seconds": (
                     round(now - state.missing_since, 1)
                     if state.missing_since else 0.0
                 ),
+                "mismatch_logged": state.mismatch_logged,
                 "notification_latched": state.notified,
+                "notification_attempts": state.notification_attempts,
                 "healthy_seconds": (
                     round(now - state.healthy_since, 1)
                     if state.healthy_since else 0.0

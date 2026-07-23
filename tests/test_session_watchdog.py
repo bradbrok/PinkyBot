@@ -10,6 +10,7 @@ from pinky_daemon.session_watchdog import (
     DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
     DEFAULT_MCP_PROBE_DEADLINE,
     DEFAULT_MCP_UNBOUND_FLOOR,
+    DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
     DEFAULT_TMUX_LIVENESS_REARM_AFTER,
     SessionWatchdog,
     WatchdogConfig,
@@ -432,6 +433,7 @@ class TestTmuxLivenessReconciliation:
 
         async def _alert(agent, message):
             alerts.append((agent, message))
+            return True
 
         async def _recover(agent, label, reason):
             recoveries.append((agent, label, reason))
@@ -472,6 +474,7 @@ class TestTmuxLivenessReconciliation:
 
         async def _alert(agent, message):
             alerts.append(message)
+            return True
 
         wd = make_watchdog(
             sessions={
@@ -499,6 +502,7 @@ class TestTmuxLivenessReconciliation:
 
         async def _alert(agent, message):
             alerts.append(message)
+            return True
 
         wd = make_watchdog(
             sessions={"sdk-agent": {"main": FakeSession(connected=True)}},
@@ -517,6 +521,7 @@ class TestTmuxLivenessReconciliation:
 
         async def _alert(agent, message):
             alerts.append(message)
+            return True
 
         wd = make_watchdog(alert_fn=_alert)
         now = 1_000.0
@@ -545,6 +550,80 @@ class TestTmuxLivenessReconciliation:
             now=now + 241 + DEFAULT_TMUX_LIVENESS_REARM_AFTER,
         )
         assert len(alerts) == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_owner_page_retries_until_confirmed(
+        self, make_watchdog, caplog,
+    ):
+        attempts = []
+
+        async def _flaky_alert(agent, message):
+            attempts.append((agent, message))
+            return len(attempts) >= 2
+
+        wd = make_watchdog(alert_fn=_flaky_alert)
+        now = 2_000.0
+        with caplog.at_level(logging.CRITICAL, logger="pinky.watchdog"):
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False, now=now,
+                session_name="pinky-billie",
+            )
+            state = wd._tmux_liveness_states["billie"]
+            assert state.mismatch_logged is True
+            assert state.notified is False
+            assert state.notification_attempts == 1
+
+            # Retry frequency is bounded even though delivery is not latched.
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False,
+                now=now + DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER - 1,
+                session_name="pinky-billie",
+            )
+            assert len(attempts) == 1
+
+            # The next eligible sweep retries and latches only after True.
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False,
+                now=now + DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
+                session_name="pinky-billie",
+            )
+            assert len(attempts) == 2
+            assert state.notified is True
+            assert state.notification_attempts == 2
+
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False,
+                now=now + (2 * DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER),
+                session_name="pinky-billie",
+            )
+        assert len(attempts) == 2
+        assert sum(
+            record.levelno == logging.CRITICAL
+            and "Session liveness mismatch" in record.message
+            for record in caplog.records
+        ) == 1
+
+    @pytest.mark.asyncio
+    async def test_alert_uses_actual_codex_tmux_resource_name(self, make_watchdog):
+        alerts = []
+
+        async def _missing_codex(agent, label, session):
+            return False, "pinky-codex-murzik"
+
+        async def _alert(agent, message):
+            alerts.append(message)
+            return True
+
+        wd = make_watchdog(
+            sessions={"murzik": {"main": FakeSession(connected=True)}},
+            alert_fn=_alert,
+            tmux_liveness_fn=_missing_codex,
+        )
+        await wd._sweep()
+
+        assert len(alerts) == 1
+        assert "tmux session 'pinky-codex-murzik' is missing" in alerts[0]
+        assert "tmux session 'pinky-murzik' is missing" not in alerts[0]
 
     @pytest.mark.asyncio
     async def test_check_error_is_diagnostic_not_missing(
