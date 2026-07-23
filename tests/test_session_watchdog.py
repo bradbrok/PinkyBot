@@ -1,6 +1,7 @@
 """Tests for session_watchdog module."""
 from __future__ import annotations
 
+import logging
 import time
 
 import pytest
@@ -9,6 +10,8 @@ from pinky_daemon.session_watchdog import (
     DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
     DEFAULT_MCP_PROBE_DEADLINE,
     DEFAULT_MCP_UNBOUND_FLOOR,
+    DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
+    DEFAULT_TMUX_LIVENESS_REARM_AFTER,
     SessionWatchdog,
     WatchdogConfig,
     _AgentState,
@@ -411,6 +414,239 @@ class TestInflightCarveOut:
         )
         await wd._evaluate(snap_quiet, now)
         assert len(recoveries) == 1
+
+
+class TestTmuxLivenessReconciliation:
+    """#902 — registered-active tmux sessions are reconciled with tmux itself."""
+
+    @pytest.mark.asyncio
+    async def test_billie_shape_alerts_once_and_never_recovers(
+        self, make_watchdog, caplog,
+    ):
+        alerts = []
+        recoveries = []
+        checks = []
+
+        async def _missing(agent, label, session):
+            checks.append((agent, label, session))
+            return False
+
+        async def _alert(agent, message):
+            alerts.append((agent, message))
+            return True
+
+        async def _recover(agent, label, reason):
+            recoveries.append((agent, label, reason))
+
+        session = FakeSession(connected=True)
+        wd = make_watchdog(
+            sessions={"billie": {"main": session}},
+            alert_fn=_alert,
+            recover_fn=_recover,
+            tmux_liveness_fn=_missing,
+        )
+        with caplog.at_level(logging.CRITICAL, logger="pinky.watchdog"):
+            await wd._sweep()
+            await wd._sweep()
+
+        assert len(checks) == 2  # checked on every periodic sweep
+        assert len(alerts) == 1  # continuous mismatch is latched
+        assert alerts[0][0] == "billie"
+        assert "pinky-billie" in alerts[0][1]
+        assert "dead-registered for at least" in alerts[0][1]
+        assert "no restart was attempted" in alerts[0][1]
+        assert recoveries == []  # detect + notify ONLY
+        mismatch_logs = [
+            record for record in caplog.records
+            if record.levelno == logging.CRITICAL
+            and "Session liveness mismatch" in record.message
+        ]
+        assert len(mismatch_logs) == 1
+
+    @pytest.mark.asyncio
+    async def test_checks_one_tmux_resource_per_agent(self, make_watchdog):
+        checks = []
+        alerts = []
+
+        async def _missing(agent, label, session):
+            checks.append((agent, label))
+            return False
+
+        async def _alert(agent, message):
+            alerts.append(message)
+            return True
+
+        wd = make_watchdog(
+            sessions={
+                "billie": {
+                    "main": FakeSession(connected=True),
+                    "worker": FakeSession(connected=True),
+                }
+            },
+            alert_fn=_alert,
+            tmux_liveness_fn=_missing,
+        )
+        await wd._sweep()
+
+        assert checks == [("billie", "main")]
+        assert len(alerts) == 1
+
+    @pytest.mark.asyncio
+    async def test_non_tmux_or_inactive_registration_is_skipped(
+        self, make_watchdog,
+    ):
+        alerts = []
+
+        async def _not_eligible(agent, label, session):
+            return None
+
+        async def _alert(agent, message):
+            alerts.append(message)
+            return True
+
+        wd = make_watchdog(
+            sessions={"sdk-agent": {"main": FakeSession(connected=True)}},
+            alert_fn=_alert,
+            tmux_liveness_fn=_not_eligible,
+        )
+        await wd._sweep()
+        assert alerts == []
+        assert wd.status()["tmux_liveness"] == {}
+
+    @pytest.mark.asyncio
+    async def test_flap_stays_debounced_until_continuously_healthy(
+        self, make_watchdog,
+    ):
+        alerts = []
+
+        async def _alert(agent, message):
+            alerts.append(message)
+            return True
+
+        wd = make_watchdog(alert_fn=_alert)
+        now = 1_000.0
+
+        # First miss pages; continuous misses do not.
+        await wd._evaluate_tmux_liveness("billie", alive=False, now=now)
+        await wd._evaluate_tmux_liveness("billie", alive=False, now=now + 60)
+        assert len(alerts) == 1
+
+        # A short healthy/missing flap remains latched.
+        await wd._evaluate_tmux_liveness("billie", alive=True, now=now + 120)
+        await wd._evaluate_tmux_liveness("billie", alive=False, now=now + 180)
+        assert len(alerts) == 1
+
+        # Only a continuously healthy re-arm window creates a new incident.
+        await wd._evaluate_tmux_liveness("billie", alive=True, now=now + 240)
+        await wd._evaluate_tmux_liveness(
+            "billie",
+            alive=True,
+            now=now + 240 + DEFAULT_TMUX_LIVENESS_REARM_AFTER,
+        )
+        assert "billie" not in wd._tmux_liveness_states
+        await wd._evaluate_tmux_liveness(
+            "billie",
+            alive=False,
+            now=now + 241 + DEFAULT_TMUX_LIVENESS_REARM_AFTER,
+        )
+        assert len(alerts) == 2
+
+    @pytest.mark.asyncio
+    async def test_failed_owner_page_retries_until_confirmed(
+        self, make_watchdog, caplog,
+    ):
+        attempts = []
+
+        async def _flaky_alert(agent, message):
+            attempts.append((agent, message))
+            return len(attempts) >= 2
+
+        wd = make_watchdog(alert_fn=_flaky_alert)
+        now = 2_000.0
+        with caplog.at_level(logging.CRITICAL, logger="pinky.watchdog"):
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False, now=now,
+                session_name="pinky-billie",
+            )
+            state = wd._tmux_liveness_states["billie"]
+            assert state.mismatch_logged is True
+            assert state.notified is False
+            assert state.notification_attempts == 1
+
+            # Retry frequency is bounded even though delivery is not latched.
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False,
+                now=now + DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER - 1,
+                session_name="pinky-billie",
+            )
+            assert len(attempts) == 1
+
+            # The next eligible sweep retries and latches only after True.
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False,
+                now=now + DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
+                session_name="pinky-billie",
+            )
+            assert len(attempts) == 2
+            assert state.notified is True
+            assert state.notification_attempts == 2
+
+            await wd._evaluate_tmux_liveness(
+                "billie", alive=False,
+                now=now + (2 * DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER),
+                session_name="pinky-billie",
+            )
+        assert len(attempts) == 2
+        assert sum(
+            record.levelno == logging.CRITICAL
+            and "Session liveness mismatch" in record.message
+            for record in caplog.records
+        ) == 1
+
+    @pytest.mark.asyncio
+    async def test_alert_uses_actual_codex_tmux_resource_name(self, make_watchdog):
+        alerts = []
+
+        async def _missing_codex(agent, label, session):
+            return False, "pinky-codex-murzik"
+
+        async def _alert(agent, message):
+            alerts.append(message)
+            return True
+
+        wd = make_watchdog(
+            sessions={"murzik": {"main": FakeSession(connected=True)}},
+            alert_fn=_alert,
+            tmux_liveness_fn=_missing_codex,
+        )
+        await wd._sweep()
+
+        assert len(alerts) == 1
+        assert "tmux session 'pinky-codex-murzik' is missing" in alerts[0]
+        assert "tmux session 'pinky-murzik' is missing" not in alerts[0]
+
+    @pytest.mark.asyncio
+    async def test_check_error_is_diagnostic_not_missing(
+        self, make_watchdog, caplog,
+    ):
+        alerts = []
+
+        async def _broken_check(agent, label, session):
+            raise TimeoutError("tmux control timed out")
+
+        async def _alert(agent, message):
+            alerts.append(message)
+
+        wd = make_watchdog(
+            sessions={"billie": {"main": FakeSession(connected=True)}},
+            alert_fn=_alert,
+            tmux_liveness_fn=_broken_check,
+        )
+        with caplog.at_level(logging.WARNING, logger="pinky.watchdog"):
+            await wd._sweep()
+
+        assert alerts == []
+        assert "tmux liveness check failed for billie/main" in caplog.text
 
 
 class TestStatus:

@@ -472,6 +472,141 @@ class TestAPI:
         from pinky_daemon.api import create_api
         return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
 
+    @pytest.mark.asyncio
+    async def test_tmux_liveness_uses_configured_owner_destination(self, tmp_path):
+        """#902 + #865: the Billie shape pages the configured owner route once."""
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        app = self._make_app(str(tmp_path / "test.db"))
+        app.state.agents.register(
+            "billie",
+            model="sonnet",
+            transport="tmux",
+            working_dir=str(tmp_path / "billie"),
+        )
+        app.state.agents.register(
+            "sdk-sibling",
+            model="sonnet",
+            transport="sdk",
+            working_dir=str(tmp_path / "sdk-sibling"),
+        )
+        app.state.agents.register(
+            "retired-tmux",
+            model="sonnet",
+            transport="tmux",
+            working_dir=str(tmp_path / "retired-tmux"),
+        )
+        app.state.agents.retire("retired-tmux")
+        app.state.agents.set_owner_notification_destinations([
+            {
+                "platform": "slack",
+                "account_id": "T_OWNER",
+                "conversation_id": "D_OWNER",
+                "principal_id": "U_OWNER",
+            }
+        ])
+
+        deliveries = []
+
+        async def _capture(
+            agent_name, platform, chat_id, content, *, account_id="", **kwargs,
+        ):
+            deliveries.append((agent_name, platform, account_id, chat_id, content))
+            return {"sent": True}
+
+        app.state.broker._send_callback = _capture
+        def _fake_session(session_name):
+            return SimpleNamespace(
+                state=TransportState.CONNECTED,
+                stats={"state": TransportState.CONNECTED.value},
+                _tmux=SimpleNamespace(
+                    session_name=session_name,
+                    has_session=AsyncMock(return_value=False),
+                ),
+            )
+
+        session = _fake_session("pinky-billie")
+        sdk_session = _fake_session("pinky-sdk-sibling")
+        retired_session = _fake_session("pinky-retired-tmux")
+        app.state.broker.register_streaming("billie", session, label="main")
+        app.state.broker.register_streaming("sdk-sibling", sdk_session, label="main")
+        app.state.broker.register_streaming("retired-tmux", retired_session, label="main")
+
+        await app.state.watchdog._sweep()
+        await app.state.watchdog._sweep()
+
+        assert len(deliveries) == 1
+        assert deliveries[0][:4] == (
+            "billie", "slack", "T_OWNER", "D_OWNER",
+        )
+        assert "pinky-billie" in deliveries[0][4]
+        assert session._tmux.has_session.await_count == 2
+        assert sdk_session._tmux.has_session.await_count == 0
+        assert retired_session._tmux.has_session.await_count == 0
+
+    @pytest.mark.asyncio
+    async def test_tmux_liveness_retries_failed_codex_owner_page(self, tmp_path):
+        """#902 review: failed pages retry and name the actual Codex resource."""
+        from pinky_daemon.session_watchdog import (
+            DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
+        )
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        app = self._make_app(str(tmp_path / "test.db"))
+        app.state.agents.register(
+            "murzik",
+            model="gpt-5.6-sol",
+            runtime="codex_cli",
+            transport="tmux",
+            working_dir=str(tmp_path / "murzik"),
+        )
+        app.state.agents.set_owner_notification_destinations([
+            {
+                "platform": "telegram",
+                "account_id": "owner-bot",
+                "conversation_id": "owner-chat",
+                "principal_id": "owner",
+            }
+        ])
+
+        attempts = []
+
+        async def _flaky(
+            agent_name, platform, chat_id, content, *, account_id="", **kwargs,
+        ):
+            attempts.append((agent_name, platform, account_id, chat_id, content))
+            if len(attempts) == 1:
+                raise RuntimeError("temporary owner route failure")
+            return {"sent": True}
+
+        app.state.broker._send_callback = _flaky
+        session = SimpleNamespace(
+            state=TransportState.CONNECTED,
+            stats={"state": TransportState.CONNECTED.value},
+            _tmux=SimpleNamespace(
+                session_name="pinky-codex-murzik",
+                has_session=AsyncMock(return_value=False),
+            ),
+        )
+        app.state.broker.register_streaming("murzik", session, label="main")
+
+        await app.state.watchdog._sweep()
+        state = app.state.watchdog._tmux_liveness_states["murzik"]
+        assert len(attempts) == 1
+        assert state.mismatch_logged is True
+        assert state.notified is False
+
+        # Advance only the retry clock; the underlying mismatch stays active.
+        state.last_notify_attempt_at -= DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER
+        await app.state.watchdog._sweep()
+        await app.state.watchdog._sweep()
+
+        assert len(attempts) == 2
+        assert state.notified is True
+        assert state.notification_attempts == 2
+        assert "pinky-codex-murzik" in attempts[1][4]
+        assert "tmux session 'pinky-murzik'" not in attempts[1][4]
+
     class _FakeContextClient:
         def __init__(self, total_tokens=0, max_tokens=200_000):
             self.total_tokens = total_tokens
