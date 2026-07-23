@@ -27,7 +27,7 @@ import urllib.request
 import uuid
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Literal
+from typing import Any, Literal
 
 from fastapi import (
     FastAPI,
@@ -10229,7 +10229,7 @@ npm run build</pre>
             _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
 
     async def _watchdog_alert(agent_name: str, message: str) -> None:
-        """Alert callback: notify the owner via the broker."""
+        """Alert callback: notify the owner over configured destinations."""
         _log(f"watchdog: alert for {agent_name} — {message}")
         try:
             activity.log(
@@ -10237,20 +10237,71 @@ npm run build</pre>
                 event_type="watchdog_warn",
                 title=message[:200],
             )
-            # Send to owner's primary chat if available
-            agent = agents.get(agent_name)
-            if agent:
-                owner = agents.get_owner_profile()
-                owner_chat = owner.get("chat_id", "") if owner else ""
-                if owner_chat:
-                    await broker.send_callback(
-                        agent_name=agent_name,
-                        platform="telegram",
-                        chat_id=str(owner_chat),
-                        content=message,
-                    )
         except Exception as exc:
-            _log(f"watchdog: alert delivery failed for {agent_name}: {exc}")
+            _log(f"watchdog: failed to record alert activity for {agent_name}: {exc}")
+
+        send_callback = broker.send_callback
+        destinations = agents.get_owner_notification_destinations()
+        if not send_callback or not destinations:
+            _log(
+                f"ERROR watchdog: owner alert for {agent_name} not delivered; "
+                "owner notification destination or send callback is not configured"
+            )
+            return
+
+        last_error = "no configured destination accepted the alert"
+        for destination in destinations:
+            try:
+                result = await send_callback(
+                    agent_name,
+                    destination["platform"],
+                    destination["conversation_id"],
+                    message,
+                    account_id=destination["account_id"],
+                )
+                if not isinstance(result, dict) or result.get("sent") is not True:
+                    raise RuntimeError("send callback did not confirm delivery")
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+            _log(
+                f"watchdog: owner alert for {agent_name} delivered via "
+                f"{destination['platform']}/{destination['account_id']}/"
+                f"{destination['conversation_id']}"
+            )
+            return
+        _log(
+            f"ERROR watchdog: owner alert delivery failed for {agent_name}: "
+            f"{last_error}"
+        )
+
+    async def _watchdog_tmux_liveness(
+        agent_name: str,
+        label: str,
+        session: Any,
+    ) -> bool | None:
+        """Return tmux resource liveness for an eligible active registration.
+
+        ``None`` is an intentional skip for disabled, retired, or non-tmux
+        agents. The watchdog already restricts calls to broker sessions whose
+        transport state is CONNECTED ("registered active"). This callback only
+        observes ``tmux has-session`` and never starts or stops a session.
+        """
+        agent = agents.get(agent_name)
+        if (
+            not agent
+            or not agent.enabled
+            or agent.status != "active"
+            or agent.transport != "tmux"
+        ):
+            return None
+        tmux = getattr(session, "_tmux", None)
+        has_session = getattr(tmux, "has_session", None)
+        if not callable(has_session):
+            raise RuntimeError(
+                f"active tmux transport {agent_name}/{label} has no tmux control"
+            )
+        return bool(await has_session())
 
     def _watchdog_mcp_bind_status(agent_name: str) -> dict:
         """Bind-status for the watchdog's #663 MCP-recover check.
@@ -10364,7 +10415,10 @@ npm run build</pre>
         agent_config_fn=_get_watchdog_config,
         mcp_bind_status_fn=_watchdog_mcp_bind_status,
         mcp_recover_fn=_watchdog_mcp_recover,
+        tmux_liveness_fn=_watchdog_tmux_liveness,
     )
+    # Test/diagnostic reach-in, matching app.state.broker/agents.
+    app.state.watchdog = watchdog
 
     # Shared MCP server (started in on_startup if enabled)
     shared_mcp_manager: SharedMcpManager | None = None

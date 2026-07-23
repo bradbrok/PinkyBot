@@ -472,6 +472,75 @@ class TestAPI:
         from pinky_daemon.api import create_api
         return create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
 
+    @pytest.mark.asyncio
+    async def test_tmux_liveness_uses_configured_owner_destination(self, tmp_path):
+        """#902 + #865: the Billie shape pages the configured owner route once."""
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        app = self._make_app(str(tmp_path / "test.db"))
+        app.state.agents.register(
+            "billie",
+            model="sonnet",
+            transport="tmux",
+            working_dir=str(tmp_path / "billie"),
+        )
+        app.state.agents.register(
+            "sdk-sibling",
+            model="sonnet",
+            transport="sdk",
+            working_dir=str(tmp_path / "sdk-sibling"),
+        )
+        app.state.agents.register(
+            "retired-tmux",
+            model="sonnet",
+            transport="tmux",
+            working_dir=str(tmp_path / "retired-tmux"),
+        )
+        app.state.agents.retire("retired-tmux")
+        app.state.agents.set_owner_notification_destinations([
+            {
+                "platform": "slack",
+                "account_id": "T_OWNER",
+                "conversation_id": "D_OWNER",
+                "principal_id": "U_OWNER",
+            }
+        ])
+
+        deliveries = []
+
+        async def _capture(
+            agent_name, platform, chat_id, content, *, account_id="", **kwargs,
+        ):
+            deliveries.append((agent_name, platform, account_id, chat_id, content))
+            return {"sent": True}
+
+        app.state.broker._send_callback = _capture
+        def _fake_session():
+            return SimpleNamespace(
+                state=TransportState.CONNECTED,
+                stats={"state": TransportState.CONNECTED.value},
+                _tmux=SimpleNamespace(has_session=AsyncMock(return_value=False)),
+            )
+
+        session = _fake_session()
+        sdk_session = _fake_session()
+        retired_session = _fake_session()
+        app.state.broker.register_streaming("billie", session, label="main")
+        app.state.broker.register_streaming("sdk-sibling", sdk_session, label="main")
+        app.state.broker.register_streaming("retired-tmux", retired_session, label="main")
+
+        await app.state.watchdog._sweep()
+        await app.state.watchdog._sweep()
+
+        assert len(deliveries) == 1
+        assert deliveries[0][:4] == (
+            "billie", "slack", "T_OWNER", "D_OWNER",
+        )
+        assert "pinky-billie" in deliveries[0][4]
+        assert session._tmux.has_session.await_count == 2
+        assert sdk_session._tmux.has_session.await_count == 0
+        assert retired_session._tmux.has_session.await_count == 0
+
     class _FakeContextClient:
         def __init__(self, total_tokens=0, max_tokens=200_000):
             self.total_tokens = total_tokens
