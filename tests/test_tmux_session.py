@@ -196,6 +196,17 @@ async def test_cold_start_drives_state_through_booting_to_connected() -> None:
 
 
 @pytest.mark.asyncio
+async def test_cold_start_caps_concurrent_subagents_in_spawn_env() -> None:
+    """Every Claude tmux launch carries the Mini-safe fleet fan-out cap."""
+    ss, tmux = _make_session()
+
+    await ss.connect()
+
+    env = tmux.new_session.await_args.kwargs["env"]
+    assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "6"
+
+
+@pytest.mark.asyncio
 async def test_cold_start_failure_drives_to_dead_via_boot_failed() -> None:
     """If ``tmux new-session`` fails, cold-start lands BOOTING → DEAD via
     BOOT_FAILED (not silent disconnect)."""

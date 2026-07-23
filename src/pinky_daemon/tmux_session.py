@@ -107,6 +107,10 @@ from pinky_daemon.watchdog_log import log_watchdog_decision
 # early, graceful heads-up to checkpoint before the safety net trips.
 DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT = 35.0
 
+# Claude Code defaults to 20 concurrent subagents, which exceeds the Mini's
+# stable fan-out envelope. Keep the fleet cap explicit in every tmux launch.
+DEFAULT_MAX_CONCURRENT_SUBAGENTS = 6
+
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
 # ──────────────────────────────────────────────────────────────────────────
@@ -3047,6 +3051,9 @@ class TmuxSession:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
+        env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(
+            DEFAULT_MAX_CONCURRENT_SUBAGENTS
+        )
         # Surface the RESOLVED effort (#151): the drift hook compares this to
         # the runtime $CLAUDE_EFFORT, which reports xhigh under ultracode — so
         # expect xhigh, not the literal "ultracode", to avoid false drift.
