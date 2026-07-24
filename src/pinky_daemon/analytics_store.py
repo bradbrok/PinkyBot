@@ -270,6 +270,8 @@ class AnalyticsStore:
         # 2026-08-31, then reverts; we seed the durable standard rate (see the
         # RATE_TABLE comment for the rationale).
         ("anthropic", "claude-sonnet-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
+        # Opus 5 (2026-07-24): same durable $5/$25 standard tier as Opus 4.8.
+        ("anthropic", "claude-opus-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
     ]
 
     def _seed_default_pricing(self, conn) -> None:
