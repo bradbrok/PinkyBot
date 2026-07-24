@@ -44,7 +44,7 @@ _M = 1_000_000
 # --------------------------------------------------------------------- #
 
 # Standard Opus tier (4.5 and newer): the price has been flat across
-# 4.5 → 4.6 → 4.7 → 4.8. 1M context is sold at the same per-token price
+# 4.5 → 4.6 → 4.7 → 4.8 → 5. 1M context is sold at the same per-token price
 # as 200K, so no tier split is needed here.
 _OPUS_STD = {
     "input": 5.00,
@@ -131,6 +131,7 @@ _GPT_53_CODEX = {
 RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-fable-5": _FABLE,
     "claude-mythos-5": _FABLE,
+    "claude-opus-5": _OPUS_STD,
     "claude-opus-4-8": _OPUS_STD,
     "claude-opus-4-7": _OPUS_STD,
     "claude-opus-4-6": _OPUS_STD,
