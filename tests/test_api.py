@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
 import sys
 import tempfile
+import threading
 import time
 from types import ModuleType, SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -1805,28 +1807,34 @@ class TestAPI:
                 assert fake.connect_calls == 1
 
     def test_streaming_restart_acks_before_teardown(self):
-        """The response body must leave the ASGI app before disconnect starts.
+        """Disconnect waits for a delayed outermost ASGI send to return.
 
         ``context_restart`` rides the MCP connection owned by the session being
         replaced.  Inline teardown closes that connection and turns every
-        otherwise-successful tool call into MCP -32000.
+        otherwise-successful tool call into MCP -32000.  A delay outside the
+        complete FastAPI/BaseHTTPMiddleware stack reproduces Murzik's
+        body-queued-but-not-delivered adversarial case.
         """
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             response_complete = False
+            delay_outer_send = False
 
             async def observed_app(scope, receive, send):
                 if scope["type"] != "http":
                     return await app(scope, receive, send)
 
                 async def observed_send(message):
-                    nonlocal response_complete
-                    await send(message)
-                    if (
+                    nonlocal response_complete, delay_outer_send
+                    is_final_body = (
                         message["type"] == "http.response.body"
                         and not message.get("more_body", False)
-                    ):
+                    )
+                    if is_final_body and delay_outer_send:
+                        await asyncio.sleep(0.75)
+                    await send(message)
+                    if is_final_body:
                         response_complete = True
 
                 return await app(scope, receive, observed_send)
@@ -1849,20 +1857,93 @@ class TestAPI:
                 fake.last_active = time.time()
 
                 disconnect_observations = []
+                disconnect_started = threading.Event()
                 original_disconnect = fake.disconnect
 
                 async def observed_disconnect():
                     disconnect_observations.append(response_complete)
+                    disconnect_started.set()
                     await original_disconnect()
 
                 fake.disconnect = observed_disconnect
                 response_complete = False
+                delay_outer_send = True
 
                 resp = client.post("/agents/test-agent/streaming/restart")
 
                 assert resp.status_code == 200
                 assert resp.json()["restart_scheduled"] is True
+                assert disconnect_started.wait(timeout=2.0)
                 assert disconnect_observations == [True]
+
+    def test_streaming_restart_cancellation_releases_overlap_guard(self):
+        """Cancellation anywhere in the helper cannot poison later restarts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post(
+                    "/agents",
+                    json={"name": "test-agent", "model": "sonnet"},
+                )
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming(
+                    "test-agent", fake, label="main"
+                )
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing cancellation-safe restart",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                disconnect_entered = threading.Event()
+                original_disconnect = fake.disconnect
+
+                async def blocking_disconnect():
+                    fake.disconnect_calls += 1
+                    disconnect_entered.set()
+                    await asyncio.Event().wait()
+
+                fake.disconnect = blocking_disconnect
+                resp = client.post("/agents/test-agent/streaming/restart")
+
+                assert resp.status_code == 200
+                assert disconnect_entered.wait(timeout=2.0)
+                task_box = []
+                client.portal.call(
+                    lambda: task_box.append(
+                        next(iter(app.state._context_restart_tasks))
+                    )
+                )
+                task = task_box[0]
+                task_done = threading.Event()
+                client.portal.call(
+                    lambda: task.add_done_callback(lambda _: task_done.set())
+                )
+                client.portal.call(task.cancel)
+                assert task_done.wait(timeout=2.0)
+                assert client.portal.call(
+                    lambda: "test-agent"
+                    not in app.state._context_restarts_inflight
+                )
+
+                # Restore a healthy transport/save binding and prove the next
+                # valid request is accepted rather than permanently 409'd.
+                fake.disconnect = original_disconnect
+                fake.resume_handle = "test-agent-main-sdk"
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing cancellation-safe retry",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                retry = client.post("/agents/test-agent/streaming/restart")
+                assert retry.status_code == 200
+                assert retry.json()["restart_scheduled"] is True
 
     def test_streaming_restart_clears_codex_session_id_on_codex_sessions(self):
         """Codex sessions track thread_id in `codex_session_id`; restart must clear it

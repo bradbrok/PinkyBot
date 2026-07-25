@@ -46,6 +46,7 @@ def _seed_inflight(
     internal: bool = False,
     completion_event: asyncio.Event | None = None,
     prompt: str = "",
+    fresh_context_epoch: int = 0,
 ) -> _InflightMeta:
     """Append one ``_InflightMeta`` entry to ``ss._inflight_metas``.
 
@@ -74,6 +75,7 @@ def _seed_inflight(
         internal=internal,
         dispatched_at=_time.time(),
         turn=synthetic_turn,
+        fresh_context_epoch=fresh_context_epoch,
     )
     was_empty = not ss._inflight_metas
     ss._inflight_metas.append(entry)
@@ -6438,6 +6440,7 @@ class TestForceFreshContextOnce:
             assert (
                 ss._fresh_context_respawn_grace_until > _time.monotonic()
             )
+            assert ss._fresh_context_respawn_epoch > 0
         finally:
             await ss.disconnect()
 
@@ -6475,11 +6478,50 @@ class TestForceFreshContextOnce:
     async def test_first_post_fresh_turn_ends_respawn_grace(self):
         ss, _ = _make_session(state=SessionState.CONNECTED)
         ss._fresh_context_respawn_grace_until = _time.monotonic() + 180.0
-        _seed_inflight(ss, internal=True)
+        ss._fresh_context_respawn_epoch = 7
+        _seed_inflight(ss, internal=True, fresh_context_epoch=7)
 
         await ss._handle_turn_complete(_turn_response(text="wake complete"))
 
         assert ss._fresh_context_respawn_grace_until == 0.0
+        assert ss._fresh_context_respawn_epoch == 0
+
+    def test_delivered_replacement_turn_captures_active_fresh_epoch(self):
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._fresh_context_respawn_epoch = 7
+
+        ss._finish_turn_delivery(
+            _QueuedTurn(prompt="replacement wake", internal=True)
+        )
+
+        assert ss._inflight_metas[0].fresh_context_epoch == 7
+
+    @pytest.mark.asyncio
+    async def test_uncorrelated_empty_stop_hook_does_not_end_respawn_grace(self):
+        """An autonomous/stale Stop hook has no replacement-turn correlation."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        grace_until = _time.monotonic() + 180.0
+        ss._fresh_context_respawn_grace_until = grace_until
+        ss._fresh_context_respawn_epoch = 7
+
+        await ss._handle_turn_complete(_turn_response(text="stale completion"))
+
+        assert ss._fresh_context_respawn_grace_until == grace_until
+        assert ss._fresh_context_respawn_epoch == 7
+
+    @pytest.mark.asyncio
+    async def test_prefresh_inflight_completion_does_not_end_respawn_grace(self):
+        """Even a queued meta must carry the active post-fresh epoch."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        grace_until = _time.monotonic() + 180.0
+        ss._fresh_context_respawn_grace_until = grace_until
+        ss._fresh_context_respawn_epoch = 7
+        _seed_inflight(ss, internal=True, fresh_context_epoch=6)
+
+        await ss._handle_turn_complete(_turn_response(text="old completion"))
+
+        assert ss._fresh_context_respawn_grace_until == grace_until
+        assert ss._fresh_context_respawn_epoch == 7
 
 
 class TestWakePromptEnqueueOnConnect:

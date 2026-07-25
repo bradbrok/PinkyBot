@@ -1165,6 +1165,14 @@ def create_server(
         result = _api("POST", f"/agents/{agent_name}/streaming/restart")
         if "error" in result:
             return f"Restart failed: {result.get('error', 'unknown')}"
+        if (
+            result.get("accepted") is not True
+            or result.get("restart_scheduled") is not True
+        ):
+            return (
+                "Restart failed: daemon did not confirm accepted=true and "
+                "restart_scheduled=true"
+            )
 
         old_id = result.get("old_session_id", "")
         old_turns = result.get("old_turns", 0)

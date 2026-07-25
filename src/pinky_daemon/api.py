@@ -30,7 +30,6 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 from fastapi import (
-    BackgroundTasks,
     FastAPI,
     HTTPException,
     Request,
@@ -180,11 +179,7 @@ from pinky_daemon.wake_prompt import WakeReason
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
 
-# ``BackgroundTasks`` starts after a route response enters Starlette's
-# middleware channel, which can still precede the outer socket write when
-# BaseHTTPMiddleware is stacked.  Give the local loopback response a short
-# flush window before context_restart tears down its own MCP transport.
-CONTEXT_RESTART_ACK_DELAY_SEC = 0.25
+_RESPONSE_SENT_HANDOFF_SCOPE_KEY = "pinky.response_sent_handoff"
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -196,6 +191,59 @@ except ImportError:
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
+
+
+class _ResponseSentHandoffMiddleware:
+    """Run a registered handoff only after the outer response send returns.
+
+    Route-level ``BackgroundTasks`` run behind Starlette's internal
+    ``BaseHTTPMiddleware`` memory channel.  A final body can therefore be
+    queued there while an outer middleware or ASGI server is still sending it.
+    This pure-ASGI middleware is installed last (outermost in the FastAPI
+    middleware stack), so awaiting its downstream ``send`` includes every
+    stacked middleware and the server-facing send call.
+
+    A route registers ``schedule`` and ``abandon`` callbacks in its mutable
+    request scope.  ``schedule`` is called only after the final body send
+    returns.  If the response never reaches that point, ``abandon`` releases
+    any reservation the route made before returning.
+    """
+
+    def __init__(self, app) -> None:
+        self.app = app
+
+    async def __call__(self, scope, receive, send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+
+        async def send_with_handoff(message) -> None:
+            await send(message)
+            if (
+                message["type"] != "http.response.body"
+                or message.get("more_body", False)
+            ):
+                return
+
+            handoff = scope.pop(_RESPONSE_SENT_HANDOFF_SCOPE_KEY, None)
+            if handoff is None:
+                return
+            try:
+                handoff["schedule"]()
+                # Let the independently owned handoff task start before this
+                # request unwinds.  It was created only after ``send`` returned,
+                # so this yield cannot move teardown ahead of acknowledgement.
+                await asyncio.sleep(0)
+            except Exception as exc:
+                handoff["abandon"]()
+                _log(f"api: response-sent handoff scheduling failed: {exc}")
+
+        try:
+            await self.app(scope, receive, send_with_handoff)
+        finally:
+            handoff = scope.pop(_RESPONSE_SENT_HANDOFF_SCOPE_KEY, None)
+            if handoff is not None:
+                handoff["abandon"]()
 
 
 def _agent_is_dreamer(agent) -> bool:
@@ -8801,88 +8849,90 @@ npm run build</pre>
         return {"reacted": True}
 
     _context_restarts_inflight: set[str] = set()
+    _context_restart_tasks: set[asyncio.Task[None]] = set()
+    # Private test reach-in for cancellation/overlap-guard regressions.
+    app.state._context_restarts_inflight = _context_restarts_inflight
+    app.state._context_restart_tasks = _context_restart_tasks
 
     async def _restart_streaming_session_after_response(
         name: str,
         ss,
         old_resume_handle: str,
     ) -> None:
-        """Run a context restart only after its acknowledgement is sent.
-
-        ``context_restart`` is invoked over the same MCP transport this
-        teardown replaces.  Running disconnect inline severs that transport
-        before the caller can receive the RPC result, so Starlette schedules
-        this coroutine as a response background task.  The short delay also
-        lets stacked HTTP middleware flush the body to the loopback caller.
-        """
-        await asyncio.sleep(CONTEXT_RESTART_ACK_DELAY_SEC)
-
-        # #667 diag: capture pre-restart live-session state so an orphan that's
-        # recovered by this (often EXTERNAL) restart isn't a black box. The
-        # connected/state fields distinguish a connected-but-MCP-wedged orphan
-        # from a disconnected-dead one — the open question from the 2026-06-02
-        # power-loss incident. Fail-safe: never block a restart on diagnostics.
+        """Run a restart handed off after the acknowledgement send returns."""
         try:
-            _st = ss.stats if hasattr(ss, "stats") else {}
-            _log(
-                f"#667 diag: pre-restart state for {name}: "
-                f"transport={type(ss).__name__} state={_st.get('state')!r} "
-                f"connected={_st.get('connected')} turns={_st.get('turns')} "
-                f"resume_handle={'set' if old_resume_handle else 'empty'}"
-            )
-        except Exception:
-            pass
+            # #667 diag: capture pre-restart live-session state so an orphan
+            # recovered by this restart isn't a black box. Diagnostics are
+            # deliberately inside the cleanup-safe lifetime: cancellation at
+            # any point must release the overlap reservation.
+            try:
+                _st = ss.stats if hasattr(ss, "stats") else {}
+                _log(
+                    f"#667 diag: pre-restart state for {name}: "
+                    f"transport={type(ss).__name__} state={_st.get('state')!r} "
+                    f"connected={_st.get('connected')} turns={_st.get('turns')} "
+                    f"resume_handle={'set' if old_resume_handle else 'empty'}"
+                )
+            except Exception:
+                pass
 
-        try:
-            # Arm fresh-launch intent BEFORE disconnect.  If a broker/watchdog
-            # wake races the teardown's transient DEAD state, its launch must
-            # inherit the force-fresh contract rather than resume the old
-            # transcript.
-            _refresh_streaming_launch_config(name, ss)
-            ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
-            ss._config.resume_handle = ""
-            ss._config.restart_reason = "context_restart"
-            # PR for #543: explicit launch-behavior contract — the next
-            # transport spawn must NOT resume the prior conversation. For
-            # SDK this is implicit (resume_handle="" already accomplishes
-            # it), but tmux ``_build_claude_cmd`` checks transcript existence
-            # only and would silently re-apply ``--continue`` unless this
-            # flag is set. One-shot: consumed by the transport on the next
-            # successful launch.
-            ss._config.force_fresh_context_once = True
-            ss.resume_handle = ""
-            # Codex sessions track the thread_id separately on the session
-            # object; clear it too or `codex exec resume <stale-id>` keeps
-            # firing next turn.
-            if hasattr(ss, "codex_session_id"):
-                if ss.codex_session_id:
-                    _log(
-                        f"api: clearing stale codex thread "
-                        f"{ss.codex_session_id[:12]} for {name}"
-                    )
-                ss.codex_session_id = ""
+            try:
+                # Arm fresh-launch intent BEFORE disconnect.  If a
+                # broker/watchdog wake races the teardown's transient DEAD
+                # state, its launch must inherit the force-fresh contract
+                # rather than resume the old transcript.
+                _refresh_streaming_launch_config(name, ss)
+                ss._config.wake_context = _build_streaming_wake_context(
+                    name, commit=False
+                )
+                ss._config.resume_handle = ""
+                ss._config.restart_reason = "context_restart"
+                # PR for #543: explicit launch-behavior contract — the next
+                # transport spawn must NOT resume the prior conversation.
+                ss._config.force_fresh_context_once = True
+                ss.resume_handle = ""
+                # Codex sessions track thread_id separately on the session.
+                if hasattr(ss, "codex_session_id"):
+                    if ss.codex_session_id:
+                        _log(
+                            f"api: clearing stale codex thread "
+                            f"{ss.codex_session_id[:12]} for {name}"
+                        )
+                    ss.codex_session_id = ""
 
-            await ss.disconnect()
-            agents.set_streaming_session_id(name, "", label="main")
-            await ss.connect()
-            _log(f"api: streaming session restarted for {name}")
-            activity.log(name, "context_restart", f"{name} context restarted")
-            session_event_store.log(
-                session_id=ss.id,
-                agent_name=name,
-                event_type="context_restart",
-                metadata={"label": "main", "old_session_id": old_resume_handle[:12] if old_resume_handle else ""},
-            )
-        except Exception as e:
-            broker.unregister_streaming(name)
-            _log(f"api: post-response context restart failed for {name}: {e}")
+                await ss.disconnect()
+                agents.set_streaming_session_id(name, "", label="main")
+                await ss.connect()
+                _log(f"api: streaming session restarted for {name}")
+                activity.log(
+                    name, "context_restart", f"{name} context restarted"
+                )
+                session_event_store.log(
+                    session_id=ss.id,
+                    agent_name=name,
+                    event_type="context_restart",
+                    metadata={
+                        "label": "main",
+                        "old_session_id": (
+                            old_resume_handle[:12] if old_resume_handle else ""
+                        ),
+                    },
+                )
+            except asyncio.CancelledError:
+                _log(f"api: post-response context restart cancelled for {name}")
+                raise
+            except Exception as e:
+                broker.unregister_streaming(name)
+                _log(
+                    f"api: post-response context restart failed for {name}: {e}"
+                )
         finally:
             _context_restarts_inflight.discard(name)
 
     @app.post("/agents/{name}/streaming/restart")
     async def restart_streaming_session(
         name: str,
-        background_tasks: BackgroundTasks,
+        request: Request,
     ):
         """Schedule a fresh-context restart after acknowledging its caller."""
         ss = broker._get_streaming_session(name)
@@ -8903,12 +8953,30 @@ npm run build</pre>
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
         _context_restarts_inflight.add(name)
-        background_tasks.add_task(
-            _restart_streaming_session_after_response,
-            name,
-            ss,
-            old_resume_handle,
-        )
+
+        def _schedule_restart() -> None:
+            task = asyncio.create_task(
+                _restart_streaming_session_after_response(
+                    name,
+                    ss,
+                    old_resume_handle,
+                )
+            )
+            _context_restart_tasks.add(task)
+
+            def _restart_done(done_task: asyncio.Task[None]) -> None:
+                _context_restart_tasks.discard(done_task)
+                # Fallback for cancellation before the coroutine executes its
+                # first instruction (and therefore before its ``finally`` can
+                # run).  ``discard`` is idempotent with helper-side cleanup.
+                _context_restarts_inflight.discard(name)
+
+            task.add_done_callback(_restart_done)
+
+        request.scope[_RESPONSE_SENT_HANDOFF_SCOPE_KEY] = {
+            "schedule": _schedule_restart,
+            "abandon": lambda: _context_restarts_inflight.discard(name),
+        }
 
         return {
             "accepted": True,
@@ -12116,5 +12184,10 @@ npm run build</pre>
         _log("voice: WS endpoint registered at /ws/voice/{id}")
     except ImportError:
         pass
+
+    # Installed last so this pure-ASGI layer wraps every BaseHTTPMiddleware
+    # registered above.  Its final-body ``send`` return is the deterministic
+    # response-delivery barrier used by context_restart.
+    app.add_middleware(_ResponseSentHandoffMiddleware)
 
     return app
