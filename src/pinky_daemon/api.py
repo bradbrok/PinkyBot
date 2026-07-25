@@ -8848,16 +8848,22 @@ npm run build</pre>
         )
         return {"reacted": True}
 
-    _context_restarts_inflight: set[str] = set()
+    _context_restarts_inflight: dict[str, object] = {}
     _context_restart_tasks: set[asyncio.Task[None]] = set()
-    # Private test reach-in for cancellation/overlap-guard regressions.
+    # Private test reach-in for cancellation/generation-guard regressions.
     app.state._context_restarts_inflight = _context_restarts_inflight
     app.state._context_restart_tasks = _context_restart_tasks
+
+    def _release_context_restart(name: str, token: object) -> None:
+        """Release the reservation only while ``token`` still owns it."""
+        if _context_restarts_inflight.get(name) is token:
+            del _context_restarts_inflight[name]
 
     async def _restart_streaming_session_after_response(
         name: str,
         ss,
         old_resume_handle: str,
+        restart_token: object,
     ) -> None:
         """Run a restart handed off after the acknowledgement send returns."""
         try:
@@ -8927,7 +8933,7 @@ npm run build</pre>
                     f"api: post-response context restart failed for {name}: {e}"
                 )
         finally:
-            _context_restarts_inflight.discard(name)
+            _release_context_restart(name, restart_token)
 
     @app.post("/agents/{name}/streaming/restart")
     async def restart_streaming_session(
@@ -8952,7 +8958,8 @@ npm run build</pre>
 
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
-        _context_restarts_inflight.add(name)
+        restart_token = object()
+        _context_restarts_inflight[name] = restart_token
 
         def _schedule_restart() -> None:
             task = asyncio.create_task(
@@ -8960,6 +8967,7 @@ npm run build</pre>
                     name,
                     ss,
                     old_resume_handle,
+                    restart_token,
                 )
             )
             _context_restart_tasks.add(task)
@@ -8968,14 +8976,15 @@ npm run build</pre>
                 _context_restart_tasks.discard(done_task)
                 # Fallback for cancellation before the coroutine executes its
                 # first instruction (and therefore before its ``finally`` can
-                # run).  ``discard`` is idempotent with helper-side cleanup.
-                _context_restarts_inflight.discard(name)
+                # run).  Token ownership prevents an old callback from
+                # releasing a newer restart generation's reservation.
+                _release_context_restart(name, restart_token)
 
             task.add_done_callback(_restart_done)
 
         request.scope[_RESPONSE_SENT_HANDOFF_SCOPE_KEY] = {
             "schedule": _schedule_restart,
-            "abandon": lambda: _context_restarts_inflight.discard(name),
+            "abandon": lambda: _release_context_restart(name, restart_token),
         }
 
         return {

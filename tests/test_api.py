@@ -1945,6 +1945,107 @@ class TestAPI:
                 assert retry.status_code == 200
                 assert retry.json()["restart_scheduled"] is True
 
+    def test_streaming_restart_late_done_callback_keeps_next_generation_guard(self):
+        """A's late done callback cannot release B's overlap reservation."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                client.post(
+                    "/agents",
+                    json={"name": "test-agent", "model": "sonnet"},
+                )
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming(
+                    "test-agent", fake, label="main"
+                )
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing restart-generation ownership",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                restart_endpoint = next(
+                    route.endpoint
+                    for route in app.routes
+                    if getattr(route, "path", None)
+                    == "/agents/{name}/streaming/restart"
+                )
+                b_accepted = threading.Event()
+                b_helper_blocked = threading.Event()
+                b_result = []
+                gates = []
+
+                async def run_queued_b():
+                    await gates[0].wait()
+                    scope = {"type": "http"}
+                    result = await restart_endpoint(
+                        name="test-agent",
+                        request=SimpleNamespace(scope=scope),
+                    )
+                    handoff = scope["pinky.response_sent_handoff"]
+                    handoff["schedule"]()
+                    b_result.append(result)
+                    b_accepted.set()
+
+                async def prime_queued_b():
+                    gates.extend((asyncio.Event(), asyncio.Event()))
+                    asyncio.create_task(run_queued_b())
+
+                client.portal.call(prime_queued_b)
+
+                async def interleaved_disconnect():
+                    fake.disconnect_calls += 1
+                    fake._state = fake._TS.DEAD
+                    if fake.disconnect_calls == 2:
+                        b_helper_blocked.set()
+                        await gates[1].wait()
+
+                async def interleaved_connect():
+                    fake.connect_calls += 1
+                    fake._state = fake._TS.CONNECTED
+                    if fake.connect_calls == 1:
+                        # Wake the already-queued B endpoint task.  B's wakeup
+                        # is queued before helper A completes and queues its
+                        # task-done callback.
+                        gates[0].set()
+
+                fake.disconnect = interleaved_disconnect
+                fake.connect = interleaved_connect
+
+                try:
+                    first = client.post(
+                        "/agents/test-agent/streaming/restart"
+                    )
+                    assert first.status_code == 200
+                    assert b_accepted.wait(timeout=2.0)
+                    assert b_result[0]["accepted"] is True
+                    assert b_result[0]["old_session_id"] == ""
+                    assert b_helper_blocked.wait(timeout=2.0)
+
+                    guard_for_b_present = client.portal.call(
+                        lambda: "test-agent"
+                        in app.state._context_restarts_inflight
+                    )
+                    third = client.post(
+                        "/agents/test-agent/streaming/restart"
+                    )
+
+                    assert guard_for_b_present is True
+                    assert third.status_code == 409
+                    assert "already in progress" in third.text
+                    assert fake.disconnect_calls == 2
+                finally:
+                    async def release_helpers():
+                        for gate in gates:
+                            gate.set()
+                        while app.state._context_restart_tasks:
+                            await asyncio.sleep(0)
+
+                    client.portal.call(release_helpers)
+
     def test_streaming_restart_clears_codex_session_id_on_codex_sessions(self):
         """Codex sessions track thread_id in `codex_session_id`; restart must clear it
         or the next turn will run `codex exec resume <stale-id>` and fail."""
