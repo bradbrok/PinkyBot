@@ -1,0 +1,145 @@
+"""Thin HMAC-authenticated HTTP client used by the Pi-side MCP wrapper."""
+
+from __future__ import annotations
+
+import json
+import os
+import urllib.error
+import urllib.parse
+import urllib.request
+from collections.abc import Mapping
+from typing import Any
+
+from pinky_ringcentral.auth import build_signed_headers
+
+FALLBACK_BRIDGE_URLS = (
+    "http://100.108.59.106:9101",
+    "http://10.0.0.32:9101",
+    "http://10.0.0.209:9101",
+)
+
+
+class RingCentralBridgeClient:
+    """At-most-once writes and resilient, idempotent reads."""
+
+    def __init__(
+        self,
+        *,
+        agent_name: str,
+        secret: str,
+        instance_id: str,
+        bridge_url: str = "",
+        timeout: float = 30.0,
+    ) -> None:
+        if not agent_name or not secret or not instance_id:
+            raise ValueError("agent_name, secret, and instance_id are required")
+        configured = bridge_url or os.environ.get("RINGCENTRAL_BRIDGE_URL", "")
+        self._urls = (
+            [configured.rstrip("/")]
+            if configured
+            else [url.rstrip("/") for url in FALLBACK_BRIDGE_URLS]
+        )
+        self.agent_name = agent_name
+        self.secret = secret
+        self.instance_id = instance_id
+        self.timeout = timeout
+        self._active_url: str | None = None
+
+    def get(self, path: str, **params: Any) -> dict[str, Any]:
+        clean = {
+            key: value
+            for key, value in params.items()
+            if value is not None and value != ""
+        }
+        full_path = path
+        if clean:
+            full_path += "?" + urllib.parse.urlencode(clean, doseq=True)
+        return self.request("GET", full_path)
+
+    def post(
+        self, path: str, body: Mapping[str, Any] | None = None
+    ) -> dict[str, Any]:
+        return self.request("POST", path, body=body)
+
+    def request(
+        self,
+        method: str,
+        path: str,
+        *,
+        body: Mapping[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        method = method.upper()
+        data = json.dumps(body).encode() if body is not None else None
+        headers = build_signed_headers(
+            self.secret,
+            agent_name=self.agent_name,
+            method=method,
+            path=path,
+            instance_id=self.instance_id,
+        )
+        if data is not None:
+            headers["Content-Type"] = "application/json"
+        idempotent = method in {"GET", "HEAD", "OPTIONS"}
+        bases = (
+            [self._active_url]
+            + [url for url in self._urls if url != self._active_url]
+            if self._active_url
+            else self._urls
+        )
+        last_error = ""
+        for base in bases:
+            if not base:
+                continue
+            request = urllib.request.Request(
+                f"{base}{path}",
+                data=data,
+                method=method,
+                headers=headers,
+            )
+            try:
+                with urllib.request.urlopen(
+                    request, timeout=self.timeout
+                ) as response:
+                    self._active_url = base
+                    return self._read_response(response)
+            except urllib.error.HTTPError as exc:
+                self._active_url = base
+                return self._http_error(exc)
+            except (urllib.error.URLError, TimeoutError, OSError) as exc:
+                last_error = self._sanitize(str(exc))
+                # A POST may have reached the Mini. Never try a second address.
+                if not idempotent:
+                    break
+        return {
+            "error": "bridge_unavailable",
+            "message": last_error or "RingCentral bridge unavailable",
+            "status": 0,
+            "may_have_completed": not idempotent,
+        }
+
+    def _read_response(self, response: Any) -> dict[str, Any]:
+        raw = response.read()
+        if not raw:
+            return {}
+        try:
+            parsed = json.loads(raw.decode("utf-8", errors="replace"))
+        except json.JSONDecodeError:
+            return {"error": "bridge_malformed_response"}
+        return parsed if isinstance(parsed, dict) else {"data": parsed}
+
+    def _http_error(self, exc: urllib.error.HTTPError) -> dict[str, Any]:
+        body = exc.read().decode("utf-8", errors="replace")
+        try:
+            parsed = json.loads(body)
+        except json.JSONDecodeError:
+            parsed = {
+                "error": "bridge_http_error",
+                "message": self._sanitize(body)[:500],
+            }
+        if not isinstance(parsed, dict):
+            parsed = {"error": "bridge_http_error", "data": parsed}
+        parsed.setdefault("status", exc.code)
+        return parsed
+
+    def _sanitize(self, value: str) -> str:
+        return value.replace(self.secret, "[redacted]") if self.secret else value
