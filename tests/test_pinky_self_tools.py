@@ -435,14 +435,37 @@ class TestCheckForUpdates:
 
 class TestContextRestart:
     def test_restart_success(self, srv):
-        with _ok({"old_session_id": "barsik-main", "old_turns": 42}):
+        with _ok({
+            "accepted": True,
+            "restart_scheduled": True,
+            "old_session_id": "barsik-main",
+            "old_turns": 42,
+        }):
             result = _tools(srv)["context_restart"]()
-        assert "restarted" in result.lower() or "42" in result
+        assert "accepted" in result.lower()
+        assert "after this response" in result.lower()
 
     def test_restart_error(self, srv):
         with _ok({"error": "no session to restart"}):
             result = _tools(srv)["context_restart"]()
-        assert isinstance(result, str)
+        assert result.startswith("Restart failed:")
+
+    @pytest.mark.parametrize(
+        "response",
+        [
+            {},
+            {"accepted": False, "restart_scheduled": True},
+            {"accepted": True, "restart_scheduled": False},
+            {"accepted": True},
+            {"restart_scheduled": True},
+            {"accepted": 1, "restart_scheduled": True},
+            {"accepted": True, "restart_scheduled": "true"},
+        ],
+    )
+    def test_restart_requires_complete_positive_contract(self, srv, response):
+        with _ok(response):
+            result = _tools(srv)["context_restart"]()
+        assert result.startswith("Restart failed:")
 
 
 # ── get_agent_card ────────────────────────────────────────────────────────────

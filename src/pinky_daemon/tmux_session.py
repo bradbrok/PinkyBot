@@ -111,6 +111,14 @@ DEFAULT_CONTEXT_NUDGE_THRESHOLD_PCT = 35.0
 # stable fan-out envelope. Keep the fleet cap explicit in every tmux launch.
 DEFAULT_MAX_CONCURRENT_SUBAGENTS = 6
 
+# A successful force-fresh launch can be followed by delayed watchdog/broker
+# wakes that still see the old transcript on disk.  Keep those respawns fresh
+# long enough to cover the scheduler's five-attempt resurrection burst
+# (30-second ticks).  The first completed replacement turn clears it sooner;
+# otherwise it remains deliberately bounded so legitimate warm-wake-after-
+# crash returns to normal ``--continue`` behavior.
+FRESH_CONTEXT_RESPAWN_GRACE_SEC = 180.0
+
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
 # ──────────────────────────────────────────────────────────────────────────
@@ -880,6 +888,12 @@ class _InflightMeta:
     # this turn's paste time regardless of write lag. Both None ⇒ fall back to wedged.
     transcript_mtime_at_paste: float | None = None
     paste_succeeded_at: float | None = None
+    # Non-zero only for turns delivered during the active post-fresh lineage.
+    # A completion may end ``_fresh_context_respawn_grace_until`` only when
+    # this epoch matches the session's active epoch.  This prevents an
+    # autonomous/stale Stop hook (or any pre-fresh metadata) from reopening
+    # ``--continue`` before the replacement turn completes.
+    fresh_context_epoch: int = 0
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1307,6 +1321,11 @@ class TmuxSession:
         self._last_launch_used_continue: bool = False
         self._last_launch_forced_fresh: bool = False
         self._last_launch_had_prior_transcript: bool = False
+        self._last_launch_force_fresh_once: bool = False
+        self._last_launch_in_fresh_grace: bool = False
+        self._fresh_context_respawn_grace_until: float = 0.0
+        self._fresh_context_respawn_epoch_seq: int = 0
+        self._fresh_context_respawn_epoch: int = 0
 
         # Issue #563 — "first transcript bind" tracking. Set to True in
         # ``_start_tailer`` after the tailer is constructed; consumed
@@ -2769,8 +2788,17 @@ class TmuxSession:
         # and rolled back the whole launch. The invariant pinned here:
         # the flag remains set until launch (REPL + tailer) succeeds
         # as a complete unit.
-        if self._last_launch_forced_fresh:
+        if self._last_launch_force_fresh_once:
             self._config.force_fresh_context_once = False
+            self._fresh_context_respawn_epoch_seq += 1
+            self._fresh_context_respawn_epoch = self._fresh_context_respawn_epoch_seq
+            self._fresh_context_respawn_grace_until = (
+                time.monotonic() + FRESH_CONTEXT_RESPAWN_GRACE_SEC
+            )
+            _log(
+                f"tmux[{self.agent_name}]: armed post-fresh respawn grace "
+                f"for {FRESH_CONTEXT_RESPAWN_GRACE_SEC:.0f}s"
+            )
 
         # Auth-relay (#205): if enabled + configured, start a flag-gated
         # background watcher that detects the claude OAuth login wall and relays
@@ -2884,11 +2912,15 @@ class TmuxSession:
         ``config.force_fresh_context_once = True``. This launch will
         skip ``--continue`` even when a prior transcript exists,
         producing a fresh Claude Code session. The flag is one-shot —
-        consumed here and reset to False so the next spawn behaves
-        normally. This is a separate contract from ``restart_reason``,
-        which controls the wake-prompt TEXT; coupling them was the
-        root cause of #543 (tmux context_restart silently resumed the
-        old transcript because we only checked transcript existence).
+        consumed only after the complete REPL + tailer boot succeeds.
+        That successful boot also arms a bounded grace period: subsequent
+        respawns remain fresh until the replacement's first completed turn
+        (or grace expiry), so a delayed warm wake cannot resume the stale
+        pre-restart transcript. This is a separate contract from
+        ``restart_reason``, which controls the wake-prompt TEXT; coupling
+        them was the root cause of #543 (tmux context_restart silently
+        resumed the old transcript because we only checked transcript
+        existence).
         """
         # Resolve launch mode. The flag is one-shot ("next launch only,"
         # not "every launch from now on") but consumption happens in
@@ -2899,7 +2931,13 @@ class TmuxSession:
         # ``--continue`` while still emitting context_restart wake copy.
         # By deferring the consume, a retry sees the flag still set
         # and honors it again. See ``_spawn_tmux_repl`` for the clear.
-        force_fresh = bool(getattr(self._config, "force_fresh_context_once", False))
+        force_fresh_once = bool(
+            getattr(self._config, "force_fresh_context_once", False)
+        )
+        in_fresh_grace = (
+            time.monotonic() < self._fresh_context_respawn_grace_until
+        )
+        force_fresh = force_fresh_once or in_fresh_grace
         has_prior = self._has_prior_transcript()
         use_continue = has_prior and not force_fresh
 
@@ -2909,6 +2947,8 @@ class TmuxSession:
         self._last_launch_used_continue = use_continue
         self._last_launch_forced_fresh = force_fresh
         self._last_launch_had_prior_transcript = has_prior
+        self._last_launch_force_fresh_once = force_fresh_once
+        self._last_launch_in_fresh_grace = in_fresh_grace
 
         parts = ["claude"]
         if use_continue:
@@ -2967,6 +3007,7 @@ class TmuxSession:
             f"tmux[{self.agent_name}]: claude_cmd_built "
             f"mode={'continue' if use_continue else 'fresh'} "
             f"force_fresh={force_fresh} "
+            f"fresh_grace={in_fresh_grace} "
             f"prior_transcript={has_prior}"
         )
         return cmd
@@ -4407,6 +4448,22 @@ class TmuxSession:
             return
 
         entry = self._inflight_metas.popleft()
+        if (
+            self._fresh_context_respawn_grace_until
+            and self._fresh_context_respawn_epoch
+            and entry.fresh_context_epoch
+            == self._fresh_context_respawn_epoch
+        ):
+            grace_was_active = (
+                time.monotonic() < self._fresh_context_respawn_grace_until
+            )
+            self._fresh_context_respawn_grace_until = 0.0
+            self._fresh_context_respawn_epoch = 0
+            if grace_was_active:
+                _log(
+                    f"tmux[{self.agent_name}]: first correlated post-fresh "
+                    f"turn completed; respawn grace ended"
+                )
         # Unblock any wait_for_completion caller for THIS entry's turn
         # before the awaitable callbacks run — keeps the caller's wakeup
         # tight (no waiting on conversation_store / response_callback /
@@ -6417,6 +6474,7 @@ class TmuxSession:
             turn=turn,
             transcript_mtime_at_paste=_tmtime_at_paste,
             paste_succeeded_at=_paste_succeeded_at,
+            fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If
