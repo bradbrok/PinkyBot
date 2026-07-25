@@ -48,18 +48,26 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_app: FastAPI) -> AsyncIterator[None]:
-        task: asyncio.Task[None] | None = None
+        tasks: list[asyncio.Task[None]] = []
         if worker is not None:
-            task = asyncio.create_task(
-                worker.run_forever(), name="ringcentral-inbound"
-            )
+            tasks = [
+                asyncio.create_task(
+                    worker.run_forever(),
+                    name="ringcentral-inbound",
+                ),
+                asyncio.create_task(
+                    worker.run_housekeeping_forever(),
+                    name="ringcentral-housekeeping",
+                ),
+            ]
         try:
             yield
         finally:
             if worker is not None:
                 worker.stop()
-            if task is not None:
+            for task in tasks:
                 task.cancel()
+            for task in tasks:
                 with contextlib.suppress(asyncio.CancelledError):
                     await task
             await service.client.aclose()
@@ -75,13 +83,33 @@ def create_app(
     )
 
     async def identity(request: Request) -> AgentIdentity:
+        body = await request.body()
+        target = request.url.path
+        if request.url.query:
+            target = f"{target}?{request.url.query}"
         verified = authenticator.authenticate(
             method=request.method,
-            path=request.url.path,
+            path=target,
             headers=request.headers,
+            body=body,
         )
         if verified is None:
             raise HTTPException(status_code=401, detail="unauthorized")
+        if request.method.upper() not in {"GET", "HEAD", "OPTIONS"}:
+            try:
+                consumed = service.store.consume_request_id(
+                    verified.request_id,
+                    agent_name=verified.name,
+                    method=request.method.upper(),
+                    target=target,
+                )
+            except Exception as exc:
+                raise HTTPException(
+                    status_code=503,
+                    detail="authorization replay state unavailable",
+                ) from exc
+            if not consumed:
+                raise HTTPException(status_code=401, detail="unauthorized")
         return verified
 
     @app.exception_handler(SmsServiceError)

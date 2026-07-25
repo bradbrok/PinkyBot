@@ -14,7 +14,7 @@ from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 from websockets.asyncio.client import connect
 
 from pinky_ringcentral.client import MESSAGE_STORE_PATH, RingCentralAPIError
-from pinky_ringcentral.service import SmsService
+from pinky_ringcentral.service import SENDER_PHONE, SmsService
 
 INBOUND_FILTER = f"{MESSAGE_STORE_PATH}/instant?type=SMS"
 OUTBOUND_FILTER = f"{MESSAGE_STORE_PATH}?type=SMS&direction=Outbound"
@@ -59,12 +59,14 @@ class RingCentralInboundWorker:
         service: SmsService,
         *,
         poll_interval: float = 30.0,
+        housekeeping_interval: float = 30.0,
         websocket_retry_interval: float = 30.0,
         websocket_connect: Callable[..., Awaitable[Any]] = connect,
         now: Any = lambda: datetime.now(UTC),
     ) -> None:
         self.service = service
         self.poll_interval = poll_interval
+        self.housekeeping_interval = housekeeping_interval
         self.websocket_retry_interval = websocket_retry_interval
         self._connect = websocket_connect
         self._now = now
@@ -74,6 +76,38 @@ class RingCentralInboundWorker:
 
     def stop(self) -> None:
         self._stop.set()
+
+    async def run_housekeeping_forever(self) -> None:
+        """Retry durable wakes/statuses independently of WS connection state."""
+
+        consecutive_pending = 0
+        while not self._stop.is_set():
+            delay = min(
+                max(self.housekeeping_interval, 0.01)
+                * (2**consecutive_pending),
+                300.0,
+            )
+            try:
+                await asyncio.wait_for(self._stop.wait(), timeout=delay)
+                return
+            except TimeoutError:
+                pass
+            try:
+                delivered = await self.service.deliver_pending_inbound()
+                await self.service.refresh_pending_statuses()
+                pending = bool(
+                    self.service.store.pending_inbound(limit=1)
+                )
+                consecutive_pending = (
+                    min(consecutive_pending + 1, 4)
+                    if pending and delivered == 0
+                    else 0
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                consecutive_pending = min(consecutive_pending + 1, 4)
+                self.last_error = _safe_error(exc)
 
     async def run_forever(self) -> None:
         while not self._stop.is_set():
@@ -109,18 +143,24 @@ class RingCentralInboundWorker:
                     pass
 
     async def poll_once(self) -> int:
-        """Rehydrate inbound SMS since the durable cursor, then refresh status."""
+        """Stage one snapshot-bounded scan, then advance its durable watermark."""
 
-        now = self._now().astimezone(UTC)
+        scan_start = self._now().astimezone(UTC)
         stored = self.service.store.get_metadata(POLL_CURSOR_KEY)
-        cursor = _parse_time(stored, default=now - timedelta(minutes=5))
+        cursor = _parse_time(
+            stored,
+            default=scan_start - timedelta(minutes=5),
+        )
         # Overlap closes timestamp/order races; the inbound table deduplicates.
         date_from = (cursor - timedelta(minutes=2)).isoformat()
+        date_to = scan_start.isoformat()
         page = 1
         messages: list[dict[str, Any]] = []
         while True:
             payload = await self.service.client.list_messages(
+                phone_number=SENDER_PHONE,
                 date_from=date_from,
+                date_to=date_to,
                 direction="Inbound",
                 page=page,
                 per_page=100,
@@ -145,23 +185,16 @@ class RingCentralInboundWorker:
         handled = 0
         for message in messages:
             await self.service.handle_inbound(message)
-            creation = _parse_time(
-                str(message.get("creationTime") or ""), default=cursor
-            )
-            if creation > cursor:
-                cursor = creation
-                self.service.store.set_metadata(
-                    POLL_CURSOR_KEY,
-                    cursor.astimezone(UTC).isoformat().replace("+00:00", "Z"),
-                )
             handled += 1
         await self.service.deliver_pending_inbound()
         await self.service.refresh_pending_statuses()
+        self.service.store.set_metadata(
+            POLL_CURSOR_KEY,
+            scan_start.isoformat().replace("+00:00", "Z"),
+        )
         return handled
 
     async def _run_websocket(self) -> None:
-        # Poll first on every connection so no gap exists between subscriptions.
-        await self.poll_once()
         token = await self.service.client.get_websocket_token()
         uri = str(token.get("uri") or "")
         access_token = str(token.get("ws_access_token") or "")
@@ -172,6 +205,8 @@ class RingCentralInboundWorker:
             open_timeout=15,
             close_timeout=5,
             max_size=4 * 1024 * 1024,
+            ping_interval=20,
+            ping_timeout=20,
         ) as websocket:
             self.mode = "websocket"
             connection_frame = await asyncio.wait_for(
@@ -189,14 +224,11 @@ class RingCentralInboundWorker:
                 raise RingCentralAPIError(
                     "WebSocket subscription was rejected"
                 )
+            # The accepted subscription buffers new traffic while this
+            # overlapping snapshot catches the pre-subscription gap.
+            await self.poll_once()
             while not self._stop.is_set():
-                try:
-                    frame = await asyncio.wait_for(
-                        websocket.recv(), timeout=60
-                    )
-                except TimeoutError:
-                    await websocket.send(json.dumps(self._heartbeat_request()))
-                    continue
+                frame = await websocket.recv()
                 await self._handle_frame(websocket, frame)
 
     async def _handle_frame(self, websocket: Any, frame: Any) -> None:
@@ -212,16 +244,8 @@ class RingCentralInboundWorker:
             )
         metadata = items[0] if items and isinstance(items[0], dict) else {}
         if metadata.get("type") == "Heartbeat":
-            await websocket.send(
-                json.dumps(
-                    [
-                        {
-                            "type": "Heartbeat",
-                            "messageId": metadata.get("messageId"),
-                        }
-                    ]
-                )
-            )
+            # RingCentral Heartbeat frames are responses to client requests.
+            # Liveness uses native WebSocket ping/pong, handled by websockets.
             return
         if metadata.get("type") != "ServerNotification":
             return
@@ -274,13 +298,4 @@ class RingCentralInboundWorker:
                 "eventFilters": [INBOUND_FILTER, OUTBOUND_FILTER],
                 "deliveryMode": {"transportType": "WebSocket"},
             },
-        ]
-
-    @staticmethod
-    def _heartbeat_request() -> list[dict[str, Any]]:
-        return [
-            {
-                "type": "Heartbeat",
-                "messageId": str(uuid.uuid4()),
-            }
         ]

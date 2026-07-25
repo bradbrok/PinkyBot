@@ -17,10 +17,23 @@ from pinky_ringcentral.auth import (
     derive_agent_key,
 )
 from pinky_ringcentral.bridge import create_app
+from pinky_ringcentral.bridge_main import build_app
 from pinky_ringcentral.client import RingCentralAPIError, RingCentralClient
 from pinky_ringcentral.service import SmsService
 from pinky_ringcentral.store import BridgeStore, DoNotTextStore
 from pinky_ringcentral.wake import MemoryWakeSink
+
+
+def test_bridge_startup_requires_current_instance_id(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("RINGCENTRAL_BRIDGE_MASTER_SECRET", "master")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "session")
+    monkeypatch.delenv("RINGCENTRAL_INSTANCE_ID", raising=False)
+    monkeypatch.delenv("PINKY_INSTANCE_ID", raising=False)
+    with pytest.raises(SystemExit, match="RINGCENTRAL_INSTANCE_ID"):
+        build_app(env_file=str(tmp_path / "missing.env"))
 
 
 @pytest.mark.asyncio
@@ -156,6 +169,120 @@ async def test_post_transport_error_is_marked_may_have_completed() -> None:
 
 
 @pytest.mark.asyncio
+async def test_pre_dispatch_connect_error_is_definite_failure() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/restapi/oauth/token":
+            return httpx.Response(200, json={"access_token": "a"})
+        raise httpx.ConnectError("connection refused", request=request)
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = RingCentralClient("id", "secret", "https://rc.example", "jwt", http=http)
+    with pytest.raises(RingCentralAPIError) as caught:
+        await client.send_sms(
+            from_phone="+19254714225",
+            to_phone="+19255550123",
+            text="hello",
+        )
+    assert caught.value.may_have_completed is False
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "body",
+    [b"", b'{"id":', b"[]"],
+    ids=["empty", "truncated", "non-dict"],
+)
+async def test_sms_malformed_2xx_is_marked_may_have_completed(
+    body: bytes,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/restapi/oauth/token":
+            return httpx.Response(200, json={"access_token": "a"})
+        return httpx.Response(
+            200,
+            content=body,
+            headers={"Content-Type": "application/json"},
+        )
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = RingCentralClient("id", "secret", "https://rc.example", "jwt", http=http)
+    with pytest.raises(RingCentralAPIError) as caught:
+        await client.send_sms(
+            from_phone="+19254714225",
+            to_phone="+19255550123",
+            text="hello",
+        )
+    assert caught.value.status_code == 200
+    assert caught.value.may_have_completed is True
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+async def test_sms_2xx_missing_message_id_is_marked_may_have_completed() -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/restapi/oauth/token":
+            return httpx.Response(200, json={"access_token": "a"})
+        return httpx.Response(200, json={"messageStatus": "Queued"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = RingCentralClient("id", "secret", "https://rc.example", "jwt", http=http)
+    with pytest.raises(RingCentralAPIError) as caught:
+        await client.send_sms(
+            from_phone="+19254714225",
+            to_phone="+19255550123",
+            text="hello",
+        )
+    assert caught.value.status_code == 200
+    assert caught.value.may_have_completed is True
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [500, 502, 599])
+async def test_sms_5xx_is_marked_may_have_completed(
+    status_code: int,
+) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/restapi/oauth/token":
+            return httpx.Response(200, json={"access_token": "a"})
+        return httpx.Response(status_code, json={"message": "upstream failure"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = RingCentralClient("id", "secret", "https://rc.example", "jwt", http=http)
+    with pytest.raises(RingCentralAPIError) as caught:
+        await client.send_sms(
+            from_phone="+19254714225",
+            to_phone="+19255550123",
+            text="hello",
+        )
+    assert caught.value.status_code == status_code
+    assert caught.value.may_have_completed is True
+    await http.aclose()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status_code", [400, 422, 429])
+async def test_sms_4xx_is_definite_failure(status_code: int) -> None:
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/restapi/oauth/token":
+            return httpx.Response(200, json={"access_token": "a"})
+        return httpx.Response(status_code, json={"message": "request rejected"})
+
+    http = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    client = RingCentralClient("id", "secret", "https://rc.example", "jwt", http=http)
+    with pytest.raises(RingCentralAPIError) as caught:
+        await client.send_sms(
+            from_phone="+19254714225",
+            to_phone="+19255550123",
+            text="hello",
+        )
+    assert caught.value.status_code == status_code
+    assert caught.value.may_have_completed is False
+    await http.aclose()
+
+
+@pytest.mark.asyncio
 async def test_message_history_query_uses_general_store_filters() -> None:
     seen: dict[str, str] = {}
 
@@ -199,7 +326,11 @@ async def test_bridge_rejects_unsigned_and_accepts_derived_key(
     class FakeClient:
         configured = True
 
+        def __init__(self) -> None:
+            self.send_count = 0
+
         async def send_sms(self, **kwargs: Any) -> dict[str, Any]:
+            self.send_count += 1
             return {"id": "msg-1", "messageStatus": "Queued"}
 
         async def aclose(self) -> None:
@@ -207,8 +338,9 @@ async def test_bridge_rejects_unsigned_and_accepts_derived_key(
 
     master = "master-secret"
     instance = "daemon-generation"
+    client = FakeClient()
     service = SmsService(
-        FakeClient(),
+        client,
         DoNotTextStore(dnt_path),
         BridgeStore(tmp_path / "bridge.sqlite3"),
         MemoryWakeSink(),
@@ -216,7 +348,11 @@ async def test_bridge_rejects_unsigned_and_accepts_derived_key(
     )
     app = create_app(
         service,
-        DerivedKeyAuthenticator(master, allowed_agents={"geordi"}),
+        DerivedKeyAuthenticator(
+            master,
+            current_instance_id=instance,
+            allowed_agents={"geordi"},
+        ),
     )
     transport = httpx.ASGITransport(app=app)
     async with httpx.AsyncClient(
@@ -229,18 +365,27 @@ async def test_bridge_rejects_unsigned_and_accepts_derived_key(
         assert unsigned.status_code == 401
         path = "/v1/sms/send"
         key = derive_agent_key(master, "geordi", instance)
+        body = json.dumps(
+            {"to": "+19255550123", "text": "hello"}
+        ).encode()
         headers = build_signed_headers(
             key,
             agent_name="geordi",
             instance_id=instance,
             method="POST",
             path=path,
+            body=body,
+            request_id="request-replay-0001",
         )
+        headers["content-type"] = "application/json"
         signed = await http.post(
             path,
             headers=headers,
-            json={"to": "+19255550123", "text": "hello"},
+            content=body,
         )
         assert signed.status_code == 200
         assert signed.json()["message_id"] == "msg-1"
+        replay = await http.post(path, headers=headers, content=body)
+        assert replay.status_code == 401
+        assert client.send_count == 1
     service.store.close()

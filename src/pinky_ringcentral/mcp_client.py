@@ -76,6 +76,7 @@ class RingCentralBridgeClient:
             method=method,
             path=path,
             instance_id=self.instance_id,
+            body=data or b"",
         )
         if data is not None:
             headers["Content-Type"] = "application/json"
@@ -101,7 +102,9 @@ class RingCentralBridgeClient:
                     request, timeout=self.timeout
                 ) as response:
                     self._active_url = base
-                    return self._read_response(response)
+                    return self._read_response(
+                        response, may_have_completed=not idempotent
+                    )
             except urllib.error.HTTPError as exc:
                 self._active_url = base
                 return self._http_error(exc)
@@ -117,15 +120,28 @@ class RingCentralBridgeClient:
             "may_have_completed": not idempotent,
         }
 
-    def _read_response(self, response: Any) -> dict[str, Any]:
+    def _read_response(
+        self, response: Any, *, may_have_completed: bool
+    ) -> dict[str, Any]:
         raw = response.read()
         if not raw:
-            return {}
+            return {
+                "error": "bridge_malformed_response",
+                "may_have_completed": may_have_completed,
+            }
         try:
             parsed = json.loads(raw.decode("utf-8", errors="replace"))
         except json.JSONDecodeError:
-            return {"error": "bridge_malformed_response"}
-        return parsed if isinstance(parsed, dict) else {"data": parsed}
+            return {
+                "error": "bridge_malformed_response",
+                "may_have_completed": may_have_completed,
+            }
+        if not isinstance(parsed, dict):
+            return {
+                "error": "bridge_malformed_response",
+                "may_have_completed": may_have_completed,
+            }
+        return parsed
 
     def _http_error(self, exc: urllib.error.HTTPError) -> dict[str, Any]:
         body = exc.read().decode("utf-8", errors="replace")

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from collections.abc import Mapping
 from typing import Any
@@ -17,6 +18,7 @@ MESSAGE_STORE_PATH = f"{API_BASE}/account/~/extension/~/message-store"
 
 _EXPIRY_SAFETY_MARGIN_SECONDS = 60
 _MIN_CACHE_LIFETIME_SECONDS = 1
+_MESSAGE_ID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 
 class RingCentralAPIError(Exception):
@@ -146,8 +148,17 @@ class RingCentralClient:
         except httpx.HTTPError as exc:
             raise RingCentralAPIError(
                 f"RingCentral request transport failed: {type(exc).__name__}",
-                may_have_completed=method.upper()
-                not in {"GET", "HEAD", "OPTIONS"},
+                may_have_completed=(
+                    method.upper() not in {"GET", "HEAD", "OPTIONS"}
+                    and not isinstance(
+                        exc,
+                        (
+                            httpx.ConnectError,
+                            httpx.ConnectTimeout,
+                            httpx.PoolTimeout,
+                        ),
+                    )
+                ),
             ) from exc
 
     async def send_sms(
@@ -162,7 +173,24 @@ class RingCentralClient:
                 "text": text,
             },
         )
-        return self._json_or_raise("SMS transmission failed", response)
+        payload = self._json_or_raise(
+            "SMS transmission failed",
+            response,
+            uncertain_after_dispatch=True,
+        )
+        message_id = str(payload.get("id") or "")
+        message_status = payload.get("messageStatus")
+        if (
+            not _MESSAGE_ID_RE.fullmatch(message_id)
+            or not isinstance(message_status, str)
+            or not message_status.strip()
+        ):
+            raise RingCentralAPIError(
+                "SMS transmission failed: RingCentral returned an incomplete response",
+                status_code=response.status_code,
+                may_have_completed=True,
+            )
+        return payload
 
     async def get_message(self, message_id: str) -> dict[str, Any]:
         response = await self._request(
@@ -202,8 +230,16 @@ class RingCentralClient:
         return self._json_or_raise("WebSocket token request failed", response)
 
     def _json_or_raise(
-        self, context: str, response: httpx.Response
+        self,
+        context: str,
+        response: httpx.Response,
+        *,
+        uncertain_after_dispatch: bool = False,
     ) -> dict[str, Any]:
+        response_is_ambiguous = uncertain_after_dispatch and (
+            200 <= response.status_code < 300
+            or 500 <= response.status_code < 600
+        )
         if 200 <= response.status_code < 300:
             try:
                 payload = response.json()
@@ -211,16 +247,19 @@ class RingCentralClient:
                 raise RingCentralAPIError(
                     f"{context}: RingCentral returned malformed JSON",
                     status_code=response.status_code,
+                    may_have_completed=response_is_ambiguous,
                 ) from exc
             if not isinstance(payload, dict):
                 raise RingCentralAPIError(
                     f"{context}: RingCentral returned an unexpected payload",
                     status_code=response.status_code,
+                    may_have_completed=response_is_ambiguous,
                 )
             return payload
         raise RingCentralAPIError(
             self._error_message(context, response),
             status_code=response.status_code,
+            may_have_completed=response_is_ambiguous,
         )
 
     def _error_message(self, context: str, response: httpx.Response) -> str:

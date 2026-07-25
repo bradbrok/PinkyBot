@@ -1,4 +1,10 @@
-"""Run the credential-holding RingCentral bridge on the Mac Mini."""
+"""Run the credential-holding RingCentral bridge on the Mac Mini.
+
+P1 uses deployment-static bridge secrets, a configured instance pin, request
+signature TTL, and bridge-owned compliance gates. Rotating the instance pin and
+derived MCP key is a coordinated deployment update, not automatic orphaned-MCP
+revocation.
+"""
 
 from __future__ import annotations
 
@@ -77,6 +83,14 @@ def build_app(*, env_file: str = ""):
     session_secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
     if not session_secret:
         raise SystemExit("Error: PINKY_SESSION_SECRET is required for ferry wake")
+    current_instance_id = (
+        os.environ.get("RINGCENTRAL_INSTANCE_ID", "").strip()
+        or os.environ.get("PINKY_INSTANCE_ID", "").strip()
+    )
+    if not current_instance_id:
+        raise SystemExit(
+            "Error: RINGCENTRAL_INSTANCE_ID or PINKY_INSTANCE_ID is required"
+        )
 
     state_dir = Path(
         os.environ.get(
@@ -113,7 +127,9 @@ def build_app(*, env_file: str = ""):
         if value.strip()
     }
     authenticator = DerivedKeyAuthenticator(
-        master_secret, allowed_agents=agents
+        master_secret,
+        current_instance_id=current_instance_id,
+        allowed_agents=agents,
     )
     inbound_enabled = os.environ.get(
         "RINGCENTRAL_INBOUND_ENABLED", "1"
