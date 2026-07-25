@@ -6426,6 +6426,61 @@ class TestForceFreshContextOnce:
         cmd = ss._build_claude_cmd()
         assert "--continue" in cmd
 
+    @pytest.mark.asyncio
+    async def test_successful_force_fresh_boot_arms_respawn_grace(self):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        await ss.connect()
+        try:
+            assert ss._config.force_fresh_context_once is False
+            assert (
+                ss._fresh_context_respawn_grace_until > _time.monotonic()
+            )
+        finally:
+            await ss.disconnect()
+
+    def test_respawn_grace_suppresses_continue(self, monkeypatch):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        monkeypatch.setattr(
+            "pinky_daemon.tmux_session.time.monotonic",
+            lambda: 100.0,
+        )
+        ss._fresh_context_respawn_grace_until = 150.0
+
+        cmd = ss._build_claude_cmd()
+
+        assert "--continue" not in cmd
+        assert ss._last_launch_forced_fresh is True
+        assert ss._last_launch_in_fresh_grace is True
+
+    def test_respawn_after_grace_uses_legit_warm_continue(self, monkeypatch):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        monkeypatch.setattr(
+            "pinky_daemon.tmux_session.time.monotonic",
+            lambda: 151.0,
+        )
+        ss._fresh_context_respawn_grace_until = 150.0
+
+        cmd = ss._build_claude_cmd()
+
+        assert "--continue" in cmd
+        assert ss._last_launch_forced_fresh is False
+        assert ss._last_launch_in_fresh_grace is False
+
+    @pytest.mark.asyncio
+    async def test_first_post_fresh_turn_ends_respawn_grace(self):
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._fresh_context_respawn_grace_until = _time.monotonic() + 180.0
+        _seed_inflight(ss, internal=True)
+
+        await ss._handle_turn_complete(_turn_response(text="wake complete"))
+
+        assert ss._fresh_context_respawn_grace_until == 0.0
+
 
 class TestWakePromptEnqueueOnConnect:
     """Wake-prompt assembly + enqueue is the parent defect from #543.

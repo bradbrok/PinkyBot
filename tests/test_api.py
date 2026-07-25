@@ -1800,9 +1800,69 @@ class TestAPI:
 
                 resp = client.post("/agents/test-agent/streaming/restart")
                 assert resp.status_code == 200
-                assert resp.json()["restarted"] is True
+                assert resp.json()["restart_scheduled"] is True
                 assert fake.disconnect_calls == 1
                 assert fake.connect_calls == 1
+
+    def test_streaming_restart_acks_before_teardown(self):
+        """The response body must leave the ASGI app before disconnect starts.
+
+        ``context_restart`` rides the MCP connection owned by the session being
+        replaced.  Inline teardown closes that connection and turns every
+        otherwise-successful tool call into MCP -32000.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            app = self._make_app(db_path)
+            response_complete = False
+
+            async def observed_app(scope, receive, send):
+                if scope["type"] != "http":
+                    return await app(scope, receive, send)
+
+                async def observed_send(message):
+                    nonlocal response_complete
+                    await send(message)
+                    if (
+                        message["type"] == "http.response.body"
+                        and not message.get("more_body", False)
+                    ):
+                        response_complete = True
+
+                return await app(scope, receive, observed_send)
+
+            with TestClient(observed_app) as client:
+                client.post(
+                    "/agents",
+                    json={"name": "test-agent", "model": "sonnet"},
+                )
+                fake = self._FakeStreamingSession("test-agent", "main")
+                app.state.broker.register_streaming(
+                    "test-agent", fake, label="main"
+                )
+                app.state.agents.set_context(
+                    "test-agent",
+                    task="Testing post-response restart",
+                    metadata={"source": "save_my_context"},
+                    updated_by=fake.resume_handle,
+                )
+                fake.last_active = time.time()
+
+                disconnect_observations = []
+                original_disconnect = fake.disconnect
+
+                async def observed_disconnect():
+                    disconnect_observations.append(response_complete)
+                    await original_disconnect()
+
+                fake.disconnect = observed_disconnect
+                response_complete = False
+
+                resp = client.post("/agents/test-agent/streaming/restart")
+
+                assert resp.status_code == 200
+                assert resp.json()["restart_scheduled"] is True
+                assert disconnect_observations == [True]
 
     def test_streaming_restart_clears_codex_session_id_on_codex_sessions(self):
         """Codex sessions track thread_id in `codex_session_id`; restart must clear it
@@ -1827,7 +1887,7 @@ class TestAPI:
 
                 resp = client.post("/agents/test-agent/streaming/restart")
                 assert resp.status_code == 200
-                assert resp.json()["restarted"] is True
+                assert resp.json()["restart_scheduled"] is True
                 assert fake.codex_session_id == "", (
                     "codex_session_id must be cleared so next turn does not "
                     "issue `codex exec resume <stale-id>`"

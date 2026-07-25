@@ -1168,7 +1168,10 @@ def create_server(
 
         old_id = result.get("old_session_id", "")
         old_turns = result.get("old_turns", 0)
-        return f"Context restarted. Previous session: {old_id} ({old_turns} turns). Fresh context ready."
+        return (
+            f"Context restart accepted. Previous session: {old_id} "
+            f"({old_turns} turns). Teardown will begin after this response."
+        )
 
     # ── Heartbeat ──────────────────────────────────────────
     # Note: agent-initiated `request_sleep` tool was removed in #552.

@@ -30,6 +30,7 @@ from types import SimpleNamespace
 from typing import Any, Literal
 
 from fastapi import (
+    BackgroundTasks,
     FastAPI,
     HTTPException,
     Request,
@@ -178,6 +179,12 @@ from pinky_daemon.wake_prompt import WakeReason
 
 # Feature flag: shared MCP mode uses a single HTTP/SSE server instead of per-agent stdio
 SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
+
+# ``BackgroundTasks`` starts after a route response enters Starlette's
+# middleware channel, which can still precede the outer socket write when
+# BaseHTTPMiddleware is stacked.  Give the local loopback response a short
+# flush window before context_restart tears down its own MCP transport.
+CONTEXT_RESTART_ACK_DELAY_SEC = 0.25
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -8793,24 +8800,22 @@ npm run build</pre>
         )
         return {"reacted": True}
 
-    @app.post("/agents/{name}/streaming/restart")
-    async def restart_streaming_session(name: str):
-        """Restart an agent's streaming session — fresh context, new CC session."""
-        ss = broker._get_streaming_session(name)
-        if not ss:
-            raise HTTPException(404, f"No streaming session for '{name}'")
+    _context_restarts_inflight: set[str] = set()
 
-        # #149 P1: restart relaunches the transport — guard before we disconnect,
-        # so a blocked (e.g. relabeled unix_user) agent isn't torn down then left
-        # down. An unrunnable isolation_mode means "do not (re)spawn".
-        _enforce_isolation_runnable(name)
+    async def _restart_streaming_session_after_response(
+        name: str,
+        ss,
+        old_resume_handle: str,
+    ) -> None:
+        """Run a context restart only after its acknowledgement is sent.
 
-        guard = _get_streaming_restart_guard(name, ss)
-        if not guard["restart_safe"]:
-            raise HTTPException(409, guard["message"])
-
-        old_resume_handle = ss.resume_handle
-        old_turns = ss._stats["turns"]
+        ``context_restart`` is invoked over the same MCP transport this
+        teardown replaces.  Running disconnect inline severs that transport
+        before the caller can receive the RPC result, so Starlette schedules
+        this coroutine as a response background task.  The short delay also
+        lets stacked HTTP middleware flush the body to the loopback caller.
+        """
+        await asyncio.sleep(CONTEXT_RESTART_ACK_DELAY_SEC)
 
         # #667 diag: capture pre-restart live-session state so an orphan that's
         # recovered by this (often EXTERNAL) restart isn't a black box. The
@@ -8828,31 +8833,37 @@ npm run build</pre>
         except Exception:
             pass
 
-        # Disconnect and clear persisted resume handle
-        await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
-
-        # Refresh wake context and reconnect fresh
-        _refresh_streaming_launch_config(name, ss)
-        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
-        ss._config.resume_handle = ""
-        ss._config.restart_reason = "context_restart"
-        # PR for #543: explicit launch-behavior contract — the next
-        # transport spawn must NOT resume the prior conversation. For
-        # SDK this is implicit (resume_handle="" already accomplishes
-        # it), but tmux ``_build_claude_cmd`` checks transcript existence
-        # only and would silently re-apply ``--continue`` unless this
-        # flag is set. One-shot: consumed by the transport on the next
-        # launch and reset to False.
-        ss._config.force_fresh_context_once = True
-        ss.resume_handle = ""
-        # Codex sessions track the thread_id separately on the session object;
-        # clear it too or `codex exec resume <stale-id>` keeps firing next turn.
-        if hasattr(ss, "codex_session_id"):
-            if ss.codex_session_id:
-                _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
-            ss.codex_session_id = ""
         try:
+            # Arm fresh-launch intent BEFORE disconnect.  If a broker/watchdog
+            # wake races the teardown's transient DEAD state, its launch must
+            # inherit the force-fresh contract rather than resume the old
+            # transcript.
+            _refresh_streaming_launch_config(name, ss)
+            ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
+            ss._config.resume_handle = ""
+            ss._config.restart_reason = "context_restart"
+            # PR for #543: explicit launch-behavior contract — the next
+            # transport spawn must NOT resume the prior conversation. For
+            # SDK this is implicit (resume_handle="" already accomplishes
+            # it), but tmux ``_build_claude_cmd`` checks transcript existence
+            # only and would silently re-apply ``--continue`` unless this
+            # flag is set. One-shot: consumed by the transport on the next
+            # successful launch.
+            ss._config.force_fresh_context_once = True
+            ss.resume_handle = ""
+            # Codex sessions track the thread_id separately on the session
+            # object; clear it too or `codex exec resume <stale-id>` keeps
+            # firing next turn.
+            if hasattr(ss, "codex_session_id"):
+                if ss.codex_session_id:
+                    _log(
+                        f"api: clearing stale codex thread "
+                        f"{ss.codex_session_id[:12]} for {name}"
+                    )
+                ss.codex_session_id = ""
+
+            await ss.disconnect()
+            agents.set_streaming_session_id(name, "", label="main")
             await ss.connect()
             _log(f"api: streaming session restarted for {name}")
             activity.log(name, "context_restart", f"{name} context restarted")
@@ -8864,10 +8875,44 @@ npm run build</pre>
             )
         except Exception as e:
             broker.unregister_streaming(name)
-            raise HTTPException(500, f"Failed to restart: {e}")
+            _log(f"api: post-response context restart failed for {name}: {e}")
+        finally:
+            _context_restarts_inflight.discard(name)
+
+    @app.post("/agents/{name}/streaming/restart")
+    async def restart_streaming_session(
+        name: str,
+        background_tasks: BackgroundTasks,
+    ):
+        """Schedule a fresh-context restart after acknowledging its caller."""
+        ss = broker._get_streaming_session(name)
+        if not ss:
+            raise HTTPException(404, f"No streaming session for '{name}'")
+
+        # #149 P1: restart relaunches the transport — guard before scheduling
+        # teardown, so a blocked (e.g. relabeled unix_user) agent isn't accepted
+        # then left down. An unrunnable isolation_mode means "do not (re)spawn".
+        _enforce_isolation_runnable(name)
+
+        guard = _get_streaming_restart_guard(name, ss)
+        if not guard["restart_safe"]:
+            raise HTTPException(409, guard["message"])
+        if name in _context_restarts_inflight:
+            raise HTTPException(409, "Context restart already in progress")
+
+        old_resume_handle = ss.resume_handle
+        old_turns = ss._stats["turns"]
+        _context_restarts_inflight.add(name)
+        background_tasks.add_task(
+            _restart_streaming_session_after_response,
+            name,
+            ss,
+            old_resume_handle,
+        )
 
         return {
-            "restarted": True,
+            "accepted": True,
+            "restart_scheduled": True,
             "agent": name,
             "old_session_id": old_resume_handle[:12] if old_resume_handle else "",
             "old_turns": old_turns,
