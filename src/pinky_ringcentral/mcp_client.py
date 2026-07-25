@@ -18,6 +18,20 @@ FALLBACK_BRIDGE_URLS = (
     "http://10.0.0.209:9101",
 )
 
+_TRUSTED_BRIDGE_ERROR_CODES = frozenset(
+    {
+        "sms_service_error",
+        "invalid_request",
+        "compliance_state_unavailable",
+        "do_not_text",
+        "quiet_hours",
+        "audit_unavailable",
+        "sms_not_found",
+        "sms_integrity_error",
+        "ringcentral_api_error",
+    }
+)
+
 
 class RingCentralBridgeClient:
     """At-most-once writes and resilient, idempotent reads."""
@@ -107,7 +121,10 @@ class RingCentralBridgeClient:
                     )
             except urllib.error.HTTPError as exc:
                 self._active_url = base
-                return self._http_error(exc)
+                return self._http_error(
+                    exc,
+                    non_idempotent=not idempotent,
+                )
             except (urllib.error.URLError, TimeoutError, OSError) as exc:
                 last_error = self._sanitize(str(exc))
                 # A POST may have reached the Mini. Never try a second address.
@@ -143,7 +160,12 @@ class RingCentralBridgeClient:
             }
         return parsed
 
-    def _http_error(self, exc: urllib.error.HTTPError) -> dict[str, Any]:
+    def _http_error(
+        self,
+        exc: urllib.error.HTTPError,
+        *,
+        non_idempotent: bool,
+    ) -> dict[str, Any]:
         body = exc.read().decode("utf-8", errors="replace")
         try:
             parsed = json.loads(body)
@@ -154,6 +176,17 @@ class RingCentralBridgeClient:
             }
         if not isinstance(parsed, dict):
             parsed = {"error": "bridge_http_error", "data": parsed}
+        trusted_uncertainty = (
+            parsed.get("error") in _TRUSTED_BRIDGE_ERROR_CODES
+            and isinstance(parsed.get("message"), str)
+            and isinstance(parsed.get("may_have_completed"), bool)
+        )
+        if (
+            non_idempotent
+            and 500 <= exc.code < 600
+            and not trusted_uncertainty
+        ):
+            parsed["may_have_completed"] = True
         parsed.setdefault("status", exc.code)
         return parsed
 

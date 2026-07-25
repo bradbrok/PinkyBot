@@ -303,8 +303,11 @@ class SmsService:
                     quarantined_status = (
                         self.store.quarantined_status_for_phone(phone)
                     )
-                    uncertain_attempt = (
-                        self.store.uncertain_attempt_for_phone(phone)
+                    unresolved_attempt = (
+                        self.store.unresolved_attempt_for_phone(
+                            phone,
+                            exclude_attempt_id=attempt_id,
+                        )
                     )
                 except Exception as exc:
                     error = ComplianceStateUnavailableError(
@@ -344,11 +347,12 @@ class SmsService:
                         error=str(error),
                     )
                     raise error
-                if uncertain_attempt:
+                if unresolved_attempt:
                     error = ComplianceStateUnavailableError(
                         "a prior SMS transmission has an unresolved outcome",
                         phone_number=phone,
-                        uncertain_attempt_id=uncertain_attempt,
+                        unresolved_attempt_id=unresolved_attempt,
+                        uncertain_attempt_id=unresolved_attempt,
                         attempt_id=attempt_id,
                     )
                     self._finish_attempt(

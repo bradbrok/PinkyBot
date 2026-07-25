@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import io
 import json
 import os
 import stat
@@ -997,22 +998,65 @@ async def test_uncertain_rc_error_survives_audit_finalization_failure(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     service, client, _dnt, store, _wake = make_service(tmp_path)
+    writes = 0
 
     async def uncertain_send(**kwargs: Any) -> dict[str, Any]:
-        raise RingCentralAPIError(
-            "response lost", may_have_completed=True
-        )
+        nonlocal writes
+        writes += 1
+        if writes == 1:
+            raise RingCentralAPIError(
+                "response lost", may_have_completed=True
+            )
+        return {"id": "after-reconciliation", "messageStatus": "Queued"}
 
     def fail_finish(*args: Any, **kwargs: Any) -> None:
         raise OSError("audit unavailable")
 
     monkeypatch.setattr(client, "send_sms", uncertain_send)
+    finish_attempt = store.finish_attempt
     monkeypatch.setattr(store, "finish_attempt", fail_finish)
     with pytest.raises(AuditUnavailableError) as caught:
         await service.send_sms(to="+19255550123", text="one attempt")
     assert caught.value.details["may_have_completed"] is True
     assert isinstance(caught.value.__cause__, RingCentralAPIError)
     assert caught.value.__cause__.may_have_completed is True
+    unresolved_id = caught.value.details["attempt_id"]
+    attempt = store.get_attempt(unresolved_id)
+    assert attempt["outcome"] == "checking"
+    assert attempt["may_have_completed"] == 0
+    assert writes == 1
+
+    monkeypatch.setattr(store, "finish_attempt", finish_attempt)
+    with pytest.raises(ComplianceStateUnavailableError) as quarantined:
+        await service.send_sms(
+            to="+19255550123",
+            text="must not write again",
+        )
+    assert quarantined.value.details["unresolved_attempt_id"] == unresolved_id
+    assert writes == 1
+
+    # An operator can release the quarantine only by durably recording an
+    # audited reconciliation outcome on the original ledger row.
+    store.finish_attempt(
+        unresolved_id,
+        outcome="failed",
+        error="manual reconciliation found no RingCentral message",
+    )
+    reconciled = store.get_attempt(unresolved_id)
+    assert reconciled["outcome"] == "failed"
+    assert (
+        reconciled["error"]
+        == "manual reconciliation found no RingCentral message"
+    )
+    assert reconciled["completed_at"]
+    assert service.store.unresolved_attempt_for_phone("+19255550123") == ""
+
+    result = await service.send_sms(
+        to="+19255550123",
+        text="allowed after reconciliation",
+    )
+    assert result["message_id"] == "after-reconciliation"
+    assert writes == 2
 
 
 @pytest.mark.asyncio
@@ -1243,6 +1287,72 @@ def test_mcp_malformed_200_write_is_uncertain(
     )
     assert result["error"] == "bridge_malformed_response"
     assert result["may_have_completed"] is True
+
+
+def test_mcp_plaintext_500_write_is_uncertain(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    error = urllib.error.HTTPError(
+        "http://bridge.invalid/v1/sms/send",
+        500,
+        "Internal Server Error",
+        {},
+        io.BytesIO(b"Internal Server Error"),
+    )
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    client = RingCentralBridgeClient(
+        agent_name="geordi",
+        secret="derived",
+        instance_id="generation-a",
+        bridge_url="http://bridge.invalid",
+    )
+    result = client.post(
+        "/v1/sms/send", {"to": "+19255550123", "text": "hi"}
+    )
+    assert result == {
+        "error": "bridge_http_error",
+        "message": "Internal Server Error",
+        "status": 500,
+        "may_have_completed": True,
+    }
+
+
+def test_mcp_trusted_bridge_error_preserves_explicit_uncertainty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    body = json.dumps(
+        {
+            "error": "ringcentral_api_error",
+            "message": "request was rejected before dispatch",
+            "may_have_completed": False,
+        }
+    ).encode()
+    error = urllib.error.HTTPError(
+        "http://bridge.invalid/v1/sms/send",
+        502,
+        "Bad Gateway",
+        {"Content-Type": "application/json"},
+        io.BytesIO(body),
+    )
+
+    def fail(*args: Any, **kwargs: Any) -> None:
+        raise error
+
+    monkeypatch.setattr(urllib.request, "urlopen", fail)
+    client = RingCentralBridgeClient(
+        agent_name="geordi",
+        secret="derived",
+        instance_id="generation-a",
+        bridge_url="http://bridge.invalid",
+    )
+    result = client.post(
+        "/v1/sms/send", {"to": "+19255550123", "text": "hi"}
+    )
+    assert result["may_have_completed"] is False
 
 
 def test_mcp_surface_contains_only_p1_sms_primitives() -> None:

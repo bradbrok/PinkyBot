@@ -533,6 +533,24 @@ class BridgeStore:
             ).fetchone()
         return str(row["attempt_id"]) if row else ""
 
+    def unresolved_attempt_for_phone(
+        self,
+        phone_number: str,
+        *,
+        exclude_attempt_id: str = "",
+    ) -> str:
+        with self._lock:
+            row = self._db.execute(
+                """
+                SELECT attempt_id FROM sms_attempts
+                WHERE phone_number=? AND attempt_id!=?
+                  AND (outcome='checking' OR may_have_completed=1)
+                ORDER BY requested_at ASC LIMIT 1
+                """,
+                (phone_number, exclude_attempt_id),
+            ).fetchone()
+        return str(row["attempt_id"]) if row else ""
+
     def record_status_check(
         self, message_id: str, *, outcome: str, error: str = ""
     ) -> None:
