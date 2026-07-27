@@ -399,17 +399,18 @@ class TestCheckInbox:
         }
         with _ok(inbox):
             result = _tools(srv)["check_inbox"]()
-        assert "pushok" in result or "hello" in result or "1" in result
+        assert "deprecated" in result.lower()
+        assert "nothing queued" in result.lower()
 
     def test_empty_inbox(self, srv):
         with _ok({"messages": [], "unread_count": 0}):
             result = _tools(srv)["check_inbox"]()
-        assert "0" in result or "empty" in result.lower() or isinstance(result, str)
+        assert "deprecated" in result.lower()
 
     def test_error(self, srv):
         with _ok({"error": "no inbox"}):
             result = _tools(srv)["check_inbox"]()
-        assert isinstance(result, str)
+        assert "deprecated" in result.lower()
 
 
 # ── check_for_updates ─────────────────────────────────────────────────────────
@@ -1019,10 +1020,11 @@ class TestSendToAgent:
             result = _tools(srv)["send_to_agent"](to="pushok", message="Hello!")
         assert "delivered" in result.lower() or "pushok" in result
 
-    def test_queued(self, srv):
+    def test_not_delivered_is_not_queued(self, srv):
         with _ok({"queued": True}):
             result = _tools(srv)["send_to_agent"](to="pushok", message="Hey, async")
-        assert "queued" in result.lower() or "offline" in result.lower()
+        assert "not delivered" in result.lower()
+        assert "not queued" in result.lower()
 
     def test_with_reply_and_priority(self, srv):
         with _ok({"delivered": True}):

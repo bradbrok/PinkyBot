@@ -33,16 +33,37 @@ class TestAgentComms:
         assert msg.message_type == "direct"
         self._cleanup(comms, path)
 
-    def test_direct_appears_in_inbox(self):
+    def test_direct_is_audit_only_and_inbox_stays_empty(self):
         comms, path = self._make_comms()
-        comms.send("alice", "bob", "Hey!")
+        msg = comms.send("alice", "bob", "Hey!")
 
-        inbox = comms.get_inbox("bob")
-        assert len(inbox) == 1
-        assert inbox[0].content == "Hey!"
-        assert inbox[0].from_session == "alice"
-        assert inbox[0].read is False
+        assert comms.get_inbox("bob") == []
+        assert comms.unread_count("bob") == 0
+        unread_rows = comms._conn.execute(
+            "SELECT COUNT(*) FROM inbox WHERE session_id = 'bob' AND read = 0"
+        ).fetchone()[0]
+        assert unread_rows == 0
+        messages, total = comms.get_all_messages()
+        assert total == 1
+        assert messages[0].id == msg.id
+        assert messages[0].content == "Hey!"
         self._cleanup(comms, path)
+
+    def test_startup_retires_legacy_unread_rows(self):
+        comms, path = self._make_comms()
+        comms.send("alice", "bob", "Legacy queued message")
+        comms._conn.execute("UPDATE inbox SET read = 0 WHERE session_id = 'bob'")
+        comms._conn.commit()
+        comms.close()
+
+        reopened = AgentComms(db_path=path)
+        unread_rows = reopened._conn.execute(
+            "SELECT COUNT(*) FROM inbox WHERE session_id = 'bob' AND read = 0"
+        ).fetchone()[0]
+        assert unread_rows == 0
+        assert reopened.get_inbox("bob") == []
+        assert reopened.unread_count("bob") == 0
+        self._cleanup(reopened, path)
 
     def test_direct_not_in_sender_inbox(self):
         comms, path = self._make_comms()
@@ -56,17 +77,13 @@ class TestAgentComms:
         comms, path = self._make_comms()
         msg = comms.send("alice", "bob", "Hey!")
 
-        assert comms.unread_count("bob") == 1
-        comms.mark_read("bob", [msg.id])
+        assert comms.unread_count("bob") == 0
+        assert comms.mark_read("bob", [msg.id]) == 0
         assert comms.unread_count("bob") == 0
 
-        # Unread_only should now be empty
-        inbox = comms.get_inbox("bob", unread_only=True)
-        assert len(inbox) == 0
-
-        # But all messages should still show
-        inbox = comms.get_inbox("bob", unread_only=False)
-        assert len(inbox) == 1
+        assert comms.get_inbox("bob", unread_only=True) == []
+        assert comms.get_inbox("bob", unread_only=False) == []
+        assert msg.read is True
         self._cleanup(comms, path)
 
     def test_mark_all_read(self):
@@ -75,9 +92,9 @@ class TestAgentComms:
         comms.send("alice", "bob", "Msg 2")
         comms.send("alice", "bob", "Msg 3")
 
-        assert comms.unread_count("bob") == 3
+        assert comms.unread_count("bob") == 0
         count = comms.mark_read("bob")
-        assert count == 3
+        assert count == 0
         assert comms.unread_count("bob") == 0
         self._cleanup(comms, path)
 
@@ -87,11 +104,15 @@ class TestAgentComms:
         comms.send("charlie", "bob", "Hi Bob from Charlie")
         comms.send("alice", "charlie", "Hi Charlie")
 
-        bob_inbox = comms.get_inbox("bob")
-        assert len(bob_inbox) == 2
-
-        charlie_inbox = comms.get_inbox("charlie")
-        assert len(charlie_inbox) == 1
+        assert comms.get_inbox("bob") == []
+        assert comms.get_inbox("charlie") == []
+        messages, total = comms.get_all_messages()
+        assert total == 3
+        assert {message.content for message in messages} == {
+            "Hi Bob",
+            "Hi Bob from Charlie",
+            "Hi Charlie",
+        }
         self._cleanup(comms, path)
 
     # ── Broadcast ────────────────────────────────────────────
@@ -105,10 +126,9 @@ class TestAgentComms:
         assert msg.message_type == "broadcast"
         assert msg.to_session == "*"
 
-        # Should be in bob and charlie's inbox, not alice's
-        assert len(comms.get_inbox("bob")) == 1
-        assert len(comms.get_inbox("charlie")) == 1
-        assert len(comms.get_inbox("alice")) == 0
+        assert comms.get_inbox("bob") == []
+        assert comms.get_inbox("charlie") == []
+        assert comms.get_inbox("alice") == []
         self._cleanup(comms, path)
 
     def test_broadcast_content(self):
@@ -118,9 +138,10 @@ class TestAgentComms:
             active_sessions=["bob", "charlie"],
         )
 
-        bob_msg = comms.get_inbox("bob")[0]
-        assert bob_msg.content == "Important update"
-        assert bob_msg.from_session == "alice"
+        messages, total = comms.get_all_messages()
+        assert total == 1
+        assert messages[0].content == "Important update"
+        assert messages[0].from_session == "alice"
         self._cleanup(comms, path)
 
     # ── Groups ───────────────────────────────────────────────
@@ -140,10 +161,9 @@ class TestAgentComms:
         assert msg.message_type == "group"
         assert msg.group == "team"
 
-        # bob and charlie get it, alice doesn't
-        assert len(comms.get_inbox("bob")) == 1
-        assert len(comms.get_inbox("charlie")) == 1
-        assert len(comms.get_inbox("alice")) == 0
+        assert comms.get_inbox("bob") == []
+        assert comms.get_inbox("charlie") == []
+        assert comms.get_inbox("alice") == []
         self._cleanup(comms, path)
 
     def test_join_group(self):
@@ -235,8 +255,13 @@ class TestAgentCommsAPI:
         resp = client.get("/sessions/bob/inbox")
         assert resp.status_code == 200
         data = resp.json()
-        assert data["count"] == 1
-        assert data["unread"] == 1
+        assert data == {
+            "session_id": "bob",
+            "messages": [],
+            "count": 0,
+            "unread": 0,
+            "deprecated": True,
+        }
         os.unlink(path)
 
     def test_mark_read(self):
@@ -247,7 +272,7 @@ class TestAgentCommsAPI:
 
         resp = client.post("/sessions/bob/inbox/read")
         assert resp.status_code == 200
-        assert resp.json()["marked"] == 1
+        assert resp.json() == {"marked": 0, "deprecated": True}
         os.unlink(path)
 
     def test_broadcast(self):
@@ -324,9 +349,9 @@ class TestAgentCommsAPI:
         assert resp.status_code == 200
         assert resp.json()["type"] == "group"
 
-        # Bob should have it
         inbox = client.get("/sessions/bob/inbox").json()
-        assert inbox["count"] == 1
+        assert inbox["count"] == 0
+        assert inbox["deprecated"] is True
         os.unlink(path)
 
     def test_send_not_found_session(self):
@@ -353,9 +378,8 @@ class TestAgentCommsAPI:
         assert data["priority"] == 2
 
         inbox = client.get("/sessions/bob/inbox").json()
-        msg = inbox["messages"][0]
-        assert msg["content_type"] == "task_request"
-        assert msg["priority"] == 2
+        assert inbox["messages"] == []
+        assert inbox["deprecated"] is True
         os.unlink(path)
 
     def test_send_with_threading(self):
@@ -424,8 +448,10 @@ class TestAgentCommsNewFeatures:
         msg = comms.send("alice", "bob", "Do task X", content_type="task_request")
         assert msg.content_type == "task_request"
 
-        inbox = comms.get_inbox("bob")
-        assert inbox[0].content_type == "task_request"
+        assert comms.get_inbox("bob") == []
+        messages, total = comms.get_all_messages()
+        assert total == 1
+        assert messages[0].content_type == "task_request"
         self._cleanup(comms, path)
 
     def test_default_content_type_is_text(self):
@@ -450,9 +476,7 @@ class TestAgentCommsNewFeatures:
         original = comms.send("alice", "bob", "Question?")
         reply = comms.send("bob", "alice", "Answer!", parent_message_id=original.id)
         assert reply.parent_message_id == original.id
-
-        inbox = comms.get_inbox("alice")
-        assert inbox[0].parent_message_id == original.id
+        assert comms.get_inbox("alice") == []
         self._cleanup(comms, path)
 
     def test_get_thread(self):
@@ -512,22 +536,19 @@ class TestAgentCommsNewFeatures:
         assert "B->C" not in contents
         self._cleanup(comms, path)
 
-    def test_get_thread_read_state(self):
-        """Thread with session_id should reflect real inbox read state."""
+    def test_get_thread_has_no_unread_state(self):
+        """Thread history is always read because delivery inboxes are deprecated."""
         comms, path = self._make_comms()
         root = comms.send("alice", "bob", "Question?")
         comms.send("bob", "alice", "Answer!", parent_message_id=root.id)
 
-        # Bob has root in inbox (unread)
         thread = comms.get_thread(root.id, session_id="bob")
         assert len(thread) == 2
         root_msg = [m for m in thread if m.content == "Question?"][0]
-        assert root_msg.read is False
+        assert root_msg.read is True
 
-        # Mark as read
-        comms.mark_read("bob", [root.id])
+        assert comms.mark_read("bob", [root.id]) == 0
 
-        # Now read state should be True
         thread2 = comms.get_thread(root.id, session_id="bob")
         root_msg2 = [m for m in thread2 if m.content == "Question?"][0]
         assert root_msg2.read is True
@@ -535,19 +556,20 @@ class TestAgentCommsNewFeatures:
 
     # ── Priority ──────────────────────────────────────────────
 
-    def test_priority_sorting(self):
+    def test_priority_is_preserved_in_audit_without_an_inbox(self):
         comms, path = self._make_comms()
         comms.send("alice", "bob", "Normal message", priority=0)
         comms.send("charlie", "bob", "Urgent!", priority=2)
         comms.send("dave", "bob", "High priority", priority=1)
 
-        inbox = comms.get_inbox("bob")
-        assert len(inbox) == 3
-        # Should be sorted by priority DESC
-        assert inbox[0].priority == 2
-        assert inbox[0].content == "Urgent!"
-        assert inbox[1].priority == 1
-        assert inbox[2].priority == 0
+        assert comms.get_inbox("bob") == []
+        messages, total = comms.get_all_messages()
+        assert total == 3
+        assert {message.content: message.priority for message in messages} == {
+            "Normal message": 0,
+            "Urgent!": 2,
+            "High priority": 1,
+        }
         self._cleanup(comms, path)
 
     def test_default_priority_is_zero(self):
@@ -560,10 +582,13 @@ class TestAgentCommsNewFeatures:
 
     def test_message_with_ttl(self):
         comms, path = self._make_comms()
-        _msg = comms.send("alice", "bob", "Temporary", ttl_seconds=3600)
-        inbox = comms.get_inbox("bob")
-        assert len(inbox) == 1
-        assert inbox[0].content == "Temporary"
+        msg = comms.send("alice", "bob", "Temporary", ttl_seconds=3600)
+        assert comms.get_inbox("bob") == []
+        row = comms._conn.execute(
+            "SELECT read, expires_at FROM inbox WHERE message_id = ?", (msg.id,)
+        ).fetchone()
+        assert row["read"] == 1
+        assert row["expires_at"] is not None
         self._cleanup(comms, path)
 
     def test_expired_message_not_in_inbox(self):
@@ -571,8 +596,7 @@ class TestAgentCommsNewFeatures:
         # Send with a TTL of 1 second
         comms.send("alice", "bob", "Ephemeral", ttl_seconds=1)
 
-        # Immediately should be visible
-        assert len(comms.get_inbox("bob")) == 1
+        assert comms.get_inbox("bob") == []
 
         # Manually expire it by updating the DB
         import time
@@ -582,8 +606,7 @@ class TestAgentCommsNewFeatures:
         )
         comms._conn.commit()
 
-        # Now should be filtered out
-        assert len(comms.get_inbox("bob")) == 0
+        assert comms.get_inbox("bob") == []
         self._cleanup(comms, path)
 
     def test_cleanup_expired(self):
@@ -602,10 +625,11 @@ class TestAgentCommsNewFeatures:
         count = comms.cleanup_expired()
         assert count == 1
 
-        # Only the permanent message remains
-        inbox = comms.get_inbox("bob")
-        assert len(inbox) == 1
-        assert inbox[0].content == "Permanent msg"
+        remaining = comms._conn.execute(
+            """SELECT m.content FROM inbox i
+               JOIN messages m ON m.id = i.message_id"""
+        ).fetchall()
+        assert [row["content"] for row in remaining] == ["Permanent msg"]
         self._cleanup(comms, path)
 
     def test_no_ttl_never_expires(self):
@@ -615,7 +639,7 @@ class TestAgentCommsNewFeatures:
         # Cleanup should not remove messages without TTL
         count = comms.cleanup_expired()
         assert count == 0
-        assert len(comms.get_inbox("bob")) == 1
+        assert comms.get_inbox("bob") == []
         self._cleanup(comms, path)
 
     def test_broadcast_default_ttl(self):
@@ -624,8 +648,9 @@ class TestAgentCommsNewFeatures:
 
         # Broadcasts should have expires_at set (7-day default)
         row = comms._conn.execute(
-            "SELECT expires_at FROM inbox WHERE session_id = 'bob'"
+            "SELECT read, expires_at FROM inbox WHERE session_id = 'bob'"
         ).fetchone()
+        assert row["read"] == 1
         assert row["expires_at"] is not None
         import time
         # Should expire roughly 7 days from now
@@ -655,7 +680,7 @@ class TestAgentCommsNewFeatures:
         thread = comms.get_thread(root.id, session_id="bob")
         assert len(thread) == 1
         assert thread[0].content == "Hear ye"
-        assert thread[0].read is False
+        assert thread[0].read is True
         self._cleanup(comms, path)
 
     def test_get_thread_still_hides_unrelated_messages(self):
@@ -750,13 +775,13 @@ class TestAgentCommsNewFeatures:
         comms.send("alice", "bob", "Msg 2")
 
         assert comms.mark_read("bob", []) == 0
-        assert comms.unread_count("bob") == 2
+        assert comms.unread_count("bob") == 0
         self._cleanup(comms, path)
 
     # ── Inbox Fallback (API) ──────────────────────────────────
 
-    def test_agent_message_auto_wake_or_queue(self):
-        """Inter-agent messages auto-wake sleeping agents. Falls back to queue if wake fails."""
+    def test_agent_message_auto_wake_or_live_delivery_only(self):
+        """Inter-agent messages may auto-wake, but they are never queued."""
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         from pinky_daemon.api import create_api
@@ -771,12 +796,11 @@ class TestAgentCommsNewFeatures:
             "from_agent": "sender",
             "message": "Hello offline agent",
         })
-        # Should succeed (200) — either delivered after auto-wake or queued
         assert resp.status_code == 200
         data = resp.json()
         assert data["message_id"] > 0
-        # Auto-wake may or may not succeed depending on environment
-        assert data["delivered"] is True or data["queued"] is True
+        assert data["queued"] is False
+        assert client.get("/sessions/target_agent/inbox").json()["messages"] == []
         os.unlink(path)
 
     # ── Agent Card (API) ──────────────────────────────────────

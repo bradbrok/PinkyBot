@@ -235,7 +235,7 @@ class AgentScheduler:
         # Used to skip eval for idle-sleeping agents (which the API callback
         # would refuse anyway, but at the cost of a budget slot and a log line).
         self._is_resurrectable_fn = is_resurrectable_fn  # fn(agent_name) -> bool
-        self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired inbox cleanup)
+        self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired comms bookkeeping cleanup)
         self._trigger_store = trigger_store  # TriggerStore | None
         self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval

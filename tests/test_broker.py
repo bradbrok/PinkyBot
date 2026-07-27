@@ -436,10 +436,7 @@ class TestMessageBrokerRouting:
 
     @pytest.mark.asyncio
     async def test_inject_unconfirmed_when_sdk_handoff_fails(self):
-        """#853 P1: capability True must NOT overrule a failed per-call
-        handoff. An SDK send whose client.query() raised internally (swallowed
-        + reconnect, returns False) → (True, False): the exact message that
-        failed stays unretired."""
+        """A failed per-call handoff is not live delivery."""
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
             from pinky_daemon.transport_state import SessionState
@@ -453,7 +450,7 @@ class TestMessageBrokerRouting:
 
             broker.register_streaming("barsik", _SdkishFailing(), label="main")
             delivered, confirmed = await broker.inject_agent_message("pushok", "barsik", "hi")
-            assert delivered is True
+            assert delivered is False
             assert confirmed is False
         finally:
             tmpdir.cleanup()
@@ -484,114 +481,43 @@ class TestMessageBrokerRouting:
         return _TmuxNudge()
 
     @pytest.mark.asyncio
-    async def test_notify_unread_enqueues_nudge_for_tmux(self):
-        """A tmux target with unread messages gets one readiness-gated nudge
-        via the internal-prompt queue."""
+    async def test_notify_unread_is_deprecated_noop(self):
+        """The compatibility method never emits an unread-inbox nudge."""
         tmpdir, _, broker, _, _ = self._make_broker()
         try:
             session = self._tmux_nudge_session()
             broker.register_streaming("barsik", session, label="main")
             fired = await broker.notify_unread_agent_messages(self._NudgeComms(2), "barsik")
-            assert fired is True
-            assert len(session.nudges) == 1
-            prompt, reason = session.nudges[0]
-            assert reason == "agent_msg_notify"
-            assert "2 unread agent messages" in prompt
-            assert "check_inbox" in prompt
-            assert broker._stats["nudged"] == 1
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_notify_unread_coalesces_within_window(self):
-        """A burst collapses to a single nudge (no storm)."""
-        tmpdir, _, broker, _, _ = self._make_broker()
-        try:
-            session = self._tmux_nudge_session()
-            broker.register_streaming("barsik", session, label="main")
-            comms = self._NudgeComms(3)
-            assert await broker.notify_unread_agent_messages(comms, "barsik") is True
-            # Second delivery in the same burst → coalesced, no new nudge.
-            assert await broker.notify_unread_agent_messages(comms, "barsik") is False
-            assert len(session.nudges) == 1
-            assert broker._stats["nudged"] == 1
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_notify_unread_flag_off_no_nudge(self, monkeypatch):
-        """PINKYBOT_AGENT_MSG_NOTIFY off → no nudge (kill-switch)."""
-        import pinky_daemon.broker as broker_mod
-
-        monkeypatch.setattr(broker_mod, "_AGENT_MSG_NOTIFY_ENABLED", False)
-        tmpdir, _, broker, _, _ = self._make_broker()
-        try:
-            session = self._tmux_nudge_session()
-            broker.register_streaming("barsik", session, label="main")
-            fired = await broker.notify_unread_agent_messages(self._NudgeComms(5), "barsik")
             assert fired is False
             assert session.nudges == []
+            assert broker._stats["nudged"] == 0
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_notify_unread_noop_for_non_tmux_transport(self):
-        """An SDK-style session (no internal-prompt queue) is never nudged —
-        its live-inject already confirmed consumption."""
-        tmpdir, _, broker, _, _ = self._make_broker()
-        try:
-            from pinky_daemon.transport_state import SessionState
-
-            class _Sdkish:
-                state = SessionState.CONNECTED
-                injection_confirms_consumption = True
-
-                async def send(self, *a, **k):
-                    pass
-
-            broker.register_streaming("barsik", _Sdkish(), label="main")
-            fired = await broker.notify_unread_agent_messages(self._NudgeComms(2), "barsik")
-            assert fired is False
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_notify_unread_noop_when_nothing_unread(self):
-        """Nothing unread → no nudge."""
-        tmpdir, _, broker, _, _ = self._make_broker()
-        try:
-            session = self._tmux_nudge_session()
-            broker.register_streaming("barsik", session, label="main")
-            fired = await broker.notify_unread_agent_messages(self._NudgeComms(0), "barsik")
-            assert fired is False
-            assert session.nudges == []
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_notify_unread_noop_without_session(self):
-        """No live session → no nudge (durable unread row is the backstop)."""
-        tmpdir, _, broker, _, _ = self._make_broker()
-        try:
-            fired = await broker.notify_unread_agent_messages(self._NudgeComms(4), "barsik")
-            assert fired is False
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_agent_reply_delivers_to_requester_inbox(self):
-        """#279: a completed agent-reply turn is delivered to the requester's
-        inbox via comms.send — and ONLY that (loop-safe: no live inject)."""
+    async def test_route_agent_reply_is_one_way_live_injection(self):
+        """The return leg is live, audited, and cannot trigger another reply."""
+        from pinky_daemon.transport_state import SessionState
         from pinky_daemon.turn_response import TurnResponse
 
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             sent: list = []
+            injected: list = []
 
             class _FakeComms:
                 def send(self, frm, to, content, **kw):
                     sent.append((frm, to, content, kw.get("metadata")))
 
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = True
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    injected.append((prompt, platform, chat_id))
+                    return True
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
             tr = TurnResponse(
                 agent_name="murzik",
                 platform="agent",
@@ -601,13 +527,16 @@ class TestMessageBrokerRouting:
             handled = await broker.route_agent_reply(_FakeComms(), tr)
             assert handled is True
             assert sent == [("murzik", "barsik", "LGTM - ship it", {"auto_routed": True})]
+            assert len(injected) == 1
+            assert "LGTM - ship it" in injected[0][0]
+            assert injected[0][1:] == ("", "")
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
     async def test_route_agent_reply_ignores_normal_platform_turns(self):
         """A telegram turn is not an agent reply: returns False (caller falls
-        through to normal routing) and nothing is delivered to an inbox."""
+        through to normal routing) and nothing is agent-routed."""
         from pinky_daemon.turn_response import TurnResponse
 
         tmpdir, registry, broker, _, _ = self._make_broker()
@@ -630,7 +559,7 @@ class TestMessageBrokerRouting:
     @pytest.mark.asyncio
     async def test_route_agent_reply_skips_empty_text(self):
         """A pure tool-call agent turn (no final text) is consumed but nothing is
-        delivered — no empty inbox entries."""
+        delivered."""
         from pinky_daemon.turn_response import TurnResponse
 
         tmpdir, registry, broker, _, _ = self._make_broker()
@@ -652,7 +581,7 @@ class TestMessageBrokerRouting:
 
     @pytest.mark.asyncio
     async def test_route_agent_reply_counts_failed_delivery(self):
-        """If comms.send raises, the turn is still consumed (handled True, never
+        """If audit storage raises, the turn is still consumed (handled True, never
         re-injected) and the failure is counted so dropped replies are visible."""
         from pinky_daemon.turn_response import TurnResponse
 
@@ -660,7 +589,7 @@ class TestMessageBrokerRouting:
         try:
             class _BoomComms:
                 def send(self, *a, **k):
-                    raise RuntimeError("inbox down")
+                    raise RuntimeError("audit down")
 
             tr = TurnResponse(
                 agent_name="murzik", platform="agent", chat_id="barsik", text="x"
@@ -673,15 +602,26 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_agent_reply_real_comms_lands_in_inbox(self):
-        """End-to-end return leg against a real AgentComms: the reply appears in
-        the requester's inbox via get_inbox, tagged auto_routed."""
+    async def test_route_agent_reply_real_comms_is_audited_and_live(self):
+        """End-to-end return leg is live and retained only in audit history."""
         from pinky_daemon.agent_comms import AgentComms
+        from pinky_daemon.transport_state import SessionState
         from pinky_daemon.turn_response import TurnResponse
 
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
+            injected: list = []
+
+            class _FakeStreaming:
+                state = SessionState.CONNECTED
+                injection_confirms_consumption = True
+
+                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
+                    injected.append((prompt, platform, chat_id))
+                    return True
+
+            broker.register_streaming("barsik", _FakeStreaming(), label="main")
             tr = TurnResponse(
                 agent_name="murzik",
                 platform="agent",
@@ -690,11 +630,16 @@ class TestMessageBrokerRouting:
             )
             handled = await broker.route_agent_reply(comms, tr)
             assert handled is True
-            inbox = comms.get_inbox("barsik")
-            assert len(inbox) == 1
-            assert inbox[0].from_session == "murzik"
-            assert inbox[0].content == "LGTM - ship it"
-            assert inbox[0].metadata.get("auto_routed") is True
+            assert comms.get_inbox("barsik") == []
+            assert comms.unread_count("barsik") == 0
+            messages, total = comms.get_all_messages()
+            assert total == 1
+            assert messages[0].from_session == "murzik"
+            assert messages[0].content == "LGTM - ship it"
+            assert messages[0].metadata.get("auto_routed") is True
+            assert len(injected) == 1
+            assert "LGTM - ship it" in injected[0][0]
+            assert injected[0][1:] == ("", "")
         finally:
             tmpdir.cleanup()
 

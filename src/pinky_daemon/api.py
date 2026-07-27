@@ -2807,16 +2807,10 @@ def create_api(
         before. The default value preserves pre-#591 behavior for the
         ``wake_context_builder(name)`` 1-arg callers.
 
-        ``commit`` gates the side-effecting consumption steps embedded in
-        the build (inbox ``mark_read`` and restart-manifest deletion).
+        ``commit`` gates restart-manifest deletion.
         When ``False``, the function renders the *current* state without
-        consuming — used by the eager pre-build at session-config creation
-        time, which would otherwise consume inbox + manifest BEFORE the
-        delivered connect-time rebuild runs (Murzik P1#1: production saw
-        unread agent messages and restart-manifest content silently
-        vanish from real wake prompts). ``True`` (the default) preserves
-        pre-#591 behavior for legacy callers and is what the connect-time
-        rebuild uses.
+        consuming it — used by the eager pre-build at session-config creation
+        time. ``True`` (the default) is what the connect-time rebuild uses.
         """
         wake_ctx = ""
         emitted_manifest = False  # Whether saved-context contributed to wake_ctx
@@ -2883,21 +2877,6 @@ def create_api(
             kg_insights = dream_runner.get_kg_insights(agent_name)
             if kg_insights:
                 wake_ctx = f"{wake_ctx}\n\n{kg_insights}" if wake_ctx else kg_insights
-
-        # Inject unread inbox messages from other agents
-        inbox_messages = comms.get_inbox(agent_name, unread_only=True, limit=10)
-        if inbox_messages:
-            lines = []
-            for m in inbox_messages:
-                lines.append(f"  From {m.from_session}: {m.content}")
-            inbox_ctx = (
-                f"Unread agent messages ({len(inbox_messages)}):\n"
-                + "\n".join(lines)
-                + "\nReply via send_to_agent, not by messaging the owner."
-            )
-            wake_ctx = f"{wake_ctx}\n\n{inbox_ctx}" if wake_ctx else inbox_ctx
-            if commit:
-                comms.mark_read(agent_name, [m.id for m in inbox_messages])
 
         # Inject open task summary
         try:
@@ -3070,9 +3049,8 @@ def create_api(
         async def _on_response(turn_result):
             # #279: agent-to-agent reply auto-routing. If this completed turn was
             # an injected agent message (platform == "agent"), deliver its text to
-            # the requesting agent's inbox and stop — loop-safe (inbox write, no
-            # live inject). Must run BEFORE the empty-chat_id early-return, which
-            # is what used to silently drop these turns.
+            # the requesting agent via a one-way live inject and stop. Must run
+            # BEFORE the empty-chat_id early-return.
             if await broker.route_agent_reply(comms, turn_result):
                 return
             if not turn_result.chat_id:
@@ -3639,10 +3617,8 @@ def create_api(
             resume_handle=resume_id,
             # commit=False here: the connect-time rebuild via
             # ``wake_context_builder`` is the delivered (committed) build
-            # that consumes inbox + restart_manifest. An eager committed
-            # build here would consume both before the delivered one
-            # runs, leaving the actual wake prompt without unread inbox
-            # or restart-manifest content (Murzik P1#1).
+            # that consumes restart_manifest. An eager committed build here
+            # would consume it before the delivered one runs.
             wake_context=_build_streaming_wake_context(agent_name, commit=False),
             wake_context_builder=_build_streaming_wake_context,
             on_wake_delivered=_log_agent_wake_event,
@@ -4407,7 +4383,7 @@ def create_api(
         # peer CRUD + operator diagnostics).
         "/analytics",      # agent usage/cost analytics (dashboard)
         "/api/migrate",    # OpenClaw migration (admin)
-        "/comms",          # inter-agent comms inboxes/messages
+        "/comms",          # inter-agent comms audit/messages
         "/dreams",         # dream-runner data
         "/federation",     # federation peer CRUD (local management)
         "/mesh",           # mesh operator diagnostics (local)
@@ -5753,20 +5729,19 @@ npm run build</pre>
 
     @app.get("/sessions/{session_id}/inbox")
     async def get_inbox(session_id: str, unread_only: bool = True, limit: int = 50):
-        """Get a session's inbox — messages from other agents."""
-        messages = comms.get_inbox(session_id, unread_only=unread_only, limit=limit)
+        """Return an empty compatibility response; agent inboxes are deprecated."""
         return {
             "session_id": session_id,
-            "messages": [m.to_dict() for m in messages],
-            "count": len(messages),
-            "unread": comms.unread_count(session_id),
+            "messages": [],
+            "count": 0,
+            "unread": 0,
+            "deprecated": True,
         }
 
     @app.post("/sessions/{session_id}/inbox/read")
     async def mark_inbox_read(session_id: str, message_ids: list[int] | None = None):
-        """Mark messages as read. Pass message_ids or omit to mark all."""
-        count = comms.mark_read(session_id, message_ids)
-        return {"marked": count}
+        """Return an inert compatibility response; agent inboxes are deprecated."""
+        return {"marked": 0, "deprecated": True}
 
     @app.get("/sessions/{session_id}/inbox/{message_id}/thread")
     async def get_message_thread(session_id: str, message_id: int):
@@ -5792,8 +5767,8 @@ npm run build</pre>
 
     @app.get("/comms/inboxes")
     async def get_inbox_summaries():
-        """Get unread message counts per agent."""
-        return {"inboxes": comms.get_all_inbox_summaries()}
+        """Return no summaries; agent inboxes are deprecated."""
+        return {"inboxes": [], "deprecated": True}
 
     @app.post("/groups")
     async def create_group(req: CreateGroupRequest):
@@ -9304,7 +9279,8 @@ npm run build</pre>
         # cross-agent surface. No-op for non-isolated callers and for
         # operator/browser sessions (no verified internal-agent header).
         _deny_isolated_cross_actor(request, req.from_agent)
-        # Always store in comms DB for audit/visibility
+        # Store in the messages table for audit/visibility. Agent inboxes are
+        # deprecated, so this creates no durable delivery copy.
         msg = comms.send(
             req.from_agent, name, req.message,
             metadata=req.metadata,
@@ -9315,9 +9291,12 @@ npm run build</pre>
         delivered, confirmed = await broker.inject_agent_message(
             req.from_agent, name, req.message,
         )
-        # Auto-wake sleeping agents on inter-agent messages
+        # Auto-wake sleeping agents, or retry after a failed live handoff.
         if not delivered:
-            _log(f"api: agent message {req.from_agent} -> {name} — target offline, auto-waking")
+            _log(
+                f"api: agent message {req.from_agent} -> {name} "
+                "not live-delivered, ensuring session"
+            )
             try:
                 streaming = await _ensure_streaming_session(name, label="main")
                 if streaming and streaming.state == TransportSessionState.CONNECTED:
@@ -9328,34 +9307,11 @@ npm run build</pre>
                         _log(f"api: agent message delivered after auto-wake {name}")
             except Exception as e:
                 _log(f"api: auto-wake failed for {name}: {e}")
-        # Fail-closed retire: only mark the durable inbox copy read when the
-        # inject POSITIVELY confirmed consumption. ``confirmed`` comes from the
-        # inject call itself — computed by the broker on the exact session
-        # object that performed the inject (per-call send() handoff AND the
-        # transport capability; Murzik #853 P1 — no second session lookup that
-        # could race a swap, and a transport-static capability can't overrule a
-        # failed handoff, e.g. an SDK query that raised). ``delivered`` alone
-        # (attempt-level) is exactly what black-holed codex-tmux messages: the
-        # row went read=1 while the paste vanished, so check_inbox (unread-only)
-        # never surfaced it. Unconfirmed → the row stays unread+queued and
-        # check_inbox remains the durable backstop.
-        if confirmed:
-            comms.mark_read(name, [msg.id])
-        else:
-            # Left durably queued (unread). Nudge tmux targets to check their
-            # inbox (best-effort, coalesced, PINKYBOT_AGENT_MSG_NOTIFY). No-op
-            # for SDK / offline / unknown transports.
-            try:
-                await broker.notify_unread_agent_messages(comms, name)
-            except Exception as e:
-                _log(f"api: check-inbox nudge for {name} failed: {e}")
-        # ``queued`` stays ``not delivered`` (unchanged tool semantics): it flags
-        # "no live session — will see on wake". A live-injected-but-unconfirmed
-        # tmux delivery is NOT reported as offline; ``confirmed`` carries the
-        # honest "was the durable copy retired?" signal for observability.
+        # Delivery is live-only. ``confirmed`` remains a transport-consumption
+        # observability signal; it no longer controls inbox retirement.
         return {
             "delivered": delivered,
-            "queued": not delivered,
+            "queued": False,
             "confirmed": confirmed,
             "message_id": msg.id,
             "from": req.from_agent,

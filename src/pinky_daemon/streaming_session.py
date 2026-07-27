@@ -254,9 +254,8 @@ class StreamingSession:
     # straight into the live turn stream, and returns a PER-CALL handoff bool
     # (False when the query raised — swallowed + reconnect, #853 P1). The
     # broker confirms an inject only when this capability AND that per-call
-    # handoff are both true, and only then retires (marks read) the durable
-    # comms inbox copy. Contrast TmuxSession (external pane) which sets this
-    # False. See MessageBroker.inject_agent_message / InjectResult.
+    # handoff are both true. Contrast TmuxSession (external pane) which sets
+    # this False. See MessageBroker.inject_agent_message / InjectResult.
     injection_confirms_consumption: bool = True
 
     def __init__(
@@ -1292,9 +1291,8 @@ class StreamingSession:
         self._state_machine._state = SessionState.RECONNECTING
 
         # #591 P1#1 (Murzik round-2): the prior eager refresh here ran
-        # the builder 1-arg (commit=True), consuming inbox + restart-
-        # manifest BEFORE connect() ran its own reason-aware committed
-        # rebuild — same double-consume pattern as the API-layer sites.
+        # the builder 1-arg (commit=True), consuming restart-manifest BEFORE
+        # connect() ran its own reason-aware committed rebuild.
         # Removed entirely: connect() is now the single source-of-truth
         # for both the wake_context body and side-effect consumption.
 

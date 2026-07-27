@@ -25,7 +25,7 @@ The builder is pure: no I/O, no MCP, no broker. ``context_body`` is the
 already-assembled context string from the upstream context collector
 (e.g. ``api._build_streaming_wake_context``) which has the registry /
 broker dependencies and is responsible for saved state, restart manifest,
-freshness warnings, active-channel preamble, inbox/task previews, etc.
+freshness warnings, active-channel preamble, task previews, etc.
 """
 
 from __future__ import annotations
