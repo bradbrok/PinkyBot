@@ -1177,8 +1177,8 @@ class BrokerSlackPoller:
         try:
             # InjectResult: attempt-level ``delivered`` is the right signal
             # here (the Slack card feedback means "routed to agent");
-            # ``confirmed`` is comms-inbox retire semantics and this path has
-            # no comms row to retire.
+            # ``confirmed`` is transport-consumption observability and is not
+            # required for this routing acknowledgement.
             delivered, _confirmed = await self._broker.inject_agent_message(
                 "slack-approval", self._agent_name, msg
             )

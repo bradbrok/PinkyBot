@@ -333,7 +333,6 @@ DEFAULT_HEARTBEAT_PROMPT = (
     "1. Call send_heartbeat(status, context_pct, notes) first "
     "(status: ok/busy/finishing).\n"
     "2. Then be proactive:\n"
-    "   - check_inbox() for messages from other agents\n"
     "   - get_next_task() for pending work\n"
     "   - Follow up on anything you're tracking\n"
     "   - Reach out to the owner if you have updates, ideas, or finished something\n"

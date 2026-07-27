@@ -227,8 +227,8 @@ class TestStreamingSession:
         """#853 P1: StreamingSession.send() reports THIS call's handoff —
         True when client.query() succeeded, False when the exception path was
         taken (swallow + reconnect preserved, no raise). The broker ANDs this
-        with the transport capability to decide whether an injected agent
-        message may retire its durable inbox copy."""
+        with the transport capability to report confirmed consumption for
+        observability."""
         from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
         from pinky_daemon.transport_state import SessionState
 
@@ -1052,19 +1052,14 @@ class TestAPI:
                 assert len(data) == 1
                 assert data[0]["id"] == "adhoc"
 
-    def test_agent_message_tmux_stays_unread_and_nudges(self):
-        """Fail-closed inter-agent delivery (#215 PR3): a tmux-transport
-        target's live-inject does NOT retire the durable inbox copy. The
-        message stays unread, check_inbox still surfaces it, and the target is
-        nudged to read its inbox. This is the codex-tmux black-hole fix."""
+    def test_agent_message_tmux_is_live_only_with_zero_unread_or_nags(self):
+        """A live tmux handoff creates audit bookkeeping but no inbox delivery."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
                 client.post("/agents", json={"name": "murzik", "model": "sonnet"})
 
-                # tmux-style transport: inject is best-effort (not confirmed),
-                # and it exposes the internal-prompt queue used for the nudge.
                 session = self._FakeStreamingSession("murzik", "main")
                 session.injection_confirms_consumption = False
                 nudges: list[tuple[str, str]] = []
@@ -1080,26 +1075,26 @@ class TestAPI:
                 })
                 assert resp.status_code == 200
                 body = resp.json()
-                assert body["delivered"] is True   # live-inject happened
-                assert body["confirmed"] is False  # but not confirmed → not retired
+                assert body["delivered"] is True
+                assert body["confirmed"] is False
+                assert body["queued"] is False
+                assert len(session.sent) == 1
+                assert "review chez#104" in session.sent[0][0]
 
-                # Durable copy remains UNREAD — the whole point of the fix.
-                assert app.state.comms.unread_count("murzik") == 1
-                # ... so check_inbox (unread-only) still returns it.
+                assert app.state.comms.unread_count("murzik") == 0
+                unread_rows = app.state.comms._conn.execute(
+                    "SELECT COUNT(*) FROM inbox WHERE session_id = ? AND read = 0",
+                    ("murzik",),
+                ).fetchone()[0]
+                assert unread_rows == 0
                 inbox = client.get("/sessions/murzik/inbox?unread_only=true").json()
-                msgs = inbox["messages"]
-                assert len(msgs) == 1
-                assert "review chez#104" in msgs[0]["content"]
-                assert msgs[0]["read"] == 0
-                # ... and the target was nudged (once) to check its inbox.
-                assert len(nudges) == 1
-                assert nudges[0][1] == "agent_msg_notify"
-                assert "check_inbox" in nudges[0][0]
+                assert inbox["messages"] == []
+                assert inbox["unread"] == 0
+                assert inbox["deprecated"] is True
+                assert nudges == []
 
-    def test_agent_message_sdk_confirmed_marks_read(self):
-        """An in-process (SDK) transport confirms consumption, so the durable
-        copy IS retired (marked read) — preserves the working path's
-        no-repeat-on-wake behavior and avoids duplicates."""
+    def test_agent_message_sdk_confirmation_is_observability_only(self):
+        """SDK confirmation remains visible without creating unread state."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
@@ -1117,15 +1112,11 @@ class TestAPI:
                 body = resp.json()
                 assert body["delivered"] is True
                 assert body["confirmed"] is True
-                # Confirmed handoff → durable copy retired.
+                assert body["queued"] is False
                 assert app.state.comms.unread_count("gemma") == 0
 
-    def test_agent_message_sdk_failed_handoff_stays_unread(self):
-        """#853 P1 regression: the SDK capability is transport-static, but
-        StreamingSession.send() swallows a failed client.query() (reconnect,
-        no raise) and reports handoff=False. That exact message must NOT be
-        retired: durable row stays unread, response says confirmed=false, and
-        the nudge no-ops for SDK (no internal-prompt queue)."""
+    def test_agent_message_sdk_failed_handoff_is_not_queued(self):
+        """A failed live handoff remains audited but is not inbox-queued."""
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
@@ -1149,14 +1140,13 @@ class TestAPI:
                 })
                 assert resp.status_code == 200
                 body = resp.json()
-                assert body["delivered"] is True   # attempt-level unchanged
-                assert body["confirmed"] is False  # handoff failed → no retire
-                # No mark_read — the message is still visible to check_inbox.
-                assert app.state.comms.unread_count("gemma") == 1
+                assert body["delivered"] is False
+                assert body["confirmed"] is False
+                assert body["queued"] is False
+                assert app.state.comms.unread_count("gemma") == 0
                 inbox = client.get("/sessions/gemma/inbox?unread_only=true").json()
-                assert len(inbox["messages"]) == 1
-                assert "important verdict" in inbox["messages"][0]["content"]
-                # SDK session has no tmux internal-prompt queue → no nudge.
+                assert inbox["messages"] == []
+                assert inbox["deprecated"] is True
                 assert app.state.broker._stats["nudged"] == 0
 
     def test_register_isolation_mode_round_trips(self):
@@ -7167,7 +7157,7 @@ class TestBuildStreamingWakeContextReasonGating:
     On any other reason (CONTEXT_RESTART / AUTO_RESTART / NEW_SESSION /
     IDLE_WAKE) the full manifest is emitted as before.
 
-    Transient context (inbox, tasks, channels, dreams, restart manifest)
+    Transient context (tasks, channels, dreams, restart manifest)
     is fresh per-wake and continues to fire on RESUME — only the saved
     manifest is gated.
     """
@@ -7386,11 +7376,10 @@ class TestBuildStreamingWakeContextReasonGating:
             assert "WARNING: Saved continuation context" not in out
 
     def test_resume_preserves_channel_context(self):
-        """Transient context (channel preamble, inbox, tasks, dreams,
+        """Transient context (channel preamble, tasks, dreams,
         restart manifest) is fresh per wake and continues to fire on
         RESUME — only the saved-context manifest is gated by reason.
-        The model wouldn't otherwise know about active channels or
-        new inbox messages received while asleep.
+        The model wouldn't otherwise know about active channels.
         """
         from pinky_daemon.wake_prompt import WakeReason
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -7407,48 +7396,31 @@ class TestBuildStreamingWakeContextReasonGating:
             assert "## ⚡ Wake Action" not in out
             assert "## Continuation" not in out
 
-    def test_commit_false_does_not_consume_inbox(self):
-        """#591 P1#1 (Murzik): the eager pre-build at session-config
-        creation time must NOT consume inbox messages — that would
-        leave the delivered (connect-time) rebuild with an empty
-        inbox and a wake prompt missing the new agent messages.
-        """
+    def test_wake_context_never_replays_agent_audit_messages(self):
+        """Audit history is never treated as a wake-time delivery inbox."""
         from pinky_daemon.wake_prompt import WakeReason
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             app.state.agents.register("dymok", model="sonnet")
             app.state.agents.register("barsik", model="sonnet")
-            # barsik sends dymok a message — appears in dymok's inbox.
             app.state.comms.send(
                 from_session="barsik",
                 to_session="dymok",
                 content="Phase 2 plan looks right — ship it",
             )
-            unread_before = len(
-                app.state.comms.get_inbox("dymok", unread_only=True)
-            )
-            assert unread_before == 1
+            assert app.state.comms.get_inbox("dymok", unread_only=True) == []
 
-            # Eager pre-build (commit=False): must NOT mark inbox read.
             out_preview = app.state._build_streaming_wake_context(
                 "dymok", WakeReason.NEW_SESSION, commit=False
             )
-            assert "Phase 2 plan looks right" in out_preview  # content rendered
-            unread_after_preview = len(
-                app.state.comms.get_inbox("dymok", unread_only=True)
-            )
-            assert unread_after_preview == 1  # NOT marked read
+            assert "Phase 2 plan looks right" not in out_preview
 
-            # Delivered build (commit=True): marks inbox read.
             out_delivered = app.state._build_streaming_wake_context(
                 "dymok", WakeReason.NEW_SESSION, commit=True
             )
-            assert "Phase 2 plan looks right" in out_delivered
-            unread_after_delivered = len(
-                app.state.comms.get_inbox("dymok", unread_only=True)
-            )
-            assert unread_after_delivered == 0  # NOW marked read
+            assert "Phase 2 plan looks right" not in out_delivered
+            assert app.state.comms.unread_count("dymok") == 0
 
     def test_commit_false_does_not_consume_restart_manifest(self):
         """#591 P1#1 (Murzik): the eager pre-build must NOT delete

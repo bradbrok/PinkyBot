@@ -50,38 +50,13 @@ _APPROVAL_NOTIFY_POLL_SEC = 5
 
 # #279: agent-to-agent reply auto-routing. ``inject_agent_message`` stamps an
 # injected turn with ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the
-# requester agent name; when that turn completes, ``route_agent_reply`` delivers
-# the recipient's turn text to the requester's INBOX (loop-safe — an inbox write
-# never spawns a live turn, so the exchange can't ping-pong). Kill-switch
-# defaults ON; set ``PINKY_AGENT_REPLY_ROUTING=0`` to revert to the old
-# drop-on-empty-chat_id behavior without a code change.
+# requester agent name; when that turn completes, ``route_agent_reply`` performs
+# a one-way live injection back to the requester. The return injection disables
+# reply routing so the exchange cannot ping-pong.
 AGENT_REPLY_PLATFORM = "agent"
 _AGENT_REPLY_ROUTING_ENABLED = os.environ.get(
     "PINKY_AGENT_REPLY_ROUTING", "1"
 ).strip().lower() not in ("0", "false", "no", "off")
-
-# #215 PR3 / fail-closed inter-agent delivery: when an agent message is left
-# durably queued (unread) for a tmux-transport target, nudge that target to
-# call ``check_inbox`` so it retrieves the message promptly. The nudge is
-# best-effort — the DURABLE truth is the unread comms row; this only makes
-# retrieval timely when the pane is alive. Coalesced (one per burst) and
-# readiness-gated (can't corrupt a mid-turn pane). Default ON; disable with
-# ``PINKYBOT_AGENT_MSG_NOTIFY=0`` to kill a bad interaction without a rollback.
-# NOTE: the fail-closed mark-read fix in the API handler is deliberately NOT
-# gated by this flag — only the notify nudge is.
-_AGENT_MSG_NOTIFY_ENABLED = os.environ.get(
-    "PINKYBOT_AGENT_MSG_NOTIFY", "1"
-).strip().lower() not in ("0", "false", "no", "off")
-
-# Coalesce window for the check-inbox nudge: at most one nudge per target per
-# window, so a burst of messages collapses to a single nudge (never a storm).
-try:
-    _AGENT_MSG_NUDGE_BACKOFF_SEC = float(
-        os.environ.get("PINKYBOT_AGENT_MSG_NUDGE_BACKOFF", "15")
-    )
-except (TypeError, ValueError):
-    _AGENT_MSG_NUDGE_BACKOFF_SEC = 15.0
-
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -90,19 +65,14 @@ def _log(msg: str) -> None:
 class InjectResult(NamedTuple):
     """Outcome of a live agent-message injection attempt.
 
-    ``delivered`` — attempt-level: the target had a CONNECTED session and the
-    inject was handed to its transport (legacy bool semantics; drives the
-    offline auto-wake path and the API's ``queued`` flag).
+    ``delivered`` — the target had a CONNECTED session and that exact session's
+    ``send()`` accepted the message.
 
-    ``confirmed`` — outcome-level: THIS message's handoff was positively
-    confirmed by the exact session object that performed the inject (the
+    ``confirmed`` — the handoff was positively confirmed as consumption by the
+    exact session object that performed the inject (the
     transport's ``injection_confirms_consumption`` capability AND the
-    per-call ``send()`` handoff bool). Only a confirmed inject may retire the
-    durable comms inbox copy (mark it read); anything less keeps the row
-    unread so ``check_inbox`` remains the backstop. (Murzik #853 P1: a
-    transport-static capability alone must never overrule a failed handoff,
-    and confirmation must not come from a second session lookup that can
-    race a session swap.)
+    per-call ``send()`` handoff bool). This remains an observability signal even
+    though the durable comms inbox is deprecated.
     """
 
     delivered: bool
@@ -330,10 +300,6 @@ class MessageBroker:
         self._message_context_stored_at: dict[tuple[str, str, str, str], float] = {}
         self._message_context_order: dict[str, list[tuple[str, str, str, str]]] = {}
         self._message_context_lock = threading.RLock()
-
-        # #215 PR3: last check-inbox nudge time per agent (monotonic seconds),
-        # used to coalesce a burst of inter-agent messages into one nudge.
-        self._agent_msg_nudge_at: dict[str, float] = {}
 
         # Active typing indicator tasks: (agent_name, chat_id) -> asyncio.Task
         self._typing_tasks: dict[tuple[str, str], asyncio.Task] = {}
@@ -1693,7 +1659,12 @@ class MessageBroker:
         _log(f"broker: streamed message to {agent_name} (non-blocking)")
 
     async def inject_agent_message(
-        self, from_agent: str, to_agent: str, message: str,
+        self,
+        from_agent: str,
+        to_agent: str,
+        message: str,
+        *,
+        route_reply: bool = True,
     ) -> InjectResult:
         """Inject a message from one agent into another's streaming session.
 
@@ -1705,11 +1676,14 @@ class MessageBroker:
         capability can't overrule a failed handoff (e.g. StreamingSession's
         swallowed ``client.query`` exception now returns handoff=False), and
         there is no second session lookup that could race a session swap.
-        Fail-closed: a transport that doesn't advertise the capability, or a
-        ``send()`` that doesn't report a truthy handoff, never confirms.
+        ``route_reply=False`` makes the injection one-way by omitting the
+        agent-reply routing sentinel. A transport that doesn't advertise the
+        confirmation capability never confirms, but a truthy per-call handoff
+        still counts as live delivery.
         """
         streaming = self._get_streaming_session(to_agent)
         if not streaming or streaming.state != SessionState.CONNECTED:
+            self._stats["routed_failed"] += 1
             _log(f"broker: can't deliver agent message to {to_agent} — not connected")
             return InjectResult(delivered=False, confirmed=False)
 
@@ -1717,9 +1691,9 @@ class MessageBroker:
         from datetime import timezone as tz
         ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
-        if _AGENT_REPLY_ROUTING_ENABLED:
+        if _AGENT_REPLY_ROUTING_ENABLED and route_reply:
             # #279: encode the requester as the route-back target so the
-            # recipient's completed turn auto-delivers to the requester's inbox
+            # recipient's completed turn auto-delivers live to the requester
             # (see ``route_agent_reply``). The ``platform="agent"`` sentinel is
             # intercepted in the response callback before normal platform
             # routing; ``chat_id`` carries the requester agent name.
@@ -1731,6 +1705,13 @@ class MessageBroker:
         confirmed = bool(handoff) and bool(
             getattr(streaming, "injection_confirms_consumption", False)
         )
+        delivered = bool(handoff)
+        if not delivered:
+            self._stats["routed_failed"] += 1
+            _log(
+                f"broker: agent message handoff failed {from_agent} -> {to_agent}"
+            )
+            return InjectResult(delivered=False, confirmed=False)
         # Server-side presence: successful delivery = agent is reachable
         try:
             self._registry.stamp_last_seen(to_agent)
@@ -1744,64 +1725,8 @@ class MessageBroker:
         return InjectResult(delivered=True, confirmed=confirmed)
 
     async def notify_unread_agent_messages(self, comms, to_agent: str) -> bool:
-        """Best-effort nudge (#215 PR3): tell a tmux-transport agent it has
-        unread inbox messages so it calls ``check_inbox``.
-
-        The durable unread comms rows are the real delivery guarantee; this
-        just makes retrieval timely when the pane is alive. No-op when:
-        - the notify flag (``PINKYBOT_AGENT_MSG_NOTIFY``) is off;
-        - the target has no live tmux session (SDK / offline / unknown
-          transport — nothing to nudge, or its live-inject already confirmed);
-        - there is nothing unread;
-        - a recent nudge is still inside the coalesce window (one nudge per
-          burst, simple backoff).
-
-        The nudge rides the session's readiness-gated internal-prompt queue
-        (``_enqueue_internal_prompt``), so it can't corrupt a half-typed /
-        mid-turn pane, and it is a daemon-internal prompt (not a comms
-        message), so it never enqueues another agent message → no nudge loop.
-        Returns ``True`` iff a nudge was actually enqueued.
-        """
-        if not _AGENT_MSG_NOTIFY_ENABLED:
-            return False
-        session = self._get_streaming_session(to_agent)
-        enqueue = getattr(session, "_enqueue_internal_prompt", None)
-        if session is None or not callable(enqueue):
-            return False  # SDK / offline / unknown transport — no tmux pane
-        if getattr(session, "state", None) != SessionState.CONNECTED:
-            return False
-        try:
-            unread = comms.unread_count(to_agent)
-        except Exception as e:
-            _log(f"broker: unread_count for {to_agent} failed: {e}")
-            return False
-        if unread <= 0:
-            return False
-        now = time.monotonic()
-        last = self._agent_msg_nudge_at.get(to_agent, 0.0)
-        if now - last < _AGENT_MSG_NUDGE_BACKOFF_SEC:
-            return False  # coalesce: a nudge already fired this window
-        # Reserve the window BEFORE the await so concurrent deliveries in the
-        # same burst don't each enqueue a nudge.
-        self._agent_msg_nudge_at[to_agent] = now
-        plural = "s" if unread != 1 else ""
-        nudge = (
-            f"[pinky] {unread} unread agent message{plural} — "
-            f"call check_inbox to read {'them' if unread != 1 else 'it'}."
-        )
-        try:
-            await enqueue(nudge, reason="agent_msg_notify")
-        except Exception as e:
-            # Roll back the reservation so a transient failure can retry.
-            self._agent_msg_nudge_at.pop(to_agent, None)
-            _log(f"broker: check-inbox nudge for {to_agent} failed: {e}")
-            return False
-        self._stats["nudged"] += 1
-        _log(
-            f"broker: nudged {to_agent} — {unread} unread agent "
-            f"message{plural} (check_inbox)"
-        )
-        return True
+        """Return false; unread-agent-message nudges are deprecated."""
+        return False
 
     # ── Response Routing ───────────────────────────────────
 
@@ -1865,18 +1790,16 @@ class MessageBroker:
             await self._send_message(agent_name, platform, chat_id, stripped)
 
     async def route_agent_reply(self, comms, turn_result) -> bool:
-        """Auto-deliver a completed agent-to-agent turn to the requester's inbox.
+        """Auto-deliver a completed agent-to-agent turn live to the requester.
 
         #279: ``inject_agent_message`` stamps injected turns with
         ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the requester
         agent name. When such a turn finishes, the recipient's turn text is
-        delivered to the requester's inbox via ``comms.send`` — the missing
-        return leg that left review verdicts (and every other agent reply)
-        stranded in the recipient's transcript with nowhere to go.
-
-        Loop-safe by construction: this writes to the inbox only and never
-        injects a live turn, so an auto-routed reply cannot itself trigger
-        another routed turn — the exchange terminates.
+        delivered by a one-way live injection. The reply is also stored in the
+        comms messages table for audit/thread history, with only read recipient
+        bookkeeping and no unread inbox state. The return injection sets
+        ``route_reply=False``, so it cannot trigger another auto-routed reply
+        and the exchange terminates.
 
         Returns True when the turn was an agent reply (handled here, caller
         should stop); False for normal platform turns so the caller falls
@@ -1899,10 +1822,18 @@ class MessageBroker:
             return True
         try:
             comms.send(responder, requester, text, metadata={"auto_routed": True})
-            self._stats["routed"] += 1
+            delivered, _confirmed = await self.inject_agent_message(
+                responder, requester, text, route_reply=False
+            )
+            if not delivered:
+                _log(
+                    f"broker: auto-route agent reply {responder} -> {requester} "
+                    "failed: requester has no accepting live session"
+                )
+                return True
             _log(
                 f"broker: auto-routed agent reply {responder} -> {requester} "
-                f"({len(text)} chars)"
+                f"live ({len(text)} chars)"
             )
         except Exception as e:
             # Delivery failed — count it so dropped replies are monitorable

@@ -1486,7 +1486,7 @@ def create_server(
         reply_to: int | None = None,
         priority: str = "normal",
     ) -> str:
-        """Message another agent (delivered immediately or queued if offline).
+        """Message another agent through live delivery only.
         Reply to agent messages here — don't message the owner unless human attention is needed.
         """
         priority_map = {"normal": 0, "high": 1, "urgent": 2}
@@ -1499,8 +1499,11 @@ def create_server(
         })
         if "error" in result:
             return f"Failed to message {to}: {result.get('error', 'unknown')}"
-        if result.get("queued"):
-            return f"Message queued for {to} (they're offline). They'll see it in their inbox when they wake up."
+        if not result.get("delivered"):
+            return (
+                f"Message not delivered to {to} — no live session accepted it. "
+                "Agent inboxes are deprecated, so it was not queued."
+            )
         return f"Message delivered to {to}."
 
     @mcp.tool()
@@ -1616,43 +1619,8 @@ def create_server(
 
     @mcp.tool()
     def check_inbox(unread_only: bool = True, limit: int = 20) -> str:
-        """Read queued messages from other agents. Messages are auto-marked as read when retrieved."""
-        result = _api(
-            "GET",
-            f"/sessions/{agent_name}/inbox?unread_only={'true' if unread_only else 'false'}&limit={limit}",
-        )
-        if "error" in result:
-            return f"Failed to check inbox: {result.get('error', 'unknown')}"
-
-        messages = result.get("messages", [])
-        unread = result.get("unread", 0)
-
-        if not messages:
-            return "Inbox empty — no unread messages."
-
-        # Auto-mark retrieved messages as read
-        msg_ids = [m["id"] for m in messages]
-        _api("POST", f"/sessions/{agent_name}/inbox/read", msg_ids)
-
-        parts = [f"Inbox: {len(messages)} message(s) ({unread} unread total)\n"]
-        for m in messages:
-            sender = m.get("from", "?")
-            content = m.get("content", "")
-            msg_type = m.get("content_type", m.get("type", "text"))
-            priority = m.get("priority", 0)
-            msg_id = m.get("id", "")
-            parent = m.get("parent_message_id")
-
-            header = f"[#{msg_id}] From {sender}"
-            if msg_type != "text":
-                header += f" ({msg_type})"
-            if priority > 0:
-                header += f" {'!' * priority}PRIORITY"
-            if parent:
-                header += f" (reply to #{parent})"
-
-            parts.append(f"{header}\n{content}\n")
-        return "\n".join(parts)
+        """Deprecated compatibility tool; agent messages are delivered live only."""
+        return "Agent inbox deprecated — messages are delivered live only; nothing queued."
 
     @mcp.tool()
     def agent_status(name: str) -> str:

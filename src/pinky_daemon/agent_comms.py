@@ -6,7 +6,9 @@ Enables sessions (agents) to send messages to each other:
 - Broadcast: to all active agents
 
 Messages are stored in SQLite for durability and searchability.
-Each session has an inbox that accumulates messages until read.
+Delivery is handled separately by the daemon's live-injection path. The legacy
+inbox schema remains as read-only recipient bookkeeping for audit/thread
+authorization, but it is never exposed as a delivery inbox.
 """
 
 from __future__ import annotations
@@ -148,6 +150,11 @@ class AgentComms:
             self._conn.execute(
                 "CREATE INDEX IF NOT EXISTS idx_inbox_expires ON inbox(expires_at)"
             )
+            retired = self._conn.execute(
+                "UPDATE inbox SET read = 1 WHERE read = 0"
+            ).rowcount
+            if retired:
+                _log(f"agent_comms: retired {retired} legacy unread inbox row(s)")
             self._conn.execute("COMMIT")
         except Exception:
             self._conn.execute("ROLLBACK")
@@ -274,7 +281,7 @@ class AgentComms:
         priority: int = 0,
         ttl_seconds: int | None = None,
     ) -> AgentMessage:
-        """Internal: store message and deliver to recipients' inboxes."""
+        """Internal: store a message for audit/thread history only."""
         if parent_message_id is not None:
             parent = self._conn.execute(
                 "SELECT 1 FROM messages WHERE id = ?", (parent_message_id,)
@@ -296,19 +303,23 @@ class AgentComms:
         )
         msg_id = cursor.lastrowid
 
-        # Compute expiry for inbox entries
+        # Preserve recipient bookkeeping for group/broadcast thread
+        # authorization and audit history, but never create unread delivery
+        # state. Live injection is the sole delivery path.
         expires_at = (ts + ttl_seconds) if ttl_seconds else None
-
-        # Deliver to each recipient's inbox
         for recipient in recipients:
             self._conn.execute(
-                "INSERT INTO inbox (session_id, message_id, expires_at) VALUES (?, ?, ?)",
+                """INSERT INTO inbox (session_id, message_id, read, expires_at)
+                   VALUES (?, ?, 1, ?)""",
                 (recipient, msg_id, expires_at),
             )
 
         self._conn.commit()
 
-        _log(f"comms: {from_session} -> {to_session} ({message_type}, {len(recipients)} recipients)")
+        _log(
+            f"comms audit: {from_session} -> {to_session} "
+            f"({message_type}, {len(recipients)} addressed; inbox deprecated)"
+        )
 
         return AgentMessage(
             id=msg_id,
@@ -322,6 +333,7 @@ class AgentComms:
             content_type=content_type,
             parent_message_id=parent_message_id,
             priority=priority,
+            read=True,
         )
 
     # ── File Transfer ───────────────────────────────────────
@@ -402,59 +414,16 @@ class AgentComms:
         unread_only: bool = True,
         limit: int = 50,
     ) -> list[AgentMessage]:
-        """Get messages from a session's inbox."""
-        read_filter = "AND i.read = 0" if unread_only else ""
-        now = time.time()
-
-        rows = self._conn.execute(
-            f"""SELECT m.*, i.read, i.id as inbox_id
-                FROM inbox i
-                JOIN messages m ON m.id = i.message_id
-                WHERE i.session_id = ?
-                {read_filter}
-                AND (i.expires_at IS NULL OR i.expires_at > ?)
-                ORDER BY m.priority DESC, m.timestamp DESC
-                LIMIT ?""",
-            (session_id, now, limit),
-        ).fetchall()
-
-        return [self._row_to_message(r) for r in rows]
+        """Return no messages; durable agent inboxes are deprecated."""
+        return []
 
     def mark_read(self, session_id: str, message_ids: list[int] | None = None) -> int:
-        """Mark messages as read in a session's inbox.
-
-        Args:
-            session_id: Session whose inbox to update.
-            message_ids: Specific message IDs to mark. None = mark all.
-
-        Returns:
-            Number of messages marked.
-        """
-        if message_ids is not None:
-            if not message_ids:
-                return 0
-            placeholders = ",".join("?" * len(message_ids))
-            cursor = self._conn.execute(
-                f"""UPDATE inbox SET read = 1
-                    WHERE session_id = ? AND message_id IN ({placeholders}) AND read = 0""",
-                [session_id, *message_ids],
-            )
-        else:
-            cursor = self._conn.execute(
-                "UPDATE inbox SET read = 1 WHERE session_id = ? AND read = 0",
-                (session_id,),
-            )
-
-        self._conn.commit()
-        return cursor.rowcount
+        """Return zero; durable agent inboxes are deprecated."""
+        return 0
 
     def unread_count(self, session_id: str) -> int:
-        """Count unread messages for a session."""
-        row = self._conn.execute(
-            "SELECT COUNT(*) FROM inbox WHERE session_id = ? AND read = 0",
-            (session_id,),
-        ).fetchone()
-        return row[0]
+        """Return zero; durable agent inboxes are deprecated."""
+        return 0
 
     # ── Groups ───────────────────────────────────────────────
 
@@ -549,7 +518,7 @@ class AgentComms:
                     SELECT m.* FROM messages m
                     JOIN thread t ON m.parent_message_id = t.id
                 )
-                SELECT t.*, COALESCE(i.read, 0) as read
+                SELECT t.*, COALESCE(i.read, 1) as read
                 FROM thread t
                 LEFT JOIN inbox i ON i.message_id = t.id AND i.session_id = ?
                 WHERE t.from_session = ? OR t.to_session = ? OR i.session_id IS NOT NULL
@@ -564,7 +533,7 @@ class AgentComms:
                     SELECT m.* FROM messages m
                     JOIN thread t ON m.parent_message_id = t.id
                 )
-                SELECT t.*, 0 as read FROM thread t
+                SELECT t.*, 1 as read FROM thread t
                 ORDER BY t.timestamp ASC
             """
             params = [root_id]
@@ -584,7 +553,7 @@ class AgentComms:
         """
         total = self._conn.execute("SELECT COUNT(*) FROM messages").fetchone()[0]
         rows = self._conn.execute(
-            """SELECT m.*, COALESCE(MAX(i.read), 0) as read
+            """SELECT m.*, COALESCE(MAX(i.read), 1) as read
                FROM messages m
                LEFT JOIN inbox i ON m.id = i.message_id
                GROUP BY m.id
@@ -595,12 +564,8 @@ class AgentComms:
         return [self._row_to_message(r) for r in rows], total
 
     def get_all_inbox_summaries(self) -> list[dict]:
-        """Get unread message count per agent for all agents with inbox entries."""
-        rows = self._conn.execute(
-            "SELECT session_id, COUNT(*) as unread "
-            "FROM inbox WHERE read = 0 GROUP BY session_id",
-        ).fetchall()
-        return [{"agent": r[0], "unread": r[1]} for r in rows]
+        """Return no summaries; durable agent inboxes are deprecated."""
+        return []
 
     def cleanup_expired(self) -> int:
         """Delete expired inbox entries. Returns count deleted."""

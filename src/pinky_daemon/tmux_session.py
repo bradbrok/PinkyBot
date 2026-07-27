@@ -1129,9 +1129,9 @@ class TmuxSession:
     # worker later pastes it into an EXTERNAL tmux pane. A dead / mid-turn /
     # restarted or stale-CONNECTED pane silently drops the paste and the queue
     # is lost on teardown, so a successful inject is NOT a positive handoff.
-    # The durable comms inbox stays the source of truth (fail-closed): the
-    # broker must never mark an agent message read merely because it was
-    # injected here. Inherited by CodexTmuxSession. See
+    # The transport therefore never confirms consumption; agent delivery is
+    # nevertheless live-only with no durable inbox fallback. Inherited by
+    # CodexTmuxSession. See
     # MessageBroker.injection_confirms_consumption.
     injection_confirms_consumption: bool = False
 

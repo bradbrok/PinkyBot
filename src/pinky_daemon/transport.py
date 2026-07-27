@@ -250,8 +250,7 @@ class Transport(Protocol):
             transport's ``injection_confirms_consumption`` class attr
             (``True`` only for in-process SDK streams; ``False`` for
             external-pane tmux/codex transports). The broker combines
-            both into ``InjectResult.confirmed``; only a confirmed inject
-            may retire the durable comms inbox copy.
+            both into ``InjectResult.confirmed`` for observability.
 
         **Caller contract.** Callers must ensure the transport is in
         ``SessionState.CONNECTED`` before invoking ``send``. ``send`` itself

@@ -88,8 +88,8 @@ class CodexSession:
 
     # ``send`` only appends to the in-memory ``_message_queue``; a worker
     # later runs ``codex exec`` out-of-process. Enqueue is NOT consumption,
-    # so an inject through this transport never confirms — the durable comms
-    # inbox copy stays unread until check_inbox. (Explicit for clarity; the
+    # so an inject through this transport never confirms consumption even
+    # though a truthy enqueue is live delivery. (Explicit for clarity; the
     # broker's getattr default is False anyway.) See
     # MessageBroker.inject_agent_message / InjectResult.
     injection_confirms_consumption: bool = False
