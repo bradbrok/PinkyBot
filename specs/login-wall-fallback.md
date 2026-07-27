@@ -6,10 +6,12 @@
 
 Phase 1 turns a silent shared-credential outage into an actionable owner page:
 
-1. The session watchdog captures active tmux panes through each
-   `TmuxSession`'s existing `_TmuxControl`. That preserves the daemon's normal
-   command runner and socket plumbing on every host; the detector does not
-   invoke `nsenter` or construct a second tmux path.
+1. The session watchdog captures active `runtime=claude_sdk`,
+   `transport=tmux` panes through each `TmuxSession`'s existing
+   `_TmuxControl`. Codex-over-tmux is not a Claude credential-fleet member.
+   The existing control preserves the daemon's normal command runner and
+   socket plumbing on every host; the detector does not invoke `nsenter` or
+   construct a second tmux path.
 2. A pane is login-walled when its joined capture contains
    `Paste code here if prompted` or `Select login method`.
 3. The wall must appear on two samples at least 30 seconds apart. One
@@ -26,6 +28,13 @@ Phase 1 turns a silent shared-credential outage into an actionable owner page:
 A confirmed shared wall plus an unclassifiable shared peer is treated as a
 possible fleet incident and paged. This is intentionally fail-closed: a
 redundant page is safer than another silent fleet outage.
+
+Capture failures retain the agent's already-resolved credential cohort;
+unknown callback failures cannot default into the shared fleet. Once every
+affected active registration is definitively clear (or no longer
+eligible/registered), the Phase 1 incident latch and `#902` hold exemption are
+released. Phase 1 does not restart or delete the preserved pane during that
+re-arm transition.
 
 ## Phase 1 operator completion
 
@@ -49,4 +58,6 @@ or flag the pane for operator review before considering recovery complete.
 Automatic owner-reply correlation, literal `send-keys -l` code injection,
 success verification, orphan cleanup, onboarding repair, and serialized
 fleet restart are explicitly deferred. No Phase 2 auto-paste path is enabled
-by this detector.
+by this detector. In particular, current `claude.com/cai` URLs are accepted
+only by the Phase 1 notification extractor and are excluded from the legacy
+flag-gated reply/paste watcher.

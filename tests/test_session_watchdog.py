@@ -823,6 +823,80 @@ class TestLoginWallDetection:
         assert wd.is_login_hold("murzik") is False
 
     @pytest.mark.asyncio
+    async def test_definitive_recovery_rearms_hold_and_later_902_detection(
+        self, make_watchdog,
+    ):
+        """Incident -> clear releases the hold so a later missing pane can page."""
+        alerts = []
+        capture = (self._fixtures / "login_wall_paste_code.txt").read_text()
+        sessions = {
+            "barsik": {"main": FakeSession()},
+            "murzik": {"main": FakeSession()},
+        }
+
+        async def _alert(agent, message):
+            alerts.append((agent, message))
+            return True
+
+        async def _freeze(agent, label, session):
+            return FrozenLoginPane(f"login-hold-{agent}", capture)
+
+        async def _tmux_liveness(agent, label, session):
+            return agent != "barsik", f"pinky-{agent}"
+
+        targets = {
+            name: ("main", registrations["main"])
+            for name, registrations in sessions.items()
+        }
+        positive = {
+            name: LoginWallProbe(wall=True, pane_text=capture)
+            for name in sessions
+        }
+        clear = {
+            name: LoginWallProbe(wall=False)
+            for name in sessions
+        }
+        wd = make_watchdog(
+            sessions=sessions,
+            alert_fn=_alert,
+            login_wall_freeze_fn=_freeze,
+            tmux_liveness_fn=_tmux_liveness,
+        )
+        await wd._evaluate_login_walls(
+            positive,
+            checked_agents=set(positive),
+            targets=targets,
+            now=2_500.0,
+        )
+        await wd._evaluate_login_walls(
+            positive,
+            checked_agents=set(positive),
+            targets=targets,
+            now=2_500.0 + DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+        assert wd.is_login_hold("barsik") is True
+
+        await wd._evaluate_login_walls(
+            clear,
+            checked_agents=set(clear),
+            targets=targets,
+            now=2_600.0,
+        )
+
+        assert wd._login_wall_incident is None
+        assert wd.is_login_hold("barsik") is False
+        assert wd._login_wall_states == {}
+
+        await wd._sweep()
+
+        assert any(
+            agent == "barsik"
+            and "Session liveness mismatch" in message
+            and "pinky-barsik" in message
+            for agent, message in alerts
+        )
+
+    @pytest.mark.asyncio
     async def test_confirmed_wall_plus_uncertain_peer_fails_closed(
         self, make_watchdog,
     ):

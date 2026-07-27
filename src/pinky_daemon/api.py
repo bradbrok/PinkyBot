@@ -10446,19 +10446,19 @@ npm run build</pre>
     ) -> LoginWallProbe | None:
         """Capture and classify one eligible pane through its tmux plumbing."""
         agent = agents.get(agent_name)
+        agent_runtime = str(
+            getattr(agent, "runtime", "") or "claude_sdk"
+        ).strip()
         if (
             not agent
             or not agent.enabled
             or agent.status != "active"
+            or agent_runtime != "claude_sdk"
             or agent.transport != "tmux"
         ):
             return None
         tmux = getattr(session, "_tmux", None)
         capture_pane = getattr(tmux, "capture_pane", None)
-        if not callable(capture_pane):
-            raise RuntimeError(
-                f"active tmux transport {agent_name}/{label} has no tmux control"
-            )
         session_name = (
             str(getattr(tmux, "session_name", "") or "")
             or str(getattr(session, "_session_name", "") or "")
@@ -10471,7 +10471,25 @@ npm run build</pre>
         shared_credentials = (
             _claude_auth_mode(agent_name) == "shared_refresh_file"
         )
-        result = await capture_pane(lines=200, join=True)
+        if not callable(capture_pane):
+            return LoginWallProbe(
+                wall=None,
+                session_name=session_name,
+                shared_credentials=shared_credentials,
+                error=(
+                    f"active Claude tmux transport {agent_name}/{label} "
+                    "has no tmux control"
+                ),
+            )
+        try:
+            result = await capture_pane(lines=200, join=True)
+        except Exception as exc:
+            return LoginWallProbe(
+                wall=None,
+                session_name=session_name,
+                shared_credentials=shared_credentials,
+                error=f"{type(exc).__name__}: {exc}"[:300],
+            )
         if not result.ok:
             return LoginWallProbe(
                 wall=None,

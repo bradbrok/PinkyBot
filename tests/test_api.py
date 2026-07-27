@@ -683,6 +683,177 @@ class TestAPI:
         )
 
     @pytest.mark.asyncio
+    async def test_codex_tmux_never_joins_or_freezes_claude_login_fleet(
+        self, tmp_path,
+    ):
+        """A signature-positive Codex pane is ineligible for #916."""
+        from pinky_daemon.session_watchdog import (
+            DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+        from pinky_daemon.tmux_session import TmuxCommandResult
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        app = self._make_app(str(tmp_path / "test.db"))
+        app.state.agents.register(
+            "alpha-codex",
+            model="gpt-5.6-sol",
+            runtime="codex_cli",
+            transport="tmux",
+            working_dir=str(tmp_path / "alpha-codex"),
+        )
+        app.state.agents.register(
+            "zeta-claude",
+            model="sonnet",
+            runtime="claude_sdk",
+            transport="tmux",
+            working_dir=str(tmp_path / "zeta-claude"),
+        )
+        app.state.agents.set_owner_notification_destinations([
+            {
+                "platform": "telegram",
+                "account_id": "owner-bot",
+                "conversation_id": "owner-chat",
+                "principal_id": "owner",
+            }
+        ])
+        capture = (
+            Path(__file__).parent / "fixtures" / "login_wall_paste_code.txt"
+        ).read_text()
+        ok_capture = TmuxCommandResult(0, capture, "")
+        ok_command = TmuxCommandResult(0, "", "")
+        sessions = {}
+        for agent_name in ("alpha-codex", "zeta-claude"):
+            sessions[agent_name] = SimpleNamespace(
+                state=TransportState.CONNECTED,
+                stats={"state": TransportState.CONNECTED.value},
+                _tmux=SimpleNamespace(
+                    session_name=f"pinky-{agent_name}",
+                    has_session=AsyncMock(return_value=True),
+                    capture_pane=AsyncMock(return_value=ok_capture),
+                    rename_session=AsyncMock(return_value=ok_command),
+                ),
+            )
+            app.state.broker.register_streaming(
+                agent_name, sessions[agent_name], label="main",
+            )
+
+        deliveries = []
+
+        async def _capture(
+            agent_name, platform, chat_id, content, *, account_id="", **kwargs,
+        ):
+            deliveries.append((agent_name, content))
+            return {"sent": True}
+
+        app.state.broker._send_callback = _capture
+        await app.state.watchdog._sweep()
+        app.state.watchdog._login_wall_states[
+            "zeta-claude"
+        ].first_seen_at -= DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER
+        await app.state.watchdog._sweep()
+
+        assert "alpha-codex" not in app.state.watchdog._login_wall_states
+        assert app.state.watchdog._login_wall_incident is None
+        sessions["alpha-codex"]._tmux.capture_pane.assert_not_awaited()
+        sessions["alpha-codex"]._tmux.rename_session.assert_not_awaited()
+        sessions["zeta-claude"]._tmux.rename_session.assert_not_awaited()
+        assert len(deliveries) == 1
+        assert deliveries[0][0] == "zeta-claude"
+        assert "No fleet de-auth is confirmed" in deliveries[0][1]
+
+    @pytest.mark.asyncio
+    async def test_per_agent_capture_timeout_cannot_open_shared_fleet(
+        self, tmp_path, monkeypatch,
+    ):
+        """A known independent OAuth timeout remains outside the shared cohort."""
+        from pinky_daemon.session_watchdog import (
+            DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+        from pinky_daemon.tmux_session import TmuxCommandResult
+        from pinky_daemon.transport_state import SessionState as TransportState
+
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
+        monkeypatch.setenv(
+            "PINKY_CLAUDE_AUTH_MODE_INDIE", "per_agent_oauth",
+        )
+        app = self._make_app(str(tmp_path / "test.db"))
+        for agent_name in ("shared", "indie"):
+            app.state.agents.register(
+                agent_name,
+                model="sonnet",
+                runtime="claude_sdk",
+                transport="tmux",
+                working_dir=str(tmp_path / agent_name),
+            )
+        app.state.agents.set_owner_notification_destinations([
+            {
+                "platform": "telegram",
+                "account_id": "owner-bot",
+                "conversation_id": "owner-chat",
+                "principal_id": "owner",
+            }
+        ])
+        capture = (
+            Path(__file__).parent / "fixtures" / "login_wall_paste_code.txt"
+        ).read_text()
+        ok_capture = TmuxCommandResult(0, capture, "")
+        ok_command = TmuxCommandResult(0, "", "")
+        shared_session = SimpleNamespace(
+            state=TransportState.CONNECTED,
+            stats={"state": TransportState.CONNECTED.value},
+            _tmux=SimpleNamespace(
+                session_name="pinky-shared",
+                has_session=AsyncMock(return_value=True),
+                capture_pane=AsyncMock(return_value=ok_capture),
+                rename_session=AsyncMock(return_value=ok_command),
+            ),
+        )
+        indie_session = SimpleNamespace(
+            state=TransportState.CONNECTED,
+            stats={"state": TransportState.CONNECTED.value},
+            _tmux=SimpleNamespace(
+                session_name="pinky-indie",
+                has_session=AsyncMock(return_value=True),
+                capture_pane=AsyncMock(side_effect=TimeoutError("capture timed out")),
+                rename_session=AsyncMock(return_value=ok_command),
+            ),
+        )
+        app.state.broker.register_streaming(
+            "shared", shared_session, label="main",
+        )
+        app.state.broker.register_streaming(
+            "indie", indie_session, label="main",
+        )
+        timeout_probe = await app.state.watchdog._login_wall_probe_fn(
+            "indie", "main", indie_session,
+        )
+        assert timeout_probe is not None
+        assert timeout_probe.wall is None
+        assert timeout_probe.shared_credentials is False
+        assert "TimeoutError" in timeout_probe.error
+        deliveries = []
+
+        async def _capture(
+            agent_name, platform, chat_id, content, *, account_id="", **kwargs,
+        ):
+            deliveries.append((agent_name, content))
+            return {"sent": True}
+
+        app.state.broker._send_callback = _capture
+        await app.state.watchdog._sweep()
+        app.state.watchdog._login_wall_states[
+            "shared"
+        ].first_seen_at -= DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER
+        await app.state.watchdog._sweep()
+
+        assert app.state.watchdog._login_wall_incident is None
+        shared_session._tmux.rename_session.assert_not_awaited()
+        indie_session._tmux.rename_session.assert_not_awaited()
+        assert len(deliveries) == 1
+        assert deliveries[0][0] == "shared"
+        assert "No fleet de-auth is confirmed" in deliveries[0][1]
+
+    @pytest.mark.asyncio
     async def test_login_wall_no_owner_destination_freezes_and_fails_loud(
         self, tmp_path, caplog, capsys,
     ):

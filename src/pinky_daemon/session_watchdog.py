@@ -527,6 +527,7 @@ class SessionWatchdog:
             return LoginWallProbe(
                 wall=None,
                 session_name=f"pinky-{snap.agent_name}",
+                shared_credentials=False,
                 error=f"{type(exc).__name__}: {exc}",
             )
 
@@ -580,9 +581,30 @@ class SessionWatchdog:
             if agent_name not in checked_agents:
                 del self._login_wall_states[agent_name]
 
-        if self._login_wall_incident is not None:
-            await self._notify_login_wall_incident(now)
-            return
+        incident = self._login_wall_incident
+        if incident is not None:
+            affected = set(incident.agents) | set(incident.uncertain_agents)
+            unresolved = {
+                agent_name
+                for agent_name in affected
+                if agent_name in checked_agents
+                and probes.get(agent_name) is not None
+                and probes[agent_name].wall is not False
+            }
+            if unresolved:
+                await self._notify_login_wall_incident(now)
+                return
+            # Phase 1 never pastes, restarts, or cleans up the preserved pane.
+            # It does need to release its in-process hold once every affected
+            # active registration is definitively normal (or is no longer an
+            # eligible registration). Otherwise #902 is suppressed forever,
+            # including for a later replacement registration with a missing
+            # pane.
+            _log(
+                "watchdog login-wall incident recovered/re-armed for %s",
+                ", ".join(sorted(affected)),
+            )
+            self._login_wall_incident = None
 
         confirmed_shared = sorted(
             agent_name

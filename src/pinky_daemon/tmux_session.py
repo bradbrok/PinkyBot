@@ -69,7 +69,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 
 from pinky_daemon.auth_relay import coordinator as _auth_relay
-from pinky_daemon.auth_relay import extract_oauth_url, looks_like_login_wall
+from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
 from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
@@ -2847,7 +2847,7 @@ class TmuxSession:
                     return
                 res = await self._tmux.capture_pane(lines=40, join=True)
                 text = res.stdout if res.ok and res.stdout else ""
-                url = extract_oauth_url(text)
+                url = extract_relay_oauth_url(text)
                 if url:
                     await self._relay_login_and_inject(url)
                     return

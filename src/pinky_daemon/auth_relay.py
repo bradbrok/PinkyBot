@@ -34,13 +34,17 @@ from typing import Awaitable, Callable, Optional
 
 # ── Pure extractors (no daemon deps — trivially unit-testable) ───────────────
 
-# claude prints an absolute https URL on claude.ai, claude.com, or
-# console.anthropic.com. Current Claude Code builds use
-# ``https://claude.com/cai/oauth/authorize?...`` (#916).
+# Phase 1 detection accepts the current ``claude.com/cai`` URL in addition to
+# the older hosts. The legacy reply/paste relay intentionally uses the narrower
+# regex below: #916 must not make a new URL shape reachable by that Phase 2
+# mutation path.
 # ``[^\s'"]+`` stops at whitespace/quotes; with a ``-J`` (join-wrapped) capture
 # the long URL is contiguous, but we also de-wrap defensively below.
 _OAUTH_URL_RE = re.compile(
     r"https://(?:claude\.ai|claude\.com|console\.anthropic\.com)/[^\s'\"<>]+"
+)
+_RELAY_OAUTH_URL_RE = re.compile(
+    r"https://(?:claude\.ai|console\.anthropic\.com)/[^\s'\"<>]+"
 )
 
 # A pasted login code is a long URL-safe token, optionally ``<code>#<state>``.
@@ -61,6 +65,21 @@ def extract_oauth_url(pane_text: str) -> Optional[str]:
     if not pane_text:
         return None
     m = _OAUTH_URL_RE.search(pane_text)
+    if not m:
+        return None
+    return "".join(m.group(0).split())
+
+
+def extract_relay_oauth_url(pane_text: str) -> Optional[str]:
+    """Return only an OAuth URL supported by the legacy reply/paste relay.
+
+    Current ``claude.com/cai`` URLs belong to the #916 Phase 1 notification
+    lane. Keeping this extractor separate prevents the older flag-gated watcher
+    from opening reply correlation and pasting owner input for that URL shape.
+    """
+    if not pane_text:
+        return None
+    m = _RELAY_OAUTH_URL_RE.search(pane_text)
     if not m:
         return None
     return "".join(m.group(0).split())

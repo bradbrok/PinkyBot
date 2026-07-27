@@ -12,6 +12,10 @@ from pinky_daemon.tmux_session import TmuxCommandResult, TmuxSession, _TmuxContr
 from pinky_daemon.transport_state import SessionState
 
 WALL = "Browse to: https://claude.ai/oauth/authorize?code=true&client_id=abc\n> "
+CURRENT_CAI_WALL = (
+    "Browse to: https://claude.com/cai/oauth/authorize?"
+    "code=true&client_id=abc&state=xyz\n> "
+)
 
 
 def _ok(stdout: str = "") -> TmuxCommandResult:
@@ -106,6 +110,24 @@ async def test_watch_detects_wall_and_relays(monkeypatch):
 
     recorder.assert_awaited_once()
     assert "claude.ai/oauth" in recorder.call_args[0][0]
+
+
+async def test_flag_on_current_cai_wall_never_opens_submits_or_pastes(monkeypatch):
+    """#916 Phase 1 URLs cannot enter the legacy reply/paste relay."""
+    monkeypatch.setenv("PINKY_TMUX_AUTH_RELAY", "1")
+    monkeypatch.setattr(tmux_session, "_AUTH_WALL_DETECT_WINDOW_SEC", 0.03)
+    monkeypatch.setattr(tmux_session, "_AUTH_WALL_POLL_SEC", 0.01)
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    tmux.capture_pane = AsyncMock(return_value=_ok(CURRENT_CAI_WALL))
+    coord = MagicMock(spec=AuthRelayCoordinator)
+    coord.open = AsyncMock()
+    monkeypatch.setattr(tmux_session, "_auth_relay", coord)
+
+    await ss._watch_for_oauth_url()
+
+    coord.open.assert_not_awaited()
+    coord.submit.assert_not_called()
+    tmux.paste_text.assert_not_awaited()
 
 
 async def test_watch_no_wall_exits_without_relay(monkeypatch):
