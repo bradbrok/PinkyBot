@@ -52,6 +52,57 @@ class TestAgentComms:
         assert len(inbox) == 0
         self._cleanup(comms, path)
 
+    # ── has_message_since (#280 agent-reply dedup probe) ─────
+
+    def test_has_message_since_detects_explicit_send(self):
+        comms, path = self._make_comms()
+        import time
+
+        t0 = time.time()
+        comms.send("murzik", "barsik", "LGTM verdict")
+        assert comms.has_message_since("murzik", "barsik", t0) is True
+        # Direction matters: barsik->murzik is a different pair.
+        assert comms.has_message_since("barsik", "murzik", t0) is False
+        self._cleanup(comms, path)
+
+    def test_has_message_since_excludes_auto_routed_by_default(self):
+        comms, path = self._make_comms()
+        import time
+
+        t0 = time.time()
+        # Only an auto-routed copy exists — must NOT count as an explicit send.
+        comms.send("murzik", "barsik", "auto copy", metadata={"auto_routed": True})
+        assert comms.has_message_since("murzik", "barsik", t0) is False
+        # ...but it IS visible when auto-routed rows are included.
+        assert (
+            comms.has_message_since(
+                "murzik", "barsik", t0, exclude_auto_routed=False
+            )
+            is True
+        )
+        self._cleanup(comms, path)
+
+    def test_has_message_since_respects_window(self):
+        comms, path = self._make_comms()
+        import time
+
+        comms.send("murzik", "barsik", "earlier reply")
+        future = time.time() + 100
+        # Nothing was sent at/after a future cutoff.
+        assert comms.has_message_since("murzik", "barsik", future) is False
+        self._cleanup(comms, path)
+
+    def test_has_message_since_legacy_empty_metadata_counts(self):
+        comms, path = self._make_comms()
+        import time
+
+        t0 = time.time()
+        # Default metadata is "{}" — json_extract returns NULL, COALESCE -> 0,
+        # so a normal send (no auto_routed key) is correctly treated as explicit.
+        comms.send("murzik", "barsik", "plain reply")
+        assert comms.has_message_since("murzik", "barsik", t0) is True
+        self._cleanup(comms, path)
+
     def test_mark_read(self):
         comms, path = self._make_comms()
         msg = comms.send("alice", "bob", "Hey!")
