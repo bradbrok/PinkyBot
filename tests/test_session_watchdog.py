@@ -3,20 +3,25 @@ from __future__ import annotations
 
 import logging
 import time
+from pathlib import Path
 
 import pytest
 
 from pinky_daemon.session_watchdog import (
+    DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
     DEFAULT_MCP_CHECKABLE_HEARTBEAT_MAX_AGE,
     DEFAULT_MCP_PROBE_DEADLINE,
     DEFAULT_MCP_UNBOUND_FLOOR,
     DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER,
     DEFAULT_TMUX_LIVENESS_REARM_AFTER,
+    FrozenLoginPane,
+    LoginWallProbe,
     SessionWatchdog,
     WatchdogConfig,
     _AgentState,
     _SessionSnapshot,
     compute_mcp_checkable,
+    pane_has_login_wall,
 )
 from pinky_daemon.transport_state import SessionState
 
@@ -647,6 +652,271 @@ class TestTmuxLivenessReconciliation:
 
         assert alerts == []
         assert "tmux liveness check failed for billie/main" in caplog.text
+
+
+class TestLoginWallDetection:
+    """#916 Phase 1 — joined captures, debounce, fleet hold, and owner page."""
+
+    _fixtures = Path(__file__).parent / "fixtures"
+
+    @pytest.mark.parametrize(
+        "fixture_name",
+        ["login_wall_paste_code.txt", "login_wall_select_method.txt"],
+    )
+    def test_fixture_signatures_are_detected(self, fixture_name):
+        capture = (self._fixtures / fixture_name).read_text()
+        assert pane_has_login_wall(capture) is True
+
+    def test_normal_pane_is_not_a_wall(self):
+        assert pane_has_login_wall("Kuzya is ready.\n>") is False
+
+    @pytest.mark.asyncio
+    async def test_single_agent_debounces_and_never_freezes(self, make_watchdog):
+        alerts = []
+        freezes = []
+        capture = (self._fixtures / "login_wall_paste_code.txt").read_text()
+
+        async def _alert(agent, message):
+            alerts.append((agent, message))
+            return True
+
+        async def _freeze(agent, label, session):
+            freezes.append(agent)
+            return FrozenLoginPane("login-hold-barsik", capture)
+
+        session = FakeSession()
+        target = {"barsik": ("main", session)}
+        probe = {
+            "barsik": LoginWallProbe(
+                wall=True,
+                pane_text=capture,
+                session_name="pinky-barsik",
+            )
+        }
+        wd = make_watchdog(
+            alert_fn=_alert,
+            login_wall_freeze_fn=_freeze,
+        )
+        await wd._evaluate_login_walls(
+            probe, checked_agents={"barsik"}, targets=target, now=1_000.0,
+        )
+        await wd._evaluate_login_walls(
+            probe,
+            checked_agents={"barsik"},
+            targets=target,
+            now=1_000.0 + DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER - 1,
+        )
+        assert alerts == []
+
+        await wd._evaluate_login_walls(
+            probe,
+            checked_agents={"barsik"},
+            targets=target,
+            now=1_000.0 + DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+        assert freezes == []
+        assert len(alerts) == 1
+        assert "No fleet de-auth is confirmed" in alerts[0][1]
+        assert "no tmux pane was renamed" in alerts[0][1]
+
+    @pytest.mark.asyncio
+    async def test_clear_sample_resets_consecutive_debounce(self, make_watchdog):
+        alerts = []
+        capture = (self._fixtures / "login_wall_paste_code.txt").read_text()
+
+        async def _alert(agent, message):
+            alerts.append(message)
+            return True
+
+        session = FakeSession()
+        target = {"barsik": ("main", session)}
+        positive = {
+            "barsik": LoginWallProbe(wall=True, pane_text=capture)
+        }
+        clear = {"barsik": LoginWallProbe(wall=False)}
+        wd = make_watchdog(alert_fn=_alert)
+        await wd._evaluate_login_walls(
+            positive, checked_agents={"barsik"}, targets=target, now=1_000.0,
+        )
+        await wd._evaluate_login_walls(
+            clear, checked_agents={"barsik"}, targets=target, now=1_020.0,
+        )
+        await wd._evaluate_login_walls(
+            positive, checked_agents={"barsik"}, targets=target, now=1_050.0,
+        )
+
+        assert alerts == []
+        assert wd._login_wall_states["barsik"].first_seen_at == 1_050.0
+        assert wd._login_wall_states["barsik"].confirmed is False
+
+    @pytest.mark.asyncio
+    async def test_fleet_freezes_before_notify_and_includes_joined_url(
+        self, make_watchdog,
+    ):
+        events = []
+        alerts = []
+        first_capture = (
+            self._fixtures / "login_wall_paste_code.txt"
+        ).read_text()
+        second_capture = (
+            self._fixtures / "login_wall_select_method.txt"
+        ).read_text()
+
+        async def _alert(agent, message):
+            events.append("notify")
+            alerts.append((agent, message))
+            return True
+
+        async def _freeze(agent, label, session):
+            events.append("freeze")
+            return FrozenLoginPane(
+                hold_session_name=f"login-hold-{agent}",
+                pane_text=first_capture,
+            )
+
+        sessions = {"barsik": FakeSession(), "murzik": FakeSession()}
+        targets = {
+            name: ("main", session) for name, session in sessions.items()
+        }
+        probes = {
+            "barsik": LoginWallProbe(
+                wall=True,
+                pane_text=first_capture,
+                session_name="pinky-barsik",
+            ),
+            "murzik": LoginWallProbe(
+                wall=True,
+                pane_text=second_capture,
+                session_name="pinky-murzik",
+            ),
+        }
+        wd = make_watchdog(
+            alert_fn=_alert,
+            login_wall_freeze_fn=_freeze,
+        )
+        await wd._evaluate_login_walls(
+            probes,
+            checked_agents=set(probes),
+            targets=targets,
+            now=2_000.0,
+        )
+        assert events == []
+
+        await wd._evaluate_login_walls(
+            probes,
+            checked_agents=set(probes),
+            targets=targets,
+            now=2_000.0 + DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+
+        assert events == ["freeze", "notify"]
+        assert len(alerts) == 1
+        message = alerts[0][1]
+        assert "Fleet Claude login wall detected" in message
+        assert "login-hold-barsik" in message
+        assert (
+            "https://claude.com/cai/oauth/authorize?"
+            "client_id=test-client&code=true&state=fixture-state-123"
+        ) in message
+        assert "reply with the exact code#state string" in message
+        assert wd.is_login_hold("barsik") is True
+        assert wd.is_login_hold("murzik") is False
+
+    @pytest.mark.asyncio
+    async def test_confirmed_wall_plus_uncertain_peer_fails_closed(
+        self, make_watchdog,
+    ):
+        events = []
+        capture = (self._fixtures / "login_wall_paste_code.txt").read_text()
+
+        async def _alert(agent, message):
+            events.append(("notify", message))
+            return True
+
+        async def _freeze(agent, label, session):
+            events.append(("freeze", agent))
+            return FrozenLoginPane(f"login-hold-{agent}", capture)
+
+        targets = {
+            "barsik": ("main", FakeSession()),
+            "murzik": ("main", FakeSession()),
+        }
+        probes = {
+            "barsik": LoginWallProbe(wall=True, pane_text=capture),
+            "murzik": LoginWallProbe(
+                wall=None,
+                shared_credentials=True,
+                error="capture timed out",
+            ),
+        }
+        wd = make_watchdog(
+            alert_fn=_alert,
+            login_wall_freeze_fn=_freeze,
+        )
+        await wd._evaluate_login_walls(
+            probes,
+            checked_agents=set(probes),
+            targets=targets,
+            now=3_000.0,
+        )
+        await wd._evaluate_login_walls(
+            probes,
+            checked_agents=set(probes),
+            targets=targets,
+            now=3_000.0 + DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+
+        assert events[0] == ("freeze", "barsik")
+        assert events[1][0] == "notify"
+        assert "additional unclassified agent(s): murzik" in events[1][1]
+
+    @pytest.mark.asyncio
+    async def test_two_independent_oauth_agents_are_not_a_fleet(
+        self, make_watchdog,
+    ):
+        alerts = []
+        freezes = []
+        capture = (self._fixtures / "login_wall_paste_code.txt").read_text()
+
+        async def _alert(agent, message):
+            alerts.append((agent, message))
+            return True
+
+        async def _freeze(agent, label, session):
+            freezes.append(agent)
+            return FrozenLoginPane(f"login-hold-{agent}", capture)
+
+        probes = {
+            name: LoginWallProbe(
+                wall=True,
+                pane_text=capture,
+                shared_credentials=False,
+            )
+            for name in ("barsik", "murzik")
+        }
+        targets = {
+            name: ("main", FakeSession()) for name in probes
+        }
+        wd = make_watchdog(
+            alert_fn=_alert,
+            login_wall_freeze_fn=_freeze,
+        )
+        await wd._evaluate_login_walls(
+            probes,
+            checked_agents=set(probes),
+            targets=targets,
+            now=4_000.0,
+        )
+        await wd._evaluate_login_walls(
+            probes,
+            checked_agents=set(probes),
+            targets=targets,
+            now=4_000.0 + DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER,
+        )
+
+        assert freezes == []
+        assert len(alerts) == 2
+        assert all("No fleet de-auth is confirmed" in msg for _, msg in alerts)
 
 
 class TestStatus:

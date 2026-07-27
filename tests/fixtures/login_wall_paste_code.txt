@@ -1,0 +1,6 @@
+Claude Code needs you to finish signing in.
+
+Open this URL in your browser:
+https://claude.com/cai/oauth/authorize?client_id=test-client&code=true&state=fixture-state-123
+
+Paste code here if prompted >

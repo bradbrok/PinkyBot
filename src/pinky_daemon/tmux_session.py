@@ -595,6 +595,18 @@ class _TmuxControl:
             return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
         return result
 
+    async def rename_session(self, new_name: str) -> TmuxCommandResult:
+        """Rename the owned session without retargeting this control object.
+
+        #916 uses this as a freeze primitive: the daemon/supervisor continues to
+        look for ``pinky-<agent>`` while the preserved OAuth pane lives under
+        ``login-hold-<agent>``. Keeping ``self.session_name`` unchanged is
+        therefore intentional.
+        """
+        return await self._run(
+            "rename-session", "-t", self.session_name, new_name,
+        )
+
     async def resize_window(
         self, *, cols: int, rows: int,
     ) -> TmuxCommandResult:
@@ -720,7 +732,12 @@ class _TmuxControl:
         return await self._run("send-keys", "-t", self.session_name, "Enter")
 
     async def capture_pane(
-        self, *, lines: int = 200, escapes: bool = False, join: bool = False,
+        self,
+        *,
+        lines: int = 200,
+        escapes: bool = False,
+        join: bool = False,
+        target_session: str = "",
     ) -> TmuxCommandResult:
         """Capture the last ``lines`` lines of the pane's visible content.
 
@@ -741,7 +758,7 @@ class _TmuxControl:
         """
         args = [
             "capture-pane",
-            "-t", self.session_name,
+            "-t", target_session or self.session_name,
             "-p",  # print to stdout instead of paste buffer
         ]
         if escapes:

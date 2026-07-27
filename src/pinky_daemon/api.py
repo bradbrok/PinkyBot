@@ -144,9 +144,12 @@ from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import (
+    FrozenLoginPane,
+    LoginWallProbe,
     SessionWatchdog,
     WatchdogConfig,
     compute_mcp_checkable,
+    pane_has_login_wall,
 )
 from pinky_daemon.sessions import (
     SessionManager,
@@ -10418,6 +10421,11 @@ npm run build</pre>
             or agent.transport != "tmux"
         ):
             return None
+        # #916 deliberately removes the preserved OAuth pane from its expected
+        # ``pinky-<agent>`` name. Do not mis-page that intentional hold as the
+        # #902 dead-registered failure class on the next sweep.
+        if watchdog.is_login_hold(agent_name):
+            return None
         tmux = getattr(session, "_tmux", None)
         has_session = getattr(tmux, "has_session", None)
         if not callable(has_session):
@@ -10430,6 +10438,98 @@ npm run build</pre>
             or f"pinky-{agent_name}"
         )
         return bool(await has_session()), session_name
+
+    async def _watchdog_login_wall_probe(
+        agent_name: str,
+        label: str,
+        session: Any,
+    ) -> LoginWallProbe | None:
+        """Capture and classify one eligible pane through its tmux plumbing."""
+        agent = agents.get(agent_name)
+        if (
+            not agent
+            or not agent.enabled
+            or agent.status != "active"
+            or agent.transport != "tmux"
+        ):
+            return None
+        tmux = getattr(session, "_tmux", None)
+        capture_pane = getattr(tmux, "capture_pane", None)
+        if not callable(capture_pane):
+            raise RuntimeError(
+                f"active tmux transport {agent_name}/{label} has no tmux control"
+            )
+        session_name = (
+            str(getattr(tmux, "session_name", "") or "")
+            or str(getattr(session, "_session_name", "") or "")
+            or f"pinky-{agent_name}"
+        )
+        # Resolve the credential cohort before capture so even a failed command
+        # is classified correctly for fail-closed fleet handling.
+        from pinky_daemon.tmux_session import _claude_auth_mode
+
+        shared_credentials = (
+            _claude_auth_mode(agent_name) == "shared_refresh_file"
+        )
+        result = await capture_pane(lines=200, join=True)
+        if not result.ok:
+            return LoginWallProbe(
+                wall=None,
+                session_name=session_name,
+                shared_credentials=shared_credentials,
+                error=(
+                    result.stderr.strip()
+                    or f"capture-pane exited {result.returncode}"
+                )[:300],
+            )
+        pane_text = result.stdout or ""
+        return LoginWallProbe(
+            wall=pane_has_login_wall(pane_text),
+            pane_text=pane_text,
+            session_name=session_name,
+            shared_credentials=shared_credentials,
+        )
+
+    async def _watchdog_login_wall_freeze(
+        agent_name: str,
+        label: str,
+        session: Any,
+    ) -> FrozenLoginPane:
+        """Rename one positive pane first, then recapture its joined OAuth URL."""
+        tmux = getattr(session, "_tmux", None)
+        rename_session = getattr(tmux, "rename_session", None)
+        capture_pane = getattr(tmux, "capture_pane", None)
+        if not callable(rename_session) or not callable(capture_pane):
+            raise RuntimeError(
+                f"active tmux transport {agent_name}/{label} lacks freeze plumbing"
+            )
+        safe_agent = re.sub(r"[^A-Za-z0-9_.-]", "-", agent_name)
+        hold_session_name = f"login-hold-{safe_agent}"
+        rename_result = await rename_session(hold_session_name)
+        if not rename_result.ok:
+            detail = (
+                rename_result.stderr.strip()
+                or f"rename-session exited {rename_result.returncode}"
+            )
+            raise RuntimeError(detail[:300])
+
+        capture_result = await capture_pane(
+            lines=200,
+            join=True,
+            target_session=hold_session_name,
+        )
+        if capture_result.ok:
+            return FrozenLoginPane(
+                hold_session_name=hold_session_name,
+                pane_text=capture_result.stdout or "",
+            )
+        return FrozenLoginPane(
+            hold_session_name=hold_session_name,
+            capture_error=(
+                capture_result.stderr.strip()
+                or f"capture-pane exited {capture_result.returncode}"
+            )[:300],
+        )
 
     def _watchdog_mcp_bind_status(agent_name: str) -> dict:
         """Bind-status for the watchdog's #663 MCP-recover check.
@@ -10544,6 +10644,8 @@ npm run build</pre>
         mcp_bind_status_fn=_watchdog_mcp_bind_status,
         mcp_recover_fn=_watchdog_mcp_recover,
         tmux_liveness_fn=_watchdog_tmux_liveness,
+        login_wall_probe_fn=_watchdog_login_wall_probe,
+        login_wall_freeze_fn=_watchdog_login_wall_freeze,
     )
     # Test/diagnostic reach-in, matching app.state.broker/agents.
     app.state.watchdog = watchdog

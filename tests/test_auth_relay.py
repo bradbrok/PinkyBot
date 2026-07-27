@@ -31,6 +31,11 @@ def test_extract_oauth_url_console_anthropic():
     assert extract_oauth_url(f"visit {url} now") == url
 
 
+def test_extract_oauth_url_current_claude_com_cai_path():
+    url = "https://claude.com/cai/oauth/authorize?client_id=abc&state=xyz"
+    assert extract_oauth_url(f"visit {url} now") == url
+
+
 def test_extract_oauth_url_dewraps_whitespace():
     # tmux may wrap a long URL across terminal columns.
     wrapped = "https://claude.ai/oauth/authorize?code=true&\n   client_id=verylongvalue123"

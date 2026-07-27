@@ -34,11 +34,13 @@ from typing import Awaitable, Callable, Optional
 
 # ── Pure extractors (no daemon deps — trivially unit-testable) ───────────────
 
-# claude prints an absolute https URL on claude.ai / console.anthropic.com.
+# claude prints an absolute https URL on claude.ai, claude.com, or
+# console.anthropic.com. Current Claude Code builds use
+# ``https://claude.com/cai/oauth/authorize?...`` (#916).
 # ``[^\s'"]+`` stops at whitespace/quotes; with a ``-J`` (join-wrapped) capture
 # the long URL is contiguous, but we also de-wrap defensively below.
 _OAUTH_URL_RE = re.compile(
-    r"https://(?:claude\.ai|console\.anthropic\.com)/[^\s'\"<>]+"
+    r"https://(?:claude\.ai|claude\.com|console\.anthropic\.com)/[^\s'\"<>]+"
 )
 
 # A pasted login code is a long URL-safe token, optionally ``<code>#<state>``.

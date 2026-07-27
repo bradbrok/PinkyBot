@@ -104,6 +104,7 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     tmux.has_session = AsyncMock(return_value=has_session_initial)
     tmux.new_session = AsyncMock(return_value=_ok())
     tmux.kill_session = AsyncMock(return_value=_ok())
+    tmux.rename_session = AsyncMock(return_value=_ok())
     tmux.send_keys = AsyncMock(return_value=_ok())
     tmux.paste_text = AsyncMock(return_value=_ok())
     tmux.capture_pane = AsyncMock(return_value=_ok())
@@ -786,6 +787,45 @@ async def test_capture_pane_with_escapes_adds_e_flag() -> None:
     tmux._run = fake_run
     await tmux.capture_pane(lines=200, escapes=True)
     assert "-e" in calls[0]
+
+
+@pytest.mark.asyncio
+async def test_capture_pane_joined_hold_target_adds_j_and_uses_target() -> None:
+    """#916 recaptures the renamed pane with ``-J`` to preserve its long URL."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.capture_pane(
+        lines=200,
+        join=True,
+        target_session="login-hold-test",
+    )
+    assert "-J" in calls[0]
+    assert calls[0][calls[0].index("-t") + 1] == "login-hold-test"
+
+
+@pytest.mark.asyncio
+async def test_rename_session_freezes_without_retargeting_control() -> None:
+    """The supervisor must keep tracking the old name after #916's rename."""
+    tmux = _TmuxControl("pinky-test")
+    calls: list[tuple[str, ...]] = []
+
+    async def fake_run(*args, timeout=5.0):
+        calls.append(args)
+        return _ok()
+
+    tmux._run = fake_run
+    await tmux.rename_session("login-hold-test")
+
+    assert calls == [
+        ("rename-session", "-t", "pinky-test", "login-hold-test")
+    ]
+    assert tmux.session_name == "pinky-test"
 
 
 # ──────────────────────────────────────────────────────────────────────────
