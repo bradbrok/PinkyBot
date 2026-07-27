@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Coroutine
 
+from pinky_daemon.auth_relay import extract_oauth_url
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
 
@@ -88,6 +89,21 @@ DEFAULT_TMUX_LIVENESS_NOTIFY_RETRY_AFTER = 60
 # out across adjacent 60s sweeps therefore produces one page, while a genuinely
 # new outage after a stable recovery still alerts.
 DEFAULT_TMUX_LIVENESS_REARM_AFTER = 300  # 5 min continuously healthy
+# #916: a login wall must persist across two samples separated by this interval.
+# The normal watchdog sweep is 60s, but keeping the policy explicit makes faster
+# test/canary intervals safe.
+DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER = 30
+DEFAULT_LOGIN_WALL_NOTIFY_RETRY_AFTER = 60
+LOGIN_WALL_SIGNATURES = (
+    "Paste code here if prompted",
+    "Select login method",
+)
+
+
+def pane_has_login_wall(pane_text: str) -> bool:
+    """Return True when a joined tmux capture contains a stable login-wall cue."""
+    folded = pane_text.casefold()
+    return any(signature.casefold() in folded for signature in LOGIN_WALL_SIGNATURES)
 
 
 def compute_mcp_checkable(
@@ -254,6 +270,66 @@ class _TmuxLivenessState:
     last_checked_at: float = 0.0
 
 
+@dataclass(frozen=True)
+class LoginWallProbe:
+    """One daemon-plumbing observation of an eligible tmux pane (#916).
+
+    ``wall=None`` means the pane could not be classified. It is deliberately
+    distinct from ``False``: uncertainty must not erase a previously confirmed
+    auth outage.
+    """
+
+    wall: bool | None
+    pane_text: str = ""
+    session_name: str = ""
+    shared_credentials: bool = True
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class FrozenLoginPane:
+    """Result of renaming one positively walled pane, then recapturing it."""
+
+    hold_session_name: str
+    pane_text: str = ""
+    capture_error: str = ""
+
+
+@dataclass
+class _LoginWallAgentState:
+    """Debounce and delivery state for one positively observed pane."""
+
+    first_seen_at: float = 0.0
+    last_seen_at: float = 0.0
+    confirmed: bool = False
+    session_name: str = ""
+    pane_text: str = ""
+    url: str = ""
+    shared_credentials: bool = True
+    label: str = ""
+    session: Any = None
+    single_notified: bool = False
+    single_last_notify_attempt_at: float = 0.0
+    single_notification_attempts: int = 0
+
+
+@dataclass
+class _LoginWallIncident:
+    """One fleet-level login-wall incident, including the preserved OAuth pane."""
+
+    agents: tuple[str, ...] = ()
+    uncertain_agents: tuple[str, ...] = ()
+    hold_agent: str = ""
+    hold_session_name: str = ""
+    url: str = ""
+    message: str = ""
+    freeze_succeeded: bool = False
+    freeze_error: str = ""
+    notified: bool = False
+    last_notify_attempt_at: float = 0.0
+    notification_attempts: int = 0
+
+
 class SessionWatchdog:
     """Background service that detects and recovers stuck streaming sessions."""
 
@@ -269,6 +345,14 @@ class SessionWatchdog:
         tmux_liveness_fn: Callable[
             [str, str, Any],
             Coroutine[Any, Any, bool | tuple[bool, str] | None],
+        ] | None = None,
+        login_wall_probe_fn: Callable[
+            [str, str, Any],
+            Coroutine[Any, Any, LoginWallProbe | None],
+        ] | None = None,
+        login_wall_freeze_fn: Callable[
+            [str, str, Any],
+            Coroutine[Any, Any, FrozenLoginPane],
         ] | None = None,
         check_interval: int = DEFAULT_CHECK_INTERVAL,
     ) -> None:
@@ -295,6 +379,16 @@ class SessionWatchdog:
                 tmux-transport agent. ``None`` skips non-tmux agents. Detection
                 is alert-only; this callback is never used to respawn or
                 otherwise mutate a session.
+            login_wall_probe_fn:
+                ``async (agent_name, label, session) -> LoginWallProbe | None``.
+                Uses the session's already-selected tmux control/command runner
+                to capture and classify the pane. ``None`` skips ineligible
+                agents; ``probe.wall=None`` is a fail-closed uncertainty.
+            login_wall_freeze_fn:
+                ``async (agent_name, label, session) -> FrozenLoginPane``.
+                Renames one positively walled tmux session before recapturing
+                its URL. It is called once per fleet incident and always before
+                the first owner notification.
             check_interval:
                 Seconds between sweeps.
         """
@@ -307,10 +401,14 @@ class SessionWatchdog:
         self._mcp_bind_status_fn = mcp_bind_status_fn
         self._mcp_recover_fn = mcp_recover_fn
         self._tmux_liveness_fn = tmux_liveness_fn
+        self._login_wall_probe_fn = login_wall_probe_fn
+        self._login_wall_freeze_fn = login_wall_freeze_fn
         self._interval = check_interval
 
         self._states: dict[str, _AgentState] = {}
         self._tmux_liveness_states: dict[str, _TmuxLivenessState] = {}
+        self._login_wall_states: dict[str, _LoginWallAgentState] = {}
+        self._login_wall_incident: _LoginWallIncident | None = None
         self._last_mcp_recover_at: float = 0.0  # global MCP-recover rate-limit
         self._task: asyncio.Task | None = None
         self._running = False
@@ -360,6 +458,9 @@ class SessionWatchdog:
         now = time.time()
         seen_keys: set[tuple[str, str]] = set()
         tmux_checked_agents: set[str] = set()
+        login_wall_checked_agents: set[str] = set()
+        login_wall_probes: dict[str, LoginWallProbe] = {}
+        login_wall_targets: dict[str, tuple[str, Any]] = {}
 
         for agent_name, sessions in list(streaming.items()):
             for label, ss in list(sessions.items()):
@@ -374,6 +475,14 @@ class SessionWatchdog:
                     )
                     if checked:
                         tmux_checked_agents.add(agent_name)
+                if snap.connected and agent_name not in login_wall_checked_agents:
+                    probe = await self._probe_login_wall(
+                        snap, ss,
+                    )
+                    if probe is not None:
+                        login_wall_probes[agent_name] = probe
+                        login_wall_targets[agent_name] = (label, ss)
+                    login_wall_checked_agents.add(agent_name)
                 await self._evaluate(snap, now)
 
         # Clean up state for sessions no longer streaming
@@ -390,6 +499,283 @@ class SessionWatchdog:
                 await self._evaluate_tmux_liveness(
                     agent_name, alive=True, now=now,
                 )
+
+        await self._evaluate_login_walls(
+            login_wall_probes,
+            checked_agents=login_wall_checked_agents,
+            targets=login_wall_targets,
+            now=now,
+        )
+
+    async def _probe_login_wall(
+        self,
+        snap: _SessionSnapshot,
+        ss: Any,
+    ) -> LoginWallProbe | None:
+        """Capture/classify one active registration without bypassing tmux rails."""
+        if self._login_wall_probe_fn is None or not snap.connected:
+            return None
+        try:
+            return await self._login_wall_probe_fn(
+                snap.agent_name, snap.label, ss,
+            )
+        except Exception as exc:
+            _warn(
+                "watchdog login-wall probe failed for %s/%s: %s",
+                snap.agent_name, snap.label, exc,
+            )
+            return LoginWallProbe(
+                wall=None,
+                session_name=f"pinky-{snap.agent_name}",
+                shared_credentials=False,
+                error=f"{type(exc).__name__}: {exc}",
+            )
+
+    async def _evaluate_login_walls(
+        self,
+        probes: dict[str, LoginWallProbe],
+        *,
+        checked_agents: set[str],
+        targets: dict[str, tuple[str, Any]],
+        now: float,
+    ) -> None:
+        """Debounce pane walls, distinguish one agent from a fleet, then alert.
+
+        A definitive clear resets that agent's debounce. An uncertain probe
+        preserves prior positive evidence. Once one shared-credential agent is
+        confirmed and a second shared agent is uncertain, fail closed and use
+        the confirmed pane for the fleet hold; the worst outcome is a redundant
+        owner page, while fail-open would repeat #916's silent outage.
+        """
+        for agent_name in checked_agents:
+            probe = probes.get(agent_name)
+            if probe is None:
+                self._login_wall_states.pop(agent_name, None)
+                continue
+            if probe.wall is False:
+                self._login_wall_states.pop(agent_name, None)
+                continue
+            if probe.wall is None:
+                continue
+
+            state = self._login_wall_states.get(agent_name)
+            if state is None:
+                state = _LoginWallAgentState(first_seen_at=now)
+                self._login_wall_states[agent_name] = state
+            state.last_seen_at = now
+            state.session_name = probe.session_name or f"pinky-{agent_name}"
+            state.pane_text = probe.pane_text
+            state.url = extract_oauth_url(probe.pane_text) or state.url
+            state.shared_credentials = probe.shared_credentials
+            # These reach-ins are used only for the one-shot freeze callback in
+            # this process. They are never exposed through status().
+            target = targets.get(agent_name)
+            if target is not None:
+                label, session = target
+                state.label = label
+                state.session = session
+            if (now - state.first_seen_at) >= DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER:
+                state.confirmed = True
+
+        for agent_name in list(self._login_wall_states):
+            if agent_name not in checked_agents:
+                del self._login_wall_states[agent_name]
+
+        incident = self._login_wall_incident
+        if incident is not None:
+            affected = set(incident.agents) | set(incident.uncertain_agents)
+            unresolved = {
+                agent_name
+                for agent_name in affected
+                if agent_name in checked_agents
+                and probes.get(agent_name) is not None
+                and probes[agent_name].wall is not False
+            }
+            if unresolved:
+                await self._notify_login_wall_incident(now)
+                return
+            # Phase 1 never pastes, restarts, or cleans up the preserved pane.
+            # It does need to release its in-process hold once every affected
+            # active registration is definitively normal (or is no longer an
+            # eligible registration). Otherwise #902 is suppressed forever,
+            # including for a later replacement registration with a missing
+            # pane.
+            _log(
+                "watchdog login-wall incident recovered/re-armed for %s",
+                ", ".join(sorted(affected)),
+            )
+            self._login_wall_incident = None
+
+        confirmed_shared = sorted(
+            agent_name
+            for agent_name, state in self._login_wall_states.items()
+            if state.confirmed and state.shared_credentials
+        )
+        uncertain_shared = sorted(
+            agent_name
+            for agent_name, probe in probes.items()
+            if probe.wall is None
+            and probe.shared_credentials
+            and agent_name not in confirmed_shared
+        )
+        fleet_detected = len(confirmed_shared) >= 2 or (
+            len(confirmed_shared) >= 1 and bool(uncertain_shared)
+        )
+        if fleet_detected:
+            await self._open_login_wall_incident(
+                confirmed_shared,
+                uncertain_agents=uncertain_shared,
+                now=now,
+            )
+            return
+
+        # A lone confirmed wall is a per-agent problem, not a fleet de-auth.
+        # Do not orphan/rename its pane; tell the owner exactly that distinction.
+        for agent_name, state in self._login_wall_states.items():
+            if not state.confirmed or state.single_notified:
+                continue
+            if (
+                state.single_last_notify_attempt_at
+                and (now - state.single_last_notify_attempt_at)
+                < DEFAULT_LOGIN_WALL_NOTIFY_RETRY_AFTER
+            ):
+                continue
+            message = (
+                f"⚠️ Claude login wall detected on {agent_name} across two "
+                f"sightings at least {DEFAULT_LOGIN_WALL_DEBOUNCE_AFTER}s apart. "
+                "No fleet de-auth is confirmed, so no tmux pane was renamed."
+            )
+            if state.url:
+                message += (
+                    f"\n\nLogin link:\n{state.url}\n\n"
+                    "Open the link and approve it, then reply with the exact "
+                    "code#state string. Phase 1 will not paste it automatically."
+                )
+            state.single_last_notify_attempt_at = now
+            state.single_notification_attempts += 1
+            delivered = await self._deliver_login_wall_alert(agent_name, message)
+            if delivered:
+                state.single_notified = True
+
+    async def _open_login_wall_incident(
+        self,
+        confirmed_agents: list[str],
+        *,
+        uncertain_agents: list[str],
+        now: float,
+    ) -> None:
+        """Freeze one confirmed pane, extract its joined URL, then notify."""
+        hold_agent = next(
+            (
+                name for name in confirmed_agents
+                if self._login_wall_states[name].url
+            ),
+            confirmed_agents[0],
+        )
+        state = self._login_wall_states[hold_agent]
+        incident = _LoginWallIncident(
+            agents=tuple(confirmed_agents),
+            uncertain_agents=tuple(uncertain_agents),
+            hold_agent=hold_agent,
+        )
+        self._login_wall_incident = incident
+
+        frozen: FrozenLoginPane | None = None
+        try:
+            if self._login_wall_freeze_fn is None:
+                raise RuntimeError("login-wall freeze callback is not configured")
+            frozen = await self._login_wall_freeze_fn(
+                hold_agent, state.label, state.session,
+            )
+            incident.freeze_succeeded = True
+            incident.hold_session_name = frozen.hold_session_name
+        except Exception as exc:
+            incident.freeze_error = f"{type(exc).__name__}: {exc}"
+            _critical(
+                "watchdog login-wall freeze failed for %s before owner notify: %s",
+                hold_agent, exc,
+            )
+
+        frozen_text = frozen.pane_text if frozen is not None else ""
+        incident.url = extract_oauth_url(frozen_text) or state.url
+        affected = ", ".join(confirmed_agents)
+        if uncertain_agents:
+            affected += (
+                "; additional unclassified agent(s): "
+                + ", ".join(uncertain_agents)
+            )
+        if incident.freeze_succeeded:
+            message = (
+                f"🚨 Fleet Claude login wall detected ({affected}). "
+                f"I froze {hold_agent}'s tmux pane as "
+                f"'{incident.hold_session_name}' before sending this alert, "
+                "preserving its OAuth state."
+            )
+        else:
+            message = (
+                f"🚨 Possible fleet Claude login wall detected ({affected}). "
+                f"The freeze was attempted before this alert but failed "
+                f"({incident.freeze_error}); operator action is required."
+            )
+        if incident.url:
+            message += (
+                f"\n\nLogin link:\n{incident.url}\n\n"
+                "Open the link and approve it, then reply with the exact "
+                "code#state string. Phase 1 will not paste it automatically."
+            )
+        else:
+            message += (
+                "\n\nThe joined pane capture did not yield a login URL. "
+                "Inspect the held pane and notify the owner manually."
+            )
+        incident.message = message
+        _critical(message)
+        await self._notify_login_wall_incident(now)
+
+    async def _notify_login_wall_incident(self, now: float) -> None:
+        incident = self._login_wall_incident
+        if incident is None or incident.notified:
+            return
+        if (
+            incident.last_notify_attempt_at
+            and (now - incident.last_notify_attempt_at)
+            < DEFAULT_LOGIN_WALL_NOTIFY_RETRY_AFTER
+        ):
+            return
+        incident.last_notify_attempt_at = now
+        incident.notification_attempts += 1
+        delivered = await self._deliver_login_wall_alert(
+            incident.hold_agent, incident.message,
+        )
+        if delivered:
+            incident.notified = True
+
+    async def _deliver_login_wall_alert(
+        self,
+        agent_name: str,
+        message: str,
+    ) -> bool:
+        """Deliver through the existing owner-notify callback, fail closed."""
+        if self._alert_fn is None:
+            _warn(
+                "watchdog login-wall alert for %s has no owner alert callback",
+                agent_name,
+            )
+            return False
+        try:
+            return await self._alert_fn(agent_name, message) is True
+        except Exception as exc:
+            _warn("watchdog login-wall alert failed for %s: %s", agent_name, exc)
+            return False
+
+    def is_login_hold(self, agent_name: str) -> bool:
+        """Whether this watchdog intentionally renamed the agent's tmux pane."""
+        incident = self._login_wall_incident
+        return bool(
+            incident
+            and incident.freeze_succeeded
+            and incident.hold_agent == agent_name
+        )
 
     async def _reconcile_tmux_liveness(
         self,
@@ -1004,9 +1390,39 @@ class SessionWatchdog:
             }
             for agent_name, state in self._tmux_liveness_states.items()
         }
+        login_walls = {
+            agent_name: {
+                "first_seen_at": state.first_seen_at,
+                "last_seen_at": state.last_seen_at,
+                "confirmed": state.confirmed,
+                "session_name": state.session_name,
+                "shared_credentials": state.shared_credentials,
+                "url_found": bool(state.url),
+                "single_notification_latched": state.single_notified,
+                "single_notification_attempts": state.single_notification_attempts,
+            }
+            for agent_name, state in self._login_wall_states.items()
+        }
+        incident = self._login_wall_incident
         return {
             "running": self._running,
             "check_interval": self._interval,
             "agents": sessions,  # kept as "agents" for API compat
             "tmux_liveness": tmux_liveness,
+            "login_walls": login_walls,
+            "login_wall_incident": (
+                {
+                    "agents": list(incident.agents),
+                    "uncertain_agents": list(incident.uncertain_agents),
+                    "hold_agent": incident.hold_agent,
+                    "hold_session_name": incident.hold_session_name,
+                    "url_found": bool(incident.url),
+                    "freeze_succeeded": incident.freeze_succeeded,
+                    "freeze_error": incident.freeze_error,
+                    "notification_latched": incident.notified,
+                    "notification_attempts": incident.notification_attempts,
+                }
+                if incident is not None
+                else None
+            ),
         }

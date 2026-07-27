@@ -12,6 +12,7 @@ from pinky_daemon.auth_relay import (
     build_relay_message,
     extract_auth_code,
     extract_oauth_url,
+    extract_relay_oauth_url,
     looks_like_login_wall,
 )
 
@@ -29,6 +30,12 @@ def test_extract_oauth_url_claude_ai():
 def test_extract_oauth_url_console_anthropic():
     url = "https://console.anthropic.com/oauth/authorize?x=1"
     assert extract_oauth_url(f"visit {url} now") == url
+
+
+def test_extract_oauth_url_current_claude_com_cai_path():
+    url = "https://claude.com/cai/oauth/authorize?client_id=abc&state=xyz"
+    assert extract_oauth_url(f"visit {url} now") == url
+    assert extract_relay_oauth_url(f"visit {url} now") is None
 
 
 def test_extract_oauth_url_dewraps_whitespace():
