@@ -2942,22 +2942,22 @@ except Exception:
     ) -> AgentSchedule:
         """Add a cron-based wake schedule for an agent."""
         _validate_schedule_cron(cron)
-        self._ensure_schedule_name_available(agent_name, name)
-
         now = time.time()
-        cursor = self._db.execute(
-            """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
-               VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
-            (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel, int(one_shot)),
-        )
-        self._db.commit()
-        return AgentSchedule(
-            id=cursor.lastrowid, agent_name=agent_name, name=name,
-            cron=cron, prompt=prompt, timezone=timezone,
-            enabled=True, last_run=0.0, created_at=now,
-            direct_send=direct_send, target_channel=target_channel,
-            one_shot=one_shot,
-        )
+        with self._rmw_lock:
+            self._ensure_schedule_name_available(agent_name, name)
+            cursor = self._db.execute(
+                """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
+                   VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
+                (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel, int(one_shot)),
+            )
+            self._db.commit()
+            return AgentSchedule(
+                id=cursor.lastrowid, agent_name=agent_name, name=name,
+                cron=cron, prompt=prompt, timezone=timezone,
+                enabled=True, last_run=0.0, created_at=now,
+                direct_send=direct_send, target_channel=target_channel,
+                one_shot=one_shot,
+            )
 
     def _row_to_schedule(self, r) -> AgentSchedule:
         """Convert a DB row to AgentSchedule, handling optional columns."""
@@ -3021,34 +3021,35 @@ except Exception:
             if column in updates:
                 updates[column] = int(updates[column])
 
-        current = self._db.execute(
-            "SELECT agent_name, enabled FROM agent_schedules WHERE id=?",
-            (schedule_id,),
-        ).fetchone()
-        if current is None:
-            return None
-        if name is not None and bool(current[1]):
-            self._ensure_schedule_name_available(
-                current[0],
-                name,
-                exclude_schedule_id=schedule_id,
-            )
+        with self._rmw_lock:
+            current = self._db.execute(
+                "SELECT agent_name, enabled FROM agent_schedules WHERE id=?",
+                (schedule_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            if name is not None and bool(current[1]):
+                self._ensure_schedule_name_available(
+                    current[0],
+                    name,
+                    exclude_schedule_id=schedule_id,
+                )
 
-        set_clause = ", ".join(f"{field}=?" for field in updates)
-        cursor = self._db.execute(
-            f"UPDATE agent_schedules SET {set_clause} WHERE id=?",
-            list(updates.values()) + [schedule_id],
-        )
-        self._db.commit()
-        if cursor.rowcount == 0:
-            return None
-        row = self._db.execute(
-            """SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run,
-                      created_at, direct_send, target_channel, one_shot
-               FROM agent_schedules WHERE id=?""",
-            (schedule_id,),
-        ).fetchone()
-        return self._row_to_schedule(row) if row else None
+            set_clause = ", ".join(f"{field}=?" for field in updates)
+            cursor = self._db.execute(
+                f"UPDATE agent_schedules SET {set_clause} WHERE id=?",
+                list(updates.values()) + [schedule_id],
+            )
+            self._db.commit()
+            if cursor.rowcount == 0:
+                return None
+            row = self._db.execute(
+                """SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run,
+                          created_at, direct_send, target_channel, one_shot
+                   FROM agent_schedules WHERE id=?""",
+                (schedule_id,),
+            ).fetchone()
+            return self._row_to_schedule(row) if row else None
 
     def remove_schedule(self, schedule_id: int) -> bool:
         """Remove a schedule."""
@@ -3058,24 +3059,31 @@ except Exception:
 
     def toggle_schedule(self, schedule_id: int, enabled: bool) -> bool:
         """Enable/disable a schedule."""
-        current = self._db.execute(
-            "SELECT agent_name, name FROM agent_schedules WHERE id=?",
-            (schedule_id,),
-        ).fetchone()
-        if current is None:
-            return False
-        if enabled:
+        if not enabled:
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET enabled=0 WHERE id=?",
+                (schedule_id,),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+        with self._rmw_lock:
+            current = self._db.execute(
+                "SELECT agent_name, name FROM agent_schedules WHERE id=?",
+                (schedule_id,),
+            ).fetchone()
+            if current is None:
+                return False
             self._ensure_schedule_name_available(
                 current[0],
                 current[1],
                 exclude_schedule_id=schedule_id,
             )
-        cursor = self._db.execute(
-            "UPDATE agent_schedules SET enabled=? WHERE id=?",
-            (int(enabled), schedule_id),
-        )
-        self._db.commit()
-        return cursor.rowcount > 0
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET enabled=1 WHERE id=?",
+                (schedule_id,),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
 
     def update_schedule_last_run(self, schedule_id: int, timestamp: float = 0.0) -> None:
         """Record when a schedule last ran."""

@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import threading
 import time
 from datetime import datetime
 
@@ -366,6 +367,105 @@ class TestAgentSchedules:
         registry.delete("oleg")
         # Schedules should be cascade-deleted
         assert registry.get_schedules("oleg") == []
+
+    def test_concurrent_add_same_name_allows_only_one(self, registry):
+        """Concurrent same-name creates must leave exactly one enabled schedule."""
+        registry.register("oleg")
+        errors: list[Exception] = []
+        successes: list[int] = []
+        barrier = threading.Barrier(12)
+
+        def worker():
+            barrier.wait()
+            try:
+                s = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+                successes.append(s.id)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker) for _ in range(12)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        enabled = registry.get_schedules("oleg", enabled_only=True)
+        enabled_named = [s for s in enabled if s.name == "morning"]
+        assert len(enabled_named) == 1, (
+            f"Expected 1 enabled 'morning' schedule, got {len(enabled_named)}"
+        )
+        assert len(successes) == 1, f"Expected 1 successful create, got {len(successes)}"
+
+    def test_concurrent_rename_to_same_free_name_allows_only_one(self, registry):
+        """Concurrent renames of distinct enabled schedules to the same free name must leave one."""
+        registry.register("oleg")
+        barrier = threading.Barrier(12)
+        schedules = [
+            registry.add_schedule("oleg", "0 8 * * *", name=f"slot-{i}")
+            for i in range(12)
+        ]
+        errors: list[Exception] = []
+        successes: list[int] = []
+
+        def worker(sched_id):
+            barrier.wait()
+            try:
+                result = registry.update_schedule(sched_id, name="target")
+                if result is not None:
+                    successes.append(sched_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(s.id,)) for s in schedules]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        enabled = registry.get_schedules("oleg", enabled_only=True)
+        named_target = [s for s in enabled if s.name == "target"]
+        assert len(named_target) <= 1, (
+            f"Expected at most 1 enabled 'target' schedule, got {len(named_target)}"
+        )
+
+    def test_concurrent_reenable_same_name_allows_only_one(self, registry):
+        """Concurrent re-enables of disabled same-name rows must leave exactly one enabled."""
+        registry.register("oleg")
+        # Create 12 schedules with distinct names, disable them, then rename all
+        # to "morning" while disabled (rename check skips disabled rows).
+        schedules = [
+            registry.add_schedule("oleg", "0 8 * * *", name=f"slot-{i}")
+            for i in range(12)
+        ]
+        for s in schedules:
+            registry.toggle_schedule(s.id, False)
+        for s in schedules:
+            registry.update_schedule(s.id, name="morning")
+
+        barrier = threading.Barrier(12)
+        errors: list[Exception] = []
+        successes: list[int] = []
+
+        def worker(sched_id):
+            barrier.wait()
+            try:
+                if registry.toggle_schedule(sched_id, True):
+                    successes.append(sched_id)
+            except Exception as exc:
+                errors.append(exc)
+
+        threads = [threading.Thread(target=worker, args=(s.id,)) for s in schedules]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        enabled = registry.get_schedules("oleg", enabled_only=True)
+        enabled_named = [s for s in enabled if s.name == "morning"]
+        assert len(enabled_named) == 1, (
+            f"Expected 1 enabled 'morning' schedule after concurrent re-enable, "
+            f"got {len(enabled_named)}"
+        )
 
 
 # ── Agent Heartbeat Tests ──────────────────────────────────
