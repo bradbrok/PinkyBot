@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts
@@ -257,8 +258,6 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
         import datetime as dt
         import zoneinfo
 
-        from pinky_daemon.scheduler import _field_matches
-
         parts = cron.strip().split()
         if len(parts) != 5:
             return None
@@ -298,6 +297,21 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
         return None
     except Exception:
         return None
+
+
+def _validate_schedule_cron(cron: str) -> None:
+    """Reject cron expressions that the scheduler cannot match."""
+    parts = cron.strip().split()
+    if len(parts) != 5:
+        raise ValueError("Cron expression must contain exactly five fields")
+
+    limits = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
+    try:
+        for part, (lo, hi) in zip(parts, limits):
+            if not any(_field_matches(part, value, lo, hi) for value in range(lo, hi + 1)):
+                raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid cron expression: {cron!r}") from exc
 
 
 # Injected into the system prompt when an agent's effective effort is the
@@ -634,6 +648,10 @@ class AgentSchedule:
             "target_channel": self.target_channel,
             "one_shot": self.one_shot,
         }
+
+
+class ScheduleNameConflictError(ValueError):
+    """An enabled schedule already uses the requested agent/name pair."""
 
 
 @dataclass
@@ -2892,6 +2910,36 @@ except Exception:
 
     # ── Schedules ───────────────────────────────────────────
 
+    def _ensure_schedule_name_available(
+        self,
+        agent_name: str,
+        name: str,
+        *,
+        exclude_schedule_id: int | None = None,
+    ) -> None:
+        """Enforce enabled agent/name uniqueness within this writer process.
+
+        Callers hold ``_rmw_lock`` across this guard and the mutation, which
+        serializes threads sharing this connection. This does not coordinate
+        with a second writer process; deployment requires one writer process
+        per agents DB file.
+        """
+        sql = """SELECT id FROM agent_schedules
+                 WHERE agent_name=? AND name=? AND enabled=1"""
+        params: list = [agent_name, name]
+        if exclude_schedule_id is not None:
+            sql += " AND id<>?"
+            params.append(exclude_schedule_id)
+        sql += " ORDER BY id ASC LIMIT 1"
+        existing = self._db.execute(sql, params).fetchone()
+        if existing:
+            raise ScheduleNameConflictError(
+                f"Enabled schedule {name!r} already exists for agent {agent_name!r} "
+                f"as ID {existing[0]}; choose a distinct name to create another "
+                f"schedule, or use update_wake_schedule with ID {existing[0]} "
+                "to edit the existing one"
+            )
+
     def add_schedule(
         self, agent_name: str, cron: str, *,
         name: str = "", prompt: str = "", timezone: str = "America/Los_Angeles",
@@ -2899,20 +2947,28 @@ except Exception:
         one_shot: bool = False,
     ) -> AgentSchedule:
         """Add a cron-based wake schedule for an agent."""
+        _validate_schedule_cron(cron)
         now = time.time()
-        cursor = self._db.execute(
-            """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
-               VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
-            (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel, int(one_shot)),
-        )
-        self._db.commit()
-        return AgentSchedule(
-            id=cursor.lastrowid, agent_name=agent_name, name=name,
-            cron=cron, prompt=prompt, timezone=timezone,
-            enabled=True, last_run=0.0, created_at=now,
-            direct_send=direct_send, target_channel=target_channel,
-            one_shot=one_shot,
-        )
+        with self._rmw_lock:
+            self._ensure_schedule_name_available(agent_name, name)
+            cursor = self._db.execute(
+                """INSERT INTO agent_schedules (
+                       agent_name, name, cron, prompt, timezone, enabled, last_run,
+                       created_at, direct_send, target_channel, one_shot
+                   ) VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
+                (
+                    agent_name, name, cron, prompt, timezone, now,
+                    int(direct_send), target_channel, int(one_shot),
+                ),
+            )
+            self._db.commit()
+            return AgentSchedule(
+                id=cursor.lastrowid, agent_name=agent_name, name=name,
+                cron=cron, prompt=prompt, timezone=timezone,
+                enabled=True, last_run=0.0, created_at=now,
+                direct_send=direct_send, target_channel=target_channel,
+                one_shot=one_shot,
+            )
 
     def _row_to_schedule(self, r) -> AgentSchedule:
         """Convert a DB row to AgentSchedule, handling optional columns."""
@@ -2945,6 +3001,67 @@ except Exception:
         return [self._row_to_schedule(r) for r in rows
         ]
 
+    def update_schedule(
+        self,
+        schedule_id: int,
+        *,
+        cron: str | None = None,
+        prompt: str | None = None,
+        timezone: str | None = None,
+        name: str | None = None,
+        direct_send: bool | None = None,
+        target_channel: str | None = None,
+        one_shot: bool | None = None,
+    ) -> AgentSchedule | None:
+        """Partially update a schedule without changing its ID."""
+        values = {
+            "name": name,
+            "cron": cron,
+            "prompt": prompt,
+            "timezone": timezone,
+            "direct_send": direct_send,
+            "target_channel": target_channel,
+            "one_shot": one_shot,
+        }
+        updates = {field: value for field, value in values.items() if value is not None}
+        if not updates:
+            raise ValueError("update_schedule requires at least one field")
+        if cron is not None:
+            _validate_schedule_cron(cron)
+        for column in ("direct_send", "one_shot"):
+            if column in updates:
+                updates[column] = int(updates[column])
+
+        with self._rmw_lock:
+            current = self._db.execute(
+                "SELECT agent_name, enabled FROM agent_schedules WHERE id=?",
+                (schedule_id,),
+            ).fetchone()
+            if current is None:
+                return None
+            if name is not None and bool(current[1]):
+                self._ensure_schedule_name_available(
+                    current[0],
+                    name,
+                    exclude_schedule_id=schedule_id,
+                )
+
+            set_clause = ", ".join(f"{field}=?" for field in updates)
+            cursor = self._db.execute(
+                f"UPDATE agent_schedules SET {set_clause} WHERE id=?",
+                list(updates.values()) + [schedule_id],
+            )
+            self._db.commit()
+            if cursor.rowcount == 0:
+                return None
+            row = self._db.execute(
+                """SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run,
+                          created_at, direct_send, target_channel, one_shot
+                   FROM agent_schedules WHERE id=?""",
+                (schedule_id,),
+            ).fetchone()
+            return self._row_to_schedule(row) if row else None
+
     def remove_schedule(self, schedule_id: int) -> bool:
         """Remove a schedule."""
         cursor = self._db.execute("DELETE FROM agent_schedules WHERE id=?", (schedule_id,))
@@ -2953,12 +3070,31 @@ except Exception:
 
     def toggle_schedule(self, schedule_id: int, enabled: bool) -> bool:
         """Enable/disable a schedule."""
-        cursor = self._db.execute(
-            "UPDATE agent_schedules SET enabled=? WHERE id=?",
-            (int(enabled), schedule_id),
-        )
-        self._db.commit()
-        return cursor.rowcount > 0
+        if not enabled:
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET enabled=0 WHERE id=?",
+                (schedule_id,),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+        with self._rmw_lock:
+            current = self._db.execute(
+                "SELECT agent_name, name FROM agent_schedules WHERE id=?",
+                (schedule_id,),
+            ).fetchone()
+            if current is None:
+                return False
+            self._ensure_schedule_name_available(
+                current[0],
+                current[1],
+                exclude_schedule_id=schedule_id,
+            )
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET enabled=1 WHERE id=?",
+                (schedule_id,),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
 
     def update_schedule_last_run(self, schedule_id: int, timestamp: float = 0.0) -> None:
         """Record when a schedule last ran."""

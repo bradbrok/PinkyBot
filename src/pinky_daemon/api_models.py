@@ -729,6 +729,16 @@ class AddScheduleRequest(BaseModel):
     one_shot: bool = False
 
 
+class UpdateScheduleRequest(BaseModel):
+    cron: str | None = None
+    prompt: str | None = None
+    timezone: str | None = None
+    name: str | None = None
+    direct_send: bool | None = None
+    target_channel: str | None = None
+    one_shot: bool | None = None
+
+
 class CreateTriggerRequest(BaseModel):
     name: str = ""
     trigger_type: str  # 'webhook' | 'url' | 'file'

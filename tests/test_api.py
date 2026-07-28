@@ -5072,6 +5072,214 @@ class TestOwnerProfileAPI:
         assert data["pronouns"] == "he/him"
 
 
+# Agent schedules
+
+
+class TestAgentScheduleEndpoints:
+    def _make_client(self):
+        from pinky_daemon.api import create_api
+
+        fd, path = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
+        return TestClient(app)
+
+    @staticmethod
+    def _register(client, name):
+        response = client.post("/agents", json={"name": name, "model": "sonnet"})
+        assert response.status_code == 200
+
+    @staticmethod
+    def _create_schedule(client, agent_name="alice", **overrides):
+        body = {
+            "name": "morning",
+            "cron": "0 8 * * *",
+            "prompt": "Original",
+            "timezone": "America/Los_Angeles",
+            "direct_send": True,
+            "target_channel": "123",
+            "one_shot": True,
+        }
+        body.update(overrides)
+        return client.post(f"/agents/{agent_name}/schedules", json=body)
+
+    def test_patch_schedule_partial_update_preserves_id_and_omitted_fields(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+
+        response = client.patch(
+            f"/agents/alice/schedules/{created['id']}",
+            json={
+                "cron": "30 8 * * 1-5",
+                "prompt": "Updated",
+                "direct_send": False,
+                "target_channel": "",
+            },
+        )
+
+        assert response.status_code == 200
+        updated = response.json()
+        assert updated["id"] == created["id"]
+        assert updated["name"] == "morning"
+        assert updated["cron"] == "30 8 * * 1-5"
+        assert updated["prompt"] == "Updated"
+        assert updated["timezone"] == "America/Los_Angeles"
+        assert updated["direct_send"] is False
+        assert updated["target_channel"] == ""
+        assert updated["one_shot"] is True
+
+    def test_patch_schedule_unknown_id_returns_404(self):
+        client = self._make_client()
+        self._register(client, "alice")
+
+        response = client.patch(
+            "/agents/alice/schedules/999",
+            json={"prompt": "Updated"},
+        )
+
+        assert response.status_code == 404
+
+    def test_patch_schedule_refuses_cross_agent_edit(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        self._register(client, "bob")
+        created = self._create_schedule(client).json()
+
+        response = client.patch(
+            f"/agents/bob/schedules/{created['id']}",
+            json={"prompt": "Cross-agent edit"},
+        )
+
+        assert response.status_code == 404
+        schedules = client.get(
+            "/agents/alice/schedules",
+            params={"enabled_only": False},
+        ).json()["schedules"]
+        assert schedules[0]["prompt"] == "Original"
+
+    def test_patch_schedule_refuses_empty_update(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+
+        response = client.patch(
+            f"/agents/alice/schedules/{created['id']}",
+            json={},
+        )
+
+        assert response.status_code == 400
+        assert "at least one field" in response.json()["detail"]
+
+    def test_patch_schedule_rejects_invalid_cron_without_mutating(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+
+        response = client.patch(
+            f"/agents/alice/schedules/{created['id']}",
+            json={"cron": "99 * * * *"},
+        )
+
+        assert response.status_code == 400
+        schedules = client.get(
+            "/agents/alice/schedules",
+            params={"enabled_only": False},
+        ).json()["schedules"]
+        assert schedules[0]["cron"] == "0 8 * * *"
+
+    def test_create_schedule_rejects_enabled_duplicate_name(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+
+        response = self._create_schedule(client, cron="0 9 * * *")
+
+        assert response.status_code == 409
+        detail = response.json()["detail"]
+        assert "distinct name" in detail
+        assert f"update_wake_schedule with ID {created['id']}" in detail
+        assert client.get("/agents/alice/schedules").json()["count"] == 1
+
+    def test_patch_schedule_rejects_enabled_name_collision(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        existing = self._create_schedule(client).json()
+        renamed = self._create_schedule(
+            client,
+            name="evening",
+            cron="0 21 * * *",
+        ).json()
+
+        response = client.patch(
+            f"/agents/alice/schedules/{renamed['id']}",
+            json={"name": "morning"},
+        )
+
+        assert response.status_code == 409
+        assert f"ID {existing['id']}" in response.json()["detail"]
+        schedules = client.get("/agents/alice/schedules").json()["schedules"]
+        assert [(row["id"], row["name"]) for row in schedules] == [
+            (existing["id"], "morning"),
+            (renamed["id"], "evening"),
+        ]
+
+    def test_toggle_schedule_rejects_reenable_name_collision(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        old = self._create_schedule(client).json()
+        disabled = client.post(
+            f"/agents/alice/schedules/{old['id']}/toggle",
+            params={"enabled": False},
+        )
+        assert disabled.status_code == 200
+        replacement = self._create_schedule(client, cron="0 9 * * *").json()
+
+        response = client.post(
+            f"/agents/alice/schedules/{old['id']}/toggle",
+            params={"enabled": True},
+        )
+
+        assert response.status_code == 409
+        assert f"ID {replacement['id']}" in response.json()["detail"]
+        schedules = client.get(
+            "/agents/alice/schedules",
+            params={"enabled_only": False},
+        ).json()["schedules"]
+        assert [(row["id"], row["enabled"]) for row in schedules] == [
+            (old["id"], False),
+            (replacement["id"], True),
+        ]
+
+    @pytest.mark.parametrize("one_shot", [False, True])
+    def test_create_schedule_reuses_disabled_name(self, one_shot):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client, one_shot=one_shot).json()
+        toggle = client.post(
+            f"/agents/alice/schedules/{created['id']}/toggle",
+            params={"enabled": False},
+        )
+        assert toggle.status_code == 200
+
+        response = self._create_schedule(
+            client,
+            cron="0 9 * * *",
+            one_shot=False,
+        )
+
+        assert response.status_code == 200
+        assert response.json()["id"] != created["id"]
+
+    def test_create_schedule_rejects_invalid_cron(self):
+        client = self._make_client()
+        self._register(client, "alice")
+
+        response = self._create_schedule(client, cron="not a cron")
+
+        assert response.status_code == 400
+
+
 # ── Agent CRUD ───────────────────────────────────────────────
 
 

@@ -5,12 +5,14 @@ from __future__ import annotations
 import asyncio
 import os
 import tempfile
+import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
 
-from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
 from pinky_daemon.scheduler import AgentScheduler, cron_matches, next_cron_description
 
 # ── Cron Parser Tests ──────────────────────────────────────
@@ -144,6 +146,40 @@ class TestAgentSchedules:
         assert schedule.prompt == "Good morning!"
         assert schedule.enabled is True
 
+    def test_add_schedule_rejects_enabled_duplicate_name(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+
+        with pytest.raises(
+            ScheduleNameConflictError,
+            match=rf"distinct name.*update_wake_schedule with ID {schedule.id}",
+        ):
+            registry.add_schedule("oleg", "0 9 * * *", name="morning")
+
+        assert [row.id for row in registry.get_schedules("oleg")] == [schedule.id]
+
+    @pytest.mark.parametrize("one_shot", [False, True])
+    def test_add_schedule_reuses_disabled_name(self, registry, one_shot):
+        registry.register("oleg")
+        old = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="morning",
+            one_shot=one_shot,
+        )
+        registry.toggle_schedule(old.id, False)
+
+        new = registry.add_schedule("oleg", "0 9 * * *", name="morning")
+
+        assert new.id != old.id
+        assert new.enabled is True
+
+    def test_add_schedule_rejects_invalid_cron(self, registry):
+        registry.register("oleg")
+
+        with pytest.raises(ValueError, match="five fields"):
+            registry.add_schedule("oleg", "not a cron", name="broken")
+
     def test_get_schedules(self, registry):
         registry.register("oleg")
         registry.add_schedule("oleg", "0 8 * * *", name="morning")
@@ -182,6 +218,103 @@ class TestAgentSchedules:
         assert registry.remove_schedule(s.id) is True
         assert registry.get_schedules("oleg") == []
 
+    def test_update_schedule_partial_preserves_id_and_omitted_fields(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="morning",
+            prompt="Original",
+            direct_send=True,
+            target_channel="123",
+            one_shot=True,
+        )
+
+        updated = registry.update_schedule(
+            schedule.id,
+            cron="30 8 * * 1-5",
+            prompt="Updated",
+            direct_send=False,
+            target_channel="",
+        )
+
+        assert updated is not None
+        assert updated.id == schedule.id
+        assert updated.name == "morning"
+        assert updated.cron == "30 8 * * 1-5"
+        assert updated.prompt == "Updated"
+        assert updated.timezone == "America/Los_Angeles"
+        assert updated.direct_send is False
+        assert updated.target_channel == ""
+        assert updated.one_shot is True
+
+    def test_update_schedule_supports_remaining_fields_and_empty_prompt(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="morning",
+            prompt="Original",
+            one_shot=True,
+        )
+
+        updated = registry.update_schedule(
+            schedule.id,
+            name="weekday",
+            prompt="",
+            timezone="UTC",
+            one_shot=False,
+        )
+
+        assert updated is not None
+        assert updated.name == "weekday"
+        assert updated.prompt == ""
+        assert updated.timezone == "UTC"
+        assert updated.one_shot is False
+
+    def test_update_schedule_refuses_empty_update(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *")
+
+        with pytest.raises(ValueError, match="at least one field"):
+            registry.update_schedule(schedule.id)
+
+    def test_update_schedule_rejects_invalid_cron_without_mutating(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *")
+
+        with pytest.raises(ValueError, match="Invalid cron"):
+            registry.update_schedule(schedule.id, cron="99 * * * *")
+
+        assert registry.get_schedules("oleg")[0].cron == "0 8 * * *"
+
+    def test_update_schedule_missing(self, registry):
+        assert registry.update_schedule(999, prompt="new") is None
+
+    def test_update_schedule_rejects_enabled_name_collision(self, registry):
+        registry.register("oleg")
+        existing = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        renamed = registry.add_schedule("oleg", "0 9 * * *", name="evening")
+
+        with pytest.raises(ScheduleNameConflictError, match=rf"ID {existing.id}"):
+            registry.update_schedule(renamed.id, name="morning")
+
+        schedules = registry.get_schedules("oleg")
+        assert [(row.id, row.name) for row in schedules] == [
+            (existing.id, "morning"),
+            (renamed.id, "evening"),
+        ]
+
+    def test_update_schedule_allows_self_rename(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+
+        updated = registry.update_schedule(schedule.id, name="morning")
+
+        assert updated is not None
+        assert updated.id == schedule.id
+        assert updated.name == "morning"
+
     def test_remove_missing(self, registry):
         assert registry.remove_schedule(999) is False
 
@@ -192,6 +325,29 @@ class TestAgentSchedules:
 
         schedules = registry.get_schedules("oleg", enabled_only=False)
         assert schedules[0].enabled is False
+
+    def test_toggle_schedule_rejects_reenable_name_collision(self, registry):
+        registry.register("oleg")
+        old = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        assert registry.toggle_schedule(old.id, False) is True
+        replacement = registry.add_schedule("oleg", "0 9 * * *", name="morning")
+
+        with pytest.raises(ScheduleNameConflictError, match=rf"ID {replacement.id}"):
+            registry.toggle_schedule(old.id, True)
+
+        schedules = registry.get_schedules("oleg", enabled_only=False)
+        assert [(row.id, row.enabled) for row in schedules] == [
+            (old.id, False),
+            (replacement.id, True),
+        ]
+
+    def test_toggle_schedule_enables_without_conflict(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        assert registry.toggle_schedule(schedule.id, False) is True
+
+        assert registry.toggle_schedule(schedule.id, True) is True
+        assert registry.get_schedules("oleg")[0].id == schedule.id
 
     def test_update_last_run(self, registry):
         registry.register("oleg")
@@ -206,12 +362,104 @@ class TestAgentSchedules:
 
     def test_cascade_delete(self, registry):
         registry.register("oleg")
-        registry.add_schedule("oleg", "0 8 * * *")
-        registry.add_schedule("oleg", "0 21 * * *")
+        registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        registry.add_schedule("oleg", "0 21 * * *", name="evening")
 
         registry.delete("oleg")
         # Schedules should be cascade-deleted
         assert registry.get_schedules("oleg") == []
+
+    def test_concurrent_add_same_name_allows_only_one(self, registry):
+        """Same-process threads serialize the guard and insert."""
+        registry.register("oleg")
+        worker_count = 12
+        start = threading.Barrier(worker_count)
+
+        def create_schedule(index):
+            start.wait(timeout=5)
+            try:
+                schedule = registry.add_schedule(
+                    "oleg",
+                    f"{index} 8 * * *",
+                    name="morning",
+                )
+            except ScheduleNameConflictError:
+                return "conflict", None
+            return "created", schedule.id
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(create_schedule, range(worker_count)))
+
+        assert [status for status, _ in results].count("created") == 1
+        assert [status for status, _ in results].count("conflict") == worker_count - 1
+        enabled = registry.get_schedules("oleg")
+        assert len(enabled) == 1
+        assert enabled[0].id == next(
+            row_id for status, row_id in results if status == "created"
+        )
+
+    def test_concurrent_rename_to_same_free_name_allows_only_one(self, registry):
+        """Same-process threads serialize each guarded enabled-row rename."""
+        registry.register("oleg")
+        worker_count = 12
+        schedules = [
+            registry.add_schedule("oleg", f"{index} 8 * * *", name=f"slot-{index}")
+            for index in range(worker_count)
+        ]
+        start = threading.Barrier(worker_count)
+
+        def rename_schedule(schedule):
+            start.wait(timeout=5)
+            try:
+                updated = registry.update_schedule(schedule.id, name="target")
+            except ScheduleNameConflictError:
+                return "conflict"
+            assert updated is not None
+            return "renamed"
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(rename_schedule, schedules))
+
+        assert results.count("renamed") == 1
+        assert results.count("conflict") == worker_count - 1
+        enabled = registry.get_schedules("oleg")
+        assert len(enabled) == worker_count
+        assert [schedule.name for schedule in enabled].count("target") == 1
+
+    def test_concurrent_reenable_same_name_allows_only_one(self, registry):
+        """Same-process threads serialize each guarded re-enable."""
+        registry.register("oleg")
+        worker_count = 12
+        # Create 12 schedules with distinct names, disable them, then rename all
+        # to "morning" while disabled (rename check skips disabled rows).
+        schedules = [
+            registry.add_schedule("oleg", f"{index} 8 * * *", name=f"slot-{index}")
+            for index in range(worker_count)
+        ]
+        for schedule in schedules:
+            registry.toggle_schedule(schedule.id, False)
+        for schedule in schedules:
+            registry.update_schedule(schedule.id, name="morning")
+
+        start = threading.Barrier(worker_count)
+
+        def enable_schedule(schedule):
+            start.wait(timeout=5)
+            try:
+                enabled = registry.toggle_schedule(schedule.id, True)
+            except ScheduleNameConflictError:
+                return "conflict"
+            assert enabled is True
+            return "enabled"
+
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(enable_schedule, schedules))
+
+        assert results.count("enabled") == 1
+        assert results.count("conflict") == worker_count - 1
+        enabled = registry.get_schedules("oleg")
+        assert len(enabled) == 1
+        assert enabled[0].name == "morning"
 
 
 # ── Agent Heartbeat Tests ──────────────────────────────────
