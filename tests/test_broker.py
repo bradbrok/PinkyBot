@@ -43,6 +43,45 @@ class TestMessageBrokerRouting:
         )
         return tmpdir, registry, broker, sent_messages, reactions
 
+    async def _capture_reply_hint(
+        self,
+        *,
+        platform: str = "telegram",
+        message_id: str = "9999",
+        reply_to: str = "",
+    ) -> str:
+        tmpdir, _, broker, _, _ = self._make_broker()
+        try:
+            from pinky_daemon.transport_state import SessionState
+
+            class _CapturingStreaming:
+                state = SessionState.CONNECTED
+                resume_handle = "live"
+
+                def __init__(self):
+                    self.captured: dict = {}
+
+                async def send(self, prompt, **kwargs) -> None:
+                    self.captured = kwargs
+
+            streaming = _CapturingStreaming()
+            broker.register_streaming("barsik", streaming, label="main")
+
+            msg = BrokerMessage(
+                platform=platform,
+                chat_id="6770805286",
+                sender_name="Brad",
+                sender_id="u-1",
+                content="hi barsik",
+                agent_name="barsik",
+                message_id=message_id,
+                reply_to=reply_to,
+            )
+            await broker._route_streaming("barsik", msg)
+            return streaming.captured.get("agent_hint", "")
+        finally:
+            tmpdir.cleanup()
+
     def test_format_prompt_includes_thread_provenance_for_child_reply(self):
         tmpdir, registry, broker, _sent, _reactions = self._make_broker()
         try:
@@ -1653,46 +1692,48 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_streaming_reply_hint_names_pinky_messaging_tools(self):
+    async def test_route_streaming_top_level_reply_hint_prefers_send_tool(self):
         """The agent reply hint must reference real pinky-messaging tools
         (send/thread), not the non-existent send_message()/reply() that the
         old hint named. Regression for Brad's 2026-05-29 report."""
-        tmpdir, _, broker, _, _ = self._make_broker()
-        try:
-            from pinky_daemon.transport_state import SessionState
+        hint = await self._capture_reply_hint()
 
-            class _CapturingStreaming:
-                state = SessionState.CONNECTED
-                resume_handle = "live"
-                captured: dict = {}
+        assert hint, "no agent_hint passed to streaming.send()"
+        assert "send_message()" not in hint
+        assert "reply()" not in hint
+        assert "Reply on telegram using pinky-messaging" in hint
+        assert 'send(chat_id="6770805286"' in hint
+        assert 'platform="telegram"' in hint
+        assert 'thread(message_id="9999"' in hint
+        assert hint.index("send(") < hint.index("thread(")
+        assert "quote/thread-reply to this message" in hint
 
-                async def send(self, prompt, **kwargs) -> None:
-                    _CapturingStreaming.captured = kwargs
+    @pytest.mark.asyncio
+    async def test_route_streaming_thread_reply_hint_prefers_thread_tool(self):
+        hint = await self._capture_reply_hint(reply_to="thread-root")
 
-            broker.register_streaming("barsik", _CapturingStreaming(), label="main")
+        assert "Reply IN THREAD to this message" in hint
+        assert 'thread(message_id="9999", text=...)' in hint
+        assert 'send(chat_id="6770805286", platform="telegram", text=...)' in hint
+        assert hint.index("thread(") < hint.index("send(")
+        assert "posts to the channel OUTSIDE the thread" in hint
 
-            msg = BrokerMessage(
-                platform="telegram",
-                chat_id="6770805286",
-                sender_name="Brad",
-                sender_id="u-1",
-                content="hi barsik",
-                agent_name="barsik",
-                message_id="9999",
-            )
-            await broker._route_streaming("barsik", msg)
+    @pytest.mark.asyncio
+    async def test_route_streaming_reply_hint_without_message_id_has_no_thread_clause(self):
+        hint = await self._capture_reply_hint(
+            message_id="",
+            reply_to="thread-root",
+        )
 
-            hint = _CapturingStreaming.captured.get("agent_hint", "")
-            assert hint, "no agent_hint passed to streaming.send()"
-            # The bogus tool names must be gone.
-            assert "send_message()" not in hint
-            assert "reply()" not in hint
-            # Real pinky-messaging tools, with the live chat_id/platform/message_id.
-            assert 'send(chat_id="6770805286"' in hint
-            assert 'platform="telegram"' in hint
-            assert 'thread(message_id="9999"' in hint
-        finally:
-            tmpdir.cleanup()
+        assert "Reply on telegram using pinky-messaging" in hint
+        assert 'send(chat_id="6770805286", platform="telegram", text=...)' in hint
+        assert "thread(" not in hint
+        assert "Reply IN THREAD" not in hint
+
+    @pytest.mark.parametrize("platform", ["web", "api", ""])
+    @pytest.mark.asyncio
+    async def test_route_streaming_internal_platforms_have_no_reply_hint(self, platform):
+        assert await self._capture_reply_hint(platform=platform) == ""
 
     @pytest.mark.asyncio
     async def test_route_streaming_falls_back_when_no_ensurer_wired(self):
