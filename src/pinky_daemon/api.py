@@ -48,7 +48,7 @@ from fastapi.staticfiles import StaticFiles
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
-from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
 from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.api_models import (
     AddDirectiveRequest,
@@ -104,6 +104,7 @@ from pinky_daemon.api_models import (
     UpdateHeartbeatPromptRequest,
     UpdateMcpServerRequest,
     UpdatePasswordRequest,
+    UpdateScheduleRequest,
 )
 from pinky_daemon.app_store import AppStore
 from pinky_daemon.auth import (
@@ -871,7 +872,10 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "get_attribution", "render_pdf", "spawn_clone", "get_agent_card",
     ],
     "schedule": [
-        "set_wake_schedule", "list_my_schedules", "remove_wake_schedule",
+        "set_wake_schedule",
+        "update_wake_schedule",
+        "list_my_schedules",
+        "remove_wake_schedule",
     ],
     "tasks-admin": [
         "decompose_project", "bulk_create_tasks",
@@ -9883,12 +9887,21 @@ npm run build</pre>
         """Add a cron-based wake schedule for an agent."""
         if not agents.get(agent_name):
             raise HTTPException(404, f"Agent '{agent_name}' not found")
-        schedule = agents.add_schedule(
-            agent_name, req.cron,
-            name=req.name, prompt=req.prompt, timezone=req.timezone,
-            direct_send=req.direct_send, target_channel=req.target_channel,
-            one_shot=req.one_shot,
-        )
+        try:
+            schedule = agents.add_schedule(
+                agent_name,
+                req.cron,
+                name=req.name,
+                prompt=req.prompt,
+                timezone=req.timezone,
+                direct_send=req.direct_send,
+                target_channel=req.target_channel,
+                one_shot=req.one_shot,
+            )
+        except ScheduleNameConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
         return schedule.to_dict()
 
     @app.get("/agents/{agent_name}/schedules")
@@ -9902,6 +9915,42 @@ npm run build</pre>
             "schedules": [s.to_dict() for s in schedules],
             "count": len(schedules),
         }
+
+    @app.patch("/agents/{agent_name}/schedules/{schedule_id}")
+    async def update_schedule(
+        agent_name: str,
+        schedule_id: int,
+        req: UpdateScheduleRequest,
+    ):
+        """Partially update an agent-owned schedule without changing its ID."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        owned_schedule = next(
+            (
+                schedule
+                for schedule in agents.get_schedules(agent_name, enabled_only=False)
+                if schedule.id == schedule_id
+            ),
+            None,
+        )
+        if owned_schedule is None:
+            raise HTTPException(404, f"Schedule {schedule_id} not found")
+        try:
+            schedule = agents.update_schedule(
+                schedule_id,
+                cron=req.cron,
+                prompt=req.prompt,
+                timezone=req.timezone,
+                name=req.name,
+                direct_send=req.direct_send,
+                target_channel=req.target_channel,
+                one_shot=req.one_shot,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if schedule is None:
+            raise HTTPException(404, f"Schedule {schedule_id} not found")
+        return schedule.to_dict()
 
     @app.delete("/agents/{agent_name}/schedules/{schedule_id}")
     async def remove_schedule(agent_name: str, schedule_id: int):

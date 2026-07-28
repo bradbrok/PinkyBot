@@ -1,7 +1,7 @@
 """Pinky Self — MCP server for agent self-management.
 
 Gives agents tools to manage their own lifecycle:
-- Wake schedules (set/list/remove cron jobs)
+- Wake schedules (set/update/list/remove cron jobs)
 - Context management (save/load continuation state)
 - Task management (claim, complete, block, get next)
 - Health monitoring (check own status)
@@ -173,6 +173,42 @@ def create_server(
             mode = "direct-send" if direct_send else "wake"
             shot = ", one-shot" if one_shot else ""
             return f"Schedule '{result.get('name', name)}' set: {cron} ({timezone}), mode={mode}{shot}. ID: {result.get('id')}"
+
+        @mcp.tool()
+        def update_wake_schedule(
+            schedule_id: int,
+            cron: str | None = None,
+            prompt: str | None = None,
+            timezone: str | None = None,
+            name: str | None = None,
+            direct_send: bool | None = None,
+            target_channel: str | None = None,
+            one_shot: bool | None = None,
+        ) -> str:
+            """Update selected fields on an existing wake schedule without changing its ID."""
+            values = {
+                "cron": cron,
+                "prompt": prompt,
+                "timezone": timezone,
+                "name": name,
+                "direct_send": direct_send,
+                "target_channel": target_channel,
+                "one_shot": one_shot,
+            }
+            body = {field: value for field, value in values.items() if value is not None}
+            if not body:
+                return "Failed to update schedule: provide at least one field to change."
+            result = _api(
+                "PATCH",
+                f"/agents/{agent_name}/schedules/{schedule_id}",
+                body,
+            )
+            if "error" in result:
+                return f"Failed to update schedule #{schedule_id}: {result['error']}"
+            return (
+                f"Schedule #{schedule_id} updated: {result.get('name', '')} — "
+                f"{result.get('cron', '')} ({result.get('timezone', '')})."
+            )
 
         @mcp.tool()
         def list_my_schedules() -> str:

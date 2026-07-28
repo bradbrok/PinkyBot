@@ -523,6 +523,60 @@ class TestSetWakeSchedule:
         assert "Failed" in result
 
 
+# update_wake_schedule
+
+class TestUpdateWakeSchedule:
+    def test_partial_update(self, srv):
+        response = {
+            "id": 42,
+            "name": "morning_check",
+            "cron": "30 8 * * *",
+            "timezone": "America/Los_Angeles",
+        }
+        captured = {}
+
+        def _urlopen(req, timeout=30):
+            captured["method"] = req.method
+            captured["url"] = req.full_url
+            captured["body"] = json.loads(req.data)
+            body = json.dumps(response).encode()
+            result = MagicMock()
+            result.read.return_value = body
+            result.__enter__ = lambda value: value
+            result.__exit__ = MagicMock(return_value=False)
+            return result
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            message = _tools(srv)["update_wake_schedule"](
+                schedule_id=42,
+                cron="30 8 * * *",
+                direct_send=False,
+            )
+
+        assert captured == {
+            "method": "PATCH",
+            "url": "http://localhost:9999/agents/barsik/schedules/42",
+            "body": {"cron": "30 8 * * *", "direct_send": False},
+        }
+        assert "Schedule #42 updated" in message
+
+    def test_empty_update_refused_without_request(self, srv):
+        with patch("urllib.request.urlopen") as urlopen:
+            message = _tools(srv)["update_wake_schedule"](schedule_id=42)
+
+        urlopen.assert_not_called()
+        assert "provide at least one field" in message
+
+    def test_api_error(self, srv):
+        with _ok({"error": "not found", "status": 404}):
+            message = _tools(srv)["update_wake_schedule"](
+                schedule_id=99,
+                prompt="new",
+            )
+
+        assert "Failed to update schedule #99" in message
+
+
 # ── list_my_schedules ─────────────────────────────────────────────────────────
 
 class TestListMySchedules:
@@ -2176,12 +2230,12 @@ class TestToolGates:
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_70_tools(self):
+    def test_all_gates_has_71_tools(self):
         """All gates → full tool set.
 
         +1 in #145 with ``register_agent`` (admin gate) → 69, then +1 in #663
         with the core ``mcp_probe`` tool → 70. (Had dropped 69→68 in #552 with
-        the removal of ``request_sleep``.)
+        the removal of ``request_sleep``.) #924 adds ``update_wake_schedule`` → 71.
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2189,7 +2243,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 70
+        assert len(tools) == 71
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""

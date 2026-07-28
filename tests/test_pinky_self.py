@@ -34,6 +34,7 @@ class TestSelfServerCreation:
         tool_names = [t.name for t in server._tool_manager.list_tools()]
         expected = [
             "set_wake_schedule",
+            "update_wake_schedule",
             "list_my_schedules",
             "remove_wake_schedule",
             "save_my_context",

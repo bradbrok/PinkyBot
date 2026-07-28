@@ -300,6 +300,23 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
         return None
 
 
+def _validate_schedule_cron(cron: str) -> None:
+    """Reject cron expressions that the scheduler cannot match."""
+    from pinky_daemon.scheduler import _field_matches
+
+    parts = cron.strip().split()
+    if len(parts) != 5:
+        raise ValueError("Cron expression must contain exactly five fields")
+
+    limits = ((0, 59), (0, 23), (1, 31), (1, 12), (0, 6))
+    try:
+        for part, (lo, hi) in zip(parts, limits):
+            if not any(_field_matches(part, value, lo, hi) for value in range(lo, hi + 1)):
+                raise ValueError
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"Invalid cron expression: {cron!r}") from exc
+
+
 # Injected into the system prompt when an agent's effective effort is the
 # ``ultracode`` tier (#151). Replicates Claude Code's native ultracode
 # semantics — "xhigh effort plus standing dynamic-workflow orchestration" —
@@ -634,6 +651,10 @@ class AgentSchedule:
             "target_channel": self.target_channel,
             "one_shot": self.one_shot,
         }
+
+
+class ScheduleNameConflictError(ValueError):
+    """An enabled schedule already uses the requested agent/name pair."""
 
 
 @dataclass
@@ -2899,6 +2920,19 @@ except Exception:
         one_shot: bool = False,
     ) -> AgentSchedule:
         """Add a cron-based wake schedule for an agent."""
+        _validate_schedule_cron(cron)
+        existing = self._db.execute(
+            """SELECT id FROM agent_schedules
+               WHERE agent_name=? AND name=? AND enabled=1
+               ORDER BY id ASC LIMIT 1""",
+            (agent_name, name),
+        ).fetchone()
+        if existing:
+            raise ScheduleNameConflictError(
+                f"Enabled schedule {name!r} already exists for agent {agent_name!r} "
+                f"as ID {existing[0]}; use update_wake_schedule to edit it"
+            )
+
         now = time.time()
         cursor = self._db.execute(
             """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
@@ -2944,6 +2978,53 @@ except Exception:
         rows = self._db.execute(sql).fetchall()
         return [self._row_to_schedule(r) for r in rows
         ]
+
+    def update_schedule(
+        self,
+        schedule_id: int,
+        *,
+        cron: str | None = None,
+        prompt: str | None = None,
+        timezone: str | None = None,
+        name: str | None = None,
+        direct_send: bool | None = None,
+        target_channel: str | None = None,
+        one_shot: bool | None = None,
+    ) -> AgentSchedule | None:
+        """Partially update a schedule without changing its ID."""
+        values = {
+            "name": name,
+            "cron": cron,
+            "prompt": prompt,
+            "timezone": timezone,
+            "direct_send": direct_send,
+            "target_channel": target_channel,
+            "one_shot": one_shot,
+        }
+        updates = {field: value for field, value in values.items() if value is not None}
+        if not updates:
+            raise ValueError("update_schedule requires at least one field")
+        if cron is not None:
+            _validate_schedule_cron(cron)
+        for column in ("direct_send", "one_shot"):
+            if column in updates:
+                updates[column] = int(updates[column])
+
+        set_clause = ", ".join(f"{field}=?" for field in updates)
+        cursor = self._db.execute(
+            f"UPDATE agent_schedules SET {set_clause} WHERE id=?",
+            list(updates.values()) + [schedule_id],
+        )
+        self._db.commit()
+        if cursor.rowcount == 0:
+            return None
+        row = self._db.execute(
+            """SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run,
+                      created_at, direct_send, target_channel, one_shot
+               FROM agent_schedules WHERE id=?""",
+            (schedule_id,),
+        ).fetchone()
+        return self._row_to_schedule(row) if row else None
 
     def remove_schedule(self, schedule_id: int) -> bool:
         """Remove a schedule."""

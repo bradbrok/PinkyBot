@@ -144,6 +144,37 @@ class TestAgentSchedules:
         assert schedule.prompt == "Good morning!"
         assert schedule.enabled is True
 
+    def test_add_schedule_rejects_enabled_duplicate_name(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+
+        with pytest.raises(ValueError, match="update_wake_schedule"):
+            registry.add_schedule("oleg", "0 9 * * *", name="morning")
+
+        assert [row.id for row in registry.get_schedules("oleg")] == [schedule.id]
+
+    @pytest.mark.parametrize("one_shot", [False, True])
+    def test_add_schedule_reuses_disabled_name(self, registry, one_shot):
+        registry.register("oleg")
+        old = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="morning",
+            one_shot=one_shot,
+        )
+        registry.toggle_schedule(old.id, False)
+
+        new = registry.add_schedule("oleg", "0 9 * * *", name="morning")
+
+        assert new.id != old.id
+        assert new.enabled is True
+
+    def test_add_schedule_rejects_invalid_cron(self, registry):
+        registry.register("oleg")
+
+        with pytest.raises(ValueError, match="five fields"):
+            registry.add_schedule("oleg", "not a cron", name="broken")
+
     def test_get_schedules(self, registry):
         registry.register("oleg")
         registry.add_schedule("oleg", "0 8 * * *", name="morning")
@@ -182,6 +213,79 @@ class TestAgentSchedules:
         assert registry.remove_schedule(s.id) is True
         assert registry.get_schedules("oleg") == []
 
+    def test_update_schedule_partial_preserves_id_and_omitted_fields(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="morning",
+            prompt="Original",
+            direct_send=True,
+            target_channel="123",
+            one_shot=True,
+        )
+
+        updated = registry.update_schedule(
+            schedule.id,
+            cron="30 8 * * 1-5",
+            prompt="Updated",
+            direct_send=False,
+            target_channel="",
+        )
+
+        assert updated is not None
+        assert updated.id == schedule.id
+        assert updated.name == "morning"
+        assert updated.cron == "30 8 * * 1-5"
+        assert updated.prompt == "Updated"
+        assert updated.timezone == "America/Los_Angeles"
+        assert updated.direct_send is False
+        assert updated.target_channel == ""
+        assert updated.one_shot is True
+
+    def test_update_schedule_supports_remaining_fields_and_empty_prompt(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="morning",
+            prompt="Original",
+            one_shot=True,
+        )
+
+        updated = registry.update_schedule(
+            schedule.id,
+            name="weekday",
+            prompt="",
+            timezone="UTC",
+            one_shot=False,
+        )
+
+        assert updated is not None
+        assert updated.name == "weekday"
+        assert updated.prompt == ""
+        assert updated.timezone == "UTC"
+        assert updated.one_shot is False
+
+    def test_update_schedule_refuses_empty_update(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *")
+
+        with pytest.raises(ValueError, match="at least one field"):
+            registry.update_schedule(schedule.id)
+
+    def test_update_schedule_rejects_invalid_cron_without_mutating(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *")
+
+        with pytest.raises(ValueError, match="Invalid cron"):
+            registry.update_schedule(schedule.id, cron="99 * * * *")
+
+        assert registry.get_schedules("oleg")[0].cron == "0 8 * * *"
+
+    def test_update_schedule_missing(self, registry):
+        assert registry.update_schedule(999, prompt="new") is None
+
     def test_remove_missing(self, registry):
         assert registry.remove_schedule(999) is False
 
@@ -206,8 +310,8 @@ class TestAgentSchedules:
 
     def test_cascade_delete(self, registry):
         registry.register("oleg")
-        registry.add_schedule("oleg", "0 8 * * *")
-        registry.add_schedule("oleg", "0 21 * * *")
+        registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        registry.add_schedule("oleg", "0 21 * * *", name="evening")
 
         registry.delete("oleg")
         # Schedules should be cascade-deleted
