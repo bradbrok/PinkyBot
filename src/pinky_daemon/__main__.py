@@ -139,15 +139,35 @@ def _run_api(args) -> None:
     )
 
     from pinky_daemon.ferry.config import FerryConfig
+    from pinky_daemon.ferry.listener import FerryListenerState, serve_ferry_with_retry
 
     ferry_cfg = FerryConfig.from_env()
+    listener_state = getattr(app.state, "ferry_listener", None)
+    if not isinstance(listener_state, FerryListenerState):
+        listener_state = FerryListenerState.from_config(ferry_cfg)
+        app.state.ferry_listener = listener_state
+    bind = (
+        f"{ferry_cfg.bind_host}:{ferry_cfg.bind_port}"
+        if ferry_cfg.bind_host
+        else ""
+    )
     if not ferry_cfg.enabled:
         # Default / current prod: single server, unchanged behavior. If the
         # operator tried to turn ferry ON but the config is incomplete or the
         # bind host is unsafe, say why (fail-closed — we never bind publicly).
-        if (os.environ.get("PINKYBOT_FERRY_ENABLED") or "").strip().lower() in (
+        enabled_requested = (
+            os.environ.get("PINKYBOT_FERRY_ENABLED") or ""
+        ).strip().lower() in (
             "1", "true", "yes", "on",
-        ):
+        )
+        disabled_error = ferry_cfg.why_disabled() if enabled_requested else ""
+        listener_state.update(
+            "disabled",
+            bind=bind,
+            last_error=disabled_error,
+            retry_count=0,
+        )
+        if enabled_requested:
             print(f"[pinky] Ferry disabled: {ferry_cfg.why_disabled()}", file=sys.stderr)
         uvicorn.run(app, host=args.host, port=args.port)
         return
@@ -160,6 +180,12 @@ def _run_api(args) -> None:
 
     host_pinky = getattr(app.state, "host_pinky", None)
     if host_pinky is None:
+        listener_state.update(
+            "dead",
+            bind=bind,
+            last_error="ferry enabled but host_pinky missing",
+            retry_count=0,
+        )
         print(
             "[pinky] ferry enabled but host_pinky missing — starting API only",
             file=sys.stderr,
@@ -187,24 +213,20 @@ def _run_api(args) -> None:
     main_server.capture_signals = lambda: contextlib.nullcontext()
     ferry_server.capture_signals = lambda: contextlib.nullcontext()
 
-    async def _serve_ferry() -> None:
-        # Best-effort: a ferry bind failure (e.g. the Tailscale IP isn't
-        # assigned yet) must NOT take down the core daemon. Log it and let the
-        # main API keep serving.
-        try:
-            await ferry_server.serve()
-        except (Exception, SystemExit) as e:  # noqa: BLE001
-            print(
-                f"[pinky] Ferry listener failed (main API unaffected): {e}",
-                file=sys.stderr,
-            )
-
     async def _serve_both() -> None:
         loop = asyncio.get_running_loop()
+        shutdown_event = asyncio.Event()
+
+        async def _wait_for_retry(delay: float) -> None:
+            try:
+                await asyncio.wait_for(shutdown_event.wait(), timeout=delay)
+            except TimeoutError:
+                pass
 
         def _shutdown(*_a) -> None:
             main_server.should_exit = True
             ferry_server.should_exit = True
+            shutdown_event.set()
 
         for sig in (signal.SIGINT, signal.SIGTERM):
             try:
@@ -212,7 +234,14 @@ def _run_api(args) -> None:
             except (NotImplementedError, RuntimeError):
                 pass
         # main API failures propagate (core); the ferry side is best-effort.
-        await asyncio.gather(main_server.serve(), _serve_ferry())
+        await asyncio.gather(
+            main_server.serve(),
+            serve_ferry_with_retry(
+                ferry_server,
+                listener_state,
+                wait=_wait_for_retry,
+            ),
+        )
 
     asyncio.run(_serve_both())
 

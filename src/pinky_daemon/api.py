@@ -124,6 +124,8 @@ from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS, resolve_cli_effort
+from pinky_daemon.ferry.config import FerryConfig
+from pinky_daemon.ferry.listener import FerryListenerState
 from pinky_daemon.hooks import (
     AuditStore,
     HookEvent,
@@ -985,6 +987,20 @@ _ISOLATION_PATH_RES = (
     re.compile(r"^/autonomy/([^/]+)/.+$"),
 )
 
+_ISOLATION_MESH_HINT = (
+    'cross-fleet messaging is available via mesh_remote_send(target="agent@fleet") '
+    "— requires your mesh_outbound_allowlist to include the target"
+)
+
+
+class _IsolationDeniedError(HTTPException):
+    """HTTP 403 whose existing error text can carry top-level guidance."""
+
+    def __init__(self, detail: str, *, hint: str | None) -> None:
+        super().__init__(status_code=403, detail=detail)
+        self.hint = hint
+
+
 # #149: body-actor surfaces (/broker/*) are NOT matched here. Their acting
 # agent comes from the request BODY (field ``agent_name``), not the path, so
 # path matching can't catch impersonation (e.g. an isolated agent POSTing to
@@ -1626,6 +1642,16 @@ def create_api(
         description="Stateful Claude Code session API",
         version="0.1.0",
     )
+    app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
+
+    @app.exception_handler(_IsolationDeniedError)
+    async def _isolation_denied_response(
+        _request: Request, error: _IsolationDeniedError
+    ) -> JSONResponse:
+        content = {"detail": error.detail}
+        if error.hint:
+            content["hint"] = error.hint
+        return JSONResponse(status_code=error.status_code, content=content)
 
     # ── CORS ──────────────────────────────────────────────
     # Allow origins from env (comma-separated) or default to same-origin only.
@@ -4654,6 +4680,25 @@ def create_api(
             return False
         return not bool(getattr(agent, "isolated", False))
 
+    def _isolation_denial_hint(request: Request) -> str | None:
+        """Point denied callers at ferry, except for a known-local message peer."""
+        target = _isolation_path_target(request.url.path)
+        if (
+            target
+            and request.method == "POST"
+            and request.url.path == f"/agents/{target}/message"
+        ):
+            try:
+                if agents.has_agent(target):
+                    return None
+            except Exception as e:
+                _log(
+                    f"isolation-hint: registry lookup failed for '{target}' "
+                    f"on {request.url.path}: {e} — suppressing cross-fleet hint"
+                )
+                return None
+        return _ISOLATION_MESH_HINT
+
     def _deny_isolated_cross_actor(request: Request, body_agent: str) -> None:
         """#149 body-actor guard for /broker/* (and any handler whose acting
         agent comes from the request body). Raises 403 when an *isolated*
@@ -4674,9 +4719,9 @@ def create_api(
                 f"isolation: denied isolated agent '{caller}' from acting as "
                 f"'{body_agent}' on {request.url.path}"
             )
-            raise HTTPException(
-                status_code=403,
-                detail="isolated agent may only act as itself",
+            raise _IsolationDeniedError(
+                "isolated agent may only act as itself",
+                hint=_isolation_denial_hint(request),
             )
 
     def _has_valid_session(request: Request) -> bool:
@@ -4730,12 +4775,16 @@ def create_api(
             # cross-agent /agents/{other}/* access even with a valid signature.
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
             if _internal_isolation_denied(request, caller):
+                content = {
+                    "error": "isolated agent may only access its own resources",
+                    "agent": caller,
+                }
+                hint = _isolation_denial_hint(request)
+                if hint:
+                    content["hint"] = hint
                 return JSONResponse(
                     status_code=403,
-                    content={
-                        "error": "isolated agent may only access its own resources",
-                        "agent": caller,
-                    },
+                    content=content,
                 )
             return await call_next(request)
 
@@ -7902,7 +7951,12 @@ npm run build</pre>
         Reports the active transport (HTTP-over-Tailscale or NATS) and whether
         it is wired, without leaking the shared secret or NATS password.
         """
-        return _build_mesh_sender().diagnostics()
+        diagnostics = _build_mesh_sender().diagnostics()
+        listener_state = getattr(app.state, "ferry_listener", None)
+        if not isinstance(listener_state, FerryListenerState):
+            listener_state = FerryListenerState()
+        diagnostics["ferry_listener"] = listener_state.snapshot()
+        return diagnostics
 
     @app.post("/agents/{name}/mesh/send")
     async def mesh_send(name: str, req: MeshSendRequest):

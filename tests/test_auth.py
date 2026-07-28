@@ -927,6 +927,11 @@ class TestAgentIsolationScoping:
     Full-trust (non-isolated) agents are unaffected by either layer.
     """
 
+    _MESH_HINT = (
+        'cross-fleet messaging is available via mesh_remote_send(target="agent@fleet") '
+        "— requires your mesh_outbound_allowlist to include the target"
+    )
+
     def _make_client_with_agents(self, monkeypatch, tmp_path):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -970,7 +975,8 @@ class TestAgentIsolationScoping:
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
         resp = self._signed_get(client, "tenant", "/agents/other")
         assert resp.status_code == 403
-        assert "isolated" in resp.json().get("error", "").lower()
+        assert resp.json()["error"] == "isolated agent may only access its own resources"
+        assert resp.json()["hint"] == self._MESH_HINT
         os.unlink(path)
 
     def test_isolated_agent_allowed_self_access(self, monkeypatch, tmp_path):
@@ -1025,7 +1031,23 @@ class TestAgentIsolationScoping:
             {"from_agent": "geordi", "message": "hi"},
         )
         assert resp.status_code == 403
-        assert "isolated" in resp.json().get("error", "").lower()
+        assert resp.json()["error"] == "isolated agent may only access its own resources"
+        assert "hint" not in resp.json()
+        os.unlink(path)
+
+    def test_isolated_unknown_message_target_gets_cross_fleet_hint(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_client_grouped(monkeypatch, tmp_path)
+        resp = self._signed_post(
+            client,
+            "geordi",
+            "/agents/onesie@tod/message",
+            {"from_agent": "geordi", "message": "hi"},
+        )
+        assert resp.status_code == 403
+        assert resp.json()["error"] == "isolated agent may only access its own resources"
+        assert resp.json()["hint"] == self._MESH_HINT
         os.unlink(path)
 
     def test_isolated_same_group_non_message_path_still_denied(self, monkeypatch, tmp_path):
@@ -1049,6 +1071,7 @@ class TestAgentIsolationScoping:
         # middleware deny uses {"error": ...}); accept either shape.
         body = resp.json()
         assert "isolated" in (body.get("detail") or body.get("error") or "").lower()
+        assert "hint" not in body
         os.unlink(path)
 
     @pytest.mark.parametrize("from_agent", ["", "   "])
@@ -1099,7 +1122,8 @@ class TestAgentIsolationScoping:
             {"agent_name": "other", "chat_id": "123", "content": "hi"},
         )
         assert resp.status_code == 403
-        assert "isolated" in str(resp.json()).lower()
+        assert resp.json()["detail"] == "isolated agent may only act as itself"
+        assert resp.json()["hint"] == self._MESH_HINT
         os.unlink(path)
 
     def test_isolated_agent_allowed_broker_send_as_self(self, monkeypatch, tmp_path):
