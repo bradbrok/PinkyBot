@@ -1631,15 +1631,26 @@ class MessageBroker:
         hint = ""
         _no_hint_platforms = {"web", "api", ""}
         if message.platform and message.platform not in _no_hint_platforms:
-            hint = (
-                f"\n💬 Reply on {message.platform} using pinky-messaging: "
-                f'send(chat_id="{message.chat_id}", platform="{message.platform}", text=...)'
-            )
-            if message.message_id:
-                hint += (
-                    f' — or thread(message_id="{message.message_id}", text=...) '
-                    f"to quote-reply to this message"
+            if message.reply_to and message.message_id:
+                hint = (
+                    f"\n💬 Reply IN THREAD to this message on {message.platform} "
+                    f"using pinky-messaging: "
+                    f'thread(message_id="{message.message_id}", text=...). '
+                    f'Fallback: send(chat_id="{message.chat_id}", '
+                    f'platform="{message.platform}", text=...) posts to the channel '
+                    f"OUTSIDE the thread"
                 )
+            else:
+                hint = (
+                    f"\n💬 Reply on {message.platform} using pinky-messaging: "
+                    f'send(chat_id="{message.chat_id}", '
+                    f'platform="{message.platform}", text=...)'
+                )
+                if message.message_id:
+                    hint += (
+                        f' — or thread(message_id="{message.message_id}", text=...) '
+                        f"to quote/thread-reply to this message"
+                    )
         await streaming.send(
             prompt,
             platform=message.platform,
