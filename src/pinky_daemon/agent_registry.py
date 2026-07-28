@@ -33,6 +33,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts
@@ -257,8 +258,6 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
         import datetime as dt
         import zoneinfo
 
-        from pinky_daemon.scheduler import _field_matches
-
         parts = cron.strip().split()
         if len(parts) != 5:
             return None
@@ -302,8 +301,6 @@ def _cron_next_run(cron: str, timezone: str = "UTC") -> float | None:
 
 def _validate_schedule_cron(cron: str) -> None:
     """Reject cron expressions that the scheduler cannot match."""
-    from pinky_daemon.scheduler import _field_matches
-
     parts = cron.strip().split()
     if len(parts) != 5:
         raise ValueError("Cron expression must contain exactly five fields")
