@@ -154,6 +154,8 @@ def create_server(
             one_shot: bool = False,
         ) -> str:
             """Set a cron schedule. Default: prompt sent TO YOU as input (wake mode).
+            Distinct concurrent schedules need distinct names. To edit an existing
+            schedule, use update_wake_schedule with its ID.
             direct_send=True: prompt sent as message to target_channel (no agent processing).
             one_shot=True: auto-disables after one fire.
             In wake mode, the prompt is an instruction — to send a message, tell yourself to call send().
@@ -185,7 +187,11 @@ def create_server(
             target_channel: str | None = None,
             one_shot: bool | None = None,
         ) -> str:
-            """Update selected fields on an existing wake schedule without changing its ID."""
+            """Update selected fields without changing a wake schedule's ID.
+
+            Distinct concurrent schedules need distinct names; renaming onto another
+            enabled schedule's name is refused.
+            """
             values = {
                 "cron": cron,
                 "prompt": prompt,

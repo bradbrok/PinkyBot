@@ -9946,6 +9946,8 @@ npm run build</pre>
                 target_channel=req.target_channel,
                 one_shot=req.one_shot,
             )
+        except ScheduleNameConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
         except ValueError as exc:
             raise HTTPException(400, str(exc)) from exc
         if schedule is None:
@@ -9962,7 +9964,11 @@ npm run build</pre>
     @app.post("/agents/{agent_name}/schedules/{schedule_id}/toggle")
     async def toggle_schedule(agent_name: str, schedule_id: int, enabled: bool = True):
         """Enable/disable a schedule."""
-        if not agents.toggle_schedule(schedule_id, enabled):
+        try:
+            toggled = agents.toggle_schedule(schedule_id, enabled)
+        except ScheduleNameConflictError as exc:
+            raise HTTPException(409, str(exc)) from exc
+        if not toggled:
             raise HTTPException(404, f"Schedule {schedule_id} not found")
         return {"toggled": True, "enabled": enabled}
 

@@ -2913,6 +2913,30 @@ except Exception:
 
     # ── Schedules ───────────────────────────────────────────
 
+    def _ensure_schedule_name_available(
+        self,
+        agent_name: str,
+        name: str,
+        *,
+        exclude_schedule_id: int | None = None,
+    ) -> None:
+        """Refuse an enabled agent/name collision, optionally excluding one row."""
+        sql = """SELECT id FROM agent_schedules
+                 WHERE agent_name=? AND name=? AND enabled=1"""
+        params: list = [agent_name, name]
+        if exclude_schedule_id is not None:
+            sql += " AND id<>?"
+            params.append(exclude_schedule_id)
+        sql += " ORDER BY id ASC LIMIT 1"
+        existing = self._db.execute(sql, params).fetchone()
+        if existing:
+            raise ScheduleNameConflictError(
+                f"Enabled schedule {name!r} already exists for agent {agent_name!r} "
+                f"as ID {existing[0]}; choose a distinct name to create another "
+                f"schedule, or use update_wake_schedule with ID {existing[0]} "
+                "to edit the existing one"
+            )
+
     def add_schedule(
         self, agent_name: str, cron: str, *,
         name: str = "", prompt: str = "", timezone: str = "America/Los_Angeles",
@@ -2921,17 +2945,7 @@ except Exception:
     ) -> AgentSchedule:
         """Add a cron-based wake schedule for an agent."""
         _validate_schedule_cron(cron)
-        existing = self._db.execute(
-            """SELECT id FROM agent_schedules
-               WHERE agent_name=? AND name=? AND enabled=1
-               ORDER BY id ASC LIMIT 1""",
-            (agent_name, name),
-        ).fetchone()
-        if existing:
-            raise ScheduleNameConflictError(
-                f"Enabled schedule {name!r} already exists for agent {agent_name!r} "
-                f"as ID {existing[0]}; use update_wake_schedule to edit it"
-            )
+        self._ensure_schedule_name_available(agent_name, name)
 
         now = time.time()
         cursor = self._db.execute(
@@ -3010,6 +3024,19 @@ except Exception:
             if column in updates:
                 updates[column] = int(updates[column])
 
+        current = self._db.execute(
+            "SELECT agent_name, enabled FROM agent_schedules WHERE id=?",
+            (schedule_id,),
+        ).fetchone()
+        if current is None:
+            return None
+        if name is not None and bool(current[1]):
+            self._ensure_schedule_name_available(
+                current[0],
+                name,
+                exclude_schedule_id=schedule_id,
+            )
+
         set_clause = ", ".join(f"{field}=?" for field in updates)
         cursor = self._db.execute(
             f"UPDATE agent_schedules SET {set_clause} WHERE id=?",
@@ -3034,6 +3061,18 @@ except Exception:
 
     def toggle_schedule(self, schedule_id: int, enabled: bool) -> bool:
         """Enable/disable a schedule."""
+        current = self._db.execute(
+            "SELECT agent_name, name FROM agent_schedules WHERE id=?",
+            (schedule_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        if enabled:
+            self._ensure_schedule_name_available(
+                current[0],
+                current[1],
+                exclude_schedule_id=schedule_id,
+            )
         cursor = self._db.execute(
             "UPDATE agent_schedules SET enabled=? WHERE id=?",
             (int(enabled), schedule_id),

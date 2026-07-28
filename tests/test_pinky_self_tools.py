@@ -493,6 +493,19 @@ class TestGetAgentCard:
 # ── set_wake_schedule ─────────────────────────────────────────────────────────
 
 class TestSetWakeSchedule:
+    def test_contract_documents_distinct_concurrent_names(self, srv):
+        descriptions = {
+            tool.name: tool.description
+            for tool in srv._tool_manager.list_tools()
+        }
+
+        assert "Distinct concurrent schedules need distinct names" in (
+            descriptions["set_wake_schedule"]
+        )
+        assert "Distinct concurrent schedules need distinct names" in (
+            descriptions["update_wake_schedule"]
+        )
+
     def test_basic_wake_mode(self, srv):
         resp = {"id": 42, "name": "morning_check", "cron": "0 8 * * *"}
         with _ok(resp):

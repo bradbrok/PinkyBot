@@ -5191,13 +5191,65 @@ class TestAgentScheduleEndpoints:
     def test_create_schedule_rejects_enabled_duplicate_name(self):
         client = self._make_client()
         self._register(client, "alice")
-        assert self._create_schedule(client).status_code == 200
+        created = self._create_schedule(client).json()
 
         response = self._create_schedule(client, cron="0 9 * * *")
 
         assert response.status_code == 409
-        assert "update_wake_schedule" in response.json()["detail"]
+        detail = response.json()["detail"]
+        assert "distinct name" in detail
+        assert f"update_wake_schedule with ID {created['id']}" in detail
         assert client.get("/agents/alice/schedules").json()["count"] == 1
+
+    def test_patch_schedule_rejects_enabled_name_collision(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        existing = self._create_schedule(client).json()
+        renamed = self._create_schedule(
+            client,
+            name="evening",
+            cron="0 21 * * *",
+        ).json()
+
+        response = client.patch(
+            f"/agents/alice/schedules/{renamed['id']}",
+            json={"name": "morning"},
+        )
+
+        assert response.status_code == 409
+        assert f"ID {existing['id']}" in response.json()["detail"]
+        schedules = client.get("/agents/alice/schedules").json()["schedules"]
+        assert [(row["id"], row["name"]) for row in schedules] == [
+            (existing["id"], "morning"),
+            (renamed["id"], "evening"),
+        ]
+
+    def test_toggle_schedule_rejects_reenable_name_collision(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        old = self._create_schedule(client).json()
+        disabled = client.post(
+            f"/agents/alice/schedules/{old['id']}/toggle",
+            params={"enabled": False},
+        )
+        assert disabled.status_code == 200
+        replacement = self._create_schedule(client, cron="0 9 * * *").json()
+
+        response = client.post(
+            f"/agents/alice/schedules/{old['id']}/toggle",
+            params={"enabled": True},
+        )
+
+        assert response.status_code == 409
+        assert f"ID {replacement['id']}" in response.json()["detail"]
+        schedules = client.get(
+            "/agents/alice/schedules",
+            params={"enabled_only": False},
+        ).json()["schedules"]
+        assert [(row["id"], row["enabled"]) for row in schedules] == [
+            (old["id"], False),
+            (replacement["id"], True),
+        ]
 
     @pytest.mark.parametrize("one_shot", [False, True])
     def test_create_schedule_reuses_disabled_name(self, one_shot):

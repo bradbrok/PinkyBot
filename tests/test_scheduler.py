@@ -10,7 +10,7 @@ from datetime import datetime
 
 import pytest
 
-from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
 from pinky_daemon.scheduler import AgentScheduler, cron_matches, next_cron_description
 
 # ── Cron Parser Tests ──────────────────────────────────────
@@ -148,7 +148,10 @@ class TestAgentSchedules:
         registry.register("oleg")
         schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
 
-        with pytest.raises(ValueError, match="update_wake_schedule"):
+        with pytest.raises(
+            ScheduleNameConflictError,
+            match=rf"distinct name.*update_wake_schedule with ID {schedule.id}",
+        ):
             registry.add_schedule("oleg", "0 9 * * *", name="morning")
 
         assert [row.id for row in registry.get_schedules("oleg")] == [schedule.id]
@@ -286,6 +289,30 @@ class TestAgentSchedules:
     def test_update_schedule_missing(self, registry):
         assert registry.update_schedule(999, prompt="new") is None
 
+    def test_update_schedule_rejects_enabled_name_collision(self, registry):
+        registry.register("oleg")
+        existing = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        renamed = registry.add_schedule("oleg", "0 9 * * *", name="evening")
+
+        with pytest.raises(ScheduleNameConflictError, match=rf"ID {existing.id}"):
+            registry.update_schedule(renamed.id, name="morning")
+
+        schedules = registry.get_schedules("oleg")
+        assert [(row.id, row.name) for row in schedules] == [
+            (existing.id, "morning"),
+            (renamed.id, "evening"),
+        ]
+
+    def test_update_schedule_allows_self_rename(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+
+        updated = registry.update_schedule(schedule.id, name="morning")
+
+        assert updated is not None
+        assert updated.id == schedule.id
+        assert updated.name == "morning"
+
     def test_remove_missing(self, registry):
         assert registry.remove_schedule(999) is False
 
@@ -296,6 +323,29 @@ class TestAgentSchedules:
 
         schedules = registry.get_schedules("oleg", enabled_only=False)
         assert schedules[0].enabled is False
+
+    def test_toggle_schedule_rejects_reenable_name_collision(self, registry):
+        registry.register("oleg")
+        old = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        assert registry.toggle_schedule(old.id, False) is True
+        replacement = registry.add_schedule("oleg", "0 9 * * *", name="morning")
+
+        with pytest.raises(ScheduleNameConflictError, match=rf"ID {replacement.id}"):
+            registry.toggle_schedule(old.id, True)
+
+        schedules = registry.get_schedules("oleg", enabled_only=False)
+        assert [(row.id, row.enabled) for row in schedules] == [
+            (old.id, False),
+            (replacement.id, True),
+        ]
+
+    def test_toggle_schedule_enables_without_conflict(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *", name="morning")
+        assert registry.toggle_schedule(schedule.id, False) is True
+
+        assert registry.toggle_schedule(schedule.id, True) is True
+        assert registry.get_schedules("oleg")[0].id == schedule.id
 
     def test_update_last_run(self, registry):
         registry.register("oleg")
