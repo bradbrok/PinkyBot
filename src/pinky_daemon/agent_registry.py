@@ -2917,7 +2917,13 @@ except Exception:
         *,
         exclude_schedule_id: int | None = None,
     ) -> None:
-        """Refuse an enabled agent/name collision, optionally excluding one row."""
+        """Enforce enabled agent/name uniqueness within this writer process.
+
+        Callers hold ``_rmw_lock`` across this guard and the mutation, which
+        serializes threads sharing this connection. This does not coordinate
+        with a second writer process; deployment requires one writer process
+        per agents DB file.
+        """
         sql = """SELECT id FROM agent_schedules
                  WHERE agent_name=? AND name=? AND enabled=1"""
         params: list = [agent_name, name]
@@ -2946,9 +2952,14 @@ except Exception:
         with self._rmw_lock:
             self._ensure_schedule_name_available(agent_name, name)
             cursor = self._db.execute(
-                """INSERT INTO agent_schedules (agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot)
-                   VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
-                (agent_name, name, cron, prompt, timezone, now, int(direct_send), target_channel, int(one_shot)),
+                """INSERT INTO agent_schedules (
+                       agent_name, name, cron, prompt, timezone, enabled, last_run,
+                       created_at, direct_send, target_channel, one_shot
+                   ) VALUES (?, ?, ?, ?, ?, 1, 0, ?, ?, ?, ?)""",
+                (
+                    agent_name, name, cron, prompt, timezone, now,
+                    int(direct_send), target_channel, int(one_shot),
+                ),
             )
             self._db.commit()
             return AgentSchedule(

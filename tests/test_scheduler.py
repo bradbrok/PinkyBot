@@ -7,6 +7,7 @@ import os
 import tempfile
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 
 import pytest
@@ -369,103 +370,96 @@ class TestAgentSchedules:
         assert registry.get_schedules("oleg") == []
 
     def test_concurrent_add_same_name_allows_only_one(self, registry):
-        """Concurrent same-name creates must leave exactly one enabled schedule."""
+        """Same-process threads serialize the guard and insert."""
         registry.register("oleg")
-        errors: list[Exception] = []
-        successes: list[int] = []
-        barrier = threading.Barrier(12)
+        worker_count = 12
+        start = threading.Barrier(worker_count)
 
-        def worker():
-            barrier.wait()
+        def create_schedule(index):
+            start.wait(timeout=5)
             try:
-                s = registry.add_schedule("oleg", "0 8 * * *", name="morning")
-                successes.append(s.id)
-            except Exception as exc:
-                errors.append(exc)
+                schedule = registry.add_schedule(
+                    "oleg",
+                    f"{index} 8 * * *",
+                    name="morning",
+                )
+            except ScheduleNameConflictError:
+                return "conflict", None
+            return "created", schedule.id
 
-        threads = [threading.Thread(target=worker) for _ in range(12)]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(create_schedule, range(worker_count)))
 
-        enabled = registry.get_schedules("oleg", enabled_only=True)
-        enabled_named = [s for s in enabled if s.name == "morning"]
-        assert len(enabled_named) == 1, (
-            f"Expected 1 enabled 'morning' schedule, got {len(enabled_named)}"
+        assert [status for status, _ in results].count("created") == 1
+        assert [status for status, _ in results].count("conflict") == worker_count - 1
+        enabled = registry.get_schedules("oleg")
+        assert len(enabled) == 1
+        assert enabled[0].id == next(
+            row_id for status, row_id in results if status == "created"
         )
-        assert len(successes) == 1, f"Expected 1 successful create, got {len(successes)}"
 
     def test_concurrent_rename_to_same_free_name_allows_only_one(self, registry):
-        """Concurrent renames of distinct enabled schedules to the same free name must leave one."""
+        """Same-process threads serialize each guarded enabled-row rename."""
         registry.register("oleg")
-        barrier = threading.Barrier(12)
+        worker_count = 12
         schedules = [
-            registry.add_schedule("oleg", "0 8 * * *", name=f"slot-{i}")
-            for i in range(12)
+            registry.add_schedule("oleg", f"{index} 8 * * *", name=f"slot-{index}")
+            for index in range(worker_count)
         ]
-        errors: list[Exception] = []
-        successes: list[int] = []
+        start = threading.Barrier(worker_count)
 
-        def worker(sched_id):
-            barrier.wait()
+        def rename_schedule(schedule):
+            start.wait(timeout=5)
             try:
-                result = registry.update_schedule(sched_id, name="target")
-                if result is not None:
-                    successes.append(sched_id)
-            except Exception as exc:
-                errors.append(exc)
+                updated = registry.update_schedule(schedule.id, name="target")
+            except ScheduleNameConflictError:
+                return "conflict"
+            assert updated is not None
+            return "renamed"
 
-        threads = [threading.Thread(target=worker, args=(s.id,)) for s in schedules]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(rename_schedule, schedules))
 
-        enabled = registry.get_schedules("oleg", enabled_only=True)
-        named_target = [s for s in enabled if s.name == "target"]
-        assert len(named_target) <= 1, (
-            f"Expected at most 1 enabled 'target' schedule, got {len(named_target)}"
-        )
+        assert results.count("renamed") == 1
+        assert results.count("conflict") == worker_count - 1
+        enabled = registry.get_schedules("oleg")
+        assert len(enabled) == worker_count
+        assert [schedule.name for schedule in enabled].count("target") == 1
 
     def test_concurrent_reenable_same_name_allows_only_one(self, registry):
-        """Concurrent re-enables of disabled same-name rows must leave exactly one enabled."""
+        """Same-process threads serialize each guarded re-enable."""
         registry.register("oleg")
+        worker_count = 12
         # Create 12 schedules with distinct names, disable them, then rename all
         # to "morning" while disabled (rename check skips disabled rows).
         schedules = [
-            registry.add_schedule("oleg", "0 8 * * *", name=f"slot-{i}")
-            for i in range(12)
+            registry.add_schedule("oleg", f"{index} 8 * * *", name=f"slot-{index}")
+            for index in range(worker_count)
         ]
-        for s in schedules:
-            registry.toggle_schedule(s.id, False)
-        for s in schedules:
-            registry.update_schedule(s.id, name="morning")
+        for schedule in schedules:
+            registry.toggle_schedule(schedule.id, False)
+        for schedule in schedules:
+            registry.update_schedule(schedule.id, name="morning")
 
-        barrier = threading.Barrier(12)
-        errors: list[Exception] = []
-        successes: list[int] = []
+        start = threading.Barrier(worker_count)
 
-        def worker(sched_id):
-            barrier.wait()
+        def enable_schedule(schedule):
+            start.wait(timeout=5)
             try:
-                if registry.toggle_schedule(sched_id, True):
-                    successes.append(sched_id)
-            except Exception as exc:
-                errors.append(exc)
+                enabled = registry.toggle_schedule(schedule.id, True)
+            except ScheduleNameConflictError:
+                return "conflict"
+            assert enabled is True
+            return "enabled"
 
-        threads = [threading.Thread(target=worker, args=(s.id,)) for s in schedules]
-        for t in threads:
-            t.start()
-        for t in threads:
-            t.join()
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            results = list(executor.map(enable_schedule, schedules))
 
-        enabled = registry.get_schedules("oleg", enabled_only=True)
-        enabled_named = [s for s in enabled if s.name == "morning"]
-        assert len(enabled_named) == 1, (
-            f"Expected 1 enabled 'morning' schedule after concurrent re-enable, "
-            f"got {len(enabled_named)}"
-        )
+        assert results.count("enabled") == 1
+        assert results.count("conflict") == worker_count - 1
+        enabled = registry.get_schedules("oleg")
+        assert len(enabled) == 1
+        assert enabled[0].name == "morning"
 
 
 # ── Agent Heartbeat Tests ──────────────────────────────────
