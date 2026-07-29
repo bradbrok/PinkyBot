@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
@@ -104,6 +107,93 @@ class TestSkillStore:
         assert d["description"] == "desc"
         assert d["skill_type"] == "builtin"
         assert d["enabled"] is True
+
+
+class TestSkillStoreConcurrency:
+    def test_point_read_hammer_uses_thread_local_connections(self, tmp_path):
+        store = SkillStore(db_path=str(tmp_path / "skills.db"))
+        worker_count = 12
+        rounds = 25
+        point_reads_per_round = 8
+        start = threading.Barrier(worker_count)
+        store.register(
+            "shared-skill",
+            description="Shared point-read seed",
+            mcp_server_config={
+                "command": "shared-command",
+                "env": {"SEED": "shared"},
+            },
+            tool_patterns=["mcp__shared__*"],
+            requires=["base-skill"],
+        )
+
+        def hammer(worker_index):
+            point_reads = 0
+            snapshots = []
+            try:
+                start.wait(timeout=10)
+                connection = store._db
+                connection_id = id(connection)
+                assert connection.execute(
+                    "PRAGMA journal_mode"
+                ).fetchone()[0].lower() == "wal"
+                assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+                for round_index in range(rounds):
+                    marker = f"{worker_index}-{round_index}"
+                    created = store.register(
+                        f"hammer-{marker}",
+                        description=f"Hammer skill {marker}",
+                        config={"marker": marker},
+                        mcp_server_config={
+                            "command": "hammer",
+                            "args": [marker],
+                        },
+                        tool_patterns=[f"mcp__hammer__{marker}"],
+                    )
+                    own = store.get(created.name)
+                    assert own is not None
+                    assert own.config == {"marker": marker}
+                    assert own.mcp_server_config["args"] == [marker]
+                    for _ in range(point_reads_per_round):
+                        shared = store.get("shared-skill")
+                        assert shared is not None
+                        assert shared.mcp_server_config == {
+                            "command": "shared-command",
+                            "env": {"SEED": "shared"},
+                        }
+                        assert shared.tool_patterns == ["mcp__shared__*"]
+                        assert shared.requires == ["base-skill"]
+                        point_reads += 1
+                    snapshots.append((created.to_dict(), own.to_dict()))
+                return connection_id, snapshots, point_reads, None
+            except Exception as exc:
+                return None, snapshots, point_reads, exc
+            finally:
+                store.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(hammer, range(worker_count)))
+
+            errors = [error for _, _, _, error in results if error is not None]
+            database_errors = [
+                error
+                for error in errors
+                if isinstance(error, sqlite3.DatabaseError)
+                or "malformed" in str(error).lower()
+            ]
+            assert database_errors == []
+            assert errors == []
+
+            connection_ids = [connection_id for connection_id, _, _, _ in results]
+            assert len(set(connection_ids)) == worker_count
+            assert sum(point_reads for _, _, point_reads, _ in results) == (
+                worker_count * rounds * point_reads_per_round
+            )
+            assert all(len(snapshots) == rounds for _, snapshots, _, _ in results)
+            assert len(store.list()) == worker_count * rounds + 1
+        finally:
+            store.close()
 
 
 class TestSessionSkills:
