@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -254,6 +257,112 @@ class TestComments:
         assert d["project_id"] == 5
         assert d["tags"] == ["a"]
         assert d["blocked_by"] == [1, 2]
+
+
+class TestTaskConcurrency:
+    def test_mixed_crud_hammer_uses_thread_local_connections(self, tmp_path):
+        store = TaskStore(db_path=str(tmp_path / "tasks.db"))
+        worker_count = 12
+        rounds = 25
+        point_reads_per_round = 8
+        start = threading.Barrier(worker_count)
+        seed_tasks = [
+            store.create(f"Point-read seed {index}", tags=["seed", str(index)])
+            for index in range(worker_count)
+        ]
+        seed_ids = [task.id for task in seed_tasks]
+
+        def hammer(worker_index):
+            snapshots = []
+            point_reads = 0
+            try:
+                start.wait(timeout=10)
+                connection_id = id(store._db)
+                for round_index in range(rounds):
+                    marker = f"{worker_index}-{round_index}"
+                    created = store.create(
+                        f"Hammer task {marker}",
+                        assigned_agent=f"worker-{worker_index}",
+                        tags=["hammer", marker],
+                    )
+                    fetched = store.get(created.id)
+                    assert fetched is not None
+                    for offset in range(point_reads_per_round):
+                        seed_id = seed_ids[
+                            (worker_index + round_index + offset) % len(seed_ids)
+                        ]
+                        point_read = store.get(seed_id)
+                        assert point_read is not None
+                        assert point_read.tags[0] == "seed"
+                        assert point_read.to_dict()["id"] == seed_id
+                        point_reads += 1
+                    listed = store.list(
+                        assigned_agent=f"worker-{worker_index}",
+                        include_completed=True,
+                        limit=1,
+                    )
+                    assert listed
+                    assert listed[0].to_dict()["assigned_agent"] == f"worker-{worker_index}"
+                    completed = store.update(created.id, status="completed")
+                    assert completed is not None
+                    completed_read = store.get(created.id)
+                    assert completed_read is not None
+                    assert completed_read.status == "completed"
+                    snapshots.append(
+                        (
+                            created.to_dict(),
+                            fetched.to_dict(),
+                            completed.to_dict(),
+                        )
+                    )
+                return connection_id, snapshots, point_reads, None
+            except Exception as exc:
+                return None, snapshots, point_reads, exc
+            finally:
+                store.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(hammer, range(worker_count)))
+
+            errors = [error for _, _, _, error in results if error is not None]
+            database_errors = [
+                error
+                for error in errors
+                if isinstance(error, sqlite3.DatabaseError)
+                or "malformed" in str(error).lower()
+            ]
+            assert database_errors == []
+            assert errors == []
+
+            connection_ids = [connection_id for connection_id, _, _, _ in results]
+            assert len(set(connection_ids)) == worker_count
+            assert sum(point_reads for _, _, point_reads, _ in results) == (
+                worker_count * rounds * point_reads_per_round
+            )
+
+            snapshots = [
+                snapshot
+                for _, worker_snapshots, _, _ in results
+                for snapshot in worker_snapshots
+            ]
+            completed_rows = worker_count * rounds
+            expected_rows = len(seed_tasks) + completed_rows
+            assert len(snapshots) == completed_rows
+            assert all(created["tags"][0] == "hammer" for created, _, _ in snapshots)
+            assert all(fetched["id"] == created["id"] for created, fetched, _ in snapshots)
+            assert all(completed["status"] == "completed" for _, _, completed in snapshots)
+
+            tasks = store.list(include_completed=True, limit=expected_rows + 1)
+            assert len(tasks) == expected_rows
+            assert store.count_by_status() == {
+                "completed": completed_rows,
+                "pending": len(seed_tasks),
+            }
+            assert len({task.id for task in tasks}) == expected_rows
+            assert all(task.tags[0] in {"hammer", "seed"} for task in tasks)
+        finally:
+            store.close()
 
 
 class TestTaskAPI:
