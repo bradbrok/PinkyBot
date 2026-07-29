@@ -3,12 +3,15 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 
 from pinky_daemon.conversation_store import ConversationStore
-from pinky_daemon.session_store import SessionRecord, SessionStore
+from pinky_daemon.session_store import SessionEventStore, SessionRecord, SessionStore
 
 
 @pytest.fixture
@@ -129,6 +132,117 @@ class TestSessionStore:
         store.save(_make_record(auto_restart=False))
         got = store.get("test-session")
         assert got.auto_restart is False
+
+
+class TestSessionStoreConcurrency:
+    def test_point_read_hammer_uses_thread_local_connections(self, tmp_path):
+        db_path = str(tmp_path / "sessions.db")
+        store = SessionStore(db_path=db_path)
+        event_store = SessionEventStore(db_path=db_path)
+        worker_count = 12
+        rounds = 25
+        point_reads_per_round = 8
+        start = threading.Barrier(worker_count)
+        store.save(
+            _make_record(
+                id="shared-session",
+                agent_name="shared-agent",
+                allowed_tools=["Read", "Glob"],
+                disallowed_tools=["Bash"],
+            )
+        )
+        event_store.log(
+            "shared-session",
+            "shared-agent",
+            "seed",
+            {"kind": "shared-seed"},
+        )
+
+        def hammer(worker_index):
+            point_reads = 0
+            snapshots = []
+            try:
+                start.wait(timeout=10)
+                session_connection_id = id(store._db)
+                event_connection_id = id(event_store._db)
+                session_id = f"worker-{worker_index}"
+                agent_name = f"agent-{worker_index}"
+                for round_index in range(rounds):
+                    marker = f"{worker_index}-{round_index}"
+                    store.save(
+                        _make_record(
+                            id=session_id,
+                            agent_name=agent_name,
+                            sdk_session_id=marker,
+                            allowed_tools=["Read", marker],
+                        )
+                    )
+                    event_store.log(
+                        session_id,
+                        agent_name,
+                        "hammer",
+                        {"marker": marker},
+                    )
+                    for _ in range(point_reads_per_round):
+                        shared = store.get("shared-session")
+                        assert shared is not None
+                        assert shared.allowed_tools == ["Read", "Glob"]
+                        assert shared.disallowed_tools == ["Bash"]
+                        shared_events = event_store.get_for_session(
+                            "shared-session",
+                            limit=1,
+                        )
+                        assert shared_events[0]["metadata"] == {
+                            "kind": "shared-seed"
+                        }
+                        point_reads += 1
+                    own = store.get(session_id)
+                    assert own is not None
+                    assert own.sdk_session_id == marker
+                    snapshots.append((own.id, own.allowed_tools, marker))
+                return (
+                    session_connection_id,
+                    event_connection_id,
+                    snapshots,
+                    point_reads,
+                    None,
+                )
+            except Exception as exc:
+                return None, None, snapshots, point_reads, exc
+            finally:
+                event_store.close()
+                store.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(hammer, range(worker_count)))
+
+            errors = [error for *_, error in results if error is not None]
+            database_errors = [
+                error
+                for error in errors
+                if isinstance(error, sqlite3.DatabaseError)
+                or "malformed" in str(error).lower()
+            ]
+            assert database_errors == []
+            assert errors == []
+
+            session_connection_ids = [result[0] for result in results]
+            event_connection_ids = [result[1] for result in results]
+            assert len(set(session_connection_ids)) == worker_count
+            assert len(set(event_connection_ids)) == worker_count
+            assert sum(result[3] for result in results) == (
+                worker_count * rounds * point_reads_per_round
+            )
+            assert all(len(result[2]) == rounds for result in results)
+            assert len(store.list_all()) == worker_count + 1
+            assert sum(
+                len(event_store.get_for_session(f"worker-{index}", limit=rounds))
+                for index in range(worker_count)
+            ) == worker_count * rounds
+        finally:
+            event_store.close()
+            store.close()
 
 
 class TestSessionManagerPersistence:

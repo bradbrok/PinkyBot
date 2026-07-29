@@ -18,6 +18,7 @@ import os
 import shutil
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -71,11 +72,20 @@ class AgentComms:
         # depend on the caller's cwd at send time.
         self._transfers_root = Path(db_path).resolve().parent / "transfers"
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._conn = sqlite3.connect(db_path, check_same_thread=False)
-        self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
+        self._thread_local = threading.local()
         self._init_schema()
         self._migrate()
+
+    @property
+    def _conn(self) -> sqlite3.Connection:
+        """Return the calling thread's connection, creating it on first use."""
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(self._db_path)
+            connection.row_factory = sqlite3.Row
+            connection.execute("PRAGMA journal_mode=WAL")
+            self._thread_local.connection = connection
+        return connection
 
     def _init_schema(self) -> None:
         # executescript issues an implicit COMMIT before running, so
@@ -479,7 +489,15 @@ class AgentComms:
     # ── Helpers ──────────────────────────────────────────────
 
     def close(self) -> None:
-        self._conn.close()
+        """Close the calling thread's connection, if it has opened one.
+
+        Connections opened by other threads belong to their thread-local state
+        and are released when those threads exit.
+        """
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is not None:
+            connection.close()
+            del self._thread_local.connection
 
     def get_thread(self, message_id: int, *, session_id: str = "") -> list[AgentMessage]:
         """Get all messages in a thread (root + all descendants at any depth).
