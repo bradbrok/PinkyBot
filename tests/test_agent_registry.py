@@ -1329,3 +1329,51 @@ class TestModelSeeds:
         )
         assert sol["context_window"] == 400_000
         assert sol["is_1m"] == 0
+
+
+class TestTmuxBootstrapMarker:
+    """First-tmux-boot marker driving one-shot fresh context on sdk→tmux.
+
+    An agent migrated from transport='sdk' to 'tmux' has SDK-authored
+    transcripts under ~/.claude/projects/<cwd>/, so TmuxSession would launch
+    ``claude --continue`` against one of them; the interactive REPL cannot
+    resume an SDK transcript, exits, and the pane is reaped (connected→dead).
+    api._start_streaming_session forces a fresh context on the FIRST tmux
+    launch only, keyed off this marker.
+    """
+
+    def test_unmarked_agent_is_not_bootstrapped(self, registry):
+        registry.register("newbie", transport="sdk")
+        assert registry.is_tmux_bootstrapped("newbie") is False
+
+    def test_mark_is_sticky(self, registry):
+        registry.register("newbie", transport="sdk")
+        registry.mark_tmux_bootstrapped("newbie")
+        assert registry.is_tmux_bootstrapped("newbie") is True
+
+    def test_marker_is_per_agent(self, registry):
+        registry.register("a1", transport="sdk")
+        registry.register("a2", transport="sdk")
+        registry.mark_tmux_bootstrapped("a1")
+        assert registry.is_tmux_bootstrapped("a1") is True
+        assert registry.is_tmux_bootstrapped("a2") is False
+
+    def test_backfill_grandfathers_existing_tmux_agents_only(self, registry):
+        registry.register("native", transport="tmux")
+        registry.register("legacy", transport="sdk")
+        # Simulate a fresh daemon boot re-running the one-shot migration.
+        registry.delete_setting("migration:tmux_bootstrapped_backfill")
+        registry._backfill_tmux_bootstrapped()
+
+        assert registry.is_tmux_bootstrapped("native") is True
+        assert registry.is_tmux_bootstrapped("legacy") is False
+
+    def test_backfill_is_one_shot(self, registry):
+        registry.register("later", transport="sdk")
+        registry.delete_setting("migration:tmux_bootstrapped_backfill")
+        registry._backfill_tmux_bootstrapped()
+        # Agent flips to tmux AFTER the backfill ran — must stay unmarked so
+        # its first tmux launch is forced fresh.
+        registry.register("later", transport="tmux")
+        registry._backfill_tmux_bootstrapped()
+        assert registry.is_tmux_bootstrapped("later") is False

@@ -3726,6 +3726,25 @@ def create_api(
         else:
             _effective_system_prompt = _raw_system_prompt
 
+        # First-ever tmux launch for this agent (i.e. an sdk→tmux transport
+        # migration, including the container flip in container_ops.py which
+        # also forces transport='tmux'). The agent's
+        # ``~/.claude/projects/<cwd>/`` is full of SDK-authored transcripts,
+        # so ``TmuxSession._has_prior_transcript()`` returns True and the
+        # launch would be ``claude --continue`` against an SDK transcript.
+        # The interactive REPL cannot resume those: it exits, tmux reaps the
+        # pane, and the agent goes connected→dead ~30s after boot. Force a
+        # fresh context for this one launch only; the marker is set after a
+        # successful connect, so every later tmux restart resumes its own
+        # tmux transcript normally. Pre-existing tmux agents are
+        # grandfathered by ``_backfill_tmux_bootstrapped``.
+        _first_tmux_boot = is_tmux and not agents.is_tmux_bootstrapped(agent_name)
+        if _first_tmux_boot:
+            _log(
+                f"streaming-start: {agent_name} first tmux launch "
+                f"(sdk→tmux migration) — forcing fresh context for this boot"
+            )
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -3770,6 +3789,7 @@ def create_api(
                 getattr(agent, "strict_effort_enforcement", False)
             ),
             idle_timeout=max(0, agent.auto_sleep_hours) * 3600,
+            force_fresh_context_once=_first_tmux_boot,
         )
 
         callback = await _make_streaming_response_callback()
@@ -3846,6 +3866,19 @@ def create_api(
                 )
             raise
         broker.register_streaming(agent_name, ss, label=label)
+
+        # The first tmux launch survived cold-start connect: record it so the
+        # next restart resumes this agent's own tmux transcript with
+        # ``--continue``. Deliberately AFTER connect+register — a failed boot
+        # leaves the marker unset so the retry is forced fresh again.
+        if _first_tmux_boot:
+            try:
+                agents.mark_tmux_bootstrapped(agent_name)
+            except Exception as e:
+                _log(
+                    f"streaming-start: mark_tmux_bootstrapped({agent_name}) "
+                    f"failed: {e}"
+                )
 
         # Log session lifecycle event
         event_type = "session_resume" if resume_id else "session_start"

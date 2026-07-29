@@ -1587,6 +1587,7 @@ class AgentRegistry:
         self._backfill_runtime_from_provider_url()
         self._warn_codex_runtime_mismatches()
         self._backfill_signing_keys()
+        self._backfill_tmux_bootstrapped()
 
         # Migrate agent_schedules table
         sched_existing = {
@@ -1719,6 +1720,40 @@ class AgentRegistry:
         self._db.commit()
         if cursor.rowcount:
             _log(f"agent_registry: backfilled runtime=codex_cli for {cursor.rowcount} agent(s)")
+
+    def _backfill_tmux_bootstrapped(self) -> None:
+        """Grandfather agents that were ALREADY on transport='tmux'.
+
+        ``tmux_bootstrapped`` marks "this agent has completed at least one
+        tmux launch", and drives the one-shot fresh-context forcing on the
+        first tmux boot after an sdk→tmux migration (see
+        ``_start_streaming_session``). Agents that were already running the
+        tmux transport when this marker landed have their own healthy tmux
+        transcripts and MUST keep resuming them with ``claude --continue``,
+        so mark them bootstrapped once at migration time.
+        """
+        marker = "migration:tmux_bootstrapped_backfill"
+        if self.get_setting(marker) == "1":
+            return
+        rows = self._db.execute(
+            "SELECT name FROM agents WHERE transport='tmux'"
+        ).fetchall()
+        for row in rows:
+            self.set_agent_setting(row[0], "tmux_bootstrapped", "1")
+        self.set_setting(marker, "1")
+        if rows:
+            _log(
+                f"agent_registry: grandfathered {len(rows)} existing tmux "
+                f"agent(s) as tmux_bootstrapped"
+            )
+
+    def is_tmux_bootstrapped(self, agent_name: str) -> bool:
+        """True once this agent has completed at least one tmux launch."""
+        return self.get_agent_setting(agent_name, "tmux_bootstrapped") == "1"
+
+    def mark_tmux_bootstrapped(self, agent_name: str) -> None:
+        """Record that this agent has completed a tmux launch."""
+        self.set_agent_setting(agent_name, "tmux_bootstrapped", "1")
 
     def _warn_codex_runtime_mismatches(self) -> None:
         """Warn when Codex provider rows still have the Claude SDK runtime.
