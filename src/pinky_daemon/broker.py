@@ -1766,6 +1766,17 @@ class MessageBroker:
         if used_outreach:
             _log(f"broker: {agent_name} handled turn via outreach tools")
             return
+
+        # OpenClaw is an internal WebSocket bridge — always deliver plain text
+        # directly, bypassing the fallback_enabled flag and the external-channel
+        # surface guard below. The _send_callback routes platform="openclaw"
+        # to openclaw_gateway.deliver_agent_reply which enqueues the reply for
+        # the waiting _route_chat coroutine.
+        if platform == "openclaw" and stripped and chat_id:
+            _log(f"broker: openclaw direct delivery for {agent_name}/{chat_id}")
+            await self._send_message(agent_name, platform, chat_id, stripped)
+            return
+
         if not stripped or not fallback_enabled or not chat_id:
             return
 

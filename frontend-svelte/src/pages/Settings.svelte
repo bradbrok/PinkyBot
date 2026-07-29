@@ -85,6 +85,10 @@
     let totalCostUsd = 0;
     let agentCosts = [];
 
+
+    // Account profile switch (LOCAL CUSTOMIZATION — personal ↔ work)
+    let switchingAccount = false;
+
     // Auth status
     let authStatus = {};
     let uiAuthStatus = {};
@@ -1689,6 +1693,7 @@
                         {accountInfo.email || '--'}
                     </div>
                 </div>
+                
                 <div>
                     <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_lifetime_cost_label')}</span>
                     <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{lifetimeCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">

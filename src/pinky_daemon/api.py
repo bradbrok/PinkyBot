@@ -9,8 +9,8 @@ Usage:
     curl -X POST http://localhost:8888/sessions -d '{"model": "sonnet"}'
     curl -X POST http://localhost:8888/sessions/{id}/message -d '{"content": "Hello"}'
 """
-
 from __future__ import annotations
+from pydantic import BaseModel
 
 import asyncio
 import contextlib
@@ -1651,6 +1651,23 @@ def _frontend_build_status(
     return base
 
 
+# ── AIena Admin: module-level request models ─────────────────
+# Must be at module scope so FastAPI can resolve type hints via globalns
+# (PEP 563). If nested inside create_api(), FastAPI treats `req` as a
+# query parameter and returns 422 on every POST.
+
+class _AienaApproveRequest(BaseModel):
+    slug: str
+    title: str = ""
+    category: str = ""
+
+
+class _AienaPromoteRequest(BaseModel):
+    slug: str
+    title: str = ""
+    category: str = ""
+
+
 # ── API Server ───────────────────────────────────────────────
 
 
@@ -2144,6 +2161,28 @@ def create_api(
         blocks: str = "",
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
+        # OpenClaw bridge: agent replies for the openclaw "platform" are not sent
+        # via a platform adapter — they're routed back over the OpenClaw Gateway
+        # WebSocket (chat_id carries the OpenClaw sessionKey). See
+        # openclaw_gateway.deliver_agent_reply. Non-fatal if no client is
+        # connected (agent replied after the app disconnected).
+        if platform == "openclaw":
+            try:
+                from pinky_daemon import openclaw_gateway as _ocg
+
+                delivered = await _ocg.deliver_agent_reply(chat_id, content)
+            except Exception as e:  # noqa: BLE001 — bridge must not break agent turn
+                _log(f"openclaw: deliver_agent_reply failed: {e}")
+                delivered = False
+            broker._stop_typing(agent_name, chat_id)
+            return {
+                "sent": bool(delivered),
+                "agent": agent_name,
+                "platform": platform,
+                "chat_id": chat_id,
+                "message_id": "",
+            }
+
         if account_id and not agents.get_raw_token_for_account(
             agent_name, platform, account_id,
         ):
@@ -3672,6 +3711,21 @@ def create_api(
         except Exception as e:
             _log(f"streaming-start: ensure_workspace_hooks({agent_name}) — {e}")
 
+        # Build system prompt; if it exceeds Linux MAX_ARG_STRLEN (~128 KB)
+        # pass it via a file to avoid CLIConnectionError [Errno 7] E2BIG.
+        _MAX_ARG_STRLEN = 128 * 1024  # conservative threshold (real limit 131072)
+        _raw_system_prompt = agents.build_system_prompt(agent_name, skill_store=skills)
+        if len(_raw_system_prompt.encode("utf-8")) >= _MAX_ARG_STRLEN:
+            _sp_file = Path(work_dir) / ".pinky_system_prompt"
+            _sp_file.write_text(_raw_system_prompt, encoding="utf-8")
+            _effective_system_prompt: str | dict = {"path": str(_sp_file)}
+            _log(
+                f"streaming-start: system prompt {len(_raw_system_prompt.encode())} bytes "
+                f"exceeds MAX_ARG_STRLEN — using file: {_sp_file}"
+            )
+        else:
+            _effective_system_prompt = _raw_system_prompt
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -3682,7 +3736,7 @@ def create_api(
             mcp_servers=codex_mcp_servers,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
+            system_prompt=_effective_system_prompt,
             resume_handle=resume_id,
             # commit=False here: the connect-time rebuild via
             # ``wake_context_builder`` is the delivered (committed) build
@@ -10990,6 +11044,32 @@ npm run build</pre>
             except Exception as exc:  # never let log rotation abort startup
                 _log(f"startup: log rotation not started ({exc})")
 
+        # Conversation pruning — delete messages older than PINKY_CONV_RETENTION_DAYS
+        # (default 30). Runs every 6 hours in a background thread to avoid blocking
+        # the event loop during bulk deletes on a large messages table.
+        _conv_retention_days = int(os.environ.get("PINKY_CONV_RETENTION_DAYS", "30"))
+        if _conv_retention_days > 0:
+            try:
+                async def _conversation_prune_loop(
+                    _store: "ConversationStore" = store,
+                    _days: int = _conv_retention_days,
+                ) -> None:
+                    import asyncio as _asyncio
+                    _CHECK_INTERVAL = 6 * 3600  # every 6 hours
+                    while True:
+                        try:
+                            deleted = await _asyncio.to_thread(_store.prune, max_age_days=_days)
+                            if deleted:
+                                _log(f"conv_prune: deleted {deleted:,} messages older than {_days}d")
+                        except Exception as _exc:
+                            _log(f"conv_prune: error ({_exc})")
+                        await _asyncio.sleep(_CHECK_INTERVAL)
+
+                app.state.conv_prune_task = asyncio.create_task(_conversation_prune_loop())
+                _log(f"startup: conversation pruning started (retention={_conv_retention_days}d)")
+            except Exception as exc:  # never let pruning abort startup
+                _log(f"startup: conversation pruning not started ({exc})")
+
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:
             def _resolve_memory_db(agent_name: str) -> str:
@@ -11816,9 +11896,15 @@ npm run build</pre>
         return result
 
     @app.post("/admin/restart")
-    async def admin_restart():
+    async def admin_restart(request: Request):
         """Graceful daemon restart. Requires process manager for auto-restart."""
         import signal
+
+        # Log caller details for auditing
+        caller_ip = request.client.host if request.client else "unknown"
+        caller_ua = request.headers.get("user-agent", "unknown")
+        caller_ref = request.headers.get("referer", "")
+        _log(f"admin: /admin/restart called — ip={caller_ip} ua={caller_ua!r} referer={caller_ref!r}")
 
         async def _delayed_exit():
             await asyncio.sleep(1)
@@ -12249,7 +12335,8 @@ npm run build</pre>
             "lifetime_agents": lifetime_costs,
         }
 
-    # ── Autonomy Engine ────────────────────────────────────
+
+        # ── Autonomy Engine ────────────────────────────────────
 
     @app.get("/autonomy/status")
     async def autonomy_status():
@@ -12556,6 +12643,285 @@ npm run build</pre>
         _log("voice: WS endpoint registered at /ws/voice/{id}")
     except ImportError:
         pass
+
+    # OpenClaw Gateway Protocol v4 bridge — lets the OpenClaw Android app
+    # connect and chat with the target agent (default: satoshi) without a
+    # separate OpenClaw Gateway server. Additive: no existing route is touched.
+    try:
+        from pinky_daemon import openclaw_gateway as _ocg
+
+        _ocg.set_dependencies(
+            broker=broker,
+            ensure_session=_ensure_streaming_session,
+            agents=agents,
+            transport_session_state=TransportSessionState,
+            target_agent=os.environ.get("OPENCLAW_TARGET_AGENT", "satoshi"),
+        )
+
+        @app.websocket("/openclaw/ws")
+        async def openclaw_ws(ws: WebSocket):
+            await _ocg.handle_connection(ws)
+
+        # Common alternate paths OpenClaw clients probe for the gateway socket.
+        @app.websocket("/gateway/ws")
+        async def openclaw_gateway_ws(ws: WebSocket):
+            await _ocg.handle_connection(ws)
+
+        # ── OpenClaw device invoke REST endpoint ─────────────────────────────
+        # Allows the AI agent (Satoshi) to call device methods on the connected
+        # Android node via HTTP, without needing a WebSocket connection.
+        # Usage: POST /openclaw/device {"method": "camera.snap", "params": {}}
+        @app.post("/openclaw/device")
+        async def openclaw_device_invoke(request: Request):
+            from fastapi.responses import JSONResponse as _JSONResponse
+            body = await request.json()
+            method = str(body.get("method") or "")
+            params = dict(body.get("params") or {})
+            timeout = float(body.get("timeout") or 15.0)
+            if not method:
+                return _JSONResponse({"ok": False, "error": "method required"}, status_code=400)
+            try:
+                result = await _ocg._forward_to_node(method, params, timeout=timeout)
+                return _JSONResponse({"ok": True, "payload": result})
+            except ValueError as exc:
+                return _JSONResponse({"ok": False, "error": str(exc), "code": "NODE_UNAVAILABLE"}, status_code=503)
+            except TimeoutError:
+                return _JSONResponse({"ok": False, "error": f"{method} timed out", "code": "TIMEOUT"}, status_code=504)
+            except Exception as exc:  # noqa: BLE001
+                return _JSONResponse({"ok": False, "error": str(exc), "code": "DEVICE_ERROR"}, status_code=500)
+
+        _log("openclaw: gateway WS registered at /openclaw/ws and /gateway/ws")
+    except Exception as _ocg_exc:  # noqa: BLE001 — bridge is optional
+        _log(f"openclaw: gateway not registered ({_ocg_exc})")
+
+    # ── AIena: approve article ─────────────────────────────────────────────────
+    # Called from admin.aiena.it when Mirko clicks APPROVATO on a preview card.
+    # Validates slug against pipeline.json investigations[status=preview] before
+    # inserting into Supabase article_approvals. Prevents test/garbage entries.
+    import json as _json_mod
+    import urllib.request as _urllib_req
+    import urllib.error as _urllib_err
+    import datetime as _dt_mod
+    import logging as _logging_mod
+    import os as _os_mod
+    import tempfile as _tmp_mod
+    import subprocess as _sp_mod
+
+    _aiena_logger = _logging_mod.getLogger("aiena.approve")
+    _AIENA_PIPELINE = "/var/www/aiena.it/data/pipeline.json"
+    _AIENA_SB_URL   = "https://fwyjxolljcogblvwvfca.supabase.co"
+    _AIENA_SB_KEY   = "sb_secret_mIKFJoDc9O-8fyPJ2N8uuA_hml1hf-4"
+    _AIENA_SB_HDR   = {
+        "apikey": _AIENA_SB_KEY,
+        "Authorization": f"Bearer {_AIENA_SB_KEY}",
+        "Content-Type": "application/json",
+        "Prefer": "return=minimal",
+    }
+
+    def _aiena_slug_in_pipeline(slug: str) -> bool:
+        """Return True if slug exists in investigations[] with status='preview'."""
+        try:
+            pipeline = _json_mod.loads(open(_AIENA_PIPELINE, encoding="utf-8").read())
+            for inv in pipeline.get("investigations", []):
+                if inv.get("slug") == slug and inv.get("status") == "preview":
+                    return True
+        except Exception as exc:
+            _aiena_logger.warning("pipeline.json read error: %s", exc)
+        return False
+
+    def _aiena_sb_exists(slug: str) -> bool:
+        """Return True if slug already in Supabase article_approvals WITH status='pending' or 'published'.
+        Records with status='lead' are NOT considered approved — they can be re-approved."""
+        try:
+            req = _urllib_req.Request(
+                f"{_AIENA_SB_URL}/rest/v1/article_approvals?slug=eq.{slug}&status=in.(pending,published)&select=slug,status",
+                headers={k: v for k, v in _AIENA_SB_HDR.items() if k != "Prefer"},
+            )
+            with _urllib_req.urlopen(req, timeout=8) as r:
+                data = _json_mod.loads(r.read())
+                return len(data) > 0
+        except Exception as exc:
+            _aiena_logger.warning("Supabase exists check failed: %s", exc)
+            return False
+
+    def _aiena_sb_insert(slug: str, title: str, category: str) -> bool:
+        """INSERT into article_approvals using service role key."""
+        payload = {
+            "slug": slug,
+            "title": title,
+            "category": category,
+            "approved_at": _dt_mod.datetime.now(_dt_mod.timezone.utc).isoformat(),
+            "status": "pending",
+        }
+        data = _json_mod.dumps(payload).encode("utf-8")
+        req = _urllib_req.Request(
+            f"{_AIENA_SB_URL}/rest/v1/article_approvals",
+            data=data,
+            headers=_AIENA_SB_HDR,
+            method="POST",
+        )
+        try:
+            with _urllib_req.urlopen(req, timeout=10) as r:
+                _aiena_logger.info("Supabase INSERT OK slug=%s status=%s", slug, r.status)
+                return True
+        except _urllib_err.HTTPError as exc:
+            body = exc.read().decode()
+            _aiena_logger.error("Supabase INSERT HTTP %s slug=%s body=%s", exc.code, slug, body[:300])
+            return False
+        except Exception as exc:
+            _aiena_logger.error("Supabase INSERT error slug=%s exc=%s", slug, exc)
+            return False
+
+    def _aiena_pipeline_set_approved(slug: str) -> bool:
+        """Atomically update pipeline.json: set investigation[slug].status = 'approvato'."""
+        try:
+            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
+                pipeline = _json_mod.load(f)
+            updated = False
+            for inv in pipeline.get("investigations", []):
+                if inv.get("slug") == slug and inv.get("status") == "preview":
+                    inv["status"] = "approvato"
+                    pipeline["updated_at"] = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+                    updated = True
+                    break
+            if not updated:
+                _aiena_logger.warning("pipeline_set_approved: slug=%s not found in preview", slug)
+                return False
+            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
+            fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
+            try:
+                with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
+                    _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
+                _os_mod.replace(tmp, _AIENA_PIPELINE)
+            except Exception:
+                try:
+                    _os_mod.unlink(tmp)
+                except OSError:
+                    pass
+                raise
+            _aiena_logger.info("pipeline_set_approved: slug=%s → approvato", slug)
+            return True
+        except Exception as exc:
+            _aiena_logger.error("pipeline_set_approved ERROR slug=%s exc=%s", slug, exc)
+            return False
+
+    @app.post("/api/aiena/approve-article")
+    async def aiena_approve_article(req: _AienaApproveRequest, request: Request):
+        """Approve an AIena article: validates slug, then inserts into Supabase.
+
+        Returns 422 if slug is not a known investigation with status='preview'.
+        Idempotent: returns 200 if already in Supabase.
+        """
+        caller_ip = request.client.host if request.client else "unknown"
+        slug = req.slug.strip()
+        _aiena_logger.info(
+            "approve-article called: slug=%s title=%r caller=%s",
+            slug, req.title[:60], caller_ip
+        )
+
+        if not _aiena_slug_in_pipeline(slug):
+            _aiena_logger.warning(
+                "approve-article REJECTED: slug=%s not in pipeline investigations[preview] caller=%s",
+                slug, caller_ip
+            )
+            raise HTTPException(
+                status_code=422,
+                detail=f"Slug '{slug}' not found in AIena pipeline investigations with status='preview'. "
+                       "Only valid preview articles can be approved."
+            )
+
+        if _aiena_sb_exists(slug):
+            _aiena_logger.info("approve-article: slug=%s already in Supabase — skip INSERT", slug)
+            return {"ok": True, "slug": slug, "inserted": False, "message": "Already approved"}
+
+        ok = _aiena_sb_insert(slug, req.title, req.category)
+        if not ok:
+            raise HTTPException(status_code=500, detail="Supabase INSERT failed")
+
+        # Sync pipeline.json: preview → approvato (best-effort)
+        _aiena_pipeline_set_approved(slug)
+
+        # Trigger immediate admin data refresh
+        _sp_mod.Popen(
+            ["/home/pinky/.pinkybot/.venv/bin/python3",
+             "/home/pinky/.pinkybot/scripts/update_admin_data.py"],
+            stdout=_sp_mod.DEVNULL, stderr=_sp_mod.DEVNULL
+        )
+
+        _aiena_logger.info("approve-article SUCCESS: slug=%s caller=%s", slug, caller_ip)
+        return {"ok": True, "slug": slug, "inserted": True}
+
+    _log("aiena: /api/aiena/approve-article registered")
+
+    # ── AIena: promote lead → investigation ────────────────────────────────────
+    @app.post("/api/leads/promote")
+    async def aiena_promote_lead(req: _AienaPromoteRequest, request: Request):
+        """Promote a lead to active investigation in pipeline.json."""
+        import datetime as _dt2
+        caller_ip = request.client.host if request.client else "unknown"
+        slug = req.slug.strip()
+        _aiena_logger.info("promote-lead called: slug=%s caller=%s", slug, caller_ip)
+
+        try:
+            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
+                pipeline = _json_mod.load(f)
+        except Exception as exc:
+            _aiena_logger.error("promote-lead: pipeline read error: %s", exc)
+            raise HTTPException(status_code=500, detail="Cannot read pipeline.json")
+
+        leads = pipeline.get("leads", [])
+        investigations = pipeline.get("investigations", [])
+
+        lead = next((l for l in leads if l.get("slug") == slug), None)
+        if not lead:
+            return {"success": False, "promoted": False,
+                    "message": f"Lead '{slug}' not found in pipeline.json leads[]"}
+
+        if any(inv.get("slug") == slug for inv in investigations):
+            return {"success": True, "promoted": True,
+                    "message": "Already an active investigation"}
+
+        now_str = _dt2.datetime.now().strftime("%Y-%m-%d")
+        investigation = {
+            "title": req.title or lead.get("title", slug),
+            "slug": slug,
+            "status": "ricerca",
+            "category": req.category or lead.get("category", "Indagine"),
+            "description": lead.get("description", lead.get("summary", "")),
+            "priority_score": lead.get("priority_score", lead.get("score", 0)),
+            "sources": lead.get("sources", []),
+            "research_notes": lead.get("research_notes", lead.get("notes", [])),
+            "added": lead.get("added", now_str),
+            "promoted_at": _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
+            "signal_source": lead.get("signal_source", "admin_panel"),
+        }
+
+        investigations.append(investigation)
+        pipeline["leads"] = [l for l in leads if l.get("slug") != slug]
+        pipeline["investigations"] = investigations
+        pipeline["updated_at"] = _dt2.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        try:
+            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
+            fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
+            with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
+                _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
+            _os_mod.replace(tmp, _AIENA_PIPELINE)
+        except Exception as exc:
+            _aiena_logger.error("promote-lead: pipeline write error: %s", exc)
+            raise HTTPException(status_code=500, detail="Cannot write pipeline.json")
+
+        _sp_mod.Popen(
+            ["/home/pinky/.pinkybot/.venv/bin/python3",
+             "/home/pinky/.pinkybot/scripts/update_admin_data.py"],
+            stdout=_sp_mod.DEVNULL, stderr=_sp_mod.DEVNULL
+        )
+
+        _aiena_logger.info("promote-lead SUCCESS: slug=%s", slug)
+        return {"success": True, "promoted": True, "slug": slug,
+                "message": f"Lead '{slug}' promosso a indagine attiva (ricerca)"}
+
+    _log("aiena: /api/leads/promote registered")
 
     # Installed last so this pure-ASGI layer wraps every BaseHTTPMiddleware
     # registered above.  Its final-body ``send`` return is the deterministic
