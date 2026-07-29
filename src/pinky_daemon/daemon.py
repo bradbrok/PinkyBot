@@ -196,6 +196,7 @@ class Daemon:
                 data={"prompt": prompt, "session_id": session_id},
             )
             await self._autonomy.push_event(event)
+            return True
 
         self._scheduler = AgentScheduler(
             self._registry,

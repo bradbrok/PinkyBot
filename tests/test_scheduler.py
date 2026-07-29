@@ -353,12 +353,28 @@ class TestAgentSchedules:
         registry.register("oleg")
         s = registry.add_schedule("oleg", "0 8 * * *")
         assert s.last_run == 0.0
+        assert s.last_delivered == 0.0
 
         now = time.time()
         registry.update_schedule_last_run(s.id, now)
 
         schedules = registry.get_schedules("oleg")
         assert schedules[0].last_run == pytest.approx(now, abs=0.1)
+        assert schedules[0].last_delivered == 0.0
+
+    def test_update_last_delivered_is_distinct_from_last_run(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *")
+
+        delivered_at = time.time()
+        registry.update_schedule_last_delivered(schedule.id, delivered_at)
+
+        stored = registry.get_schedules("oleg")[0]
+        assert stored.last_run == 0.0
+        assert stored.last_delivered == pytest.approx(delivered_at, abs=0.1)
+        assert stored.to_dict()["last_delivered"] == pytest.approx(
+            delivered_at, abs=0.1
+        )
 
     def test_cascade_delete(self, registry):
         registry.register("oleg")
@@ -704,6 +720,99 @@ class TestScheduler:
         scheduler = AgentScheduler(registry)
         result = await scheduler.fire_now("oleg")
         assert result is False
+
+    @pytest.mark.asyncio
+    async def test_same_tick_prompts_wait_for_each_delivery_confirmation(
+        self, registry
+    ):
+        """A busy session must not swallow the tail of a same-tick cohort."""
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg", "* * * * *", name="first", prompt="first prompt"
+        )
+        registry.add_schedule(
+            "oleg", "* * * * *", name="second", prompt="second prompt"
+        )
+
+        busy = False
+        delivered: list[str] = []
+        events: list[str] = []
+
+        class Activity:
+            def log(self, agent_name, event_type, summary):
+                del agent_name, summary
+                events.append(event_type)
+
+        async def wake_cb(agent_name, session_id, prompt):
+            nonlocal busy
+            del agent_name, session_id
+            receipt = asyncio.get_running_loop().create_future()
+            if busy:
+                receipt.set_result(False)
+                return receipt
+
+            busy = True
+
+            def confirm_delivery():
+                nonlocal busy
+                delivered.append(prompt)
+                busy = False
+                receipt.set_result(True)
+
+            asyncio.get_running_loop().call_soon(confirm_delivery)
+            return receipt
+
+        scheduler = AgentScheduler(
+            registry, wake_callback=wake_cb, activity=Activity()
+        )
+        await scheduler._check_schedules(time.time())
+        await asyncio.sleep(0.05)
+
+        assert delivered == ["first prompt", "second prompt"]
+        schedules = registry.get_schedules("oleg")
+        assert all(schedule.last_run > 0 for schedule in schedules)
+        assert all(schedule.last_delivered > 0 for schedule in schedules)
+        assert events == [
+            "schedule_fired",
+            "schedule_fired",
+            "schedule_delivered",
+            "schedule_delivered",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_delivery_stays_fired_but_undelivered(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg", "* * * * *", name="unconfirmed", prompt="prompt"
+        )
+        events: list[str] = []
+
+        class Activity:
+            def log(self, agent_name, event_type, summary):
+                del agent_name, summary
+                events.append(event_type)
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            activity=Activity(),
+            schedule_delivery_timeout=0.01,
+        )
+        fired_at = time.time()
+        await scheduler._check_schedules(fired_at)
+        await asyncio.sleep(0.05)
+
+        stored = registry.get_schedules("oleg")[0]
+        assert stored.last_run == pytest.approx(fired_at)
+        assert stored.last_delivered == 0.0
+        assert events == ["schedule_fired", "schedule_undelivered"]
+        assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
 
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────

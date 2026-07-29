@@ -122,7 +122,9 @@ class CodexSession:
         # CONNECTED; send is accepted only while CONNECTED).
         self._state_machine = StateMachine(owner_label=f"codex:{config.agent_name}")
         self._processing = False  # True while a codex exec is running
-        self._message_queue: asyncio.Queue[tuple[str, str, str, str]] = asyncio.Queue()
+        # Scheduler entries carry a fifth per-call delivery Future. Legacy
+        # four-tuples remain accepted for connect-time wakes and tests.
+        self._message_queue: asyncio.Queue[tuple] = asyncio.Queue()
         # Serializes _exec_codex between the worker and out-of-band callers
         # (idle_sleep's save turn): two concurrent execs would resume the same
         # codex thread and clobber the shared _current_proc / app-server
@@ -447,6 +449,39 @@ class CodexSession:
         is not consumption — ``injection_confirms_consumption`` is False, so
         the broker never confirms an inject off this value alone.
         """
+        return await self._queue_external_message(
+            prompt,
+            platform=platform,
+            chat_id=chat_id,
+            message_id=message_id,
+            agent_hint=agent_hint,
+        )
+
+    async def send_scheduler_prompt(
+        self, prompt: str
+    ) -> asyncio.Future[bool]:
+        """Queue a scheduler prompt and confirm when its exec turn starts."""
+        receipt: asyncio.Future[bool] = (
+            asyncio.get_running_loop().create_future()
+        )
+        queued = await self._queue_external_message(
+            prompt, scheduler_delivery=receipt
+        )
+        if not queued and not receipt.done():
+            receipt.set_result(False)
+        return receipt
+
+    async def _queue_external_message(
+        self,
+        prompt: str,
+        *,
+        platform: str = "",
+        chat_id: str = "",
+        message_id: str = "",
+        agent_hint: str = "",
+        scheduler_delivery: asyncio.Future[bool] | None = None,
+    ) -> bool:
+        """Apply external-send side effects and enqueue one Codex turn."""
         if self.state != SessionState.CONNECTED:
             _log(
                 f"codex[{self.agent_name}]: not connected "
@@ -477,7 +512,17 @@ class CodexSession:
                 _log(f"codex[{self.agent_name}]: conversation store append failed: {e}")
 
         queued_prompt = prompt + agent_hint if agent_hint else prompt
-        await self._message_queue.put((queued_prompt, platform, chat_id, message_id))
+        if scheduler_delivery is None:
+            queued = (queued_prompt, platform, chat_id, message_id)
+        else:
+            queued = (
+                queued_prompt,
+                platform,
+                chat_id,
+                message_id,
+                scheduler_delivery,
+            )
+        await self._message_queue.put(queued)
         _log(f"codex[{self.agent_name}]: queued message (chat={chat_id})")
         return True
 
@@ -491,11 +536,23 @@ class CodexSession:
             # the loop at the next iteration, and disconnect() cancels an
             # in-flight ``get``. (#206 — was ``while self._connected``.)
             while self.state == SessionState.CONNECTED:
-                prompt, platform, chat_id, message_id = await self._message_queue.get()
+                queued = await self._message_queue.get()
+                prompt, platform, chat_id, message_id = queued[:4]
+                scheduler_delivery = queued[4] if len(queued) > 4 else None
+                if (
+                    scheduler_delivery is not None
+                    and scheduler_delivery.cancelled()
+                ):
+                    continue
                 try:
                     self._processing = True
                     self._current_turn_seq = self._stats["turns"] + 1
                     async with self._exec_lock:
+                        if (
+                            scheduler_delivery is not None
+                            and not scheduler_delivery.done()
+                        ):
+                            scheduler_delivery.set_result(True)
                         result = await self._exec_codex(prompt)
 
                     # #591 P1#2 (Murzik round-2): fire the pending wake

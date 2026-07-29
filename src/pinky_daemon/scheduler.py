@@ -14,6 +14,7 @@ Supports standard 5-field cron: minute hour day month weekday.
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import sys
 import time
@@ -170,9 +171,13 @@ class AgentScheduler:
         trigger_store=None,
         activity=None,
         tick_interval: int = 30,
+        schedule_delivery_timeout: float = 600.0,
     ) -> None:
         self._registry = registry
-        self._wake_callback = wake_callback  # async fn(agent_name, session_id, prompt)
+        # async fn(agent_name, session_id, prompt) -> bool | Awaitable[bool].
+        # An awaitable return is a per-prompt delivery receipt; same-agent
+        # schedules are not advanced until it resolves.
+        self._wake_callback = wake_callback
         self._heartbeat_callback = heartbeat_callback  # async fn(agent_name, session_id)
         self._direct_send_callback = direct_send_callback  # async fn(agent_name, platform, chat_id, message)
         self._auto_sleep_callback = auto_sleep_callback  # async fn(agent_name, reason)
@@ -189,6 +194,7 @@ class AgentScheduler:
         self._trigger_store = trigger_store  # TriggerStore | None
         self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval
+        self._schedule_delivery_timeout = schedule_delivery_timeout
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
@@ -207,6 +213,12 @@ class AgentScheduler:
         # inline in the tick (same #702 class as dreams): one slot per
         # (agent_name, label) so a sleep spanning several ticks isn't refired.
         self._sleep_tasks: dict[tuple[str, str], asyncio.Task] = {}
+        # Schedule prompts run outside the tick loop so waiting for a busy
+        # agent cannot freeze every other cron/heartbeat check (#702 class).
+        # A per-agent lock preserves fire order across same-tick and later-tick
+        # cohorts while allowing unrelated agents to progress independently.
+        self._schedule_delivery_tasks: set[asyncio.Task] = set()
+        self._schedule_delivery_locks: dict[str, asyncio.Lock] = {}
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -242,6 +254,13 @@ class AgentScheduler:
                     except asyncio.CancelledError:
                         pass
             task_map.clear()
+        delivery_tasks = list(self._schedule_delivery_tasks)
+        for task in delivery_tasks:
+            if not task.done():
+                task.cancel()
+        if delivery_tasks:
+            await asyncio.gather(*delivery_tasks, return_exceptions=True)
+        self._schedule_delivery_tasks.clear()
         _log("scheduler: stopped")
 
     async def _loop(self) -> None:
@@ -285,11 +304,12 @@ class AgentScheduler:
         await self._check_url_watchers(now)
 
     async def _check_schedules(self, now: float) -> None:
-        """Check all enabled schedules and fire any that match current time."""
+        """Stamp due schedules fired, then deliver each agent's cohort in order."""
         schedules = self._registry.get_all_schedules(enabled_only=True)
         if not schedules:
             return
 
+        due_by_agent: dict[str, list] = {}
         for schedule in schedules:
             try:
                 tz = ZoneInfo(schedule.timezone)
@@ -321,28 +341,128 @@ class AgentScheduler:
                     self._registry.toggle_schedule(schedule.id, False)
                     _log(f"scheduler: one-shot schedule '{schedule.name}' (#{schedule.id}) auto-disabled after firing")
 
-                if schedule.direct_send and schedule.target_channel and self._direct_send_callback:
-                    # Direct send mode: route message through broker, not as agent input
-                    try:
-                        await self._direct_send_callback(
-                            schedule.agent_name,
-                            "telegram",  # Default platform
-                            schedule.target_channel,
-                            schedule.prompt,
-                        )
-                        _log(f"scheduler: direct-sent to {schedule.target_channel} for {schedule.agent_name}")
-                    except Exception as e:
-                        _log(f"scheduler: direct send failed for {schedule.agent_name}: {e}")
-                elif self._wake_callback:
-                    try:
-                        main_session_id = f"{schedule.agent_name}-main"
-                        await self._wake_callback(
-                            schedule.agent_name,
-                            main_session_id,
-                            schedule.prompt or f"Scheduled wake: {schedule.name}",
-                        )
-                    except Exception as e:
-                        _log(f"scheduler: wake callback failed for {schedule.agent_name}: {e}")
+                due_by_agent.setdefault(schedule.agent_name, []).append(schedule)
+
+        for agent_name, due_schedules in due_by_agent.items():
+            task = asyncio.create_task(
+                self._deliver_schedule_group(agent_name, due_schedules)
+            )
+            self._schedule_delivery_tasks.add(task)
+            task.add_done_callback(self._schedule_delivery_done)
+
+        # Give callbacks that confirm immediately one loop turn without making
+        # a busy agent's bounded receipt wait part of the scheduler tick.
+        if due_by_agent:
+            await asyncio.sleep(0)
+
+    async def _deliver_schedule_group(
+        self, agent_name: str, schedules: list
+    ) -> None:
+        """Deliver one agent's due prompts serially, including receipt waits."""
+        lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
+        async with lock:
+            for schedule in schedules:
+                await self._deliver_schedule(schedule)
+
+    async def _deliver_schedule(self, schedule) -> None:
+        """Attempt one fired schedule and record confirmed delivery separately."""
+        confirmed = False
+        failure_reason = "no delivery callback configured"
+
+        if (
+            schedule.direct_send
+            and schedule.target_channel
+            and self._direct_send_callback
+        ):
+            try:
+                await self._direct_send_callback(
+                    schedule.agent_name,
+                    "telegram",  # Default platform
+                    schedule.target_channel,
+                    schedule.prompt,
+                )
+                confirmed = True
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failure_reason = f"direct send raised {type(e).__name__}: {e}"
+        elif self._wake_callback:
+            try:
+                confirmed = await asyncio.wait_for(
+                    self._wake_and_confirm(schedule),
+                    timeout=self._schedule_delivery_timeout,
+                )
+                if not confirmed:
+                    failure_reason = "wake callback returned no positive receipt"
+            except asyncio.TimeoutError:
+                failure_reason = (
+                    "delivery receipt timed out after "
+                    f"{self._schedule_delivery_timeout:g}s"
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                failure_reason = f"wake callback raised {type(e).__name__}: {e}"
+
+        if confirmed:
+            delivered_at = time.time()
+            self._registry.update_schedule_last_delivered(
+                schedule.id, delivered_at
+            )
+            if self._activity:
+                try:
+                    self._activity.log(
+                        schedule.agent_name,
+                        "schedule_delivered",
+                        f"Schedule '{schedule.name}' delivery confirmed",
+                    )
+                except Exception:
+                    pass
+            _log(
+                f"scheduler: delivery confirmed for schedule "
+                f"'{schedule.name}' (#{schedule.id}) for agent "
+                f"'{schedule.agent_name}'"
+            )
+            return
+
+        if self._activity:
+            try:
+                self._activity.log(
+                    schedule.agent_name,
+                    "schedule_undelivered",
+                    f"Schedule '{schedule.name}' fired but delivery was not confirmed",
+                )
+            except Exception:
+                pass
+        _log(
+            f"scheduler: FIRED BUT UNDELIVERED schedule "
+            f"'{schedule.name}' (#{schedule.id}) for agent "
+            f"'{schedule.agent_name}': {failure_reason}"
+        )
+
+    async def _wake_and_confirm(self, schedule) -> bool:
+        """Invoke the wake callback and await its exact per-prompt receipt."""
+        main_session_id = f"{schedule.agent_name}-main"
+        result = await self._wake_callback(
+            schedule.agent_name,
+            main_session_id,
+            schedule.prompt or f"Scheduled wake: {schedule.name}",
+        )
+        if inspect.isawaitable(result):
+            result = await result
+        return result is True
+
+    def _schedule_delivery_done(self, task: asyncio.Task) -> None:
+        """Retire a delivery task and surface any unexpected cohort crash."""
+        self._schedule_delivery_tasks.discard(task)
+        if task.cancelled():
+            return
+        error = task.exception()
+        if error is not None:
+            _log(
+                f"scheduler: SCHEDULE DELIVERY TASK CRASHED with "
+                f"{type(error).__name__}: {error}"
+            )
 
     async def _check_heartbeats(self, now: float) -> None:
         """Check heartbeat health for all agents with heartbeat_interval > 0."""

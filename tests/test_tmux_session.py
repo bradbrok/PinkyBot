@@ -3572,6 +3572,60 @@ async def test_disconnect_clears_inflight_meta() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
+    """#931: scheduler turns must never paste concurrently into a busy REPL."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+
+    first_receipt = await ss.send_scheduler_prompt("first")
+    first_turn = await ss._message_queue.get()
+    await ss._deliver_turn(first_turn)
+    assert await first_receipt is True
+    assert len(ss._inflight_metas) == 1
+
+    second_receipt = await ss.send_scheduler_prompt("second")
+    second_turn = await ss._message_queue.get()
+    second_delivery = asyncio.create_task(ss._deliver_turn(second_turn))
+    await asyncio.sleep(0.02)
+
+    assert tmux.paste_text.await_count == 1
+    assert not second_receipt.done()
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="first done", stop_reason="end_turn")
+    )
+    await asyncio.wait_for(second_delivery, timeout=1)
+
+    assert await second_receipt is True
+    assert tmux.paste_text.await_count == 2
+    assert [call.args[0] for call in tmux.paste_text.await_args_list] == [
+        "first",
+        "second",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
+    """#931: pane status must gate prompts without local inflight metadata."""
+    live = {"status": "working"}
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: live
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    turn = await ss._message_queue.get()
+    delivery = asyncio.create_task(ss._deliver_turn(turn))
+    await asyncio.sleep(0.02)
+
+    assert tmux.paste_text.await_count == 0
+    assert not receipt.done()
+
+    live["status"] = "idle"
+    await asyncio.wait_for(delivery, timeout=1)
+
+    assert await receipt is True
+    tmux.paste_text.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_multi_prompt_routing_no_cross_user_leak(tmp_path) -> None:
     """#560 / Pushok PR #496 round-1 Case 1 — preserved with concurrent
     dispatch: two ``send()`` calls in quick succession must route response

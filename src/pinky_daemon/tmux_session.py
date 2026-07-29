@@ -465,6 +465,10 @@ class _ContextLockDeferral(Exception):  # noqa: N818
     """
 
 
+class _SchedulerDeliveryCancelled(Exception):  # noqa: N818
+    """A timed-out scheduler receipt cancelled this turn before paste."""
+
+
 @dataclass
 class TmuxCommandResult:
     """Outcome of one ``tmux ...`` invocation."""
@@ -827,6 +831,11 @@ class _QueuedTurn:
     # so a never-clearing wedge can't replay the same turn forever and grow
     # the deque unboundedly (the murzik #846 loop).
     replay_count: int = 0
+    # Scheduler-only receipt. A serialized scheduler turn waits for the
+    # pane to become idle before paste; successful paste resolves True,
+    # permanent failure resolves False, and receipt timeout cancels it.
+    scheduler_delivery: asyncio.Future[bool] | None = None
+    scheduler_serialized: bool = False
 
 
 @dataclass
@@ -3282,6 +3291,9 @@ class TmuxSession:
             evt = self._inflight_turn.completion_event
             if evt is not None and not evt.is_set():
                 evt.set()
+            delivery = self._inflight_turn.scheduler_delivery
+            if delivery is not None and not delivery.done():
+                delivery.set_result(False)
             self._inflight_turn = None
 
         # Stop the response tailer (PR8b). Tailer instance is retained
@@ -3340,6 +3352,46 @@ class TmuxSession:
         sets ``injection_confirms_consumption = False``, so the broker never
         confirms off this value alone.
         """
+        return await self._queue_external_turn(
+            prompt,
+            platform=platform,
+            chat_id=chat_id,
+            message_id=message_id,
+            agent_hint=agent_hint,
+        )
+
+    async def send_scheduler_prompt(
+        self, prompt: str
+    ) -> asyncio.Future[bool]:
+        """Queue a scheduler turn and return its exact pane-delivery receipt.
+
+        The worker does not paste this turn while another turn is in flight.
+        That idle gate preserves each same-tick prompt instead of relying on
+        Claude Code's lossy mid-turn input behavior.
+        """
+        loop = asyncio.get_running_loop()
+        receipt: asyncio.Future[bool] = loop.create_future()
+        queued = await self._queue_external_turn(
+            prompt,
+            scheduler_delivery=receipt,
+            scheduler_serialized=True,
+        )
+        if not queued and not receipt.done():
+            receipt.set_result(False)
+        return receipt
+
+    async def _queue_external_turn(
+        self,
+        prompt: str,
+        *,
+        platform: str = "",
+        chat_id: str = "",
+        message_id: str = "",
+        agent_hint: str = "",
+        scheduler_delivery: asyncio.Future[bool] | None = None,
+        scheduler_serialized: bool = False,
+    ) -> bool:
+        """Apply external-send side effects and enqueue one pane turn."""
         if self.state != SessionState.CONNECTED:
             _log(
                 f"tmux[{self.agent_name}]: not connected (state={self.state.value}), "
@@ -3367,6 +3419,8 @@ class TmuxSession:
             platform=platform,
             chat_id=chat_id,
             message_id=message_id,
+            scheduler_delivery=scheduler_delivery,
+            scheduler_serialized=scheduler_serialized,
         ))
         _log(f"tmux[{self.agent_name}]: queued message (chat={chat_id})")
         return True
@@ -5211,6 +5265,13 @@ class TmuxSession:
                     # the second/third/Nth pasted turn while the first
                     # is still running.
                     self._inflight_turn = None
+                except _SchedulerDeliveryCancelled:
+                    _log(
+                        f"tmux[{self.agent_name}]: scheduler delivery "
+                        f"cancelled before paste"
+                    )
+                    self._inflight_turn = None
+                    continue
                 except _ContextLockDeferral as e:
                     # Transient: lock file present. Don't touch
                     # _inflight_turn or any deque state — _deliver_turn
@@ -5290,6 +5351,11 @@ class TmuxSession:
                         and not turn.completion_event.is_set()
                     ):
                         turn.completion_event.set()
+                    if (
+                        turn.scheduler_delivery is not None
+                        and not turn.scheduler_delivery.done()
+                    ):
+                        turn.scheduler_delivery.set_result(False)
                     # The message is being dropped; tell the chat that
                     # sent it instead of leaving the user with dead
                     # silence (daemon-log-only failures are invisible
@@ -6166,6 +6232,40 @@ class TmuxSession:
         """
         return _TRANSPORT_LOCK_DIR / f"{self.agent_name}.lock"
 
+    async def _wait_for_scheduler_delivery_slot(
+        self, turn: _QueuedTurn
+    ) -> None:
+        """Wait until no pane turn is running before a scheduler paste."""
+        if not turn.scheduler_serialized:
+            return
+
+        while self._scheduler_pane_busy():
+            if (
+                turn.scheduler_delivery is not None
+                and turn.scheduler_delivery.cancelled()
+            ):
+                raise _SchedulerDeliveryCancelled
+            await asyncio.sleep(0.25)
+
+        if (
+            turn.scheduler_delivery is not None
+            and turn.scheduler_delivery.cancelled()
+        ):
+            raise _SchedulerDeliveryCancelled
+
+    def _scheduler_pane_busy(self) -> bool:
+        """Conservative busy verdict for safe scheduled-prompt injection."""
+        if self._inflight_metas or self._inflight_tool_calls:
+            return True
+        live_status_fn = getattr(self._config, "live_status_fn", None)
+        if live_status_fn is None:
+            return False
+        try:
+            live = live_status_fn() or {}
+        except Exception:
+            return False
+        return live.get("status") == "working"
+
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
 
@@ -6231,8 +6331,15 @@ class TmuxSession:
         the wake prompt (broker calls ``send`` the moment ``state ==
         CONNECTED``, which fires before this wait would have ended).
         """
+        # #931: scheduled prompts are not steering messages. Mid-turn pastes
+        # can vanish after a successful tmux command, so wait for the pane's
+        # prior FIFO turn to complete before injecting this one. Do this before
+        # the context-lock check so a lock created during a long idle wait is
+        # still observed immediately before delivery.
+        await self._wait_for_scheduler_delivery_slot(turn)
+
         # Pulse-v2 safety primitive: context-lock check. Cheap fs stat;
-        # do this first so we bail before mutating any state. The lock
+        # do this before mutating any delivery state. The lock
         # being held is transient — Murzik #522 round-1: raise a typed
         # ``_ContextLockDeferral`` so the worker knows to PRESERVE the
         # inflight turn, sleep, and retry on the next iteration. Bare
@@ -6403,6 +6510,11 @@ class TmuxSession:
             self._turn_done.set()
             if turn.completion_event is not None and not turn.completion_event.is_set():
                 turn.completion_event.set()
+            if (
+                turn.scheduler_delivery is not None
+                and not turn.scheduler_delivery.done()
+            ):
+                turn.scheduler_delivery.set_result(False)
             # Task #90: detect dead-pane (tmux session killed externally,
             # tmux server crashed, etc.). Without this, the worker would
             # loop forever pasting into a non-existent pane. Schedule
@@ -6499,6 +6611,12 @@ class TmuxSession:
         # became the head — leave it alone (Murzik review point #1).
         if was_empty:
             self._head_started_at = time.time()
+
+        if (
+            turn.scheduler_delivery is not None
+            and not turn.scheduler_delivery.done()
+        ):
+            turn.scheduler_delivery.set_result(True)
 
         # Hint to the tailer that a turn is in flight — switches to the
         # active-poll cadence (200ms vs 2s) for low-latency response

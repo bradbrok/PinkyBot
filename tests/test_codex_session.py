@@ -365,6 +365,39 @@ class TestCodexSessionSendSignature:
         queued = await s._message_queue.get()
         assert queued[0] == "plain prompt"
 
+    @pytest.mark.asyncio
+    async def test_scheduler_receipt_waits_until_worker_starts_exact_turn(self):
+        """#931: a queued scheduler prompt is not delivered at enqueue time."""
+        s = self._make()
+        await _to_connected(s)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_exec(prompt: str) -> CodexTurnResult:
+            calls.append(prompt)
+            if prompt == "first":
+                first_started.set()
+                await release_first.wait()
+            return CodexTurnResult()
+
+        s._exec_codex = fake_exec  # type: ignore[assignment]
+        await s.send("first")
+        worker = asyncio.create_task(s._message_worker())
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        second_receipt = await s.send_scheduler_prompt("second")
+        await asyncio.sleep(0.02)
+        assert not second_receipt.done()
+
+        release_first.set()
+        assert await asyncio.wait_for(second_receipt, timeout=1) is True
+        assert calls == ["first", "second"]
+
+        await _to_dead(s)
+        s._message_queue.put_nowait(("noop", "", "", ""))
+        await asyncio.wait_for(worker, timeout=1)
+
 
 class TestCodexSessionDisconnect:
     @pytest.mark.asyncio
