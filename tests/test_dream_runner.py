@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
+import threading
 import time
 import urllib.error
 import urllib.request
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime
 from urllib.parse import urlsplit
 
@@ -23,6 +26,72 @@ class _FakeAgentConfig:
 
     def __init__(self, provider_key: str = "") -> None:
         self.provider_key = provider_key
+
+
+class TestDreamRunnerConcurrency:
+    def test_point_read_hammer_uses_thread_local_connections(self, tmp_path):
+        runner = DreamRunner(db_path=str(tmp_path / "dream.db"))
+        worker_count = 12
+        rounds = 25
+        point_reads_per_round = 8
+        start = threading.Barrier(worker_count)
+        runner._save_state("shared-agent", "Shared dream summary", 123.0)
+
+        def hammer(worker_index):
+            point_reads = 0
+            snapshots = []
+            try:
+                start.wait(timeout=10)
+                connection = runner._db
+                connection_id = id(connection)
+                assert connection.execute(
+                    "PRAGMA journal_mode"
+                ).fetchone()[0].lower() == "wal"
+                assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+                agent_name = f"worker-{worker_index}"
+                for round_index in range(rounds):
+                    marker = f"{worker_index}-{round_index}"
+                    runner._save_state(
+                        agent_name,
+                        f"Hammer dream summary {marker}",
+                        float(round_index),
+                    )
+                    own = runner.get_state(agent_name)
+                    assert own["last_summary"] == f"Hammer dream summary {marker}"
+                    for _ in range(point_reads_per_round):
+                        point_read = runner.get_state("shared-agent")
+                        assert point_read["last_summary"] == "Shared dream summary"
+                        point_reads += 1
+                    snapshots.append(own)
+                return connection_id, snapshots, point_reads, None
+            except Exception as exc:
+                return None, snapshots, point_reads, exc
+            finally:
+                runner.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(hammer, range(worker_count)))
+
+            errors = [error for _, _, _, error in results if error is not None]
+            database_errors = [
+                error
+                for error in errors
+                if isinstance(error, sqlite3.DatabaseError)
+                or "malformed" in str(error).lower()
+            ]
+            assert database_errors == []
+            assert errors == []
+
+            connection_ids = [connection_id for connection_id, _, _, _ in results]
+            assert len(set(connection_ids)) == worker_count
+            assert sum(point_reads for _, _, point_reads, _ in results) == (
+                worker_count * rounds * point_reads_per_round
+            )
+            assert all(len(snapshots) == rounds for _, snapshots, _, _ in results)
+            assert len(runner.list_states()) == worker_count + 1
+        finally:
+            runner.close()
 
 
 def _new_runner(**kwargs) -> tuple[DreamRunner, str]:

@@ -19,6 +19,7 @@ import os
 import re
 import sqlite3
 import sys
+import threading
 import time
 from collections.abc import Callable
 from datetime import date, datetime, timezone
@@ -92,7 +93,8 @@ class DreamRunner:
         signing_key_provider: Callable[[str], str | None] | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db_path = db_path
+        self._thread_local = threading.local()
         self._history_provider = history_provider
         # Optional () -> owner-profile dict, used to derive high-value entity
         # names for KG proactive-surfacing materiality. May be None.
@@ -104,8 +106,17 @@ class DreamRunner:
         # Optional agent_name -> per-agent signing key resolver for daemon-internal
         # API calls. Isolated agents cannot authenticate with the fleet-wide secret.
         self._signing_key_provider = signing_key_provider
-        self._db.execute("PRAGMA journal_mode=WAL")
         self._init_tables()
+
+    @property
+    def _db(self) -> sqlite3.Connection:
+        """Return the calling thread's connection, creating it on first use."""
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(self._db_path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            self._thread_local.connection = connection
+        return connection
 
     def _init_tables(self) -> None:
         self._db.executescript("""
@@ -1303,3 +1314,14 @@ class DreamRunner:
             (agent_name, now, summary, last_message_ts),
         )
         self._db.commit()
+
+    def close(self) -> None:
+        """Close the calling thread's connection, if it has opened one.
+
+        Connections opened by other threads belong to their thread-local state
+        and are released when those threads exit.
+        """
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is not None:
+            connection.close()
+            del self._thread_local.connection
