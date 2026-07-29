@@ -3676,14 +3676,18 @@ async def test_scheduler_gate_fails_closed_without_trustworthy_idle(
     """Missing/error/non-idle status never permits a scheduler pane paste."""
     ss, tmux = _make_session(state=SessionState.CONNECTED)
     ss._config.live_status_fn = live_status_fn
+    ss._worker_task = asyncio.create_task(ss._message_worker())
+    receipt: asyncio.Future[bool] | None = None
+    try:
+        receipt = await ss.send_scheduler_prompt("scheduled")
+        await asyncio.sleep(0.02)
 
-    receipt = await ss.send_scheduler_prompt("scheduled")
-    await asyncio.sleep(0.02)
-
-    tmux.paste_text.assert_not_awaited()
-    assert not receipt.done()
-    receipt.cancel()
-    await ss.disconnect()
+        tmux.paste_text.assert_not_awaited()
+        assert not receipt.done()
+    finally:
+        if receipt is not None:
+            receipt.cancel()
+        await ss.disconnect()
 
 
 @pytest.mark.asyncio
