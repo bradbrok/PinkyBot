@@ -15,7 +15,8 @@ security boundary.
 
 The daemon has **no MCP client** — it cannot call `approve_purchase` directly
 (arch map, #249). So after the gate passes, the daemon injects a synthetic
-instruction to the owning agent (chekov), which calls the purchasing MCP. (B1.)
+instruction to the owning requester agent (Chekov or Geordi), which calls its
+isolated purchasing MCP. (B1.)
 
 ## Flow
 
@@ -39,23 +40,27 @@ instruction to the owning agent (chekov), which calls the purchasing MCP. (B1.)
       blank id, an unconfigured allowlist, or any error → **deny**. Unauthorized
       clicks get an ephemeral refusal and never reach the agent.
    c. Authorized → **mint a daemon-signed approval token**
-      (`HMAC-SHA256(secret, decision \n pending_id \n clicker_id \n expires)`,
-      ~15-min TTL) and inject a synthetic instruction to the owning agent telling
-      it to call `approve_purchase`/`reject_purchase` for that exact `pending_id`
-      with the verified `clicker_id` **and the token + expiry**. Update the card
-      via `response_url` ("Approved/Rejected by X", buttons removed). If no secret
-      is configured, or the agent is unreachable, fail-closed (ephemeral note;
-      card keeps its buttons).
+      (`HMAC-SHA256(secret, decision \n pending_id \n requester \n clicker_id
+      \n expires)`, ~15-min TTL). `requester` comes from the poller's
+      infrastructure-owned `self._agent_name`, never from the Slack payload or
+      an LLM argument. Inject a synthetic instruction to that same owning agent
+      telling it to call `approve_purchase`/`reject_purchase` for the exact
+      `pending_id` with the verified `clicker_id` **and the token + expiry**.
+      Update the card via `response_url` ("Approved/Rejected by X", buttons
+      removed). If no secret is configured, or the agent is unreachable,
+      fail-closed (ephemeral note; card keeps its buttons).
 5. The agent calls the MCP tool, relaying the token. The MCP verifies it before
-   any state change, then the agent posts the cart link / confirmation.
+   any state change. The MCP first loads the proposal's persisted requester and
+   verifies that exact tuple. The owning agent then posts the returned public
+   purchase links / confirmation.
 
 ## Enforcement layers (defense in depth)
 
 1. **Daemon-signed token (authoritative).** The state transition (pending →
    approved | rejected) requires an HMAC token only the daemon can mint, and only
    after the verified-clicker gate (below) passes. The MCP verifies the token
-   (shared secret, exact `decision`/`pending_id`/`approver`/`expiry` tuple, not
-   expired) before touching the store. **An LLM cannot forge it**, so no prompt
+   (shared secret, exact `decision`/`pending_id`/`requester`/`approver`/`expiry`
+   tuple, not expired) before touching the store. **An LLM cannot forge it**, so no prompt
    path — including the legacy "type `approve`" text path — can drive the agent
    into approving an order that was never clicked by a verified, allowlisted
    approver. Fail-closed: missing secret / missing / invalid / expired token →
@@ -72,15 +77,20 @@ The shared secret lives in two places that must match: the daemon's
 `POS_PURCHASING_APPROVAL_SECRET` env (verifier). Either side unset → no approvals
 (fail-closed).
 
+4. **Requester isolation.** The daemon signs the owning poller's
+   `self._agent_name`; the MCP compares it to the stored proposal requester and
+   its process `--agent` identity. A Chekov token cannot authorize a Geordi
+   proposal, and neither model can choose or override requester identity.
+
 ## Phase 2 (pay-on-approval)
 
-`approve_purchase` returns only an Amazon cart link today — **no money moves**.
+`approve_purchase` returns only public cart/product/quote links today — **no money moves**.
 Phase 2 adds real payment via the Amazon Business API. The token already proves a
 verified click; phase 2 extends it so the *payment* step is bound to the same
 proof (and may add a daemon-recorded click ledger for non-repudiation). **Do not
 enable real payment before that exists.**
 
-## Deploy prerequisites (Pi / chekov)
+## Deploy prerequisites (isolated Pi requesters)
 
 1. **Slack app**: enable *Interactivity & Shortcuts* (Socket Mode is already on,
    so no Request URL and no reinstall needed). Without it, clicks deliver no
@@ -88,10 +98,13 @@ enable real payment before that exists.**
 2. **Shared approval secret** (fail-closed, else every approval is refused):
    generate one secret and set it on BOTH sides —
    `registry.set_purchase_approval_secret("<secret>")` (daemon) **and**
-   `POS_PURCHASING_APPROVAL_SECRET=<same secret>` in chekov's pos-spec-purchasing
-   MCP env. They must be identical.
+   `POS_PURCHASING_APPROVAL_SECRET=<same secret>` in each requester's isolated
+   pos-spec-purchasing MCP env. They must be identical.
 3. **Seed the approver allowlist** (fail-closed):
    `registry.set_purchase_approvers(["U7W8RJGP5"])` (Brad). Stored in
    `system_settings.purchase_approver_slack_ids`. Optionally also set
    `POS_PURCHASING_APPROVERS` on the MCP env (secondary check).
-4. Restart is on the **Pi** (chekov's Slack poller). Heads-up to Brad first.
+4. Chekov and Geordi each use their own explicit `--agent` and SQLite state
+   path. They may share a read-only catalog, but never a requester identity or
+   pending-order database.
+5. Restart is on the applicable **Pi tenant**. Heads-up to Brad first.

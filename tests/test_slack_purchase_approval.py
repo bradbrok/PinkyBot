@@ -31,7 +31,7 @@ SECRET = "test-secret"
 
 def _make_poller(
     *, approver_ok=True, inject_ok=True, registry_raises=False, registry=None,
-    approval_secret=SECRET,
+    approval_secret=SECRET, agent_name="chekov",
 ):
     adapter = MagicMock()
     adapter.bot_token = "xoxb-test"
@@ -52,7 +52,7 @@ def _make_poller(
         registry.get_purchase_approval_secret.return_value = approval_secret
 
     poller = BrokerSlackPoller(
-        adapter, "chekov", broker,
+        adapter, agent_name, broker,
         registry=(None if registry is False else registry),
         app_token="xapp-test",
     )
@@ -207,9 +207,14 @@ class TestApprovalToken:
         _f, _t, msg = poller._broker.inject_agent_message.call_args[0]
         token = re.search(r"approval_token='([0-9a-f]+)'", msg).group(1)
         expires = int(re.search(r"token_expires=(\d+)", msg).group(1))
-        # The minted token must verify for exactly (approve, PID, clicker, expires).
+        # Token binds the exact decision, proposal, requester, clicker, and expiry.
         expected = make_approval_token(
-            SECRET, decision="approve", pending_id=PID, approver=BRAD, expires=expires
+            SECRET,
+            decision="approve",
+            pending_id=PID,
+            requester="chekov",
+            approver=BRAD,
+            expires=expires,
         )
         assert token == expected
 
@@ -221,7 +226,43 @@ class TestApprovalToken:
         token = re.search(r"approval_token='([0-9a-f]+)'", msg).group(1)
         expires = int(re.search(r"token_expires=(\d+)", msg).group(1))
         assert token == make_approval_token(
-            SECRET, decision="reject", pending_id=PID, approver=BRAD, expires=expires
+            SECRET,
+            decision="reject",
+            pending_id=PID,
+            requester="chekov",
+            approver=BRAD,
+            expires=expires,
+        )
+
+    @pytest.mark.asyncio
+    async def test_geordi_token_is_requester_bound(self):
+        poller = _make_poller(
+            approver_ok=True,
+            inject_ok=True,
+            approval_secret=SECRET,
+            agent_name="geordi",
+        )
+        await poller._handle_interactive(_interactive(_PURCHASE_APPROVE_ACTION_ID))
+        _f, target, msg = poller._broker.inject_agent_message.call_args[0]
+        assert target == "geordi"
+        assert "infrastructure-bound to `geordi`" in msg
+        token = re.search(r"approval_token='([0-9a-f]+)'", msg).group(1)
+        expires = int(re.search(r"token_expires=(\d+)", msg).group(1))
+        assert token == make_approval_token(
+            SECRET,
+            decision="approve",
+            pending_id=PID,
+            requester="geordi",
+            approver=BRAD,
+            expires=expires,
+        )
+        assert token != make_approval_token(
+            SECRET,
+            decision="approve",
+            pending_id=PID,
+            requester="chekov",
+            approver=BRAD,
+            expires=expires,
         )
 
     @pytest.mark.asyncio
@@ -238,8 +279,8 @@ class TestApprovalToken:
         # Locked cross-repo contract — must equal pos-spec-purchasing's verifier.
         assert make_approval_token(
             "testsecret", decision="approve", pending_id="abc123",
-            approver="U7W8RJGP5", expires=1700000000,
-        ) == "8226a7515254d1640bc320eb2f9a57ca45cddcc8b920eaffa7044b82dbee0f3e"
+            requester="chekov", approver="U7W8RJGP5", expires=1700000000,
+        ) == "17a128f65d20f93ef3080876906cb3f03968e55fefd1710bf734bae0dbf3f2dc"
 
 
 class TestStripEmoji:

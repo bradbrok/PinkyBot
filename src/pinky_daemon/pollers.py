@@ -1145,6 +1145,7 @@ class BrokerSlackPoller:
             secret,
             decision=token_decision,
             pending_id=pending_id,
+            requester=self._agent_name,
             approver=clicker_id,
             expires=token_expires,
         )
@@ -1155,9 +1156,10 @@ class BrokerSlackPoller:
             instruction = (
                 f"Call approve_purchase(pending_id='{pending_id}', approver='{clicker_id}', "
                 f"approval_token='{token}', token_expires={token_expires}). "
-                f"If it returns ok, post the returned cart_link and instruction to channel "
-                f"{channel} so the human can place the order on Amazon. Approve ONLY this "
-                "pending_id; do not approve anything else."
+                f"If it returns ok, post the returned purchase_links and instruction to "
+                f"channel {channel} so the human can verify live prices and complete the "
+                f"vendor checkout or quote. Approve ONLY this pending_id; do not approve "
+                "anything else."
             )
         else:
             instruction = (
@@ -1169,8 +1171,10 @@ class BrokerSlackPoller:
         msg = (
             f"[purchase-approval] VERIFIED Slack approver {clicker_name} (id={clicker_id}) "
             f"clicked {decision.upper()} on purchase pending_id=`{pending_id}` in channel "
-            f"{channel}. The daemon has already verified the clicker's identity and confirmed "
-            f"they are an allowlisted purchase approver, so this {decision} is authorized.\n"
+            f"{channel}. Requester identity is infrastructure-bound to `{self._agent_name}` "
+            "and included in the signed token. The daemon has already verified the clicker's "
+            f"identity and confirmed they are an allowlisted purchase approver, so this "
+            f"{decision} is authorized.\n"
             + instruction
         )
 
