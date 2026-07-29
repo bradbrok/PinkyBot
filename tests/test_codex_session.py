@@ -6,6 +6,7 @@ import asyncio
 import os
 import sys
 import tempfile
+from unittest.mock import AsyncMock, patch
 
 import pytest
 
@@ -364,6 +365,65 @@ class TestCodexSessionSendSignature:
 
         queued = await s._message_queue.get()
         assert queued[0] == "plain prompt"
+
+    @pytest.mark.asyncio
+    async def test_scheduler_receipt_waits_until_worker_starts_exact_turn(self):
+        """#931: a queued scheduler prompt is not delivered at enqueue time."""
+        s = self._make()
+        await _to_connected(s)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        calls: list[str] = []
+
+        async def fake_exec(
+            prompt: str,
+            *,
+            scheduler_delivery: asyncio.Future[bool] | None = None,
+        ) -> CodexTurnResult:
+            calls.append(prompt)
+            if prompt == "first":
+                first_started.set()
+                await release_first.wait()
+            s._resolve_scheduler_delivery(scheduler_delivery, True)
+            return CodexTurnResult()
+
+        s._exec_codex = fake_exec  # type: ignore[assignment]
+        await s.send("first")
+        worker = asyncio.create_task(s._message_worker())
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+
+        second_receipt = await s.send_scheduler_prompt("second")
+        await asyncio.sleep(0.02)
+        assert not second_receipt.done()
+
+        release_first.set()
+        assert await asyncio.wait_for(second_receipt, timeout=1) is True
+        assert calls == ["first", "second"]
+
+        await _to_dead(s)
+        s._message_queue.put_nowait(("noop", "", "", ""))
+        await asyncio.wait_for(worker, timeout=1)
+
+    @pytest.mark.asyncio
+    async def test_scheduler_receipt_is_false_when_exec_fails_before_acceptance(
+        self,
+    ):
+        """A spawned/accepted turn, not _exec_lock acquisition, is the edge."""
+        s = self._make()
+        s._use_app_server = False
+        await _to_connected(s)
+
+        with patch(
+            "asyncio.create_subprocess_exec",
+            AsyncMock(side_effect=OSError("spawn failed before acceptance")),
+        ):
+            receipt = await s.send_scheduler_prompt("scheduled")
+            worker = asyncio.create_task(s._message_worker())
+            assert await asyncio.wait_for(receipt, timeout=1) is False
+
+        await _to_dead(s)
+        s._message_queue.put_nowait(("noop", "", "", ""))
+        await asyncio.wait_for(worker, timeout=1)
 
 
 class TestCodexSessionDisconnect:
@@ -1235,10 +1295,14 @@ class TestCodexAppServerTurn:
         ]
         fake = _FakeAppClient(s, notifications)
         _patch_ensure(s, fake)
+        receipt = asyncio.get_running_loop().create_future()
 
-        result = await s._exec_codex_app_server("hi there")
+        result = await s._exec_codex_app_server(
+            "hi there", scheduler_delivery=receipt
+        )
 
         assert not result.failed
+        assert await receipt is True
         assert result.text_parts == ["hello"]
         assert result.input_tokens == 100
         assert result.output_tokens == 10
@@ -1333,6 +1397,28 @@ class TestCodexAppServerTurn:
         result = await s._exec_codex_app_server("hi")
         assert result.failed
         assert "spawn failed" in result.errors[0]
+
+    @pytest.mark.asyncio
+    async def test_turn_start_failure_is_a_negative_scheduler_receipt(self):
+        s = _appserver_session()
+        fake = _FakeAppClient(s, [])
+        original_request = fake.request
+
+        async def fail_turn_start(method, params=None, *, timeout=600.0):
+            if method == "turn/start":
+                raise RuntimeError("turn rejected before acceptance")
+            return await original_request(method, params, timeout=timeout)
+
+        fake.request = fail_turn_start
+        _patch_ensure(s, fake)
+        receipt = asyncio.get_running_loop().create_future()
+
+        result = await s._exec_codex_app_server(
+            "scheduled", scheduler_delivery=receipt
+        )
+
+        assert result.failed
+        assert await receipt is False
 
 
 # -- Exec serialization / stderr drain / delta dedupe regressions ---------

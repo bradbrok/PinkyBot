@@ -10219,21 +10219,45 @@ npm run build</pre>
             "connected": ss.state == TransportSessionState.CONNECTED,
         }
 
-    async def _wake_callback(agent_name: str, session_id: str, prompt: str) -> None:
-        """Callback for the scheduler/autonomy to wake an agent."""
+    async def _wake_callback(agent_name: str, session_id: str, prompt: str):
+        """Queue a wake and return its exact per-prompt delivery receipt."""
         del session_id  # Streaming is now the canonical main runtime.
         ss = await _ensure_streaming_session(agent_name, label="main")
         if not ss:
             _log(f"scheduler: no streaming main session for {agent_name}, skipping wake")
-            return
-        await ss.send(prompt)
-        _log(f"scheduler: woke {agent_name} via streaming main")
+            return False
+
+        scheduler_send = getattr(ss, "send_scheduler_prompt", None)
+        if callable(scheduler_send):
+            receipt = await scheduler_send(prompt)
+            _log(
+                f"scheduler: queued confirmed-delivery wake for "
+                f"{agent_name} via streaming main"
+            )
+            return receipt
+
+        handed_off = await ss.send(prompt)
+        confirmed = bool(
+            handed_off
+            and getattr(ss, "injection_confirms_consumption", False)
+        )
+        if confirmed:
+            _log(
+                f"scheduler: wake accepted for {agent_name} via "
+                f"streaming main"
+            )
+        else:
+            _log(
+                f"scheduler: wake enqueue for {agent_name} did not "
+                f"provide a positive delivery receipt"
+            )
         # ``agent_wake`` is logged centrally via ``on_wake_delivered``
         # when the session's connect-time wake prompt lands. Logging
         # here would double-count for scheduled wakes that triggered
         # a cold-start (the connect already fired the callback) and
         # would mismark scheduled re-prompts (which aren't really new
         # wake events — the session was already awake). See Murzik P1#2.
+        return confirmed
 
     async def _dream_callback(agent_name: str, agent_config) -> None:
         """Callback for the scheduler to run nightly dream consolidation."""

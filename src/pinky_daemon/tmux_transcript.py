@@ -294,6 +294,7 @@ class TmuxTranscriptTailer:
         active_poll_sec: float = _ACTIVE_POLL_SEC,
         path_discovery: Callable[[], Path | None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
+        on_entry: Callable[[dict], None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
         # #291: wall-clock when ``_path`` was last bound via an explicit
@@ -331,6 +332,9 @@ class TmuxTranscriptTailer:
         # transcript-swap race that ``_swap_generation`` guards around
         # turn callbacks.
         self._on_usage = on_usage
+        # Raw-entry hook used by TmuxSession to observe prompt acceptance.
+        # Sync so reading a chunk has no new suspension point.
+        self._on_entry = on_entry
 
         self._offset: int = 0
         # Bumped by every path-changing ``set_transcript_path``. Lets
@@ -729,6 +733,16 @@ class TmuxTranscriptTailer:
                     )
                     bytes_read += len(line) + 1
                     continue
+
+                if self._on_entry is not None:
+                    try:
+                        self._on_entry(dict(entry))
+                    except Exception as e:
+                        self._stats["callback_errors"] += 1
+                        _log(
+                            f"tmux_tailer[{self._agent_name}]: on_entry raised "
+                            f"({type(e).__name__}: {e}); continuing"
+                        )
 
                 closes_turn = False
                 prevented = False

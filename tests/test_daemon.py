@@ -488,3 +488,30 @@ class TestDaemon:
         assert stats["running"] is False
         assert stats["pollers"] == 0
         assert stats["messages_processed"] == 0
+
+    @pytest.mark.asyncio
+    async def test_legacy_schedule_enqueue_is_not_a_delivery_receipt(
+        self, tmp_path, capsys
+    ):
+        """A pending autonomy event must not advance last_delivered."""
+        config = DaemonConfig(working_dir=str(tmp_path))
+        with patch(
+            "pinky_daemon.claude_runner._find_claude_binary",
+            return_value="/usr/bin/claude",
+        ):
+            daemon = Daemon(config)
+        daemon._registry.register("oleg")
+        daemon._registry.add_schedule(
+            "oleg", "* * * * *", name="queued-only", prompt="scheduled"
+        )
+        schedule = daemon._registry.get_schedules("oleg")[0]
+        daemon._runner.run = AsyncMock()
+
+        await daemon._scheduler._deliver_schedule(schedule)
+        await asyncio.sleep(0)
+
+        stored = daemon._registry.get_schedules("oleg")[0]
+        assert daemon._autonomy.event_queue.pending_count("oleg") == 1
+        daemon._runner.run.assert_not_awaited()
+        assert stored.last_delivered == 0.0
+        assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err

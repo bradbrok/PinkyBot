@@ -196,6 +196,11 @@ class Daemon:
                 data={"prompt": prompt, "session_id": session_id},
             )
             await self._autonomy.push_event(event)
+            # This legacy daemon can observe only event-queue insertion here;
+            # the autonomy runner accepts the prompt later in another task.
+            # Enqueue is not a transport receipt, so fail closed rather than
+            # stamping last_delivered for an unconsumed pending event.
+            return False
 
         self._scheduler = AgentScheduler(
             self._registry,

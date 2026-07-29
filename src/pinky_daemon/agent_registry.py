@@ -626,7 +626,8 @@ class AgentSchedule:
     prompt: str = ""  # Message to send to main session on wake
     timezone: str = "America/Los_Angeles"
     enabled: bool = True
-    last_run: float = 0.0
+    last_run: float = 0.0  # Scheduler decided to fire.
+    last_delivered: float = 0.0  # Session confirmed prompt acceptance.
     created_at: float = 0.0
     direct_send: bool = False  # If true, prompt is sent directly as a message (not as agent input)
     target_channel: str = ""  # Chat ID or channel for direct_send routing
@@ -642,6 +643,7 @@ class AgentSchedule:
             "timezone": self.timezone,
             "enabled": self.enabled,
             "last_run": self.last_run,
+            "last_delivered": self.last_delivered,
             "next_run": _cron_next_run(self.cron, self.timezone),
             "created_at": self.created_at,
             "direct_send": self.direct_send,
@@ -1242,6 +1244,7 @@ class AgentRegistry:
                 timezone TEXT NOT NULL DEFAULT 'America/Los_Angeles',
                 enabled INTEGER NOT NULL DEFAULT 1,
                 last_run REAL NOT NULL DEFAULT 0,
+                last_delivered REAL NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
@@ -1561,6 +1564,7 @@ class AgentRegistry:
             ("direct_send", "INTEGER NOT NULL DEFAULT 0"),
             ("target_channel", "TEXT NOT NULL DEFAULT ''"),
             ("one_shot", "INTEGER NOT NULL DEFAULT 0"),
+            ("last_delivered", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in sched_migrations:
             if col not in sched_existing:
@@ -2965,7 +2969,7 @@ except Exception:
             return AgentSchedule(
                 id=cursor.lastrowid, agent_name=agent_name, name=name,
                 cron=cron, prompt=prompt, timezone=timezone,
-                enabled=True, last_run=0.0, created_at=now,
+                enabled=True, last_run=0.0, last_delivered=0.0, created_at=now,
                 direct_send=direct_send, target_channel=target_channel,
                 one_shot=one_shot,
             )
@@ -2975,15 +2979,15 @@ except Exception:
         return AgentSchedule(
             id=r[0], agent_name=r[1], name=r[2], cron=r[3],
             prompt=r[4], timezone=r[5], enabled=bool(r[6]),
-            last_run=r[7], created_at=r[8],
-            direct_send=bool(r[9]) if len(r) > 9 else False,
-            target_channel=r[10] if len(r) > 10 else "",
-            one_shot=bool(r[11]) if len(r) > 11 else False,
+            last_run=r[7], last_delivered=r[8], created_at=r[9],
+            direct_send=bool(r[10]) if len(r) > 10 else False,
+            target_channel=r[11] if len(r) > 11 else "",
+            one_shot=bool(r[12]) if len(r) > 12 else False,
         )
 
     def get_schedules(self, agent_name: str, *, enabled_only: bool = True) -> list[AgentSchedule]:
         """Get all schedules for an agent."""
-        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot FROM agent_schedules WHERE agent_name=?"
+        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, last_delivered, created_at, direct_send, target_channel, one_shot FROM agent_schedules WHERE agent_name=?"
         params: list = [agent_name]
         if enabled_only:
             sql += " AND enabled=1"
@@ -2993,7 +2997,7 @@ except Exception:
 
     def get_all_schedules(self, *, enabled_only: bool = True) -> list[AgentSchedule]:
         """Get all schedules across all agents."""
-        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, created_at, direct_send, target_channel, one_shot FROM agent_schedules"
+        sql = "SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run, last_delivered, created_at, direct_send, target_channel, one_shot FROM agent_schedules"
         if enabled_only:
             sql += " WHERE enabled=1"
         sql += " ORDER BY agent_name, created_at ASC"
@@ -3056,7 +3060,7 @@ except Exception:
                 return None
             row = self._db.execute(
                 """SELECT id, agent_name, name, cron, prompt, timezone, enabled, last_run,
-                          created_at, direct_send, target_channel, one_shot
+                          last_delivered, created_at, direct_send, target_channel, one_shot
                    FROM agent_schedules WHERE id=?""",
                 (schedule_id,),
             ).fetchone()
@@ -3097,10 +3101,21 @@ except Exception:
             return cursor.rowcount > 0
 
     def update_schedule_last_run(self, schedule_id: int, timestamp: float = 0.0) -> None:
-        """Record when a schedule last ran."""
+        """Record when the scheduler decided to fire a schedule."""
         ts = timestamp or time.time()
         self._db.execute(
             "UPDATE agent_schedules SET last_run=? WHERE id=?",
+            (ts, schedule_id),
+        )
+        self._db.commit()
+
+    def update_schedule_last_delivered(
+        self, schedule_id: int, timestamp: float = 0.0
+    ) -> None:
+        """Record when the session confirmed acceptance of a fired prompt."""
+        ts = timestamp or time.time()
+        self._db.execute(
+            "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
             (ts, schedule_id),
         )
         self._db.commit()
