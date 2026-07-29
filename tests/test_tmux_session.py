@@ -3573,56 +3573,117 @@ async def test_disconnect_clears_inflight_meta() -> None:
 
 @pytest.mark.asyncio
 async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
-    """#931: scheduler turns must never paste concurrently into a busy REPL."""
+    """Successful pane keystrokes are not a scheduler delivery receipt."""
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
 
-    first_receipt = await ss.send_scheduler_prompt("first")
-    first_turn = await ss._message_queue.get()
-    await ss._deliver_turn(first_turn)
-    assert await first_receipt is True
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1:
+            break
+        await asyncio.sleep(0.01)
+
+    tmux.paste_text.assert_awaited_once_with("scheduled", enter=True)
+    assert not receipt.done()
     assert len(ss._inflight_metas) == 1
 
-    second_receipt = await ss.send_scheduler_prompt("second")
-    second_turn = await ss._message_queue.get()
-    second_delivery = asyncio.create_task(ss._deliver_turn(second_turn))
-    await asyncio.sleep(0.02)
-
-    assert tmux.paste_text.await_count == 1
-    assert not second_receipt.done()
-
-    await ss._handle_turn_complete(
-        TurnResponse(text="first done", stop_reason="end_turn")
-    )
-    await asyncio.wait_for(second_delivery, timeout=1)
-
-    assert await second_receipt is True
-    assert tmux.paste_text.await_count == 2
-    assert [call.args[0] for call in tmux.paste_text.await_args_list] == [
-        "first",
-        "second",
-    ]
+    ss._on_transcript_entry({
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": "scheduled",
+    })
+    assert not receipt.done()
+    ss._on_transcript_entry({
+        "type": "queue-operation",
+        "operation": "dequeue",
+    })
+    assert await receipt is True
+    await ss.disconnect()
 
 
 @pytest.mark.asyncio
 async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
     """#931: pane status must gate prompts without local inflight metadata."""
-    live = {"status": "working"}
+    live = {"status": "working", "last_updated": _time.time()}
     ss, tmux = _make_session(state=SessionState.CONNECTED)
     ss._config.live_status_fn = lambda: live
 
     receipt = await ss.send_scheduler_prompt("scheduled")
-    turn = await ss._message_queue.get()
-    delivery = asyncio.create_task(ss._deliver_turn(turn))
     await asyncio.sleep(0.02)
 
     assert tmux.paste_text.await_count == 0
     assert not receipt.done()
 
     live["status"] = "idle"
-    await asyncio.wait_for(delivery, timeout=1)
+    live["last_updated"] = _time.time()
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1:
+            break
+        await asyncio.sleep(0.01)
 
-    assert await receipt is True
     tmux.paste_text.assert_awaited_once()
+    assert not receipt.done()
+    ss._on_transcript_entry({
+        "type": "user",
+        "message": {"role": "user", "content": "scheduled"},
+    })
+    assert await receipt is True
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_idle_wait_does_not_block_ordinary_midturn_send() -> None:
+    """A waiting scheduler turn never owns the ordinary worker head-of-line."""
+    live = {"status": "working", "last_updated": _time.time()}
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: live
+    ss._worker_task = asyncio.create_task(ss._message_worker())
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    await asyncio.sleep(0.02)
+    assert tmux.paste_text.await_count == 0
+
+    assert await ss.send("ordinary") is True
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1:
+            break
+        await asyncio.sleep(0.01)
+
+    tmux.paste_text.assert_awaited_once_with("ordinary", enter=True)
+    assert not receipt.done()
+    receipt.cancel()
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "live_status_fn",
+    [
+        None,
+        lambda: {},
+        lambda: {"status": "thinking", "last_updated": _time.time()},
+        lambda: {"status": "tool_use", "last_updated": _time.time()},
+        lambda: {"status": "offline", "last_updated": _time.time()},
+        lambda: (_ for _ in ()).throw(RuntimeError("status failed")),
+    ],
+)
+async def test_scheduler_gate_fails_closed_without_trustworthy_idle(
+    live_status_fn,
+) -> None:
+    """Missing/error/non-idle status never permits a scheduler pane paste."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = live_status_fn
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    await asyncio.sleep(0.02)
+
+    tmux.paste_text.assert_not_awaited()
+    assert not receipt.done()
+    receipt.cancel()
+    await ss.disconnect()
 
 
 @pytest.mark.asyncio

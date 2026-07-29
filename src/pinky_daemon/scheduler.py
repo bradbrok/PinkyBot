@@ -360,32 +360,55 @@ class AgentScheduler:
     ) -> None:
         """Deliver one agent's due prompts serially, including receipt waits."""
         lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
-        async with lock:
-            for schedule in schedules:
-                await self._deliver_schedule(schedule)
+        next_index = 0
+        try:
+            async with lock:
+                for next_index, schedule in enumerate(schedules):
+                    try:
+                        await self._deliver_schedule(schedule)
+                    except asyncio.CancelledError:
+                        self._record_schedule_undelivered(
+                            schedule, "delivery canceled before confirmation"
+                        )
+                        next_index += 1
+                        raise
+                    next_index += 1
+        except asyncio.CancelledError:
+            # All members of this cohort were stamped fired before this task
+            # was created. Cancellation (including stop()) must not make the
+            # current/tail schedules disappear from the audit trail. Keep this
+            # synchronous so shutdown remains fast.
+            for schedule in schedules[next_index:]:
+                self._record_schedule_undelivered(
+                    schedule, "delivery canceled before attempt"
+                )
+            raise
 
     async def _deliver_schedule(self, schedule) -> None:
         """Attempt one fired schedule and record confirmed delivery separately."""
         confirmed = False
         failure_reason = "no delivery callback configured"
 
-        if (
-            schedule.direct_send
-            and schedule.target_channel
-            and self._direct_send_callback
-        ):
-            try:
-                await self._direct_send_callback(
-                    schedule.agent_name,
-                    "telegram",  # Default platform
-                    schedule.target_channel,
-                    schedule.prompt,
-                )
-                confirmed = True
-            except asyncio.CancelledError:
-                raise
-            except Exception as e:
-                failure_reason = f"direct send raised {type(e).__name__}: {e}"
+        if schedule.direct_send:
+            if not schedule.target_channel:
+                failure_reason = "direct send has no target channel"
+            elif self._direct_send_callback is None:
+                failure_reason = "no direct send callback configured"
+            else:
+                try:
+                    await self._direct_send_callback(
+                        schedule.agent_name,
+                        "telegram",  # Default platform
+                        schedule.target_channel,
+                        schedule.prompt,
+                    )
+                    confirmed = True
+                except asyncio.CancelledError:
+                    raise
+                except Exception as e:
+                    failure_reason = (
+                        f"direct send raised {type(e).__name__}: {e}"
+                    )
         elif self._wake_callback:
             try:
                 confirmed = await asyncio.wait_for(
@@ -425,6 +448,12 @@ class AgentScheduler:
             )
             return
 
+        self._record_schedule_undelivered(schedule, failure_reason)
+
+    def _record_schedule_undelivered(
+        self, schedule, failure_reason: str
+    ) -> None:
+        """Loudly account one fired schedule without advancing delivery."""
         if self._activity:
             try:
                 self._activity.log(

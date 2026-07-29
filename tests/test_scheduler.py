@@ -814,6 +814,80 @@ class TestScheduler:
         assert events == ["schedule_fired", "schedule_undelivered"]
         assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
 
+    @pytest.mark.asyncio
+    async def test_canceled_cohort_accounts_current_and_remaining_as_undelivered(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg", "* * * * *", name="first", prompt="first"
+        )
+        registry.add_schedule(
+            "oleg", "* * * * *", name="second", prompt="second"
+        )
+        first_started = asyncio.Event()
+        attempts: list[str] = []
+        events: list[str] = []
+
+        class Activity:
+            def log(self, agent_name, event_type, summary):
+                del agent_name, summary
+                events.append(event_type)
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            first_started.set()
+            return asyncio.get_running_loop().create_future()
+
+        scheduler = AgentScheduler(
+            registry, wake_callback=wake_cb, activity=Activity()
+        )
+        await scheduler._check_schedules(time.time())
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await asyncio.wait_for(scheduler.stop(), timeout=1)
+
+        schedules = registry.get_schedules("oleg")
+        assert attempts == ["first"]
+        assert all(schedule.last_run > 0 for schedule in schedules)
+        assert all(schedule.last_delivered == 0 for schedule in schedules)
+        assert events == [
+            "schedule_fired",
+            "schedule_fired",
+            "schedule_undelivered",
+            "schedule_undelivered",
+        ]
+        assert capsys.readouterr().err.count("FIRED BUT UNDELIVERED") == 2
+
+    @pytest.mark.asyncio
+    async def test_misconfigured_direct_send_never_falls_back_to_agent_wake(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg",
+            "* * * * *",
+            name="direct",
+            prompt="target prompt",
+            target_channel="12345",
+            direct_send=True,
+        )
+        wake_calls: list[str] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id
+            wake_calls.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=wake_cb)
+        schedule = registry.get_schedules("oleg")[0]
+        await scheduler._deliver_schedule(schedule)
+
+        stored = registry.get_schedules("oleg")[0]
+        assert wake_calls == []
+        assert stored.last_delivered == 0.0
+        assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
+
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────
 

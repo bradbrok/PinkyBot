@@ -310,6 +310,31 @@ class TestTailerReadOnce:
         assert tailer.offset == 0
 
     @pytest.mark.asyncio
+    async def test_raw_entry_hook_observes_queue_acceptance_rows(
+        self, transcript
+    ):
+        cb = _Captor()
+        entries = [
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": "scheduled",
+            },
+            {"type": "queue-operation", "operation": "dequeue"},
+            _user(text="scheduled"),
+        ]
+        seen: list[dict] = []
+        tailer = TmuxTranscriptTailer(
+            transcript, cb, on_entry=seen.append
+        )
+        _write_jsonl(transcript, entries)
+
+        await tailer.read_once()
+
+        assert seen == entries
+        assert cb.responses == []
+
+    @pytest.mark.asyncio
     async def test_nonexistent_file_no_error(self, tmp_path):
         cb = _Captor()
         tailer = TmuxTranscriptTailer(tmp_path / "does-not-exist.jsonl", cb)

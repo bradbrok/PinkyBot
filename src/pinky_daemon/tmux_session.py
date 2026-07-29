@@ -832,10 +832,14 @@ class _QueuedTurn:
     # the deque unboundedly (the murzik #846 loop).
     replay_count: int = 0
     # Scheduler-only receipt. A serialized scheduler turn waits for the
-    # pane to become idle before paste; successful paste resolves True,
-    # permanent failure resolves False, and receipt timeout cancels it.
+    # pane to become explicitly idle before paste. True requires a matching
+    # transcript user row, or queue enqueue followed by dequeue; successful
+    # tmux keystrokes alone are not a receipt.
     scheduler_delivery: asyncio.Future[bool] | None = None
     scheduler_serialized: bool = False
+    pane_delivery_started: bool = False
+    pane_queue_enqueued: bool = False
+    transport_accepted: bool = False
 
 
 @dataclass
@@ -1187,6 +1191,16 @@ class TmuxSession:
         # Worker queue + task.
         self._message_queue: asyncio.Queue[_QueuedTurn] = asyncio.Queue()
         self._worker_task: asyncio.Task | None = None
+        # Scheduler turns use separate delivery tasks so their conservative
+        # idle wait can never occupy the ordinary worker's head-of-line.
+        self._scheduler_delivery_tasks: set[asyncio.Task] = set()
+        self._scheduler_delivery_lock = asyncio.Lock()
+        # Turns remain here after paste until their exact transcript receipt
+        # resolves. Raw queue-operation dequeue rows carry no content, so the
+        # companion deque preserves enqueue ordering across all pane turns.
+        self._scheduler_pending_turns: list[_QueuedTurn] = []
+        self._pane_queue_operations: deque[_QueuedTurn | None] = deque()
+        self._pane_dequeued_turns: deque[_QueuedTurn | None] = deque()
         # Background watchdog that ages the deque head against
         # ``_TURN_DONE_TIMEOUT_SEC`` and triggers ``force_restart`` when
         # a stop hook fails to land. Issue #560 replaces the per-iter
@@ -3232,6 +3246,23 @@ class TmuxSession:
         intent (idle_sleep / force_restart / explicit DEAD) by driving
         the state machine BEFORE calling disconnect.
         """
+        # Fail and cancel scheduler-only delivery tasks before tearing down the
+        # ordinary worker/pane. A pane shutdown is a terminal non-receipt.
+        for turn in list(self._scheduler_pending_turns):
+            delivery = turn.scheduler_delivery
+            if delivery is not None and not delivery.done():
+                delivery.set_result(False)
+        scheduler_tasks = list(self._scheduler_delivery_tasks)
+        for task in scheduler_tasks:
+            if not task.done():
+                task.cancel()
+        if scheduler_tasks:
+            await asyncio.gather(*scheduler_tasks, return_exceptions=True)
+        self._scheduler_delivery_tasks.clear()
+        self._scheduler_pending_turns.clear()
+        self._pane_queue_operations.clear()
+        self._pane_dequeued_turns.clear()
+
         # Cancel worker.
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()
@@ -3279,6 +3310,9 @@ class TmuxSession:
         for entry in drained:
             if entry.completion_event is not None and not entry.completion_event.is_set():
                 entry.completion_event.set()
+            delivery = entry.turn.scheduler_delivery
+            if delivery is not None and not delivery.done():
+                delivery.set_result(False)
 
         # Issue #547: also unblock ``_inflight_turn`` — the turn the
         # worker pulled from the queue but had NOT yet pasted (e.g.
@@ -3363,11 +3397,10 @@ class TmuxSession:
     async def send_scheduler_prompt(
         self, prompt: str
     ) -> asyncio.Future[bool]:
-        """Queue a scheduler turn and return its exact pane-delivery receipt.
+        """Start a scheduler turn and return its exact acceptance receipt.
 
-        The worker does not paste this turn while another turn is in flight.
-        That idle gate preserves each same-tick prompt instead of relying on
-        Claude Code's lossy mid-turn input behavior.
+        Scheduler idle waits run outside the ordinary message worker, so user
+        steering and inter-agent sends retain their mid-turn paste latency.
         """
         loop = asyncio.get_running_loop()
         receipt: asyncio.Future[bool] = loop.create_future()
@@ -3414,16 +3447,101 @@ class TmuxSession:
                 pass
 
         queued_prompt = prompt + agent_hint if agent_hint else prompt
-        await self._message_queue.put(_QueuedTurn(
+        turn = _QueuedTurn(
             prompt=queued_prompt,
             platform=platform,
             chat_id=chat_id,
             message_id=message_id,
             scheduler_delivery=scheduler_delivery,
             scheduler_serialized=scheduler_serialized,
-        ))
+        )
+        if scheduler_serialized:
+            self._scheduler_pending_turns.append(turn)
+            if scheduler_delivery is not None:
+                scheduler_delivery.add_done_callback(
+                    lambda _receipt, _turn=turn: self._scheduler_receipt_done(
+                        _turn
+                    )
+                )
+            task = asyncio.create_task(self._deliver_scheduler_turn(turn))
+            self._scheduler_delivery_tasks.add(task)
+            task.add_done_callback(
+                lambda done, _turn=turn: self._scheduler_delivery_done(
+                    done, _turn
+                )
+            )
+        else:
+            await self._message_queue.put(turn)
         _log(f"tmux[{self.agent_name}]: queued message (chat={chat_id})")
         return True
+
+    def _scheduler_receipt_done(self, turn: _QueuedTurn) -> None:
+        """Forget one receipt turn by identity, preserving equal duplicates."""
+        self._scheduler_pending_turns[:] = [
+            pending
+            for pending in self._scheduler_pending_turns
+            if pending is not turn
+        ]
+
+    def _scheduler_delivery_done(
+        self, task: asyncio.Task, turn: _QueuedTurn
+    ) -> None:
+        """Retire an out-of-band scheduler paste task and surface crashes."""
+        self._scheduler_delivery_tasks.discard(task)
+        if task.cancelled():
+            receipt = turn.scheduler_delivery
+            if receipt is not None and not receipt.done():
+                receipt.set_result(False)
+            return
+        error = task.exception()
+        if error is not None:
+            receipt = turn.scheduler_delivery
+            if receipt is not None and not receipt.done():
+                receipt.set_result(False)
+            _log(
+                f"tmux[{self.agent_name}]: SCHEDULER DELIVERY TASK CRASHED "
+                f"with {type(error).__name__}: {error}"
+            )
+
+    async def _deliver_scheduler_turn(self, turn: _QueuedTurn) -> None:
+        """Paste one scheduler turn without blocking ordinary sends."""
+        receipt = turn.scheduler_delivery
+        try:
+            async with self._scheduler_delivery_lock:
+                while self.state == SessionState.CONNECTED:
+                    if receipt is None or receipt.cancelled():
+                        return
+                    try:
+                        self._processing = True
+                        await self._deliver_turn(turn)
+                        self._stats["turns"] += 1
+                        return
+                    except _SchedulerDeliveryCancelled:
+                        return
+                    except _ContextLockDeferral as e:
+                        _log(
+                            f"tmux[{self.agent_name}]: scheduler turn deferred "
+                            f"(context lock); retrying in "
+                            f"{_TRANSIENT_RETRY_BACKOFF_SEC}s ({e})"
+                        )
+                        await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
+                    except Exception as e:
+                        self._stats["errors"] += 1
+                        _log(
+                            f"tmux[{self.agent_name}]: scheduler turn "
+                            f"delivery raised: {e}"
+                        )
+                        if receipt is not None and not receipt.done():
+                            receipt.set_result(False)
+                        return
+                    finally:
+                        self._processing = False
+                if receipt is not None and not receipt.done():
+                    receipt.set_result(False)
+        except asyncio.CancelledError:
+            if receipt is not None and not receipt.done():
+                receipt.set_result(False)
+            raise
 
     async def _enqueue_internal_prompt(
         self,
@@ -4519,6 +4637,16 @@ class TmuxSession:
             return
 
         entry = self._inflight_metas.popleft()
+        self._pane_queue_operations = deque(
+            queued
+            for queued in self._pane_queue_operations
+            if queued is not entry.turn
+        )
+        self._pane_dequeued_turns = deque(
+            dequeued
+            for dequeued in self._pane_dequeued_turns
+            if dequeued is not entry.turn
+        )
         if (
             self._fresh_context_respawn_grace_until
             and self._fresh_context_respawn_epoch
@@ -4874,6 +5002,9 @@ class TmuxSession:
                 # the live window instead of freezing at the previous
                 # turn's value for the whole in-flight turn.
                 on_usage=self._on_transcript_usage,
+                # Scheduler receipts require an exact user/dequeue transcript
+                # observation; successful external-pane keystrokes are weaker.
+                on_entry=self._on_transcript_entry,
             )
             await self._tailer.start()
             if guessed is None:
@@ -5963,6 +6094,9 @@ class TmuxSession:
                         ev = m.completion_event
                         if ev is not None and not ev.is_set():
                             ev.set()
+                        delivery = m.turn.scheduler_delivery
+                        if delivery is not None and not delivery.done():
+                            delivery.set_result(False)
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
                         f"but REPL is idle — reconciled {len(drained)} phantom "
@@ -6123,6 +6257,9 @@ class TmuxSession:
                             f"already-completed {kind} turn "
                             f"(completion_event set) — #846"
                         )
+                        delivery = t.scheduler_delivery
+                        if delivery is not None and not delivery.done():
+                            delivery.set_result(False)
                         return False
                     t.replay_count += 1
                     if replay_cap and t.replay_count > replay_cap:
@@ -6134,6 +6271,9 @@ class TmuxSession:
                         )
                         if ev is not None and not ev.is_set():
                             ev.set()
+                        delivery = t.scheduler_delivery
+                        if delivery is not None and not delivery.done():
+                            delivery.set_result(False)
                         return False
                     return True
 
@@ -6152,6 +6292,9 @@ class TmuxSession:
                             de = dropped.turn.completion_event
                             if de is not None and not de.is_set():
                                 de.set()
+                            delivery = dropped.turn.scheduler_delivery
+                            if delivery is not None and not delivery.done():
+                                delivery.set_result(False)
                         break
                     if _consider_replay(entry.turn, kind="tail"):
                         replay.append(entry.turn)
@@ -6193,6 +6336,9 @@ class TmuxSession:
                     and not head.completion_event.is_set()
                 ):
                     head.completion_event.set()
+                head_delivery = head.turn.scheduler_delivery
+                if head_delivery is not None and not head_delivery.done():
+                    head_delivery.set_result(False)
                 self._turn_done.set()
                 self._stats["errors"] += 1
                 self._stats["turn_timeouts"] = (
@@ -6255,16 +6401,119 @@ class TmuxSession:
 
     def _scheduler_pane_busy(self) -> bool:
         """Conservative busy verdict for safe scheduled-prompt injection."""
-        if self._inflight_metas or self._inflight_tool_calls:
+        if (
+            self._inflight_metas
+            or self._inflight_tool_calls
+            or self._inflight_turn is not None
+            or not self._message_queue.empty()
+        ):
             return True
         live_status_fn = getattr(self._config, "live_status_fn", None)
         if live_status_fn is None:
-            return False
+            return True
         try:
             live = live_status_fn() or {}
         except Exception:
-            return False
-        return live.get("status") == "working"
+            return True
+        if live.get("status") != "idle":
+            return True
+        last_updated = live.get("last_updated")
+        return not (
+            isinstance(last_updated, (int, float))
+            and not isinstance(last_updated, bool)
+            and last_updated > 0
+        )
+
+    @staticmethod
+    def _transcript_user_text(entry: dict) -> str | None:
+        """Extract a plain user prompt from either known transcript shape."""
+        message = entry.get("message") or {}
+        content = message.get("content") if isinstance(message, dict) else None
+        if isinstance(content, str):
+            return content
+        if not isinstance(content, list):
+            return None
+        text_parts = [
+            block.get("text", "")
+            for block in content
+            if (
+                isinstance(block, dict)
+                and block.get("type") == "text"
+                and isinstance(block.get("text"), str)
+            )
+        ]
+        return "".join(text_parts) if text_parts else None
+
+    def _acceptance_candidates(self) -> list[_QueuedTurn]:
+        """Return known pane turns oldest-first, without duplicate objects."""
+        candidates = [entry.turn for entry in self._inflight_metas]
+        if self._inflight_turn is not None:
+            candidates.append(self._inflight_turn)
+        candidates.extend(self._scheduler_pending_turns)
+        unique: dict[int, _QueuedTurn] = {}
+        for turn in candidates:
+            unique.setdefault(id(turn), turn)
+        return sorted(unique.values(), key=lambda turn: turn.queued_at)
+
+    def _match_acceptance_turn(
+        self, prompt: str, *, for_enqueue: bool = False
+    ) -> _QueuedTurn | None:
+        """Match an exact transcript prompt to its oldest pending pane turn."""
+        for turn in self._acceptance_candidates():
+            if (
+                not turn.pane_delivery_started
+                or turn.transport_accepted
+                or turn.prompt != prompt
+            ):
+                continue
+            if for_enqueue and turn.pane_queue_enqueued:
+                continue
+            return turn
+        return None
+
+    @staticmethod
+    def _mark_transport_accepted(turn: _QueuedTurn | None) -> None:
+        """Resolve a scheduler receipt only on observed pane acceptance."""
+        if turn is None or turn.transport_accepted:
+            return
+        turn.transport_accepted = True
+        receipt = turn.scheduler_delivery
+        if receipt is not None and not receipt.done():
+            receipt.set_result(True)
+
+    def _on_transcript_entry(self, entry: dict) -> None:
+        """Consume transcript evidence strong enough for exact-turn receipts."""
+        entry_type = entry.get("type")
+        if entry_type == "queue-operation":
+            operation = entry.get("operation")
+            if operation == "enqueue":
+                content = entry.get("content")
+                turn = (
+                    self._match_acceptance_turn(content, for_enqueue=True)
+                    if isinstance(content, str)
+                    else None
+                )
+                if turn is not None:
+                    turn.pane_queue_enqueued = True
+                self._pane_queue_operations.append(turn)
+            elif operation == "dequeue" and self._pane_queue_operations:
+                turn = self._pane_queue_operations.popleft()
+                self._pane_dequeued_turns.append(turn)
+                self._mark_transport_accepted(turn)
+            return
+
+        if entry_type == "user":
+            prompt = self._transcript_user_text(entry)
+            if prompt is not None:
+                if self._pane_dequeued_turns:
+                    dequeued = self._pane_dequeued_turns[0]
+                    if dequeued is None or dequeued.prompt == prompt:
+                        self._pane_dequeued_turns.popleft()
+                        self._mark_transport_accepted(dequeued)
+                        return
+                self._mark_transport_accepted(
+                    self._match_acceptance_turn(prompt)
+                )
 
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
@@ -6500,8 +6749,25 @@ class TmuxSession:
         # Held under the REPL-control lock so a live /effort or /model
         # apply (which sends, settles, and may confirm a dialog) can't
         # interleave with this paste — two send paths into one pane.
-        async with self._repl_control_lock:
-            result = await self._tmux.paste_text(turn.prompt, enter=True)
+        while True:
+            async with self._repl_control_lock:
+                # An ordinary send can win the REPL lock after the scheduler's
+                # outer idle wait. Recheck under the shared lock so a scheduler
+                # paste never races behind newly queued steering input.
+                if (
+                    turn.scheduler_serialized
+                    and self._scheduler_pane_busy()
+                ):
+                    retry_scheduler_gate = True
+                else:
+                    retry_scheduler_gate = False
+                    turn.pane_delivery_started = True
+                    result = await self._tmux.paste_text(
+                        turn.prompt, enter=True
+                    )
+            if not retry_scheduler_gate:
+                break
+            await self._wait_for_scheduler_delivery_slot(turn)
         if not result.ok:
             # Send failed — no response will arrive. Re-arm turn_done
             # (back-compat) and unblock any wait_for_completion caller
@@ -6611,12 +6877,6 @@ class TmuxSession:
         # became the head — leave it alone (Murzik review point #1).
         if was_empty:
             self._head_started_at = time.time()
-
-        if (
-            turn.scheduler_delivery is not None
-            and not turn.scheduler_delivery.done()
-        ):
-            turn.scheduler_delivery.set_result(True)
 
         # Hint to the tailer that a turn is in flight — switches to the
         # active-poll cadence (200ms vs 2s) for low-latency response

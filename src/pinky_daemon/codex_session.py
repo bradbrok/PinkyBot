@@ -460,7 +460,7 @@ class CodexSession:
     async def send_scheduler_prompt(
         self, prompt: str
     ) -> asyncio.Future[bool]:
-        """Queue a scheduler prompt and confirm when its exec turn starts."""
+        """Queue a scheduler prompt and confirm transport acceptance."""
         receipt: asyncio.Future[bool] = (
             asyncio.get_running_loop().create_future()
         )
@@ -470,6 +470,14 @@ class CodexSession:
         if not queued and not receipt.done():
             receipt.set_result(False)
         return receipt
+
+    @staticmethod
+    def _resolve_scheduler_delivery(
+        receipt: asyncio.Future[bool] | None, accepted: bool
+    ) -> None:
+        """Resolve an exact-turn receipt once, unless its waiter timed out."""
+        if receipt is not None and not receipt.done():
+            receipt.set_result(accepted)
 
     async def _queue_external_message(
         self,
@@ -548,12 +556,19 @@ class CodexSession:
                     self._processing = True
                     self._current_turn_seq = self._stats["turns"] + 1
                     async with self._exec_lock:
-                        if (
-                            scheduler_delivery is not None
-                            and not scheduler_delivery.done()
-                        ):
-                            scheduler_delivery.set_result(True)
-                        result = await self._exec_codex(prompt)
+                        if scheduler_delivery is None:
+                            result = await self._exec_codex(prompt)
+                        else:
+                            result = await self._exec_codex(
+                                prompt,
+                                scheduler_delivery=scheduler_delivery,
+                            )
+                        # The real implementations resolve True at their
+                        # transport acceptance edge. A replacement/mock that
+                        # returns without doing so has provided no receipt.
+                        self._resolve_scheduler_delivery(
+                            scheduler_delivery, False
+                        )
 
                     # #591 P1#2 (Murzik round-2): fire the pending wake
                     # callback after exec confirms delivery. Only on
@@ -661,10 +676,16 @@ class CodexSession:
                     self._current_turn_seq = 0
 
                 except Exception as e:
+                    self._resolve_scheduler_delivery(
+                        scheduler_delivery, False
+                    )
                     self._current_turn_seq = 0
                     self._stats["errors"] += 1
                     _log(f"codex[{self.agent_name}]: exec error: {e}")
                 finally:
+                    self._resolve_scheduler_delivery(
+                        scheduler_delivery, False
+                    )
                     self._processing = False
 
         except asyncio.CancelledError:
@@ -850,13 +871,22 @@ class CodexSession:
         cmd.append("-")
         return cmd
 
-    async def _exec_codex(self, prompt: str) -> CodexTurnResult:
+    async def _exec_codex(
+        self,
+        prompt: str,
+        *,
+        scheduler_delivery: asyncio.Future[bool] | None = None,
+    ) -> CodexTurnResult:
         """Run a single codex exec invocation and parse JSONL output.
 
         Streams stdout line-by-line for real-time activity tracking.
         """
         if self._use_app_server:
-            return await self._exec_codex_app_server(prompt)
+            if scheduler_delivery is None:
+                return await self._exec_codex_app_server(prompt)
+            return await self._exec_codex_app_server(
+                prompt, scheduler_delivery=scheduler_delivery
+            )
 
         result = CodexTurnResult()
 
@@ -901,6 +931,10 @@ class CodexSession:
             await proc.stdin.drain()
             proc.stdin.close()
             await proc.stdin.wait_closed()
+            # The exact prompt has crossed the exec transport boundary.
+            # Merely acquiring _exec_lock or spawning the process is not a
+            # receipt: stdin write+drain+EOF is the first observed acceptance.
+            self._resolve_scheduler_delivery(scheduler_delivery, True)
 
             # Stream stdout line-by-line for real-time activity tracking.
             # Defensive: skip-and-continue on a single oversized line rather
@@ -996,6 +1030,9 @@ class CodexSession:
                 except Exception:
                     pass
         finally:
+            # Spawn/write/protocol failures before the acceptance edge are
+            # terminal negative receipts.
+            self._resolve_scheduler_delivery(scheduler_delivery, False)
             self._current_proc = None
             if stderr_task is not None and not stderr_task.done():
                 stderr_task.cancel()
@@ -1105,7 +1142,12 @@ class CodexSession:
             return effort
         return None
 
-    async def _exec_codex_app_server(self, prompt: str) -> CodexTurnResult:
+    async def _exec_codex_app_server(
+        self,
+        prompt: str,
+        *,
+        scheduler_delivery: asyncio.Future[bool] | None = None,
+    ) -> CodexTurnResult:
         """Run a single turn over the long-lived app-server connection."""
         result = CodexTurnResult()
         try:
@@ -1124,6 +1166,7 @@ class CodexSession:
                 "session_id": self.id, "error": str(e),
             })
             await self._terminalize_dead("app-server connect failed")
+            self._resolve_scheduler_delivery(scheduler_delivery, False)
             return result
 
         client = self._app_client
@@ -1183,6 +1226,9 @@ class CodexSession:
             if effort:
                 turn_params["effort"] = effort
             await client.request("turn/start", turn_params)
+            # Successful turn/start response is the app-server's exact prompt
+            # acceptance edge. Thread start/resume alone is not sufficient.
+            self._resolve_scheduler_delivery(scheduler_delivery, True)
 
             # turn/start returns immediately; notifications drive the turn.
             # _on_appserver_notification resolves _turn_done on turn/completed.
@@ -1225,6 +1271,7 @@ class CodexSession:
             await self._teardown_app_server()
             await self._terminalize_dead("app-server turn exception")
         finally:
+            self._resolve_scheduler_delivery(scheduler_delivery, False)
             self._active_turn_result = None
             self._turn_done = None
 
