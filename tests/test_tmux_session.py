@@ -3635,6 +3635,90 @@ async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("steering_starts_before_stop", [True, False])
+async def test_second_scheduler_prompt_delivers_after_first_receipt_and_stop(
+    steering_starts_before_stop: bool,
+) -> None:
+    """Midturn native-queue steering must not starve the next scheduler turn."""
+    live = {"status": "idle", "last_updated": _time.time()}
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: live
+    ss._worker_task = asyncio.create_task(ss._message_worker())
+    second_receipt: asyncio.Future[bool] | None = None
+    try:
+        first_receipt = await ss.send_scheduler_prompt("first scheduled")
+        for _ in range(100):
+            if tmux.paste_text.await_count == 1:
+                break
+            await asyncio.sleep(0.01)
+        tmux.paste_text.assert_awaited_once_with(
+            "first scheduled", enter=True
+        )
+
+        ss._on_transcript_entry({
+            "type": "user",
+            "message": {"role": "user", "content": "first scheduled"},
+        })
+        assert await first_receipt is True
+
+        # Faithfully model Claude Code's native queue: steering can be pasted
+        # while the scheduled turn is active. It may coalesce into that model
+        # turn (the live #939 shape) or remain queued across its final Stop.
+        assert await ss.send("ordinary steering") is True
+        for _ in range(100):
+            if tmux.paste_text.await_count == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert tmux.paste_text.await_args_list[-1].args == (
+            "ordinary steering",
+        )
+        if steering_starts_before_stop:
+            ss._on_transcript_entry({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "ordinary steering",
+                },
+            })
+
+        live.update(status="idle", last_updated=_time.time())
+        await ss._handle_turn_complete(
+            TurnResponse(text="first complete", stop_reason="end_turn")
+        )
+
+        second_receipt = await ss.send_scheduler_prompt("second scheduled")
+        for _ in range(100):
+            if tmux.paste_text.await_count == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert tmux.paste_text.await_count == 3
+        assert tmux.paste_text.await_args_list[-1].args == (
+            "second scheduled",
+        )
+
+        if not steering_starts_before_stop:
+            # The pre-existing native-queue turn starts first. Exact prompt
+            # matching must not misattribute it as the scheduler receipt.
+            ss._on_transcript_entry({
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "ordinary steering",
+                },
+            })
+            assert not second_receipt.done()
+        ss._on_transcript_entry({
+            "type": "user",
+            "message": {"role": "user", "content": "second scheduled"},
+        })
+        assert await second_receipt is True
+    finally:
+        if second_receipt is not None and not second_receipt.done():
+            second_receipt.cancel()
+        await ss.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_scheduler_idle_wait_does_not_block_ordinary_midturn_send() -> None:
     """A waiting scheduler turn never owns the ordinary worker head-of-line."""
     live = {"status": "working", "last_updated": _time.time()}
@@ -3656,6 +3740,25 @@ async def test_scheduler_idle_wait_does_not_block_ordinary_midturn_send() -> Non
     assert not receipt.done()
     receipt.cancel()
     await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_gate_rejects_idle_older_than_local_pane_paste() -> None:
+    """Stale idle evidence never overrides genuinely in-flight pane work."""
+    live = {"status": "idle", "last_updated": _time.time()}
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: live
+    _seed_inflight(ss, prompt="still active")
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    try:
+        await asyncio.sleep(0.02)
+
+        tmux.paste_text.assert_not_awaited()
+        assert not receipt.done()
+    finally:
+        receipt.cancel()
+        await ss.disconnect()
 
 
 @pytest.mark.asyncio
