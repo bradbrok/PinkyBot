@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 import pytest
 from fastapi.testclient import TestClient
@@ -220,6 +223,81 @@ class TestAgentComms:
         assert d["to"] == "bob"
         assert d["type"] == "direct"
         assert d["read"] is False
+
+
+class TestAgentCommsConcurrency:
+    def test_point_read_hammer_uses_thread_local_connections(self, tmp_path):
+        comms = AgentComms(db_path=str(tmp_path / "agent-comms.db"))
+        worker_count = 12
+        rounds = 25
+        point_reads_per_round = 8
+        start = threading.Barrier(worker_count)
+        seed = comms.send(
+            "seed-sender",
+            "shared-recipient",
+            "Shared point-read seed",
+            metadata={"kind": "shared-seed"},
+        )
+
+        def hammer(worker_index):
+            point_reads = 0
+            snapshots = []
+            try:
+                start.wait(timeout=10)
+                connection_id = id(comms._conn)
+                sender = f"worker-{worker_index}"
+                for round_index in range(rounds):
+                    marker = f"{worker_index}-{round_index}"
+                    created = comms.send(
+                        sender,
+                        "shared-recipient",
+                        f"Hammer message {marker}",
+                        metadata={"marker": marker},
+                    )
+                    own_thread = comms.get_thread(created.id)
+                    assert own_thread[0].id == created.id
+                    assert own_thread[0].metadata == {"marker": marker}
+                    for _ in range(point_reads_per_round):
+                        shared_thread = comms.get_thread(seed.id)
+                        assert shared_thread[0].content == "Shared point-read seed"
+                        assert shared_thread[0].metadata == {"kind": "shared-seed"}
+                        point_reads += 1
+                    snapshots.append(
+                        (created.to_dict(), own_thread[0].to_dict())
+                    )
+                return connection_id, snapshots, point_reads, None
+            except Exception as exc:
+                return None, snapshots, point_reads, exc
+            finally:
+                comms.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(hammer, range(worker_count)))
+
+            errors = [error for _, _, _, error in results if error is not None]
+            database_errors = [
+                error
+                for error in errors
+                if isinstance(error, sqlite3.DatabaseError)
+                or "malformed" in str(error).lower()
+            ]
+            assert database_errors == []
+            assert errors == []
+
+            connection_ids = [connection_id for connection_id, _, _, _ in results]
+            assert len(set(connection_ids)) == worker_count
+            assert sum(point_reads for _, _, point_reads, _ in results) == (
+                worker_count * rounds * point_reads_per_round
+            )
+            assert all(len(snapshots) == rounds for _, snapshots, _, _ in results)
+            messages, total = comms.get_all_messages(
+                limit=worker_count * rounds + 1
+            )
+            assert total == worker_count * rounds + 1
+            assert len(messages) == total
+        finally:
+            comms.close()
 
 
 class TestAgentCommsAPI:

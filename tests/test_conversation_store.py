@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import tempfile
+import threading
+from concurrent.futures import ThreadPoolExecutor
 
 from fastapi.testclient import TestClient
 
@@ -219,6 +222,79 @@ class TestConversationStore:
         d = cs.to_dict()
         assert d["session_id"] == "s1"
         assert d["message_count"] == 5
+
+
+class TestConversationStoreConcurrency:
+    def test_point_read_hammer_uses_thread_local_connections(self, tmp_path):
+        store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+        worker_count = 12
+        rounds = 25
+        point_reads_per_round = 8
+        start = threading.Barrier(worker_count)
+        store.append(
+            "shared-session",
+            "user",
+            "Shared point-read seed",
+            metadata={"kind": "shared-seed"},
+        )
+
+        def hammer(worker_index):
+            point_reads = 0
+            snapshots = []
+            try:
+                start.wait(timeout=10)
+                connection_id = id(store._conn)
+                session_id = f"worker-{worker_index}"
+                for round_index in range(rounds):
+                    marker = f"{worker_index}-{round_index}"
+                    created = store.append(
+                        session_id,
+                        "assistant",
+                        f"Hammer message {marker}",
+                        metadata={"marker": marker},
+                    )
+                    own = store.get_history(session_id, limit=1)
+                    assert own[0].id == created.id
+                    assert own[0].metadata == {"marker": marker}
+                    for _ in range(point_reads_per_round):
+                        shared = store.get_history("shared-session", limit=1)
+                        assert shared[0].content == "Shared point-read seed"
+                        assert shared[0].metadata == {"kind": "shared-seed"}
+                        point_reads += 1
+                    snapshots.append((created.to_dict(), own[0].to_dict()))
+                return connection_id, snapshots, point_reads, None
+            except Exception as exc:
+                return None, snapshots, point_reads, exc
+            finally:
+                store.close()
+
+        try:
+            with ThreadPoolExecutor(max_workers=worker_count) as executor:
+                results = list(executor.map(hammer, range(worker_count)))
+
+            errors = [error for _, _, _, error in results if error is not None]
+            database_errors = [
+                error
+                for error in errors
+                if isinstance(error, sqlite3.DatabaseError)
+                or "malformed" in str(error).lower()
+            ]
+            assert database_errors == []
+            assert errors == []
+
+            connection_ids = [connection_id for connection_id, _, _, _ in results]
+            assert len(set(connection_ids)) == worker_count
+            assert sum(point_reads for _, _, point_reads, _ in results) == (
+                worker_count * rounds * point_reads_per_round
+            )
+            assert all(len(snapshots) == rounds for _, snapshots, _, _ in results)
+            assert store.count() == worker_count * rounds + 1
+            assert all(
+                store.count(f"worker-{index}") == rounds
+                for index in range(worker_count)
+            )
+        finally:
+            store.close()
 
 
 class TestConversationAPI:
