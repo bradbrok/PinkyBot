@@ -17,6 +17,7 @@ from __future__ import annotations
 import json
 import sqlite3
 import sys
+import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -184,10 +185,20 @@ class TaskStore:
 
     def __init__(self, db_path: str = "data/tasks.db") -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA foreign_keys=ON")
+        self._db_path = db_path
+        self._thread_local = threading.local()
         self._init_tables()
+
+    @property
+    def _db(self) -> sqlite3.Connection:
+        """Return the calling thread's connection, creating it on first use."""
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is None:
+            connection = sqlite3.connect(self._db_path)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA foreign_keys=ON")
+            self._thread_local.connection = connection
+        return connection
 
     def _init_tables(self) -> None:
         self._db.executescript("""
@@ -888,4 +899,12 @@ class TaskStore:
         return cursor.rowcount > 0
 
     def close(self) -> None:
-        self._db.close()
+        """Close the calling thread's connection, if it has opened one.
+
+        Connections opened by other threads belong to their thread-local state
+        and are released when those threads exit.
+        """
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is not None:
+            connection.close()
+            del self._thread_local.connection
