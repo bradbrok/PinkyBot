@@ -6402,8 +6402,7 @@ class TmuxSession:
     def _scheduler_pane_busy(self) -> bool:
         """Conservative busy verdict for safe scheduled-prompt injection."""
         if (
-            self._inflight_metas
-            or self._inflight_tool_calls
+            self._inflight_tool_calls
             or self._inflight_turn is not None
             or not self._message_queue.empty()
         ):
@@ -6418,11 +6417,28 @@ class TmuxSession:
         if live.get("status") != "idle":
             return True
         last_updated = live.get("last_updated")
-        return not (
+        if not (
             isinstance(last_updated, (int, float))
             and not isinstance(last_updated, bool)
             and last_updated > 0
-        )
+        ):
+            return True
+
+        # Claude Code can consume several pane pastes in one native queued turn
+        # and emit one final Stop hook. That leaves extra routing metas even
+        # though the pane is explicitly idle. Trust that idle only when it was
+        # reported after every successful paste; an idle row older than any
+        # local inflight meta still fails closed.
+        for entry in self._inflight_metas:
+            dispatched_at = getattr(entry, "dispatched_at", None)
+            if not (
+                isinstance(dispatched_at, (int, float))
+                and not isinstance(dispatched_at, bool)
+                and dispatched_at > 0
+                and last_updated >= dispatched_at
+            ):
+                return True
+        return False
 
     @staticmethod
     def _transcript_user_text(entry: dict) -> str | None:
