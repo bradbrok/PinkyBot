@@ -63,34 +63,48 @@ _log_fh: logging.FileHandler | None = None
 
 # ── API keys for voice pipeline ──────────────────────────────────────────────
 
-# Read from the environment only — never a hardcoded fallback. The daemon loads
-# ~/.pinkybot/.env (gitignored) in __main__._load_dotenv() before importing
-# api.py, so a key placed there is visible here at module-import time.
-# Empty means the voice pipeline's STT step raises and is skipped; text chat is
-# unaffected.
-DEEPGRAM_API_KEY: str = os.getenv("DEEPGRAM_API_KEY", "")
+# Keys are read from the environment, never from a hardcoded fallback, and the
+# lookup is repeated at call time rather than trusted once at import. The daemon
+# normally loads ~/.pinkybot/.env (gitignored) in __main__._load_dotenv() before
+# importing api.py, but not every restart path goes through that, so each
+# resolver also reads the .env files directly as a fallback. Empty means the
+# corresponding voice step raises and is skipped; text chat is unaffected.
+
+_ENV_FILES = [
+    os.path.expanduser("~/projects/dnd-ai-master/.env"),
+    os.path.expanduser("~/.pinkybot/.env"),
+]
 
 
-def _load_openai_key() -> str:
-    """Load OpenAI key from env or fallback env files."""
-    key = os.getenv("OPENAI_API_KEY", "").strip()
+def _load_env_key(name: str) -> str:
+    """Resolve an API key from os.environ, falling back to reading the .env files."""
+    key = os.getenv(name, "").strip()
     if key:
         return key
-    for env_path in [
-        os.path.expanduser("~/projects/dnd-ai-master/.env"),
-        os.path.expanduser("~/.pinkybot/.env"),
-    ]:
+    prefix = f"{name}="
+    for env_path in _ENV_FILES:
         try:
             with open(env_path) as _f:
                 for _line in _f:
                     _line = _line.strip()
-                    if _line.startswith("OPENAI_API_KEY="):
+                    if _line.startswith(prefix):
                         return _line.split("=", 1)[1].strip().strip("\"'")
         except OSError:
             pass
     return ""
 
 
+def _load_openai_key() -> str:
+    """Load OpenAI key from env or fallback env files."""
+    return _load_env_key("OPENAI_API_KEY")
+
+
+def _load_deepgram_key() -> str:
+    """Load Deepgram key from env or fallback env files."""
+    return _load_env_key("DEEPGRAM_API_KEY")
+
+
+DEEPGRAM_API_KEY: str = _load_deepgram_key()
 OPENAI_API_KEY: str = _load_openai_key()
 
 PROTOCOL_VERSION = 4
@@ -388,7 +402,8 @@ async def _stt_deepgram(audio_data: bytes, language: str = "it") -> str:
     Audio is wrapped in WAV so Deepgram can auto-detect PCM format from header.
     The OpenClaw gateway-relay sends raw linear16 PCM at 16000 Hz, mono.
     """
-    if not DEEPGRAM_API_KEY:
+    key = DEEPGRAM_API_KEY or _load_deepgram_key()
+    if not key:
         raise RuntimeError("DEEPGRAM_API_KEY not configured")
     # WAV container: Deepgram reads sample_rate/encoding from the RIFF header.
     # Do NOT include encoding/sample_rate/channels in the URL when sending WAV —
@@ -399,7 +414,7 @@ async def _stt_deepgram(audio_data: bytes, language: str = "it") -> str:
         f"?model=nova-3&language={language}&smart_format=true&punctuate=true"
     )
     headers = {
-        "Authorization": f"Token {DEEPGRAM_API_KEY}",
+        "Authorization": f"Token {key}",
         "Content-Type": "audio/wav",
     }
     wav_data = _pcm_to_wav(audio_data)
