@@ -1315,7 +1315,7 @@ def _write_mcp_json(
             # silently falls back to the NoOp embedder (embedded: false).
             try:
                 openai_key = agent_registry.get_setting("OPENAI_API_KEY")
-                if openai_key:
+                if isinstance(openai_key, str) and openai_key:
                     stdio_env["OPENAI_API_KEY"] = openai_key
             except Exception:
                 pass
@@ -4393,6 +4393,10 @@ def create_api(
         "/auth/setup",
         "/favicon.svg",
         "/icons.svg",
+        # OpenClaw device WebSocket — external Android client connects here;
+        # auth is handled inside the WS handshake, not via session cookie.
+        "/openclaw/ws",
+        "/gateway/ws",
     }
     _public_prefixes = (
         "/assets/", "/static/", "/p/", "/hooks/",
@@ -4482,6 +4486,12 @@ def create_api(
         "/soul-templates", # soul template registry
         "/sprints",        # sprint management
         "/triggers",       # webhook/url trigger management
+        # OpenClaw/AIena/leads endpoints (commit 361e6dc) — agent/admin callers
+        # authenticate via internal auth headers or session cookie. The WS paths
+        # (/openclaw/ws, /gateway/ws) are carved out as public_exact above.
+        "/openclaw/",      # /openclaw/device (agent→device REST invoke)
+        "/api/aiena/",     # /api/aiena/approve-article (AIena admin action)
+        "/api/leads/",     # /api/leads/promote (lead promotion)
     )
 
     # Single source of truth for the auth gate's route classification. Exposed
