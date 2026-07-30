@@ -134,9 +134,10 @@ class TestSkillStoreConcurrency:
                 start.wait(timeout=10)
                 connection = store._db
                 connection_id = id(connection)
+                # Rollback (TRUNCATE), never WAL — see #797/#220.
                 assert connection.execute(
                     "PRAGMA journal_mode"
-                ).fetchone()[0].lower() == "wal"
+                ).fetchone()[0].lower() == "truncate"
                 assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
                 for round_index in range(rounds):
                     marker = f"{worker_index}-{round_index}"
