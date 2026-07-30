@@ -1307,6 +1307,20 @@ def _write_mcp_json(
             db_path = getattr(agent_registry, "_db_path", "")
             if isinstance(db_path, str) and db_path:
                 stdio_env["PINKY_AGENTS_DB"] = db_path
+            # Memory embeddings: the pinky-memory stdio subprocess only reads
+            # OPENAI_API_KEY from its own environment (embeddings.py resolves
+            # api_key arg -> os.environ, and build_embedding_client() is called
+            # without an api_key in pinky_memory/__main__.py), so without this
+            # the key saved via set_setting() never reaches it and reflect()
+            # silently falls back to the NoOp embedder (embedded: false).
+            try:
+                openai_key = agent_registry.get_setting("OPENAI_API_KEY")
+                if openai_key:
+                    stdio_env["OPENAI_API_KEY"] = openai_key
+            except Exception:
+                pass
+        if stdio_env:
+            mcp_config["mcpServers"]["pinky-memory"]["env"] = dict(stdio_env)
 
         # Pinky-self: heartbeat_ack, schedules, self-management
         tool_gates = _get_agent_tool_gates(agent_name, skill_store)
