@@ -1113,6 +1113,33 @@ async def test_paste_text_waits_enter_delay_between_paste_and_enter() -> None:
     assert 0.25 in sleep_durations
 
 
+def test_adaptive_paste_enter_delay_scales_and_is_bounded() -> None:
+    """#953: a live 6,207-char wake must get materially more than 300ms."""
+    short = tmux_session._adaptive_paste_enter_delay_ms("hello")
+    live_size = tmux_session._adaptive_paste_enter_delay_ms("x" * 6_207)
+    huge = tmux_session._adaptive_paste_enter_delay_ms("x" * 100_000)
+
+    assert short >= 300
+    assert live_size > 1_500
+    assert live_size < huge
+    assert huge == tmux_session._PASTE_ENTER_MAX_DELAY_MS == 2_000
+
+
+@pytest.mark.asyncio
+async def test_paste_text_default_uses_adaptive_delay(monkeypatch) -> None:
+    tmux = _TmuxControl("pinky-test")
+    tmux._run = AsyncMock(return_value=_ok())
+    sleep = AsyncMock()
+    monkeypatch.setattr(tmux_session.asyncio, "sleep", sleep)
+    prompt = "x" * 6_207
+
+    await tmux.paste_text(prompt)
+
+    sleep.assert_awaited_once_with(
+        tmux_session._adaptive_paste_enter_delay_ms(prompt) / 1000.0
+    )
+
+
 @pytest.mark.asyncio
 async def test_deliver_turn_uses_paste_text_not_send_keys() -> None:
     """The worker's per-turn delivery must go through paste_text (not
@@ -1139,10 +1166,11 @@ async def test_deliver_turn_uses_paste_text_not_send_keys() -> None:
     tmux.send_keys.assert_not_awaited()
 
 
-# Native ultracode activation delivery (#151). When armed, ``_deliver_turn``
-# types ``/effort ultracode`` via send_keys BEFORE the prompt's paste_text, on
-# the still-empty input area (no mid-session confirmation). One-shot +
-# best-effort: fires once, and a send failure still pastes the prompt.
+# Native ultracode activation delivery (#151). For a non-wake first turn,
+# ``_deliver_turn`` types ``/effort ultracode`` BEFORE paste_text on the empty
+# composer. #953 defers that slash command past receipt-verified wake turns;
+# those cases live in ``TestWakeSubmissionVerification`` below. One-shot +
+# best-effort: the non-wake path fires once and still pastes after send failure.
 # ──────────────────────────────────────────────────────────────────────────
 
 
@@ -1793,7 +1821,7 @@ async def test_force_restart_enqueues_resume_wake_prompt() -> None:
     # Pin a prior transcript so the launch records had_prior=True → RESUME.
     ss._has_prior_transcript = lambda: True
 
-    enqueued: list[tuple[str, bool]] = []
+    enqueued: list[tuple[str, bool, bool]] = []
 
     async def _record(
         prompt,
@@ -1803,8 +1831,9 @@ async def test_force_restart_enqueues_resume_wake_prompt() -> None:
         timeout_sec=None,
         front=False,
         on_delivered=None,
+        verify_submission=False,
     ):
-        enqueued.append((reason, front))
+        enqueued.append((reason, front, verify_submission))
         return None
 
     ss._enqueue_internal_prompt = _record
@@ -1818,6 +1847,7 @@ async def test_force_restart_enqueues_resume_wake_prompt() -> None:
     # Must front-enqueue so it leads any watchdog-replayed backlog
     # (Murzik #589). See test_force_restart_wake_prompt_leads_backlog.
     assert wake[0][1] is True, "force_restart wake prompt must be front-enqueued"
+    assert wake[0][2] is True, "wake prompt must require a submission receipt"
 
 
 @pytest.mark.asyncio
@@ -1840,6 +1870,7 @@ async def test_force_restart_skips_wake_prompt_under_test_seam() -> None:
         timeout_sec=None,
         front=False,
         on_delivered=None,
+        verify_submission=False,
     ):
         enqueued.append(reason)
         return None
@@ -9090,14 +9121,633 @@ class TestHandleStopFailure:
         assert not b_event.is_set()
 
 
+class TestWakeSubmissionVerification:
+    """Issue #953 — wake Enter is receipt-confirmed, never fire-and-forget."""
+
+    @pytest.mark.asyncio
+    async def test_verified_wake_enqueue_attaches_exact_receipt(self) -> None:
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+
+        await ss._enqueue_internal_prompt(
+            "wake body",
+            reason="wake_context_restart",
+            verify_submission=True,
+        )
+
+        turn = ss._message_queue.get_nowait()
+        assert turn.submission_receipt is not None
+        assert not turn.submission_receipt.done()
+
+    @pytest.mark.asyncio
+    async def test_initial_enter_requires_matching_transcript_receipt(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.2
+        )
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="wake prompt body",
+            internal=True,
+            reason="wake_context_restart",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+
+        task = asyncio.create_task(ss._deliver_turn(turn))
+        for _ in range(100):
+            if ss._inflight_metas:
+                break
+            await asyncio.sleep(0.001)
+
+        assert len(ss._inflight_metas) == 1
+        assert fires == [], "paste success alone must not claim wake delivery"
+        ss._on_transcript_entry(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "wake prompt body"},
+            }
+        )
+        await task
+
+        assert await receipt is True
+        assert fires == ["delivered"]
+        tmux.send_keys.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_queue_dequeue_is_an_exact_submission_receipt(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.2
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="wake queued by composer",
+            internal=True,
+            reason="wake_resume",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+
+        task = asyncio.create_task(ss._deliver_turn(turn))
+        for _ in range(100):
+            if ss._inflight_metas:
+                break
+            await asyncio.sleep(0.001)
+
+        ss._on_transcript_entry(
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": "wake queued by composer",
+            }
+        )
+        assert not receipt.done(), "enqueue alone is not turn-start proof"
+        ss._on_transcript_entry(
+            {"type": "queue-operation", "operation": "dequeue"}
+        )
+        await task
+
+        assert await receipt is True
+        assert fires == ["delivered"]
+
+    @pytest.mark.asyncio
+    async def test_missing_receipt_retries_enter_only_then_verifies(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.01
+        )
+        tmux = _make_mock_tmux()
+        tmux.capture_pane = AsyncMock(
+            return_value=TmuxCommandResult(
+                returncode=0,
+                stdout="> wake prompt body",
+                stderr="",
+            )
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="wake prompt body",
+            internal=True,
+            reason="wake_context_restart",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+
+        async def accept_on_retry(*_args, **_kwargs):
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "wake prompt body",
+                    },
+                }
+            )
+            return _ok()
+
+        tmux.send_keys = AsyncMock(side_effect=accept_on_retry)
+        await ss._deliver_turn(turn)
+
+        tmux.paste_text.assert_awaited_once_with("wake prompt body", enter=True)
+        tmux.send_keys.assert_awaited_once_with("", enter=True)
+        assert await receipt is True
+        assert fires == ["delivered"]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_user_row_is_not_a_submission_receipt(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.02
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="exact wake prompt",
+            internal=True,
+            reason="wake_resume",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+
+        task = asyncio.create_task(ss._deliver_turn(turn))
+        for _ in range(100):
+            if ss._inflight_metas:
+                break
+            await asyncio.sleep(0.001)
+        ss._on_transcript_entry(
+            {
+                "type": "user",
+                "message": {"role": "user", "content": "unrelated turn"},
+            }
+        )
+
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            await task
+        assert await receipt is False
+        assert fires == []
+        assert len(ss._inflight_metas) == 0
+
+    @pytest.mark.asyncio
+    async def test_receipt_during_final_pane_probe_wins_timeout(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="boundary wake prompt",
+            internal=True,
+            reason="wake_resume",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+
+        async def receipt_during_probe(*_args, **_kwargs):
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "boundary wake prompt",
+                    },
+                }
+            )
+            return TmuxCommandResult(
+                returncode=0,
+                stdout="prompt already left composer",
+                stderr="",
+            )
+
+        tmux.capture_pane = AsyncMock(side_effect=receipt_during_probe)
+        await ss._deliver_turn(turn)
+
+        assert await receipt is True
+        assert fires == ["delivered"]
+        tmux.send_keys.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_exhausted_enter_retries_fail_closed_without_repaste(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        tmux.capture_pane = AsyncMock(
+            return_value=TmuxCommandResult(
+                returncode=0,
+                stdout="> exact wake prompt parked",
+                stderr="",
+            )
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="exact wake prompt parked",
+            internal=True,
+            reason="wake_new_session",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+
+        with pytest.raises(RuntimeError, match="bounded Enter retries"):
+            await ss._deliver_turn(turn)
+
+        assert tmux.paste_text.await_count == 1, "never re-paste the wake"
+        assert tmux.send_keys.await_count == 2, "exactly 2 Enter-only retries"
+        assert all(call.args == ("",) for call in tmux.send_keys.await_args_list)
+        assert await receipt is False
+        assert fires == []
+        assert len(ss._inflight_metas) == 0
+        assert ss._turn_done.is_set()
+
+        # Model the worker-clear gap: a terminal-False wake must not rematch
+        # its now-late exact user row and resurrect phantom FIFO metadata.
+        ss._inflight_turn = turn
+        ss._on_transcript_entry(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "exact wake prompt parked",
+                },
+            }
+        )
+        assert turn.transport_accepted is False
+        assert len(ss._inflight_metas) == 0
+
+    @pytest.mark.asyncio
+    async def test_fast_user_and_stop_rows_cannot_outrun_inflight_meta(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.2
+        )
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="very fast wake",
+            internal=True,
+            reason="wake_resume",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+        # Production's worker registers this in-hand identity before calling
+        # _deliver_turn. Make paste_text yield the entire transcript turn
+        # before its coroutine returns — the adversarial scheduling order.
+        ss._inflight_turn = turn
+
+        async def instant_turn(*_args, **_kwargs):
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "very fast wake",
+                    },
+                }
+            )
+            await ss._handle_turn_complete(_turn_response(text="done"))
+            return _ok()
+
+        tmux.paste_text = AsyncMock(side_effect=instant_turn)
+
+        await ss._deliver_turn(turn)
+
+        assert len(ss._inflight_metas) == 0
+        assert await receipt is True
+        assert fires == ["delivered"]
+        assert ss._turn_done.is_set()
+
+    @pytest.mark.asyncio
+    async def test_worker_timeout_landed_wake_still_requires_receipt(
+        self, monkeypatch,
+    ) -> None:
+        """The worker's landed-timeout guard must not bypass #953."""
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.2
+        )
+        tmux = _make_mock_tmux()
+        tmux.paste_text = AsyncMock(
+            side_effect=asyncio.TimeoutError("final Enter timed out")
+        )
+        tmux.capture_pane = AsyncMock(
+            return_value=TmuxCommandResult(
+                returncode=0,
+                stdout="> landed wake prompt body",
+                stderr="",
+            )
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="landed wake prompt body",
+            internal=True,
+            reason="wake_context_restart",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+        ss._message_queue.put_nowait(turn)
+
+        worker = asyncio.create_task(ss._message_worker())
+        try:
+            for _ in range(100):
+                if ss._inflight_metas:
+                    break
+                await asyncio.sleep(0.001)
+
+            assert ss._inflight_turn is turn
+            assert ss._stats["turns"] == 0
+            assert fires == []
+            tmux.send_keys.assert_not_awaited()
+
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "landed wake prompt body",
+                    },
+                }
+            )
+            for _ in range(100):
+                if ss._inflight_turn is None:
+                    break
+                await asyncio.sleep(0.001)
+        finally:
+            worker.cancel()
+            await worker
+
+        assert await receipt is True
+        assert fires == ["delivered"]
+        assert ss._stats["turns"] == 1
+        assert tmux.paste_text.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_worker_timeout_after_suspended_paste_honors_exact_receipt(
+        self,
+    ) -> None:
+        """Acceptance during paste_text reserves meta and forbids retry paste."""
+        tmux = _make_mock_tmux()
+        paste_suspended = asyncio.Event()
+        release_timeout = asyncio.Event()
+
+        async def timeout_after_receipt(*_args, **_kwargs):
+            paste_suspended.set()
+            await release_timeout.wait()
+            raise asyncio.TimeoutError(
+                "final Enter timed out after acceptance"
+            )
+
+        tmux.paste_text = AsyncMock(side_effect=timeout_after_receipt)
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="receipt while paste is suspended",
+            internal=True,
+            reason="wake_context_restart",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+        ss._message_queue.put_nowait(turn)
+
+        worker = asyncio.create_task(ss._message_worker())
+        try:
+            await asyncio.wait_for(paste_suspended.wait(), timeout=1)
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "receipt while paste is suspended",
+                    },
+                }
+            )
+            assert len(ss._inflight_metas) == 1
+            release_timeout.set()
+            for _ in range(100):
+                if ss._inflight_turn is None:
+                    break
+                await asyncio.sleep(0.001)
+        finally:
+            worker.cancel()
+            await worker
+
+        assert await receipt is True
+        assert fires == ["delivered"]
+        assert ss._stats["turns"] == 1
+        assert tmux.paste_text.await_count == 1
+        tmux.capture_pane.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_worker_wake_timeout_enters_one_way_no_repaste_verifier(
+        self, monkeypatch,
+    ) -> None:
+        """An exact row during retry set-buffer can never cause paste two."""
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.1
+        )
+        monkeypatch.setattr(
+            tmux_session, "_TRANSIENT_RETRY_BACKOFF_SEC", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_adaptive_paste_enter_delay_ms", lambda _text: 0
+        )
+        tmux = _TmuxControl("pinky-test")
+        set_buffers = 0
+        pane_pastes = 0
+        first_enter_timed_out = asyncio.Event()
+
+        async def run_command(*args, **_kwargs):
+            nonlocal set_buffers, pane_pastes
+            command = args[0]
+            if command == "set-buffer":
+                set_buffers += 1
+                if set_buffers == 2:
+                    # Reproduce the rejected-head TOCTOU: retry passed its
+                    # last receipt check, then yielded inside set-buffer.
+                    await asyncio.sleep(0.02)
+                return _ok()
+            if command == "paste-buffer":
+                pane_pastes += 1
+                return _ok()
+            if command == "send-keys":
+                first_enter_timed_out.set()
+                raise asyncio.TimeoutError("initial Enter timed out")
+            if command == "capture-pane":
+                return TmuxCommandResult(
+                    returncode=0,
+                    stdout="negative pane snapshot",
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected tmux command: {args!r}")
+
+        tmux._run = AsyncMock(side_effect=run_command)
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="receipt lands during forbidden retry set-buffer",
+            internal=True,
+            reason="wake_context_restart",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+        ss._message_queue.put_nowait(turn)
+
+        async def inject_exact_receipt() -> None:
+            await first_enter_timed_out.wait()
+            # On rejected a11de3cd, worker pane-probe/backoff reaches the
+            # second set-buffer before this row. The set-buffer then resumes
+            # and executes a duplicate paste-buffer despite receipt=True.
+            await asyncio.sleep(0.01)
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": (
+                            "receipt lands during forbidden retry set-buffer"
+                        ),
+                    },
+                }
+            )
+
+        worker = asyncio.create_task(ss._message_worker())
+        injector = asyncio.create_task(inject_exact_receipt())
+        try:
+            await asyncio.wait_for(injector, timeout=1)
+            for _ in range(200):
+                if ss._inflight_turn is None and fires:
+                    break
+                await asyncio.sleep(0.001)
+        finally:
+            worker.cancel()
+            await worker
+
+        assert await receipt is True
+        assert fires == ["delivered"]
+        assert ss._stats["turns"] == 1
+        assert set_buffers == 1, "verified wake must never enter retry paste"
+        assert pane_pastes == 1, "accepted wake must remain pane_pastes=1"
+
+    @pytest.mark.asyncio
+    async def test_unverified_wake_does_not_type_deferred_effort(
+        self, monkeypatch,
+    ) -> None:
+        """Never send /effort into the resistant composer after failure."""
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        tmux = _make_mock_tmux()
+        tmux.paste_text = AsyncMock(
+            side_effect=asyncio.TimeoutError("final Enter timed out")
+        )
+        tmux.capture_pane = AsyncMock(
+            return_value=TmuxCommandResult(
+                returncode=0,
+                stdout="> parked wake prompt body",
+                stderr="",
+            )
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._native_ultracode_pending = True
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        ss._message_queue.put_nowait(
+            _QueuedTurn(
+                prompt="parked wake prompt body",
+                internal=True,
+                reason="wake_new_session",
+                submission_receipt=receipt,
+            )
+        )
+
+        worker = asyncio.create_task(ss._message_worker())
+        try:
+            for _ in range(200):
+                if receipt.done() and ss._inflight_turn is None:
+                    break
+                await asyncio.sleep(0.001)
+            await asyncio.sleep(0)
+        finally:
+            worker.cancel()
+            await worker
+
+        assert await receipt is False
+        assert tmux.paste_text.await_count == 1
+        tmux.send_keys.assert_not_awaited()
+        assert ss._stats["turns"] == 0
+        assert ss._stats["errors"] == 1
+        assert ss._pending_live_effort == "ultracode"
+
+    @pytest.mark.asyncio
+    async def test_native_effort_is_deferred_past_wake_prompt(self) -> None:
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._native_ultracode_pending = True
+        ss._session_ready_event.set()
+        turn = _QueuedTurn(
+            prompt="large wake body",
+            internal=True,
+            reason="wake_context_restart",
+        )
+
+        await ss._deliver_turn(turn)
+
+        tmux.send_keys.assert_not_awaited()
+        tmux.paste_text.assert_awaited_once_with("large wake body", enter=True)
+        assert ss._pending_live_effort == "ultracode"
+        assert ss._native_ultracode_pending is False
+
+
 @pytest.mark.asyncio
-async def test_deliver_turn_fires_on_delivered_after_paste_success() -> None:
-    """#591 P1#2 (Murzik round-2): for wake turns, the
-    ``on_delivered`` callback (carried on the _QueuedTurn) must fire
-    AFTER paste_text succeeds — not at enqueue time. This pins the
-    "boundary advances on confirmed delivery" invariant; enqueue-time
-    fire would let context-lock deferrals or stuck pastes advance
-    the #591 cycle-gate against a wake that never reached the model.
+async def test_nonverified_turn_fires_on_delivered_after_paste_success() -> None:
+    """#591 compatibility: turns without a receipt retain old semantics.
+
+    Production wakes now carry ``submission_receipt`` and are covered by
+    ``TestWakeSubmissionVerification``. This pins the callback contract for
+    legacy/direct internal turns and external callers that do not opt in.
     """
     tmux = _make_mock_tmux()
     tmux.paste_text = AsyncMock(return_value=_ok())
@@ -9430,6 +10080,7 @@ async def test_attempt_reconnect_enqueues_resume_wake_prompt() -> None:
         timeout_sec=None,
         front=False,
         on_delivered=None,
+        verify_submission=False,
     ):
         enqueued.append((reason, front))
         return None
