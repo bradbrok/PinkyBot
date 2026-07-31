@@ -199,6 +199,27 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+_STATUS_HOOK_RECEIPT_LOG_INTERVAL_SEC = 60.0
+
+
+def _read_persisted_agent_working_status(
+    registry: AgentRegistry, agent_name: str,
+) -> dict | None:
+    """Read the hook-written working status directly from SQLite.
+
+    The inflight watchdog calls this at verdict time.  Do not substitute the
+    process-local live-status map here: that map was observed fossilized while
+    the committed hook-written agent record remained current (#943).
+    """
+    agent = registry.get(agent_name)
+    if agent is None:
+        return None
+    return {
+        "status": agent.working_status or "idle",
+        "last_updated": agent.working_status_updated_at,
+    }
+
+
 class _ResponseSentHandoffMiddleware:
     """Run a registered handoff only after the outer response send returns.
 
@@ -1702,6 +1723,7 @@ def create_api(
     # In-memory live status for agents (updated by POST /agents/{name}/status).
     # Keys are agent names; values are dicts with status/tool_name/detail/last_updated.
     _agent_live_status: dict[str, dict] = {}
+    _agent_status_receipt_logged_at: dict[str, float] = {}
 
     # Per-agent cost milestone tracking — set of already-fired thresholds (USD).
     _agent_cost_milestones: dict[str, set[float]] = {}
@@ -3653,7 +3675,12 @@ def create_api(
             wake_context_builder=_build_streaming_wake_context,
             on_wake_delivered=_log_agent_wake_event,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
-            live_status_fn=lambda _agent_name=agent_name: _agent_live_status.get(_agent_name),
+            # #943: verdict-time fresh read of the persisted field that the
+            # working/idle hooks update.  The in-memory map is non-authoritative
+            # and was observed fossilized while this record remained current.
+            live_status_fn=lambda _agent_name=agent_name: (
+                _read_persisted_agent_working_status(agents, _agent_name)
+            ),
             # #846 — expose watchdog_config.enabled to the tmux inflight
             # watchdog so it honors the same operator kill-switch the daemon
             # SessionWatchdog already respects. Deferred (called per watchdog
@@ -6363,12 +6390,24 @@ npm run build</pre>
         agents.set_working_status(name, db_status)
 
         # Update live in-memory status (fine-grained: thinking, tool_use, etc.)
+        receipt_at = time.time()
         _agent_live_status[name] = {
             "status": new_status,
             "tool_name": req.tool_name,
             "detail": req.detail,
-            "last_updated": time.time(),
+            "last_updated": receipt_at,
         }
+        last_receipt_log = _agent_status_receipt_logged_at.get(name, 0.0)
+        if (
+            last_receipt_log <= 0
+            or receipt_at - last_receipt_log
+            >= _STATUS_HOOK_RECEIPT_LOG_INTERVAL_SEC
+        ):
+            _log(
+                f"STATUS_HOOK_RECEIPT agent={name} "
+                f"status={new_status} received_at={receipt_at:.6f}"
+            )
+            _agent_status_receipt_logged_at[name] = receipt_at
 
         # Only log meaningful state transitions to activity (not every tool tick)
         if new_status in ("idle", "working", "offline"):

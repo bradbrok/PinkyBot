@@ -1366,6 +1366,10 @@ class TmuxSession:
         self._fresh_context_respawn_grace_until: float = 0.0
         self._fresh_context_respawn_epoch_seq: int = 0
         self._fresh_context_respawn_epoch: int = 0
+        # Daemon-clock lower bound for status evidence belonging to the
+        # currently-running tmux/Claude process.  Status evidence older than
+        # this launch is unknown, never restart proof.
+        self._current_session_started_at: float = 0.0
 
         # Issue #563 — "first transcript bind" tracking. Set to True in
         # ``_start_tailer`` after the tailer is constructed; consumed
@@ -2760,6 +2764,9 @@ class TmuxSession:
             # before the REPL launches. No-ops for local agents.
             await self._seed_container_trust(cwd)
             await self._seed_container_home_creds()
+            # Stamp before process creation so even an immediate current-
+            # session hook POST is correctly considered fresh.
+            session_started_at = time.time()
             result = await self._tmux.new_session(
                 cwd=cwd,
                 command=claude_cmd,
@@ -2770,6 +2777,7 @@ class TmuxSession:
                     f"tmux new-session failed: rc={result.returncode} "
                     f"stderr={result.stderr.strip()!r}"
                 )
+            self._current_session_started_at = session_started_at
 
         try:
             await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
@@ -5801,6 +5809,8 @@ class TmuxSession:
                             input, so the lingering meta(s) are phantom (a
                             paste with no matching stop_hook). Reconcile, don't
                             restart.
+          - ``"unknown"`` — live_status predates this tmux process and cannot
+                            prove either idle or wedged; veto restart.
           - ``"wedged"``  — aged out, transcript quiet, REPL not idle →
                             genuinely stuck; force_restart.
 
@@ -5849,6 +5859,14 @@ class TmuxSession:
                 live = fn()
             except Exception:
                 live = None
+        live_last_updated = live.get("last_updated") if live else None
+        if (
+            self._current_session_started_at > 0
+            and isinstance(live_last_updated, (int, float))
+            and not isinstance(live_last_updated, bool)
+            and live_last_updated < self._current_session_started_at
+        ):
+            return "unknown"
         if live and live.get("status") == "idle":
             last_updated = live.get("last_updated") or 0.0
             # Floor the idle-freshness check at when the current head was
@@ -5990,19 +6008,16 @@ class TmuxSession:
         window once it's the head — a queued turn doesn't get
         force_restarted for ageing while ANOTHER turn was running.
 
-        **Tail requeue on timeout** (Murzik review on PR #561).
-        When the head wedges, ONLY the head is abandoned — its
-        ``completion_event`` fires (signal of "definitively failed"),
-        but its prompt is NOT replayed. Tail entries (B, C, ... that
-        were already dispatched into Claude Code's native queue but
-        never got to run because A wedged) carry intact prompts +
-        completion_events; we requeue them at the FRONT of
-        ``_message_queue`` in FIFO order so the new worker (spawned
-        by force_restart's disconnect→connect cycle) re-dispatches
-        them after the restart. Their ``completion_event`` stays
-        UNSET so a ``wait_for_completion=True`` caller still waits
-        for the actual rerun, not for a phantom "completion" the
-        watchdog falsely signaled.
+        **Undelivered requeue on timeout** (#943, extending Murzik's PR #561
+        tail-requeue contract). A head with no transcript acceptance receipt
+        is replayed first: it was pasted but never observed reaching the REPL.
+        An accepted head is still abandoned to avoid duplicating partial,
+        potentially side-effecting work. Tail entries (B, C, ... already
+        dispatched into Claude Code's native queue but not yet run) carry
+        intact prompts + completion events; they are requeued at the FRONT of
+        ``_message_queue`` in FIFO order so the new worker re-dispatches them
+        after restart. Replayed completion events stay UNSET so a
+        ``wait_for_completion=True`` caller still waits for the actual rerun.
 
         Also covers the worker's in-hand-but-not-pasted turn (e.g.
         mid context-lock retry) — that turn's meta isn't in the deque
@@ -6105,6 +6120,38 @@ class TmuxSession:
                     log_watchdog_decision(
                         watchdog="inflight", agent=self.agent_name,
                         decision="reconcile", reason="idle_phantom",
+                        state=self.state.value, progress_stale_s=age,
+                        inflight_turns=depth, inflight_active=False,
+                    )
+                    continue
+                if verdict == "unknown":
+                    # #943: a process-local live-status reader can fossilize
+                    # across session recreation.  A value predating THIS tmux
+                    # process is not evidence that an idle/static pane is
+                    # wedged. Fail toward no-restart, extend the decision
+                    # window, and emit a distinctive release receipt once per
+                    # timeout window.
+                    self._head_started_at = now
+                    self._inflight_pane_ext_anchor = None
+                    live = None
+                    live_status_fn = getattr(self._config, "live_status_fn", None)
+                    if live_status_fn is not None:
+                        try:
+                            live = live_status_fn()
+                        except Exception:
+                            live = None
+                    _log(
+                        f"tmux[{self.agent_name}]: "
+                        f"WATCHDOG_STALE_LIVE_STATUS_VETO "
+                        f"live_last_updated="
+                        f"{live.get('last_updated') if live else None} "
+                        f"session_started_at={self._current_session_started_at} "
+                        f"— input unknown; NOT restarting "
+                        f"(deque depth={depth})"
+                    )
+                    log_watchdog_decision(
+                        watchdog="inflight", agent=self.agent_name,
+                        decision="skip", reason="stale_live_status_veto",
                         state=self.state.value, progress_stale_s=age,
                         inflight_turns=depth, inflight_active=False,
                     )
@@ -6278,6 +6325,38 @@ class TmuxSession:
                     return True
 
                 replay: list[_QueuedTurn] = []
+                # A head with no transcript queue-dequeue/user-row receipt was
+                # pasted but never observed as accepted by the REPL.  It is an
+                # undelivered item, not failed in-progress work: preserve it
+                # across force_restart ahead of the later tail/in-hand turns.
+                # Accepted heads retain the historical abandon behavior to
+                # avoid duplicating side effects after partial processing.
+                head_replayed = False
+                if not head.turn.transport_accepted and _consider_replay(
+                    head.turn, kind="unaccepted_head"
+                ):
+                    # A scheduler turn was originally pasted by its dedicated
+                    # out-of-band delivery task and remains listed only until
+                    # the transcript acceptance receipt resolves.  Detach it
+                    # before force_restart→disconnect so that teardown neither
+                    # resolves the still-valid receipt False nor treats this
+                    # preserved turn as an abandoned scheduler delivery.  The
+                    # ordinary replay worker keeps scheduler_serialized=True;
+                    # its slot check explicitly excludes that same in-hand
+                    # replay candidate, while still waiting behind earlier
+                    # work.
+                    if head.turn.scheduler_serialized:
+                        self._scheduler_pending_turns[:] = [
+                            pending
+                            for pending in self._scheduler_pending_turns
+                            if pending is not head.turn
+                        ]
+                    # Any enqueue/dequeue evidence belonged to the killed pane.
+                    # Re-arm exact matching for the replacement paste.
+                    head.turn.pane_delivery_started = False
+                    head.turn.pane_queue_enqueued = False
+                    replay.append(head.turn)
+                    head_replayed = True
                 tail_replayed = 0
                 for i, entry in enumerate(tail_entries):
                     if tail_cap and tail_replayed >= tail_cap:
@@ -6322,22 +6401,29 @@ class TmuxSession:
                         f"{len(replay)} turn(s) for replay after "
                         f"force_restart (tail={tail_replayed}/"
                         f"{len(tail_entries)}, "
+                        f"unaccepted_head={'yes' if head_replayed else 'no'}, "
                         f"in_hand={'yes' if in_hand else 'no'})"
                     )
 
-                # HEAD ONLY: fire its completion_event. Head was
-                # definitively abandoned (its prompt is NOT replayed —
-                # the wedge invalidated whatever progress it made).
+                # ACCEPTED HEAD ONLY: fire its completion_event. An unaccepted
+                # head is replayed with its event still unset; accepted work
+                # may have made partial side-effecting progress and remains
+                # definitively abandoned to avoid duplicate execution.
                 # Tail entries' events stay UNSET so wait_for_completion
                 # callers wait for the actual rerun, not the watchdog
                 # itself. Critical contract — Murzik review on PR #561.
                 if (
-                    head.completion_event is not None
+                    not head_replayed
+                    and head.completion_event is not None
                     and not head.completion_event.is_set()
                 ):
                     head.completion_event.set()
                 head_delivery = head.turn.scheduler_delivery
-                if head_delivery is not None and not head_delivery.done():
+                if (
+                    not head_replayed
+                    and head_delivery is not None
+                    and not head_delivery.done()
+                ):
                     head_delivery.set_result(False)
                 self._turn_done.set()
                 self._stats["errors"] += 1
@@ -6385,7 +6471,7 @@ class TmuxSession:
         if not turn.scheduler_serialized:
             return
 
-        while self._scheduler_pane_busy():
+        while self._scheduler_pane_busy(turn):
             if (
                 turn.scheduler_delivery is not None
                 and turn.scheduler_delivery.cancelled()
@@ -6399,12 +6485,31 @@ class TmuxSession:
         ):
             raise _SchedulerDeliveryCancelled
 
-    def _scheduler_pane_busy(self) -> bool:
-        """Conservative busy verdict for safe scheduled-prompt injection."""
+    def _scheduler_pane_busy(
+        self, candidate: _QueuedTurn | None = None
+    ) -> bool:
+        """Conservative busy verdict for safe scheduled-prompt injection.
+
+        ``candidate`` is normally delivered by an out-of-band scheduler task,
+        so ordinary in-hand/queued work remains ahead of it.  After #943
+        preserves an unaccepted scheduler head across force_restart, the
+        ordinary replay worker itself holds that candidate.  Exclude only that
+        identity (and queue items necessarily behind it) to avoid a self-wait;
+        all earlier pane work and live-idle evidence still gate the paste.
+        """
+        candidate_in_worker = (
+            candidate is not None and self._inflight_turn is candidate
+        )
         if (
             self._inflight_tool_calls
-            or self._inflight_turn is not None
-            or not self._message_queue.empty()
+            or (
+                self._inflight_turn is not None
+                and not candidate_in_worker
+            )
+            or (
+                not self._message_queue.empty()
+                and not candidate_in_worker
+            )
         ):
             return True
         live_status_fn = getattr(self._config, "live_status_fn", None)
@@ -6772,7 +6877,7 @@ class TmuxSession:
                 # paste never races behind newly queued steering input.
                 if (
                     turn.scheduler_serialized
-                    and self._scheduler_pane_busy()
+                    and self._scheduler_pane_busy(turn)
                 ):
                     retry_scheduler_gate = True
                 else:

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import os
 import tempfile
 import threading
@@ -330,6 +331,91 @@ class TestSigningKeys:
 
         assert (working.read_text(), idle.read_text()) == before
         assert (working.stat().st_mtime_ns, idle.stat().st_mtime_ns) == before_mtimes
+
+    def test_existing_settings_repair_missing_status_hook_entries(self, tmp_path):
+        """#943: a workspace can retain SessionStart while losing the
+        working/idle hooks. Every sync must restore both live-status writers."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "hooks": {
+                "SessionStart": [{
+                    "matcher": ".*",
+                    "hooks": [{"type": "command", "command": "echo retained"}],
+                }],
+            },
+        }))
+
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+
+        hooks = json.loads(settings_path.read_text())["hooks"]
+        working_path = str((claude_dir / "hook_working.py").resolve())
+        idle_path = str((claude_dir / "hook_idle.py").resolve())
+        pre_tool_commands = [
+            hook["command"]
+            for bucket in hooks["PreToolUse"]
+            for hook in bucket["hooks"]
+        ]
+        stop_commands = [
+            hook["command"]
+            for bucket in hooks["Stop"]
+            for hook in bucket["hooks"]
+        ]
+        assert sum(working_path in command for command in pre_tool_commands) == 1
+        assert sum(idle_path in command for command in stop_commands) == 1
+
+    def test_status_hook_failures_are_loud_and_stale_wrappers_upgrade(
+        self, tmp_path,
+    ):
+        """#943: managed status POST failures must reach logger/stderr, and an
+        existing 2>/dev/null wrapper must be upgraded rather than accepted."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        working_path = (claude_dir / "hook_working.py").resolve()
+        idle_path = (claude_dir / "hook_idle.py").resolve()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"python3 {working_path} 2>/dev/null || true",
+                    }],
+                }],
+                "Stop": [{
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": f"python3 {idle_path} 2>/dev/null || true",
+                    }],
+                }],
+            },
+        }))
+
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+
+        for path in (working_path, idle_path):
+            source = path.read_text()
+            compile(source, str(path), "exec")
+            assert "STATUS_HOOK_POST_FAILURE" in source
+            assert "STATUS_HOOK_SECRET_MISSING" in source
+            assert "os.O_CREAT | os.O_EXCL | os.O_WRONLY" in source
+            assert "os.getsid(0)" in source
+            assert '["logger", "-t", "pinkybot-status-hook", message]' in source
+            assert "print(message, file=sys.stderr, flush=True)" in source
+
+        hooks = json.loads(settings_path.read_text())["hooks"]
+        managed_commands = [
+            hook["command"]
+            for event in ("PreToolUse", "Stop")
+            for bucket in hooks[event]
+            for hook in bucket["hooks"]
+            if str(working_path) in hook["command"] or str(idle_path) in hook["command"]
+        ]
+        assert len(managed_commands) == 2
+        assert all("2>/dev/null" not in command for command in managed_commands)
 
     def test_backfill_skips_malformed_name_without_bricking(self, registry):
         # A legacy/non-conforming agent name must not brick boot: the per-row

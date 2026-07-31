@@ -173,6 +173,45 @@ class TestPostAgentStatus:
         assert resp.status_code == 200
         assert resp.json()["status"] == "working"
 
+    def test_status_receipt_log_is_distinctive_and_rate_limited_per_agent(
+        self, capsys,
+    ):
+        client = self._client_with_agent()
+        client.post("/agents/arty/status", json={"status": "working"})
+        client.post("/agents/arty/status", json={"status": "idle"})
+        client.post("/agents", json={"name": "beth", "model": "sonnet"})
+        client.post("/agents/beth/status", json={"status": "working"})
+
+        receipt_lines = [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if "STATUS_HOOK_RECEIPT" in line
+        ]
+        assert len(receipt_lines) == 2
+        assert any("agent=arty" in line for line in receipt_lines)
+        assert any("agent=beth" in line for line in receipt_lines)
+
+    def test_watchdog_reader_observes_hook_updates_across_registry_connections(
+        self,
+    ):
+        """#943: the watchdog source is SQLite, not a process-local snapshot."""
+        from pinky_daemon.agent_registry import AgentRegistry
+        from pinky_daemon.api import _read_persisted_agent_working_status
+
+        client = self._client_with_agent()
+        observer = AgentRegistry(db_path=self._db.replace(".db", "_agents.db"))
+        try:
+            client.post("/agents/arty/status", json={"status": "working"})
+            working = _read_persisted_agent_working_status(observer, "arty")
+            client.post("/agents/arty/status", json={"status": "idle"})
+            idle = _read_persisted_agent_working_status(observer, "arty")
+
+            assert working is not None and working["status"] == "working"
+            assert idle is not None and idle["status"] == "idle"
+            assert idle["last_updated"] >= working["last_updated"] > 0
+        finally:
+            observer.close()
+
     def test_thinking_status(self):
         client = self._client_with_agent()
         resp = client.post("/agents/arty/status", json={"status": "thinking"})
