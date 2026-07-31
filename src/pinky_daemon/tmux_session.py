@@ -430,6 +430,30 @@ _DELIVERY_TIMEOUT_RETRY_LIMIT = 3
 _PANE_MARKER_CHARS = 40
 _PANE_MARKER_MIN_CHARS = 12
 
+# Issue #953 — Claude's composer needs more time to absorb/render a large
+# bracketed paste before the submit Enter arrives.  The old fixed 300 ms delay
+# was adequate for short prompts but lost Enter on a live 6,207-character wake
+# prompt.  Scale the Claude delay with payload size, while bounding startup
+# latency.  Codex keeps its independently validated 4,000 ms override.
+_PASTE_ENTER_BASE_DELAY_MS = 300
+_PASTE_ENTER_DELAY_CHARS_PER_MS = 4
+_PASTE_ENTER_MAX_DELAY_MS = 2_000
+
+# Wait for exact transcript evidence that a wake prompt started, then retry
+# only Enter (never the already-pasted text) while the prompt remains visible
+# in the composer.  Three total submit attempts match the bounded retry shape
+# used by the dashboard terminal transport.
+_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC = 5.0
+_WAKE_SUBMISSION_ENTER_RETRY_LIMIT = 2
+
+
+def _adaptive_paste_enter_delay_ms(text: str) -> int:
+    """Bounded Claude paste-to-Enter settle scaled to payload size."""
+    scaled = _PASTE_ENTER_BASE_DELAY_MS + (
+        len(text) // _PASTE_ENTER_DELAY_CHARS_PER_MS
+    )
+    return min(_PASTE_ENTER_MAX_DELAY_MS, scaled)
+
 # Sentinel path used by ``_start_tailer`` when the transcript JSONL
 # doesn't exist yet (cold-start). The tailer's ``read_once`` treats
 # the non-existent file as "no data" and waits; once the SessionStart
@@ -673,7 +697,7 @@ class _TmuxControl:
         text: str,
         *,
         enter: bool = True,
-        enter_delay_ms: int = 300,
+        enter_delay_ms: int | None = None,
     ) -> TmuxCommandResult:
         """Deliver ``text`` to the pane via tmux paste-buffer with
         bracketed paste mode, then (optionally) send Enter after a
@@ -698,10 +722,10 @@ class _TmuxControl:
             enter: If True (default), send a submit Enter after
                 ``enter_delay_ms`` ms. If False, leaves the pasted text
                 in the input buffer unsubmitted.
-            enter_delay_ms: Sleep between paste and Enter. Defaults to
-                300 — the value Pulse v2's session manager uses for the
-                claude backend (it uses 4000 for codex, which renders
-                its prompt more slowly).
+            enter_delay_ms: Sleep between paste and Enter. ``None`` (the
+                default) selects a bounded adaptive Claude delay based on
+                payload size. Codex supplies its separately validated
+                4000 ms override.
 
         Returns the last tmux command's result (either the Enter send
         or the paste, depending on ``enter``). On any intermediate
@@ -730,6 +754,8 @@ class _TmuxControl:
         if not paste_result.ok or not enter:
             return paste_result
 
+        if enter_delay_ms is None:
+            enter_delay_ms = _adaptive_paste_enter_delay_ms(text)
         if enter_delay_ms > 0:
             await asyncio.sleep(enter_delay_ms / 1000.0)
 
@@ -815,15 +841,15 @@ class _QueuedTurn:
     # prompt. Ignored when ``None``.
     completion_event: asyncio.Event | None = None
     # #591 P1#2 (Murzik round-2): for wake prompts, the
-    # ``on_wake_delivered`` callback must fire ONLY after the actual
-    # paste lands — enqueue-time firing advances the cycle-gate
+    # ``on_wake_delivered`` callback must fire ONLY after delivery —
+    # enqueue-time firing advances the cycle-gate
     # boundary even when the paste later fails (context-lock deferral
     # or REPL not-ready), eating the directive on the next RESUME.
-    # ``_deliver_turn`` invokes this after ``result.ok`` so the boundary
-    # tracks confirmed delivery, not just intent. ``None`` for
+    # #953 further requires an exact transcript turn-start receipt for
+    # production wakes; tmux command success alone is insufficient. ``None`` for
     # non-wake turns and for any internal turn whose enqueuer doesn't
     # care about post-delivery hooks.
-    on_delivered: object = None  # Callable() -> None — fires on paste-success
+    on_delivered: object = None  # Callable() -> None — fires on delivery proof
     # #846 — replay-amplification guard. Incremented each time the inflight
     # watchdog requeues this turn for replay after a stuck-head force_restart.
     # Once it exceeds ``_inflight_replay_cap()`` the watchdog DROPS the turn
@@ -840,6 +866,16 @@ class _QueuedTurn:
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
     transport_accepted: bool = False
+    # Idempotency guard for routing metadata. Exact transcript acceptance can
+    # race ahead of the tmux command coroutine's return; in that case the
+    # transcript callback records metadata before a same-read Stop row fires.
+    pane_delivery_recorded: bool = False
+    # Wake-only exact submission receipt (#953). True requires a matching
+    # transcript user row or queue enqueue→dequeue; successful tmux paste/Enter
+    # commands alone are deliberately insufficient. Kept separate from the
+    # scheduler receipt because wake prompts remain ordinary worker-queued
+    # internal turns rather than scheduler-serialized external turns.
+    submission_receipt: asyncio.Future[bool] | None = None
 
 
 @dataclass
@@ -2272,6 +2308,13 @@ class TmuxSession:
             f"{'applied live' if ok else 'failed — applies on next relaunch'}"
         )
 
+    def _schedule_pending_effort_if_idle(self) -> None:
+        """Apply an armed effort command at a verified idle boundary."""
+        if self._pending_live_effort and not self._repl_busy():
+            pending = self._pending_live_effort
+            self._pending_live_effort = None
+            asyncio.create_task(self._apply_pending_effort(pending))
+
     async def apply_model_live(self, model: str) -> str:
         """Switch the running REPL's model via the interactive ``/model``.
 
@@ -2640,16 +2683,13 @@ class TmuxSession:
                 timezone=self._config.timezone or "America/Los_Angeles",
             )
         )
-        # #591 P1#2 (Murzik round-2): defer the on_wake_delivered fire
-        # to AFTER the actual paste lands, not at enqueue success. The
-        # paste happens later in ``_deliver_turn``; if it fails (context
-        # lock deferral, paste_text returning not-ok) the prompt is
-        # never shown to the agent, and firing the callback at enqueue
-        # would advance the #591 cycle-gate boundary against a wake
-        # that never reached the model — eating the directive on the
-        # next RESUME. The closure carries the agent name + reason so
-        # ``_deliver_turn`` can fire on paste-success without re-reading
-        # them. ``None`` when no callback is wired (tests).
+        # #591 P1#2 (Murzik round-2): defer on_wake_delivered until actual
+        # delivery, not enqueue success. #953 now makes that proof an exact
+        # transcript turn-start receipt; a successful paste/Enter command is
+        # not enough. Otherwise the cycle-gate could advance against a wake
+        # that never reached the model, eating the directive on next RESUME.
+        # The closure carries agent name + reason so _deliver_turn need not
+        # re-read them. ``None`` when no callback is wired (tests).
         _wake_delivered_cb: object = None
         if self._config.on_wake_delivered:
             _config_cb = self._config.on_wake_delivered
@@ -2666,6 +2706,7 @@ class TmuxSession:
                 wait_for_completion=False,
                 front=front,
                 on_delivered=_wake_delivered_cb,
+                verify_submission=True,
             )
         except Exception as e:
             _log(
@@ -3047,9 +3088,11 @@ class TmuxSession:
         # (above) because the CLI flag rejects the literal "ultracode". The
         # real tier — xhigh + the CLI's own standing dynamic-workflow
         # system-reminder — is reachable ONLY via the interactive
-        # ``/effort ultracode``. Arm a one-shot so ``_deliver_turn`` types it
-        # into the ready REPL BEFORE the first prompt pastes (Brad's ordering:
-        # spawn → change effort → inject wake context). FRESH launches only:
+        # ``/effort ultracode``. Arm a one-shot for ``_deliver_turn``. #953
+        # applies it before a non-wake first prompt, but defers it until the
+        # verified idle boundary when the first prompt is a wake (slash-command
+        # state immediately before the live loss is an explicit interferer).
+        # FRESH launches only:
         # a ``--continue`` reconnect already carries conversation context,
         # where ``/effort`` trips the mid-session "Change effort level?"
         # confirmation (the prompt-cache full re-read). On a fresh spawn the
@@ -3336,6 +3379,7 @@ class TmuxSession:
             delivery = entry.turn.scheduler_delivery
             if delivery is not None and not delivery.done():
                 delivery.set_result(False)
+            self._resolve_submission_receipt(entry.turn, False)
 
         # Issue #547: also unblock ``_inflight_turn`` — the turn the
         # worker pulled from the queue but had NOT yet pasted (e.g.
@@ -3351,6 +3395,7 @@ class TmuxSession:
             delivery = self._inflight_turn.scheduler_delivery
             if delivery is not None and not delivery.done():
                 delivery.set_result(False)
+            self._resolve_submission_receipt(self._inflight_turn, False)
             self._inflight_turn = None
 
         # Stop the response tailer (PR8b). Tailer instance is retained
@@ -3575,6 +3620,7 @@ class TmuxSession:
         timeout_sec: float | None = None,
         front: bool = False,
         on_delivered: object = None,
+        verify_submission: bool = False,
     ) -> None:
         """Queue a daemon-internal prompt with no external-side-effects.
 
@@ -3642,6 +3688,10 @@ class TmuxSession:
         ``await`` between drain and repush) so it's atomic w.r.t. other
         tasks. Caller is responsible for invoking this BEFORE the worker
         starts draining when strict head placement is required.
+
+        ``verify_submission=True`` attaches an exact transcript-backed
+        receipt. Wake prompts use it so successful tmux commands are not
+        mistaken for a turn that actually started (#953).
         """
         if self.state != SessionState.CONNECTED:
             _log(
@@ -3676,6 +3726,11 @@ class TmuxSession:
         )
 
         completion = asyncio.Event() if wait_for_completion else None
+        submission_receipt = (
+            asyncio.get_running_loop().create_future()
+            if verify_submission
+            else None
+        )
         turn = _QueuedTurn(
             prompt=prompt,
             platform="",
@@ -3685,6 +3740,7 @@ class TmuxSession:
             reason=reason,
             completion_event=completion,
             on_delivered=on_delivered,
+            submission_receipt=submission_receipt,
         )
         if front:
             # Prepend ahead of existing queue contents. Synchronous
@@ -4905,10 +4961,7 @@ class TmuxSession:
         # the now-idle REPL. Fire-and-forget task: the apply sequence
         # sleeps between sends, and this callback runs on the tailer's
         # read loop, which must not stall.
-        if self._pending_live_effort and not self._repl_busy():
-            pending = self._pending_live_effort
-            self._pending_live_effort = None
-            asyncio.create_task(self._apply_pending_effort(pending))
+        self._schedule_pending_effort_if_idle()
 
     async def handle_stop_failure(
         self,
@@ -5495,14 +5548,31 @@ class TmuxSession:
                     await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
                     continue
                 except Exception as e:
-                    # A tmux command timeout (``_run``'s 5s subprocess
-                    # ceiling) is transient - a busy tmux server must not
-                    # cost the user their message. Keep the turn in hand
-                    # and retry with a bounded budget; ``_deliver_turn``
-                    # raised before appending any meta, so the retry is
-                    # state-clean.
+                    # For an ordinary turn, a tmux command timeout (``_run``'s
+                    # 5s subprocess ceiling) is transient: keep the turn in
+                    # hand and retry with a bounded budget. That retry is
+                    # state-clean only for ordinary turns. Once a verified
+                    # wake's initial paste_text has timed out, no pane snapshot
+                    # or pre-paste boolean can prove a retry safe: an exact row
+                    # can arrive while the retry is suspended between
+                    # set-buffer and paste-buffer. Enter the wake's one-way
+                    # receipt/Enter-only/fail-closed verifier instead. This
+                    # branch can never return to worker re-paste.
                     if (
                         isinstance(e, TimeoutError)
+                        and self._wake_requires_submission_receipt(turn)
+                    ):
+                        try:
+                            await self._finish_submitted_turn(turn)
+                        except Exception as finish_e:
+                            e = finish_e
+                        else:
+                            self._stats["turns"] += 1
+                            self._inflight_turn = None
+                            continue
+                    if (
+                        isinstance(e, TimeoutError)
+                        and not self._wake_requires_submission_receipt(turn)
                         and delivery_timeouts + 1 < _DELIVERY_TIMEOUT_RETRY_LIMIT
                     ):
                         delivery_timeouts += 1
@@ -5520,25 +5590,38 @@ class TmuxSession:
                                 f"out but the prompt reached the pane; "
                                 f"recording delivery instead of re-pasting"
                             )
+                            # A verified wake must still wait for its exact
+                            # transcript receipt. Its verifier owns bounded
+                            # Enter-only retries; the legacy blind Enter is
+                            # retained only for ordinary turns.
+                            if not self._wake_requires_submission_receipt(turn):
+                                try:
+                                    await self._tmux.send_keys("", enter=True)
+                                except Exception as enter_e:
+                                    _log(
+                                        f"tmux[{self.agent_name}]: post-timeout "
+                                        f"submit Enter failed: {enter_e}"
+                                    )
                             try:
-                                await self._tmux.send_keys("", enter=True)
-                            except Exception as enter_e:
-                                _log(
-                                    f"tmux[{self.agent_name}]: post-timeout "
-                                    f"submit Enter failed: {enter_e}"
-                                )
-                            self._finish_turn_delivery(turn)
-                            self._stats["turns"] += 1
-                            self._inflight_turn = None
+                                await self._finish_submitted_turn(turn)
+                            except Exception as finish_e:
+                                # Fall through to the permanent-failure cleanup
+                                # below. In particular, never turn an exhausted
+                                # wake receipt into a worker success.
+                                e = finish_e
+                            else:
+                                self._stats["turns"] += 1
+                                self._inflight_turn = None
+                                continue
+                        else:
+                            _log(
+                                f"tmux[{self.agent_name}]: turn delivery timed "
+                                f"out (attempt {delivery_timeouts}/"
+                                f"{_DELIVERY_TIMEOUT_RETRY_LIMIT}); retrying in "
+                                f"{_TRANSIENT_RETRY_BACKOFF_SEC}s"
+                            )
+                            await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
                             continue
-                        _log(
-                            f"tmux[{self.agent_name}]: turn delivery timed "
-                            f"out (attempt {delivery_timeouts}/"
-                            f"{_DELIVERY_TIMEOUT_RETRY_LIMIT}); retrying in "
-                            f"{_TRANSIENT_RETRY_BACKOFF_SEC}s"
-                        )
-                        await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
-                        continue
                     # Permanent failure (paste-buffer/send-keys failed,
                     # dead-pane, tailer-state corruption, etc.). Drop
                     # the inflight turn so we don't redeliver into a
@@ -5567,6 +5650,7 @@ class TmuxSession:
                         and not turn.scheduler_delivery.done()
                     ):
                         turn.scheduler_delivery.set_result(False)
+                    self._resolve_submission_receipt(turn, False)
                     # The message is being dropped; tell the chat that
                     # sent it instead of leaving the user with dead
                     # silence (daemon-log-only failures are invisible
@@ -6394,6 +6478,9 @@ class TmuxSession:
                         if delivery is not None and not delivery.done():
                             delivery.set_result(False)
                         return False
+                    # Its old FIFO metadata was removed above. Allow the
+                    # replacement-pane delivery to record a fresh entry.
+                    t.pane_delivery_recorded = False
                     return True
 
                 replay: list[_QueuedTurn] = []
@@ -6657,6 +6744,11 @@ class TmuxSession:
                 not turn.pane_delivery_started
                 or turn.transport_accepted
                 or turn.prompt != prompt
+                or (
+                    turn.submission_receipt is not None
+                    and turn.submission_receipt.done()
+                    and not self._receipt_accepted(turn.submission_receipt)
+                )
             ):
                 continue
             if for_enqueue and turn.pane_queue_enqueued:
@@ -6664,15 +6756,20 @@ class TmuxSession:
             return turn
         return None
 
-    @staticmethod
-    def _mark_transport_accepted(turn: _QueuedTurn | None) -> None:
-        """Resolve a scheduler receipt only on observed pane acceptance."""
+    def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> None:
+        """Resolve exact receipts only on observed pane acceptance."""
         if turn is None or turn.transport_accepted:
             return
+        # A fast wake can write user+assistant+Stop rows before paste_text's
+        # final tmux subprocess coroutine resumes. Reserve its FIFO metadata
+        # synchronously on the exact user/dequeue row so the same-read Stop
+        # callback has an entry to pop. _finish_turn_delivery is idempotent.
+        if self._wake_requires_submission_receipt(turn):
+            self._finish_turn_delivery(turn, fire_on_delivered=False)
         turn.transport_accepted = True
-        receipt = turn.scheduler_delivery
-        if receipt is not None and not receipt.done():
-            receipt.set_result(True)
+        for receipt in (turn.scheduler_delivery, turn.submission_receipt):
+            if receipt is not None and not receipt.done():
+                receipt.set_result(True)
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Consume transcript evidence strong enough for exact-turn receipts."""
@@ -6707,6 +6804,210 @@ class TmuxSession:
                 self._mark_transport_accepted(
                     self._match_acceptance_turn(prompt)
                 )
+
+    @staticmethod
+    def _resolve_submission_receipt(
+        turn: _QueuedTurn, accepted: bool
+    ) -> None:
+        """Resolve one wake submission receipt once, if still pending."""
+        receipt = turn.submission_receipt
+        if receipt is not None and not receipt.done():
+            receipt.set_result(accepted)
+
+    @staticmethod
+    def _receipt_accepted(receipt: asyncio.Future[bool]) -> bool:
+        """Read a terminal receipt without leaking cancellation/errors."""
+        if not receipt.done() or receipt.cancelled():
+            return False
+        try:
+            return receipt.result() is True
+        except Exception:
+            return False
+
+    def _discard_unverified_turn_delivery(self, turn: _QueuedTurn) -> None:
+        """Remove only ``turn``'s pane bookkeeping after receipt exhaustion."""
+        entries = list(self._inflight_metas)
+        removed_index = next(
+            (i for i, entry in enumerate(entries) if entry.turn is turn),
+            None,
+        )
+        if removed_index is not None:
+            del entries[removed_index]
+            self._inflight_metas = deque(entries)
+            if removed_index == 0:
+                self._inflight_pane_ext_anchor = None
+                self._head_started_at = time.time() if entries else None
+        self._pane_queue_operations = deque(
+            queued
+            for queued in self._pane_queue_operations
+            if queued is not turn
+        )
+        self._pane_dequeued_turns = deque(
+            dequeued
+            for dequeued in self._pane_dequeued_turns
+            if dequeued is not turn
+        )
+        turn.pane_delivery_recorded = False
+
+    @staticmethod
+    def _wake_requires_submission_receipt(turn: _QueuedTurn) -> bool:
+        """Whether ``turn`` is a production wake under the #953 contract."""
+        return bool(
+            turn.internal
+            and turn.reason.startswith("wake_")
+            and turn.submission_receipt is not None
+        )
+
+    async def _report_verified_wake_submission(
+        self,
+        turn: _QueuedTurn,
+        *,
+        started: float,
+        submit_attempts: int,
+    ) -> bool:
+        """Emit one positive wake submission verdict."""
+        latency_ms = int((time.monotonic() - started) * 1000)
+        _log(
+            f"tmux[{self.agent_name}]: wake prompt submission VERIFIED "
+            f"by transcript receipt (reason={turn.reason}, "
+            f"submit_attempts={submit_attempts}, latency_ms={latency_ms})"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_submission_verified",
+                "agent_name": self.agent_name,
+                "reason": turn.reason,
+                "submit_attempts": submit_attempts,
+                "latency_ms": latency_ms,
+            }
+        )
+        return True
+
+    async def _verify_wake_submission(self, turn: _QueuedTurn) -> bool:
+        """Require exact turn-start evidence, retrying only a parked Enter."""
+        receipt = turn.submission_receipt
+        if receipt is None:
+            return True
+
+        started = time.monotonic()
+        prompt_visible: bool | None = None
+        submit_attempts = 1  # paste_text already sent the initial Enter
+
+        for retry_index in range(_WAKE_SUBMISSION_ENTER_RETRY_LIMIT + 1):
+            try:
+                accepted = bool(
+                    await asyncio.wait_for(
+                        asyncio.shield(receipt),
+                        timeout=_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC,
+                    )
+                )
+            except asyncio.TimeoutError:
+                # The receipt can resolve at the same event-loop boundary at
+                # which wait_for reports its timeout. Prefer the exact positive
+                # receipt over a stale timeout verdict.
+                accepted = self._receipt_accepted(receipt)
+            except Exception:
+                accepted = self._receipt_accepted(receipt)
+
+            if accepted:
+                return await self._report_verified_wake_submission(
+                    turn,
+                    started=started,
+                    submit_attempts=submit_attempts,
+                )
+
+            # A terminal/cancelled False receipt cannot become True later.
+            if receipt.done():
+                break
+            if retry_index >= _WAKE_SUBMISSION_ENTER_RETRY_LIMIT:
+                break
+
+            # No exact receipt: retry only when the prompt is still visible.
+            # Re-pasting here could duplicate a side-effecting wake turn.
+            prompt_visible = await self._timed_out_turn_landed(turn)
+            if self._receipt_accepted(receipt):
+                return await self._report_verified_wake_submission(
+                    turn,
+                    started=started,
+                    submit_attempts=submit_attempts,
+                )
+            if not prompt_visible:
+                break
+            try:
+                enter_result = await self._tmux.send_keys("", enter=True)
+            except Exception as exc:
+                _log(
+                    f"tmux[{self.agent_name}]: wake prompt submit Enter retry "
+                    f"raised ({type(exc).__name__}: {exc}); not claiming delivery"
+                )
+                break
+            if not enter_result.ok:
+                _log(
+                    f"tmux[{self.agent_name}]: wake prompt submit Enter retry "
+                    f"failed (rc={enter_result.returncode}, "
+                    f"stderr={(enter_result.stderr or '').strip()!r}); "
+                    f"not claiming delivery"
+                )
+                break
+            submit_attempts += 1
+            _log(
+                f"tmux[{self.agent_name}]: wake prompt had no transcript "
+                f"receipt; re-sent Enter only (reason={turn.reason}, "
+                f"submit_attempt={submit_attempts})"
+            )
+
+        if prompt_visible is None:
+            prompt_visible = await self._timed_out_turn_landed(turn)
+        # The exact row can land while the final best-effort pane probe yields.
+        # Positive transcript evidence wins that timeout boundary.
+        if self._receipt_accepted(receipt):
+            return await self._report_verified_wake_submission(
+                turn,
+                started=started,
+                submit_attempts=submit_attempts,
+            )
+        latency_ms = int((time.monotonic() - started) * 1000)
+        self._resolve_submission_receipt(turn, False)
+        _log(
+            f"tmux[{self.agent_name}]: wake prompt submission UNVERIFIED "
+            f"after bounded Enter retries (reason={turn.reason}, "
+            f"submit_attempts={submit_attempts}, latency_ms={latency_ms}, "
+            f"prompt_visible={prompt_visible}); not claiming delivery"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_submission_unverified",
+                "agent_name": self.agent_name,
+                "reason": turn.reason,
+                "submit_attempts": submit_attempts,
+                "latency_ms": latency_ms,
+                "prompt_visible": prompt_visible,
+            }
+        )
+        return False
+
+    async def _finish_submitted_turn(self, turn: _QueuedTurn) -> None:
+        """Record pane delivery and enforce any exact wake receipt."""
+        verify_submission = self._wake_requires_submission_receipt(turn)
+        # Record the inflight meta before waiting: a very fast turn can write
+        # user+assistant+Stop rows in one tailer read, and the Stop callback
+        # must already have metadata to pop.
+        self._finish_turn_delivery(
+            turn,
+            fire_on_delivered=not verify_submission,
+        )
+        if not verify_submission:
+            return
+        if await self._verify_wake_submission(turn):
+            self._fire_on_delivered(turn)
+            return
+
+        self._discard_unverified_turn_delivery(turn)
+        self._turn_done.set()
+        raise RuntimeError(
+            "wake prompt paste/Enter was not confirmed by an exact "
+            "transcript receipt after bounded Enter retries"
+        )
 
     async def _deliver_turn(self, turn: _QueuedTurn) -> None:
         """Push one turn through to the tmux pane.
@@ -6872,23 +7173,25 @@ class TmuxSession:
                         f"emit failed ({gate_subtype}, {gate_latency_ms}ms): {e}"
                     )
 
-        # #151 native ultracode activation. On the FIRST turn after a fresh
-        # cold-start with ultracode effort, type the interactive
-        # ``/effort ultracode`` into the now-ready REPL BEFORE pasting the
-        # prompt — Brad's ordering: spawn → change effort → inject wake
-        # context. The input area is empty at this point (no turn has pasted
-        # yet), so the CLI sets effort silently; the "Change effort level?"
-        # confirmation only fires mid-conversation (the prompt-cache re-read).
-        # One-shot + best-effort: the flag is cleared regardless of outcome,
-        # and a send failure / readiness timeout degrades to the
-        # ULTRACODE_DIRECTIVE fallback rather than blocking delivery.
+        # #953 pre-prompt hygiene: the live loss immediately followed this
+        # slash command. A wake runs first at boot-time xhigh plus the directive
+        # fallback, then applies native ultracode at its verified idle boundary.
+        if self._native_ultracode_pending and is_wake_turn:
+            self._native_ultracode_pending = False
+            self._pending_live_effort = "ultracode"
+            _log(
+                f"tmux[{self.agent_name}]: native /effort ultracode "
+                f"deferred until wake turn completes (pre-prompt hygiene)"
+            )
+
+        # #151 native ultracode activation. On a NON-WAKE first turn after a
+        # fresh cold-start, type the interactive command before the prompt.
+        # Wakes consumed the flag above and deliberately skip this block.
         if self._native_ultracode_pending:
             self._native_ultracode_pending = False
             # Raw keystrokes typed during the splash/MCP-boot phase get eaten,
-            # so ensure the input area is live first. Wake turns already
-            # awaited this gate above (no-op here); a non-wake first turn
-            # waits here. Timeout → attempt the send anyway (context is still
-            # empty; worst case the directive fallback carries the tier).
+            # so ensure the input area is live first. Timeout → attempt the send
+            # anyway; the directive fallback still carries the tier.
             if not self._session_ready_event.is_set():
                 try:
                     await asyncio.wait_for(
@@ -6974,6 +7277,7 @@ class TmuxSession:
                 and not turn.scheduler_delivery.done()
             ):
                 turn.scheduler_delivery.set_result(False)
+            self._resolve_submission_receipt(turn, False)
             # Task #90: detect dead-pane (tmux session killed externally,
             # tmux server crashed, etc.). Without this, the worker would
             # loop forever pasting into a non-existent pane. Schedule
@@ -6997,9 +7301,28 @@ class TmuxSession:
                 f"stderr={result.stderr.strip()!r}"
             )
 
-        self._finish_turn_delivery(turn)
+        await self._finish_submitted_turn(turn)
 
-    def _finish_turn_delivery(self, turn: _QueuedTurn) -> None:
+    def _fire_on_delivered(self, turn: _QueuedTurn) -> None:
+        """Fire a turn's post-delivery callback at most once."""
+        callback = turn.on_delivered
+        turn.on_delivered = None
+        if callback is None:
+            return
+        try:
+            callback()
+        except Exception as exc:
+            _log(
+                f"tmux[{self.agent_name}]: on_delivered callback "
+                f"failed (reason={turn.reason}): {exc}"
+            )
+
+    def _finish_turn_delivery(
+        self,
+        turn: _QueuedTurn,
+        *,
+        fire_on_delivered: bool = True,
+    ) -> None:
         """Post-paste bookkeeping for a turn that reached the pane.
 
         Factored out of ``_deliver_turn`` so the worker's timeout-retry
@@ -7007,24 +7330,14 @@ class TmuxSession:
         (``_timed_out_turn_landed``) shows a timed-out paste actually
         landed -- without re-pasting it.
         """
-        # #591 P1#2 (Murzik round-2): paste landed. Fire the optional
-        # post-delivery callback (set on wake turns by
-        # ``_enqueue_wake_prompt`` so ``agent_wake`` is logged AFTER the
-        # prompt actually reached the REPL — not at enqueue time). This
-        # guarantees the cycle-gate boundary advances only on confirmed
-        # delivery: paste-failure (``_deliver_turn``'s ``not result.ok``
-        # branch) raises BEFORE this point, so a wedged paste leaves the
-        # boundary intact and the next attempt re-emits the directive.
-        # Failure-tolerant: a misbehaving callback must not strand the
-        # delivery, so wrap in try/except.
-        if turn.on_delivered is not None:
-            try:
-                turn.on_delivered()
-            except Exception as _cb_e:
-                _log(
-                    f"tmux[{self.agent_name}]: on_delivered callback "
-                    f"failed (reason={turn.reason}): {_cb_e}"
-                )
+        # #591 originally fired this callback after paste success. #953 raises
+        # the wake contract: verified wake turns defer it until an exact
+        # transcript receipt proves the turn started. Other turns preserve the
+        # established paste-success behavior.
+        if fire_on_delivered:
+            self._fire_on_delivered(turn)
+        if turn.pane_delivery_recorded:
+            return
 
         # Paste succeeded — append routing metadata to the deque so
         # ``_handle_turn_complete`` can popleft it when this turn's
@@ -7054,6 +7367,7 @@ class TmuxSession:
             except OSError:
                 pass
         was_empty = not self._inflight_metas
+        turn.pane_delivery_recorded = True
         self._inflight_metas.append(_InflightMeta(
             meta=meta_dict,
             completion_event=turn.completion_event,
