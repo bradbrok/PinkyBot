@@ -726,13 +726,18 @@ async def _send_err(ws: WebSocket, req_id: str, code: str, message: str, details
 def _auth_ok(params: dict) -> tuple[bool, str]:
     """Validate auth for the connect request.
 
-    Permissive by default (self-hosted trusted path). If OPENCLAW_GATEWAY_TOKEN
-    is set, the client MUST present it as auth.token / auth.bootstrapToken /
-    auth.password. Returns (ok, reason).
+    Fail-closed: the gateway relays device methods (camera, SMS, location,
+    contacts, callLog) to the phone, so an unset token must not mean "open".
+    The client MUST present OPENCLAW_GATEWAY_TOKEN as auth.token /
+    auth.bootstrapToken / auth.password. If no token is configured the
+    handshake is refused unless the owner explicitly opts out by setting
+    OPENCLAW_GATEWAY_ALLOW_ANON=1. Returns (ok, reason).
     """
-    required = os.environ.get("OPENCLAW_GATEWAY_TOKEN", "").strip()
+    required = _load_env_key("OPENCLAW_GATEWAY_TOKEN")
     if not required:
-        return True, ""
+        if _load_env_key("OPENCLAW_GATEWAY_ALLOW_ANON").lower() in ("1", "true", "yes", "on"):
+            return True, ""
+        return False, "gateway token not configured (set OPENCLAW_GATEWAY_TOKEN)"
     auth = params.get("auth") or {}
     presented = {
         str(auth.get("token") or "").strip(),
