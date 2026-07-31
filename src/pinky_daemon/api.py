@@ -5246,6 +5246,7 @@ npm run build</pre>
             soul=soul_text,
             working_dir=working_dir,
             allowed_tools=req.allowed_tools,
+            disallowed_tools=req.disallowed_tools,
             max_turns=req.max_turns,
             timeout=req.timeout,
             system_prompt=system_prompt,

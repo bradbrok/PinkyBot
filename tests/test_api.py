@@ -109,6 +109,19 @@ class TestSession:
         assert d["state"] == "idle"
         assert isinstance(d["created_at"], float)
 
+    def test_sdk_runner_receives_requested_permission_mode(self, monkeypatch, tmp_path):
+        from pinky_daemon import sdk_runner
+
+        monkeypatch.setattr(sdk_runner, "sdk_available", lambda: True)
+        session = Session(
+            session_id="permission-boundary",
+            working_dir=str(tmp_path),
+            permission_mode="plan",
+        )
+
+        assert session._runner_type == "sdk"
+        assert session._runner._config.permission_mode == "plan"
+
     @pytest.mark.asyncio
     async def test_send_message(self):
         session = Session(session_id="test")
@@ -993,6 +1006,27 @@ class TestAPI:
         resp = client.post("/sessions", json={"session_id": "my-session"})
         assert resp.status_code == 200
         assert resp.json()["id"] == "my-session"
+
+    def test_create_session_threads_tool_denials_to_sdk_runner(self, monkeypatch):
+        from pinky_daemon import sdk_runner
+
+        monkeypatch.setattr(sdk_runner, "sdk_available", lambda: True)
+        client = self._make_client()
+        resp = client.post(
+            "/sessions",
+            json={
+                "session_id": "policy-boundary",
+                "permission_mode": "acceptEdits",
+                "disallowed_tools": ["Bash", "Write"],
+            },
+        )
+
+        assert resp.status_code == 200
+        session = client.app.state.manager.get("policy-boundary")
+        assert session is not None
+        assert session.disallowed_tools == ["Bash", "Write"]
+        assert session._runner._config.permission_mode == "acceptEdits"
+        assert session._runner._config.disallowed_tools == ["Bash", "Write"]
 
     def test_get_heartbeat_settings_includes_prompt(self):
         client = self._make_client()

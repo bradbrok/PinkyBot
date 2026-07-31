@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import argparse
+import asyncio
+import os
 import sys
 
 
@@ -49,6 +51,22 @@ def main() -> None:
         help="Working directory (where CLAUDE.md lives)",
     )
 
+    # ACP daemon-backed stdio connector
+    acp_parser = subparsers.add_parser(
+        "acp",
+        help="Run an ACP stdio connector backed by the Pinky daemon",
+    )
+    acp_parser.add_argument(
+        "--agent",
+        default=os.environ.get("PINKY_AGENT"),
+        help="Agent identity (or PINKY_AGENT)",
+    )
+    acp_parser.add_argument(
+        "--daemon-url",
+        default=os.environ.get("PINKY_DAEMON_URL", "http://127.0.0.1:8888"),
+        help="Pinky daemon URL (or PINKY_DAEMON_URL)",
+    )
+
     args = parser.parse_args()
 
     if args.command == "init":
@@ -70,6 +88,16 @@ def main() -> None:
             "--working-dir", args.working_dir,
         ]
         daemon_main()
+    elif args.command == "acp":
+        if not args.agent:
+            acp_parser.error("--agent is required when PINKY_AGENT is not set")
+        from pinky_cli.acp import run_acp
+
+        try:
+            asyncio.run(run_acp(args.agent, args.daemon_url))
+        except (RuntimeError, ValueError) as exc:
+            print(f"[pinky-acp] {exc}", file=sys.stderr, flush=True)
+            sys.exit(2)
     else:
         parser.print_help()
         sys.exit(1)
