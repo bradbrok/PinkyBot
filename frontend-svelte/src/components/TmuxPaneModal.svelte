@@ -11,8 +11,8 @@
   passthrough — xterm onData chunks are mapped to the backend's
   `/tmux/pane/keys` endpoint (named keys for control sequences, literal text
   otherwise), so an operator can answer first-run dialogs or interrupt a
-  wedged REPL without SSH + `tmux attach`. Sends are serialized through a
-  promise chain to preserve keystroke order.
+  wedged REPL without SSH + `tmux attach`. Sends start immediately and repeat
+  unacknowledged events; the daemon orders and de-duplicates them by sequence.
 
   Props:
     show:  bool   — modal open state (bind from parent)
@@ -25,6 +25,7 @@
     import { onDestroy } from 'svelte';
     import Modal from './Modal.svelte';
     import { api, sse } from '../lib/api.js';
+    import { createPaneInputSender } from '../lib/paneInputSender.js';
 
     export let show = false;
     export let agent = '';
@@ -55,9 +56,7 @@
     let inputEnabled = false;
     let inputError = '';
     let onDataDisposable = null;
-    // Serialize sends so fast typing can't reorder keystrokes (fetches
-    // racing each other would scramble e.g. "ls" into "sl").
-    let sendChain = Promise.resolve();
+    let paneInputSender = null;
 
     // xterm onData control sequences → backend named keys (tmux names).
     const KEY_SEQUENCES = {
@@ -81,22 +80,8 @@
         '\x1b[6~': 'NPage',
     };
 
-    // Bumped on teardown (close/switch) so queued keystrokes from a previous
-    // pane are dropped instead of landing on the newly-selected agent/label.
-    let sendEpoch = 0;
     function queueSend(payload) {
-        // Snapshot the target at enqueue time — a queued link of the chain must
-        // hit the pane the keystroke was typed for, not the live agent/label.
-        const targetAgent = agent;
-        const targetLabel = label;
-        const epoch = sendEpoch;
-        sendChain = sendChain
-            .then(() => {
-                if (epoch !== sendEpoch) return; // pane torn down/switched — drop
-                return api('POST', `/agents/${encodeURIComponent(targetAgent)}/tmux/pane/keys`, { ...payload, label: targetLabel });
-            })
-            .then(() => { if (epoch === sendEpoch && inputError) inputError = ''; })
-            .catch((e) => { if (epoch === sendEpoch) inputError = `send failed: ${e?.message || e}`; });
+        paneInputSender?.enqueue(payload);
     }
 
     function handleTerminalData(data) {
@@ -222,6 +207,20 @@
 
     async function mount() {
         statusMessage = 'Loading terminal…';
+        // Capture this mount's target. Requests initiated before a close/switch
+        // must finish against the old pane, never the newly selected one.
+        const targetAgent = agent;
+        const targetLabel = label;
+        paneInputSender = createPaneInputSender({
+            send: (body, options) => api(
+                'POST',
+                `/agents/${encodeURIComponent(targetAgent)}/tmux/pane/keys`,
+                { ...body, label: targetLabel },
+                options,
+            ),
+            onSuccess: () => { if (inputError) inputError = ''; },
+            onError: (e) => { inputError = `send failed: ${e?.message || e}`; },
+        });
         try {
             const [{ Terminal }, { FitAddon }] = await Promise.all([
                 import('@xterm/xterm'),
@@ -294,6 +293,7 @@
         if (sseSource) { try { sseSource.close(); } catch {} sseSource = null; }
         if (resizeObserver) { try { resizeObserver.disconnect(); } catch {} resizeObserver = null; }
         if (onDataDisposable) { try { onDataDisposable.dispose(); } catch {} onDataDisposable = null; }
+        if (paneInputSender) { paneInputSender.dispose(); paneInputSender = null; }
         if (terminal) { try { terminal.dispose(); } catch {} terminal = null; }
         fitAddon = null;
         statusMessage = '';
@@ -302,8 +302,6 @@
         lastReqRows = 0;
         inputEnabled = false;
         inputError = '';
-        sendEpoch++; // invalidate any keystrokes still queued for the old pane
-        sendChain = Promise.resolve();
     }
 
     onDestroy(teardown);

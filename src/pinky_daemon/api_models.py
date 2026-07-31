@@ -1100,14 +1100,24 @@ class PeerFleetAclSetRequest(BaseModel):
     selectors: list[PeerFleetAclEntryRequest] = []
 
 
+class TmuxPaneKeyEvent(BaseModel):
+    """One sequenced literal/key event from a terminal modal client."""
+
+    seq: int
+    text: str = ""
+    key: str = ""
+
+
 class TmuxPaneKeysRequest(BaseModel):
     """Operator keystrokes for the typeable pane view (terminal modal).
 
-    Exactly one of ``text`` (literal characters, no tmux keyname
-    interpretation) or ``key`` (named tmux key — Enter, Up, C-c, ... —
-    validated against ``TmuxSession.PANE_KEY_WHITELIST``) per request.
+    Legacy callers provide exactly one of ``text`` / ``key``. Dashboard
+    terminal clients provide ``client_id`` plus a cumulative list of sequenced
+    ``events`` so an Enter request can retry slower text safely and atomically.
     """
 
     text: str = ""
     key: str = ""
     label: str = "main"
+    client_id: str = ""
+    events: list[TmuxPaneKeyEvent] = Field(default_factory=list)

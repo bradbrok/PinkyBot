@@ -6,11 +6,12 @@ function authRedirectTarget(payload) {
     return `${path}?next=${encodeURIComponent(next || '/')}`;
 }
 
-export async function api(method, path, body) {
+export async function api(method, path, body, { keepalive = false } = {}) {
     const opts = {
         method,
         headers: { 'Content-Type': 'application/json' },
         credentials: 'same-origin',
+        keepalive,
     };
     if (body) opts.body = JSON.stringify(body);
     const resp = await fetch(`${API}${path}`, opts);

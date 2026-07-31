@@ -64,7 +64,7 @@ import re
 import shlex
 import threading
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -1201,6 +1201,11 @@ class TmuxSession:
         self._scheduler_pending_turns: list[_QueuedTurn] = []
         self._pane_queue_operations: deque[_QueuedTurn | None] = deque()
         self._pane_dequeued_turns: deque[_QueuedTurn | None] = deque()
+        # Dashboard terminal requests start immediately and may arrive out of
+        # order. Serialize pane input and remember each client's acknowledged
+        # sequence so cumulative retries never duplicate text or Enter.
+        self._pane_input_lock = asyncio.Lock()
+        self._pane_input_acked: OrderedDict[str, int] = OrderedDict()
         # Background watchdog that ages the deque head against
         # ``_TURN_DONE_TIMEOUT_SEC`` and triggers ``force_restart`` when
         # a stop hook fails to land. Issue #560 replaces the per-iter
@@ -3881,6 +3886,7 @@ class TmuxSession:
         "Up", "Down", "Left", "Right", "Home", "End", "PPage", "NPage",
         "C-c", "C-u",
     })
+    _PANE_INPUT_CLIENT_LIMIT = 1024
 
     async def send_pane_keys(self, *, text: str = "", key: str = "") -> bool:
         """Operator keystrokes from the pane-view modal (typeable terminal).
@@ -3899,6 +3905,13 @@ class TmuxSession:
         an operator can resolve first-run dialogs / wedged prompts from the
         web UI without SSH + ``tmux attach``.
         """
+        async with self._pane_input_lock:
+            return await self._send_pane_keys_unlocked(text=text, key=key)
+
+    async def _send_pane_keys_unlocked(
+        self, *, text: str = "", key: str = ""
+    ) -> bool:
+        """Validated single-event implementation; caller holds pane-input lock."""
         if bool(text) == bool(key):
             return False  # exactly one input mode per call
         if key and key not in self.PANE_KEY_WHITELIST:
@@ -3931,6 +3944,55 @@ class TmuxSession:
             )
             return False
         return True
+
+    async def send_pane_key_events(
+        self,
+        *,
+        client_id: str,
+        events: list[tuple[int, str, str]],
+    ) -> int:
+        """Apply a cumulative sequenced input batch exactly once.
+
+        Concurrent dashboard fetches can complete in any order. Each request
+        repeats its unacknowledged prefix, so whichever request reaches this
+        lock first can fill every sequence through its final event. Later
+        requests skip the already-applied prefix and return the same receipt.
+        """
+        if not client_id or not events:
+            return 0
+        seqs = [seq for seq, _, _ in events]
+        if any(seq < 1 for seq in seqs) or seqs != sorted(set(seqs)):
+            return 0
+
+        async with self._pane_input_lock:
+            if (
+                client_id not in self._pane_input_acked
+                and len(self._pane_input_acked) >= self._PANE_INPUT_CLIENT_LIMIT
+            ):
+                self._pane_input_acked.popitem(last=False)
+            acked = self._pane_input_acked.get(client_id, 0)
+            for seq, text, key in events:
+                if seq <= acked:
+                    continue
+                if seq != acked + 1:
+                    _log(
+                        f"tmux[{self.agent_name}]: pane-input gap for "
+                        f"client={client_id!r} (acked={acked}, got={seq})"
+                    )
+                    return acked
+                if not await self._send_pane_keys_unlocked(text=text, key=key):
+                    return acked
+                acked = seq
+                # Persist partial progress before the next tmux operation: if
+                # Enter fails after text lands, its cumulative retry must not
+                # type that text a second time.
+                self._pane_input_acked[client_id] = acked
+
+            self._pane_input_acked[client_id] = acked
+            self._pane_input_acked.move_to_end(client_id)
+            while len(self._pane_input_acked) > self._PANE_INPUT_CLIENT_LIMIT:
+                self._pane_input_acked.popitem(last=False)
+            return acked
 
     # Claude Code reserves a buffer below the raw model cap so the
     # ``/compact`` autocompact step fires before the API rejects the

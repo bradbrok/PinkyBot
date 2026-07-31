@@ -9611,12 +9611,11 @@ npm run build</pre>
         from lera's container rollout, #735 — three dialogs, three round
         trips to a shell).
 
-        Exactly one of ``text`` / ``key`` per request; ``key`` must be in
-        ``TmuxSession.PANE_KEY_WHITELIST``. Bounded to 1024 chars — the
-        modal sends keystrokes, not documents. Every send is logged with
-        the agent name for auditability (input content included: this is
-        an operator-facing admin surface, and "what did I type into the
-        wedged dialog" is exactly what the log needs to answer).
+        Legacy callers provide exactly one of ``text`` / ``key``. Dashboard
+        clients provide ``client_id`` plus cumulative sequenced ``events``;
+        the session applies each sequence once, so Enter can start immediately
+        and safely repeat any unacknowledged text ahead of it. Input remains
+        bounded to 1024 events / literal chars per request.
 
         404 unknown agent · 409 not a tmux session · 400 bad input.
         """
@@ -9625,32 +9624,80 @@ npm run build</pre>
         agent = agents.get(agent_name)
         if not agent:
             raise HTTPException(404, f"Agent '{agent_name}' not found")
-        if bool(req.text) == bool(req.key):
-            raise HTTPException(400, "provide exactly one of 'text' or 'key'")
-        if len(req.text) > 1024:
-            raise HTTPException(400, "text too long (max 1024 chars)")
-        if req.text and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in req.text):
-            # Control bytes in 'text' would bypass the named-key whitelist
-            # ("\x04" is C-d either way) — controls only via whitelisted 'key'.
-            raise HTTPException(
-                400,
-                "text must not contain control characters; "
-                "use a whitelisted 'key' for control sequences",
-            )
-        if req.key and req.key not in TmuxSession.PANE_KEY_WHITELIST:
-            raise HTTPException(
-                400,
-                f"key {req.key!r} not allowed; whitelist: "
-                f"{sorted(TmuxSession.PANE_KEY_WHITELIST)}",
-            )
+
+        batch_mode = bool(req.client_id or req.events)
+        if batch_mode:
+            if req.text or req.key:
+                raise HTTPException(400, "sequenced events cannot mix with text/key")
+            if not re.fullmatch(r"[A-Za-z0-9._:-]{1,128}", req.client_id):
+                raise HTTPException(400, "invalid terminal client_id")
+            if not req.events or len(req.events) > 1024:
+                raise HTTPException(400, "events must contain 1..1024 items")
+            seqs = [event.seq for event in req.events]
+            if any(seq < 1 for seq in seqs) or seqs != sorted(set(seqs)):
+                raise HTTPException(400, "event seq values must be positive and increasing")
+            if sum(len(event.text) for event in req.events) > 1024:
+                raise HTTPException(400, "event text too long (max 1024 chars total)")
+            inputs = [(event.text, event.key) for event in req.events]
+        else:
+            if bool(req.text) == bool(req.key):
+                raise HTTPException(400, "provide exactly one of 'text' or 'key'")
+            if len(req.text) > 1024:
+                raise HTTPException(400, "text too long (max 1024 chars)")
+            inputs = [(req.text, req.key)]
+
+        for text, key in inputs:
+            if bool(text) == bool(key):
+                raise HTTPException(400, "each input must provide exactly one text/key")
+            if text and any(ord(ch) < 0x20 or ord(ch) == 0x7F for ch in text):
+                # Control bytes in 'text' would bypass the named-key whitelist
+                # ("\x04" is C-d either way) — controls only as named keys.
+                raise HTTPException(
+                    400,
+                    "text must not contain control characters; "
+                    "use a whitelisted 'key' for control sequences",
+                )
+            if key and key not in TmuxSession.PANE_KEY_WHITELIST:
+                raise HTTPException(
+                    400,
+                    f"key {key!r} not allowed; whitelist: "
+                    f"{sorted(TmuxSession.PANE_KEY_WHITELIST)}",
+                )
 
         session = broker.get_streaming_session(agent_name, label=req.label)
-        sender = getattr(session, "send_pane_keys", None)
-        if session is None or not callable(sender):
+        if session is None:
             raise HTTPException(
                 409, f"Agent '{agent_name}' has no live tmux session"
             )
 
+        if batch_mode:
+            batch_sender = getattr(session, "send_pane_key_events", None)
+            if not callable(batch_sender):
+                raise HTTPException(
+                    409, f"Agent '{agent_name}' has no live tmux session"
+                )
+            first_seq, last_seq = req.events[0].seq, req.events[-1].seq
+            _log(
+                f"api: pane-events → {agent_name} "
+                f"(client={req.client_id!r}, seq={first_seq}..{last_seq})"
+            )
+            acked_seq = await batch_sender(
+                client_id=req.client_id,
+                events=[(event.seq, event.text, event.key) for event in req.events],
+            )
+            if acked_seq < last_seq:
+                raise HTTPException(502, "tmux send-keys failed (see daemon log)")
+            return {
+                "sent": True,
+                "agent": agent_name,
+                "acked_seq": acked_seq,
+            }
+
+        sender = getattr(session, "send_pane_keys", None)
+        if not callable(sender):
+            raise HTTPException(
+                409, f"Agent '{agent_name}' has no live tmux session"
+            )
         summary = f"text={req.text!r}" if req.text else f"key={req.key}"
         _log(f"api: pane-keys → {agent_name} ({summary})")
         ok = await sender(text=req.text, key=req.key)
