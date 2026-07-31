@@ -9602,6 +9602,83 @@ async def test_send_pane_keys_false_on_tmux_failure() -> None:
     assert await session.send_pane_keys(key="Enter") is False
 
 
+@pytest.mark.asyncio
+async def test_send_pane_key_events_cumulative_retry_is_idempotent() -> None:
+    """A keepalive Enter batch can repeat an in-flight text event safely."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+    tmux.send_keys = AsyncMock(return_value=_ok())
+
+    ack = await session.send_pane_key_events(
+        client_id="dashboard-1",
+        events=[(1, "answer", ""), (2, "", "Enter")],
+    )
+    stale_ack = await session.send_pane_key_events(
+        client_id="dashboard-1",
+        events=[(1, "answer", "")],
+    )
+
+    assert ack == stale_ack == 2
+    tmux.send_literal.assert_awaited_once_with("answer")
+    tmux.send_keys.assert_awaited_once_with("Enter", enter=False)
+
+
+@pytest.mark.asyncio
+async def test_send_pane_key_events_later_cumulative_request_fills_gap() -> None:
+    """A later request may arrive first and carry the complete ordered prefix."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+    tmux.send_keys = AsyncMock(return_value=_ok())
+
+    ack = await session.send_pane_key_events(
+        client_id="dashboard-2",
+        events=[(1, "a", ""), (2, "b", ""), (3, "", "Enter")],
+    )
+    old_request_ack = await session.send_pane_key_events(
+        client_id="dashboard-2",
+        events=[(1, "a", ""), (2, "b", "")],
+    )
+
+    assert ack == old_request_ack == 3
+    assert [call.args[0] for call in tmux.send_literal.await_args_list] == ["a", "b"]
+    tmux.send_keys.assert_awaited_once_with("Enter", enter=False)
+
+
+@pytest.mark.asyncio
+async def test_send_pane_key_events_refuses_missing_sequence() -> None:
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+
+    ack = await session.send_pane_key_events(
+        client_id="dashboard-3",
+        events=[(2, "missing-one", "")],
+    )
+
+    assert ack == 0
+    tmux.send_literal.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_send_pane_key_events_persists_partial_receipt_before_retry() -> None:
+    """A failed Enter retry must not duplicate text that already landed."""
+    session, tmux = _make_session()
+    tmux.send_literal = AsyncMock(return_value=_ok())
+    tmux.send_keys = AsyncMock(side_effect=[_fail("transient"), _ok()])
+    events = [(1, "answer", ""), (2, "", "Enter")]
+
+    partial_ack = await session.send_pane_key_events(
+        client_id="dashboard-4", events=events,
+    )
+    final_ack = await session.send_pane_key_events(
+        client_id="dashboard-4", events=events,
+    )
+
+    assert partial_ack == 1
+    assert final_ack == 2
+    tmux.send_literal.assert_awaited_once_with("answer")
+    assert tmux.send_keys.await_count == 2
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # #230 — _watchdog_liveness: live carve-out signal for the OUTER watchdogs
 # (daemon SessionWatchdog warn/recover + scheduler idle-sleep). Active ONLY

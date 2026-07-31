@@ -75,5 +75,8 @@ jobs:
           npm run i18n:extract || true
           git diff --exit-code src/locales/en.json || (echo "::error::New i18n keys found — run 'npm run i18n:sync' and commit the result" && exit 1)
 
+      - name: Test frontend
+        run: npm test
+
       - name: Build frontend
         run: npm run build

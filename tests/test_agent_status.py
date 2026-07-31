@@ -699,6 +699,75 @@ class TestTmuxPaneKeys:
             {"text": "", "key": "Enter"},
         ]
 
+    def test_cumulative_sequenced_events_reach_batch_sender(self):
+        """The Enter request may safely repeat slower text in one batch."""
+        app, client = self._client()
+        calls = []
+
+        class _PaneSession:
+            async def send_pane_key_events(self, *, client_id, events):
+                calls.append((client_id, events))
+                return events[-1][0]
+
+        app.state.broker.register_streaming("dymok", _PaneSession(), label="main")
+        resp = self._post(client, {
+            "client_id": "dashboard-123",
+            "events": [
+                {"seq": 1, "text": "rapid"},
+                {"seq": 2, "key": "Enter"},
+            ],
+        })
+        assert resp.status_code == 200
+        assert resp.json() == {
+            "sent": True,
+            "agent": "dymok",
+            "acked_seq": 2,
+        }
+        assert calls == [(
+            "dashboard-123",
+            [(1, "rapid", ""), (2, "", "Enter")],
+        )]
+
+    def test_400_on_invalid_sequenced_events(self):
+        app, client = self._client()
+
+        class _PaneSession:
+            async def send_pane_key_events(self, *, client_id, events):
+                return events[-1][0]
+
+        app.state.broker.register_streaming("dymok", _PaneSession(), label="main")
+        bad_bodies = [
+            {"client_id": "bad id", "events": [{"seq": 1, "text": "x"}]},
+            {"client_id": "ok", "events": []},
+            {"client_id": "ok", "events": [{"seq": 0, "text": "x"}]},
+            {"client_id": "ok", "events": [
+                {"seq": 2, "text": "x"}, {"seq": 1, "key": "Enter"},
+            ]},
+            {"client_id": "ok", "events": [{"seq": 1, "text": "x", "key": "Enter"}]},
+            {"client_id": "ok", "events": [{"seq": 1, "text": "\x1b"}]},
+            {"client_id": "ok", "events": [{"seq": 1, "key": "C-d"}]},
+            {"client_id": "ok", "events": [{"seq": 1, "text": "x"}], "key": "Enter"},
+        ]
+        for body in bad_bodies:
+            assert self._post(client, body).status_code == 400, body
+
+    def test_502_when_batch_receipt_stops_before_final_event(self):
+        app, client = self._client()
+
+        class _PaneSession:
+            async def send_pane_key_events(self, *, client_id, events):
+                return 1
+
+        app.state.broker.register_streaming("dymok", _PaneSession(), label="main")
+        resp = self._post(client, {
+            "client_id": "dashboard-123",
+            "events": [
+                {"seq": 1, "text": "answer"},
+                {"seq": 2, "key": "Enter"},
+            ],
+        })
+        assert resp.status_code == 502
+
     def test_502_when_session_send_fails(self):
         app, client = self._client()
 
