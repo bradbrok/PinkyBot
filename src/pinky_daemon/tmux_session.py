@@ -1889,7 +1889,9 @@ class TmuxSession:
         # read to avoid tearing down a session mid-Workflow. Computed live here
         # so those paths don't recompute slightly-different truth; cheap when no
         # turn is in flight (returns early before any filesystem stat).
-        live = self._watchdog_liveness(time.time())
+        now = time.time()
+        live = self._watchdog_liveness(now)
+        stall_verdict = self._inflight_stall_verdict(now)
         return {
             **self._stats,
             "state": self.state.value,
@@ -1900,6 +1902,14 @@ class TmuxSession:
             "pending_responses": self._message_queue.qsize(),
             "inflight_turns": len(self._inflight_metas),
             "inflight_active": live["active"],
+            # #949 scheduler receipt waits need the SAME positive verdict the
+            # inflight watchdog uses. ``inflight_active`` intentionally has a
+            # narrower recent-write window for outer teardown carve-outs; a
+            # transcript that grew within the watchdog's full timeout window
+            # is still proven busy-not-wedged for confirmed wake delivery.
+            "inflight_busy_not_wedged": (
+                live["active"] or stall_verdict == "growing"
+            ),
             "inflight_liveness_reason": live["reason"],
             "inflight_liveness_age_s": live["age_s"],
             "current_activity": self._current_activity,

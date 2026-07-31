@@ -652,6 +652,24 @@ class AgentSchedule:
         }
 
 
+@dataclass
+class PendingScheduleWake:
+    """A fired scheduler prompt awaiting confirmed transport acceptance."""
+
+    id: int = 0
+    schedule_id: int = 0
+    agent_name: str = ""
+    schedule_name: str = ""
+    prompt: str = ""
+    fired_at: float = 0.0
+    created_at: float = 0.0
+
+    @property
+    def name(self) -> str:
+        """Match the ``AgentSchedule`` interface used by receipt waiting."""
+        return self.schedule_name
+
+
 class ScheduleNameConflictError(ValueError):
     """An enabled schedule already uses the requested agent/name pair."""
 
@@ -1249,6 +1267,18 @@ class AgentRegistry:
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS pending_schedule_wakes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                schedule_id INTEGER NOT NULL,
+                agent_name TEXT NOT NULL,
+                schedule_name TEXT NOT NULL DEFAULT '',
+                prompt TEXT NOT NULL DEFAULT '',
+                fired_at REAL NOT NULL,
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
+                UNIQUE(schedule_id, fired_at)
+            );
+
             CREATE TABLE IF NOT EXISTS agent_heartbeats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
@@ -1392,6 +1422,8 @@ class AgentRegistry:
                 ON agent_heartbeats(agent_name, timestamp DESC);
             CREATE INDEX IF NOT EXISTS idx_schedules_agent
                 ON agent_schedules(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_pending_schedule_wakes_agent
+                ON pending_schedule_wakes(agent_name, fired_at, id);
             CREATE INDEX IF NOT EXISTS idx_pending_messages_agent_chat
                 ON pending_messages(agent_name, chat_id, delivered);
             CREATE INDEX IF NOT EXISTS idx_approval_requests_retry
@@ -3066,6 +3098,17 @@ except Exception as exc:
         return [self._row_to_schedule(r) for r in rows
         ]
 
+    def get_schedule(self, schedule_id: int) -> AgentSchedule | None:
+        """Return one schedule regardless of enabled state."""
+        row = self._db.execute(
+            """SELECT id, agent_name, name, cron, prompt, timezone, enabled,
+                      last_run, last_delivered, created_at, direct_send,
+                      target_channel, one_shot
+               FROM agent_schedules WHERE id=?""",
+            (schedule_id,),
+        ).fetchone()
+        return self._row_to_schedule(row) if row else None
+
     def update_schedule(
         self,
         schedule_id: int,
@@ -3180,6 +3223,98 @@ except Exception as exc:
             (ts, schedule_id),
         )
         self._db.commit()
+
+    def persist_schedule_wake(
+        self,
+        schedule_id: int,
+        *,
+        agent_name: str,
+        schedule_name: str,
+        prompt: str,
+        fired_at: float,
+    ) -> tuple[PendingScheduleWake, bool]:
+        """Durably retain one fired wake until exact delivery is confirmed.
+
+        ``(schedule_id, fired_at)`` identifies one cron fire and makes repeated
+        accounting of the same failed receipt idempotent. Callers must carry
+        that immutable timestamp with the fired cohort; rereading mutable
+        ``last_run`` here can collapse overlapping fires into one row.
+        """
+        if fired_at <= 0:
+            raise ValueError("fired_at must be a positive exact-fire timestamp")
+        created_at = time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """INSERT OR IGNORE INTO pending_schedule_wakes (
+                       schedule_id, agent_name, schedule_name, prompt,
+                       fired_at, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    schedule_id,
+                    agent_name,
+                    schedule_name,
+                    prompt,
+                    fired_at,
+                    created_at,
+                ),
+            )
+            created = cursor.rowcount > 0
+            row = self._db.execute(
+                """SELECT id, schedule_id, agent_name, schedule_name, prompt,
+                          fired_at, created_at
+                   FROM pending_schedule_wakes
+                   WHERE schedule_id=? AND fired_at=?""",
+                (schedule_id, fired_at),
+            ).fetchone()
+            self._db.commit()
+        return PendingScheduleWake(*row), created
+
+    def list_pending_schedule_wakes(
+        self, agent_name: str | None = None
+    ) -> list[PendingScheduleWake]:
+        """Return pending scheduler wakes oldest-first."""
+        sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
+                        fired_at, created_at
+                 FROM pending_schedule_wakes"""
+        params: tuple = ()
+        if agent_name is not None:
+            sql += " WHERE agent_name=?"
+            params = (agent_name,)
+        sql += " ORDER BY fired_at ASC, id ASC"
+        rows = self._db.execute(sql, params).fetchall()
+        return [PendingScheduleWake(*row) for row in rows]
+
+    def confirm_pending_schedule_wake(
+        self, pending_id: int, *, delivered_at: float = 0.0
+    ) -> bool:
+        """Atomically stamp the schedule delivered and retire its outbox row."""
+        timestamp = delivered_at or time.time()
+        with self._rmw_lock:
+            row = self._db.execute(
+                "SELECT schedule_id FROM pending_schedule_wakes WHERE id=?",
+                (pending_id,),
+            ).fetchone()
+            if row is None:
+                return False
+            self._db.execute(
+                "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
+                (timestamp, row[0]),
+            )
+            cursor = self._db.execute(
+                "DELETE FROM pending_schedule_wakes WHERE id=?",
+                (pending_id,),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def discard_pending_schedule_wake(self, pending_id: int) -> bool:
+        """Retire a pending wake without marking its schedule delivered."""
+        cursor = self._db.execute(
+            "DELETE FROM pending_schedule_wakes WHERE id=?",
+            (pending_id,),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
 
     # ── Heartbeats ─────────────────────────────────────────
 

@@ -7723,6 +7723,48 @@ class TestBuildStreamingWakeContextReasonGating:
             )
             assert "Grep daemon log for verdict_wedged_inputs" not in out_t3
 
+    def test_central_wake_triggers_persisted_scheduler_catch_up(self):
+        """#949: every proven session boot wakes the durable scheduler outbox."""
+        from pinky_daemon.wake_prompt import WakeReason
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            replayed: list[str] = []
+            app.state.scheduler.replay_pending_for_agent = replayed.append
+
+            app.state._log_agent_wake_event("dymok", WakeReason.CONTEXT_RESTART)
+
+            assert replayed == ["dymok"]
+
+    @pytest.mark.asyncio
+    async def test_scheduler_undelivered_alert_uses_owner_destination(self):
+        """#949 alerting uses the durable #863 owner-notify configuration."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "acct-1",
+                    "conversation_id": "owner-dm",
+                    "principal_id": "owner-user",
+                }
+            ])
+            send = AsyncMock(return_value={"sent": True})
+            app.state.broker._send_callback = send
+
+            delivered = await app.state.scheduler._owner_notify_callback(
+                "dymok", "FIRED BUT UNDELIVERED test"
+            )
+
+            assert delivered is True
+            send.assert_awaited_once_with(
+                "dymok",
+                "telegram",
+                "owner-dm",
+                "FIRED BUT UNDELIVERED test",
+                account_id="acct-1",
+            )
+
     def test_central_wake_log_failure_does_not_advance_gate(self):
         """#591 P1#2 (Barsik refinement): the callback fires ONLY on
         successful delivery. If the wake prompt's paste/query fails,

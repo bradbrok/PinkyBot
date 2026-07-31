@@ -168,6 +168,8 @@ class AgentScheduler:
         streaming_sessions_fn=None,
         is_resurrectable_fn=None,
         comms_cleanup_fn=None,
+        delivery_busy_fn=None,
+        owner_notify_callback=None,
         trigger_store=None,
         activity=None,
         tick_interval: int = 30,
@@ -191,6 +193,13 @@ class AgentScheduler:
         # would refuse anyway, but at the cost of a budget slot and a log line).
         self._is_resurrectable_fn = is_resurrectable_fn  # fn(agent_name) -> bool
         self._comms_cleanup_fn = comms_cleanup_fn  # fn() -> int (expired comms bookkeeping cleanup)
+        # fn(agent_name) -> bool. True means the inflight watchdog has
+        # positive busy-not-wedged evidence, so a pending scheduler receipt
+        # must keep waiting instead of expiring behind a healthy long turn.
+        self._delivery_busy_fn = delivery_busy_fn
+        # async fn(agent_name, text) -> bool. FIRED BUT UNDELIVERED must leave
+        # journald and reach the owner through an out-of-band transport.
+        self._owner_notify_callback = owner_notify_callback
         self._trigger_store = trigger_store  # TriggerStore | None
         self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval
@@ -219,6 +228,8 @@ class AgentScheduler:
         # cohorts while allowing unrelated agents to progress independently.
         self._schedule_delivery_tasks: set[asyncio.Task] = set()
         self._schedule_delivery_locks: dict[str, asyncio.Lock] = {}
+        self._pending_replay_tasks: dict[str, asyncio.Task] = {}
+        self._owner_alert_tasks: set[asyncio.Task] = set()
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -229,6 +240,10 @@ class AgentScheduler:
         if self._running:
             return
         self._running = True
+        for pending in self._registry.list_pending_schedule_wakes():
+            self.replay_pending_for_agent(pending.agent_name)
+        # Queue startup catch-up before the first live tick can enqueue newer
+        # cron fires. Per-agent delivery locks preserve that ordering.
         self._task = asyncio.create_task(self._loop())
         _log(f"scheduler: started (tick every {self._tick_interval}s)")
 
@@ -261,6 +276,17 @@ class AgentScheduler:
         if delivery_tasks:
             await asyncio.gather(*delivery_tasks, return_exceptions=True)
         self._schedule_delivery_tasks.clear()
+        replay_tasks = list(self._pending_replay_tasks.values())
+        for task in replay_tasks:
+            if not task.done():
+                task.cancel()
+        if replay_tasks:
+            await asyncio.gather(*replay_tasks, return_exceptions=True)
+        self._pending_replay_tasks.clear()
+        alert_tasks = list(self._owner_alert_tasks)
+        if alert_tasks:
+            await asyncio.gather(*alert_tasks, return_exceptions=True)
+        self._owner_alert_tasks.clear()
         _log("scheduler: stopped")
 
     async def _loop(self) -> None:
@@ -335,6 +361,11 @@ class AgentScheduler:
                     except Exception:
                         pass
                 self._registry.update_schedule_last_run(schedule.id, now)
+                # Carry the exact fire identity on this queued snapshot. A
+                # later minute can advance the DB row while this cohort still
+                # waits behind a long turn, so failure paths must never reread
+                # mutable last_run from storage.
+                schedule.last_run = now
 
                 # Auto-disable one-shot schedules after firing
                 if schedule.one_shot:
@@ -343,29 +374,77 @@ class AgentScheduler:
 
                 due_by_agent.setdefault(schedule.agent_name, []).append(schedule)
 
+        cohort_started: list[asyncio.Event] = []
         for agent_name, due_schedules in due_by_agent.items():
+            attempt_started = asyncio.Event()
             task = asyncio.create_task(
-                self._deliver_schedule_group(agent_name, due_schedules)
+                self._deliver_schedule_group(
+                    agent_name,
+                    due_schedules,
+                    attempt_started=attempt_started,
+                )
             )
             self._schedule_delivery_tasks.add(task)
             task.add_done_callback(self._schedule_delivery_done)
+            cohort_started.append(attempt_started)
 
-        # Give callbacks that confirm immediately one loop turn without making
-        # a busy agent's bounded receipt wait part of the scheduler tick.
-        if due_by_agent:
-            await asyncio.sleep(0)
+        # Synchronize on the actual start condition rather than counting event
+        # loop turns. The confirmation monitor adds task indirection on Python
+        # 3.12/3.13, but a due callback must still begin before this check
+        # returns (#702). This bound never waits for a receipt (or a dream), and
+        # prevents an older per-agent delivery lock from blocking the tick.
+        if cohort_started:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*(event.wait() for event in cohort_started)),
+                    timeout=1.0,
+                )
+            except asyncio.TimeoutError:
+                _log(
+                    "scheduler: cohort-start synchronization timed out; "
+                    "blocked delivery tasks remain queued"
+                )
 
     async def _deliver_schedule_group(
-        self, agent_name: str, schedules: list
+        self,
+        agent_name: str,
+        schedules: list,
+        *,
+        attempt_started: asyncio.Event | None = None,
     ) -> None:
         """Deliver one agent's due prompts serially, including receipt waits."""
         lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
         next_index = 0
         try:
+            # Persisted wakes belong to the NEXT session, never another cron
+            # tick on the same doomed transport. Only wait when boot/
+            # orientation explicitly scheduled catch-up; otherwise leave the
+            # outbox untouched until that lifecycle boundary occurs.
+            replay_task = self._pending_replay_tasks.get(agent_name)
+            if (
+                replay_task is not None
+                and replay_task is not asyncio.current_task()
+                and not replay_task.done()
+            ):
+                try:
+                    await asyncio.shield(replay_task)
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    _log(
+                        f"scheduler: persisted wake catch-up failed before "
+                        f"live cohort for '{agent_name}': "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             async with lock:
                 for next_index, schedule in enumerate(schedules):
                     try:
-                        await self._deliver_schedule(schedule)
+                        await self._deliver_schedule(
+                            schedule,
+                            attempt_started=(
+                                attempt_started if next_index == 0 else None
+                            ),
+                        )
                     except asyncio.CancelledError:
                         self._record_schedule_undelivered(
                             schedule, "delivery canceled before confirmation"
@@ -384,12 +463,19 @@ class AgentScheduler:
                 )
             raise
 
-    async def _deliver_schedule(self, schedule) -> None:
+    async def _deliver_schedule(
+        self,
+        schedule,
+        *,
+        attempt_started: asyncio.Event | None = None,
+    ) -> None:
         """Attempt one fired schedule and record confirmed delivery separately."""
         confirmed = False
         failure_reason = "no delivery callback configured"
 
         if schedule.direct_send:
+            if attempt_started is not None:
+                attempt_started.set()
             if not schedule.target_channel:
                 failure_reason = "direct send has no target channel"
             elif self._direct_send_callback is None:
@@ -411,9 +497,8 @@ class AgentScheduler:
                     )
         elif self._wake_callback:
             try:
-                confirmed = await asyncio.wait_for(
-                    self._wake_and_confirm(schedule),
-                    timeout=self._schedule_delivery_timeout,
+                confirmed = await self._wait_for_wake_confirmation(
+                    schedule, attempt_started=attempt_started
                 )
                 if not confirmed:
                     failure_reason = "wake callback returned no positive receipt"
@@ -426,6 +511,8 @@ class AgentScheduler:
                 raise
             except Exception as e:
                 failure_reason = f"wake callback raised {type(e).__name__}: {e}"
+        elif attempt_started is not None:
+            attempt_started.set()
 
         if confirmed:
             delivered_at = time.time()
@@ -439,8 +526,12 @@ class AgentScheduler:
                         "schedule_delivered",
                         f"Schedule '{schedule.name}' delivery confirmed",
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    _log(
+                        f"scheduler: failed to record schedule delivery "
+                        f"activity for '{schedule.agent_name}': "
+                        f"{type(exc).__name__}: {exc}"
+                    )
             _log(
                 f"scheduler: delivery confirmed for schedule "
                 f"'{schedule.name}' (#{schedule.id}) for agent "
@@ -453,7 +544,29 @@ class AgentScheduler:
     def _record_schedule_undelivered(
         self, schedule, failure_reason: str
     ) -> None:
-        """Loudly account one fired schedule without advancing delivery."""
+        """Persist, alert, and loudly account one unconfirmed fired schedule."""
+        persisted = False
+        alert_this_failure = True
+        if not schedule.direct_send:
+            try:
+                _, created = self._registry.persist_schedule_wake(
+                    schedule.id,
+                    agent_name=schedule.agent_name,
+                    schedule_name=schedule.name,
+                    prompt=(
+                        schedule.prompt
+                        or f"Scheduled wake: {schedule.name}"
+                    ),
+                    fired_at=schedule.last_run,
+                )
+                persisted = True
+                alert_this_failure = created
+            except Exception as exc:
+                _log(
+                    f"scheduler: SCHEDULER_WAKE_PERSIST_FAILURE schedule "
+                    f"'{schedule.name}' (#{schedule.id}) for agent "
+                    f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+                )
         if self._activity:
             try:
                 self._activity.log(
@@ -468,9 +581,219 @@ class AgentScheduler:
             f"'{schedule.name}' (#{schedule.id}) for agent "
             f"'{schedule.agent_name}': {failure_reason}"
         )
+        if alert_this_failure:
+            recovery = (
+                " The wake was persisted for the agent's next session."
+                if persisted
+                else " WARNING: durable wake persistence did not succeed."
+            )
+            self._queue_owner_alert(
+                schedule.agent_name,
+                (
+                    "🚨 FIRED BUT UNDELIVERED: schedule "
+                    f"'{schedule.name}' (#{schedule.id}) for agent "
+                    f"'{schedule.agent_name}' was not confirmed: "
+                    f"{failure_reason}.{recovery}"
+                ),
+            )
 
-    async def _wake_and_confirm(self, schedule) -> bool:
+    async def _wait_for_wake_confirmation(
+        self,
+        schedule,
+        *,
+        attempt_started: asyncio.Event | None = None,
+    ) -> bool:
+        """Wait for one exact receipt, extending while positive liveness holds."""
+        delivery = asyncio.create_task(
+            self._wake_and_confirm(
+                schedule, attempt_started=attempt_started
+            )
+        )
+        try:
+            while True:
+                try:
+                    return await asyncio.wait_for(
+                        asyncio.shield(delivery),
+                        timeout=self._schedule_delivery_timeout,
+                    )
+                except asyncio.TimeoutError:
+                    if self._agent_busy_not_wedged(schedule.agent_name):
+                        _log(
+                            f"scheduler: receipt still pending for schedule "
+                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.agent_name}', but inflight watchdog "
+                            "reports busy-not-wedged; extending delivery timeout"
+                        )
+                        continue
+                    delivery.cancel()
+                    await asyncio.gather(delivery, return_exceptions=True)
+                    raise
+        except asyncio.CancelledError:
+            delivery.cancel()
+            await asyncio.gather(delivery, return_exceptions=True)
+            raise
+
+    def _agent_busy_not_wedged(self, agent_name: str) -> bool:
+        """Read the transport's live positive-liveness signal, failing closed."""
+        if self._delivery_busy_fn is None:
+            return False
+        try:
+            return self._delivery_busy_fn(agent_name) is True
+        except Exception as exc:
+            _log(
+                f"scheduler: busy-not-wedged check failed for "
+                f"'{agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return False
+
+    def _queue_owner_alert(self, agent_name: str, message: str) -> None:
+        """Start one owner alert with a strong task reference and loud failure."""
+        if self._owner_notify_callback is None:
+            _log(
+                f"scheduler: OWNER_NOTIFY_UNAVAILABLE for schedule-delivery "
+                f"alert agent '{agent_name}'"
+            )
+            return
+
+        async def _notify() -> None:
+            try:
+                result = self._owner_notify_callback(agent_name, message)
+                if inspect.isawaitable(result):
+                    result = await result
+                if result is not True:
+                    raise RuntimeError("owner notify returned no positive receipt")
+            except Exception as exc:
+                _log(
+                    f"scheduler: OWNER_NOTIFY_FAILURE for schedule-delivery "
+                    f"alert agent '{agent_name}': "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _log(
+                f"scheduler: OWNER_NOTIFY_FAILURE for schedule-delivery "
+                f"alert agent '{agent_name}': no running event loop"
+            )
+            return
+        task = loop.create_task(_notify())
+        self._owner_alert_tasks.add(task)
+        task.add_done_callback(self._owner_alert_tasks.discard)
+
+    def replay_pending_for_agent(self, agent_name: str) -> None:
+        """Replay the durable wake outbox after the agent's next session boot."""
+        existing = self._pending_replay_tasks.get(agent_name)
+        if existing is not None and not existing.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _log(
+                f"scheduler: persisted wake replay trigger for '{agent_name}' "
+                "has no running event loop; startup catch-up remains pending"
+            )
+            return
+        task = loop.create_task(self._replay_pending_for_agent(agent_name))
+        self._pending_replay_tasks[agent_name] = task
+
+        def _done(done: asyncio.Task) -> None:
+            if self._pending_replay_tasks.get(agent_name) is done:
+                self._pending_replay_tasks.pop(agent_name, None)
+            if not done.cancelled() and done.exception() is not None:
+                error = done.exception()
+                _log(
+                    f"scheduler: PERSISTED_WAKE_REPLAY_FAILURE for "
+                    f"'{agent_name}': {type(error).__name__}: {error}"
+                )
+
+        task.add_done_callback(_done)
+
+    async def _replay_pending_for_agent(self, agent_name: str) -> None:
+        """Deliver one agent's persisted wakes FIFO and retire exact successes."""
+        lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
+        async with lock:
+            await self._replay_pending_locked(agent_name)
+
+    async def _replay_pending_locked(self, agent_name: str) -> None:
+        """Replay FIFO pending wakes while the caller holds the agent lock."""
+        pending_wakes = self._registry.list_pending_schedule_wakes(agent_name)
+        for pending in pending_wakes:
+            current_schedule = self._registry.get_schedule(pending.schedule_id)
+            zombie_reason = ""
+            if current_schedule is None:
+                zombie_reason = "schedule deleted"
+            elif current_schedule.agent_name != pending.agent_name:
+                zombie_reason = "schedule reassigned to another agent"
+            elif not current_schedule.enabled and not current_schedule.one_shot:
+                zombie_reason = "schedule disabled"
+            if zombie_reason:
+                retired = self._registry.discard_pending_schedule_wake(
+                    pending.id
+                )
+                _log(
+                    f"scheduler: PERSISTED_WAKE_ZOMBIE_DROPPED pending "
+                    f"#{pending.id}, schedule #{pending.schedule_id} for "
+                    f"agent '{pending.agent_name}': {zombie_reason}; "
+                    f"outbox_retired={retired}"
+                )
+                continue
+            try:
+                confirmed = await self._wait_for_wake_confirmation(pending)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log(
+                    f"scheduler: persisted wake #{pending.id} for "
+                    f"'{agent_name}' remains pending after replay: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+                break
+            if not confirmed:
+                _log(
+                    f"scheduler: persisted wake #{pending.id} for "
+                    f"'{agent_name}' remains pending: no positive receipt"
+                )
+                break
+            delivered_at = time.time()
+            if not self._registry.confirm_pending_schedule_wake(
+                pending.id, delivered_at=delivered_at
+            ):
+                _log(
+                    f"scheduler: persisted wake #{pending.id} for "
+                    f"'{agent_name}' was confirmed but outbox retirement "
+                    "did not match a row"
+                )
+                break
+            if self._activity:
+                try:
+                    self._activity.log(
+                        agent_name,
+                        "schedule_delivered",
+                        f"Schedule '{pending.schedule_name}' persisted "
+                        "wake delivery confirmed",
+                    )
+                except Exception as exc:
+                    _log(
+                        f"scheduler: failed to record persisted wake "
+                        f"delivery activity for '{agent_name}': "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+            _log(
+                f"scheduler: persisted wake delivery confirmed for "
+                f"schedule '{pending.schedule_name}' "
+                f"(#{pending.schedule_id}) for agent '{agent_name}'"
+            )
+
+    async def _wake_and_confirm(
+        self,
+        schedule,
+        *,
+        attempt_started: asyncio.Event | None = None,
+    ) -> bool:
         """Invoke the wake callback and await its exact per-prompt receipt."""
+        if attempt_started is not None:
+            attempt_started.set()
         main_session_id = f"{schedule.agent_name}-main"
         result = await self._wake_callback(
             schedule.agent_name,

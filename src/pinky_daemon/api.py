@@ -3051,6 +3051,8 @@ def create_api(
     # Not part of the public API; harness should not depend on it.
     app.state._build_streaming_wake_context = _build_streaming_wake_context
 
+    _scheduler_holder: dict[str, AgentScheduler] = {}
+
     def _log_agent_wake_event(agent_name: str, reason: WakeReason) -> None:
         """Fires from SDK / tmux / codex sessions after a wake prompt is
         successfully delivered.
@@ -3076,6 +3078,21 @@ def create_api(
             _log(
                 f"api: agent_wake log failed for {agent_name} "
                 f"(reason={reason.value}): {e}"
+            )
+        # #949 startup catch-up: a durable wake must target a newly-booted
+        # session, not the in-memory deque that produced its negative receipt.
+        # This callback fires only after the orientation wake itself lands, so
+        # persisted scheduler prompts replay behind a proven-live boot. The
+        # holder is populated before application startup; keeping the callback
+        # synchronous lets each transport retain its existing delivery hook.
+        try:
+            scheduler_instance = _scheduler_holder.get("scheduler")
+            if scheduler_instance is not None:
+                scheduler_instance.replay_pending_for_agent(agent_name)
+        except Exception as e:
+            _log(
+                f"api: PERSISTED_WAKE_REPLAY_TRIGGER_FAILURE for "
+                f"{agent_name} (reason={reason.value}): {e}"
             )
 
     # Exposed for unit-test reach-in (verifying centralized wake logging
@@ -10426,6 +10443,52 @@ npm run build</pre>
             return False  # deliberately disconnected — leave it alone
         return True
 
+    def _scheduler_delivery_busy(agent_name: str) -> bool:
+        """Fresh positive-liveness signal used to extend receipt waits."""
+        ss = broker._get_streaming_session(agent_name)
+        if ss is None:
+            return False
+        stats = getattr(ss, "stats", None) or {}
+        return (
+            stats.get("inflight_busy_not_wedged") is True
+            or stats.get("inflight_active") is True
+        )
+
+    async def _notify_owner_undelivered(
+        agent_name: str, message: str
+    ) -> bool:
+        """Send scheduler failures through canonical owner destinations."""
+        send_callback = broker.send_callback
+        destinations = agents.get_owner_notification_destinations()
+        if not send_callback or not destinations:
+            return False
+        last_error = "no configured destination accepted the alert"
+        for destination in destinations:
+            try:
+                result = await send_callback(
+                    agent_name,
+                    destination["platform"],
+                    destination["conversation_id"],
+                    message,
+                    account_id=destination["account_id"],
+                )
+                if not (
+                    isinstance(result, dict)
+                    and result.get("sent") is True
+                ):
+                    raise RuntimeError(
+                        "send callback did not confirm delivery"
+                    )
+            except Exception as exc:
+                last_error = f"{type(exc).__name__}: {exc}"
+                continue
+            return True
+        _log(
+            f"api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+            f"agent '{agent_name}': {last_error}"
+        )
+        return False
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
@@ -10436,9 +10499,13 @@ npm run build</pre>
         librarian_callback=_librarian_callback,
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
+        delivery_busy_fn=_scheduler_delivery_busy,
+        owner_notify_callback=_notify_owner_undelivered,
         trigger_store=trigger_store,
         activity=activity,
     )
+    _scheduler_holder["scheduler"] = scheduler
+    app.state.scheduler = scheduler
 
     # Autonomy engine — self-directed work loops
     autonomy = AutonomyEngine(

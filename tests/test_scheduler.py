@@ -376,6 +376,42 @@ class TestAgentSchedules:
             delivered_at, abs=0.1
         )
 
+    def test_pending_schedule_wake_is_idempotent_until_confirmed(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="morning", prompt="check mail"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+
+        first, first_created = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="morning",
+            prompt="check mail",
+            fired_at=fired_at,
+        )
+        duplicate, duplicate_created = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="morning",
+            prompt="check mail",
+            fired_at=fired_at,
+        )
+
+        assert first_created is True
+        assert duplicate_created is False
+        assert duplicate.id == first.id
+        assert registry.list_pending_schedule_wakes("oleg") == [first]
+
+        delivered_at = time.time()
+        assert registry.confirm_pending_schedule_wake(
+            first.id, delivered_at=delivered_at
+        ) is True
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        stored = registry.get_schedules("oleg")[0]
+        assert stored.last_delivered == pytest.approx(delivered_at)
+
     def test_cascade_delete(self, registry):
         registry.register("oleg")
         registry.add_schedule("oleg", "0 8 * * *", name="morning")
@@ -811,8 +847,440 @@ class TestScheduler:
         stored = registry.get_schedules("oleg")[0]
         assert stored.last_run == pytest.approx(fired_at)
         assert stored.last_delivered == 0.0
+        pending = registry.list_pending_schedule_wakes("oleg")
+        assert [(wake.schedule_id, wake.prompt) for wake in pending] == [
+            (stored.id, "prompt")
+        ]
         assert events == ["schedule_fired", "schedule_undelivered"]
         assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_overlapping_fires_keep_distinct_exact_outbox_rows(
+        self, registry
+    ):
+        """A later tick must not replace an older cohort's fire identity."""
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg", "* * * * *", name="overlap", prompt="same schedule"
+        )
+        first_started = asyncio.Event()
+        attempts: list[str] = []
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            first_started.set()
+            return asyncio.get_running_loop().create_future()
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            schedule_delivery_timeout=0.03,
+        )
+        first_fire = 1_800_000_000.0
+        second_fire = first_fire + 60
+
+        await scheduler._check_schedules(first_fire)
+        await asyncio.wait_for(first_started.wait(), timeout=1)
+        await scheduler._check_schedules(second_fire)
+        delivery_tasks = list(scheduler._schedule_delivery_tasks)
+        await asyncio.wait_for(
+            asyncio.gather(*delivery_tasks, return_exceptions=True), timeout=1
+        )
+
+        assert attempts == ["same schedule", "same schedule"]
+        assert [
+            pending.fired_at
+            for pending in registry.list_pending_schedule_wakes("oleg")
+        ] == [first_fire, second_fire]
+
+    @pytest.mark.asyncio
+    async def test_busy_not_wedged_extends_receipt_timeout(self, registry, capsys):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="long-turn", prompt="after busy turn"
+        )
+        receipt = asyncio.get_running_loop().create_future()
+        busy_checks: list[str] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            asyncio.get_running_loop().call_later(
+                0.025, receipt.set_result, True
+            )
+            return receipt
+
+        def busy_fn(agent_name):
+            busy_checks.append(agent_name)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=busy_fn,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        assert len(busy_checks) >= 2
+        assert set(busy_checks) == {"oleg"}
+        assert registry.get_schedules("oleg")[0].last_delivered > 0
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        assert "busy-not-wedged; extending" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_undelivered_alerts_owner_and_replays_on_next_boot(
+        self, registry
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="durable", prompt="durable prompt"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        alerts: list[tuple[str, str]] = []
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        first_session = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+        )
+        await first_session._deliver_schedule(schedule)
+        await asyncio.sleep(0)
+
+        pending = registry.list_pending_schedule_wakes("oleg")
+        assert len(pending) == 1
+        assert alerts[0][0] == "oleg"
+        assert "FIRED BUT UNDELIVERED" in alerts[0][1]
+        assert "persisted for the agent's next session" in alerts[0][1]
+
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        next_session = AgentScheduler(registry, wake_callback=confirmed)
+        next_session.replay_pending_for_agent("oleg")
+        replay_task = next_session._pending_replay_tasks["oleg"]
+        await replay_task
+
+        assert attempts == ["durable prompt"]
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        assert registry.get_schedules("oleg")[0].last_delivered > 0
+
+    @pytest.mark.asyncio
+    async def test_persisted_fifo_replays_before_new_schedule_cohort(
+        self, registry
+    ):
+        registry.register("oleg")
+        older = registry.add_schedule(
+            "oleg", "0 8 * * *", name="older", prompt="older pending"
+        )
+        newer = registry.add_schedule(
+            "oleg", "0 9 * * *", name="newer", prompt="new live fire"
+        )
+        older_fired_at = time.time() - 60
+        registry.update_schedule_last_run(older.id, older_fired_at)
+        registry.persist_schedule_wake(
+            older.id,
+            agent_name="oleg",
+            schedule_name="older",
+            prompt="older pending",
+            fired_at=older_fired_at,
+        )
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        scheduler.replay_pending_for_agent("oleg")
+        await scheduler._deliver_schedule_group("oleg", [newer])
+
+        assert attempts == ["older pending", "new live fire"]
+        assert registry.list_pending_schedule_wakes("oleg") == []
+
+    @pytest.mark.asyncio
+    async def test_transient_oldest_replay_failure_halts_fifo(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="fifo", prompt="unused"
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="fifo",
+            prompt="oldest",
+            fired_at=100.0,
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="fifo",
+            prompt="newer",
+            fired_at=200.0,
+        )
+        attempts: list[str] = []
+
+        async def first_fails(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return False
+
+        scheduler = AgentScheduler(registry, wake_callback=first_fails)
+        scheduler.replay_pending_for_agent("oleg")
+        await scheduler._pending_replay_tasks["oleg"]
+
+        assert attempts == ["oldest"]
+        assert [
+            pending.prompt
+            for pending in registry.list_pending_schedule_wakes("oleg")
+        ] == ["oldest", "newer"]
+
+    @pytest.mark.asyncio
+    async def test_terminal_zombie_head_retires_and_fifo_advances(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        zombie = registry.add_schedule(
+            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+        )
+        live = registry.add_schedule(
+            "oleg", "* * * * *", name="live", prompt="unused"
+        )
+        registry.persist_schedule_wake(
+            zombie.id,
+            agent_name="oleg",
+            schedule_name="zombie",
+            prompt="never deliver",
+            fired_at=100.0,
+        )
+        registry.persist_schedule_wake(
+            live.id,
+            agent_name="oleg",
+            schedule_name="live",
+            prompt="live one",
+            fired_at=200.0,
+        )
+        registry.persist_schedule_wake(
+            live.id,
+            agent_name="oleg",
+            schedule_name="live",
+            prompt="live two",
+            fired_at=300.0,
+        )
+        registry.remove_schedule(zombie.id)
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        scheduler.replay_pending_for_agent("oleg")
+        await scheduler._pending_replay_tasks["oleg"]
+
+        assert attempts == ["live one", "live two"]
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        assert "PERSISTED_WAKE_ZOMBIE_DROPPED" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_new_cron_fire_does_not_replay_backlog_into_old_session(
+        self, registry
+    ):
+        registry.register("oleg")
+        older = registry.add_schedule(
+            "oleg", "0 8 * * *", name="older", prompt="next session only"
+        )
+        newer = registry.add_schedule(
+            "oleg", "0 9 * * *", name="newer", prompt="new live fire"
+        )
+        older_fired_at = time.time() - 60
+        registry.update_schedule_last_run(older.id, older_fired_at)
+        registry.persist_schedule_wake(
+            older.id,
+            agent_name="oleg",
+            schedule_name="older",
+            prompt="next session only",
+            fired_at=older_fired_at,
+        )
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+
+        await scheduler._deliver_schedule_group("oleg", [newer])
+
+        assert attempts == ["new live fire"]
+        assert [
+            pending.prompt
+            for pending in registry.list_pending_schedule_wakes("oleg")
+        ] == ["next session only"]
+
+    @pytest.mark.asyncio
+    async def test_canceled_cohort_waiting_for_boot_replay_is_persisted(
+        self, registry
+    ):
+        registry.register("oleg")
+        older = registry.add_schedule(
+            "oleg", "0 8 * * *", name="older", prompt="older pending"
+        )
+        newer = registry.add_schedule(
+            "oleg", "0 9 * * *", name="newer", prompt="new live fire"
+        )
+        older_fired_at = time.time() - 60
+        registry.update_schedule_last_run(older.id, older_fired_at)
+        registry.persist_schedule_wake(
+            older.id,
+            agent_name="oleg",
+            schedule_name="older",
+            prompt="older pending",
+            fired_at=older_fired_at,
+        )
+        newer_fired_at = time.time()
+        registry.update_schedule_last_run(newer.id, newer_fired_at)
+        newer.last_run = newer_fired_at
+        replay_started = asyncio.Event()
+
+        async def blocked(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            replay_started.set()
+            return asyncio.get_running_loop().create_future()
+
+        scheduler = AgentScheduler(registry, wake_callback=blocked)
+        scheduler.replay_pending_for_agent("oleg")
+        await asyncio.wait_for(replay_started.wait(), timeout=1)
+        cohort = asyncio.create_task(
+            scheduler._deliver_schedule_group("oleg", [newer])
+        )
+        await asyncio.sleep(0)
+
+        cohort.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cohort
+        replay = scheduler._pending_replay_tasks["oleg"]
+        replay.cancel()
+        await asyncio.gather(replay, return_exceptions=True)
+
+        assert [
+            pending.prompt
+            for pending in registry.list_pending_schedule_wakes("oleg")
+        ] == ["older pending", "new live fire"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("mutation", "reason"),
+        [("delete", "schedule deleted"), ("disable", "schedule disabled")],
+    )
+    async def test_replay_drops_deleted_or_disabled_zombie_wake(
+        self, registry, capsys, mutation, reason
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="obsolete", prompt="do not deliver"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="obsolete",
+            prompt="do not deliver",
+            fired_at=fired_at,
+        )
+        if mutation == "delete":
+            registry.remove_schedule(schedule.id)
+        else:
+            registry.toggle_schedule(schedule.id, False)
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        scheduler.replay_pending_for_agent("oleg")
+        replay_task = scheduler._pending_replay_tasks["oleg"]
+        await replay_task
+
+        assert attempts == []
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        error_log = capsys.readouterr().err
+        assert "PERSISTED_WAKE_ZOMBIE_DROPPED" in error_log
+        assert reason in error_log
+
+    @pytest.mark.asyncio
+    async def test_disabled_one_shot_replays_once_across_scheduler_restart(
+        self, registry
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="one-shot",
+            prompt="deliver exactly once",
+            one_shot=True,
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        registry.toggle_schedule(schedule.id, False)
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="one-shot",
+            prompt="deliver exactly once",
+            fired_at=fired_at,
+        )
+        db_path = registry._db_path
+        registry.close()
+        reopened = AgentRegistry(db_path=db_path)
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        try:
+            first_boot = AgentScheduler(
+                reopened, wake_callback=confirmed, tick_interval=3600
+            )
+            await first_boot.start()
+            first_replay = first_boot._pending_replay_tasks["oleg"]
+            await asyncio.wait_for(first_replay, timeout=1)
+            await first_boot.stop()
+
+            second_boot = AgentScheduler(
+                reopened, wake_callback=confirmed, tick_interval=3600
+            )
+            await second_boot.start()
+            await asyncio.sleep(0.01)
+            await second_boot.stop()
+
+            assert attempts == ["deliver exactly once"]
+            assert reopened.list_pending_schedule_wakes("oleg") == []
+        finally:
+            reopened.close()
 
     @pytest.mark.asyncio
     async def test_canceled_cohort_accounts_current_and_remaining_as_undelivered(
@@ -851,6 +1319,10 @@ class TestScheduler:
         assert attempts == ["first"]
         assert all(schedule.last_run > 0 for schedule in schedules)
         assert all(schedule.last_delivered == 0 for schedule in schedules)
+        assert [
+            pending.prompt
+            for pending in registry.list_pending_schedule_wakes("oleg")
+        ] == ["first", "second"]
         assert events == [
             "schedule_fired",
             "schedule_fired",
@@ -1346,12 +1818,14 @@ class TestDreamNonBlocking:
         registry.add_schedule("ivan", "* * * * *", name="mid-dream", prompt="hi")
         release = asyncio.Event()
         fired = []
+        receipt = asyncio.get_running_loop().create_future()
 
         async def dream_cb(agent_name, agent):
             await release.wait()
 
         async def wake_cb(agent_name, session_id, prompt):
             fired.append(agent_name)
+            return receipt
 
         scheduler = AgentScheduler(
             registry, dream_callback=dream_cb, wake_callback=wake_cb
@@ -1360,6 +1834,11 @@ class TestDreamNonBlocking:
         await asyncio.wait_for(scheduler._check_dreams(now), timeout=2)
         await asyncio.wait_for(scheduler._check_schedules(now), timeout=2)
         assert fired == ["ivan"]
+        delivery_tasks = list(scheduler._schedule_delivery_tasks)
+        assert delivery_tasks
+        assert all(not task.done() for task in delivery_tasks)
+        receipt.set_result(True)
+        await asyncio.wait_for(asyncio.gather(*delivery_tasks), timeout=2)
         release.set()
         await asyncio.wait_for(scheduler._dream_tasks["ivan"], timeout=2)
 
