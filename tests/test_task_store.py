@@ -365,6 +365,83 @@ class TestTaskConcurrency:
             store.close()
 
 
+class _StaleOnce:
+    """Wraps a real connection but raises 'database disk image is malformed' on the
+    first execute — simulating a thread-local handle whose WAL generation was
+    checkpointed/reset underneath it (#889). Later calls delegate normally.
+    """
+
+    def __init__(self, conn):
+        self._conn = conn
+        self._raised = False
+
+    def execute(self, *args, **kwargs):
+        if not self._raised:
+            self._raised = True
+            raise sqlite3.DatabaseError("database disk image is malformed")
+        return self._conn.execute(*args, **kwargs)
+
+    def close(self):
+        self._conn.close()
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+
+class TestStaleConnectionRecovery:
+    """#889 — the file is intact but the long-lived handle is stale; reads self-heal
+    by dropping and reopening the thread-local connection and retrying once.
+    """
+
+    def test_list_reopens_and_retries_on_malformed(self, store):
+        store.create("alpha", assigned_agent="onesie", status="pending")
+        poisoned = _StaleOnce(store._db)  # materialize a healthy conn, then poison it
+        store._thread_local.connection = poisoned
+
+        tasks = store.list(assigned_agent="onesie", status="pending")
+
+        assert [t.title for t in tasks] == ["alpha"]
+        # the poisoned handle was dropped; a fresh real connection is now in place
+        assert store._thread_local.connection is not poisoned
+        assert not isinstance(store._thread_local.connection, _StaleOnce)
+
+    def test_get_one_recovers(self, store):
+        created = store.create("beta")
+        store._thread_local.connection = _StaleOnce(store._db)
+
+        got = store.get(created.id)
+
+        assert got is not None
+        assert got.title == "beta"
+
+    def test_retry_is_bounded_to_once(self, store):
+        """If the handle stays broken, the error propagates (no infinite retry)."""
+        store.create("gamma")
+
+        class AlwaysMalformed:
+            def execute(self, *a, **k):
+                raise sqlite3.DatabaseError("database disk image is malformed")
+
+            def close(self):
+                pass
+
+        store._thread_local.connection = AlwaysMalformed()
+        # first attempt raises -> reset -> _db reopens a *real* connection, which
+        # succeeds; to prove the bound, force reopen to also yield a broken handle.
+        store._reset_connection()
+        store._thread_local.connection = AlwaysMalformed()
+        original_reset = store._reset_connection
+        store._reset_connection = lambda: setattr(
+            store._thread_local, "connection", AlwaysMalformed()
+        )
+        try:
+            with pytest.raises(sqlite3.DatabaseError):
+                store.list()
+        finally:
+            store._reset_connection = original_reset
+            store._reset_connection()
+
+
 class TestTaskAPI:
     def _make_client(self):
         fd, path = tempfile.mkstemp(suffix=".db")

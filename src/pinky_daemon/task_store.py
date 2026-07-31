@@ -200,6 +200,45 @@ class TaskStore:
             self._thread_local.connection = connection
         return connection
 
+    def _reset_connection(self) -> None:
+        """Drop the calling thread's cached connection so the next access reopens it.
+
+        Recovers from a stale WAL generation (see #889): the database file is intact
+        (integrity_check passes from a separate process) but this long-lived handle's
+        page cache still references a WAL that was checkpointed/reset underneath it,
+        which surfaces as "database disk image is malformed" on every statement.
+        Reopening rebinds to the current generation; the file itself is never touched.
+        """
+        connection = getattr(self._thread_local, "connection", None)
+        if connection is not None:
+            try:
+                connection.close()
+            except sqlite3.Error:
+                pass
+            self._thread_local.connection = None
+
+    def _read(self, sql: str, params=()) -> list:
+        """Run a read-only query, healing a stale connection once (see #889).
+
+        On DatabaseError the thread-local handle is dropped and reopened, then the
+        query is retried exactly once. This is safe for reads: the error fires before
+        any row is produced, so a retry cannot double-apply anything. Write paths are
+        deliberately NOT routed through here — a blind retry could re-apply a
+        statement that had partially landed before the handle went bad; hardening the
+        write path is a separate, deliberate pass.
+        """
+        try:
+            return self._db.execute(sql, params).fetchall()
+        except sqlite3.DatabaseError as exc:
+            _log(f"task_store: read hit stale handle ({exc}); reopening connection, retry 1/1")
+            self._reset_connection()
+            return self._db.execute(sql, params).fetchall()
+
+    def _read_one(self, sql: str, params=()):
+        """Single-row variant of :meth:`_read` (see #889). Returns the first row or None."""
+        rows = self._read(sql, params)
+        return rows[0] if rows else None
+
     def _init_tables(self) -> None:
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS projects (
@@ -340,9 +379,7 @@ class TaskStore:
 
     def get(self, task_id: int) -> Task | None:
         """Get a task by ID."""
-        row = self._db.execute(
-            "SELECT * FROM tasks WHERE id=?", (task_id,)
-        ).fetchone()
+        row = self._read_one("SELECT * FROM tasks WHERE id=?", (task_id,))
         if not row:
             return None
         return self._row_to_task(row)
@@ -442,7 +479,7 @@ class TaskStore:
         where = f"WHERE {' AND '.join(conditions)}" if conditions else ""
         params.append(limit)
 
-        rows = self._db.execute(
+        rows = self._read(
             f"""SELECT * FROM tasks {where}
                 ORDER BY
                     CASE priority WHEN 'urgent' THEN 0 WHEN 'high' THEN 1
@@ -450,7 +487,7 @@ class TaskStore:
                     created_at DESC
                 LIMIT ?""",
             params,
-        ).fetchall()
+        )
 
         return [self._row_to_task(r) for r in rows]
 
@@ -460,18 +497,16 @@ class TaskStore:
 
     def count_by_status(self) -> dict[str, int]:
         """Get task counts grouped by status."""
-        rows = self._db.execute(
-            "SELECT status, COUNT(*) FROM tasks GROUP BY status"
-        ).fetchall()
+        rows = self._read("SELECT status, COUNT(*) FROM tasks GROUP BY status")
         return {r[0]: r[1] for r in rows}
 
     def count_by_agent(self) -> dict[str, int]:
         """Get active task counts grouped by assigned agent."""
-        rows = self._db.execute(
+        rows = self._read(
             """SELECT assigned_agent, COUNT(*) FROM tasks
                WHERE status NOT IN ('completed', 'cancelled') AND assigned_agent != ''
                GROUP BY assigned_agent"""
-        ).fetchall()
+        )
         return {r[0]: r[1] for r in rows}
 
     # ── Helpers ────────────────────────────────────────────
@@ -537,10 +572,10 @@ class TaskStore:
 
     def get_project(self, project_id: int) -> Project | None:
         """Get a project by ID."""
-        row = self._db.execute(
+        row = self._read_one(
             f"SELECT {self._P_COLS} FROM projects WHERE id=?",
             (project_id,),
-        ).fetchone()
+        )
         if not row:
             return None
         return self._row_to_project(row)
@@ -548,13 +583,13 @@ class TaskStore:
     def list_projects(self, *, include_archived: bool = False) -> list[Project]:
         """List all projects."""
         if include_archived:
-            rows = self._db.execute(
+            rows = self._read(
                 f"SELECT {self._P_COLS} FROM projects ORDER BY updated_at DESC"
-            ).fetchall()
+            )
         else:
-            rows = self._db.execute(
+            rows = self._read(
                 f"SELECT {self._P_COLS} FROM projects WHERE status != 'archived' ORDER BY updated_at DESC"
-            ).fetchall()
+            )
         return [self._row_to_project(r) for r in rows]
 
     def update_project(self, project_id: int, **kwargs) -> Project | None:
@@ -618,11 +653,11 @@ class TaskStore:
 
     def get_milestone(self, milestone_id: int) -> Milestone | None:
         """Get a milestone by ID."""
-        row = self._db.execute(
+        row = self._read_one(
             "SELECT id, project_id, name, description, due_date, status, created_at, updated_at"
             " FROM milestones WHERE id=?",
             (milestone_id,),
-        ).fetchone()
+        )
         if not row:
             return None
         return Milestone(
@@ -632,11 +667,11 @@ class TaskStore:
 
     def list_milestones(self, project_id: int) -> list[Milestone]:
         """List all milestones for a project."""
-        rows = self._db.execute(
+        rows = self._read(
             "SELECT id, project_id, name, description, due_date, status, created_at, updated_at"
             " FROM milestones WHERE project_id=? ORDER BY due_date ASC, created_at ASC",
             (project_id,),
-        ).fetchall()
+        )
         return [
             Milestone(
                 id=r[0], project_id=r[1], name=r[2], description=r[3],
@@ -706,11 +741,11 @@ class TaskStore:
 
     def get_sprint(self, sprint_id: int) -> Sprint | None:
         """Get a sprint by ID."""
-        row = self._db.execute(
+        row = self._read_one(
             "SELECT id, project_id, name, goal, start_date, end_date, status, created_at, updated_at"
             " FROM sprints WHERE id=?",
             (sprint_id,),
-        ).fetchone()
+        )
         if not row:
             return None
         return self._row_to_sprint(row)
@@ -718,17 +753,17 @@ class TaskStore:
     def list_sprints(self, project_id: int, include_completed: bool = False) -> list[Sprint]:
         """List sprints for a project."""
         if include_completed:
-            rows = self._db.execute(
+            rows = self._read(
                 "SELECT id, project_id, name, goal, start_date, end_date, status, created_at, updated_at"
                 " FROM sprints WHERE project_id=? ORDER BY created_at DESC",
                 (project_id,),
-            ).fetchall()
+            )
         else:
-            rows = self._db.execute(
+            rows = self._read(
                 "SELECT id, project_id, name, goal, start_date, end_date, status, created_at, updated_at"
                 " FROM sprints WHERE project_id=? AND status != 'completed' ORDER BY created_at DESC",
                 (project_id,),
-            ).fetchall()
+            )
         return [self._row_to_sprint(r) for r in rows]
 
     def update_sprint(self, sprint_id: int, **kwargs) -> Sprint | None:
@@ -776,10 +811,10 @@ class TaskStore:
 
     def count_tasks_by_sprint(self, sprint_id: int) -> dict:
         """Return total and completed task counts for a sprint."""
-        rows = self._db.execute(
+        rows = self._read(
             "SELECT status, COUNT(*) FROM tasks WHERE sprint_id=? GROUP BY status",
             (sprint_id,),
-        ).fetchall()
+        )
         counts = {r[0]: r[1] for r in rows}
         total = sum(counts.values())
         completed = counts.get("completed", 0) + counts.get("cancelled", 0)
@@ -797,10 +832,10 @@ class TaskStore:
         if not sprint:
             return []
 
-        rows = self._db.execute(
+        rows = self._read(
             "SELECT status, updated_at FROM tasks WHERE sprint_id=?",
             (sprint_id,),
-        ).fetchall()
+        )
 
         total = len(rows)
         if not total:
@@ -853,19 +888,19 @@ class TaskStore:
 
     def count_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
         """Return task counts keyed by milestone_id for a project."""
-        rows = self._db.execute(
+        rows = self._read(
             "SELECT milestone_id, COUNT(*) FROM tasks WHERE project_id=? GROUP BY milestone_id",
             (project_id,),
-        ).fetchall()
+        )
         return {r[0]: r[1] for r in rows}
 
     def count_completed_tasks_by_milestone(self, project_id: int) -> dict[int, int]:
         """Return completed task counts keyed by milestone_id for a project."""
-        rows = self._db.execute(
+        rows = self._read(
             "SELECT milestone_id, COUNT(*) FROM tasks"
             " WHERE project_id=? AND status IN ('completed', 'cancelled') GROUP BY milestone_id",
             (project_id,),
-        ).fetchall()
+        )
         return {r[0]: r[1] for r in rows}
 
     # ── Comments ───────────────────────────────────────────
@@ -883,10 +918,10 @@ class TaskStore:
 
     def get_comments(self, task_id: int, *, limit: int = 50) -> list[TaskComment]:
         """Get comments for a task, newest first."""
-        rows = self._db.execute(
+        rows = self._read(
             "SELECT id, task_id, author, content, created_at FROM task_comments WHERE task_id=? ORDER BY created_at DESC LIMIT ?",
             (task_id, limit),
-        ).fetchall()
+        )
         return [
             TaskComment(id=r[0], task_id=r[1], author=r[2], content=r[3], created_at=r[4])
             for r in rows
