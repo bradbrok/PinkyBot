@@ -115,6 +115,7 @@ class DreamRunner:
         if connection is None:
             connection = sqlite3.connect(self._db_path)
             connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=30000")
             self._thread_local.connection = connection
         return connection
 

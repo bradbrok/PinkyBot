@@ -154,6 +154,7 @@ class SkillStore:
         if connection is None:
             connection = sqlite3.connect(self._db_path)
             connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA foreign_keys=ON")
             self._thread_local.connection = connection
         return connection
