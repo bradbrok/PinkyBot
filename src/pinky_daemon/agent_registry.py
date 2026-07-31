@@ -1809,13 +1809,46 @@ class AgentRegistry:
 
         hook_template = '''\
 #!/usr/bin/env python3
-import hashlib, hmac, base64, time, urllib.request, json, os, sys
+import hashlib, hmac, base64, time, urllib.request, json, os, subprocess, sys, tempfile
+
+agent = "{agent_name}"
+status = "{status}"
+
+def emit_failure(literal, detail):
+    message = "%s agent=%s status=%s error=%s" % (literal, agent, status, detail)
+    # The hook runs inside a tmux pane, whose stderr is not guaranteed to
+    # reach the daemon's systemd journal. Send failures to the host logger as
+    # the durable operator receipt, with stderr as a portable fallback.
+    try:
+        subprocess.run(
+            ["logger", "-t", "pinkybot-status-hook", message],
+            timeout=1,
+            check=False,
+        )
+    except Exception:
+        pass
+    print(message, file=sys.stderr, flush=True)
 
 secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
+    # One durable receipt per tmux/Claude session. Hook commands are separate
+    # subprocesses, so an O_EXCL marker keyed by their inherited session ID is
+    # the cheap cross-invocation once guard.
+    marker = os.path.join(
+        tempfile.gettempdir(),
+        "pinkybot-status-hook-%s-%s.missing-secret" % (agent, os.getsid(0)),
+    )
+    try:
+        fd = os.open(marker, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600)
+    except FileExistsError:
+        pass
+    except Exception as exc:
+        emit_failure("STATUS_HOOK_SECRET_MISSING", "marker: %s" % exc)
+    else:
+        os.close(fd)
+        emit_failure("STATUS_HOOK_SECRET_MISSING", "no signing key in hook env")
     sys.exit(0)
 
-agent = "{agent_name}"
 path = "/agents/{agent_name}/status"
 ts = int(time.time())
 payload = f"{{agent}}\\nPOST\\n{{path}}\\n{{ts}}".encode()
@@ -1833,8 +1866,11 @@ req.add_header("x-pinky-timestamp", str(ts))
 req.add_header("x-pinky-signature", sig)
 try:
     urllib.request.urlopen(req, timeout=2)
-except Exception:
-    pass
+except Exception as exc:
+    emit_failure(
+        "STATUS_HOOK_POST_FAILURE",
+        "%s: %s" % (type(exc).__name__, exc),
+    )
 '''
         working_path = claude_dir / "hook_working.py"
         idle_path = claude_dir / "hook_idle.py"
@@ -1962,8 +1998,10 @@ except Exception:
             f"python3 {shlex.quote(str(verify_effort_path))}"
             f' "$CLAUDE_PROJECT_DIR" 2>/dev/null || true'
         )
-        working_cmd = f"python3 {shlex.quote(str(working_path))} 2>/dev/null || true"
-        idle_cmd = f"python3 {shlex.quote(str(idle_path))} 2>/dev/null || true"
+        # Do not suppress stderr: STATUS_HOOK_POST_FAILURE is a release
+        # receipt when the direct POST (and possibly host logger) fails.
+        working_cmd = f"python3 {shlex.quote(str(working_path))} || true"
+        idle_cmd = f"python3 {shlex.quote(str(idle_path))} || true"
         tmux_wake_cmd = f"python3 {shlex.quote(str(tmux_wake_path))} 2>/dev/null || true"
         tmux_session_start_cmd = (
             f"python3 {shlex.quote(str(tmux_session_start_path))} 2>/dev/null || true"
@@ -2060,6 +2098,21 @@ except Exception:
         changed = False
         hooks = data.setdefault("hooks", {})
 
+        # Working/idle status hooks predate the managed merge path.  Existing
+        # settings.json files could therefore retain SessionStart/tmux hooks
+        # while silently missing the only writers of live_status.  Repair both
+        # on every workspace sync, just like the newer managed hooks.
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "PreToolUse",
+            needle=str(working_path),
+            command=working_cmd,
+        )
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "Stop",
+            needle=str(idle_path),
+            command=idle_cmd,
+        )
+
         # verify_effort hook → PreToolUse bucket
         changed |= AgentRegistry._merge_hook_into_event(
             hooks, "PreToolUse",
@@ -2124,7 +2177,15 @@ except Exception:
         for entry in event_list:
             for h in entry.get("hooks", []):
                 if needle in (h.get("command") or ""):
-                    return False
+                    if h.get("type") == "command" and h.get("command") == command:
+                        return False
+                    # PinkyBot-managed hook paths are the identity.  Upgrade
+                    # stale command wrappers in place (for example, remove the
+                    # historical ``2>/dev/null`` status-hook sink) instead of
+                    # treating any path match as permanently current.
+                    h["type"] = "command"
+                    h["command"] = command
+                    return True
 
         target_bucket = None
         for entry in event_list:

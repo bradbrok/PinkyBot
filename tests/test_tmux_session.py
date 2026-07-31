@@ -47,6 +47,7 @@ def _seed_inflight(
     completion_event: asyncio.Event | None = None,
     prompt: str = "",
     fresh_context_epoch: int = 0,
+    transport_accepted: bool = True,
 ) -> _InflightMeta:
     """Append one ``_InflightMeta`` entry to ``ss._inflight_metas``.
 
@@ -68,6 +69,7 @@ def _seed_inflight(
         message_id=m.get("message_id", ""),
         internal=internal,
         completion_event=completion_event,
+        transport_accepted=transport_accepted,
     )
     entry = _InflightMeta(
         meta=m,
@@ -3635,6 +3637,81 @@ async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_watchdog_force_restart_replays_unaccepted_scheduler_head(
+    monkeypatch,
+) -> None:
+    """#943 / Murzik terminal block: a serialized scheduler head must keep its
+    pending receipt, cross a real force_restart, and repaste without waiting on
+    itself in the ordinary replay worker."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.02)
+
+    live = {"status": "idle", "last_updated": _time.time()}
+    ss, tmux = _make_session()
+    ss._config.live_status_fn = lambda: live
+    ss._transcript_recently_grew = lambda *_args: False
+    ss._background_tasks_recently_active = lambda *_args: False
+    ss._foreground_tool_in_flight = lambda *_args: False
+    ss._pane_is_animating = AsyncMock(return_value=False)
+
+    async def _spawn_with_current_idle(*_args, **_kwargs):
+        live.update(status="idle", last_updated=_time.time())
+        return _ok()
+
+    tmux.new_session = AsyncMock(side_effect=_spawn_with_current_idle)
+    await ss.connect()
+
+    receipt = await ss.send_scheduler_prompt("one-shot scheduled wake")
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1 and ss._inflight_metas:
+            break
+        await asyncio.sleep(0.01)
+    assert tmux.paste_text.await_count == 1
+    assert len(ss._inflight_metas) == 1
+    original = ss._inflight_metas[0].turn
+    assert original.scheduler_serialized is True
+    assert not original.transport_accepted
+    assert not receipt.done()
+
+    # Freeze the current pane in a fresh "working" state so the watchdog takes
+    # its real wedged→force_restart recovery path.
+    live.update(status="working", last_updated=_time.time())
+    ss._head_started_at = 0.0
+
+    for _ in range(300):
+        if (
+            tmux.new_session.await_count >= 2
+            and tmux.paste_text.await_count >= 2
+            and len(ss._inflight_metas) == 1
+            and ss._inflight_metas[0].turn is original
+            and ss._inflight_turn is None
+        ):
+            break
+        await asyncio.sleep(0.01)
+
+    assert ss.state == SessionState.CONNECTED
+    assert tmux.new_session.await_count == 2
+    assert [
+        call.args[0] for call in tmux.paste_text.await_args_list
+    ] == ["one-shot scheduled wake", "one-shot scheduled wake"]
+    assert len(ss._inflight_metas) == 1
+    assert ss._inflight_metas[0].turn is original
+    assert original.replay_count == 1
+    assert not original.transport_accepted
+    assert not receipt.done(), "force_restart must preserve the exact receipt"
+
+    ss._on_transcript_entry({
+        "type": "user",
+        "message": {
+            "role": "user",
+            "content": "one-shot scheduled wake",
+        },
+    })
+    assert await receipt is True
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("steering_starts_before_stop", [True, False])
 async def test_second_scheduler_prompt_delivers_after_first_receipt_and_stop(
     steering_starts_before_stop: bool,
@@ -3980,8 +4057,9 @@ async def test_worker_force_restarts_on_turn_done_timeout(monkeypatch) -> None:
     assert ss._has_completed_turn is False
     assert force_restart_results == [True]
     guard.assert_not_called()
-    # Deque was drained by the watchdog's force_restart path.
-    assert len(ss._inflight_metas) == 0
+    # #943: the prompt had no transcript acceptance receipt, so the restart
+    # must preserve exactly one copy (queued or already re-dispatched).
+    assert len(ss._inflight_metas) + ss._message_queue.qsize() == 1
 
     await ss.disconnect()
 
@@ -6672,6 +6750,19 @@ class TestForceFreshContextOnce:
             "a prior transcript exists"
         )
 
+    def test_prior_transcript_is_informational_on_force_fresh_build(self):
+        """#943 Fix-C adjudication: prior history may exist, but a force-fresh
+        context_restart passes neither --continue nor a transcript argument."""
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        cmd = ss._build_claude_cmd()
+
+        assert ss._last_launch_had_prior_transcript is True
+        assert ss._last_launch_used_continue is False
+        assert "--continue" not in shlex.split(cmd)
+
     def test_build_claude_cmd_records_launch_mode_on_session(self):
         ss, _ = _make_session()
         ss._has_prior_transcript = lambda: True
@@ -8008,6 +8099,95 @@ class TestInflightDequeConcurrentDispatch:
         # Stats updated.
         assert ss._stats.get("turn_timeouts", 0) == 1
 
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_requeues_unaccepted_head_across_force_restart(
+        self, monkeypatch,
+    ):
+        """#943: a pasted head with no transcript acceptance receipt is
+        undelivered and must survive the discarding force_restart boundary."""
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        assert ss._worker_task is not None
+        ss._worker_task.cancel()
+        try:
+            await ss._worker_task
+        except asyncio.CancelledError:
+            pass
+
+        force_called = asyncio.Event()
+
+        async def _stub_force_restart(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub_force_restart
+        completion = asyncio.Event()
+        original = _seed_inflight(
+            ss,
+            prompt="one-shot wake payload",
+            completion_event=completion,
+            transport_accepted=False,
+        ).turn
+        ss._head_started_at = 0.0
+
+        try:
+            await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        except asyncio.TimeoutError:
+            pytest.fail("watchdog must schedule force_restart")
+
+        assert ss._message_queue.qsize() == 1
+        replay = ss._message_queue.get_nowait()
+        assert replay is original
+        assert replay.prompt == "one-shot wake payload"
+        assert replay.replay_count == 1
+        assert not completion.is_set(), (
+            "unaccepted head completion waits for the replay, not restart"
+        )
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_vetoes_frozen_pre_session_live_status(
+        self, monkeypatch, capsys,
+    ):
+        """#943: frozen live_last_updated + a static/idle pane is unknown
+        evidence and must never trigger force_restart."""
+        from pinky_daemon import tmux_session as _ts
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+        ss._pane_is_animating = AsyncMock(return_value=False)
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": ss._current_session_started_at - 1.0,
+        }
+        _seed_inflight(ss, prompt="wake")
+        ss._head_started_at = 0.0
+
+        restarted = asyncio.Event()
+
+        async def _must_not_restart(*, bypass_guard: bool = False):
+            restarted.set()
+            return True
+
+        ss.force_restart = _must_not_restart
+        await asyncio.sleep(0.15)
+
+        assert not restarted.is_set()
+        assert len(ss._inflight_metas) == 1
+        assert ss._head_started_at is not None and ss._head_started_at > 0
+        assert ss._pane_is_animating.await_count == 0
+        assert "WATCHDOG_STALE_LIVE_STATUS_VETO" in capsys.readouterr().err
         await ss.disconnect()
 
     @pytest.mark.asyncio

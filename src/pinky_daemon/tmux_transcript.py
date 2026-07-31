@@ -71,6 +71,12 @@ _FALLBACK_POLL_SEC = 2.0
 # to do on a hot file.
 _ACTIVE_POLL_SEC = 0.2
 
+# A freshly-bound transcript path may be reported before Claude Code creates
+# the JSONL.  During that brief gap discovery keeps returning the previous
+# session's stale file.  Keep the #291 guard, but rate-limit its operator log
+# so active polling cannot flood the journal at 5 lines/second.
+_STALE_DISCOVERY_LOG_INTERVAL_SEC = 30.0
+
 # Max bytes read per ``_read_and_dispatch`` invocation. Bounds memory if the
 # transcript path ever points at something pathologically large (per
 # Pushok's PR #496 round-1 Case 4a: the daemon endpoint's docstring claims
@@ -348,6 +354,7 @@ class TmuxTranscriptTailer:
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._stopped = False
+        self._last_stale_discovery_log_at = 0.0
         self._stats = {
             "turns_fired": 0,
             "lines_read": 0,
@@ -635,12 +642,19 @@ class TmuxTranscriptTailer:
         except OSError:
             return
         if discovered_mtime < self._path_bound_at:
-            _log(
-                f"tmux_tailer[{self._agent_name}]: self-heal SKIP stale "
-                f"discovery {discovered} (mtime {discovered_mtime:.0f} predates "
-                f"bind {self._path_bound_at:.0f}) — awaiting bound path to "
-                f"materialise (#291)"
-            )
+            monotonic_now = time.monotonic()
+            if (
+                self._last_stale_discovery_log_at == 0.0
+                or monotonic_now - self._last_stale_discovery_log_at
+                >= _STALE_DISCOVERY_LOG_INTERVAL_SEC
+            ):
+                _log(
+                    f"tmux_tailer[{self._agent_name}]: self-heal SKIP stale "
+                    f"discovery {discovered} (mtime {discovered_mtime:.0f} "
+                    f"predates bind {self._path_bound_at:.0f}) — awaiting "
+                    f"bound path to materialise (#291)"
+                )
+                self._last_stale_discovery_log_at = monotonic_now
             self._stats["self_heal_stale_skips"] += 1
             return
         _log(

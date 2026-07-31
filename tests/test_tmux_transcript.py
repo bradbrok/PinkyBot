@@ -1173,6 +1173,31 @@ class TestSelfHealDiscovery:
         assert tailer.stats["self_heal_stale_skips"] == 1
 
     @pytest.mark.asyncio
+    async def test_stale_discovery_skip_log_is_rate_limited(
+        self, tmp_path, monkeypatch, capsys,
+    ):
+        """#943: active polling must not flood the journal with #291 skips."""
+        cb = _Captor()
+        old = tmp_path / "old-session.jsonl"
+        _write_jsonl(old, [_assistant(text="old"), _stop_hook_summary()])
+        os.utime(old, (time.time() - 3600, time.time() - 3600))
+        fresh = tmp_path / "fresh-session.jsonl"
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl", cb,
+            path_discovery=lambda: old,
+        )
+        tailer.set_transcript_path(fresh)
+        monkeypatch.setattr(
+            "pinky_daemon.tmux_transcript.time.monotonic", lambda: 100.0,
+        )
+
+        tailer._try_self_heal_repoint()
+        tailer._try_self_heal_repoint()
+
+        assert tailer.stats["self_heal_stale_skips"] == 2
+        assert capsys.readouterr().err.count("self-heal SKIP stale discovery") == 1
+
+    @pytest.mark.asyncio
     async def test_self_heal_strict_floor_blocks_recent_previous_session(self, tmp_path):
         """#291: the floor is STRICT (no slack). The clobber target is often the
         *immediately* preceding session, whose last write can be only seconds
