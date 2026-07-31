@@ -12767,7 +12767,7 @@ npm run build</pre>
     _aiena_logger = _logging_mod.getLogger("aiena.approve")
     _AIENA_PIPELINE = "/var/www/aiena.it/data/pipeline.json"
     _AIENA_SB_URL   = "https://fwyjxolljcogblvwvfca.supabase.co"
-    _AIENA_SB_KEY   = "sb_secret_mIKFJoDc9O-8fyPJ2N8uuA_hml1hf-4"
+    _AIENA_SB_KEY   = _os_mod.environ.get("AIENA_SB_KEY", "")
     _AIENA_SB_HDR   = {
         "apikey": _AIENA_SB_KEY,
         "Authorization": f"Bearer {_AIENA_SB_KEY}",
