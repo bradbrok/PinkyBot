@@ -220,16 +220,24 @@ class TaskStore:
     def _read(self, sql: str, params=()) -> list:
         """Run a read-only query, healing a stale connection once (see #889).
 
-        On DatabaseError the thread-local handle is dropped and reopened, then the
-        query is retried exactly once. This is safe for reads: the error fires before
-        any row is produced, so a retry cannot double-apply anything. Write paths are
-        deliberately NOT routed through here — a blind retry could re-apply a
-        statement that had partially landed before the handle went bad; hardening the
-        write path is a separate, deliberate pass.
+        On DatabaseError outside a transaction, the thread-local handle is dropped
+        and reopened, then the query is retried exactly once. This is safe for reads:
+        the error fires before any row is produced, so a retry cannot double-apply
+        anything. Inside a transaction the error propagates without resetting the
+        handle, because closing it would silently roll back pending writes. Write
+        paths are deliberately NOT routed through here — a blind retry could re-apply
+        a statement that had partially landed before the handle went bad; hardening
+        the write path is a separate, deliberate pass.
         """
         try:
             return self._db.execute(sql, params).fetchall()
         except sqlite3.DatabaseError as exc:
+            if self._db.in_transaction:
+                _log(
+                    f"task_store: read failed inside transaction ({exc}); "
+                    "propagating without reopening connection"
+                )
+                raise
             _log(f"task_store: read hit stale handle ({exc}); reopening connection, retry 1/1")
             self._reset_connection()
             return self._db.execute(sql, params).fetchall()

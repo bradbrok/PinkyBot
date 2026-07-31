@@ -419,6 +419,8 @@ class TestStaleConnectionRecovery:
         store.create("gamma")
 
         class AlwaysMalformed:
+            in_transaction = False
+
             def execute(self, *a, **k):
                 raise sqlite3.DatabaseError("database disk image is malformed")
 
@@ -440,6 +442,43 @@ class TestStaleConnectionRecovery:
         finally:
             store._reset_connection = original_reset
             store._reset_connection()
+
+    def test_mid_transaction_read_failure_does_not_reset_or_activate_two_sprints(
+        self, store
+    ):
+        project = store.create_project("transaction guard")
+        current = store.create_sprint(project.id, "current")
+        target = store.create_sprint(project.id, "target")
+        store.update_sprint(current.id, status="active")
+
+        class FailReadInTransaction:
+            def __init__(self, conn):
+                self._conn = conn
+                self.close_calls = 0
+
+            def execute(self, sql, *args, **kwargs):
+                if self._conn.in_transaction and sql.lstrip().upper().startswith("SELECT"):
+                    raise sqlite3.DatabaseError("database disk image is malformed")
+                return self._conn.execute(sql, *args, **kwargs)
+
+            def close(self):
+                self.close_calls += 1
+                self._conn.close()
+
+            def __getattr__(self, name):
+                return getattr(self._conn, name)
+
+        poisoned = FailReadInTransaction(store._db)
+        store._thread_local.connection = poisoned
+
+        with pytest.raises(sqlite3.DatabaseError, match="malformed"):
+            store.start_sprint(target.id)
+
+        assert store._thread_local.connection is poisoned
+        assert poisoned.close_calls == 0
+        with sqlite3.connect(store._db_path) as observer:
+            statuses = dict(observer.execute("SELECT id, status FROM sprints"))
+        assert statuses == {current.id: "active", target.id: "planned"}
 
 
 class TestTaskAPI:
