@@ -70,6 +70,12 @@ def _effective_permission_mode(agent_config: dict[str, Any]) -> str:
     """Choose an ACP-specific daemon policy without inheriting unsafe bypass."""
     agent_name = str(agent_config.get("name", "unknown"))
     override = os.environ.get("PINKY_ACP_PERMISSION_MODE", "")
+    if override == "bypassPermissions":
+        _stderr(
+            f"agent '{agent_name}' bypassPermissions is not permitted on the ACP "
+            "surface (owner policy); using dontAsk"
+        )
+        return "dontAsk"
     if override:
         _stderr(
             f"agent '{agent_name}' ACP permission mode is '{override}' from "
@@ -82,14 +88,13 @@ def _effective_permission_mode(agent_config: dict[str, Any]) -> str:
     if configured == "bypassPermissions":
         _stderr(
             f"agent '{agent_name}' is configured bypassPermissions; ACP surface "
-            "downgrades to dontAsk — set PINKY_ACP_PERMISSION_MODE to "
-            "override deliberately"
+            "downgrades to dontAsk"
         )
         return "dontAsk"
     if not configured:
         _stderr(
             f"agent '{agent_name}' has no configured permission mode; ACP surface "
-            "uses dontAsk — set PINKY_ACP_PERMISSION_MODE to override deliberately"
+            "uses dontAsk"
         )
         return "dontAsk"
 

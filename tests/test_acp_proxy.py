@@ -245,7 +245,7 @@ async def test_empty_agent_mode_uses_dont_ask_and_acp_default_allowlist(
 
 
 @pytest.mark.asyncio
-async def test_acp_permission_env_override_allows_deliberate_bypass(
+async def test_acp_permission_env_override_refuses_bypass(
     tmp_path, monkeypatch, capsys
 ):
     monkeypatch.setenv("PINKY_ACP_PERMISSION_MODE", "bypassPermissions")
@@ -263,9 +263,35 @@ async def test_acp_permission_env_override_allows_deliberate_bypass(
 
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert create_bodies[0]["permission_mode"] == "bypassPermissions"
+    assert create_bodies[0]["permission_mode"] == "dontAsk"
+    assert (
+        "bypassPermissions is not permitted on the ACP surface (owner policy); "
+        "using dontAsk"
+    ) in captured.err
+
+
+@pytest.mark.asyncio
+async def test_acp_permission_env_override_honors_non_bypass_mode(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PINKY_ACP_PERMISSION_MODE", "default")
+    create_bodies: list[dict[str, Any]] = []
+    config = {**_agent_config(), "permission_mode": "bypassPermissions"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _response(200, config)
+        create_bodies.append(json.loads(request.content))
+        return _response(200, {"id": "daemon-session"})
+
+    agent, _, _ = await _new_agent(tmp_path, handler)
+    await agent.close()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert create_bodies[0]["permission_mode"] == "default"
     assert "PINKY_ACP_PERMISSION_MODE" in captured.err
-    assert "downgrades to dontAsk" not in captured.err
+    assert "not permitted on the ACP surface" not in captured.err
 
 
 @pytest.mark.asyncio
