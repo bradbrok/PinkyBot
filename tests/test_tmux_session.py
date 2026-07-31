@@ -9706,12 +9706,32 @@ def test_watchdog_liveness_surfaced_in_stats(tmp_path) -> None:
     ss._inflight_tool_calls = {"tool-1": _time.time()}
     stats = ss.stats
     assert stats["inflight_active"] is True
+    assert stats["inflight_busy_not_wedged"] is True
     assert stats["inflight_liveness_reason"] == "foreground_tool_in_flight"
     assert stats["inflight_turns"] == 1
+
+
+def test_stats_scheduler_busy_uses_full_watchdog_growth_window(tmp_path) -> None:
+    """#949: scheduler waits must not use only the narrower active window."""
+    ss, _ = _make_session()
+    _seed_inflight(ss)
+    ss._head_started_at = (
+        _time.time() - tmux_session._TURN_DONE_TIMEOUT_SEC - 1
+    )
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _age_file(main, 300)
+    _point_transcript(ss, main)
+
+    stats = ss.stats
+
+    assert stats["inflight_active"] is False
+    assert stats["inflight_busy_not_wedged"] is True
 
 
 def test_stats_inflight_inactive_when_idle(tmp_path) -> None:
     ss, _ = _make_session()
     stats = ss.stats
     assert stats["inflight_active"] is False
+    assert stats["inflight_busy_not_wedged"] is False
     assert stats["inflight_liveness_reason"] == "no_inflight_turn"
