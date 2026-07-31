@@ -35,6 +35,7 @@ class CreateSessionRequest(BaseModel):
         "Glob",
         "Grep",
     ])
+    disallowed_tools: list[str] = Field(default_factory=list)
     max_turns: int = 0
     timeout: float = 300.0
     system_prompt: str = ""

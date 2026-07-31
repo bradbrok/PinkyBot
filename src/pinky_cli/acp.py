@@ -31,6 +31,17 @@ else:
 DEFAULT_KEEPALIVE_INTERVAL = 60.0
 DEFAULT_BUSY_RETRIES = 10
 DEFAULT_BUSY_RETRY_DELAY = 1.0
+ACP_DEFAULT_ALLOWED_TOOLS = [
+    "Bash",
+    "Read",
+    "Glob",
+    "Grep",
+    "Edit",
+    "Write",
+    "mcp__pinky-memory__*",
+    "mcp__pinky-messaging__*",
+    "mcp__pinky-self__*",
+]
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _AgentBase = acp.Agent if acp is not None else object
 
@@ -53,6 +64,39 @@ def _require_acp() -> None:
 
 def _stderr(message: str) -> None:
     print(f"[pinky-acp] {message}", file=sys.stderr, flush=True)
+
+
+def _effective_permission_mode(agent_config: dict[str, Any]) -> str:
+    """Choose an ACP-specific daemon policy without inheriting unsafe bypass."""
+    agent_name = str(agent_config.get("name", "unknown"))
+    override = os.environ.get("PINKY_ACP_PERMISSION_MODE", "")
+    if override:
+        _stderr(
+            f"agent '{agent_name}' ACP permission mode is '{override}' from "
+            "PINKY_ACP_PERMISSION_MODE"
+        )
+        return override
+
+    configured = agent_config.get("permission_mode", "")
+    configured = configured if isinstance(configured, str) else ""
+    if configured == "bypassPermissions":
+        _stderr(
+            f"agent '{agent_name}' is configured bypassPermissions; ACP surface "
+            "downgrades to dontAsk — set PINKY_ACP_PERMISSION_MODE to "
+            "override deliberately"
+        )
+        return "dontAsk"
+    if not configured:
+        _stderr(
+            f"agent '{agent_name}' has no configured permission mode; ACP surface "
+            "uses dontAsk — set PINKY_ACP_PERMISSION_MODE to override deliberately"
+        )
+        return "dontAsk"
+
+    _stderr(
+        f"agent '{agent_name}' ACP permission mode is '{configured}' from agent config"
+    )
+    return configured
 
 
 def _project_root() -> Path:
@@ -149,16 +193,36 @@ class DaemonClient:
         working_dir: Path,
     ) -> str:
         requested_id = f"acp-{self.agent_name}-{uuid4().hex[:12]}"
+        permission_mode = _effective_permission_mode(config)
+        configured_allowed_tools = config.get("allowed_tools", [])
+        if not isinstance(configured_allowed_tools, list):
+            configured_allowed_tools = []
+        allowed_tools = configured_allowed_tools
+        if permission_mode == "dontAsk":
+            source = "agent-config"
+            if not allowed_tools:
+                allowed_tools = list(ACP_DEFAULT_ALLOWED_TOOLS)
+                source = "acp-default"
+            _stderr(
+                f"agent '{self.agent_name}' ACP session uses dontAsk with {source} "
+                f"allowed_tools: {', '.join(allowed_tools)}"
+            )
+            if "Bash" not in allowed_tools:
+                _stderr(
+                    f"warning: agent '{self.agent_name}' ACP allowlist lacks Bash; "
+                    "the Buzz CLI reply path will be denied"
+                )
         body = {
             "session_id": requested_id,
             "model": config.get("model", ""),
             "working_dir": str(working_dir),
-            "allowed_tools": config.get("allowed_tools", []),
+            "allowed_tools": allowed_tools,
+            "disallowed_tools": config.get("disallowed_tools", []),
             "max_turns": config.get("max_turns", 0),
             "timeout": config.get("timeout", 300.0),
             "restart_threshold_pct": config.get("restart_threshold_pct", 80.0),
             "auto_restart": config.get("auto_restart", True),
-            "permission_mode": config.get("permission_mode", ""),
+            "permission_mode": permission_mode,
         }
         response = await self._request("POST", "/sessions", json=body)
         response.raise_for_status()
@@ -320,7 +384,7 @@ class PinkyAcpAgent(_AgentBase):
         finally:
             keepalive_task.cancel()
             with contextlib.suppress(asyncio.CancelledError):
-                await keepalive_task
+                _ = await keepalive_task
             active = self._cancel_events.get(session_id)
             if active is not None:
                 active.discard(cancel_event)

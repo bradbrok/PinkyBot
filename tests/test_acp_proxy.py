@@ -12,7 +12,12 @@ from typing import Any
 import httpx
 import pytest
 
-from pinky_cli.acp import DaemonClient, PinkyAcpAgent, _read_session_secret
+from pinky_cli.acp import (
+    ACP_DEFAULT_ALLOWED_TOOLS,
+    DaemonClient,
+    PinkyAcpAgent,
+    _read_session_secret,
+)
 
 acp = pytest.importorskip("acp")
 
@@ -33,6 +38,7 @@ def _agent_config() -> dict[str, Any]:
         "name": "tester",
         "model": "sonnet",
         "allowed_tools": ["Read", "Bash"],
+        "disallowed_tools": ["WebSearch", "Write"],
         "permission_mode": "plan",
         "max_turns": 17,
         "timeout": 901.0,
@@ -116,7 +122,10 @@ async def test_subprocess_handshake_env_fallbacks_and_stdout_hygiene(tmp_path):
 
 
 @pytest.mark.asyncio
-async def test_new_and_prompt_happy_path_uses_agent_identity_and_policy(tmp_path):
+async def test_new_and_prompt_happy_path_uses_agent_identity_and_policy(
+    tmp_path, monkeypatch
+):
+    monkeypatch.delenv("PINKY_ACP_PERMISSION_MODE", raising=False)
     requests: list[tuple[str, str, dict[str, Any], httpx.Headers]] = []
 
     def handler(request: httpx.Request) -> httpx.Response:
@@ -158,6 +167,7 @@ async def test_new_and_prompt_happy_path_uses_agent_identity_and_policy(tmp_path
     assert create_body["working_dir"] != "/client/cwd"
     assert create_body["model"] == "sonnet"
     assert create_body["allowed_tools"] == ["Read", "Bash"]
+    assert create_body["disallowed_tools"] == ["WebSearch", "Write"]
     assert create_body["permission_mode"] == "plan"
     assert create_body["permission_mode"] != "bypassPermissions"
     assert create_body["max_turns"] == 17
@@ -174,6 +184,88 @@ async def test_new_and_prompt_happy_path_uses_agent_identity_and_policy(tmp_path
         assert headers["x-pinky-agent"] == "tester"
         assert headers["x-pinky-signature"]
         assert headers["x-pinky-timestamp"]
+
+
+@pytest.mark.asyncio
+async def test_bypass_agent_defaults_acp_surface_to_dont_ask(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("PINKY_ACP_PERMISSION_MODE", raising=False)
+    create_bodies: list[dict[str, Any]] = []
+    config = {
+        **_agent_config(),
+        "allowed_tools": ["Read"],
+        "permission_mode": "bypassPermissions",
+    }
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _response(200, config)
+        create_bodies.append(json.loads(request.content))
+        return _response(200, {"id": "daemon-session"})
+
+    agent, _, _ = await _new_agent(tmp_path, handler)
+    await agent.close()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert create_bodies[0]["permission_mode"] == "dontAsk"
+    assert create_bodies[0]["allowed_tools"] == ["Read"]
+    assert "configured bypassPermissions" in captured.err
+    assert "ACP surface downgrades to dontAsk" in captured.err
+    assert "agent-config allowed_tools: Read" in captured.err
+    assert "ACP allowlist lacks Bash" in captured.err
+
+
+@pytest.mark.asyncio
+async def test_empty_agent_mode_uses_dont_ask_and_acp_default_allowlist(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.delenv("PINKY_ACP_PERMISSION_MODE", raising=False)
+    create_bodies: list[dict[str, Any]] = []
+    config = {**_agent_config(), "allowed_tools": [], "permission_mode": ""}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _response(200, config)
+        create_bodies.append(json.loads(request.content))
+        return _response(200, {"id": "daemon-session"})
+
+    agent, _, _ = await _new_agent(tmp_path, handler)
+    await agent.close()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert create_bodies[0]["permission_mode"] == "dontAsk"
+    assert create_bodies[0]["allowed_tools"] == ACP_DEFAULT_ALLOWED_TOOLS
+    assert "has no configured permission mode" in captured.err
+    assert "ACP surface uses dontAsk" in captured.err
+    assert "acp-default allowed_tools" in captured.err
+    assert "ACP allowlist lacks Bash" not in captured.err
+
+
+@pytest.mark.asyncio
+async def test_acp_permission_env_override_allows_deliberate_bypass(
+    tmp_path, monkeypatch, capsys
+):
+    monkeypatch.setenv("PINKY_ACP_PERMISSION_MODE", "bypassPermissions")
+    create_bodies: list[dict[str, Any]] = []
+    config = {**_agent_config(), "permission_mode": "bypassPermissions"}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if request.method == "GET":
+            return _response(200, config)
+        create_bodies.append(json.loads(request.content))
+        return _response(200, {"id": "daemon-session"})
+
+    agent, _, _ = await _new_agent(tmp_path, handler)
+    await agent.close()
+
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert create_bodies[0]["permission_mode"] == "bypassPermissions"
+    assert "PINKY_ACP_PERMISSION_MODE" in captured.err
+    assert "downgrades to dontAsk" not in captured.err
 
 
 @pytest.mark.asyncio

@@ -283,6 +283,7 @@ class Session:
                     working_dir=working_dir,
                     model=model or None,
                     max_turns=max_turns,
+                    permission_mode=permission_mode or "bypassPermissions",
                     allowed_tools=self.allowed_tools,
                     disallowed_tools=getattr(self, "disallowed_tools", []),
                     mcp_servers=mcp_servers,
