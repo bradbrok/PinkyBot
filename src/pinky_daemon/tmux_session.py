@@ -1366,6 +1366,17 @@ class TmuxSession:
         self._fresh_context_respawn_grace_until: float = 0.0
         self._fresh_context_respawn_epoch_seq: int = 0
         self._fresh_context_respawn_epoch: int = 0
+        # #352 — the same intent as the grace window above, but with no
+        # deadline: armed on a force-fresh launch, disarmed only when a
+        # post-fresh turn actually completes. The time-boxed grace expires
+        # at 180s; the inflight watchdog fires at 600s, so a fresh REPL
+        # that wedges before its first turn was relaunched warm and
+        # resumed the pre-restart transcript.
+        self._fresh_context_intent_pending: bool = False
+        # Last transcript path bound for this session (SessionStart hook or
+        # discovery). Lets a relaunch resume THAT conversation explicitly
+        # instead of letting ``--continue`` pick the newest file on disk.
+        self._active_transcript_path: Path | None = None
         # Daemon-clock lower bound for status evidence belonging to the
         # currently-running tmux/Claude process.  Status evidence older than
         # this launch is unknown, never restart proof.
@@ -2843,9 +2854,11 @@ class TmuxSession:
             self._fresh_context_respawn_grace_until = (
                 time.monotonic() + FRESH_CONTEXT_RESPAWN_GRACE_SEC
             )
+            self._fresh_context_intent_pending = True
             _log(
                 f"tmux[{self.agent_name}]: armed post-fresh respawn grace "
-                f"for {FRESH_CONTEXT_RESPAWN_GRACE_SEC:.0f}s"
+                f"for {FRESH_CONTEXT_RESPAWN_GRACE_SEC:.0f}s "
+                f"(fresh intent sticky until first completed turn)"
             )
 
         # Auth-relay (#205): if enabled + configured, start a flag-gated
@@ -2985,9 +2998,41 @@ class TmuxSession:
         in_fresh_grace = (
             time.monotonic() < self._fresh_context_respawn_grace_until
         )
-        force_fresh = force_fresh_once or in_fresh_grace
+        # #352: the deadline-free half of the same intent. The grace window
+        # expires at 180s but the inflight watchdog only force-restarts at
+        # 600s, so a fresh REPL that wedges before completing its first turn
+        # used to be relaunched warm — resuming the very transcript the
+        # context_restart was meant to leave behind. Stay fresh until a turn
+        # actually completes on the fresh REPL.
+        fresh_intent_pending = self._fresh_context_intent_pending
+        force_fresh = force_fresh_once or in_fresh_grace or fresh_intent_pending
         has_prior = self._has_prior_transcript()
         use_continue = has_prior and not force_fresh
+
+        # Resolve HOW to resume (#352). ``--continue`` means "newest
+        # transcript in this project dir", which is a guess that goes wrong
+        # exactly when it matters. When this session has a bound transcript,
+        # resume it by path; when the bound transcript does not exist on
+        # disk (the fresh REPL never wrote one), resuming anything would
+        # mean resuming somebody else's conversation — go fresh instead.
+        # No recorded bind at all (e.g. first launch after a daemon
+        # restart) keeps the legacy ``--continue`` behavior.
+        resume_path: Path | None = None
+        if use_continue and self._active_transcript_path is not None:
+            active = self._active_transcript_path
+            try:
+                active_exists = active.exists()
+            except OSError:
+                active_exists = False
+            if active_exists:
+                resume_path = active
+            else:
+                use_continue = False
+                _log(
+                    f"tmux[{self.agent_name}]: bound transcript {active} is "
+                    f"missing — launching fresh instead of resuming another "
+                    f"conversation"
+                )
 
         # Record launch mode on the session so ``connect()`` can derive
         # the wake reason post-spawn (force_fresh / restart_reason both
@@ -3000,7 +3045,10 @@ class TmuxSession:
 
         parts = ["claude"]
         if use_continue:
-            parts.append("--continue")
+            if resume_path is not None:
+                parts.extend(["--resume", str(resume_path)])
+            else:
+                parts.append("--continue")
         parts.append("--dangerously-skip-permissions")
         # Optional model override.
         if self._config.model:
@@ -3056,7 +3104,9 @@ class TmuxSession:
             f"mode={'continue' if use_continue else 'fresh'} "
             f"force_fresh={force_fresh} "
             f"fresh_grace={in_fresh_grace} "
-            f"prior_transcript={has_prior}"
+            f"fresh_intent_pending={fresh_intent_pending} "
+            f"prior_transcript={has_prior} "
+            f"resume_path={resume_path or '-'}"
         )
         return cmd
 
@@ -3776,6 +3826,10 @@ class TmuxSession:
         and external sends queue behind — FIFO preserved (Murzik #571
         review).
         """
+        # Record the bind before the tailer guard (#352): the path is what
+        # a later relaunch resumes explicitly, and it must be known even if
+        # the tailer is momentarily absent (stopped mid-respawn).
+        self._active_transcript_path = Path(path)
         if self._tailer is None:
             return
         seek_to_start = (
@@ -4666,6 +4720,10 @@ class TmuxSession:
             )
             self._fresh_context_respawn_grace_until = 0.0
             self._fresh_context_respawn_epoch = 0
+            # #352: this completion is the proof the fresh REPL is alive
+            # and owns a real transcript — the only thing that disarms the
+            # sticky fresh intent.
+            self._fresh_context_intent_pending = False
             if grace_was_active:
                 _log(
                     f"tmux[{self.agent_name}]: first correlated post-fresh "
