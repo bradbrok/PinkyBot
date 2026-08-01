@@ -189,6 +189,16 @@ class TestReflect:
         assert result["salience"] == 5
         assert result["type"] == "project_state"
 
+    def test_reflect_invalid_type_falls_back_to_fact(self, srv):
+        """Regression: an unrecognized type (e.g. dream-hallucinated 'session_log')
+        must not raise — it previously crashed the whole dream run."""
+        result = json.loads(_tools(srv)["reflect"](
+            content="something the dream agent decided to call session_log",
+            type="session_log",
+        ))
+        assert result["stored"] is True
+        assert result["type"] == "fact"
+
     def test_reflect_supersedes(self, srv, store):
         # First memory
         r1 = json.loads(_tools(srv)["reflect"](content="old fact", type="fact"))
