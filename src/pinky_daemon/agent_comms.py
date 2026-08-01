@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 @dataclass
 class AgentMessage:
@@ -83,7 +85,7 @@ class AgentComms:
         if connection is None:
             connection = sqlite3.connect(self._db_path)
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
+            configure_rollback_journal(connection, db_label="agent_comms.db")
             self._thread_local.connection = connection
         return connection
 

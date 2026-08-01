@@ -22,6 +22,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -195,7 +197,7 @@ class TaskStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            configure_rollback_journal(connection, db_label="tasks.db")
             connection.execute("PRAGMA foreign_keys=ON")
             self._thread_local.connection = connection
         return connection
