@@ -832,6 +832,9 @@ class AgentScheduler:
 
             hb = self._registry.get_latest_heartbeat(agent.name)
             if self._reconcile_server_liveness(agent, hb, now, streaming_sessions):
+                # Server-side transport evidence proves this agent is live —
+                # a safe boot boundary to drain any stranded wake outbox.
+                self._drain_outbox_if_pending(agent.name)
                 continue
             if not hb:
                 # No heartbeat ever recorded — mark stale
@@ -865,6 +868,49 @@ class AgentScheduler:
                         message_count=hb.message_count,
                         metadata={"reason": f"heartbeat overdue by {int(age - agent.heartbeat_interval)}s"},
                     )
+            else:
+                # Fresh heartbeat: the session ran a tool and reported in, so
+                # it is processing NOW. That is proof-of-life the durable wake
+                # outbox can safely drain against.
+                self._drain_outbox_if_pending(agent.name)
+
+    def _drain_outbox_if_pending(self, agent_name: str) -> None:
+        """Replay a proven-live agent's stranded wake outbox.
+
+        The durable outbox otherwise drains only at daemon ``start()`` or on a
+        confirmed wake-prompt turn (``on_wake_delivered``). A session revived
+        WITHOUT such a turn — e.g. a ``context_restart`` whose orientation wake
+        never produced an exact receipt, then kept alive by heartbeats — stays
+        alive yet never replays, stranding every cron it missed while dark
+        (live incident 2026-08-01: 20 rows still pending after a mid-day heartbeat, all
+        fired 06:00–10:15 into the gap). ``_check_heartbeats`` calls this once
+        it has proof the session is live, closing that gap without touching the
+        deliberate "a new cron fire never replays backlog into the old session"
+        contract: replay still happens only at a proven-live boundary.
+
+        Idempotent and self-limiting: skips when a replay is already in flight,
+        only reads the (indexed) outbox for a genuinely-live agent, and the
+        FIFO replay's per-prompt receipt gate leaves rows pending if the
+        session cannot accept them. So this never double-delivers and never
+        drains into a dead transport.
+        """
+        existing = self._pending_replay_tasks.get(agent_name)
+        if existing is not None and not existing.done():
+            return
+        try:
+            if not self._registry.list_pending_schedule_wakes(agent_name):
+                return
+        except Exception as exc:
+            _log(
+                f"scheduler: outbox drain check failed for '{agent_name}': "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        _log(
+            f"scheduler: proven-live agent '{agent_name}' has a stranded wake "
+            "outbox; triggering durable replay"
+        )
+        self.replay_pending_for_agent(agent_name)
 
     # Resurrection cap: at most this many attempts per RESURRECTION_WINDOW_SECONDS
     # per agent. Prevents thrashing on a persistently-broken session while still
