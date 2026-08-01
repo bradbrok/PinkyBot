@@ -36,7 +36,7 @@ class TestUserProfileStoreConcurrency:
                 connection_id = id(connection)
                 assert connection.execute(
                     "PRAGMA journal_mode"
-                ).fetchone()[0].lower() == "wal"
+                ).fetchone()[0].lower() == "truncate"
                 assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
                 chat_id = f"worker-{worker_index}"
                 for round_index in range(rounds):
