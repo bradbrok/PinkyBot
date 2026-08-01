@@ -43,6 +43,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Optional
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 DEFAULT_DB_PATH = "data/federation/state.db"
 
 # Instance-key lifecycle states.
@@ -273,7 +275,7 @@ class FederationStateStore:
         self.db_path = db_path
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(self._db, db_label="federation state")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._db.row_factory = sqlite3.Row
         self._create_schema()

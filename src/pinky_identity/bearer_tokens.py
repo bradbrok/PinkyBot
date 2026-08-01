@@ -70,6 +70,7 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from pathlib import Path
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
 from pinky_identity.fs_security import harden_secret_file
 from pinky_identity.keys import SignatureError
 
@@ -290,7 +291,7 @@ class BearerTokenStore:
             str(self._db_path), isolation_level=None, check_same_thread=False
         )
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(self._db, db_label="bearer tokens")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
         harden_secret_file(self._db_path)

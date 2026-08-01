@@ -13,6 +13,7 @@ from typing import TYPE_CHECKING
 
 import numpy as np
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
 from pinky_memory.ephemeral_guard import (
     guard_enabled,
     is_ephemeral_entity,
@@ -159,8 +160,7 @@ class ReflectionStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._conn = sqlite3.connect(db_path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
-        self._conn.execute("PRAGMA journal_mode=WAL")
-        self._conn.execute("PRAGMA busy_timeout=5000")
+        configure_rollback_journal(self._conn, db_label="pinky memory")
         self._init_schema()
 
     def _init_schema(self) -> None:
@@ -2458,7 +2458,7 @@ class ReflectionStore:
                 return (False, str(exc))
 
     def reopen(self) -> None:
-        """Close and reopen the connection (triggers WAL recovery)."""
+        """Close and reopen the connection."""
         with self._lock:
             try:
                 self._conn.close()
@@ -2468,8 +2468,7 @@ class ReflectionStore:
                 logger.debug("close on reopen failed (already closed?): %s", e)
             self._conn = sqlite3.connect(self._db_path, check_same_thread=False)
             self._conn.row_factory = sqlite3.Row
-            self._conn.execute("PRAGMA journal_mode=WAL")
-            self._conn.execute("PRAGMA busy_timeout=5000")
+            configure_rollback_journal(self._conn, db_label="pinky memory")
             # Reload sqlite-vec extension after reconnect
             self._vec_available = False
             self._init_vec()

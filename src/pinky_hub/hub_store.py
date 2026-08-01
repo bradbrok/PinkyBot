@@ -20,6 +20,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -100,7 +102,7 @@ class HubStore:
     def __init__(self, db_path: str = "data/hub.db") -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(self._db, db_label="hub.db")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._init_tables()
 
