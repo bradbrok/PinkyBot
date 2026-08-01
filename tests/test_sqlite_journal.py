@@ -14,14 +14,29 @@ from pathlib import Path
 
 import pytest
 
+from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
+from pinky_daemon.analytics_store import AnalyticsStore
+from pinky_daemon.app_store import AppStore
 from pinky_daemon.conversation_store import ConversationStore
+from pinky_daemon.hooks import AuditStore
+from pinky_daemon.kb_store import KBStore
+from pinky_daemon.librarian_runner import LibrarianRunner
+from pinky_daemon.mesh_store import MeshStore
+from pinky_daemon.message_context_store import MessageContextStore
+from pinky_daemon.outreach_config import OutreachConfigStore
+from pinky_daemon.plugin_manager import PluginManager
+from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
+from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.sqlite_journal import (
     SqliteJournalConfigError,
     configure_rollback_journal,
 )
 from pinky_daemon.task_store import TaskStore
+from pinky_daemon.trigger_store import TriggerStore
+from pinky_daemon.user_profile_store import UserProfileStore
+from pinky_daemon.voice_store import VoiceStore
 
 
 def _journal_mode(db_path: Path) -> str:
@@ -179,6 +194,18 @@ def test_fts5_shadow_tables_survive_the_wal_conversion(tmp_path):
         (TaskStore, "tasks.db", "_db"),
         (AgentComms, "agent_comms.db", "_conn"),
         (ResearchStore, "research.db", "_db"),
+        (ActivityStore, "activity.db", "_db"),
+        (AppStore, "apps.db", "_db"),
+        (AuditStore, "audit.db", "_db"),
+        (MeshStore, "mesh.db", "_db"),
+        (MessageContextStore, "message_context.db", "_db"),
+        (OutreachConfigStore, "outreach_config.db", "_db"),
+        (PresentationStore, "presentations.db", "_db"),
+        (SessionStore, "sessions.db", "_db"),
+        (SessionEventStore, "session_events.db", "_db"),
+        (TriggerStore, "triggers.db", "_db"),
+        (UserProfileStore, "user_profiles.db", "_db"),
+        (VoiceStore, "voice_calls.db", "_db"),
     ],
 )
 def test_stores_open_in_rollback_mode(tmp_path, factory, filename, conn_attr):
@@ -188,3 +215,46 @@ def test_stores_open_in_rollback_mode(tmp_path, factory, filename, conn_attr):
     assert getattr(store, conn_attr) is not None
     assert _journal_mode(db_path) != "wal"
     assert not (tmp_path / f"{filename}-wal").exists()
+
+
+def test_per_call_connection_stores_open_in_rollback_mode(tmp_path):
+    """Stores that open a fresh connection per call, not one long-lived handle.
+
+    These are just as exposed: two overlapping short connections in one process
+    still share POSIX locks, so whichever closes first drops the locks the other
+    is relying on.
+    """
+    kb = KBStore(data_dir=str(tmp_path / "kb"))
+    assert _journal_mode(Path(kb.db_path)) != "wal"
+    assert not Path(str(kb.db_path) + "-wal").exists()
+
+    librarian_db = tmp_path / "librarian_state.db"
+    LibrarianRunner(kb, db_path=str(librarian_db))
+    assert _journal_mode(librarian_db) != "wal"
+
+    analytics_db = tmp_path / "analytics.db"
+    AnalyticsStore(db_path=str(analytics_db))
+    assert _journal_mode(analytics_db) != "wal"
+
+    plugins_db = tmp_path / "plugins.db"
+    PluginManager(
+        db_path=str(plugins_db),
+        api_url="http://localhost:8888",
+        working_dir=str(tmp_path / "wd"),
+    )
+    assert _journal_mode(plugins_db) != "wal"
+
+
+def test_no_daemon_module_still_asks_for_wal():
+    """Guard against a new store landing back on WAL by copy-paste."""
+    src = Path(__file__).resolve().parents[1] / "src" / "pinky_daemon"
+    offenders = [
+        f"{path.relative_to(src)}:{n}"
+        for path in sorted(src.rglob("*.py"))
+        for n, line in enumerate(path.read_text().splitlines(), 1)
+        if "journal_mode=WAL" in line
+    ]
+    assert offenders == [], (
+        "these daemon modules still open SQLite in WAL mode — use "
+        f"configure_rollback_journal() instead: {offenders}"
+    )
