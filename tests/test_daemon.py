@@ -474,14 +474,14 @@ class TestResolveEnv:
 
 
 class TestDaemon:
-    def test_create_daemon(self):
-        config = DaemonConfig()
+    def test_create_daemon(self, tmp_path):
+        config = DaemonConfig(working_dir=str(tmp_path))
         with patch("pinky_daemon.claude_runner._find_claude_binary", return_value="/usr/bin/claude"):
             daemon = Daemon(config)
         assert daemon.is_running is False
 
-    def test_stats(self):
-        config = DaemonConfig()
+    def test_stats(self, tmp_path):
+        config = DaemonConfig(working_dir=str(tmp_path))
         with patch("pinky_daemon.claude_runner._find_claude_binary", return_value="/usr/bin/claude"):
             daemon = Daemon(config)
         stats = daemon.stats

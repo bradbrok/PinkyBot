@@ -4295,7 +4295,11 @@ def create_api(
         from pinky_daemon.voice_routes import set_dependencies as _voice_set_deps
         from pinky_daemon.voice_store import VoiceStore
 
-        _voice_store = VoiceStore(db_path="data/voice_calls.db")
+        # Sibling of the main DB, not a hardcoded relative path: every other
+        # store here derives from ``db_path``, and a literal "data/..." makes
+        # an API created with a custom db_path write to the *cwd's* data dir
+        # anyway. Keeping the basename means the deployed file is unchanged.
+        _voice_store = VoiceStore(db_path=str(Path(db_path).parent / "voice_calls.db"))
         _voice_base_url = (
             agents.get_setting("PINKY_BASE_URL")
             or os.environ.get("PINKY_BASE_URL", "")
@@ -12058,7 +12062,10 @@ npm run build</pre>
 
     from pinky_daemon.user_profile_store import UserProfileStore
 
-    user_profiles = UserProfileStore()
+    # Sibling of the main DB — see the VoiceStore note above.
+    user_profiles = UserProfileStore(
+        db_path=str(Path(db_path).parent / "user_profiles.db"),
+    )
 
     from pinky_daemon.routes.user_profiles import router as _user_profiles_router
     from pinky_daemon.routes.user_profiles import set_dependencies as _user_profiles_set_deps

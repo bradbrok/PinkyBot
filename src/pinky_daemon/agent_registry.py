@@ -2803,7 +2803,11 @@ except Exception as exc:
         # Inject learned user profiles (from dream consolidation)
         try:
             from pinky_daemon.user_profile_store import UserProfileStore
-            profile_store = UserProfileStore()
+            # Sibling of this registry's own DB rather than the default
+            # relative path, which would resolve against the daemon's cwd.
+            profile_store = UserProfileStore(
+                db_path=str(Path(self._db_path).parent / "user_profiles.db"),
+            )
             known_users = profile_store.get_all_users()
             profile_sections = []
             for uid in known_users:
