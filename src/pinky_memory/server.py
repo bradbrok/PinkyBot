@@ -32,6 +32,18 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _parse_reflection_type(type_str: str) -> ReflectionType:
+    """Coerce a caller-supplied type to ReflectionType, defaulting to `fact`
+    on an unrecognized value instead of raising. Callers (including dream
+    runs) occasionally pass a plausible-sounding but invalid type; failing
+    hard here previously aborted the entire dream run (#session_log bug)."""
+    try:
+        return ReflectionType(type_str)
+    except ValueError:
+        _log(f"reflect: invalid type={type_str!r}, defaulting to 'fact'")
+        return ReflectionType.fact
+
+
 # Strict agent-name slug for cross-agent memory targets (#614/#145). Mirrors
 # the trust-boundary slug discipline tracked in #105 — defends the
 # store-factory path resolution against traversal / injection even though the
@@ -369,7 +381,7 @@ def create_server(
         """
         input_data = ReflectInput(
             content=content,
-            type=ReflectionType(type),
+            type=_parse_reflection_type(type),
             context=context,
             project=project,
             salience=salience,
@@ -430,7 +442,7 @@ def create_server(
             s = _resolve_target_store(target_agent)
             input_data = ReflectInput(
                 content=content,
-                type=ReflectionType(type),
+                type=_parse_reflection_type(type),
                 context=context,
                 project=project,
                 salience=salience,
