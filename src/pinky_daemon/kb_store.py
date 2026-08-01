@@ -34,6 +34,8 @@ from pathlib import Path
 
 import yaml
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -177,7 +179,7 @@ class KBStore:
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(conn, db_label="kb.db")
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
         return conn

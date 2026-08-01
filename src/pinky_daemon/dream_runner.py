@@ -33,6 +33,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
+from pinky_daemon.sqlite_journal import configure_rollback_journal
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 
 
@@ -114,8 +115,7 @@ class DreamRunner:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=30000")
+            configure_rollback_journal(connection, db_label="dreams.db")
             self._thread_local.connection = connection
         return connection
 

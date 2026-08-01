@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 # -- Records -------------------------------------------------------------------
 
 
@@ -102,7 +104,7 @@ class MeshStore:
     def __init__(self, db_path: str = "data/mesh.db") -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(self._db, db_label="mesh.db")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._lock = threading.RLock()
         self._init_tables()

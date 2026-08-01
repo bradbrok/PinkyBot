@@ -6,6 +6,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 # Providers to include in analytics dashboards.
 # Only Anthropic/Claude usage — excludes Codex CLI (OpenAI) and other non-Anthropic providers.
 _ANTHROPIC_PROVIDERS = {"firstParty", "default", "anthropic", "bedrock", "vertex"}
@@ -77,10 +79,12 @@ class AnalyticsStore:
 
     def _init_db(self) -> None:
         with self._connect() as conn:
+            # Runs once per store construction, before any other connection is
+            # handed out. TRUNCATE is persisted in the database header, so the
+            # short-lived connections from _connect() inherit it.
+            configure_rollback_journal(conn, db_label="analytics.db")
             conn.executescript(
                 """
-                PRAGMA journal_mode=WAL;
-
                 CREATE TABLE IF NOT EXISTS analytics_session_facts (
                   session_id TEXT PRIMARY KEY,
                   agent_name TEXT NOT NULL,
