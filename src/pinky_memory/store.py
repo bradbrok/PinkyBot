@@ -121,17 +121,24 @@ CREATE TRIGGER IF NOT EXISTS reflections_ad AFTER DELETE ON reflections BEGIN
     INSERT INTO reflections_fts(reflections_fts, rowid, id, content, context, project)
     VALUES ('delete', old.rowid, old.id, old.content, old.context, old.project);
 END;
+"""
 
--- Drop+recreate migrates older DBs where the trigger fired on every UPDATE
--- (access tracking churned the FTS index); only indexed columns matter here.
-DROP TRIGGER IF EXISTS reflections_au;
+# The AFTER UPDATE trigger is migrated separately (#366): older DBs have a
+# version that fired on every UPDATE (access tracking churned the FTS index),
+# so it needs a drop+recreate rather than a CREATE ... IF NOT EXISTS. That
+# rewrite must NOT run on every open — see _migrate_fts_update_trigger.
+_FTS5_AU_TRIGGER = """\
 CREATE TRIGGER reflections_au AFTER UPDATE OF id, content, context, project ON reflections BEGIN
     INSERT INTO reflections_fts(reflections_fts, rowid, id, content, context, project)
     VALUES ('delete', old.rowid, old.id, old.content, old.context, old.project);
     INSERT INTO reflections_fts(rowid, id, content, context, project)
     VALUES (new.rowid, new.id, new.content, new.context, new.project);
-END;
-"""
+END"""
+
+
+def _normalize_sql(sql: str) -> str:
+    """Collapse whitespace so stored DDL compares equal to our literal."""
+    return " ".join(sql.split())
 
 
 def _now_iso() -> str:
@@ -209,8 +216,15 @@ class ReflectionStore:
             self._conn.executescript(_FTS5_SCHEMA)
             self._conn.executescript(_FTS5_TRIGGERS)
             self._conn.commit()
+            self._migrate_fts_update_trigger()
             self._fts5_available = True
         except sqlite3.OperationalError as e:
+            if "no such module" not in str(e).lower():
+                # Any other OperationalError (I/O error, corruption, lock
+                # timeout) is a real fault. Swallowing it here would pin this
+                # process to LIKE-based search for its whole lifetime with no
+                # signal at all — let it surface instead. #366
+                raise
             # FTS5 extension not compiled into this sqlite build. Search
             # falls back to LIKE — log so admins can diagnose slow queries. #295
             logger.warning(
@@ -220,6 +234,44 @@ class ReflectionStore:
             self._fts5_available = False
         # sqlite-vec virtual table (separate try — graceful if not available)
         self._init_vec()
+
+    def _current_au_trigger_sql(self) -> str | None:
+        row = self._conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type = 'trigger' AND name = 'reflections_au'"
+        ).fetchone()
+        return row[0] if row is not None else None
+
+    def _migrate_fts_update_trigger(self) -> None:
+        """Bring reflections_au up to date, writing only when it is stale (#366).
+
+        The old code dropped and recreated this trigger on *every* open. Since
+        several components construct a ReflectionStore at daemon start, two of
+        them could overlap in that window: the loser hit "trigger
+        reflections_au already exists" and — via an over-broad except — spent
+        its lifetime with keyword search silently degraded to LIKE.
+
+        The read-only fast path removes the window entirely for an up-to-date
+        DB. A DB that genuinely needs migrating takes a write lock and
+        re-checks under it, so concurrent openers serialize and exactly one
+        performs the rewrite. Note executescript() would COMMIT implicitly,
+        hence execute() statement by statement here.
+        """
+        wanted = _normalize_sql(_FTS5_AU_TRIGGER)
+        current = self._current_au_trigger_sql()
+        if current is not None and _normalize_sql(current) == wanted:
+            return
+
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                current = self._current_au_trigger_sql()
+                if current is None or _normalize_sql(current) != wanted:
+                    self._conn.execute("DROP TRIGGER IF EXISTS reflections_au")
+                    self._conn.execute(_FTS5_AU_TRIGGER)
+                self._conn.commit()
+            except Exception:
+                self._conn.rollback()
+                raise
 
     def _migrate_add_column(self, column: str, definition: str) -> None:
         """Add a column to the reflections table if it doesn't exist."""
