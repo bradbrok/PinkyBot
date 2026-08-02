@@ -20,6 +20,7 @@ from pinky_memory.types import (
     ReflectInput,
     Reflection,
     ReflectionType,
+    coerce_reflection_type,
 )
 
 if TYPE_CHECKING:
@@ -33,15 +34,13 @@ def _log(msg: str) -> None:
 
 
 def _parse_reflection_type(type_str: str) -> ReflectionType:
-    """Coerce a caller-supplied type to ReflectionType, defaulting to `fact`
-    on an unrecognized value instead of raising. Callers (including dream
-    runs) occasionally pass a plausible-sounding but invalid type; failing
-    hard here previously aborted the entire dream run (#session_log bug)."""
-    try:
-        return ReflectionType(type_str)
-    except ValueError:
+    """Coerce a caller-supplied type to ReflectionType, logging when it falls
+    back to `fact` (callers, including dream runs, occasionally pass a
+    plausible-sounding but invalid type — see #session_log bug)."""
+    coerced = coerce_reflection_type(type_str)
+    if coerced.value != type_str:
         _log(f"reflect: invalid type={type_str!r}, defaulting to 'fact'")
-        return ReflectionType.fact
+    return coerced
 
 
 # Strict agent-name slug for cross-agent memory targets (#614/#145). Mirrors

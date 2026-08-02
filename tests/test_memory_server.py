@@ -199,6 +199,22 @@ class TestReflect:
         assert result["stored"] is True
         assert result["type"] == "fact"
 
+    def test_recall_survives_legacy_invalid_stored_type(self, srv, store):
+        """Regression: a row written before a type was retired/renamed (e.g.
+        'session_log', 'episode', 'nav_audit' from pre-fallback dream runs)
+        must not crash hydration on read — it previously aborted every
+        subsequent recall/dream-linking pass that touched the row."""
+        import sqlite3
+
+        stored = json.loads(_tools(srv)["reflect"](content="pre-fallback dream note", type="fact"))
+        conn = sqlite3.connect(store._db_path)
+        conn.execute("UPDATE reflections SET type = 'session_log' WHERE id = ?", (stored["id"],))
+        conn.commit()
+        conn.close()
+
+        result = _parse_recall(_tools(srv)["recall"](query="pre-fallback dream note"))
+        assert any(r["id"] == stored["id"] and r["type"] == "fact" for r in result["reflections"])
+
     def test_reflect_supersedes(self, srv, store):
         # First memory
         r1 = json.loads(_tools(srv)["reflect"](content="old fact", type="fact"))

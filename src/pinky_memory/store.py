@@ -23,6 +23,7 @@ from pinky_memory.types import (
     Reflection,
     ReflectionLink,
     ReflectionType,
+    coerce_reflection_type,
     resolve_preset,
 )
 
@@ -1527,9 +1528,17 @@ class ReflectionStore:
         source_message_ids = json.loads(raw_msg_ids) if raw_msg_ids else []
         next_review_date = row["next_review_date"] if "next_review_date" in keys else None
         review_interval_days = row["review_interval_days"] if "review_interval_days" in keys else 7
+        row_type = row["type"]
+        coerced_type = coerce_reflection_type(row_type)
+        if coerced_type.value != row_type:
+            logger.warning(
+                "row_to_reflection: invalid stored type=%r for id=%r, defaulting to 'fact'",
+                row_type,
+                row["id"],
+            )
         return Reflection(
             id=row["id"],
-            type=ReflectionType(row["type"]),
+            type=coerced_type,
             content=row["content"],
             context=row["context"],
             project=row["project"],

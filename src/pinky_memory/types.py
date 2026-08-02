@@ -15,6 +15,18 @@ class ReflectionType(str, Enum):
     fact = "fact"
 
 
+def coerce_reflection_type(type_str: str) -> ReflectionType:
+    """Coerce a caller- or DB-supplied type to ReflectionType, defaulting to
+    `fact` on an unrecognized value instead of raising. Used both when writing
+    a new reflection (a caller passed a plausible-sounding but invalid type)
+    and when hydrating a row written before this type was retired/renamed —
+    a stale value must not crash every future read of that row."""
+    try:
+        return ReflectionType(type_str)
+    except ValueError:
+        return ReflectionType.fact
+
+
 class Reflection(BaseModel):
     model_config = ConfigDict(extra="ignore")
 
