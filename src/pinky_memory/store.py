@@ -134,6 +134,18 @@ END;
 """
 
 
+# Rows that still need a review date. Shared by the guard and the UPDATE in
+# _migrate_backfill_review_schedule so the two can never drift apart: a guard
+# that is narrower than the write would skip work, a wider one would write when
+# there is nothing to do. salience >= 4 is protected — those stay NULL and are
+# never auto-reviewed.
+_NEEDS_REVIEW_DATE = """active = 1
+      AND next_review_date IS NULL
+      AND salience < 4
+      AND type != 'continuation'
+      AND no_recall = 0"""
+
+
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat()
 
@@ -230,19 +242,26 @@ class ReflectionStore:
             pass  # column already exists
 
     def _migrate_backfill_review_schedule(self) -> None:
-        """Backfill next_review_date for existing active memories on first run."""
+        """Give unscheduled active memories a review date, writing only if any exist.
+
+        Despite the "migration" name this is not one-shot: insert() leaves
+        next_review_date NULL, so this is also what makes newly created
+        memories reviewable. It must keep running on every open — it just must
+        not take a write lock when there is nothing to schedule, which is the
+        steady state and used to cost one write transaction per store opened
+        at daemon start. #368
+        """
         with self._lock:
-            # Only backfill rows that have NULL next_review_date AND salience < 4
-            # (salience >= 4 are protected and stay NULL = never auto-reviewed)
-            self._conn.execute("""
-                UPDATE reflections
-                SET next_review_date = date(created_at, '+30 days')
-                WHERE active = 1
-                  AND next_review_date IS NULL
-                  AND salience < 4
-                  AND type != 'continuation'
-                  AND no_recall = 0
-            """)
+            unscheduled = self._conn.execute(
+                f"SELECT 1 FROM reflections WHERE {_NEEDS_REVIEW_DATE} LIMIT 1"
+            ).fetchone()
+            if unscheduled is None:
+                return
+            self._conn.execute(
+                f"""UPDATE reflections
+                    SET next_review_date = date(created_at, '+30 days')
+                    WHERE {_NEEDS_REVIEW_DATE}"""
+            )
             self._conn.commit()
 
     def _migrate_create_memory_events(self) -> None:
