@@ -207,6 +207,17 @@ class AgentScheduler:
         # instead. Distinct from delivery_busy_fn: that reads watchdog
         # liveness (can blip false between turns at the timeout boundary);
         # this reads the turn's own transport execution state.
+        #
+        # The extension is DELIBERATELY unbounded while the probe keeps
+        # reporting pasted-unresolved: in that state any timeout action
+        # either drops the wake or duplicates it, so the scheduler holds.
+        # The hold ends when the receipt resolves (acceptance observed),
+        # the session leaves CONNECTED (receipt resolves False), or a
+        # force_restart resets the turn's pasted flag (probe reads False
+        # and the durable cancel+persist path resumes). Operational cost
+        # while held: same-agent schedule cohorts queue behind the
+        # per-agent delivery lock — surfaced by the "extending" log line
+        # each timeout period (Murzik review, PR #983).
         self._delivery_inflight_fn = delivery_inflight_fn
         # async fn(agent_name, text) -> bool. FIRED BUT UNDELIVERED must leave
         # journald and reach the owner through an out-of-band transport.

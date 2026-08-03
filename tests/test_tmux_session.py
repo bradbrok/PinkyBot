@@ -3789,6 +3789,12 @@ async def test_watchdog_force_restart_replays_unaccepted_scheduler_head(
     assert original.replay_count == 1
     assert not original.transport_accepted
     assert not receipt.done(), "force_restart must preserve the exact receipt"
+    # Murzik review (PR #983): the replayed head now lives outside
+    # _scheduler_pending_turns (the watchdog removed it and requeued via the
+    # ordinary worker) but it is pasted with an open receipt — the inflight
+    # probe must still see it, or the scheduler's timeout path re-opens the
+    # cancel+persist duplicate hole for exactly this turn.
+    assert ss.scheduler_wake_inflight("one-shot scheduled wake") is True
 
     ss._on_transcript_entry({
         "type": "user",

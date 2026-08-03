@@ -3492,11 +3492,25 @@ class TmuxSession:
         execution. Prompt-text matching mirrors ``_match_acceptance_turn``:
         scheduler turns are enqueued without an agent hint, so the queued
         prompt is the schedule's exact wake prompt.
+
+        Scans ``_acceptance_candidates()`` — NOT just
+        ``_scheduler_pending_turns`` — because the #943 watchdog
+        unaccepted-head path removes a preserved scheduler head from the
+        pending list and requeues it through the ordinary worker; after the
+        post-restart repaste that turn lives in ``_inflight_turn`` /
+        ``_inflight_metas`` only. Scanning the narrow list would report
+        False for exactly that pasted-with-open-receipt replay and re-open
+        the duplicate path (Murzik review, PR #983). While the replayed
+        turn is still queued-unpasted, ``pane_delivery_started`` is False
+        (reset by the watchdog) and a cancel remains safe: the shared
+        in-lock cancelled-receipt check covers the ordinary worker's paste
+        path too.
         """
-        for turn in self._scheduler_pending_turns:
+        for turn in self._acceptance_candidates():
             receipt = turn.scheduler_delivery
             if (
-                receipt is not None
+                turn.scheduler_serialized
+                and receipt is not None
                 and not receipt.done()
                 and turn.pane_delivery_started
                 and turn.prompt == prompt
