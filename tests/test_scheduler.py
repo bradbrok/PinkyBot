@@ -1082,6 +1082,109 @@ class TestScheduler:
         assert registry.get_schedules("oleg")[0].last_delivered > 0
 
     @pytest.mark.asyncio
+    async def test_fresh_heartbeat_drains_stranded_outbox(self, registry):
+        """A session revived by a heartbeat (no confirmed wake) still replays.
+
+        Reproduces the 2026-08-01 live incident: a context_restart whose
+        orientation wake never produced a receipt left the session alive but
+        never fired on_wake_delivered, so the durable outbox — the only two
+        triggers being daemon start() and on_wake_delivered — never drained.
+        _check_heartbeats must treat a fresh heartbeat as the proof-of-life
+        boundary and replay the backlog.
+        """
+        registry.register("oleg", heartbeat_interval=60)
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="inbox", prompt="morning inbox"
+        )
+        fired_at = time.time() - 300
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="inbox",
+            prompt="morning inbox",
+            fired_at=fired_at,
+        )
+        # Session is provably alive again: a fresh heartbeat, exactly as
+        # the live incident's reviving heartbeat proved — but NO confirmed wake landed.
+        registry.record_heartbeat("oleg", session_id="oleg-main", status="alive")
+
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        # streaming_sessions_fn returns {} so server-liveness does not short
+        # -circuit — the fresh-heartbeat branch is what must drain the outbox.
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            streaming_sessions_fn=lambda: {},
+        )
+        await scheduler._check_heartbeats(time.time())
+        replay_task = scheduler._pending_replay_tasks.get("oleg")
+        assert replay_task is not None, "fresh heartbeat did not trigger replay"
+        await replay_task
+
+        assert attempts == ["morning inbox"]
+        assert registry.list_pending_schedule_wakes("oleg") == []
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("status", ["stale", "dead"])
+    async def test_fresh_but_non_alive_heartbeat_never_drains(
+        self, registry, status
+    ):
+        """A temporally-fresh stale/dead heartbeat row is NOT proof-of-life.
+
+        The scheduler itself writes "stale"/"dead" rows with current
+        timestamps, so on the next tick those rows pass the age check while
+        the session is provably NOT live. Draining there would cold-start a
+        dead (or deliberately non-resurrectable) runtime through the wake
+        callback, bypassing the proven-live-only policy (Murzik review,
+        PR #981). The pending row must be retained untouched.
+        """
+        registry.register("oleg", heartbeat_interval=60)
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="inbox", prompt="morning inbox"
+        )
+        fired_at = time.time() - 300
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="inbox",
+            prompt="morning inbox",
+            fired_at=fired_at,
+        )
+        # Temporally fresh, but the status says the session is not live —
+        # exactly what the scheduler's own bookkeeping writes.
+        registry.record_heartbeat("oleg", session_id="oleg-main", status=status)
+
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            streaming_sessions_fn=lambda: {},
+        )
+        await scheduler._check_heartbeats(time.time())
+        replay_task = scheduler._pending_replay_tasks.get("oleg")
+        if replay_task is not None:
+            await replay_task
+
+        assert attempts == []
+        assert [
+            wake.prompt for wake in registry.list_pending_schedule_wakes("oleg")
+        ] == ["morning inbox"]
+
+    @pytest.mark.asyncio
     async def test_persisted_fifo_replays_before_new_schedule_cohort(
         self, registry
     ):
