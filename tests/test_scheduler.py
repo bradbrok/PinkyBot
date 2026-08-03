@@ -1199,7 +1199,9 @@ class TestScheduler:
         )
         # Temporally fresh, but the status says the session is not live —
         # exactly what the scheduler's own bookkeeping writes.
-        registry.record_heartbeat("oleg", session_id="oleg-main", status=status)
+        heartbeat = registry.record_heartbeat(
+            "oleg", session_id="oleg-main", status=status
+        )
 
         attempts: list[str] = []
 
@@ -1213,7 +1215,7 @@ class TestScheduler:
             wake_callback=confirmed,
             streaming_sessions_fn=lambda: {},
         )
-        await scheduler._check_heartbeats(time.time())
+        await scheduler._check_heartbeats(heartbeat.timestamp + 1)
         replay_task = scheduler._pending_replay_tasks.get("oleg")
         if replay_task is not None:
             await replay_task
