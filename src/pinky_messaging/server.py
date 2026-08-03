@@ -140,8 +140,14 @@ def create_server(
         prefer_large_media: bool = False,
         link_preview_above: bool = False,
         blocks: str = "",
+        reply_to: str = "",
     ) -> str:
-        """Send a standalone message to a chat/channel. Use chat IDs, not display names.
+        """Send a message to a chat/channel. Use chat IDs, not display names.
+
+        Slack threading: reply_to is the thread root ts. When an inbound header
+        includes thread_root_ts and is_thread_reply:true, default to replying in
+        that thread (thread() already does this for an inbound message_id). Omit
+        reply_to to explicitly break out of the thread and post at the channel root.
 
         Link-preview flags (Telegram): disable_link_preview suppresses the URL
         preview card; prefer_large_media forces a big thumbnail; link_preview_above
@@ -158,6 +164,7 @@ def create_server(
             "platform": platform,
             "chat_id": chat_id,
             "content": text,
+            "reply_to": reply_to,
             "parse_mode": parse_mode,
             "link_preview_options": _link_preview_options(
                 disable_link_preview, prefer_large_media, link_preview_above

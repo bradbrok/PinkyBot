@@ -3607,6 +3607,33 @@ class TestAPI:
                 assert stored["metadata"] == {"direction": "outbound"}
                 assert send.call_args_list[1].kwargs["reply_to_message_id"] == 501
 
+    def test_broker_send_reply_to_reaches_slack_text_thread(self):
+        """#341: /broker/send reply_to reaches text send_message.thread_ts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "slack", "xoxb-test")
+
+                with patch(
+                    "pinky_outreach.slack.SlackAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="1711584001.000200"),
+                ) as send:
+                    response = client.post(
+                        "/broker/send",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "slack",
+                            "chat_id": "C123",
+                            "content": "reply in thread",
+                            "reply_to": "1711584000.000100",
+                        },
+                    )
+
+                assert response.status_code == 200, response.text
+                send.assert_called_once()
+                assert send.call_args.kwargs["thread_ts"] == "1711584000.000100"
+
     def test_broker_thread_fails_closed_on_chat_scoped_message_id_collision(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")

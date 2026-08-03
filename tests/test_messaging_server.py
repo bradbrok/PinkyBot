@@ -59,6 +59,24 @@ class TestSend:
             )
         assert json.loads(result)["ok"] is True
 
+    def test_send_forwards_reply_to(self):
+        payload = {"ok": True, "message_id": "1711584001.000200"}
+        with patch(
+            "urllib.request.urlopen", return_value=_mock_response(payload),
+        ) as mock_open:
+            srv = _srv()
+            result = _tools(srv)["send"](
+                chat_id="C123",
+                platform="slack",
+                text="reply in thread",
+                reply_to="1711584000.000100",
+            )
+
+        assert json.loads(result)["ok"] is True
+        request = mock_open.call_args[0][0]
+        body = json.loads(request.data)
+        assert body["reply_to"] == "1711584000.000100"
+
     def test_send_http_error(self):
         import urllib.error
         err = urllib.error.HTTPError(
