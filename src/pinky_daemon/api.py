@@ -10502,6 +10502,18 @@ npm run build</pre>
             or stats.get("inflight_active") is True
         )
 
+    def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
+        """Per-turn execution state: is this wake pasted with an open receipt?
+
+        Transports without the probe (e.g. Codex sessions) fall through to
+        False, preserving their pre-probe timeout behavior.
+        """
+        ss = broker._get_streaming_session(agent_name)
+        probe = getattr(ss, "scheduler_wake_inflight", None) if ss else None
+        if not callable(probe):
+            return False
+        return probe(prompt) is True
+
     async def _notify_owner_undelivered(
         agent_name: str, message: str
     ) -> bool:
@@ -10548,6 +10560,7 @@ npm run build</pre>
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
         delivery_busy_fn=_scheduler_delivery_busy,
+        delivery_inflight_fn=_scheduler_wake_inflight,
         owner_notify_callback=_notify_owner_undelivered,
         trigger_store=trigger_store,
         activity=activity,
