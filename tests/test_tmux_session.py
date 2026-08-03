@@ -3727,6 +3727,43 @@ async def test_scheduler_cancel_before_paste_never_pastes() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_cancel_during_repl_lock_wait_never_pastes() -> None:
+    """Murzik review (PR #983): the IN-LOCK cancelled-receipt check must fire.
+
+    The slot-wait check catches a cancel that lands while the pane is busy;
+    this test targets the residual race AFTER the outer idle gate: the
+    delivery task is parked on ``_repl_control_lock`` when the cancel lands,
+    so only the check inside the lock stands between the cancel and a paste
+    of an already-re-persisted wake.
+    """
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+
+    await ss._repl_control_lock.acquire()
+    try:
+        receipt = await ss.send_scheduler_prompt("scheduled")
+        # Idle pane → the delivery task passes the outer slot gate and its
+        # final pre-lock cancelled check, then parks on the held lock.
+        await asyncio.sleep(0.3)
+        assert tmux.paste_text.await_count == 0
+        receipt.cancel()
+    finally:
+        ss._repl_control_lock.release()
+
+    # The task acquires the lock, sees the cancelled receipt inside it, and
+    # must abort without ever pasting.
+    for _ in range(50):
+        if not ss._scheduler_delivery_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_watchdog_force_restart_replays_unaccepted_scheduler_head(
     monkeypatch,
 ) -> None:
