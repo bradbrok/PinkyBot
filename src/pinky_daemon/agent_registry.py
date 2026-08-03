@@ -663,6 +663,8 @@ class PendingScheduleWake:
     prompt: str = ""
     fired_at: float = 0.0
     created_at: float = 0.0
+    attempts: int = 0
+    parked_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -1275,6 +1277,8 @@ class AgentRegistry:
                 prompt TEXT NOT NULL DEFAULT '',
                 fired_at REAL NOT NULL,
                 created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                parked_at REAL NOT NULL DEFAULT 0,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -1602,6 +1606,27 @@ class AgentRegistry:
             if col not in sched_existing:
                 self._db.execute(f"ALTER TABLE agent_schedules ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to agent_schedules")
+
+        # Migrate pending_schedule_wakes table
+        wake_existing = {
+            row[1]
+            for row in self._db.execute(
+                "PRAGMA table_info(pending_schedule_wakes)"
+            ).fetchall()
+        }
+        wake_migrations = [
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("parked_at", "REAL NOT NULL DEFAULT 0"),
+        ]
+        for col, typedef in wake_migrations:
+            if col not in wake_existing:
+                self._db.execute(
+                    f"ALTER TABLE pending_schedule_wakes ADD COLUMN {col} {typedef}"
+                )
+                _log(
+                    "agent_registry: migrated — added "
+                    f"{col} to pending_schedule_wakes"
+                )
 
         # Migrate agent_heartbeats table
         hb_existing = {
@@ -3261,7 +3286,7 @@ except Exception as exc:
             created = cursor.rowcount > 0
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
-                          fired_at, created_at
+                          fired_at, created_at, attempts, parked_at
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -3270,19 +3295,68 @@ except Exception as exc:
         return PendingScheduleWake(*row), created
 
     def list_pending_schedule_wakes(
-        self, agent_name: str | None = None
+        self,
+        agent_name: str | None = None,
+        *,
+        include_parked: bool = False,
     ) -> list[PendingScheduleWake]:
-        """Return pending scheduler wakes oldest-first."""
+        """Return pending scheduler wakes oldest-first.
+
+        Parked rows are dead letters and are excluded by default. Pass
+        ``include_parked=True`` to inspect them. For now, deleting a parked row
+        manually is the only supported way to unpark it.
+        """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
-                        fired_at, created_at
+                        fired_at, created_at, attempts, parked_at
                  FROM pending_schedule_wakes"""
-        params: tuple = ()
+        conditions: list[str] = []
+        params: list = []
         if agent_name is not None:
-            sql += " WHERE agent_name=?"
-            params = (agent_name,)
+            conditions.append("agent_name=?")
+            params.append(agent_name)
+        if not include_parked:
+            conditions.append("parked_at=0")
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at ASC, id ASC"
         rows = self._db.execute(sql, params).fetchall()
         return [PendingScheduleWake(*row) for row in rows]
+
+    def increment_pending_schedule_wake_attempts(
+        self, pending_id: int
+    ) -> int | None:
+        """Persist one delivery attempt and return its new count."""
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET attempts=attempts + 1
+                   WHERE id=? AND parked_at=0""",
+                (pending_id,),
+            )
+            if cursor.rowcount == 0:
+                self._db.commit()
+                return None
+            row = self._db.execute(
+                "SELECT attempts FROM pending_schedule_wakes WHERE id=?",
+                (pending_id,),
+            ).fetchone()
+            self._db.commit()
+        return int(row[0])
+
+    def park_pending_schedule_wake(
+        self, pending_id: int, *, parked_at: float = 0.0
+    ) -> bool:
+        """Atomically move an active wake to dead-letter parked state once."""
+        timestamp = parked_at or time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET parked_at=?
+                   WHERE id=? AND parked_at=0""",
+                (timestamp, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
 
     def confirm_pending_schedule_wake(
         self, pending_id: int, *, delivered_at: float = 0.0

@@ -31,6 +31,11 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+_PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
+    {"alive", "ok", "busy", "finishing"}
+)
+
+
 # ── Rate Limit Gating ───────────────────────────────────────
 
 _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
@@ -154,6 +159,8 @@ class AgentScheduler:
     Also supports auto-sleep: agents are put to sleep after a configurable
     number of hours with no activity.
     """
+
+    PERSISTED_WAKE_ATTEMPT_CAP = 5
 
     def __init__(
         self,
@@ -748,10 +755,48 @@ class AgentScheduler:
         async with lock:
             await self._replay_pending_locked(agent_name)
 
+    def _park_pending_wake_if_capped(self, pending, attempts: int) -> bool:
+        """Park one capped wake once and emit its single owner alert."""
+        if attempts < self.PERSISTED_WAKE_ATTEMPT_CAP:
+            return False
+        try:
+            parked = self._registry.park_pending_schedule_wake(pending.id)
+        except Exception as exc:
+            _log(
+                f"scheduler: PERSISTED_WAKE_PARK_FAILURE pending "
+                f"#{pending.id}, schedule '{pending.schedule_name}' "
+                f"(#{pending.schedule_id}) for agent '{pending.agent_name}': "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        if not parked:
+            return False
+        _log(
+            f"scheduler: PERSISTED_WAKE_PARKED pending #{pending.id}, "
+            f"schedule '{pending.schedule_name}' (#{pending.schedule_id}), "
+            f"fired_at={pending.fired_at}, attempts={attempts} for agent "
+            f"'{pending.agent_name}'"
+        )
+        self._queue_owner_alert(
+            pending.agent_name,
+            (
+                "🚨 PERSISTED WAKE PARKED: outbox row "
+                f"#{pending.id} for schedule '{pending.schedule_name}' "
+                f"(#{pending.schedule_id}) on agent '{pending.agent_name}' "
+                f"reached {attempts} unconfirmed delivery attempts. Replay "
+                "is stopped for this row to prevent a storm; delete the row "
+                "manually to unpark it."
+            ),
+        )
+        return True
+
     async def _replay_pending_locked(self, agent_name: str) -> None:
-        """Replay FIFO pending wakes while the caller holds the agent lock."""
-        pending_wakes = self._registry.list_pending_schedule_wakes(agent_name)
-        for pending in pending_wakes:
+        """Reap all zombies, then replay active wakes FIFO under the agent lock."""
+        all_pending_wakes = self._registry.list_pending_schedule_wakes(
+            agent_name, include_parked=True
+        )
+        pending_wakes = []
+        for pending in all_pending_wakes:
             current_schedule = self._registry.get_schedule(pending.schedule_id)
             zombie_reason = ""
             if current_schedule is None:
@@ -771,6 +816,18 @@ class AgentScheduler:
                     f"outbox_retired={retired}"
                 )
                 continue
+            if pending.parked_at == 0:
+                pending_wakes.append(pending)
+
+        for pending in pending_wakes:
+            if pending.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP:
+                self._park_pending_wake_if_capped(pending, pending.attempts)
+                break
+            attempts = self._registry.increment_pending_schedule_wake_attempts(
+                pending.id
+            )
+            if attempts is None:
+                continue
             try:
                 confirmed = await self._wait_for_wake_confirmation(pending)
             except asyncio.CancelledError:
@@ -781,12 +838,14 @@ class AgentScheduler:
                     f"'{agent_name}' remains pending after replay: "
                     f"{type(exc).__name__}: {exc}"
                 )
+                self._park_pending_wake_if_capped(pending, attempts)
                 break
             if not confirmed:
                 _log(
                     f"scheduler: persisted wake #{pending.id} for "
                     f"'{agent_name}' remains pending: no positive receipt"
                 )
+                self._park_pending_wake_if_capped(pending, attempts)
                 break
             delivered_at = time.time()
             if not self._registry.confirm_pending_schedule_wake(
@@ -930,16 +989,14 @@ class AgentScheduler:
                         message_count=hb.message_count,
                         metadata={"reason": f"heartbeat overdue by {int(age - agent.heartbeat_interval)}s"},
                     )
-            elif hb.status == "alive":
-                # Fresh AND alive: the session ran a tool and reported in, so
-                # it is processing NOW. That is proof-of-life the durable wake
-                # outbox can safely drain against. The status gate matters:
-                # this scheduler itself writes "stale"/"dead" rows with
-                # CURRENT timestamps (above), so on the next tick those
-                # non-live rows are temporally fresh — draining on age alone
-                # would cold-start a dead or deliberately non-resurrectable
-                # runtime through the wake callback, bypassing the
-                # proven-live-only policy (Murzik review, PR #981).
+            elif hb.status in _PROVEN_LIVE_HEARTBEAT_STATUSES:
+                # Fresh agent/hook activity is transport-observed execution
+                # evidence: SDK hooks write "alive" and tmux-rails agents POST
+                # "ok"/"busy"/"finishing" themselves while running. This
+                # scheduler's own current-timestamp writes use only
+                # "stale"/"dead", which remain excluded, so accepting the full
+                # agent-authored vocabulary preserves #981's proven-live-only
+                # policy and never drains on scheduler-authored or aged rows.
                 self._drain_outbox_if_pending(agent.name)
 
     def _drain_outbox_if_pending(self, agent_name: str) -> None:
@@ -957,10 +1014,11 @@ class AgentScheduler:
         contract: replay still happens only at a proven-live boundary.
 
         Idempotent and self-limiting: skips when a replay is already in flight,
-        only reads the (indexed) outbox for a genuinely-live agent, and the
-        FIFO replay's per-prompt receipt gate leaves rows pending if the
-        session cannot accept them. So this never double-delivers and never
-        drains into a dead transport.
+        only reads the (indexed) outbox for a genuinely-live agent, and excludes
+        parked dead letters from its pending check. FIFO receipt failures remain
+        pending only through the bounded attempt cap, preventing one
+        never-confirming row from spawning replay tasks forever while preserving
+        the proven-live-only drain policy.
         """
         existing = self._pending_replay_tasks.get(agent_name)
         if existing is not None and not existing.done():
