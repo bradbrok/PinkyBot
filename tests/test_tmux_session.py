@@ -3668,6 +3668,65 @@ async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_wake_inflight_probe_tracks_pasted_turn() -> None:
+    """The probe reports pasted-with-open-receipt, per exact prompt."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1:
+            break
+        await asyncio.sleep(0.01)
+
+    assert ss.scheduler_wake_inflight("scheduled") is True
+    assert ss.scheduler_wake_inflight("some other prompt") is False
+
+    ss._on_transcript_entry({
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": "scheduled",
+    })
+    ss._on_transcript_entry({
+        "type": "queue-operation",
+        "operation": "dequeue",
+    })
+    assert await receipt is True
+    assert ss.scheduler_wake_inflight("scheduled") is False
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_before_paste_never_pastes() -> None:
+    """A queued-unpasted turn reports not-inflight and honors a cancel.
+
+    This is the safe half of the timeout split: while the prompt has not
+    been pasted, the probe returns False (so the scheduler may cancel and
+    durably persist the wake) and the cancelled turn must never reach the
+    pane afterwards — otherwise the persisted row replays a wake that also
+    executed (the 2026-08-01 duplicate-execution incident).
+    """
+    live = {"status": "working", "last_updated": _time.time()}
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: live
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    await asyncio.sleep(0.02)
+    assert tmux.paste_text.await_count == 0
+    assert ss.scheduler_wake_inflight("scheduled") is False
+
+    receipt.cancel()
+    live["status"] = "idle"
+    live["last_updated"] = _time.time()
+    await asyncio.sleep(0.35)  # > slot-wait poll interval
+    assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_watchdog_force_restart_replays_unaccepted_scheduler_head(
     monkeypatch,
 ) -> None:

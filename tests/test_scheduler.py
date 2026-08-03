@@ -929,6 +929,107 @@ class TestScheduler:
         assert "busy-not-wedged; extending" in capsys.readouterr().err
 
     @pytest.mark.asyncio
+    async def test_pasted_wake_extends_timeout_instead_of_cancelling(
+        self, registry, capsys
+    ):
+        """A pasted-but-unaccepted wake must extend, never re-persist.
+
+        Reproduces the 2026-08-01 duplicate-execution incident: the 600s
+        receipt timeout hit while the prompt was already pasted to the pane
+        (watchdog liveness blipped false between turns). Cancelling there
+        cannot recall the paste — the REPL executes it anyway — so the
+        re-persisted outbox row replays a wake that already ran. The
+        transport execution-state probe must block the cancel.
+        """
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="sweep", prompt="run the sweep"
+        )
+        receipt = asyncio.get_running_loop().create_future()
+        probes: list[tuple[str, str]] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            # Acceptance lands well after several timeout boundaries.
+            asyncio.get_running_loop().call_later(
+                0.05, receipt.set_result, True
+            )
+            return receipt
+
+        def inflight_fn(agent_name, prompt):
+            probes.append((agent_name, prompt))
+            return True  # prompt is pasted, receipt open
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,  # liveness blip
+            delivery_inflight_fn=inflight_fn,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        assert probes and set(probes) == {("oleg", "run the sweep")}
+        assert registry.get_schedules("oleg")[0].last_delivered > 0
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        assert "already pasted to the transport" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_unpasted_wake_still_persists_on_timeout(self, registry):
+        """Probe False (never pasted) keeps the durable-persist behavior."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="queued-only", prompt="never pasted"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            delivery_inflight_fn=lambda agent_name, prompt: False,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        pending = registry.list_pending_schedule_wakes("oleg")
+        assert [wake.prompt for wake in pending] == ["never pasted"]
+
+    @pytest.mark.asyncio
+    async def test_inflight_probe_failure_fails_closed(self, registry):
+        """A broken probe degrades to the pre-probe cancel path, loudly."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="broken-probe", prompt="probe breaks"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        def broken(agent_name, prompt):
+            raise RuntimeError("probe transport gone")
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            delivery_inflight_fn=broken,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        pending = registry.list_pending_schedule_wakes("oleg")
+        assert [wake.prompt for wake in pending] == ["probe breaks"]
+
+    @pytest.mark.asyncio
     async def test_undelivered_alerts_owner_and_replays_on_next_boot(
         self, registry
     ):

@@ -169,6 +169,7 @@ class AgentScheduler:
         is_resurrectable_fn=None,
         comms_cleanup_fn=None,
         delivery_busy_fn=None,
+        delivery_inflight_fn=None,
         owner_notify_callback=None,
         trigger_store=None,
         activity=None,
@@ -197,6 +198,16 @@ class AgentScheduler:
         # positive busy-not-wedged evidence, so a pending scheduler receipt
         # must keep waiting instead of expiring behind a healthy long turn.
         self._delivery_busy_fn = delivery_busy_fn
+        # fn(agent_name, prompt) -> bool. True means THIS wake's prompt has
+        # already been pasted to the transport with its receipt unresolved.
+        # Past that point a cancel cannot recall the prompt — the pane will
+        # execute it regardless — so declaring the wake undelivered and
+        # re-persisting it would mint a phantom outbox row whose later
+        # replay is a DUPLICATE EXECUTION. The receipt wait must extend
+        # instead. Distinct from delivery_busy_fn: that reads watchdog
+        # liveness (can blip false between turns at the timeout boundary);
+        # this reads the turn's own transport execution state.
+        self._delivery_inflight_fn = delivery_inflight_fn
         # async fn(agent_name, text) -> bool. FIRED BUT UNDELIVERED must leave
         # journald and reach the owner through an out-of-band transport.
         self._owner_notify_callback = owner_notify_callback
@@ -625,6 +636,17 @@ class AgentScheduler:
                             "reports busy-not-wedged; extending delivery timeout"
                         )
                         continue
+                    if self._wake_prompt_inflight(schedule):
+                        _log(
+                            f"scheduler: receipt still pending for schedule "
+                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.agent_name}', but its prompt is "
+                            "already pasted to the transport — a cancel "
+                            "cannot recall it, and declaring undelivered "
+                            "would re-persist a wake that is about to "
+                            "execute (duplicate execution); extending"
+                        )
+                        continue
                     delivery.cancel()
                     await asyncio.gather(delivery, return_exceptions=True)
                     raise
@@ -785,6 +807,35 @@ class AgentScheduler:
                 f"(#{pending.schedule_id}) for agent '{agent_name}'"
             )
 
+    @staticmethod
+    def _wake_prompt(schedule) -> str:
+        """The exact prompt text a schedule's wake delivers to the transport."""
+        return schedule.prompt or f"Scheduled wake: {schedule.name}"
+
+    def _wake_prompt_inflight(self, schedule) -> bool:
+        """True when this wake's prompt is pasted with its receipt unresolved.
+
+        Reads the transport's per-turn execution state via
+        ``delivery_inflight_fn``, failing closed (False) so a missing or
+        broken probe degrades to the pre-probe behavior rather than
+        extending forever.
+        """
+        if self._delivery_inflight_fn is None:
+            return False
+        try:
+            return (
+                self._delivery_inflight_fn(
+                    schedule.agent_name, self._wake_prompt(schedule)
+                )
+                is True
+            )
+        except Exception as exc:
+            _log(
+                f"scheduler: wake-inflight check failed for "
+                f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return False
+
     async def _wake_and_confirm(
         self,
         schedule,
@@ -798,7 +849,7 @@ class AgentScheduler:
         result = await self._wake_callback(
             schedule.agent_name,
             main_session_id,
-            schedule.prompt or f"Scheduled wake: {schedule.name}",
+            self._wake_prompt(schedule),
         )
         if inspect.isawaitable(result):
             result = await result
