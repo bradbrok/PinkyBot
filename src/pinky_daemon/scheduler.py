@@ -930,10 +930,16 @@ class AgentScheduler:
                         message_count=hb.message_count,
                         metadata={"reason": f"heartbeat overdue by {int(age - agent.heartbeat_interval)}s"},
                     )
-            else:
-                # Fresh heartbeat: the session ran a tool and reported in, so
+            elif hb.status == "alive":
+                # Fresh AND alive: the session ran a tool and reported in, so
                 # it is processing NOW. That is proof-of-life the durable wake
-                # outbox can safely drain against.
+                # outbox can safely drain against. The status gate matters:
+                # this scheduler itself writes "stale"/"dead" rows with
+                # CURRENT timestamps (above), so on the next tick those
+                # non-live rows are temporally fresh — draining on age alone
+                # would cold-start a dead or deliberately non-resurrectable
+                # runtime through the wake callback, bypassing the
+                # proven-live-only policy (Murzik review, PR #981).
                 self._drain_outbox_if_pending(agent.name)
 
     def _drain_outbox_if_pending(self, agent_name: str) -> None:
