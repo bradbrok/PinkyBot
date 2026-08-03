@@ -7010,6 +7010,124 @@ class TestForceFreshContextOnce:
         assert ss._fresh_context_respawn_epoch == 7
 
 
+class TestStickyFreshContextIntent:
+    """#352 — the fresh-context intent must survive the watchdog.
+
+    Observed failure: ``context_restart`` launches fresh, the fresh REPL
+    never completes a turn (so its transcript file is never created), the
+    inflight watchdog fires at 600s — past the 180s respawn grace — and
+    the force_restart relaunch resolves ``--continue``, which Claude Code
+    resumes onto the newest transcript *on disk*: the pre-restart one.
+    The context window is never actually cleared.
+    """
+
+    @pytest.mark.asyncio
+    async def test_fresh_intent_survives_grace_expiry_until_a_turn_completes(
+        self, monkeypatch
+    ):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        await ss.connect()
+        try:
+            # Watchdog territory: well past FRESH_CONTEXT_RESPAWN_GRACE_SEC,
+            # and no post-fresh turn ever completed.
+            base = _time.monotonic()
+            monkeypatch.setattr(
+                "pinky_daemon.tmux_session.time.monotonic",
+                lambda: base + 700.0,
+            )
+
+            parts = shlex.split(ss._build_claude_cmd())
+
+            assert "--continue" not in parts, (
+                "a fresh REPL that never completed a turn must not be "
+                "relaunched with --continue — that resumes the "
+                "pre-restart transcript (#352)"
+            )
+            assert "--resume" not in parts
+            assert ss._last_launch_forced_fresh is True
+        finally:
+            await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_completed_post_fresh_turn_releases_the_fresh_intent(
+        self, monkeypatch
+    ):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        ss._config.force_fresh_context_once = True
+
+        await ss.connect()
+        try:
+            ss._state_machine._state = SessionState.CONNECTED
+            _seed_inflight(
+                ss,
+                internal=True,
+                fresh_context_epoch=ss._fresh_context_respawn_epoch,
+            )
+            await ss._handle_turn_complete(_turn_response(text="wake complete"))
+
+            base = _time.monotonic()
+            monkeypatch.setattr(
+                "pinky_daemon.tmux_session.time.monotonic",
+                lambda: base + 700.0,
+            )
+
+            parts = shlex.split(ss._build_claude_cmd())
+
+            assert "--continue" in parts, (
+                "once the fresh REPL has completed a turn the intent is "
+                "satisfied — later respawns must resume warm"
+            )
+            assert ss._last_launch_forced_fresh is False
+        finally:
+            await ss.disconnect()
+
+    def test_warm_relaunch_resumes_the_bound_transcript_by_path(self, tmp_path):
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+        transcript = tmp_path / "59201989.jsonl"
+        transcript.write_text('{"type":"user"}\n')
+        ss.set_transcript_path(transcript)
+
+        parts = shlex.split(ss._build_claude_cmd())
+
+        assert parts.count("--resume") == 1
+        assert str(transcript) in parts
+        assert "--continue" not in parts, (
+            "an explicit --resume <path> must replace --continue when the "
+            "active transcript is known (#352)"
+        )
+        assert ss._last_launch_used_continue is True
+
+    def test_relaunch_is_fresh_when_the_bound_transcript_does_not_exist(
+        self, tmp_path
+    ):
+        """The decisive case: the fresh REPL's transcript was never written."""
+        ss, _ = _make_session()
+        # Older transcripts DO exist on disk — that is exactly what
+        # ``--continue`` would latch onto.
+        ss._has_prior_transcript = lambda: True
+        ss.set_transcript_path(tmp_path / "5543e594.jsonl")
+
+        parts = shlex.split(ss._build_claude_cmd())
+
+        assert "--continue" not in parts
+        assert "--resume" not in parts
+        assert ss._last_launch_used_continue is False
+
+    def test_unknown_active_transcript_keeps_legacy_continue(self):
+        """Daemon restart: no bind was ever recorded for this session."""
+        ss, _ = _make_session()
+        ss._has_prior_transcript = lambda: True
+
+        parts = shlex.split(ss._build_claude_cmd())
+
+        assert "--continue" in parts
+
+
 class TestWakePromptEnqueueOnConnect:
     """Wake-prompt assembly + enqueue is the parent defect from #543.
     These tests pin that ``connect()`` actually injects the wake prompt,
