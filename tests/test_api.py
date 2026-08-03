@@ -7775,6 +7775,10 @@ class TestBuildStreamingWakeContextReasonGating:
         """#949 alerting uses the durable #863 owner-notify configuration."""
         with tempfile.TemporaryDirectory() as tmpdir:
             app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.register("dymok", model="sonnet")
+            app.state.agents.set_token(
+                "dymok", "telegram", "token", settings={"account_id": "acct-1"},
+            )
             app.state.agents.set_owner_notification_destinations([
                 {
                     "platform": "telegram",
@@ -7797,6 +7801,106 @@ class TestBuildStreamingWakeContextReasonGating:
                 "owner-dm",
                 "FIRED BUT UNDELIVERED test",
                 account_id="acct-1",
+            )
+
+    @pytest.mark.asyncio
+    async def test_scheduler_owner_alert_uses_exact_account_on_another_local_agent(
+        self, monkeypatch,
+    ):
+        """#985: an absent preferred binding falls back without hiding the rot."""
+        import pinky_daemon.api as api_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.register("geordi", model="sonnet")
+            app.state.agents.register("local-notifier", model="sonnet")
+            app.state.agents.set_token(
+                "local-notifier",
+                "telegram",
+                "token",
+                settings={"account_id": "brad-telegram"},
+            )
+            app.state.agents.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "brad-telegram",
+                    "conversation_id": "owner-dm",
+                    "principal_id": "owner-user",
+                }
+            ])
+            send = AsyncMock(return_value={"sent": True})
+            app.state.broker._send_callback = send
+            logs: list[str] = []
+            monkeypatch.setattr(api_mod, "_log", logs.append)
+
+            delivered = await app.state.scheduler._owner_notify_callback(
+                "geordi", "FIRED BUT UNDELIVERED test"
+            )
+
+            assert delivered is True
+            send.assert_awaited_once_with(
+                "local-notifier",
+                "telegram",
+                "owner-dm",
+                "FIRED BUT UNDELIVERED test",
+                account_id="brad-telegram",
+            )
+            assert any("OWNER_NOTIFY_DELIVERY_FAILURE" in line for line in logs)
+            assert any(
+                "OWNER_NOTIFY_ROUTE_FALLBACK" in line and "local-notifier" in line
+                for line in logs
+            )
+
+    @pytest.mark.asyncio
+    async def test_scheduler_owner_alert_uses_default_channel_with_any_local_account(
+        self, monkeypatch,
+    ):
+        """#985: total canonical-binding absence falls back to the daemon default."""
+        import pinky_daemon.api as api_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.register("geordi", model="sonnet")
+            app.state.agents.set_token(
+                "geordi", "slack", "token", settings={"team_id": "T_PI"},
+            )
+            app.state.agents.set_setting("operator_chat_id", "D_OWNER")
+            app.state.agents.set_setting("operator_platform", "slack")
+            app.state.agents.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "brad-telegram",
+                    "conversation_id": "telegram-owner-dm",
+                    "principal_id": "telegram-owner",
+                }
+            ])
+            send = AsyncMock(return_value={"sent": True})
+            app.state.broker._send_callback = send
+            logs: list[str] = []
+            monkeypatch.setattr(api_mod, "_log", logs.append)
+
+            delivered = await app.state.scheduler._owner_notify_callback(
+                "geordi", "FIRED BUT UNDELIVERED test"
+            )
+
+            assert delivered is True
+            send.assert_awaited_once_with(
+                "geordi",
+                "slack",
+                "D_OWNER",
+                "FIRED BUT UNDELIVERED test",
+                account_id="T_PI",
+            )
+            assert any(
+                "OWNER_NOTIFY_DELIVERY_FAILURE" in line
+                and "brad-telegram" in line
+                for line in logs
+            )
+            assert any(
+                "OWNER_NOTIFY_ROUTE_FALLBACK" in line
+                and "daemon default owner channel" in line
+                and "slack/T_PI/D_OWNER" in line
+                for line in logs
             )
 
     def test_central_wake_log_failure_does_not_advance_gate(self):

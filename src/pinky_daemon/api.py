@@ -10517,34 +10517,143 @@ npm run build</pre>
     async def _notify_owner_undelivered(
         agent_name: str, message: str
     ) -> bool:
-        """Send scheduler failures through canonical owner destinations."""
+        """Send scheduler failures through canonical and host-local fallbacks."""
         send_callback = broker.send_callback
         destinations = agents.get_owner_notification_destinations()
-        if not send_callback or not destinations:
+        if not send_callback:
             return False
-        last_error = "no configured destination accepted the alert"
-        for destination in destinations:
+
+        sender_names = [agent_name] + [
+            agent.name
+            for agent in agents.list(enabled_only=True)
+            if agent.name != agent_name
+        ]
+        attempted_routes: set[tuple[str, str, str, str]] = set()
+        failures: list[str] = []
+
+        async def _attempt(
+            sender_name: str,
+            platform: str,
+            account_id: str,
+            conversation_id: str,
+        ) -> bool:
+            route = (sender_name, platform, account_id, conversation_id)
+            if route in attempted_routes:
+                return False
+            attempted_routes.add(route)
             try:
                 result = await send_callback(
-                    agent_name,
-                    destination["platform"],
-                    destination["conversation_id"],
+                    sender_name,
+                    platform,
+                    conversation_id,
                     message,
-                    account_id=destination["account_id"],
+                    account_id=account_id,
                 )
                 if not (
                     isinstance(result, dict)
                     and result.get("sent") is True
                 ):
-                    raise RuntimeError(
-                        "send callback did not confirm delivery"
-                    )
+                    raise RuntimeError("send callback did not confirm delivery")
             except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                continue
+                error = f"{type(exc).__name__}: {exc}"
+                failures.append(error)
+                _log(
+                    "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                    f"agent '{agent_name}' via sender '{sender_name}' route "
+                    f"{platform}/{account_id}/{conversation_id}: {error}"
+                )
+                return False
             return True
+
+        for index, destination in enumerate(destinations):
+            platform = destination["platform"]
+            account_id = destination["account_id"]
+            conversation_id = destination["conversation_id"]
+            preferred_bound = bool(agents.get_raw_token_for_account(
+                agent_name, platform, account_id,
+            ))
+            sender_name = next((
+                candidate
+                for candidate in sender_names
+                if agents.get_raw_token_for_account(candidate, platform, account_id)
+            ), "")
+
+            if not preferred_bound:
+                error = (
+                    f"no {platform} token bound to destination account "
+                    f"{account_id} for preferred sender {agent_name}"
+                )
+                failures.append(error)
+                _log(
+                    "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                    f"agent '{agent_name}' via sender '{agent_name}' route "
+                    f"{platform}/{account_id}/{conversation_id}: {error}"
+                )
+
+            if not sender_name:
+                continue
+            if index > 0 or sender_name != agent_name:
+                _log(
+                    "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
+                    f"agent '{agent_name}': using canonical route "
+                    f"{platform}/{account_id}/{conversation_id} via local "
+                    f"sender '{sender_name}'"
+                )
+            if await _attempt(sender_name, platform, account_id, conversation_id):
+                return True
+
+        try:
+            default_conversation_id, default_platform = resolve_operator_chat(
+                get_setting=agents.get_setting,
+                list_all_approved_users=agents.list_all_approved_users,
+            )
+        except Exception as exc:
+            error = f"default owner channel resolution failed: {type(exc).__name__}: {exc}"
+            failures.append(error)
+            _log(
+                "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                f"agent '{agent_name}': {error}"
+            )
+            default_conversation_id, default_platform = "", ""
+
+        default_sender = ""
+        default_account = ""
+        if default_conversation_id and default_platform:
+            for candidate in sender_names:
+                account_id = agents.get_token_account_id(candidate, default_platform)
+                if account_id and agents.get_raw_token_for_account(
+                    candidate, default_platform, account_id,
+                ):
+                    default_sender = candidate
+                    default_account = account_id
+                    break
+
+        if default_sender:
+            _log(
+                "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
+                f"agent '{agent_name}': using daemon default owner channel "
+                f"{default_platform}/{default_account}/{default_conversation_id} "
+                f"via local sender '{default_sender}'"
+            )
+            if await _attempt(
+                default_sender,
+                default_platform,
+                default_account,
+                default_conversation_id,
+            ):
+                return True
+        elif default_conversation_id and default_platform:
+            error = f"no local token bound for default owner platform {default_platform}"
+            failures.append(error)
+            _log(
+                "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                f"agent '{agent_name}' route {default_platform}/"
+                f"{default_conversation_id}: {error}"
+            )
+
+        last_error = failures[-1] if failures else "no owner alert route is configured"
         _log(
-            f"api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+            "api: OWNER_NOTIFY_TERMINAL_FAILURE for scheduler alert "
             f"agent '{agent_name}': {last_error}"
         )
         return False
