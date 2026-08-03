@@ -3381,6 +3381,42 @@ except Exception as exc:
             self._db.commit()
         return cursor.rowcount > 0
 
+    def confirm_pending_schedule_wake_by_fire(
+        self,
+        schedule_id: int,
+        fired_at: float,
+        *,
+        delivered_at: float = 0.0,
+    ) -> bool:
+        """Atomically confirm and retire the outbox row for one exact fire."""
+        timestamp = delivered_at or time.time()
+        with self._rmw_lock:
+            row = self._db.execute(
+                """SELECT id FROM pending_schedule_wakes
+                   WHERE schedule_id=? AND fired_at=?""",
+                (schedule_id, fired_at),
+            ).fetchone()
+            if row is None:
+                return False
+            self._db.execute(
+                "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
+                (timestamp, schedule_id),
+            )
+            cursor = self._db.execute(
+                """DELETE FROM pending_schedule_wakes
+                   WHERE schedule_id=? AND fired_at=?""",
+                (schedule_id, fired_at),
+            )
+            self._db.commit()
+        retired = cursor.rowcount > 0
+        if retired:
+            _log(
+                "agent_registry: PERSISTED_WAKE_RETIRED_ON_LATE_CONFIRM "
+                f"pending #{row[0]}, schedule #{schedule_id}, "
+                f"fired_at={fired_at}"
+            )
+        return retired
+
     def discard_pending_schedule_wake(self, pending_id: int) -> bool:
         """Retire a pending wake without marking its schedule delivered."""
         cursor = self._db.execute(
