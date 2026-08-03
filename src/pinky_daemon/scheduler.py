@@ -545,9 +545,17 @@ class AgentScheduler:
 
         if confirmed:
             delivered_at = time.time()
-            self._registry.update_schedule_last_delivered(
-                schedule.id, delivered_at
+            retired_pending = (
+                self._registry.confirm_pending_schedule_wake_by_fire(
+                    schedule.id,
+                    schedule.last_run,
+                    delivered_at=delivered_at,
+                )
             )
+            if not retired_pending:
+                self._registry.update_schedule_last_delivered(
+                    schedule.id, delivered_at
+                )
             if self._activity:
                 try:
                     self._activity.log(

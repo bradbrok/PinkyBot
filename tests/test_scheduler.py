@@ -413,6 +413,52 @@ class TestAgentSchedules:
         stored = registry.get_schedules("oleg")[0]
         assert stored.last_delivered == pytest.approx(delivered_at)
 
+    def test_confirm_pending_wake_by_fire_missing_is_harmless(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="morning", prompt="check mail"
+        )
+
+        assert registry.confirm_pending_schedule_wake_by_fire(
+            schedule.id, 100.0, delivered_at=200.0
+        ) is False
+
+        assert registry.get_schedules("oleg")[0].last_delivered == 0.0
+        captured = capsys.readouterr().err
+        assert "PERSISTED_WAKE_RETIRED_ON_LATE_CONFIRM" not in captured
+
+    def test_confirm_pending_wake_by_fire_retires_parked_row(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="morning", prompt="check mail"
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="morning",
+            prompt="check mail",
+            fired_at=100.0,
+        )
+        assert registry.park_pending_schedule_wake(
+            pending.id, parked_at=150.0
+        ) is True
+
+        assert registry.confirm_pending_schedule_wake_by_fire(
+            schedule.id, 100.0, delivered_at=200.0
+        ) is True
+
+        assert registry.list_pending_schedule_wakes(
+            "oleg", include_parked=True
+        ) == []
+        assert registry.get_schedules("oleg")[0].last_delivered == 200.0
+        captured = capsys.readouterr().err
+        assert "PERSISTED_WAKE_RETIRED_ON_LATE_CONFIRM" in captured
+        assert f"pending #{pending.id}, schedule #{schedule.id}" in captured
+
     def test_pending_wake_columns_migrate_idempotently_on_existing_db(self):
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
@@ -889,6 +935,54 @@ class TestScheduler:
         ]
         assert events == ["schedule_fired", "schedule_undelivered"]
         assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_late_primary_confirm_retires_persisted_wake(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="late", prompt="run once"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+        pending = registry.list_pending_schedule_wakes("oleg")
+        assert len(pending) == 1
+
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler._wake_callback = confirmed
+        await scheduler._deliver_schedule(schedule)
+
+        assert attempts == ["run once"]
+        assert registry.list_pending_schedule_wakes(
+            "oleg", include_parked=True
+        ) == []
+        assert registry.get_schedules("oleg")[0].last_delivered > 0
+        captured = capsys.readouterr().err
+        assert "PERSISTED_WAKE_RETIRED_ON_LATE_CONFIRM" in captured
+        assert f"pending #{pending[0].id}, schedule #{schedule.id}" in captured
+
+        scheduler.replay_pending_for_agent("oleg")
+        await scheduler._pending_replay_tasks["oleg"]
+        assert attempts == ["run once"]
 
     @pytest.mark.asyncio
     async def test_overlapping_fires_keep_distinct_exact_outbox_rows(
