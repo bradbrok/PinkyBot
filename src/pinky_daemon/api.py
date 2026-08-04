@@ -11836,14 +11836,42 @@ npm run build</pre>
                     deps_drift = []
 
                 if changed or force_deps or deps_drift:
-                    # Prefer project venv pip if present, else use the running daemon's
-                    # interpreter (sys.executable). This works for both venv and
-                    # system-python deployments — the prior `.venv/bin/pip`-only path
-                    # silently skipped rebuilds on system-python hosts.
+                    # Prefer a functional project venv pip, else use the running
+                    # daemon's interpreter (sys.executable). A vestigial .venv can
+                    # retain bin/pip even after pip disappears from its interpreter,
+                    # so file existence alone is not enough to select it.
                     venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
+                    venv_python = Path(repo_dir) / ".venv" / "bin" / "python"
+                    pip_cmd: list[str] | None = None
                     if venv_pip.exists():
-                        pip_cmd = [str(venv_pip), "install", "-e", ".[all]", "--quiet"]
-                    else:
+                        try:
+                            sp.check_output(
+                                [str(venv_python), "-m", "pip", "--version"],
+                                cwd=repo_dir, stderr=sp.STDOUT, timeout=10,
+                            )
+                        except Exception as probe_exc:
+                            probe_output = getattr(probe_exc, "output", None)
+                            if isinstance(probe_output, bytes):
+                                probe_detail = probe_output.decode(errors="replace")
+                            elif probe_output:
+                                probe_detail = str(probe_output)
+                            else:
+                                probe_detail = f"{type(probe_exc).__name__}: {probe_exc}"
+                            probe_detail = " ".join(probe_detail.split())[:500]
+                            if not probe_detail:
+                                probe_detail = f"{type(probe_exc).__name__}: {probe_exc}"
+                            _log(
+                                "admin: .venv exists but its pip is broken "
+                                f"({probe_detail}) — treating it as vestigial and "
+                                f"falling back to {sys.executable}"
+                            )
+                        else:
+                            pip_cmd = [
+                                str(venv_python), "-m", "pip", "install",
+                                "-e", ".[all]", "--quiet",
+                            ]
+
+                    if pip_cmd is None:
                         # PEP 668: system pythons (Homebrew, Debian) mark themselves
                         # externally-managed. --break-system-packages lets us install
                         # into the same env the daemon imports from.
@@ -11923,6 +11951,20 @@ npm run build</pre>
             return result
 
         result = await asyncio.to_thread(_run_update)
+
+        if result.get("deps_error"):
+            try:
+                delivered = await scheduler._owner_notify_callback(
+                    "admin",
+                    "ADMIN UPDATE DEPENDENCY REBUILD FAILED: "
+                    f"{result['deps_error']}. The code update may have landed "
+                    "without required dependencies; inspect the daemon log and "
+                    "rerun the dependency rebuild.",
+                )
+                if not delivered:
+                    _log("admin: dependency rebuild owner alert was not delivered")
+            except Exception as notify_exc:
+                _log(f"admin: dependency rebuild owner alert failed: {notify_exc}")
 
         # Schedule graceful restart if anything changed
         if result.get("restarting"):
