@@ -17,5 +17,5 @@ def test_slack_socket_mode_dependencies_are_in_base_install() -> None:
     assert project["optional-dependencies"]["slack"] == []
 
 
-def test_claude_agent_sdk_excludes_pretooluse_bypass_version() -> None:
-    assert "claude-agent-sdk>=0.2.127,<0.3" in _project()["dependencies"]
+def test_claude_agent_sdk_excludes_allowed_tools_injection_versions() -> None:
+    assert "claude-agent-sdk>=0.2.129,<0.3" in _project()["dependencies"]
