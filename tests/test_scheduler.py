@@ -357,11 +357,34 @@ class TestAgentSchedules:
         assert s.last_delivered == 0.0
 
         now = time.time()
-        registry.update_schedule_last_run(s.id, now)
+        assert registry.update_schedule_last_run(s.id, now) is True
 
         schedules = registry.get_schedules("oleg")
         assert schedules[0].last_run == pytest.approx(now, abs=0.1)
         assert schedules[0].last_delivered == 0.0
+
+    def test_update_last_run_compare_and_swap(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule("oleg", "0 8 * * *")
+        contender = AgentRegistry(db_path=registry._db_path)
+        try:
+            contender_snapshot = contender.get_schedules("oleg")[0]
+
+            assert registry.update_schedule_last_run(
+                schedule.id,
+                100.0,
+                expected_last_run=schedule.last_run,
+            ) is True
+            assert contender.update_schedule_last_run(
+                schedule.id,
+                200.0,
+                expected_last_run=contender_snapshot.last_run,
+            ) is False
+
+            stored = registry.get_schedules("oleg")[0]
+            assert stored.last_run == 100.0
+        finally:
+            contender.close()
 
     def test_update_last_delivered_is_distinct_from_last_run(self, registry):
         registry.register("oleg")
@@ -896,6 +919,103 @@ class TestScheduler:
             "schedule_delivered",
             "schedule_delivered",
         ]
+
+    @pytest.mark.asyncio
+    async def test_primary_confirm_log_includes_fire_identity(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="forensic", prompt="run once"
+        )
+        fired_at = 1_800_000_000.0
+        assert registry.update_schedule_last_run(
+            schedule.id,
+            fired_at,
+            expected_last_run=schedule.last_run,
+        ) is True
+        schedule.last_run = fired_at
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        await scheduler._deliver_schedule(schedule)
+
+        assert (
+            f"scheduler: delivery confirmed for schedule 'forensic' "
+            f"(#{schedule.id}) for agent 'oleg' (fired_at={fired_at})"
+        ) in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_lost_last_run_claim_race_skips_fire(
+        self, registry, monkeypatch, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="claimed", prompt="run once"
+        )
+        wake_calls: list[str] = []
+        events: list[str] = []
+        real_update = registry.update_schedule_last_run
+        competing_claim_made = False
+
+        def lose_to_competing_claim(
+            schedule_id,
+            timestamp=0.0,
+            *,
+            expected_last_run=None,
+        ):
+            nonlocal competing_claim_made
+            if expected_last_run is not None and not competing_claim_made:
+                competing_claim_made = True
+                assert real_update(
+                    schedule_id,
+                    timestamp,
+                    expected_last_run=expected_last_run,
+                ) is True
+            return real_update(
+                schedule_id,
+                timestamp,
+                expected_last_run=expected_last_run,
+            )
+
+        class Activity:
+            def log(self, agent_name, event_type, summary):
+                del agent_name, summary
+                events.append(event_type)
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id
+            wake_calls.append(prompt)
+            return True
+
+        monkeypatch.setattr(
+            registry,
+            "update_schedule_last_run",
+            lose_to_competing_claim,
+        )
+        scheduler = AgentScheduler(
+            registry, wake_callback=wake_cb, activity=Activity()
+        )
+        fired_at = 1_800_000_000.0
+
+        await scheduler._check_schedules(fired_at)
+
+        stored = registry.get_schedules("oleg")[0]
+        assert competing_claim_made is True
+        assert stored.last_run == fired_at
+        assert stored.last_delivered == 0.0
+        assert wake_calls == []
+        assert events == []
+        assert scheduler._schedule_delivery_tasks == set()
+        error_log = capsys.readouterr().err
+        assert (
+            f"scheduler: lost last_run claim race for "
+            f"#{schedule.id} — skipping fire"
+        ) in error_log
+        assert "scheduler: firing schedule" not in error_log
 
     @pytest.mark.asyncio
     async def test_unconfirmed_delivery_stays_fired_but_undelivered(

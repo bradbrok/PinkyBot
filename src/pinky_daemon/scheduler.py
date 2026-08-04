@@ -383,13 +383,23 @@ class AgentScheduler:
                     continue
 
             if cron_matches(schedule.cron, dt):
+                claimed = self._registry.update_schedule_last_run(
+                    schedule.id,
+                    now,
+                    expected_last_run=schedule.last_run,
+                )
+                if not claimed:
+                    _log(
+                        f"scheduler: lost last_run claim race for "
+                        f"#{schedule.id} — skipping fire"
+                    )
+                    continue
                 _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send}, one_shot={schedule.one_shot})")
                 if self._activity:
                     try:
                         self._activity.log(schedule.agent_name, "schedule_fired", f"Schedule '{schedule.name}' fired")
                     except Exception:
                         pass
-                self._registry.update_schedule_last_run(schedule.id, now)
                 # Carry the exact fire identity on this queued snapshot. A
                 # later minute can advance the DB row while this cohort still
                 # waits behind a long turn, so failure paths must never reread
@@ -572,7 +582,7 @@ class AgentScheduler:
             _log(
                 f"scheduler: delivery confirmed for schedule "
                 f"'{schedule.name}' (#{schedule.id}) for agent "
-                f"'{schedule.agent_name}'"
+                f"'{schedule.agent_name}' (fired_at={schedule.last_run})"
             )
             return
 
