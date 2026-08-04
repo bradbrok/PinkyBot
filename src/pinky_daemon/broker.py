@@ -43,6 +43,7 @@ _INBOUND_RECONNECT_POLL_SEC = 0.25
 # five cycles; every cycle walks the canonical primary + ordered fallbacks.
 _APPROVAL_RENOTIFY_INTERVAL_SEC = 4 * 60 * 60
 _APPROVAL_RENOTIFY_HELD_COUNT = 10
+_APPROVAL_AGING_REPROMPT_AFTER_SEC = (24 * 60 * 60, 72 * 60 * 60)
 _APPROVAL_NOTIFY_RETRY_BASE_SEC = 30
 _APPROVAL_NOTIFY_RETRY_MAX_SEC = 30 * 60
 _APPROVAL_NOTIFY_MAX_ATTEMPTS = 5
@@ -309,6 +310,7 @@ class MessageBroker:
         self._background_tasks: set[asyncio.Task] = set()
         self._approval_notification_task: asyncio.Task | None = None
         self._approval_notification_locks: dict[int, asyncio.Lock] = {}
+        self._approval_flush_locks: dict[tuple[str, str], asyncio.Lock] = {}
 
     @property
     def send_callback(self):
@@ -1017,8 +1019,17 @@ class MessageBroker:
     def _format_approval_notification(request: dict) -> str:
         approval_key = request["chat_id"]
         agent_name = request["agent_name"]
-        held_count = request["held_count"]
+        held_count = request.get("undelivered_count", request["held_count"])
         oldest_age = max(0, int(time.time() - request["oldest_held_at"]))
+        alert = ""
+        if request.get("high_signal"):
+            principals = ", ".join(request.get("approved_principal_ids") or [])
+            alert = (
+                "🚨 APPROVAL GATE BLACK-HOLE RISK\n"
+                f"This pending chat is holding messages from an already-approved "
+                f"{agent_name} principal"
+                f"{f' ({principals})' if principals else ''}.\n\n"
+            )
         if request["is_channel"]:
             subject = (
                 f"{agent_name} has messages held from a new channel "
@@ -1033,7 +1044,7 @@ class MessageBroker:
             )
             action = "Review the request:"
         return (
-            f"🆕 {subject}\n\n"
+            f"{alert}🆕 {subject}\n\n"
             f"Held messages: {held_count}; oldest: {oldest_age}s\n"
             f"{action}\n"
             f"/approve_{approval_key}\n"
@@ -1041,19 +1052,33 @@ class MessageBroker:
         )
 
     @staticmethod
-    def _approval_request_needs_notification(request: dict, now: float) -> bool:
+    def _approval_notification_reason(request: dict, now: float) -> str:
         if request["gate_state"] != "pending":
-            return False
+            return ""
+        if request.get("undelivered_count", request["held_count"]) < 1:
+            return ""
         if request["notification_state"] == "retrying":
-            return request["next_retry_at"] <= now
+            return "retry" if request["next_retry_at"] <= now else ""
+        aging_count = request.get("aging_reprompt_count", 0)
+        if aging_count < len(_APPROVAL_AGING_REPROMPT_AFTER_SEC):
+            threshold = _APPROVAL_AGING_REPROMPT_AFTER_SEC[aging_count]
+            if now - request["oldest_held_at"] >= threshold:
+                return "aging"
+        if request.get("high_signal") and not request.get("high_signal_alerted_at"):
+            return "high_signal"
         if request["notification_state"] == "failed":
-            return False
+            return ""
         new_holds = request["held_count"] - request["notified_held_count"]
         elapsed = now - request["last_notified_at"]
-        return (
-            new_holds >= _APPROVAL_RENOTIFY_HELD_COUNT
-            or (new_holds > 0 and elapsed >= _APPROVAL_RENOTIFY_INTERVAL_SEC)
-        )
+        if new_holds >= _APPROVAL_RENOTIFY_HELD_COUNT:
+            return "new_holds"
+        if new_holds > 0 and elapsed >= _APPROVAL_RENOTIFY_INTERVAL_SEC:
+            return "new_holds"
+        return ""
+
+    @staticmethod
+    def _approval_request_needs_notification(request: dict, now: float) -> bool:
+        return bool(MessageBroker._approval_notification_reason(request, now))
 
     async def _notify_approval_request(self, request: dict) -> None:
         """Deliver one durable approval notification over ordered fallbacks."""
@@ -1064,12 +1089,18 @@ class MessageBroker:
                 request["agent_name"], request["chat_id"],
             )
             now = time.time()
-            if not current or not self._approval_request_needs_notification(current, now):
+            reason = (
+                self._approval_notification_reason(current, now)
+                if current else ""
+            )
+            if not current or not reason:
                 return
 
-            reset_attempts = current["notification_state"] == "delivered"
+            reset_attempts = current["notification_state"] in ("delivered", "failed")
             self._registry.begin_approval_notification(
-                request_id, reset_attempts=reset_attempts,
+                request_id,
+                reset_attempts=reset_attempts,
+                aging_reprompt=reason == "aging",
             )
             current = self._registry.get_approval_request(
                 current["agent_name"], current["chat_id"],
@@ -1103,6 +1134,7 @@ class MessageBroker:
                         request_id,
                         destination=destination,
                         fallback_path=fallback_path,
+                        high_signal=bool(current.get("high_signal")),
                     )
                     _log(
                         "broker: owner approval notification delivered "
@@ -1135,15 +1167,46 @@ class MessageBroker:
 
     async def retry_due_approval_notifications(self) -> int:
         """Attempt every due durable notification; return requests examined."""
-        due = self._registry.list_due_approval_notifications()
+        now = time.time()
+        due = [
+            request
+            for request in self._registry.list_due_approval_notifications(now)
+            if self._approval_request_needs_notification(request, now)
+        ]
         for request in due:
             await self._notify_approval_request(request)
         return len(due)
+
+    async def reconcile_approved_pending_messages(self) -> int:
+        """Flush held rows whose approval gate is already approved.
+
+        This is the systemic catch-all for transitions outside the two normal
+        approval endpoints (migrations, direct registry callers, and old rows
+        surviving an upgrade). It is safe to run at startup and continuously;
+        ``handle_approval`` serializes each agent/chat flush and checkpoints
+        successful messages individually.
+        """
+        delivered = 0
+        for backlog in self._registry.list_approval_backlogs():
+            if backlog["gate_status"] != "approved":
+                continue
+            agent_name = backlog["agent_name"]
+            chat_id = backlog["chat_id"]
+            try:
+                self._registry.settle_approval_request(agent_name, chat_id, "approved")
+                delivered += await self.handle_approval(agent_name, chat_id)
+            except Exception as exc:
+                _log(
+                    "ERROR broker: approved pending-message reconcile failed "
+                    f"for {agent_name}/{chat_id}: {exc}"
+                )
+        return delivered
 
     async def run_approval_notification_retries(self) -> None:
         """Daemon loop that resumes retrying receipts after process restarts."""
         while True:
             try:
+                await self.reconcile_approved_pending_messages()
                 await self.retry_due_approval_notifications()
             except asyncio.CancelledError:
                 raise
@@ -1394,6 +1457,14 @@ class MessageBroker:
         return f"{header}\n{body}"
 
     async def handle_approval(self, agent_name: str, chat_id: str) -> int:
+        """Serialize and flush one approved chat's held messages."""
+        lock = self._approval_flush_locks.setdefault(
+            (agent_name, chat_id), asyncio.Lock(),
+        )
+        async with lock:
+            return await self._handle_approval_unlocked(agent_name, chat_id)
+
+    async def _handle_approval_unlocked(self, agent_name: str, chat_id: str) -> int:
         """When a pending user is approved, deliver their held messages.
 
         Successful rows are checkpointed individually so a later-row failure
@@ -1425,7 +1496,11 @@ class MessageBroker:
                 timestamp=msg["created_at"],
                 is_group=bool(msg.get("is_group")),
             )
-            await self._route_streaming(agent_name, broker_msg)
+            handoff = await self._route_streaming(agent_name, broker_msg)
+            if handoff is False:
+                raise RuntimeError(
+                    f"streaming handoff unavailable for {agent_name}/{chat_id}"
+                )
 
             # Checkpoint each successful handoff before attempting the next
             # row. A later-row failure can then retry without deterministically
@@ -1458,7 +1533,7 @@ class MessageBroker:
         # Fall back to main
         return sessions.get("main")
 
-    async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> None:
+    async def _route_streaming(self, agent_name: str, message: BrokerMessage) -> bool:
         """Route a message via streaming session — non-blocking.
 
         Resolution order:
@@ -1586,7 +1661,7 @@ class MessageBroker:
                 agent_name, message.platform, message.chat_id,
                 f"⚠️ {agent_name} is not running right now. Try again later.",
             )
-            return
+            return False
 
         # Show typing indicator
         if self._typing_callback:
@@ -1619,7 +1694,7 @@ class MessageBroker:
                     agent_name, message.platform, message.chat_id,
                     "I received your voice message but couldn't transcribe it — please try again or send text.",
                 )
-                return
+                return False
         else:
             self._voice_pending.pop((agent_name, message.chat_id), None)
 
@@ -1668,6 +1743,7 @@ class MessageBroker:
             await self._start_typing(agent_name, message.platform, message.chat_id, streaming)
         self._stats["routed"] += 1
         _log(f"broker: streamed message to {agent_name} (non-blocking)")
+        return True
 
     async def inject_agent_message(
         self,

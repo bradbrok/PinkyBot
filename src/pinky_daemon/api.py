@@ -6184,6 +6184,11 @@ npm run build</pre>
         """List all approved users across all agents."""
         return {"users": agents.list_all_approved_users()}
 
+    @app.get("/system/approval-backlog")
+    async def approval_backlog():
+        """Fleet-wide owner/operator view of undelivered approval-gate rows."""
+        return agents.get_approval_backlog_health()
+
     # ── Outreach Platform Configuration Routes ──────────
     from pinky_daemon.routes.outreach import router as _outreach_router
     from pinky_daemon.routes.outreach import set_dependencies as _outreach_set_deps
@@ -8190,6 +8195,7 @@ npm run build</pre>
             "pending_users": len(by_chat),
             "total_messages": len(messages),
             "by_sender": by_chat,
+            "approval_backlog": agents.get_approval_backlog_health(name),
         }
 
     @app.delete("/agents/{name}/pending-messages/{chat_id}")
@@ -11181,6 +11187,18 @@ npm run build</pre>
         # carries the one-time owner digest until confirmed delivery.
         await _resume_grandfather_migration(agents, broker)
 
+        # #998: heal every approved-but-undelivered backlog, not only rows
+        # created by the grandfather migration. This catches approval changes
+        # made by older migrations/direct registry paths before any poller can
+        # accept new traffic; the broker's maintenance loop keeps reconciling
+        # later runtime transitions as well.
+        reconciled = await broker.reconcile_approved_pending_messages()
+        if reconciled:
+            _log(
+                "startup: reconciled "
+                f"{reconciled} approved pending message(s)"
+            )
+
         # Boot policy: the main agent always starts. Enabled siblings start only
         # when the shutdown manifest proves they had a live streaming transport;
         # all other siblings stay dormant until an inbound/scheduled wake.
@@ -12563,7 +12581,11 @@ npm run build</pre>
         approval_notification_health = agents.get_approval_notification_health(
             agent_name,
         )
-        checks = {"approval_notifications": approval_notification_health}
+        approval_backlog_health = agents.get_approval_backlog_health(agent_name)
+        checks = {
+            "approval_notifications": approval_notification_health,
+            "approval_backlog": approval_backlog_health,
+        }
 
         return {
             "agent": agent_name,
@@ -12599,10 +12621,17 @@ npm run build</pre>
         if len(errors) >= 3:
             issues.append("high_error_rate")
         approval_check = (checks or {}).get("approval_notifications", {})
+        backlog_check = (checks or {}).get("approval_backlog", {})
         if approval_check.get("failed"):
             issues.append("owner_notification_failed")
         elif approval_check.get("retrying"):
             issues.append("owner_notification_retrying")
+        if backlog_check.get("approved_stranded_chats"):
+            issues.append("approved_messages_stranded")
+        if backlog_check.get("high_signal_chats"):
+            issues.append("approved_principal_blocked")
+        elif backlog_check.get("pending_chats"):
+            issues.append("approval_pending")
 
         if not issues:
             return "healthy"
@@ -12613,6 +12642,8 @@ npm run build</pre>
         if "high_error_rate" in issues:
             return "unstable"
         if "owner_notification_failed" in issues:
+            return "needs_attention"
+        if "approved_messages_stranded" in issues or "approved_principal_blocked" in issues:
             return "needs_attention"
         return "degraded"
 
