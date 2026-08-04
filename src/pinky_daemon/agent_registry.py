@@ -1353,6 +1353,8 @@ class AgentRegistry:
                 last_error TEXT NOT NULL DEFAULT '',
                 notification_destination TEXT NOT NULL DEFAULT '{}',
                 fallback_path TEXT NOT NULL DEFAULT '[]',
+                aging_reprompt_count INTEGER NOT NULL DEFAULT 0,
+                high_signal_alerted_at REAL NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
@@ -1706,6 +1708,26 @@ class AgentRegistry:
                 "UPDATE pending_messages SET sender_id=chat_id WHERE sender_id=''"
             )
             _log("agent_registry: migrated — added sender_id to pending_messages")
+
+        # Approval maintenance metadata (#998). Aging re-prompts are bounded
+        # independently from transport retries/new-message notifications, and
+        # high-signal alerts are durable so one approved principal does not
+        # page the owner on every message while its channel awaits approval.
+        ar_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(approval_requests)").fetchall()
+        }
+        if "aging_reprompt_count" not in ar_existing:
+            self._db.execute(
+                "ALTER TABLE approval_requests "
+                "ADD COLUMN aging_reprompt_count INTEGER NOT NULL DEFAULT 0"
+            )
+            _log("agent_registry: migrated — added aging_reprompt_count to approval_requests")
+        if "high_signal_alerted_at" not in ar_existing:
+            self._db.execute(
+                "ALTER TABLE approval_requests "
+                "ADD COLUMN high_signal_alerted_at REAL NOT NULL DEFAULT 0"
+            )
+            _log("agent_registry: migrated — added high_signal_alerted_at to approval_requests")
 
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
@@ -3918,6 +3940,14 @@ except Exception as exc:
                             approved_by=excluded.approved_by, updated_at=excluded.updated_at""",
             (agent_name, chat_id, display_name, approved_by, now, now),
         )
+        # Approval state and its durable notification aggregate must transition
+        # together regardless of caller (API, owner command, or migration).
+        self._db.execute(
+            """UPDATE approval_requests
+               SET gate_state='approved', next_retry_at=0, updated_at=?
+               WHERE agent_name=? AND chat_id=?""",
+            (now, agent_name, chat_id),
+        )
         self._db.commit()
         _log(f"agents: approved user {chat_id} for {agent_name}")
         row = self._db.execute(
@@ -3940,6 +3970,12 @@ except Exception as exc:
                ON CONFLICT (agent_name, chat_id)
                DO UPDATE SET status='denied', updated_at=excluded.updated_at""",
             (agent_name, chat_id, now, now),
+        )
+        self._db.execute(
+            """UPDATE approval_requests
+               SET gate_state='denied', next_retry_at=0, updated_at=?
+               WHERE agent_name=? AND chat_id=?""",
+            (now, agent_name, chat_id),
         )
         self._db.commit()
         return cursor.rowcount > 0
@@ -4191,6 +4227,94 @@ except Exception as exc:
         self._db.commit()
         return cursor.rowcount
 
+    def list_approval_backlogs(
+        self,
+        agent_name: str = "",
+        chat_id: str = "",
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """Return every undelivered approval backlog, grouped by agent/chat.
+
+        This deliberately mirrors the fleet-wide incident diagnostic: group
+        undelivered ``pending_messages`` by ``(agent_name, chat_id)`` and join
+        both the gate status and the original sender's approval status. The
+        latter identifies the high-signal case where an approved principal is
+        being silently held behind a still-pending group/channel gate.
+        """
+        where = ["pm.delivered=0"]
+        params: list[object] = []
+        if agent_name:
+            where.append("pm.agent_name=?")
+            params.append(agent_name)
+        if chat_id:
+            where.append("pm.chat_id=?")
+            params.append(chat_id)
+        rows = self._db.execute(
+            f"""SELECT pm.agent_name, pm.chat_id,
+                       COALESCE(gate.status, 'missing'),
+                       COALESCE(gate.display_name, ''),
+                       COUNT(*), MIN(pm.created_at), MAX(pm.created_at),
+                       COALESCE(ar.id, 0),
+                       COALESCE(ar.notification_state, 'missing'),
+                       COALESCE(ar.last_notified_at, 0),
+                       COUNT(DISTINCT CASE WHEN principal.status='approved'
+                                           THEN pm.sender_id END),
+                       GROUP_CONCAT(DISTINCT CASE WHEN principal.status='approved'
+                                                  THEN pm.sender_id END)
+                FROM pending_messages AS pm
+                LEFT JOIN approved_users AS gate
+                  ON gate.agent_name=pm.agent_name AND gate.chat_id=pm.chat_id
+                LEFT JOIN approved_users AS principal
+                  ON principal.agent_name=pm.agent_name
+                 AND principal.chat_id=pm.sender_id
+                LEFT JOIN approval_requests AS ar
+                  ON ar.agent_name=pm.agent_name AND ar.chat_id=pm.chat_id
+                WHERE {' AND '.join(where)}
+                GROUP BY pm.agent_name, pm.chat_id, gate.status,
+                         gate.display_name, ar.id, ar.notification_state,
+                         ar.last_notified_at
+                ORDER BY MIN(pm.created_at), pm.agent_name, pm.chat_id""",
+            params,
+        ).fetchall()
+        observed_at = time.time() if now is None else now
+        return [
+            {
+                "agent_name": row[0],
+                "chat_id": row[1],
+                "gate_status": row[2],
+                "display_name": row[3],
+                "undelivered_count": row[4],
+                "oldest_held_at": row[5],
+                "newest_held_at": row[6],
+                "oldest_age_seconds": max(0, int(observed_at - row[5])),
+                "request_id": row[7],
+                "notification_state": row[8],
+                "last_notified_at": row[9],
+                "approved_principal_count": row[10],
+                "approved_principal_ids": row[11].split(",") if row[11] else [],
+                "high_signal": row[2] != "approved" and row[10] > 0,
+            }
+            for row in rows
+        ]
+
+    def get_approval_backlog_health(self, agent_name: str = "") -> dict:
+        """Owner/operator-facing summary of every undelivered approval row."""
+        backlogs = self.list_approval_backlogs(agent_name)
+        pending = [row for row in backlogs if row["gate_status"] in ("pending", "missing")]
+        approved = [row for row in backlogs if row["gate_status"] == "approved"]
+        denied = [row for row in backlogs if row["gate_status"] == "denied"]
+        high_signal = [row for row in backlogs if row["high_signal"]]
+        return {
+            "healthy": not backlogs,
+            "pending_chats": len(pending),
+            "approved_stranded_chats": len(approved),
+            "denied_stranded_chats": len(denied),
+            "high_signal_chats": len(high_signal),
+            "undelivered_messages": sum(row["undelivered_count"] for row in backlogs),
+            "backlogs": backlogs,
+        }
+
     # ── Approval Requests (#863 emergency lane) ─────────────
 
     @staticmethod
@@ -4206,7 +4330,29 @@ except Exception as exc:
             "notification_destination": json.loads(row[14] or "{}"),
             "fallback_path": json.loads(row[15] or "[]"),
             "created_at": row[16], "updated_at": row[17],
+            "aging_reprompt_count": row[18],
+            "high_signal_alerted_at": row[19],
         }
+
+    def _enrich_approval_request(self, request: dict) -> dict:
+        backlogs = self.list_approval_backlogs(
+            request["agent_name"], request["chat_id"],
+        )
+        if backlogs:
+            request.update({
+                "undelivered_count": backlogs[0]["undelivered_count"],
+                "approved_principal_count": backlogs[0]["approved_principal_count"],
+                "approved_principal_ids": backlogs[0]["approved_principal_ids"],
+                "high_signal": backlogs[0]["high_signal"],
+            })
+        else:
+            request.update({
+                "undelivered_count": 0,
+                "approved_principal_count": 0,
+                "approved_principal_ids": [],
+                "high_signal": False,
+            })
+        return request
 
     def get_approval_request(self, agent_name: str, chat_id: str) -> dict | None:
         """Return the stable request for a legacy ``(agent, chat_id)`` gate.
@@ -4219,11 +4365,12 @@ except Exception as exc:
                       gate_state, held_count, oldest_held_at, notification_state,
                       notification_attempts, notified_held_count, last_notified_at,
                       next_retry_at, last_error, notification_destination,
-                      fallback_path, created_at, updated_at
+                      fallback_path, created_at, updated_at,
+                      aging_reprompt_count, high_signal_alerted_at
                FROM approval_requests WHERE agent_name=? AND chat_id=?""",
             (agent_name, chat_id),
         ).fetchone()
-        return self._approval_request_dict(row) if row else None
+        return self._enrich_approval_request(self._approval_request_dict(row)) if row else None
 
     def record_approval_hold(
         self, agent_name: str, chat_id: str, *, target_name: str = "",
@@ -4302,15 +4449,21 @@ except Exception as exc:
             raise RuntimeError("approval request missing after atomic hold commit")
         return message_id, request
 
-    def begin_approval_notification(self, request_id: int, *, reset_attempts: bool) -> None:
+    def begin_approval_notification(
+        self,
+        request_id: int,
+        *,
+        reset_attempts: bool,
+        aging_reprompt: bool = False,
+    ) -> None:
         """Mark a notification cycle active, optionally resetting re-notify attempts."""
-        reset_sql = ", notification_attempts=0" if reset_attempts else ""
         self._db.execute(
-            f"""UPDATE approval_requests
-                SET notification_state='retrying', last_error='', updated_at=?
-                    {reset_sql}
-                WHERE id=? AND gate_state='pending'""",
-            (time.time(), request_id),
+            """UPDATE approval_requests
+               SET notification_state='retrying', last_error='', updated_at=?,
+                   notification_attempts=CASE WHEN ? THEN 0 ELSE notification_attempts END,
+                   aging_reprompt_count=aging_reprompt_count + ?
+               WHERE id=? AND gate_state='pending'""",
+            (time.time(), int(reset_attempts), int(aging_reprompt), request_id),
         )
         self._db.commit()
 
@@ -4332,18 +4485,25 @@ except Exception as exc:
         self._db.commit()
 
     def record_approval_notification_delivered(
-        self, request_id: int, *, destination: dict, fallback_path: list[dict],
+        self,
+        request_id: int,
+        *,
+        destination: dict,
+        fallback_path: list[dict],
+        high_signal: bool = False,
     ) -> None:
         now = time.time()
         self._db.execute(
             """UPDATE approval_requests
                SET notification_state='delivered', notification_attempts=0,
                    notified_held_count=held_count, last_notified_at=?, next_retry_at=0,
-                   last_error='', notification_destination=?, fallback_path=?, updated_at=?
+                   last_error='', notification_destination=?, fallback_path=?, updated_at=?,
+                   high_signal_alerted_at=CASE WHEN ? THEN ? ELSE high_signal_alerted_at END
                WHERE id=? AND gate_state='pending'""",
             (
                 now, json.dumps(destination, separators=(",", ":")),
-                json.dumps(fallback_path, separators=(",", ":")), now, request_id,
+                json.dumps(fallback_path, separators=(",", ":")), now,
+                int(high_signal), now, request_id,
             ),
         )
         self._db.commit()
@@ -4360,19 +4520,31 @@ except Exception as exc:
         self._db.commit()
 
     def list_due_approval_notifications(self, now: float | None = None) -> list[dict]:
+        """Return retry-due rows plus delivered rows eligible for maintenance.
+
+        The broker applies the aging/new-hold/high-signal policy to delivered
+        candidates. Including them here lets the daemon re-prompt without a new
+        inbound message waking the approval path.
+        """
         due_at = time.time() if now is None else now
         rows = self._db.execute(
             """SELECT id, agent_name, chat_id, target_name, is_channel,
                       gate_state, held_count, oldest_held_at, notification_state,
                       notification_attempts, notified_held_count, last_notified_at,
                       next_retry_at, last_error, notification_destination,
-                      fallback_path, created_at, updated_at
+                      fallback_path, created_at, updated_at,
+                      aging_reprompt_count, high_signal_alerted_at
                FROM approval_requests
-               WHERE gate_state='pending' AND notification_state='retrying'
-                 AND next_retry_at <= ? ORDER BY next_retry_at, id""",
+               WHERE gate_state='pending'
+                 AND ((notification_state='retrying' AND next_retry_at <= ?)
+                      OR notification_state IN ('delivered', 'failed'))
+               ORDER BY next_retry_at, id""",
             (due_at,),
         ).fetchall()
-        return [self._approval_request_dict(row) for row in rows]
+        return [
+            self._enrich_approval_request(self._approval_request_dict(row))
+            for row in rows
+        ]
 
     def get_approval_notification_health(self, agent_name: str) -> dict:
         rows = self._db.execute(
