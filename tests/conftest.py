@@ -20,11 +20,20 @@ opt out via the ``real_auth`` pytest marker (set as a module-level
 ``pytestmark`` in that file). For those, the conftest leaves
 ``TestClient`` alone and the test sets up its own auth state via
 ``monkeypatch.setenv`` + ``/auth/setup``.
+
+Production-database guard (#355):
+
+``_forbid_production_db_writes`` wraps ``sqlite3.connect`` for the whole
+session and raises if a test opens a database under a checkout's
+``data/`` directory. See that fixture's docstring for the why.
 """
 
 from __future__ import annotations
 
 import os
+import sqlite3
+from pathlib import Path
+from urllib.parse import unquote, urlparse
 
 import pytest
 from fastapi.testclient import TestClient
@@ -41,6 +50,90 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "real_auth: test exercises real auth flow — skip conftest auto-cookie patch",
     )
+
+
+def _sqlite_target_path(database, uri: bool) -> Path | None:
+    """Best-effort resolution of a ``sqlite3.connect`` target to a real file.
+
+    Returns ``None`` for anything that is not an on-disk database
+    (``:memory:``, empty/temporary databases, ``mode=memory`` URIs, and
+    exotic argument types we don't want to guess about).
+    """
+    if isinstance(database, (bytes, bytearray)):
+        database = os.fsdecode(database)
+    if not isinstance(database, (str, os.PathLike)):
+        return None
+
+    target = os.fspath(database)
+    if target in ("", ":memory:"):
+        return None
+
+    if uri or target.startswith("file:"):
+        parsed = urlparse(target)
+        if parsed.scheme != "file":
+            return None
+        if "mode=memory" in (parsed.query or ""):
+            return None
+        target = unquote(parsed.path)
+        if target in ("", ":memory:"):
+            return None
+
+    try:
+        return Path(target).resolve()
+    except (OSError, ValueError):  # pragma: no cover - defensive
+        return None
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _forbid_production_db_writes():
+    """Fail loudly if a test opens a SQLite file under a checkout's ``data/``.
+
+    Roughly two dozen stores default to a *relative* ``db_path``
+    (``data/tasks.db``, ``data/agents.db``, ...). A test that instantiates
+    one without an explicit path therefore reads and writes whatever
+    ``./data`` happens to be — which, when pytest is run from a live
+    deployment checkout, is the production database.
+
+    Rather than rewrite the defaults (invasive, production code) or chdir
+    the whole session into a tmpdir (breaks tests that rely on
+    repo-relative paths), this wraps ``sqlite3.connect`` for the duration
+    of the test session and raises on any target under
+    ``<cwd>/data`` or ``<repo root>/data``. The fix for a test that trips
+    it is always the same: pass an explicit ``db_path`` under ``tmp_path``.
+
+    Known limitation: this only covers connections opened in the pytest
+    process. Code executed in a subprocess is unaffected.
+    """
+    repo_data = (Path(__file__).resolve().parent.parent / "data").resolve()
+    original_connect = sqlite3.connect
+
+    def guarded_connect(database=None, *args, **kwargs):
+        uri = kwargs.get("uri", False)
+        target = _sqlite_target_path(database, uri)
+        if target is not None:
+            # cwd is recomputed per call and checked alongside the repo
+            # root because the two can differ: running pytest from a live
+            # deployment against another checkout's tests resolves the
+            # stores' relative defaults against the *deployment's* data/.
+            # A test that chdirs elsewhere first is refused too — the rule
+            # is simply "pass an explicit path", with no exceptions to
+            # reason about.
+            for guarded in {repo_data, (Path.cwd() / "data").resolve()}:
+                if target == guarded or target.is_relative_to(guarded):
+                    raise RuntimeError(
+                        f"Test tried to open a SQLite database inside a checkout's "
+                        f"data/ directory: {target}\n"
+                        f"That is the production database when pytest runs from a "
+                        f"live deployment. Pass an explicit db_path under tmp_path "
+                        f"instead of relying on the store's relative default."
+                    )
+        return original_connect(database, *args, **kwargs)
+
+    sqlite3.connect = guarded_connect
+    try:
+        yield
+    finally:
+        sqlite3.connect = original_connect
 
 
 @pytest.fixture(autouse=True, scope="session")

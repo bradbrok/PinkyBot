@@ -656,7 +656,11 @@ class DreamRunner:
         # Lazy import to avoid circular deps
         from pinky_daemon.user_profile_store import ProfileEntry, UserProfileStore
 
-        store = UserProfileStore()
+        # Sibling of the dream state DB rather than the default relative
+        # path, which would resolve against the daemon's cwd.
+        store = UserProfileStore(
+            db_path=str(Path(self._db_path).parent / "user_profiles.db"),
+        )
         count = 0
 
         valid_categories = {
@@ -718,7 +722,11 @@ class DreamRunner:
 
         from pinky_daemon.user_profile_store import Relationship, UserProfileStore
 
-        store = UserProfileStore()
+        # Sibling of the dream state DB rather than the default relative
+        # path, which would resolve against the daemon's cwd.
+        store = UserProfileStore(
+            db_path=str(Path(self._db_path).parent / "user_profiles.db"),
+        )
         rels = []
         for rd in rels_data:
             from_id = rd.get("from_chat_id", "")
