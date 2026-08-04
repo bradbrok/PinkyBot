@@ -3229,14 +3229,27 @@ except Exception as exc:
             self._db.commit()
             return cursor.rowcount > 0
 
-    def update_schedule_last_run(self, schedule_id: int, timestamp: float = 0.0) -> None:
-        """Record when the scheduler decided to fire a schedule."""
+    def update_schedule_last_run(
+        self,
+        schedule_id: int,
+        timestamp: float = 0.0,
+        *,
+        expected_last_run: float | None = None,
+    ) -> bool:
+        """Record a fire, optionally only if ``last_run`` is unchanged."""
         ts = timestamp or time.time()
-        self._db.execute(
-            "UPDATE agent_schedules SET last_run=? WHERE id=?",
-            (ts, schedule_id),
-        )
+        if expected_last_run is None:
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET last_run=? WHERE id=?",
+                (ts, schedule_id),
+            )
+        else:
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET last_run=? WHERE id=? AND last_run=?",
+                (ts, schedule_id, expected_last_run),
+            )
         self._db.commit()
+        return cursor.rowcount > 0
 
     def update_schedule_last_delivered(
         self, schedule_id: int, timestamp: float = 0.0
