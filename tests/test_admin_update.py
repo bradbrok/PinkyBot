@@ -775,6 +775,23 @@ class TestInstalledDepsDriftDetection:
         assert entry["installed"] == installed
         assert str(major) in entry["specifier"]
 
+    def test_claude_agent_sdk_security_floor_flags_pre_fix_install(self):
+        """The security floor must make a stale pre-fix SDK visible."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(tmp, ["claude-agent-sdk>=0.2.129,<0.3"])
+            with patch("importlib.metadata.version", return_value="0.2.128"):
+                drifts = _check_installed_deps_drift(tmp)
+
+        assert drifts == [
+            {
+                "package": "claude-agent-sdk",
+                "specifier": "<0.3,>=0.2.129",
+                "installed": "0.2.128",
+            }
+        ]
+
     def test_missing_package_records_installed_none(self):
         """A pyproject dep that isn't installed at all shows up with
         installed=None — distinct from a version mismatch."""
