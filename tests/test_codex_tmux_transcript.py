@@ -19,6 +19,7 @@ Coverage:
   - Cold-start seek-to-EOF vs first-bind seek-to-0.
   - ``path_discovery``: cwd-filtered selection from a temp tree of fixtures.
   - Background loop: wake() short-circuits poll; fallback poll makes progress.
+  - Raw rollout entries are forwarded to the session acceptance observer.
   - Standard stats shape; self_heal_repoints counter; callback errors.
 """
 
@@ -80,6 +81,20 @@ def _agent_message(text: str = "Hello") -> dict:
             "message": text,
             "phase": "commentary",
             "memory_citation": None,
+        },
+    }
+
+
+def _user_message(text: str = "queued wake") -> dict:
+    return {
+        "timestamp": "2026-06-17T10:00:01.500Z",
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": text,
+            "images": [],
+            "local_images": [],
+            "text_elements": [],
         },
     }
 
@@ -346,6 +361,23 @@ class TestTailerReadOnce:
         tailer = CodexTmuxTranscriptTailer(tmp_path / "does-not-exist.jsonl", cb)
         consumed = await tailer.read_once()
         assert consumed == 0
+
+    @pytest.mark.asyncio
+    async def test_forwards_raw_user_message_to_entry_observer(self, transcript):
+        cb = _Captor()
+        observed: list[dict] = []
+        entry = _user_message("scheduled codex wake")
+        tailer = CodexTmuxTranscriptTailer(
+            transcript,
+            cb,
+            on_entry=lambda raw: observed.append(raw),
+        )
+        _write_jsonl(transcript, [entry])
+
+        await tailer.read_once()
+
+        assert observed == [entry]
+        assert cb.responses == []
 
     @pytest.mark.asyncio
     async def test_single_turn_fires_callback_once(self, transcript):
