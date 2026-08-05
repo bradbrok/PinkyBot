@@ -1,0 +1,322 @@
+#!/usr/bin/env python3
+"""
+aiena_qa_daily.py — Daily QA automatico per il sistema di pubblicazione AIena.
+
+Verifica:
+1. Coerenza slug/titolo tra pipeline.json ↔ admin/data.json (preview_articles)
+2. Esistenza file preview per ogni articolo status=preview in pipeline.json
+3. Coerenza approvazioni: admin preview_articles approved=True → Supabase status=pending
+4. Articoli in admin ma non in pipeline.json (orfani)
+5. Endpoint test: POST /api/aiena/approve-article risponde (non 404)
+
+Output:
+- Se tutto OK: log silenzioso
+- Se issues: notifica agente AIena via PinkyBot API
+
+Cron: 08:00 UTC ogni giorno
+    0 8 * * * cd /home/pinky/.pinkybot/scripts && python3 aiena_qa_daily.py >> /home/pinky/.pinkybot/logs/aiena_qa.log 2>&1
+
+Autore: Satoshi — 2026-06-06
+"""
+
+import json
+import os
+import urllib.request
+import urllib.error
+from datetime import datetime, timezone
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+
+def _load_secrets() -> dict:
+    """Load sensitive credentials from .aiena_secrets file. Falls back to env vars."""
+    secrets: dict = {}
+    secrets_file = Path("/home/pinky/.pinkybot/scripts/.aiena_secrets")
+    if secrets_file.exists():
+        for line in secrets_file.read_text().splitlines():
+            line = line.strip()
+            if line and "=" in line and not line.startswith("#"):
+                k, _, v = line.partition("=")
+                secrets[k.strip()] = v.strip()
+    for key in ("SB_SERVICE_KEY", "FTP_PASS"):
+        if os.environ.get(key):
+            secrets[key] = os.environ[key]
+    return secrets
+
+
+# ── Paths ────────────────────────────────────────────────
+PIPELINE_JSON  = Path("/var/www/aiena.it/data/pipeline.json")
+ADMIN_DATA     = Path("/var/www/aiena-admin/data.json")
+PREVIEW_DIR    = Path("/var/www/aiena.it/preview")
+APPROVE_URL    = "http://127.0.0.1:8888/api/aiena/approve-article"
+
+# ── Supabase ─────────────────────────────────────────────
+SB_URL     = "https://fwyjxolljcogblvwvfca.supabase.co"
+SB_KEY = _load_secrets().get("SB_SERVICE_KEY", "")
+SB_HEADERS = {"apikey": SB_KEY, "Authorization": f"Bearer {SB_KEY}"}
+
+# ── PinkyBot agent messaging ──────────────────────────────
+PINKYBOT_URL   = "http://127.0.0.1:8888"
+AIENA_AGENT    = "aiena"
+SATOSHI_AGENT  = "satoshi"
+
+ROME = ZoneInfo("Europe/Rome")
+
+
+def now_str() -> str:
+    return datetime.now(ROME).strftime("%Y-%m-%d %H:%M:%S")
+
+
+def log(msg: str):
+    print(f"[{now_str()}] {msg}")
+
+
+# ── Data loaders ──────────────────────────────────────────
+
+def load_pipeline() -> dict:
+    with open(PIPELINE_JSON) as f:
+        return json.load(f)
+
+
+def load_admin() -> dict:
+    with open(ADMIN_DATA) as f:
+        return json.load(f)
+
+
+def load_supabase_approvals() -> list:
+    req = urllib.request.Request(
+        f"{SB_URL}/rest/v1/article_approvals?select=slug,title,status,approved_at",
+        headers=SB_HEADERS,
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            return json.loads(r.read())
+    except Exception as e:
+        log(f"⚠️  Supabase fetch error: {e}")
+        return []
+
+
+# ── Checks ───────────────────────────────────────────────
+
+def check_preview_files(pipeline_previews: list) -> list[str]:
+    """Check 1: ogni articolo preview in pipeline.json ha il file HTML."""
+    issues = []
+    for inv in pipeline_previews:
+        slug = inv.get("slug", "")
+        path = PREVIEW_DIR / f"{slug}.html"
+        if not path.exists():
+            issues.append(f"❌ FILE MANCANTE: /preview/{slug}.html (titolo: {inv.get('title','?')[:50]})")
+        else:
+            log(f"  ✅ preview/{slug}.html OK")
+    return issues
+
+
+def check_pipeline_vs_admin(pipeline_previews: list, admin_previews: list) -> list[str]:
+    """Check 2: ogni preview in pipeline.json è presente in admin/data.json."""
+    issues = []
+    admin_slugs = {a["slug"]: a for a in admin_previews}
+    for inv in pipeline_previews:
+        slug = inv.get("slug", "")
+        if slug not in admin_slugs:
+            issues.append(f"❌ SLUG MANCANTE in admin/data.json: {slug}")
+            continue
+        # Controlla mismatch titolo (warning, non errore)
+        admin_title = admin_slugs[slug].get("title", "")
+        pipe_title  = inv.get("title", "")
+        if admin_title and pipe_title and admin_title != pipe_title:
+            issues.append(
+                f"⚠️  TITOLO DIVERSO [{slug}]:\n"
+                f"    pipeline: {pipe_title[:60]}\n"
+                f"    admin:    {admin_title[:60]}"
+            )
+        else:
+            log(f"  ✅ {slug} presente in admin con titolo coerente")
+    return issues
+
+
+def check_admin_orphans(pipeline_all: list, admin_previews: list) -> list[str]:
+    """Check 3: articoli in admin/data.json non presenti in pipeline.json (tutte le investigations)."""
+    issues = []
+    pipe_slugs = {inv.get("slug") for inv in pipeline_all}
+    for art in admin_previews:
+        slug = art.get("slug", "")
+        if slug not in pipe_slugs:
+            issues.append(f"⚠️  ORFANO in admin (non in pipeline): {slug}")
+    return issues
+
+
+def check_approved_vs_supabase(admin_previews: list, sb_approvals: list) -> list[str]:
+    """Check 4: articoli approved=True in admin ma assenti/wrong status in Supabase."""
+    issues = []
+    sb_map = {a["slug"]: a for a in sb_approvals}
+    for art in admin_previews:
+        if not art.get("approved"):
+            continue
+        slug = art.get("slug", "")
+        if slug not in sb_map:
+            issues.append(f"❌ APPROVATO in admin ma ASSENTE in Supabase: {slug}")
+        else:
+            status = sb_map[slug].get("status", "")
+            if status not in ("pending", "published", "pipeline_archive"):
+                issues.append(f"⚠️  Status anomalo Supabase [{slug}]: {status}")
+            else:
+                log(f"  ✅ {slug} approvato in Supabase (status={status})")
+    return issues
+
+
+def _cleanup_qa_test_records():
+    """Elimina eventuali record __qa_test__ rimasti in Supabase da run precedenti."""
+    try:
+        req = urllib.request.Request(
+            f"{SB_URL}/rest/v1/article_approvals?slug=eq.__qa_test__",
+            headers={**SB_HEADERS, "Content-Type": "application/json"},
+            method="DELETE",
+        )
+        urllib.request.urlopen(req, timeout=10)
+        log("  🧹 Cleanup __qa_test__ Supabase records: OK")
+    except Exception as e:
+        log(f"  ⚠️  Cleanup __qa_test__ WARN: {e}")
+
+
+def check_endpoint() -> list[str]:
+    """
+    Check 5: endpoint /api/aiena/approve-article esiste (verifica tramite HEAD, no POST).
+
+    FIX: in precedenza si inviava una POST con slug '__qa_test__' che creava un record
+    reale in Supabase ogni giorno. Ora si usa HEAD: se risponde 405 (Method Not Allowed)
+    l'endpoint esiste; se risponde 404 manca.
+    """
+    issues = []
+    # Cleanup residui da run passati (prima del check)
+    _cleanup_qa_test_records()
+
+    req = urllib.request.Request(
+        APPROVE_URL,
+        headers={"Content-Type": "application/json"},
+        method="HEAD",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10):
+            # HEAD 200 → endpoint esiste e accetta HEAD (raro ma OK)
+            log("  ✅ Endpoint /api/aiena/approve-article: OK (HEAD 200)")
+    except urllib.error.HTTPError as e:
+        if e.code == 405:
+            # 405 Method Not Allowed = endpoint esiste ma accetta solo POST → OK
+            log("  ✅ Endpoint /api/aiena/approve-article: OK (HEAD 405, endpoint attivo)")
+        elif e.code == 404:
+            issues.append("❌ ENDPOINT MANCANTE: POST /api/aiena/approve-article → 404")
+        else:
+            # Altro errore HTTP (es. 422 Unprocessable) — endpoint esiste
+            log(f"  ✅ Endpoint risponde (HEAD {e.code}) — endpoint attivo")
+    except Exception as e:
+        issues.append(f"❌ Endpoint non raggiungibile: {e}")
+    return issues
+
+
+# ── Notifica ──────────────────────────────────────────────
+
+def _build_auth_headers(method: str, path: str) -> dict:
+    """Costruisce HMAC-signed headers per PinkyBot API.
+
+    Delega a /home/pinky/lib/broker_auth.py (sorgente unica della firma). Prima
+    l'except catturava anche il secret mancante e faceva `return {}`: la
+    richiesta partiva non firmata e prendeva 401, con un solo warning nel log.
+    Ora l'errore si propaga invece di trasformarsi in un invio fallito.
+    """
+    import sys
+    sys.path.insert(0, "/home/pinky/lib")
+    import broker_auth
+    return broker_auth.build_headers(method, path, agent="satoshi")
+
+
+def notify_agent(agent: str, message: str):
+    """Invia messaggio a un agente via PinkyBot API con HMAC auth."""
+    path = f"/agents/{agent}/message"
+    payload = json.dumps({
+        "from_agent": "satoshi",
+        "message": message,
+        "priority": 2,
+    }).encode()
+    headers = {"Content-Type": "application/json"}
+    headers.update(_build_auth_headers("POST", path))
+    req = urllib.request.Request(
+        f"{PINKYBOT_URL}{path}",
+        data=payload,
+        headers=headers,
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            log(f"  📨 Notifica inviata a {agent}")
+    except Exception as e:
+        log(f"  ⚠️  Impossibile notificare {agent}: {e}")
+
+
+# ── Main ──────────────────────────────────────────────────
+
+def run_qa() -> int:
+    """Esegue tutti i check. Ritorna numero di issues trovate."""
+    log("=" * 60)
+    log("AIena QA Daily — avvio")
+
+    # Carica dati
+    try:
+        pipeline = load_pipeline()
+        admin    = load_admin()
+        sb_recs  = load_supabase_approvals()
+    except Exception as e:
+        log(f"❌ ERRORE caricamento dati: {e}")
+        notify_agent(AIENA_AGENT, f"🚨 QA FALLITO — impossibile caricare dati: {e}")
+        return 1
+
+    pipeline_previews = [i for i in pipeline.get("investigations", []) if i.get("status") == "preview"]
+    admin_previews    = admin.get("preview_articles", [])
+
+    log(f"Pipeline preview: {len(pipeline_previews)} | Admin preview: {len(admin_previews)} | Supabase: {len(sb_recs)}")
+
+    all_issues = []
+
+    # Check 1: file HTML
+    log("--- Check 1: file preview HTML ---")
+    all_issues += check_preview_files(pipeline_previews)
+
+    # Check 2: pipeline vs admin coerenza
+    log("--- Check 2: pipeline ↔ admin/data.json ---")
+    all_issues += check_pipeline_vs_admin(pipeline_previews, admin_previews)
+
+    # Check 3: orfani in admin (confronta vs TUTTE le investigations, non solo preview)
+    pipeline_all_invs = pipeline.get("investigations", [])
+    log("--- Check 3: orfani admin ---")
+    all_issues += check_admin_orphans(pipeline_all_invs, admin_previews)
+
+    # Check 4: approvazioni vs Supabase
+    log("--- Check 4: approved ↔ Supabase ---")
+    all_issues += check_approved_vs_supabase(admin_previews, sb_recs)
+
+    # Check 5: endpoint
+    log("--- Check 5: endpoint approve-article ---")
+    all_issues += check_endpoint()
+
+    # Report
+    if not all_issues:
+        log("✅ QA completato — nessun problema trovato.")
+    else:
+        log(f"⚠️  QA completato — {len(all_issues)} problemi trovati:")
+        for issue in all_issues:
+            log(f"  {issue}")
+
+        report = (
+            f"🚨 AIena QA Daily — {len(all_issues)} problemi trovati [{now_str()}]\n\n"
+            + "\n".join(all_issues)
+            + "\n\nAzione richiesta: verifica e correggi prima della prossima approvazione."
+        )
+        notify_agent(AIENA_AGENT, report)
+
+    log("=" * 60)
+    return len(all_issues)
+
+
+if __name__ == "__main__":
+    import sys
+    n = run_qa()
+    sys.exit(0 if n == 0 else 1)

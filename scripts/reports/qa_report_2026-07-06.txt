@@ -1,0 +1,28 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-07-06T16:09:43.998990
+Files Scanned: 613
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 0
+  WARNING issues:  1
+
+BY CATEGORY:
+
+BY PAGE TYPE:
+  generic: 30 pages, 0 issues
+  guide: 306 pages, 0 issues
+  landing: 1 pages, 0 issues
+  magazine: 194 pages, 0 issues
+  review: 82 pages, 0 issues
+
+SITE-LEVEL ISSUES
+--------------------------------------------------
+  [~] Orphan page: guide/comprare-bitcoin-senza-kyc-dex-p2p.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+
+======================================================================
+END OF REPORT
+======================================================================

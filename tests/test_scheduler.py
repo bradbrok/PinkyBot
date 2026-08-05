@@ -1020,19 +1020,21 @@ class TestScheduler:
         schedule = registry.add_schedule(
             "oleg", "* * * * *", name="fifo", prompt="unused"
         )
+        # Use recent timestamps (within 24h) to avoid stale-wake discard
+        current = time.time()
         registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="fifo",
             prompt="oldest",
-            fired_at=100.0,
+            fired_at=current - 3600,  # 1 hour ago
         )
         registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="fifo",
             prompt="newer",
-            fired_at=200.0,
+            fired_at=current - 1800,  # 30 min ago
         )
         attempts: list[str] = []
 
@@ -1062,26 +1064,28 @@ class TestScheduler:
         live = registry.add_schedule(
             "oleg", "* * * * *", name="live", prompt="unused"
         )
+        # Use recent timestamps (within 24h) to avoid stale-wake discard
+        current = time.time()
         registry.persist_schedule_wake(
             zombie.id,
             agent_name="oleg",
             schedule_name="zombie",
             prompt="never deliver",
-            fired_at=100.0,
+            fired_at=current - 3600,  # 1 hour ago
         )
         registry.persist_schedule_wake(
             live.id,
             agent_name="oleg",
             schedule_name="live",
             prompt="live one",
-            fired_at=200.0,
+            fired_at=current - 1800,  # 30 min ago
         )
         registry.persist_schedule_wake(
             live.id,
             agent_name="oleg",
             schedule_name="live",
             prompt="live two",
-            fired_at=300.0,
+            fired_at=current - 600,  # 10 min ago
         )
         registry.remove_schedule(zombie.id)
         attempts: list[str] = []
@@ -1359,6 +1363,65 @@ class TestScheduler:
         assert wake_calls == []
         assert stored.last_delivered == 0.0
         assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_stale_persisted_wakes_older_than_24h_are_discarded(
+        self, registry, capsys
+    ):
+        """Persisted wakes older than 24 hours should be discarded on replay,
+        preventing phantom fires of stale prompts from old deleted/changed schedules."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="durable", prompt="current prompt"
+        )
+
+        # Create a stale persisted wake (>24h old)
+        stale_fired_at = time.time() - (25 * 3600)  # 25 hours ago
+        stale_wake_id = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="durable",
+            prompt="stale prompt from deleted schedule",
+            fired_at=stale_fired_at,
+        )
+
+        # Create a fresh persisted wake (<24h old)
+        fresh_fired_at = time.time() - (1 * 3600)  # 1 hour ago
+        fresh_wake_id = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="durable",
+            prompt="fresh prompt",
+            fired_at=fresh_fired_at,
+        )
+
+        # Verify both persisted wakes exist before replay
+        pending_before = registry.list_pending_schedule_wakes("oleg")
+        assert len(pending_before) == 2
+
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        # Create scheduler and replay pending wakes
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        scheduler.replay_pending_for_agent("oleg")
+        await scheduler._pending_replay_tasks["oleg"]
+
+        # The stale wake should have been discarded, only fresh one delivered
+        assert attempts == ["fresh prompt"]
+
+        # Only fresh wake should remain (as undelivered if it was)
+        # or be confirmed depending on timing
+        pending_after = registry.list_pending_schedule_wakes("oleg")
+        assert len(pending_after) == 0  # Both should be gone (one discarded, one confirmed)
+
+        # Verify the stale wake was logged as discarded
+        stderr = capsys.readouterr().err
+        assert "PERSISTED_WAKE_STALE_DROPPED" in stderr or "PERSISTED_WAKE_ZOMBIE_DROPPED" in stderr
 
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────

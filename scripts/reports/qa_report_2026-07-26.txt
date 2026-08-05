@@ -1,0 +1,62 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-07-26T21:50:51.655713
+Files Scanned: 654
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 0
+  WARNING issues:  19
+
+BY CATEGORY:
+  SEO: 0 critical, 1 warning
+  SCHEMA: 0 critical, 1 warning
+
+BY PAGE TYPE:
+  generic: 31 pages, 1 issues
+  guide: 306 pages, 0 issues
+  landing: 1 pages, 0 issues
+  magazine: 230 pages, 0 issues
+  review: 86 pages, 1 issues
+
+SITE-LEVEL ISSUES
+--------------------------------------------------
+  [~] Orphan page: guide/bitcoin-kaufen-ohne-kyc-dex-p2p-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: guide/buy-bitcoin-without-kyc-dex-p2p-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: guide/comprar-bitcoin-sin-kyc-dex-p2p-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/bear-market-dca-bitcoin-exchange-mica-europa-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/binance-eu-exit-july-2026-mica-alternatives-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/binance-verlasst-europa-juli-2026-mica-alternativen-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/bitcoin-dca-baermarkt-exchange-mica-europa-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/bitcoin-etf-abfluesse-rekord-juni-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/etf-bitcoin-salidas-record-junio-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-corea-nord-bitcoin-missili-miliardi.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-corea-norte-bitcoin-misiles-miles-millones-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-nordkorea-bitcoin-raketen-milliarden-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-north-korea-bitcoin-missiles-billions-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/strike-review-bitcoin-lightning-mica-malta-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/strike-review-bitcoin-lightning-mica-malta-2026-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/strike-review-bitcoin-lightning-mica-malta-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/youhodler-eu-suspension-mica-2026-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+
+======================================================================
+END OF REPORT
+======================================================================

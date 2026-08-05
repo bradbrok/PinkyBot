@@ -1,0 +1,218 @@
+#!/usr/bin/env python3
+"""
+alterego_kg_catchup.py — KG extraction catchup for alter-ego memories.
+
+Finds episodic memories saved WITHOUT KG extraction (entities=NULL)
+and triggers extraction via the alter-ego API.
+
+Runs every 30 minutes via cron.
+Alerts Mirko on Telegram if KG hasn't been updated in >2 hours.
+
+Log: /home/pinky/.pinkybot/logs/alterego_kg_catchup.log
+"""
+
+import json
+import sqlite3
+import sys
+import urllib.request
+import urllib.error
+import time
+
+sys.path.insert(0, "/home/pinky/lib")
+import broker_auth  # noqa: E402  (path aggiunto sopra)
+from datetime import datetime, timezone
+from pathlib import Path
+
+MEMORIES_DB = "/home/pinky/projects/alter-ego/data/memories.db"
+ALTER_EGO_API = "http://127.0.0.1:7778"
+BROKER_API = "http://localhost:8888"
+LOG_PATH = "/home/pinky/.pinkybot/logs/alterego_kg_catchup.log"
+STATE_FILE = "/home/pinky/.pinkybot/scripts/alterego_kg_catchup_state.json"
+MIRKO_CHAT_ID = "32405655"
+KG_STALE_HOURS = 2  # Alert if no new KG entities in this many hours
+
+
+def log(msg):
+    ts = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    line = f"[{ts}] {msg}"
+    print(line)
+    Path(LOG_PATH).parent.mkdir(parents=True, exist_ok=True)
+    with open(LOG_PATH, "a") as f:
+        f.write(line + "\n")
+
+
+def load_state():
+    if Path(STATE_FILE).exists():
+        with open(STATE_FILE) as f:
+            return json.load(f)
+    return {"last_processed_id": 0, "last_kg_update": None, "alerted": False}
+
+
+def save_state(state):
+    with open(STATE_FILE, "w") as f:
+        json.dump(state, f, indent=2)
+
+
+def get_unextracted_memories(last_id: int) -> list[dict]:
+    """Get episodic memories with no KG entities extracted (entities IS NULL or empty)."""
+    conn = sqlite3.connect(MEMORIES_DB)
+    conn.row_factory = sqlite3.Row
+    cursor = conn.execute("""
+        SELECT id, content, source
+        FROM episodic_memories
+        WHERE id > ?
+          AND (entities IS NULL OR entities = '' OR entities = '[]')
+          AND content IS NOT NULL
+          AND length(content) > 20
+        ORDER BY id ASC
+        LIMIT 50
+    """, (last_id,))
+    rows = [dict(r) for r in cursor.fetchall()]
+    conn.close()
+    return rows
+
+
+def get_last_kg_entity_time() -> str | None:
+    """Get the created_at of the most recent KG entity."""
+    conn = sqlite3.connect(MEMORIES_DB)
+    cursor = conn.execute("SELECT MAX(created_at) FROM kg_entities")
+    row = cursor.fetchone()
+    conn.close()
+    return row[0] if row else None
+
+
+def extract_for_memory(memory_id: int, content: str) -> int:
+    """Call graph/extract API. Returns number of items extracted, -1 on error."""
+    payload = json.dumps({
+        "text": content,
+        "source_memory_id": memory_id
+    }).encode()
+    req = urllib.request.Request(
+        f"{ALTER_EGO_API}/graph/extract",
+        data=payload,
+        headers={"Content-Type": "application/json"},
+        method="POST"
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            data = json.loads(resp.read())
+            return data.get("extracted", 0)
+    except Exception as e:
+        log(f"  ERROR extract id={memory_id}: {e}")
+        return -1
+
+
+def mark_entities_extracted(memory_id: int, count: int):
+    """Update episodic_memories.entities to mark as processed."""
+    conn = sqlite3.connect(MEMORIES_DB)
+    conn.execute(
+        "UPDATE episodic_memories SET entities = ? WHERE id = ?",
+        (json.dumps({"kg_extracted": count, "at": datetime.now().isoformat()}), memory_id)
+    )
+    conn.commit()
+    conn.close()
+
+
+def send_telegram_alert(message: str) -> bool:
+    """Send alert to Mirko via PinkyBot broker. True solo se consegnato."""
+    # POST firmata: senza header HMAC il daemon risponde 401 e l'alert non
+    # arriva. broker_auth solleva su secret mancante e su risposta non-2xx.
+    # Qui NON si propaga: send_telegram_alert() e' chiamata anche prima
+    # dell'estrazione, e un alert non consegnato non deve bloccare il catchup.
+    # Il ritorno bool serve a non marcare come "alerted" cio' che non e' partito.
+    try:
+        broker_auth.send_message(MIRKO_CHAT_ID, message, agent="satoshi")
+        return True
+    except Exception as e:
+        log(f"  ERROR /broker/send: alert NON consegnato ({type(e).__name__}: {e})")
+        return False
+
+
+def check_kg_staleness(state: dict) -> bool:
+    """Check if KG hasn't been updated in too long. Returns True if alert sent."""
+    last_kg = get_last_kg_entity_time()
+    if not last_kg:
+        return False
+
+    # Parse ISO timestamp
+    try:
+        last_dt = datetime.fromisoformat(last_kg.replace("Z", "+00:00"))
+        if last_dt.tzinfo is None:
+            last_dt = last_dt.replace(tzinfo=timezone.utc)
+        now = datetime.now(timezone.utc)
+        hours_since = (now - last_dt).total_seconds() / 3600
+
+        if hours_since > KG_STALE_HOURS and not state.get("alerted"):
+            msg = (
+                f"⚠️ KG alter-ego non aggiornato da {hours_since:.1f}h\n"
+                f"Ultimo entity: {last_kg[:16]}\n"
+                f"Possibile problema con estrazione memorie."
+            )
+            # "alerted" solo se l'alert e' partito davvero: altrimenti il flag
+            # sopprimerebbe per sempre un avviso mai consegnato.
+            delivered = send_telegram_alert(msg)
+            state["alerted"] = delivered
+            log(f"ALERT: KG stale for {hours_since:.1f}h — "
+                f"{'Mirko notified' if delivered else 'INVIO FALLITO, si ritenta'}")
+            return delivered
+        elif hours_since <= KG_STALE_HOURS:
+            state["alerted"] = False  # Reset alert when KG is fresh
+    except Exception as e:
+        log(f"  ERROR staleness check: {e}")
+    return False
+
+
+def main():
+    state = load_state()
+    last_id = state.get("last_processed_id", 0)
+
+    # Check KG staleness
+    check_kg_staleness(state)
+
+    # Get unextracted memories
+    memories = get_unextracted_memories(last_id)
+
+    if not memories:
+        log(f"Nessuna memoria da estrarre (last_id={last_id})")
+        save_state(state)
+        return
+
+    log(f"Trovate {len(memories)} memorie senza KG extraction (from id>{last_id})")
+
+    extracted_count = 0
+    failed_count = 0
+    max_processed_id = last_id
+
+    for mem in memories:
+        mem_id = mem["id"]
+        content = mem["content"]
+        source = mem.get("source", "unknown")
+
+        n = extract_for_memory(mem_id, content)
+        if n >= 0:
+            mark_entities_extracted(mem_id, n)
+            extracted_count += n
+            log(f"  OK id={mem_id} ({source}): +{n} items | {content[:60]}")
+        else:
+            failed_count += 1
+            log(f"  FAIL id={mem_id} ({source}): extraction error")
+
+        if mem_id > max_processed_id:
+            max_processed_id = mem_id
+
+        time.sleep(0.5)  # Rate limit
+
+    state["last_processed_id"] = max_processed_id
+    state["last_kg_update"] = datetime.now().isoformat()
+    save_state(state)
+
+    log(f"DONE: +{extracted_count} KG items da {len(memories)} memorie ({failed_count} falliti)")
+
+    if failed_count > 3:
+        send_telegram_alert(
+            f"⚠️ KG catchup: {failed_count} memorie non estratte — controlla alter-ego API."
+        )
+
+
+if __name__ == "__main__":
+    main()

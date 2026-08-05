@@ -1,0 +1,1445 @@
+#!/usr/bin/env python3
+"""
+AIena Daily Health Check — guardia mattutina del sistema editoriale.
+
+Legge pipeline.json v2 (investigations[], leads[], published[]).
+
+Esegue 11 controlli prima del cron di pubblicazione (09:30) per intercettare
+ogni modalita' di failure nota:
+
+    1.  PUBLICATION INTEGRITY    (lock file, cron, audit log)
+    2.  PIPELINE COHERENCE       (pipeline.json vs articoli locali)
+    3.  HOMEPAGE COHERENCE       (index.html vs pipeline) [AUTOFIX ticker/diary]
+    4.  SUPABASE CONSISTENCY     (article_approvals vs published[])
+    5.  PUBLICATION SCHEDULE     (pipeline.json dates vs Supabase queue) [AUTOFIX]
+    6.  FTP SYNC VERIFICATION    (file presenti su ftp.aiena.it)
+    7.  AIENA AGENT STATUS       (auto_start, heartbeat, sessione)
+    8.  ADMIN PANEL              (file aiena-admin, symlink data.json)
+    9.  OTS INTEGRITY            (ots_state.json)
+    10. CRON JOBS AUDIT          (cron critici presenti)
+    11. LOG ANALYSIS             (auto_publish, publication_audit, admin logs)
+
+Auto-fix (COMPLETE mode — fix everything automatically):
+    - lock file mancante o malformato        -> ricreato
+    - __pycache__ stale in aiena-sistema     -> rimosso
+    - aiena-admin/index.html stale           -> ricopiato da aiena.it/admin/
+    - aiena-admin/data.json symlink rotto    -> ricreato
+    - ticker hashtags mismatch               -> run aiena_update_ticker.py
+    - diary category mismatch                -> update index.html
+    - pipeline dates mismatch                -> update pipeline.json + Supabase
+    - after any FTP-relevant autofix         -> FTP deploy affected files
+    - after all autofixes                    -> rebuild admin data.json
+
+Output:
+    - console (cron log)
+    - Telegram via broker locale (SEMPRE, anche se tutto OK)
+
+Cron:
+    0 8 * * * /home/pinky/.pinkybot/.venv/bin/python3 \
+        /home/pinky/.pinkybot/scripts/aiena_daily_health.py \
+        >> /home/pinky/.pinkybot/data/logs/aiena_daily_health.log 2>&1
+
+Test (no Telegram, solo console):
+    python3 aiena_daily_health.py --test
+"""
+from __future__ import annotations
+
+import argparse
+import fcntl
+import ftplib
+import json
+import os
+import re
+import shutil
+import sqlite3
+import ssl
+import subprocess
+import sys
+import time
+import traceback
+import urllib.parse
+import urllib.request
+from dataclasses import dataclass, field
+from datetime import date, datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any
+
+sys.path.insert(0, "/home/pinky/lib")
+import broker_auth  # noqa: E402  (path aggiunto sopra)
+
+from aiena_secrets import _load_secrets
+
+# ---------------------------------------------------------------------------
+# CONFIG
+# ---------------------------------------------------------------------------
+
+PIPELINE_PATH = Path("/var/www/aiena.it/data/pipeline.json")
+INDEX_PATH = Path("/var/www/aiena.it/index.html")
+INDEX_LOCK_PATH = Path("/tmp/aiena_index_html.lock")  # shared lock con post_publish + update_ticker (stesso path)
+ARTICLES_DIR = Path("/var/www/aiena.it/articles")
+ADMIN_LOCAL_DIR = Path("/var/www/aiena.it/admin")
+ADMIN_NGINX_DIR = Path("/var/www/aiena-admin")
+OTS_STATE_PATH = Path("/var/www/aiena.it/data/ots_state.json")
+
+LOCK_FILE = Path("/home/pinky/.pinkybot/data/logs/last_publish_week.txt")
+AUDIT_LOG = Path("/home/pinky/.pinkybot/data/logs/publication_audit.log")
+AUTO_PUBLISH_LOG = Path("/home/pinky/.pinkybot/data/logs/auto_publish.log")
+ADMIN_REBUILD_LOG = Path("/home/pinky/.pinkybot/logs/aiena_admin_rebuild.log")
+ADMIN_DATA_LOG = Path("/home/pinky/.pinkybot/data/logs/admin_data.log")
+AGENTS_DB = Path("/home/pinky/.pinkybot/data/conversations_agents.db")
+
+AIENA_SISTEMA_SCRIPTS = Path("/home/pinky/aiena-sistema/scripts")
+SCRIPTS_DIR = Path("/home/pinky/.pinkybot/scripts")
+TICKER_SCRIPT = SCRIPTS_DIR / "aiena_update_ticker.py"
+UPDATE_ADMIN_SCRIPT = SCRIPTS_DIR / "update_admin_data.py"
+PYTHON_BIN = Path("/home/pinky/.pinkybot/.venv/bin/python3")
+
+FTP_HOST = "ftp.aiena.it"
+FTP_USER = "aiena.it"
+FTP_PASS = _load_secrets().get("FTP_PASS", "")
+FTP_TIMEOUT = 8
+
+SUPABASE_URL = "https://fwyjxolljcogblvwvfca.supabase.co"
+SUPABASE_KEY = _load_secrets().get("SB_SERVICE_KEY", "")
+
+BROKER_URL = "http://localhost:8888/broker/send"
+AGENT_STATUS_URL = "http://localhost:8888/agents/aiena/status"
+TELEGRAM_CHAT_ID = "32405655"
+
+REQUIRED_CRONS = [
+    ("30 9 * * 2,3,4", "aiena_auto_publish.py"),
+    ("*/5 * * * *", "update_admin_data.py"),
+    ("5 * * * *", "aiena_pipeline_backup.py"),
+    ("0 2 * * *", "aiena_git_backup.py"),
+]
+
+REQUIRED_FTP_ROOT = ["index.html", "archivio.html", "indagini.html",
+                     "feed.xml", "sitemap.xml", "data/pipeline.json"]
+
+# Log files to analyze with line limits
+LOG_FILES_TO_CHECK = [
+    (AUTO_PUBLISH_LOG, 50, "auto_publish"),
+    (AUDIT_LOG, 20, "publication_audit"),
+    (ADMIN_REBUILD_LOG, 20, "admin_rebuild"),
+    (ADMIN_DATA_LOG, 20, "admin_data"),
+]
+
+# severity buckets
+CRITICAL = "CRITICAL"
+WARNING = "WARNING"
+OK = "OK"
+
+# Track files that need FTP deploy after autofix
+FILES_TO_DEPLOY: list[tuple[Path, str]] = []  # [(local_path, remote_path), ...]
+ADMIN_REBUILD_NEEDED = False
+
+
+# ---------------------------------------------------------------------------
+# RESULT MODEL
+# ---------------------------------------------------------------------------
+
+@dataclass
+class CheckResult:
+    name: str
+    severity: str = OK            # OK | WARNING | CRITICAL
+    summary: str = "OK"
+    details: list[str] = field(default_factory=list)
+    fixed: list[str] = field(default_factory=list)
+
+    def warn(self, msg: str) -> None:
+        if self.severity != CRITICAL:
+            self.severity = WARNING
+        self.details.append(f"WARN: {msg}")
+
+    def critical(self, msg: str) -> None:
+        self.severity = CRITICAL
+        self.details.append(f"CRIT: {msg}")
+
+    def info(self, msg: str) -> None:
+        self.details.append(msg)
+
+    def fix(self, msg: str) -> None:
+        self.fixed.append(msg)
+
+
+# ---------------------------------------------------------------------------
+# UTILITIES
+# ---------------------------------------------------------------------------
+
+def this_tuesday(today: date | None = None) -> date:
+    """Return the date of Tuesday of the current ISO week (Mon=0)."""
+    today = today or date.today()
+    return today - timedelta(days=today.weekday() - 1) if today.weekday() >= 1 \
+        else today - timedelta(days=today.weekday() + 6)
+
+
+def http_get_json(url: str, headers: dict[str, str] | None = None,
+                  timeout: int = 10) -> Any:
+    req = urllib.request.Request(url, headers=headers or {})
+    ctx = ssl.create_default_context()
+    with urllib.request.urlopen(req, timeout=timeout, context=ctx) as resp:
+        return json.loads(resp.read().decode("utf-8"))
+
+
+def http_post_json(url: str, payload: dict[str, Any],
+                   timeout: int = 10) -> int:
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        url, data=data, headers={"Content-Type": "application/json"}, method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
+        return resp.status
+
+
+def ftp_connect() -> ftplib.FTP:
+    ftp = ftplib.FTP(FTP_HOST, timeout=FTP_TIMEOUT)
+    ftp.login(FTP_USER, FTP_PASS)
+    return ftp
+
+
+def ftp_exists(ftp: ftplib.FTP, path: str) -> bool:
+    """Check existence using SIZE (cheap, no download)."""
+    try:
+        ftp.voidcmd("TYPE I")
+        ftp.size(path)
+        return True
+    except ftplib.error_perm:
+        return False
+    except Exception:
+        # SIZE may fail on dirs; fallback to NLST of parent
+        try:
+            parent, name = path.rsplit("/", 1) if "/" in path else (".", path)
+            return name in ftp.nlst(parent)
+        except Exception:
+            return False
+
+
+def load_pipeline() -> dict[str, Any]:
+    try:
+        return json.loads(PIPELINE_PATH.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {"investigations": [], "leads": [], "published": []}
+    except json.JSONDecodeError as e:
+        # Log error but return safe fallback
+        return {"investigations": [], "leads": [], "published": []}
+
+
+def save_pipeline(data: dict[str, Any]) -> None:
+    """Salva pipeline.json in modo atomico."""
+    import tempfile
+    data["updated_at"] = date.today().isoformat()
+    content = json.dumps(data, ensure_ascii=False, indent=2)
+    fd, tmp_path = tempfile.mkstemp(dir=PIPELINE_PATH.parent, suffix=".tmp", prefix="pipeline_")
+    try:
+        with os.fdopen(fd, 'w', encoding='utf-8') as f:
+            f.write(content)
+        os.replace(tmp_path, PIPELINE_PATH)
+    except Exception as e:
+        try:
+            os.unlink(tmp_path)
+        except OSError:
+            pass
+        raise e
+
+
+def next_tuesday(from_date: date | None = None) -> date:
+    """Return the next Tuesday (or today if today is Tuesday and not yet used)."""
+    today = from_date or date.today()
+    days_ahead = 1 - today.weekday()  # Tuesday = weekday 1
+    if days_ahead < 0:
+        days_ahead += 7
+    next_tue = today + timedelta(days=days_ahead)
+
+    # Check if this Tuesday was already used for publication
+    if LOCK_FILE.exists():
+        try:
+            saved = LOCK_FILE.read_text().strip()
+            if len(saved) == 10 and "-" in saved:
+                last_pub = date.fromisoformat(saved)
+                if last_pub == next_tue:
+                    next_tue += timedelta(weeks=1)
+        except Exception:
+            pass
+    return next_tue
+
+
+def ftp_deploy_file(local_path: Path, remote_path: str) -> tuple[bool, str]:
+    """Deploy a single file via FTP using curl."""
+    try:
+        result = subprocess.run([
+            "curl", "-s", "-S", "-T", str(local_path),
+            f"ftp://{FTP_HOST}/{remote_path}",
+            "--user", f"{FTP_USER}:{FTP_PASS}"
+        ], capture_output=True, timeout=30, text=True)
+        if result.returncode == 0:
+            return True, f"FTP OK: {remote_path}"
+        return False, f"FTP error: {result.stderr or 'unknown'}"
+    except Exception as e:
+        return False, f"FTP exception: {e}"
+
+
+def run_script(script_path: Path, args: list[str] | None = None) -> tuple[bool, str]:
+    """Run a Python script and return success status and output."""
+    try:
+        cmd = [str(PYTHON_BIN), str(script_path)] + (args or [])
+        result = subprocess.run(cmd, capture_output=True, timeout=60, text=True)
+        output = (result.stdout + result.stderr).strip()
+        return result.returncode == 0, output[:500]
+    except Exception as e:
+        return False, str(e)
+
+
+def supabase_patch(table: str, filters: str, data: dict[str, Any]) -> tuple[bool, str]:
+    """PATCH a Supabase row."""
+    try:
+        url = f"{SUPABASE_URL}/rest/v1/{table}?{filters}"
+        body = json.dumps(data).encode("utf-8")
+        req = urllib.request.Request(
+            url,
+            data=body,
+            headers={
+                "apikey": SUPABASE_KEY,
+                "Authorization": f"Bearer {SUPABASE_KEY}",
+                "Content-Type": "application/json",
+                "Prefer": "return=minimal"
+            },
+            method="PATCH"
+        )
+        ctx = ssl.create_default_context()
+        with urllib.request.urlopen(req, timeout=10, context=ctx) as resp:
+            return True, f"HTTP {resp.status}"
+    except Exception as e:
+        return False, str(e)
+
+
+def read_log_tail(log_path: Path, lines: int) -> list[str]:
+    """Read the last N lines of a log file."""
+    if not log_path.exists():
+        return []
+    try:
+        content = log_path.read_text(encoding="utf-8", errors="replace")
+        all_lines = content.splitlines()
+        return all_lines[-lines:] if len(all_lines) > lines else all_lines
+    except Exception:
+        return []
+
+
+# ---------------------------------------------------------------------------
+# AUTO-FIX HELPERS (soft mode)
+# ---------------------------------------------------------------------------
+
+def fix_lock_file() -> str:
+    tue = this_tuesday().strftime("%Y-%m-%d")
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+    LOCK_FILE.write_text(tue + "\n", encoding="utf-8")
+    return f"lock file ricreato: {LOCK_FILE} = {tue}"
+
+
+def fix_pyc_cache() -> list[str]:
+    cleaned = []
+    if not AIENA_SISTEMA_SCRIPTS.exists():
+        return cleaned
+    for pyc_dir in AIENA_SISTEMA_SCRIPTS.rglob("__pycache__"):
+        try:
+            # only delete if any source .py is newer than the cache dir
+            cache_mtime = pyc_dir.stat().st_mtime
+            parent = pyc_dir.parent
+            stale = any(p.stat().st_mtime > cache_mtime
+                        for p in parent.glob("*.py"))
+            if stale:
+                shutil.rmtree(pyc_dir, ignore_errors=True)
+                cleaned.append(str(pyc_dir))
+        except Exception:
+            pass
+    return cleaned
+
+
+def fix_admin_index() -> str | None:
+    src = ADMIN_LOCAL_DIR / "index.html"
+    dst = ADMIN_NGINX_DIR / "index.html"
+    if not src.exists():
+        return None
+    try:
+        shutil.copy2(src, dst)
+        return f"copiato {src} -> {dst}"
+    except Exception as e:
+        return f"copia fallita: {e}"
+
+
+def fix_admin_symlink() -> str | None:
+    link = ADMIN_NGINX_DIR / "data.json"
+    target = ADMIN_LOCAL_DIR / "data.json"
+    try:
+        if link.exists() or link.is_symlink():
+            link.unlink()
+        link.symlink_to(target)
+        return f"symlink ricreato: {link} -> {target}"
+    except Exception as e:
+        return f"symlink fallito: {e}"
+
+
+def fix_ticker_hashtags(hashtags: list[str], title: str) -> str | None:
+    """Run aiena_update_ticker.py with correct hashtags."""
+    global FILES_TO_DEPLOY
+    if not TICKER_SCRIPT.exists():
+        return f"ticker script non trovato: {TICKER_SCRIPT}"
+    args = ["--titolo", title, "--hashtags", " ".join(hashtags)]
+    ok, output = run_script(TICKER_SCRIPT, args)
+    if ok:
+        FILES_TO_DEPLOY.append((INDEX_PATH, "index.html"))
+        return f"ticker aggiornato con {len(hashtags)} hashtag"
+    return f"ticker update fallito: {output}"
+
+
+def fix_diary_category(expected_cat: str) -> str | None:
+    """Update diary-cat in index.html.
+    Usa fcntl.flock per serializzare con altri script (urgente_processor, post_publish)
+    che leggono/scrivono index.html, evitando race condition read-modify-write.
+    """
+    global FILES_TO_DEPLOY
+    try:
+        import tempfile
+        INDEX_LOCK_PATH.parent.mkdir(parents=True, exist_ok=True)
+        with open(INDEX_LOCK_PATH, "a") as lock_fh:
+            fcntl.flock(lock_fh, fcntl.LOCK_EX)
+            try:
+                html = INDEX_PATH.read_text(encoding="utf-8")
+                pattern = r'(<span class="diary-cat">)[^<]*(</span>)'
+                new_html, n = re.subn(pattern, rf'\g<1>{expected_cat}\g<2>', html, count=1)
+                if n == 0:
+                    return "diary-cat pattern non trovato in index.html"
+                # Atomic write (dentro il lock)
+                fd, tmp = tempfile.mkstemp(dir=INDEX_PATH.parent, suffix=".tmp")
+                try:
+                    with os.fdopen(fd, 'w', encoding='utf-8') as f:
+                        f.write(new_html)
+                    os.chmod(tmp, 0o644)  # nginx (www-data) must read it; mkstemp creates 0600
+                    os.replace(tmp, INDEX_PATH)
+                except Exception:
+                    try:
+                        os.unlink(tmp)
+                    except OSError:
+                        pass
+                    raise
+            finally:
+                fcntl.flock(lock_fh, fcntl.LOCK_UN)
+        FILES_TO_DEPLOY.append((INDEX_PATH, "index.html"))
+        return f"diary-cat aggiornata a '{expected_cat}'"
+    except Exception as e:
+        return f"diary-cat update fallito: {e}"
+
+
+def fix_pipeline_dates(
+    investigation_dates: list[str | None]
+) -> str | None:
+    """Update pub_date fields in pipeline.json v2 to match expected dates."""
+    global FILES_TO_DEPLOY
+    try:
+        p = load_pipeline()
+        changes = []
+
+        # pipeline.json v2: investigations[] contiene tutti gli articoli in lavorazione
+        investigations = p.get("investigations", [])
+        for i, exp_date in enumerate(investigation_dates):
+            if i < len(investigations) and exp_date:
+                old = investigations[i].get("pub_date")
+                if old != exp_date:
+                    investigations[i]["pub_date"] = exp_date
+                    changes.append(f"inv[{i}]: {old}->{exp_date}")
+
+        if changes:
+            save_pipeline(p)
+            FILES_TO_DEPLOY.append((PIPELINE_PATH, "data/pipeline.json"))
+            return f"pipeline dates aggiornate: {', '.join(changes)}"
+        return None
+    except Exception as e:
+        return f"pipeline dates update fallito: {e}"
+
+
+def rebuild_admin_data() -> str | None:
+    """Rebuild admin data.json by running update_admin_data.py."""
+    if not UPDATE_ADMIN_SCRIPT.exists():
+        return f"admin script non trovato: {UPDATE_ADMIN_SCRIPT}"
+    ok, output = run_script(UPDATE_ADMIN_SCRIPT)
+    if ok:
+        return "admin data.json rigenerato"
+    return f"admin rebuild fallito: {output}"
+
+
+def deploy_pending_files() -> list[str]:
+    """Deploy all files queued for FTP upload. Returns list of results."""
+    global FILES_TO_DEPLOY
+    results = []
+    # Deduplicate by remote path
+    seen = set()
+    unique = []
+    for local, remote in FILES_TO_DEPLOY:
+        if remote not in seen:
+            seen.add(remote)
+            unique.append((local, remote))
+
+    for local_path, remote_path in unique:
+        ok, msg = ftp_deploy_file(local_path, remote_path)
+        results.append(msg)
+    FILES_TO_DEPLOY = []
+    return results
+
+
+# ---------------------------------------------------------------------------
+# CHECK 1 — PUBLICATION INTEGRITY
+# ---------------------------------------------------------------------------
+
+def check_publication_integrity() -> CheckResult:
+    r = CheckResult("Publication integrity")
+
+    # 1a) lock file
+    lock_date: date | None = None
+    if not LOCK_FILE.exists():
+        r.critical(f"lock file mancante: {LOCK_FILE}")
+        r.fix(fix_lock_file())
+        lock_date = this_tuesday()
+    else:
+        raw = LOCK_FILE.read_text(encoding="utf-8").strip()
+        try:
+            lock_date = datetime.strptime(raw, "%Y-%m-%d").date()
+            r.info(f"lock file = {raw}")
+        except ValueError:
+            r.critical(f"lock file formato invalido: '{raw}'")
+            r.fix(fix_lock_file())
+            lock_date = this_tuesday()
+
+    # 1b) lock date >= this week's Tuesday
+    if lock_date and lock_date < this_tuesday():
+        r.warn(
+            f"lock date {lock_date} antecedente al martedi corrente "
+            f"({this_tuesday()}): possibile ri-pubblicazione"
+        )
+
+    # 1c) audit log: ultima riga non un 'published' inatteso oggi
+    if AUDIT_LOG.exists():
+        try:
+            lines = [l.strip() for l in AUDIT_LOG.read_text(
+                encoding="utf-8").splitlines() if l.strip()]
+            if lines:
+                last = lines[-1]
+                r.info(f"audit ultima riga: {last[:140]}")
+                today = date.today().isoformat()
+                if "published" in last.lower() and today in last:
+                    # informativo se siamo martedi/mercoledi/giovedi
+                    if date.today().weekday() not in (1, 2, 3):
+                        r.warn(f"audit registra 'published' oggi ({today}) "
+                               f"ma non e' un giorno di pubblicazione")
+        except Exception as e:
+            r.warn(f"impossibile leggere audit log: {e}")
+    else:
+        r.warn(f"audit log non esiste ancora: {AUDIT_LOG}")
+
+    # 1d) cron auto_publish presente
+    crontab = _read_crontab()
+    if not re.search(r"^\s*30\s+9\s+\*\s+\*\s+2,3,4\s+.*aiena_auto_publish\.py",
+                     crontab, re.M):
+        r.critical("cron '30 9 * * 2,3,4 aiena_auto_publish.py' MANCANTE")
+    else:
+        r.info("cron auto_publish presente")
+
+    if r.severity == OK:
+        r.summary = "lock OK, audit OK, cron OK"
+    else:
+        r.summary = "; ".join(r.details[:2])
+    return r
+
+
+def _read_crontab() -> str:
+    try:
+        return subprocess.check_output(
+            ["crontab", "-l"], stderr=subprocess.DEVNULL, timeout=5
+        ).decode("utf-8", errors="replace")
+    except Exception:
+        return ""
+
+
+# ---------------------------------------------------------------------------
+# CHECK 2 — PIPELINE COHERENCE
+# ---------------------------------------------------------------------------
+
+def check_pipeline_coherence() -> CheckResult:
+    r = CheckResult("Pipeline coherence")
+
+    try:
+        p = load_pipeline()
+    except Exception as e:
+        r.critical(f"pipeline.json invalido o assente: {e}")
+        r.summary = "pipeline.json corrotta"
+        return r
+
+    # pipeline.json v2: investigations[], leads[], published[]
+    required = ["investigations", "leads", "published"]
+    for k in required:
+        if k not in p:
+            r.critical(f"chiave mancante: {k}")
+    if r.severity == CRITICAL:
+        r.summary = "pipeline.json incompleta"
+        return r
+
+    pub_slugs = {x.get("slug") for x in p["published"] if isinstance(x, dict)}
+    investigations = p.get("investigations", [])
+    inv_slugs = [x.get("slug") for x in investigations if isinstance(x, dict)]
+
+    # Controllo: nessun item in investigations[] dovrebbe essere gia in published[]
+    for s in inv_slugs:
+        if s and s in pub_slugs:
+            r.critical(f"investigations[] contiene slug gia' pubblicato: {s}")
+
+    # duplicati in investigations[]
+    seen, dups = set(), set()
+    for s in inv_slugs:
+        if s:
+            if s in seen:
+                dups.add(s)
+            seen.add(s)
+    if dups:
+        r.warn(f"slug duplicati in investigations[]: {sorted(dups)}")
+
+    # articoli locali vs published
+    local_articles = set()
+    if ARTICLES_DIR.exists():
+        local_articles = {p.stem for p in ARTICLES_DIR.glob("*.html")}
+
+    orphans = local_articles - pub_slugs
+    if orphans:
+        r.critical(f"articoli locali NON in published[]: {sorted(orphans)}")
+
+    missing_files = pub_slugs - local_articles
+    if missing_files:
+        r.warn(f"published[] senza file locale: {sorted(missing_files)}")
+
+    if r.severity == OK:
+        r.summary = (f"{len(pub_slugs)} pub, {len(inv_slugs)} in investigations, "
+                     f"{len(local_articles)} file locali, coerente")
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 3 — HOMEPAGE COHERENCE
+# ---------------------------------------------------------------------------
+
+_HERO_RE = re.compile(
+    r'<section[^>]*class="[^"]*hero[^"]*"[\s\S]*?href="articles/([^"]+)\.html"',
+    re.I,
+)
+_TICKER_RE = re.compile(r'<span class="ticker-item">([^<]+)</span>', re.I)
+_DIARY_CAT_RE = re.compile(r'<span class="diary-cat">([^<]+)</span>', re.I)
+_CARD_BLOCK_RE = re.compile(
+    r'<!--\s*Card\s*(\d+)\s*-->[\s\S]*?'
+    r'<span class="badge badge-cat">([^<]+)</span>[\s\S]*?'
+    r'<h2 class="card-title">([^<]+)</h2>',
+    re.I,
+)
+
+
+def check_homepage_coherence() -> CheckResult:
+    """Check homepage coherence with AUTOFIX for ticker and diary mismatches."""
+    r = CheckResult("Homepage coherence")
+
+    if not INDEX_PATH.exists():
+        r.critical(f"index.html non trovato: {INDEX_PATH}")
+        r.summary = "homepage assente"
+        return r
+
+    try:
+        p = load_pipeline()
+    except Exception as e:
+        r.critical(f"pipeline.json non leggibile: {e}")
+        r.summary = "pipeline non leggibile"
+        return r
+
+    html = INDEX_PATH.read_text(encoding="utf-8", errors="replace")
+
+    # 3a) hero slug = ultimo published[] per published_at
+    pub = sorted([x for x in p.get("published", []) if isinstance(x, dict)],
+                 key=lambda x: x.get("published_at", ""))
+    last_pub_slug = pub[-1]["slug"] if pub else None
+    # pipeline.json v2: investigations[] + leads[] contengono items non pubblicati
+    investigations_slugs = {x.get("slug") for x in p.get("investigations", []) if isinstance(x, dict)}
+    leads_slugs = {x.get("slug") for x in p.get("leads", []) if isinstance(x, dict)}
+    pipeline_slugs = investigations_slugs | leads_slugs
+
+    m = _HERO_RE.search(html)
+    if not m:
+        r.warn("hero slug non parsabile dall'index.html")
+        hero_slug = None
+    else:
+        hero_slug = m.group(1)
+        r.info(f"hero slug = {hero_slug}")
+        if last_pub_slug and hero_slug != last_pub_slug:
+            r.warn(f"hero stale: home={hero_slug} vs ultimo pub={last_pub_slug}")
+        if hero_slug in pipeline_slugs:
+            r.critical(f"hero slug '{hero_slug}' e' una preview/pipeline, "
+                       f"NON un articolo pubblicato")
+        elif hero_slug not in {x.get("slug") for x in pub}:
+            r.critical(f"hero slug '{hero_slug}' non e' in published[]")
+
+    # 3b) ticker hashtags = investigations[0].hashtags (set, dedup) [AUTOFIX]
+    # pipeline.json v2: investigations[0] e' l'indagine corrente
+    investigations = p.get("investigations", [])
+    cur = investigations[0] if len(investigations) > 0 else {}
+    cur_tags = set(cur.get("hashtags", []) or [])
+    home_tags = set(_TICKER_RE.findall(html))
+    ticker_mismatch = False
+    if cur_tags and home_tags and home_tags != cur_tags:
+        only_cur = cur_tags - home_tags
+        only_home = home_tags - cur_tags
+        r.warn(f"ticker mismatch: in pipeline ma non in home={sorted(only_cur)}, "
+               f"in home ma non in pipeline={sorted(only_home)}")
+        ticker_mismatch = True
+    elif cur_tags and not home_tags:
+        r.warn(f"ticker vuoto in home ma pipeline ha {len(cur_tags)} hashtag")
+        ticker_mismatch = True
+
+    # AUTOFIX ticker
+    if ticker_mismatch and cur_tags:
+        hashtag_list = list(cur.get("hashtags", []) or [])
+        title = cur.get("title", "Indagine corrente")
+        fix_result = fix_ticker_hashtags(hashtag_list, title)
+        if fix_result:
+            r.fix(fix_result)
+
+    # 3c) diary-cat = investigations[0].category [AUTOFIX]
+    diary_cats = _DIARY_CAT_RE.findall(html)
+    diary_mismatch = False
+    expected_cat = cur.get("category", "")
+    if diary_cats:
+        home_cat = diary_cats[0].strip()
+        if expected_cat and home_cat != expected_cat:
+            r.warn(f"diary-cat home='{home_cat}' vs pipeline='{expected_cat}'")
+            diary_mismatch = True
+    else:
+        r.warn("diary-cat non trovata in index.html")
+
+    # AUTOFIX diary category
+    if diary_mismatch and expected_cat:
+        fix_result = fix_diary_category(expected_cat)
+        if fix_result:
+            r.fix(fix_result)
+
+    # 3d) cards 1/2/3 = investigations[0] / investigations[1] / investigations[2]
+    # pipeline.json v2: investigations[] contiene tutti gli articoli in lavorazione
+    nxt = investigations[1] if len(investigations) > 1 else {}
+    third = investigations[2] if len(investigations) > 2 else {}
+    expected = [
+        (cur.get("title"), cur.get("category")),
+        (nxt.get("title"), nxt.get("category")),
+        (third.get("title"), third.get("category")),
+    ]
+    cards = sorted(_CARD_BLOCK_RE.findall(html), key=lambda t: int(t[0]))
+    for i in range(min(3, len(cards))):
+        idx, cat, title = cards[i]
+        exp_title, exp_cat = expected[i]
+        if exp_title and title.strip() != exp_title.strip():
+            r.warn(f"card{idx} title='{title.strip()[:40]}' "
+                   f"vs atteso='{(exp_title or '')[:40]}'")
+        if exp_cat and cat.strip() != exp_cat.strip():
+            r.warn(f"card{idx} cat='{cat.strip()}' vs atteso='{exp_cat}'")
+
+    if r.severity == OK:
+        r.summary = "hero/ticker/diary/cards allineati"
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 4 — SUPABASE CONSISTENCY
+# ---------------------------------------------------------------------------
+
+def check_supabase_consistency() -> CheckResult:
+    r = CheckResult("Supabase consistency")
+
+    try:
+        p = load_pipeline()
+    except Exception as e:
+        r.critical(f"pipeline.json non leggibile: {e}")
+        r.summary = "pipeline non leggibile"
+        return r
+
+    pub_slugs = {x.get("slug") for x in p.get("published", []) if isinstance(x, dict)}
+
+    headers = {
+        "apikey": SUPABASE_KEY,
+        "Authorization": f"Bearer {SUPABASE_KEY}",
+    }
+
+    def fetch(status: str) -> list[dict]:
+        # NOTE: schema usa approved_at/published_at, NON updated_at.
+        # Quando si filtrano timestamp, usare suffisso 'Z' (UTC) e non '+00:00'
+        # che decodifica come spazio in URL.
+        q = urllib.parse.urlencode({
+            "select": "slug,status,published_at",
+            "status": f"eq.{status}",
+        })
+        url = f"{SUPABASE_URL}/rest/v1/article_approvals?{q}"
+        return http_get_json(url, headers=headers, timeout=10)
+
+    try:
+        sb_published = fetch("published")
+    except Exception as e:
+        r.warn(f"Supabase fetch published fallito: {e}")
+        sb_published = []
+
+    try:
+        sb_approved = fetch("approved")
+    except Exception as e:
+        r.warn(f"Supabase fetch approved fallito: {e}")
+        sb_approved = []
+
+    sb_pub_slugs = {row["slug"] for row in sb_published if row.get("slug")}
+    sb_app_slugs = {row["slug"] for row in sb_approved if row.get("slug")}
+
+    # Supabase published not in pipeline.published
+    sb_extra = sb_pub_slugs - pub_slugs
+    if sb_extra:
+        r.warn(f"Supabase status=published ma NON in pipeline: {sorted(sb_extra)}")
+
+    pipeline_extra = pub_slugs - sb_pub_slugs
+    if pipeline_extra:
+        r.warn(f"pipeline.published ma NON in Supabase published: {sorted(pipeline_extra)}")
+
+    # Supabase approved che risultano gia' pubblicati su pipeline -> CRITICAL
+    bad_approved = sb_app_slugs & pub_slugs
+    if bad_approved:
+        r.critical(f"Supabase status=approved ma gia' in pipeline.published: "
+                   f"{sorted(bad_approved)}")
+
+    if r.severity == OK:
+        r.summary = (f"sb_pub={len(sb_pub_slugs)} sb_app={len(sb_app_slugs)} "
+                     f"local_pub={len(pub_slugs)} coerente")
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 5 — PUBLICATION SCHEDULE (pipeline dates vs Supabase queue positions)
+# ---------------------------------------------------------------------------
+
+def check_publication_schedule() -> CheckResult:
+    """
+    Verify that pipeline.json pub_date fields match expected positions:
+    - investigations[0] pub_date = position 1 (next Tuesday if not already used)
+    - investigations[1] pub_date = position 2
+    - investigations[2+] pub_dates = positions 3, 4, 5...
+
+    AUTOFIX: update pipeline.json dates AND rebuild admin if mismatch.
+    """
+    r = CheckResult("Publication schedule")
+
+    try:
+        p = load_pipeline()
+    except Exception as e:
+        r.critical(f"pipeline.json non leggibile: {e}")
+        r.summary = "pipeline non leggibile"
+        return r
+
+    # Calculate expected dates based on position
+    # pipeline.json v2: investigations[] contiene tutti gli articoli in lavorazione
+    base_tue = next_tuesday()
+    expected_dates: list[tuple[str, str, str | None]] = []  # [(label, slug, expected_date), ...]
+
+    investigations = p.get("investigations", []) or []
+    mismatches = []
+
+    # Position 1, 2, 3...: investigations[0], investigations[1], investigations[2]...
+    for i, item in enumerate(investigations):
+        slug = item.get("slug", "")
+        if not slug:
+            continue
+        position = i + 1
+        exp_date = (base_tue + timedelta(weeks=position - 1)).isoformat()
+        actual_date = item.get("pub_date")
+        expected_dates.append((f"investigations[{i}]", slug, exp_date))
+        if actual_date != exp_date:
+            mismatches.append(f"inv[{i}]: atteso {exp_date}, trovato {actual_date}")
+            r.warn(f"investigations[{i}] pub_date mismatch: {actual_date} vs atteso {exp_date}")
+        else:
+            r.info(f"investigations[{i}] pub_date OK: {exp_date}")
+
+    # AUTOFIX: update pipeline.json with correct dates
+    if mismatches:
+        # Extract expected dates for fix function
+        inv_exp: list[str | None] = [None] * len(investigations)
+
+        for label, slug, exp in expected_dates:
+            if label.startswith("investigations["):
+                idx = int(label.split("[")[1].rstrip("]"))
+                if idx < len(inv_exp):
+                    inv_exp[idx] = exp
+
+        fix_result = fix_pipeline_dates(inv_exp)
+        if fix_result:
+            r.fix(fix_result)
+
+    if r.severity == OK:
+        r.summary = f"schedule OK: {len(expected_dates)} items con date corrette"
+    else:
+        r.summary = f"{len(mismatches)} date mismatch" + (", autofixed" if r.fixed else "")
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 6 — FTP SYNC VERIFICATION
+# ---------------------------------------------------------------------------
+
+def check_ftp_sync() -> CheckResult:
+    r = CheckResult("FTP sync verification")
+
+    try:
+        p = load_pipeline()
+    except Exception as e:
+        r.critical(f"pipeline.json non leggibile: {e}")
+        r.summary = "pipeline non leggibile"
+        return r
+
+    pub_slugs = [x.get("slug") for x in p.get("published", [])
+                 if isinstance(x, dict) and x.get("slug")]
+    # pipeline.json v2: investigations[0] e investigations[1] per preview
+    investigations = p.get("investigations", [])
+    cur_slug = investigations[0].get("slug") if len(investigations) > 0 else None
+    nxt_slug = investigations[1].get("slug") if len(investigations) > 1 else None
+
+    try:
+        ftp = ftp_connect()
+    except Exception as e:
+        r.critical(f"FTP connessione fallita ({FTP_HOST}): {e}")
+        r.summary = "FTP irraggiungibile"
+        return r
+
+    try:
+        # 5a) root files
+        for f in REQUIRED_FTP_ROOT:
+            if not ftp_exists(ftp, f):
+                r.critical(f"FTP manca: {f}")
+
+        # 5b) articoli published
+        missing_pub = []
+        for slug in pub_slugs:
+            if not ftp_exists(ftp, f"articles/{slug}.html"):
+                missing_pub.append(slug)
+        if missing_pub:
+            r.critical(f"FTP articles/ manca {len(missing_pub)} pubblicati: "
+                       f"{missing_pub[:5]}")
+
+        # 5c) preview per current/next
+        for label, slug in [("current", cur_slug), ("next", nxt_slug)]:
+            if slug and not ftp_exists(ftp, f"preview/{slug}.html"):
+                r.warn(f"FTP preview/{slug}.html mancante ({label})")
+
+        # 5d) NESSUN published in preview/
+        leaked = []
+        for slug in pub_slugs:
+            if ftp_exists(ftp, f"preview/{slug}.html"):
+                leaked.append(slug)
+        if leaked:
+            r.critical(f"FTP preview/ contiene articoli gia' pubblicati: {leaked}")
+
+    finally:
+        try:
+            ftp.quit()
+        except Exception:
+            pass
+
+    if r.severity == OK:
+        r.summary = (f"FTP OK: {len(REQUIRED_FTP_ROOT)} root + "
+                     f"{len(pub_slugs)} articoli verificati")
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 7 — AIENA AGENT STATUS
+# ---------------------------------------------------------------------------
+
+def check_aiena_agent() -> CheckResult:
+    r = CheckResult("AIena agent status")
+
+    if not AGENTS_DB.exists():
+        r.critical(f"DB non trovato: {AGENTS_DB}")
+        r.summary = "DB assente"
+        return r
+
+    try:
+        con = sqlite3.connect(str(AGENTS_DB))
+        con.row_factory = sqlite3.Row
+
+        row = con.execute(
+            "SELECT auto_start FROM agents WHERE name='aiena'"
+        ).fetchone()
+        if not row:
+            r.critical("agent 'aiena' assente in tabella agents")
+        elif row["auto_start"] != 1:
+            r.critical(f"aiena.auto_start={row['auto_start']} (atteso 1)")
+        else:
+            r.info("auto_start=1")
+
+        hb = con.execute(
+            "SELECT timestamp FROM agent_heartbeats "
+            "WHERE agent_name='aiena' ORDER BY timestamp DESC LIMIT 1"
+        ).fetchone()
+        con.close()
+
+        if not hb:
+            r.warn("nessun heartbeat trovato")
+        else:
+            ts = hb["timestamp"]
+            # timestamp puo' essere unix-epoch float o ISO
+            try:
+                last = datetime.fromtimestamp(float(ts), tz=timezone.utc)
+            except Exception:
+                last = datetime.fromisoformat(str(ts).replace("Z", "+00:00"))
+            age_h = (datetime.now(timezone.utc) - last).total_seconds() / 3600
+            r.info(f"ultimo heartbeat: {age_h:.1f}h fa")
+            if age_h > 48:
+                r.critical(f"heartbeat troppo vecchio: {age_h:.1f}h (>48h)")
+    except Exception as e:
+        r.warn(f"query DB fallita: {e}")
+
+    # 6c) sessione online
+    try:
+        data = http_get_json(AGENT_STATUS_URL, timeout=5)
+        status = data.get("status") or data.get("db_status") or "?"
+        r.info(f"sessione: {status}")
+        if status not in ("active", "running", "idle", "busy"):
+            r.warn(f"stato sessione anomalo: {status}")
+    except Exception as e:
+        r.warn(f"endpoint /agents/aiena/status fallito: {e}")
+
+    if r.severity == OK:
+        r.summary = "auto_start=1, heartbeat fresco, sessione online"
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 8 — ADMIN PANEL
+# ---------------------------------------------------------------------------
+
+def check_admin_panel() -> CheckResult:
+    r = CheckResult("Admin panel")
+
+    idx = ADMIN_NGINX_DIR / "index.html"
+    if not idx.exists():
+        r.critical(f"{idx} mancante")
+    else:
+        age_h = (time.time() - idx.stat().st_mtime) / 3600
+        r.info(f"index.html eta: {age_h:.1f}h")
+        if age_h > 25:
+            r.warn(f"index.html stale ({age_h:.1f}h > 25h)")
+            res = fix_admin_index()
+            if res:
+                r.fix(res)
+
+    # symlink data.json
+    link = ADMIN_NGINX_DIR / "data.json"
+    target = ADMIN_LOCAL_DIR / "data.json"
+    if not link.is_symlink():
+        r.warn(f"{link} non e' un symlink")
+        res = fix_admin_symlink()
+        if res:
+            r.fix(res)
+    else:
+        try:
+            resolved = link.resolve()
+            if resolved != target.resolve():
+                r.warn(f"symlink punta a {resolved} invece di {target}")
+                res = fix_admin_symlink()
+                if res:
+                    r.fix(res)
+            elif not target.exists():
+                r.critical(f"target symlink non esiste: {target}")
+        except Exception as e:
+            r.warn(f"resolve symlink fallito: {e}")
+
+    # data.json: published count = len(pipeline.published)
+    if target.exists():
+        try:
+            adm = json.loads(target.read_text(encoding="utf-8"))
+            p = load_pipeline()
+            pip_count = len(p.get("published", []))
+            adm_articles = adm.get("published_articles") or adm.get("published") or []
+            adm_count = (adm.get("published_count")
+                         if isinstance(adm.get("published_count"), int)
+                         else len(adm_articles))
+            r.info(f"admin published count={adm_count}, pipeline={pip_count}")
+            if adm_count != pip_count:
+                r.warn(f"admin/data.json published={adm_count} "
+                       f"vs pipeline.published={pip_count}")
+        except Exception as e:
+            r.warn(f"parse admin data.json fallito: {e}")
+
+    if r.severity == OK:
+        r.summary = "index recente, symlink valido, conteggi allineati"
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 9 — OTS INTEGRITY
+# ---------------------------------------------------------------------------
+
+def check_ots_integrity() -> CheckResult:
+    r = CheckResult("OTS integrity")
+
+    if not OTS_STATE_PATH.exists():
+        r.warn(f"ots_state.json non trovato: {OTS_STATE_PATH}")
+        r.summary = "ots_state assente"
+        return r
+
+    try:
+        ots = json.loads(OTS_STATE_PATH.read_text(encoding="utf-8"))
+    except Exception as e:
+        r.warn(f"ots_state.json invalido: {e}")
+        r.summary = "ots_state corrotto"
+        return r
+
+    try:
+        p = load_pipeline()
+    except Exception as e:
+        r.warn(f"pipeline.json non leggibile per cross-check OTS: {e}")
+        r.summary = "no cross-check"
+        return r
+
+    pub_slugs = [x.get("slug") for x in p.get("published", [])
+                 if isinstance(x, dict) and x.get("slug")]
+
+    # ots_state puo' essere dict {slug: {...status...}} oppure {"articles": [...]}
+    missing = []
+    for slug in pub_slugs:
+        entry = None
+        if isinstance(ots, dict):
+            if slug in ots:
+                entry = ots[slug]
+            elif "articles" in ots and isinstance(ots["articles"], dict):
+                entry = ots["articles"].get(slug)
+            elif "articles" in ots and isinstance(ots["articles"], list):
+                entry = next((a for a in ots["articles"]
+                              if a.get("slug") == slug), None)
+        status = (entry or {}).get("status", "missing") if entry else "missing"
+        if status == "missing":
+            missing.append(slug)
+
+    if missing:
+        r.warn(f"OTS missing per {len(missing)} articoli: {missing[:5]}")
+        r.summary = f"{len(missing)} articoli senza OTS"
+    else:
+        r.summary = f"tutti {len(pub_slugs)} articoli timestamped"
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 10 — CRON JOBS AUDIT
+# ---------------------------------------------------------------------------
+
+def check_cron_jobs() -> CheckResult:
+    r = CheckResult("Cron jobs audit")
+    crontab = _read_crontab()
+    if not crontab:
+        r.critical("crontab vuoto o non leggibile")
+        r.summary = "crontab non disponibile"
+        return r
+
+    missing = []
+    for schedule, script in REQUIRED_CRONS:
+        # match schedule literal + script name on same line
+        sch_re = re.escape(schedule).replace(r"\ ", r"\s+")
+        if not re.search(rf"^\s*{sch_re}\s+.*{re.escape(script)}", crontab, re.M):
+            missing.append(f"{schedule} {script}")
+
+    if missing:
+        for m in missing:
+            r.critical(f"cron mancante: {m}")
+        r.summary = f"{len(missing)} cron critici mancanti"
+    else:
+        r.summary = f"tutti i {len(REQUIRED_CRONS)} cron critici presenti"
+    return r
+
+
+# ---------------------------------------------------------------------------
+# CHECK 11 — LOG ANALYSIS
+# ---------------------------------------------------------------------------
+
+def check_log_analysis() -> CheckResult:
+    """
+    Analyze multiple log files for errors:
+    - auto_publish.log (last 50 lines) — ERROR today = CRITICAL
+    - publication_audit.log (last 20 lines)
+    - aiena_admin_rebuild.log (last 20 lines)
+    - admin_data.log (last 20 lines)
+    """
+    r = CheckResult("Log analysis")
+    today = date.today().isoformat()
+    errors_today = []
+    warnings_today = []
+
+    for log_path, line_limit, log_name in LOG_FILES_TO_CHECK:
+        if not log_path.exists():
+            r.info(f"{log_name}: file non esiste")
+            continue
+
+        lines = read_log_tail(log_path, line_limit)
+        if not lines:
+            r.info(f"{log_name}: vuoto o non leggibile")
+            continue
+
+        # Check for errors
+        for line in lines:
+            line_lower = line.lower()
+            has_error = "error" in line_lower or "traceback" in line_lower or "critical" in line_lower
+            has_warning = "warn" in line_lower
+
+            if has_error and today in line:
+                errors_today.append((log_name, line[:100]))
+            elif has_warning and today in line:
+                warnings_today.append((log_name, line[:80]))
+
+        # Report log status
+        age_h = (time.time() - log_path.stat().st_mtime) / 3600
+        r.info(f"{log_name}: {len(lines)} righe lette, eta {age_h:.1f}h")
+
+    # CRITICAL if ERROR in auto_publish.log today
+    auto_errors = [e for e in errors_today if e[0] == "auto_publish"]
+    if auto_errors:
+        r.critical(f"ERROR oggi in auto_publish.log: {auto_errors[0][1]}")
+
+    # Warning for other errors
+    other_errors = [e for e in errors_today if e[0] != "auto_publish"]
+    if other_errors:
+        for log_name, err_line in other_errors[:3]:
+            r.warn(f"ERROR in {log_name}: {err_line}")
+
+    # Info about warnings
+    if warnings_today:
+        r.info(f"{len(warnings_today)} WARN oggi nei log")
+
+    if r.severity == OK:
+        r.summary = f"log OK: analizzati {len(LOG_FILES_TO_CHECK)} file, nessun errore critico"
+    else:
+        r.summary = "; ".join(d for d in r.details if d.startswith(("CRIT", "WARN")))[:200]
+    return r
+
+
+# ---------------------------------------------------------------------------
+# AUTO-FIX PASS (pre-checks)
+# ---------------------------------------------------------------------------
+
+def autofix_preflight() -> list[str]:
+    """Soft-mode fixes applicati prima dei check."""
+    fixes: list[str] = []
+    cleaned = fix_pyc_cache()
+    if cleaned:
+        fixes.append(f"rimossi {len(cleaned)} __pycache__ stale: "
+                     f"{', '.join(c.split('aiena-sistema/')[-1] for c in cleaned[:3])}")
+    return fixes
+
+
+# ---------------------------------------------------------------------------
+# REPORT FORMATTING
+# ---------------------------------------------------------------------------
+
+def format_telegram(results: list[CheckResult],
+                    preflight_fixes: list[str],
+                    pipeline_data: dict | None) -> str:
+    crits = [r for r in results if r.severity == CRITICAL]
+    warns = [r for r in results if r.severity == WARNING]
+    oks = [r for r in results if r.severity == OK]
+    now_str = datetime.now().strftime("%Y-%m-%d %H:%M")
+
+    auto_fixed_lines = []
+    for r in results:
+        for f in r.fixed:
+            auto_fixed_lines.append(f"- [{r.name}] {f}")
+    for f in preflight_fixes:
+        auto_fixed_lines.append(f"- [preflight] {f}")
+
+    if crits:
+        lines = [f"AIena - Check CRITICO", f"{now_str}", ""]
+        for r in crits:
+            lines.append(f"- {r.name}: {r.summary}")
+        if warns:
+            lines.append("")
+            lines.append(f"Warning ({len(warns)}):")
+            for r in warns:
+                lines.append(f"- {r.name}: {r.summary}")
+        if auto_fixed_lines:
+            lines.append("")
+            lines.append("Auto-fix applicati:")
+            lines.extend(auto_fixed_lines)
+        lines.append("")
+        lines.append("Azione immediata richiesta prima del cron 09:30.")
+        return "\n".join(lines)
+
+    if warns:
+        lines = [f"AIena - Check mattutino: {len(warns)} warning",
+                 f"{now_str}", ""]
+        for r in warns:
+            lines.append(f"- {r.name}: {r.summary}")
+        if auto_fixed_lines:
+            lines.append("")
+            lines.append("Auto-fix applicati:")
+            lines.extend(auto_fixed_lines)
+        lines.append("")
+        lines.append("Nessuna azione critica richiesta.")
+        return "\n".join(lines)
+
+    # All OK
+    next_pub = ""
+    if pipeline_data:
+        # pipeline.json v2: investigations[0] e' l'indagine corrente
+        investigations = pipeline_data.get("investigations", [])
+        cur = investigations[0] if len(investigations) > 0 else {}
+        if cur.get("pub_date"):
+            try:
+                d = datetime.strptime(cur["pub_date"], "%Y-%m-%d")
+                next_pub = (f"Prossima pub: {d.strftime('%-d %b').lower()} "
+                            f"({cur.get('title','?')[:40]}).")
+            except Exception:
+                pass
+    lines = [f"AIena - Check mattutino OK",
+             f"{now_str} - tutto regolare.",
+             f"{len(oks)} controlli superati."]
+    if next_pub:
+        lines.append(next_pub)
+    if auto_fixed_lines:
+        lines.append("")
+        lines.append("Auto-fix applicati:")
+        lines.extend(auto_fixed_lines)
+    return "\n".join(lines)
+
+
+def send_telegram(text: str) -> tuple[bool, str]:
+    # Due bug in una riga sola, prima: la POST non era firmata (401 dal daemon)
+    # e il payload usava "text" invece di "content" senza "agent_name", che il
+    # broker non accetta. broker_auth costruisce header firmati e payload
+    # corretto, e solleva se l'invio non e' avvenuto davvero.
+    try:
+        broker_auth.send_message(TELEGRAM_CHAT_ID, text, agent="satoshi")
+        return (True, "sent")
+    except Exception as e:
+        msg = f"{type(e).__name__}: {e}"
+        print(f"ERRORE INVIO /broker/send: report NON consegnato — {msg}",
+              file=sys.stderr)
+        return (False, msg)
+
+
+# ---------------------------------------------------------------------------
+# MAIN
+# ---------------------------------------------------------------------------
+
+CHECKS = [
+    ("Publication integrity",   check_publication_integrity),
+    ("Pipeline coherence",      check_pipeline_coherence),
+    ("Homepage coherence",      check_homepage_coherence),
+    ("Supabase consistency",    check_supabase_consistency),
+    ("Publication schedule",    check_publication_schedule),
+    ("FTP sync verification",   check_ftp_sync),
+    ("AIena agent status",      check_aiena_agent),
+    ("Admin panel",             check_admin_panel),
+    ("OTS integrity",           check_ots_integrity),
+    ("Cron jobs audit",         check_cron_jobs),
+    ("Log analysis",            check_log_analysis),
+]
+
+
+def main() -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--test", action="store_true",
+                        help="dry-run: no Telegram, solo console")
+    parser.add_argument("--no-fix", action="store_true",
+                        help="disabilita auto-fix soft-mode")
+    args = parser.parse_args()
+
+    started = time.time()
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    print(f"[AIENA-HEALTH {stamp}] Running {len(CHECKS)} checks...", flush=True)
+
+    preflight_fixes: list[str] = []
+    if not args.no_fix:
+        preflight_fixes = autofix_preflight()
+        for f in preflight_fixes:
+            print(f"[AUTOFIX] {f}", flush=True)
+
+    results: list[CheckResult] = []
+    for i, (name, fn) in enumerate(CHECKS, 1):
+        try:
+            res = fn()
+        except Exception as e:
+            res = CheckResult(name)
+            res.critical(f"check crashed: {e}")
+            res.summary = f"crash: {e}"
+            res.details.append(traceback.format_exc().splitlines()[-1])
+        results.append(res)
+        sev = res.severity
+        marker = "OK" if sev == OK else sev
+        print(f"[CHECK {i:>2}] {name:<26} ... {marker}: {res.summary}", flush=True)
+        for d in res.details:
+            print(f"           {d}", flush=True)
+        for f in res.fixed:
+            print(f"           [AUTOFIX] {f}", flush=True)
+
+    n_ok = sum(1 for r in results if r.severity == OK)
+    n_warn = sum(1 for r in results if r.severity == WARNING)
+    n_crit = sum(1 for r in results if r.severity == CRITICAL)
+    n_fixed = sum(len(r.fixed) for r in results)
+    elapsed = time.time() - started
+    print(f"[SUMMARY] {n_ok} OK, {n_warn} WARNING, {n_crit} CRITICAL, "
+          f"{n_fixed} fixes ({elapsed:.1f}s)", flush=True)
+
+    # POST-AUTOFIX: Deploy files and rebuild admin if needed
+    post_fix_results: list[str] = []
+    if not args.no_fix and not args.test:
+        # Deploy any files queued during autofix
+        if FILES_TO_DEPLOY:
+            print(f"[POST-FIX] Deploying {len(FILES_TO_DEPLOY)} files via FTP...", flush=True)
+            deploy_results = deploy_pending_files()
+            for dr in deploy_results:
+                print(f"           {dr}", flush=True)
+                post_fix_results.append(dr)
+
+        # Rebuild admin data.json after all autofixes
+        if n_fixed > 0:
+            print("[POST-FIX] Rebuilding admin data.json...", flush=True)
+            rebuild_result = rebuild_admin_data()
+            if rebuild_result:
+                print(f"           {rebuild_result}", flush=True)
+                post_fix_results.append(rebuild_result)
+
+    # Telegram (ALWAYS send)
+    try:
+        pdata = load_pipeline()
+    except Exception:
+        pdata = None
+    msg = format_telegram(results, preflight_fixes + post_fix_results, pdata)
+
+    send_failed = False
+    if args.test:
+        print("\n--- TELEGRAM PREVIEW (test mode, NOT sent) ---")
+        print(msg)
+        print("--- end preview ---")
+    else:
+        ok, info = send_telegram(msg)
+        print(f"[TELEGRAM] sent={ok} ({info})", flush=True)
+        send_failed = not ok
+
+    # exit code: 0 if ok/warn, 2 if critical (utile per monitor)
+    # 3 = i check sono girati ma il report non e' stato consegnato: senza
+    # questo, un report perso restava indistinguibile da un run pulito.
+    if send_failed:
+        return 3
+    return 2 if n_crit else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

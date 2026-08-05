@@ -1,0 +1,47 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-07-21T21:50:47.912245
+Files Scanned: 645
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 0
+  WARNING issues:  11
+
+BY CATEGORY:
+  SCHEMA: 0 critical, 1 warning
+
+BY PAGE TYPE:
+  generic: 30 pages, 0 issues
+  guide: 306 pages, 0 issues
+  landing: 1 pages, 0 issues
+  magazine: 222 pages, 0 issues
+  review: 86 pages, 1 issues
+
+SITE-LEVEL ISSUES
+--------------------------------------------------
+  [~] Orphan page: magazine/binance-abandona-europa-julio-2026-alternativas-mica-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/binance-verlasst-europa-juli-2026-mica-alternativen-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/bitcoin-etf-abfluesse-rekord-juni-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/etf-bitcoin-salidas-record-junio-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-corea-nord-bitcoin-missili-miliardi.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-corea-norte-bitcoin-misiles-miles-millones-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-nordkorea-bitcoin-raketen-milliarden-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-north-korea-bitcoin-missiles-billions-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/strike-review-bitcoin-lightning-mica-malta-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/strike-review-bitcoin-lightning-mica-malta-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+
+======================================================================
+END OF REPORT
+======================================================================

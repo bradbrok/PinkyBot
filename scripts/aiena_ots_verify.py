@@ -1,0 +1,317 @@
+#!/usr/bin/env python3
+"""
+AIena OTS verifier — controlla se i timestamp pendenti sono stati confermati
+su Bitcoin e aggiorna il badge nell'articolo HTML.
+Da lanciare ogni heartbeat (~5 min).
+Usa il CLI 'ots' via subprocess (niente libreria Python rotta).
+"""
+import ftplib, json, pathlib, re, subprocess, sys, urllib.request
+from datetime import datetime, timezone
+
+sys.path.insert(0, "/home/pinky/lib")
+import broker_auth  # noqa: E402  (path aggiunto sopra)
+
+from aiena_secrets import _load_secrets
+
+STATE_FILE = pathlib.Path("/home/pinky/.pinkybot/data/aiena_ots_stamps.json")
+OTS_DIR    = pathlib.Path("/home/pinky/.pinkybot/data/aiena_ots/")
+ARTICLES_DIR = pathlib.Path("/var/www/aiena.it/articles")
+
+# OTS CLI path — venv non è nel PATH del cron, quindi usiamo il percorso assoluto
+OTS_BIN = pathlib.Path("/home/pinky/.pinkybot/.venv/bin/ots")
+
+FTP_HOST = "ftp.aiena.it"
+FTP_USER = "aiena.it"
+FTP_PASS = _load_secrets().get("FTP_PASS", "")
+
+def load_state():
+    if STATE_FILE.exists():
+        return json.loads(STATE_FILE.read_text())
+    return {}
+
+
+def save_state(state):
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def try_upgrade_ots(ots_path: pathlib.Path) -> bool:
+    """Run 'ots upgrade' CLI to fetch Bitcoin attestation from calendar servers.
+    Modifies the .ots file in-place. Returns True if upgrade succeeded."""
+    try:
+        result = subprocess.run(
+            [str(OTS_BIN), "upgrade", str(ots_path)],
+            capture_output=True, text=True, timeout=60
+        )
+        print(f"  ots upgrade stdout: {result.stdout.strip()}")
+        if result.stderr.strip():
+            print(f"  ots upgrade stderr: {result.stderr.strip()}")
+        return result.returncode == 0
+    except Exception as e:
+        print(f"  ots upgrade error: {e}")
+        return False
+
+
+def check_bitcoin_confirmed(ots_path: pathlib.Path) -> dict | None:
+    """Run 'ots info' and parse for BitcoinBlockHeaderAttestation(NNNNN).
+    Returns dict with block_height if confirmed, None if still pending."""
+    try:
+        result = subprocess.run(
+            [str(OTS_BIN), "info", str(ots_path)],
+            capture_output=True, text=True, timeout=30
+        )
+        output = result.stdout + result.stderr
+        print(f"  ots info: {output[:200].strip()}")
+        match = re.search(r"BitcoinBlockHeaderAttestation\((\d+)\)", output)
+        if match:
+            return {"block_height": int(match.group(1)), "confirmed": True}
+        return None
+    except Exception as e:
+        print(f"  ots info error: {e}")
+        return None
+
+
+def build_confirmed_bc_box(hash_hex: str, block_height: int, ots_name: str, confirmed_date: str) -> str:
+    """Build a clean confirmed bc-box HTML (no history section, proper indentation)."""
+    return f"""      <!-- BLOCKCHAIN INTEGRITY — OpenTimestamps -->
+      <div class="bc-box" id="bc-box">
+        <div class="bc-header">
+          <div class="bc-header-left">
+            <div class="bc-dot"></div>
+            <span class="bc-title">Integrità — Proof of Existence</span>
+          </div>
+          <div class="bc-chips">
+            <span class="bc-chip">&#x26d3; Blockchain</span>
+            <span class="bc-chip">OpenTimestamps</span>
+          </div>
+          <span class="bc-toggle-arrow">&#x25be;</span>
+        </div>
+        <!-- Hash visualizer: 32 colored blocks, one per byte -->
+        <div class="bc-hashvis" id="bc-hashvis" aria-hidden="true"></div>
+        <div class="bc-body">
+          <div class="bc-field">
+            <span class="bc-label">SHA-256</span>
+            <span class="bc-hashtext">
+              <span id="bc-hashval">{hash_hex}</span>
+              <button class="bc-copy" onclick="navigator.clipboard.writeText('{hash_hex}').then(()=>{{this.textContent='&#x2713;';setTimeout(()=>this.textContent='&#x2398;',1200)}})" title="Copia hash">&#x2398;</button>
+            </span>
+          </div>
+          <div class="bc-field">
+            <span class="bc-label">Blockchain proof</span>
+            <span class="bc-val"><span style="display:inline-block;width:6px;height:6px;border-radius:50%;background:#22c55e;margin-right:.4rem;vertical-align:middle;"></span>Confermato — blocco #{block_height} — <a href="/assets/ots/{ots_name}" download="{ots_name}">Scarica .ots</a> — <a href="https://blockstream.info/block-height/{block_height}" target="_blank" rel="noopener">Vedi sulla blockchain &#x2197;</a></span>
+          </div>
+          <div class="bc-field">
+            <span class="bc-label">Certificato il</span>
+            <span class="bc-val">{confirmed_date[:10]} UTC — sistema AIena</span>
+          </div>
+        </div>
+        <div class="bc-note">
+          <span class="bc-note-text">Hash SHA-256 del testo (senza questo blocco). Verifica in-browser oppure: <code>ots verify {ots_name}</code></span>
+          <div style="display:flex;gap:.5rem;flex-shrink:0;flex-wrap:wrap;">
+            <button class="bc-info-btn" id="bc-verify-btn" onclick="verifyIntegrity()">&#x26a1; verifica ora</button>
+            <button class="bc-info-btn" id="bc-info-btn" onclick="var e=document.getElementById('bc-explain');e.classList.toggle('open');this.textContent=e.classList.contains('open')?'&#x2715; chiudi':'? come funziona'">? come funziona</button>
+          </div>
+        </div>
+        <div id="bc-verify-result" class="bc-verify-result"></div>
+        <div class="bc-explain" id="bc-explain">
+          <span class="bc-explain-title">// in parole semplici</span>
+          <p class="bc-explain-text">
+            Questo articolo ha un'<strong>impronta digitale unica</strong> — il codice sopra. È come un'impronta del pollice: cambia anche solo se viene modificata una virgola del testo.<br><br>
+            Questa impronta è stata <strong>registrata sulla blockchain</strong>, che è un registro pubblico immutabile tenuto da migliaia di computer nel mondo. Nessuno — neanche AIena stessa — può cancellare o alterare questa registrazione.<br><br>
+            Questo significa che <strong>la data di pubblicazione e il contenuto di questo articolo sono certificati</strong>. Se qualcuno in futuro sostenesse che l'articolo è stato modificato dopo la pubblicazione, chiunque può verificarlo.<br><br>
+            <strong>Come verificare subito:</strong> clicca <em>&#x26a1; verifica ora</em> — il tuo browser calcolerà l'impronta del testo direttamente sul tuo dispositivo, senza inviare nulla a nessun server, e la confronterà con quella registrata sulla blockchain.
+          </p>
+        </div>
+      </div>
+      <!-- /BC-BOX -->"""
+
+
+def update_article_badge(article_slug: str, hash_hex: str, block_height: int, confirmed_date: str):
+    """Replace the entire bc-box with a clean confirmed version (fixes layout and removes history bugs)."""
+    html_path = ARTICLES_DIR / f"{article_slug}.html"
+    if not html_path.exists():
+        print(f"  Article not found: {html_path}")
+        return False
+
+    html = html_path.read_text(encoding="utf-8")
+    ots_name = f"aiena-{hash_hex[:8]}.ots"
+
+    # Build the new clean bc-box
+    new_bc_box = build_confirmed_bc_box(hash_hex, block_height, ots_name, confirmed_date)
+
+    # Replace entire bc-box (from comment marker to end marker)
+    if '<!-- BLOCKCHAIN INTEGRITY' in html and '<!-- /BC-BOX -->' in html:
+        start = html.index('<!-- BLOCKCHAIN INTEGRITY')
+        end = html.index('<!-- /BC-BOX -->') + len('<!-- /BC-BOX -->')
+        # Check if bc-box is outside container (layout bug) - need to move it inside
+        # Find the </div> that closes container before bc-box
+        pre_box = html[:start]
+        # The bc-box should be INSIDE the container div, before its closing </div>
+        # Look for pattern: content...</div>\n    </div>\n  </article>
+        # We want bc-box BEFORE the container's </div>
+
+        # Find where to insert: look for the last </div> before </article> that's inside container
+        article_end = html.find('</article>')
+        if article_end > end:
+            # Get the section between bc-box end and </article>
+            post_box = html[end:article_end]
+            # The bc-box should be inside container, which closes with </div>\n  </article>
+            # So we rebuild: content + bc-box + </div>\n</article>
+
+            # Strategy: remove old bc-box, find correct insertion point, insert new bc-box
+            html_no_box = html[:start] + html[end:]
+
+            # Now find insertion point: before the last </div> that precedes </article>
+            # Pattern: ...content...</div>\n  </article>
+            # We want: ...content...\n      [bc-box]\n    </div>\n  </article>
+
+            # Find </article> position in html_no_box
+            art_end_new = html_no_box.find('</article>')
+            # Look backwards for </div>
+            pre_article = html_no_box[:art_end_new]
+            last_div_close = pre_article.rfind('</div>')
+            if last_div_close > 0:
+                # Insert bc-box before this </div>
+                html = pre_article[:last_div_close] + '\n' + new_bc_box + '\n    ' + html_no_box[last_div_close:]
+            else:
+                # Fallback: simple replacement
+                html = html[:start] + new_bc_box + html[end:]
+        else:
+            # Simple replacement
+            html = html[:start] + new_bc_box + html[end:]
+    elif '<!-- BLOCKCHAIN INTEGRITY' in html:
+        # Legacy format without end marker - use regex
+        pattern = r'<!-- BLOCKCHAIN INTEGRITY.*?</div>\s*</div>\s*</div>'
+        html = re.sub(pattern, new_bc_box, html, flags=re.DOTALL)
+    else:
+        print(f"  No bc-box found in {html_path}")
+        return False
+
+    html_path.write_text(html, encoding="utf-8")
+    print(f"  ✓ Badge aggiornato: {html_path}")
+    return True
+
+
+def upload_article(article_slug: str):
+    """Upload updated article to FTP."""
+    html_path = ARTICLES_DIR / f"{article_slug}.html"
+    try:
+        ftp = ftplib.FTP(FTP_HOST)
+        ftp.login(FTP_USER, FTP_PASS)
+        ftp.cwd("articles")
+        with open(html_path, "rb") as f:
+            ftp.storbinary(f"STOR {article_slug}.html", f)
+        ftp.quit()
+        print(f"  ✓ FTP upload: articles/{article_slug}.html")
+        return True
+    except Exception as e:
+        print(f"  FTP error: {e}")
+        return False
+
+
+def tg_notify(text: str):
+    """Notify Mirko on Telegram."""
+    # POST firmata: senza header HMAC il daemon risponde 401 e la notifica
+    # non arriva. broker_auth solleva su secret mancante e su non-2xx.
+    try:
+        broker_auth.send_message("32405655", text, agent="satoshi")
+    except Exception as e:
+        # Non si propaga: tg_notify() gira dopo l'aggiornamento dei badge e
+        # prima di save_state(), e un'eccezione qui perderebbe lo stato dei
+        # timestamp gia' confermati. L'errore va su stderr, che il cron cattura.
+        print(f"  ERRORE INVIO /broker/send: notifica NON consegnata "
+              f"({type(e).__name__}: {e})", file=sys.stderr)
+
+
+def run():
+    state = load_state()
+    if not state:
+        print("No stamps to check.")
+        return
+
+    changed = False
+    newly_confirmed = []  # batch notifications
+
+    for slug, info in state.items():
+        if info.get("status") == "confirmed":
+            print(f"[{slug}] Already confirmed, skip.")
+            continue
+
+        hash_hex = info.get("hash")
+        ots_filename = info.get("ots_file")
+        if not hash_hex or not ots_filename:
+            continue
+
+        ots_path = OTS_DIR / ots_filename
+        if not ots_path.exists():
+            print(f"[{slug}] OTS file missing: {ots_path}")
+            continue
+
+        print(f"[{slug}] Checking OTS status…")
+
+        # Try to upgrade the OTS file (modifies in-place)
+        upgraded = try_upgrade_ots(ots_path)
+        if upgraded:
+            # Re-upload upgraded .ots to FTP
+            try:
+                ftp = ftplib.FTP(FTP_HOST)
+                ftp.login(FTP_USER, FTP_PASS)
+                try:
+                    ftp.mkd("assets/ots")
+                except Exception:
+                    pass
+                with open(ots_path, "rb") as f:
+                    ftp.storbinary(f"STOR assets/ots/{ots_filename}", f)
+                ftp.quit()
+            except Exception as e:
+                print(f"  FTP ots upload error: {e}")
+
+        # Check if confirmed
+        result = check_bitcoin_confirmed(ots_path)
+        if result and result.get("confirmed"):
+            block_height = result["block_height"]
+            confirmed_at = datetime.now(timezone.utc).isoformat()
+            print(f"[{slug}] ✓ CONFERMATO — blocco #{block_height}")
+
+            # Update article HTML
+            updated = update_article_badge(slug, hash_hex, block_height, confirmed_at)
+            if updated:
+                upload_article(slug)
+
+            # Update state
+            state[slug]["status"] = "confirmed"
+            state[slug]["block_height"] = block_height
+            state[slug]["confirmed_at"] = confirmed_at
+            changed = True
+
+            newly_confirmed.append({"slug": slug, "block": block_height, "hash": hash_hex})
+        else:
+            stamped = info.get("stamped_at", "")[:10]
+            print(f"[{slug}] Ancora pendente (da {stamped})")
+
+    # Send ONE batched notification instead of N individual ones
+    if newly_confirmed:
+        if len(newly_confirmed) == 1:
+            c = newly_confirmed[0]
+            tg_notify(
+                f"⛓ *OTS confermato su Bitcoin*\n\n"
+                f"Articolo: {c['slug']}\n"
+                f"Blocco: #{c['block']}\n"
+                f"Hash: `{c['hash'][:16]}…`\n\n"
+                f"Badge aggiornato automaticamente."
+            )
+        else:
+            lines = "\n".join(f"• {c['slug']} (#{c['block']})" for c in newly_confirmed)
+            tg_notify(
+                f"⛓ *OTS — {len(newly_confirmed)} articoli confermati su Bitcoin*\n\n"
+                f"{lines}\n\n"
+                f"Badge aggiornati automaticamente."
+            )
+
+    if changed:
+        save_state(state)
+
+    print("Done.")
+
+
+if __name__ == "__main__":
+    run()

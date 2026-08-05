@@ -1,0 +1,118 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-08-03T07:08:52.427762
+Files Scanned: 658
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 362
+  WARNING issues:  9
+
+BY CATEGORY:
+  LINK: 358 critical, 0 warning
+  SEO: 4 critical, 1 warning
+  SCHEMA: 0 critical, 5 warning
+
+BY PAGE TYPE:
+  generic: 31 pages, 23 issues
+  guide: 310 pages, 192 issues
+  landing: 1 pages, 1 issues
+  magazine: 230 pages, 76 issues
+  review: 86 pages, 76 issues
+
+SITE-LEVEL ISSUES
+--------------------------------------------------
+  [~] Orphan page: magazine/bitcoin-etf-abfluesse-rekord-juni-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/etf-bitcoin-salidas-record-junio-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/youhodler-eu-suspension-mica-2026-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+
+CRITICAL ISSUES
+--------------------------------------------------
+
+  about-de.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  about-en.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  about-es.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  about.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  affiliate-disclosure-de.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  affiliate-disclosure-en.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  affiliate-disclosure-es.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  affiliate-disclosure.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  disclaimer-en.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  disclaimer.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  faq-de.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  faq-en.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  faq-es.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  faq.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  glossario.html (generic)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  guide/best-crypto-apps-2026-en.html (guide)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  guide/best-crypto-exchange-uk-2026-en.html (guide)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  guide/best-crypto-exchange-usa-2026-en.html (guide)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+  guide/best-crypto-loan-platforms-europe-2026-en.html (guide)
+    [!] 1 broken external links
+        https://www.esma.europa.eu/document/casp-register (HTTP 404)
+
+  guide/best-exchange-europe-2026-de.html (guide)
+    [!] 1 broken external links
+        https://promote.mexc.com/r/eu4x3b79Ec (HTTP 405)
+
+======================================================================
+END OF REPORT
+======================================================================

@@ -1,0 +1,370 @@
+#!/usr/bin/env python3
+"""
+AIena Daily Investigation Review Tracker
+
+Scansiona DIARY.md delle indagini, rileva pending actions >24h,
+monitora inattività >7gg, invia report via broker.
+
+Usage:
+  python aiena_investigations_daily_review.py [--dry-run]
+"""
+
+import base64
+import hashlib
+import hmac
+import os
+import re
+import json
+import sys
+import argparse
+import time
+from datetime import datetime, timedelta
+from pathlib import Path
+import urllib.request
+import urllib.error
+import logging
+
+_ENV_FILE = Path("/home/pinky/.pinkybot/.env")
+
+
+def _read_signing_secret() -> str:
+    secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+    if not secret and _ENV_FILE.exists():
+        for line in _ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("PINKY_SESSION_SECRET="):
+                secret = line.partition("=")[2].strip().strip('"').strip("'")
+                break
+    return secret
+
+
+def _build_auth_headers(secret: str, agent_name: str, method: str, path: str) -> dict:
+    if not secret or not agent_name:
+        return {}
+    ts = int(time.time())
+    normalized_path = path.split("?", 1)[0]
+    payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
+    digest = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).digest()
+    signature = base64.urlsafe_b64encode(digest).decode("ascii").rstrip("=")
+    return {
+        "x-pinky-agent": agent_name,
+        "x-pinky-timestamp": str(ts),
+        "x-pinky-signature": signature,
+    }
+
+# Configuration
+AGENTS_DIR = Path("/home/pinky/.pinkybot/data/agents")
+AIENA_INDAGINI_DIR = AGENTS_DIR / "aiena" / "indagini"
+LOGS_DIR = Path("/home/pinky/.pinkybot/data/logs")
+LOGS_FILE = LOGS_DIR / "aiena_investigations.log"
+BROKER_URL = "http://localhost:8888/broker/send"
+
+# Fonte di verita' per status/pub_date. Il DIARY.md contiene annotazioni scritte
+# a mano che invecchiano (es. "(pub 4/8)" rimasto dopo lo slittamento all'11/8):
+# il report le ristampa verbatim, quindi accanto va sempre il dato autorevole.
+PIPELINE_JSON = Path("/home/pinky/aiena-sistema/site/data/pipeline.json")
+PIPELINE_SECTIONS = ("investigations", "leads", "archived", "published")
+
+# Ensure logs directory exists
+LOGS_DIR.mkdir(parents=True, exist_ok=True)
+
+# Setup logging
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s [%(levelname)s] %(message)s",
+    handlers=[
+        logging.FileHandler(LOGS_FILE),
+        logging.StreamHandler(sys.stdout),
+    ],
+)
+logger = logging.getLogger(__name__)
+
+
+def load_pipeline_meta():
+    """
+    Indicizza pipeline.json per slug -> {status, pub_date}.
+
+    Il nome della cartella dell'indagine e' lo slug. Se pipeline.json manca o e'
+    illeggibile si degrada a dict vuoto: il daily review resta utile anche senza
+    il dato autorevole, non deve morire per questo.
+    """
+    try:
+        with open(PIPELINE_JSON, "r", encoding="utf-8") as f:
+            data = json.load(f)
+    except FileNotFoundError:
+        logger.warning(f"pipeline.json non trovato: {PIPELINE_JSON}")
+        return {}
+    except Exception as e:
+        logger.warning(f"pipeline.json illeggibile ({PIPELINE_JSON}): {e}")
+        return {}
+
+    meta = {}
+    for section in PIPELINE_SECTIONS:
+        for item in data.get(section) or []:
+            if not isinstance(item, dict):
+                continue
+            slug = item.get("slug")
+            if not slug or slug in meta:
+                continue
+            meta[slug] = {
+                "status": item.get("status"),
+                "pub_date": item.get("pub_date"),
+                "section": section,
+            }
+    return meta
+
+
+def format_pipeline_status(case_names, meta):
+    """
+    Righe con status/pub_date autorevoli per i casi citati nel report.
+    Gli slug assenti da pipeline.json vengono segnalati esplicitamente invece
+    di essere omessi in silenzio (una cartella senza slug e' un'anomalia).
+    """
+    lines = []
+    for case_name in sorted(case_names):
+        entry = meta.get(case_name)
+        if not entry:
+            lines.append(f"• {case_name}: assente da pipeline.json")
+            continue
+        status = entry.get("status") or "?"
+        pub_date = entry.get("pub_date") or "non assegnata"
+        lines.append(f"• {case_name}: status={status}, pub_date={pub_date}")
+    return lines
+
+
+def extract_date_from_entry(text):
+    """Estrae data da formato [YYYY-MM-DD] o YYYY-MM-DD"""
+    patterns = [
+        r"\[(\d{4}-\d{2}-\d{2})\]",  # [YYYY-MM-DD]
+        r"(\d{4}-\d{2}-\d{2})",       # YYYY-MM-DD
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, text)
+        if match:
+            try:
+                return datetime.strptime(match.group(1), "%Y-%m-%d").date()
+            except ValueError:
+                continue
+    return None
+
+
+def find_section_date(lines, pending_line_idx):
+    """
+    Cerca la data più recente nel file prima della riga pending.
+    Cerca pattern ## YYYY-MM-DD o [YYYY-MM-DD]
+    """
+    for i in range(pending_line_idx - 1, -1, -1):
+        line = lines[i]
+        date = extract_date_from_entry(line)
+        if date:
+            return date
+    return None
+
+
+def parse_diary(diary_path):
+    """
+    Legge DIARY.md e estrae:
+    - pending_actions: list of (action_text, date)
+    - last_modified: mtime del file
+    """
+    pending_actions = []
+
+    try:
+        with open(diary_path, "r", encoding="utf-8") as f:
+            lines = f.readlines()
+
+        for i, line in enumerate(lines):
+            if re.match(r"^\s*-\s+\[\s*\]\s+", line):
+                # Riga pending trovata
+                action_text = line.strip()
+                # Cerchiamo data nella stessa riga
+                date = extract_date_from_entry(action_text)
+
+                # Se non trovata nella riga, cerchiamo nella sezione precedente
+                if not date:
+                    date = find_section_date(lines, i)
+
+                pending_actions.append((action_text, date))
+
+        mtime = os.path.getmtime(diary_path)
+        last_modified = datetime.fromtimestamp(mtime).date()
+
+        return pending_actions, last_modified
+
+    except Exception as e:
+        logger.error(f"Errore parsing {diary_path}: {e}")
+        return [], None
+
+
+def scan_investigations():
+    """
+    Scansiona indagini/ e raccoglie:
+    - pending_actions_old: azioni >24h fa
+    - missing_diary: cartelle senza DIARY.md
+    - inactive_cases: DIARY.md non modificato >7gg
+    """
+    pending_actions_old = []  # (case_name, action_text, date)
+    missing_diary = []
+    inactive_cases = []
+
+    # Crea directory se non esiste
+    AIENA_INDAGINI_DIR.mkdir(parents=True, exist_ok=True)
+
+    if not AIENA_INDAGINI_DIR.exists():
+        logger.info("Directory indagini non esiste")
+        return pending_actions_old, missing_diary, inactive_cases
+
+    today = datetime.now().date()
+    threshold_old = today - timedelta(days=1)
+    threshold_inactive = today - timedelta(days=7)
+
+    for case_dir in sorted(AIENA_INDAGINI_DIR.iterdir()):
+        if not case_dir.is_dir():
+            continue
+
+        case_name = case_dir.name
+        diary_path = case_dir / "DIARY.md"
+
+        if not diary_path.exists():
+            missing_diary.append(case_name)
+            logger.warning(f"DIARY.md mancante: {case_name}")
+        else:
+            # Parse DIARY
+            actions, last_mod = parse_diary(diary_path)
+
+            # Controlla inattività
+            if last_mod and last_mod <= threshold_inactive:
+                days_ago = (today - last_mod).days
+                inactive_cases.append((case_name, last_mod, days_ago))
+                logger.warning(f"Caso inattivo: {case_name} ({days_ago}gg)")
+
+            # Controlla pending actions >24h
+            for action_text, action_date in actions:
+                if action_date and action_date <= threshold_old:
+                    days_old = (today - action_date).days
+                    pending_actions_old.append((case_name, action_text, action_date, days_old))
+                    logger.info(f"Pending action old: {case_name} - {action_text[:50]}... ({days_old}gg)")
+
+    return pending_actions_old, missing_diary, inactive_cases
+
+
+def format_report(pending_actions_old, missing_diary, inactive_cases):
+    """Formatta il report per AIena"""
+    lines = []
+    today = datetime.now().strftime("%Y-%m-%d")
+
+    lines.append(f"📋 DAILY REVIEW INDAGINI — {today}")
+    lines.append("")
+
+    # Pending actions
+    if pending_actions_old:
+        lines.append("⚠️ PENDING ACTIONS (>24h):")
+        for case_name, action_text, action_date, days_old in pending_actions_old:
+            date_str = action_date.strftime("%Y-%m-%d") if action_date else "?"
+            lines.append(f"• {case_name}: {action_text} [{date_str}] ({days_old}gg)")
+        lines.append("")
+
+    # Missing DIARY
+    if missing_diary:
+        lines.append("🔴 DIARY.md MANCANTE:")
+        for case_name in missing_diary:
+            lines.append(f"• indagini/{case_name}/")
+        lines.append("")
+
+    # Inactive cases
+    if inactive_cases:
+        lines.append("💤 CASI INATTIVI (>7gg):")
+        for case_name, last_mod, days_ago in inactive_cases:
+            last_mod_str = last_mod.strftime("%Y-%m-%d")
+            lines.append(f"• {case_name}: ultima modifica {last_mod_str} ({days_ago}gg)")
+        lines.append("")
+
+    # Dato autorevole da pipeline.json. Le righe qui sopra sono copiate
+    # verbatim dal DIARY.md: eventuali date citate li' dentro sono annotazioni
+    # a mano e possono essere stantie. Queste no.
+    case_names = {c for c, _, _, _ in pending_actions_old}
+    case_names.update(missing_diary)
+    case_names.update(c for c, _, _ in inactive_cases)
+
+    if case_names:
+        pipeline_lines = format_pipeline_status(case_names, load_pipeline_meta())
+        if pipeline_lines:
+            lines.append("📅 PIPELINE (dato autorevole — le date citate sopra sono note a mano):")
+            lines.extend(pipeline_lines)
+            lines.append("")
+
+    # Summary
+    pending_count = len(pending_actions_old)
+    alert_count = len(missing_diary) + len(inactive_cases)
+    inactive_count = len(inactive_cases)
+    lines.append(f"{pending_count} pending, {alert_count} alert, {inactive_count} inattivi")
+
+    return "\n".join(lines)
+
+
+def send_to_broker(report_text):
+    """Invia report ad AIena via endpoint inter-agente"""
+    payload = {
+        "from_agent": "satoshi",
+        "message": report_text,
+    }
+
+    path = "/agents/aiena/message"
+    secret = _read_signing_secret()
+    auth_headers = _build_auth_headers(secret, "satoshi", "POST", path)
+
+    try:
+        req = urllib.request.Request(
+            f"http://localhost:8888{path}",
+            data=json.dumps(payload).encode(),
+            headers={"Content-Type": "application/json", **auth_headers},
+        )
+        with urllib.request.urlopen(req, timeout=10) as response:
+            logger.info(f"Report inviato ad AIena: {response.status}")
+            return True
+    except urllib.error.URLError as e:
+        logger.error(f"Errore connessione agent endpoint: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Errore invio report: {e}")
+        return False
+
+
+def main():
+    parser = argparse.ArgumentParser(description="Daily investigation review tracker")
+    parser.add_argument("--dry-run", action="store_true", help="Stampa report su stdout senza inviare")
+    args = parser.parse_args()
+
+    logger.info("=== Avvio Daily Review Indagini ===")
+
+    # Scansiona
+    pending_actions_old, missing_diary, inactive_cases = scan_investigations()
+
+    # Se niente da segnalare, silenzioso
+    if not pending_actions_old and not missing_diary and not inactive_cases:
+        logger.info("Nessun pending action, alert o inattività rilevata. Silenzioso.")
+        return 0
+
+    # Formatta report
+    report = format_report(pending_actions_old, missing_diary, inactive_cases)
+
+    if args.dry_run:
+        print("\n" + "="*60)
+        print("DRY-RUN: Report da inviare ad AIena:")
+        print("="*60)
+        print(report)
+        print("="*60 + "\n")
+        logger.info("Dry-run completato")
+        return 0
+
+    # Invia
+    if send_to_broker(report):
+        logger.info("Daily review completata con successo")
+        return 0
+    else:
+        logger.error("Errore invio report")
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(main())

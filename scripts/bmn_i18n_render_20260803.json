@@ -1,0 +1,2428 @@
+[
+  {
+    "page": "affiliate-disclosure.html",
+    "line": 106,
+    "key": "affil.content",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1538,
+    "html_dates": [
+      "marzo 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 3535,
+    "i18n_chars": 2719,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1538,
+        "i18n_chars": 2719,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2746,
+    "orig_chars": 3536,
+    "loss_pct": 22.3
+  },
+  {
+    "page": "disclaimer.html",
+    "line": 103,
+    "key": "disclaimer.content",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.0382,
+    "html_dates": [
+      "marzo 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 4974,
+    "i18n_chars": 3463,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.0382,
+        "i18n_chars": 3463,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 3485,
+    "orig_chars": 4974,
+    "loss_pct": 29.9
+  },
+  {
+    "page": "faq.html",
+    "line": 137,
+    "key": "faq.accordion.iniziare",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.2028,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 2367,
+    "i18n_chars": 1864,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.2028,
+        "i18n_chars": 1864,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 215,
+    "orig_chars": 2367,
+    "loss_pct": 90.9
+  },
+  {
+    "page": "faq.html",
+    "line": 201,
+    "key": "faq.accordion.sicurezza",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1727,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 2731,
+    "i18n_chars": 1738,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1727,
+        "i18n_chars": 1738,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 230,
+    "orig_chars": 2731,
+    "loss_pct": 91.6
+  },
+  {
+    "page": "faq.html",
+    "line": 283,
+    "key": "faq.accordion.tasse",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1187,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 2145,
+    "i18n_chars": 1411,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1187,
+        "i18n_chars": 1411,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 185,
+    "orig_chars": 2145,
+    "loss_pct": 91.4
+  },
+  {
+    "page": "faq.html",
+    "line": 346,
+    "key": "faq.accordion.tecnico",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1592,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 2213,
+    "i18n_chars": 1757,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1592,
+        "i18n_chars": 1757,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 128,
+    "orig_chars": 2213,
+    "loss_pct": 94.2
+  },
+  {
+    "page": "faq.html",
+    "line": 405,
+    "key": "faq.accordion.trading",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.2681,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 2487,
+    "i18n_chars": 2049,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.2681,
+        "i18n_chars": 2049,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 165,
+    "orig_chars": 2487,
+    "loss_pct": 93.4
+  },
+  {
+    "page": "faq.html",
+    "line": 463,
+    "key": "faq.accordion.sito",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1153,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 977,
+    "i18n_chars": 931,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1153,
+        "i18n_chars": 931,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 109,
+    "orig_chars": 977,
+    "loss_pct": 88.8
+  },
+  {
+    "page": "glossario.html",
+    "line": 122,
+    "key": "glossario.terms",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1878,
+    "html_dates": [
+      "aprile 2024"
+    ],
+    "i18n_dates": [
+      "april 2024"
+    ],
+    "html_chars": 16745,
+    "i18n_chars": 11783,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1878,
+        "i18n_chars": 11783,
+        "i18n_dates": [
+          "april 2024"
+        ]
+      }
+    },
+    "rendered_chars": 11934,
+    "orig_chars": 16771,
+    "loss_pct": 28.8
+  },
+  {
+    "page": "guide/best-exchange-europe-2026-en.html",
+    "line": 283,
+    "key": "guide.best-exchange-europe.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1225,
+    "html_dates": [
+      "july 2026",
+      "june 2026"
+    ],
+    "i18n_dates": [
+      "july 2026"
+    ],
+    "html_chars": 9897,
+    "i18n_chars": 646,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1225,
+        "i18n_chars": 646,
+        "i18n_dates": [
+          "july 2026"
+        ]
+      }
+    },
+    "rendered_chars": 646,
+    "orig_chars": 9936,
+    "loss_pct": 93.5
+  },
+  {
+    "page": "guide/binance-bonus-2026.html",
+    "line": 185,
+    "key": "guide.binanceBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9374,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 3055,
+    "i18n_chars": 2697,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9374,
+        "i18n_chars": 2697,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2725,
+    "orig_chars": 3060,
+    "loss_pct": 10.9
+  },
+  {
+    "page": "guide/binance-commissioni.html",
+    "line": 186,
+    "key": "guide.binanceCommissioni.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9285,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 3404,
+    "i18n_chars": 2950,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9285,
+        "i18n_chars": 2950,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2978,
+    "orig_chars": 3414,
+    "loss_pct": 12.8
+  },
+  {
+    "page": "guide/binance-vs-coinbase.html",
+    "line": 251,
+    "key": "guide.binanceVsCoinbase.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0336,
+    "html_dates": [
+      "giugno 2026",
+      "luglio 2026",
+      "maggio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 17210,
+    "i18n_chars": 2137,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0336,
+        "i18n_chars": 2137,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2148,
+    "orig_chars": 17228,
+    "loss_pct": 87.5
+  },
+  {
+    "page": "guide/bitcoin-halving.html",
+    "line": 146,
+    "key": "guide.halving.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8126,
+    "html_dates": [
+      "aprile 2024",
+      "dicembre 2013",
+      "dicembre 2017",
+      "dicembre 2018",
+      "dicembre 2022",
+      "dicembre 2024",
+      "gennaio 2024",
+      "luglio 2016",
+      "maggio 2020",
+      "maggio 2026",
+      "maggio 2028",
+      "novembre 2012",
+      "novembre 2013",
+      "novembre 2021",
+      "novembre 2024",
+      "settembre 2024"
+    ],
+    "i18n_dates": [
+      "aprile 2024",
+      "dicembre 2013",
+      "dicembre 2017",
+      "dicembre 2018",
+      "dicembre 2022",
+      "gennaio 2024",
+      "luglio 2016",
+      "maggio 2020",
+      "maggio 2028",
+      "marzo 2026",
+      "novembre 2012",
+      "novembre 2013",
+      "novembre 2021"
+    ],
+    "html_chars": 24399,
+    "i18n_chars": 17204,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8126,
+        "i18n_chars": 17204,
+        "i18n_dates": [
+          "aprile 2024",
+          "dicembre 2013",
+          "dicembre 2017",
+          "dicembre 2018",
+          "dicembre 2022",
+          "gennaio 2024",
+          "luglio 2016",
+          "maggio 2020",
+          "maggio 2028",
+          "marzo 2026",
+          "novembre 2012",
+          "novembre 2013",
+          "novembre 2021"
+        ]
+      }
+    },
+    "rendered_chars": 17264,
+    "orig_chars": 24412,
+    "loss_pct": 29.3
+  },
+  {
+    "page": "guide/bitget-bonus-2026.html",
+    "line": 108,
+    "key": "guide.bitgetBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0627,
+    "html_dates": [
+      "aprile 2026",
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 7044,
+    "i18n_chars": 228,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0627,
+        "i18n_chars": 228,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 228,
+    "orig_chars": 7047,
+    "loss_pct": 96.8
+  },
+  {
+    "page": "guide/bitget-commissioni.html",
+    "line": 108,
+    "key": "guide.bitgetCommissioni.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0764,
+    "html_dates": [
+      "aprile 2026",
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 6196,
+    "i18n_chars": 246,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0764,
+        "i18n_chars": 246,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 246,
+    "orig_chars": 6198,
+    "loss_pct": 96.0
+  },
+  {
+    "page": "guide/bybit-bonus-2026.html",
+    "line": 186,
+    "key": "guide.bybitBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9428,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 2891,
+    "i18n_chars": 2578,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9428,
+        "i18n_chars": 2578,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2606,
+    "orig_chars": 2896,
+    "loss_pct": 10.0
+  },
+  {
+    "page": "guide/bybit-commissioni.html",
+    "line": 196,
+    "key": "guide.bybitCommissioni.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9552,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 3464,
+    "i18n_chars": 3167,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9552,
+        "i18n_chars": 3167,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 3200,
+    "orig_chars": 3471,
+    "loss_pct": 7.8
+  },
+  {
+    "page": "guide/bybit-vs-binance-de.html",
+    "line": 111,
+    "key": "guide.bybitVsBinance.article",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.181,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "april 2026"
+    ],
+    "html_chars": 4710,
+    "i18n_chars": 1689,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.181,
+        "i18n_chars": 1689,
+        "i18n_dates": [
+          "april 2026"
+        ]
+      }
+    },
+    "rendered_chars": 1707,
+    "orig_chars": 4711,
+    "loss_pct": 63.8
+  },
+  {
+    "page": "guide/bybit-vs-binance-en.html",
+    "line": 110,
+    "key": "guide.bybitVsBinance.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.3196,
+    "html_dates": [
+      "july 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 4353,
+    "i18n_chars": 2424,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.3196,
+        "i18n_chars": 2424,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2452,
+    "orig_chars": 4354,
+    "loss_pct": 43.7
+  },
+  {
+    "page": "guide/bybit-vs-binance-es.html",
+    "line": 111,
+    "key": "guide.bybitVsBinance.article",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.1868,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 4502,
+    "i18n_chars": 1622,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.1868,
+        "i18n_chars": 1622,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 1640,
+    "orig_chars": 4503,
+    "loss_pct": 63.6
+  },
+  {
+    "page": "guide/bybit-vs-binance.html",
+    "line": 224,
+    "key": "guide.bybitVsBinance.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0305,
+    "html_dates": [
+      "aprile 2026",
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 12742,
+    "i18n_chars": 2400,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0305,
+        "i18n_chars": 2400,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 2426,
+    "orig_chars": 12744,
+    "loss_pct": 81.0
+  },
+  {
+    "page": "guide/coinbase-bonus-2026.html",
+    "line": 185,
+    "key": "guide.coinbaseBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.6275,
+    "html_dates": [
+      "13/7/2026",
+      "luglio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 3794,
+    "i18n_chars": 2440,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.6275,
+        "i18n_chars": 2440,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2469,
+    "orig_chars": 3833,
+    "loss_pct": 35.6
+  },
+  {
+    "page": "guide/coinbase-commissioni.html",
+    "line": 197,
+    "key": "guide.coinbaseCommissioni.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8428,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 3529,
+    "i18n_chars": 3047,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8428,
+        "i18n_chars": 3047,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 3076,
+    "orig_chars": 3536,
+    "loss_pct": 13.0
+  },
+  {
+    "page": "guide/come-comprare-bitcoin.html",
+    "line": 247,
+    "key": "guide.comprare.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0302,
+    "html_dates": [
+      "dicembre 2022",
+      "luglio 2023",
+      "maggio 2026",
+      "novembre 2022"
+    ],
+    "i18n_dates": [],
+    "html_chars": 21536,
+    "i18n_chars": 1075,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0302,
+        "i18n_chars": 1075,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 1092,
+    "orig_chars": 21540,
+    "loss_pct": 94.9
+  },
+  {
+    "page": "guide/comprare-bitcoin-senza-commissioni.html",
+    "line": 195,
+    "key": "guide.senzaCommissioni.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.053,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 14004,
+    "i18n_chars": 3470,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.053,
+        "i18n_chars": 3470,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 3486,
+    "orig_chars": 14009,
+    "loss_pct": 75.1
+  },
+  {
+    "page": "guide/cose-bitcoin.html",
+    "line": 142,
+    "key": "guide.cose-bitcoin.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.1067,
+    "html_dates": [
+      "gennaio 2009",
+      "marzo 2026",
+      "ottobre 2008"
+    ],
+    "i18n_dates": [
+      "gennaio 2009",
+      "ottobre 2008"
+    ],
+    "html_chars": 9403,
+    "i18n_chars": 2251,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.1067,
+        "i18n_chars": 2251,
+        "i18n_dates": [
+          "gennaio 2009",
+          "ottobre 2008"
+        ]
+      }
+    },
+    "rendered_chars": 2262,
+    "orig_chars": 9403,
+    "loss_pct": 75.9
+  },
+  {
+    "page": "guide/crypto-tax-return-2026-de.html",
+    "line": 198,
+    "key": "guide.taxReturn.article",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.9606,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 10889,
+    "i18n_chars": 10063,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.9606,
+        "i18n_chars": 10063,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 10092,
+    "orig_chars": 10902,
+    "loss_pct": 7.4
+  },
+  {
+    "page": "guide/crypto-tax-return-2026-es.html",
+    "line": 196,
+    "key": "guide.taxReturn.article",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.9828,
+    "html_dates": [
+      "31/12/2025"
+    ],
+    "i18n_dates": [
+      "31/12/2025"
+    ],
+    "html_chars": 8737,
+    "i18n_chars": 8461,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.9828,
+        "i18n_chars": 8461,
+        "i18n_dates": [
+          "31/12/2025"
+        ]
+      }
+    },
+    "rendered_chars": 8490,
+    "orig_chars": 8741,
+    "loss_pct": 2.9
+  },
+  {
+    "page": "guide/dca-strategie.html",
+    "line": 158,
+    "key": "guide.dca.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0741,
+    "html_dates": [
+      "aprile 2026",
+      "aprile 2028",
+      "gennaio 2023",
+      "novembre 2021"
+    ],
+    "i18n_dates": [
+      "dicembre 2023",
+      "gennaio 2019"
+    ],
+    "html_chars": 11497,
+    "i18n_chars": 1128,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0741,
+        "i18n_chars": 1128,
+        "i18n_dates": [
+          "dicembre 2023",
+          "gennaio 2019"
+        ]
+      }
+    },
+    "rendered_chars": 1131,
+    "orig_chars": 11508,
+    "loss_pct": 90.2
+  },
+  {
+    "page": "guide/errori-da-evitare.html",
+    "line": 143,
+    "key": "guide.errori.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.1228,
+    "html_dates": [
+      "marzo 2026",
+      "novembre 2022"
+    ],
+    "i18n_dates": [],
+    "html_chars": 11597,
+    "i18n_chars": 1730,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.1228,
+        "i18n_chars": 1730,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 1752,
+    "orig_chars": 11598,
+    "loss_pct": 84.9
+  },
+  {
+    "page": "guide/exchange-principianti.html",
+    "line": 339,
+    "key": "guide.exchangePrincipianti.readAlso",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.7336,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 164,
+    "i18n_chars": 95,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.7336,
+        "i18n_chars": 95,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 95,
+    "orig_chars": 164,
+    "loss_pct": 42.1
+  },
+  {
+    "page": "guide/hardware-wallet.html",
+    "line": 160,
+    "key": "guide.hardwareWallet.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9472,
+    "html_dates": [
+      "maggio 2026"
+    ],
+    "i18n_dates": [
+      "marzo 2026"
+    ],
+    "html_chars": 20743,
+    "i18n_chars": 18889,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9472,
+        "i18n_chars": 18889,
+        "i18n_dates": [
+          "marzo 2026"
+        ]
+      }
+    },
+    "rendered_chars": 18972,
+    "orig_chars": 20761,
+    "loss_pct": 8.6
+  },
+  {
+    "page": "guide/index.html",
+    "line": 152,
+    "key": "guide.index.riskWarning",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.0547,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 227,
+    "i18n_chars": 212,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.0547,
+        "i18n_chars": 212,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 212,
+    "orig_chars": 227,
+    "loss_pct": 6.6
+  },
+  {
+    "page": "guide/kraken-bonus-2026.html",
+    "line": 184,
+    "key": "guide.krakenBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.6958,
+    "html_dates": [
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 3692,
+    "i18n_chars": 2413,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.6958,
+        "i18n_chars": 2413,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2440,
+    "orig_chars": 3712,
+    "loss_pct": 34.3
+  },
+  {
+    "page": "guide/kraken-commissioni.html",
+    "line": 195,
+    "key": "guide.krakenCommissioni.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9483,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 3033,
+    "i18n_chars": 2735,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9483,
+        "i18n_chars": 2735,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2764,
+    "orig_chars": 3043,
+    "loss_pct": 9.2
+  },
+  {
+    "page": "guide/kraken-vs-coinbase-2026.html",
+    "line": 207,
+    "key": "guide.krakenVsCoinbase2026.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9841,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 8556,
+    "i18n_chars": 8288,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9841,
+        "i18n_chars": 8288,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 8350,
+    "orig_chars": 8561,
+    "loss_pct": 2.5
+  },
+  {
+    "page": "guide/kucoin-bonus-2026.html",
+    "line": 190,
+    "key": "guide.kucoinBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9389,
+    "html_dates": [
+      "luglio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 2778,
+    "i18n_chars": 2458,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9389,
+        "i18n_chars": 2458,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2489,
+    "orig_chars": 2783,
+    "loss_pct": 10.6
+  },
+  {
+    "page": "guide/lightning-network.html",
+    "line": 146,
+    "key": "guide.lightning.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.6957,
+    "html_dates": [
+      "marzo 2018",
+      "marzo 2026"
+    ],
+    "i18n_dates": [
+      "marzo 2018"
+    ],
+    "html_chars": 19075,
+    "i18n_chars": 10175,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.6957,
+        "i18n_chars": 10175,
+        "i18n_dates": [
+          "marzo 2018"
+        ]
+      }
+    },
+    "rendered_chars": 10208,
+    "orig_chars": 10250,
+    "loss_pct": 0.4
+  },
+  {
+    "page": "guide/mejores-exchanges-espana-2026.html",
+    "line": 175,
+    "key": "guide.mejores-exchanges-espana.article",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.1449,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 9298,
+    "i18n_chars": 726,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.1449,
+        "i18n_chars": 726,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 725,
+    "orig_chars": 9302,
+    "loss_pct": 92.2
+  },
+  {
+    "page": "guide/mexc-bonus-2026.html",
+    "line": 185,
+    "key": "guide.mexcBonus.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9454,
+    "html_dates": [
+      "luglio 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 2955,
+    "i18n_chars": 2649,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9454,
+        "i18n_chars": 2649,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 2680,
+    "orig_chars": 2960,
+    "loss_pct": 9.5
+  },
+  {
+    "page": "guide/migliore-exchange-2026.html",
+    "line": 304,
+    "key": "ctaExchangeDesc",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.4891,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 96,
+    "i18n_chars": 133,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.4891,
+        "i18n_chars": 133,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 133,
+    "orig_chars": 96,
+    "loss_pct": -38.5
+  },
+  {
+    "page": "guide/migliore-exchange-2026.html",
+    "line": 310,
+    "key": "guide.migliore.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0387,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 12576,
+    "i18n_chars": 8980,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0387,
+        "i18n_chars": 8980,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 9035,
+    "orig_chars": 12630,
+    "loss_pct": 28.5
+  },
+  {
+    "page": "guide/migliore-exchange-principianti-2026.html",
+    "line": 202,
+    "key": "guide.miglioreExchangePrincipianti2026.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.979,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 6589,
+    "i18n_chars": 6318,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.979,
+        "i18n_chars": 6318,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 6412,
+    "orig_chars": 6610,
+    "loss_pct": 3.0
+  },
+  {
+    "page": "guide/sicurezza-wallet.html",
+    "line": 143,
+    "key": "guide.sicurezza.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0848,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 7866,
+    "i18n_chars": 1287,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0848,
+        "i18n_chars": 1287,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 1296,
+    "orig_chars": 7869,
+    "loss_pct": 83.5
+  },
+  {
+    "page": "guide/trading-principianti.html",
+    "line": 143,
+    "key": "guide.trading.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.0631,
+    "html_dates": [
+      "marzo 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 12320,
+    "i18n_chars": 1278,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.0631,
+        "i18n_chars": 1278,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 1286,
+    "orig_chars": 12328,
+    "loss_pct": 89.6
+  },
+  {
+    "page": "index.html",
+    "line": 1148,
+    "key": "faq1A",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.4857,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 141,
+    "i18n_chars": 139,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.4857,
+        "i18n_chars": 139,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 139,
+    "orig_chars": 141,
+    "loss_pct": 1.4
+  },
+  {
+    "page": "index.html",
+    "line": 1158,
+    "key": "faq2A",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.2639,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 141,
+    "i18n_chars": 147,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.2639,
+        "i18n_chars": 147,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 147,
+    "orig_chars": 141,
+    "loss_pct": -4.3
+  },
+  {
+    "page": "index.html",
+    "line": 1168,
+    "key": "faq3A",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1233,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 114,
+    "i18n_chars": 113,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1233,
+        "i18n_chars": 113,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 113,
+    "orig_chars": 114,
+    "loss_pct": 0.9
+  },
+  {
+    "page": "index.html",
+    "line": 1178,
+    "key": "faq4A",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.2263,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 146,
+    "i18n_chars": 128,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.2263,
+        "i18n_chars": 128,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 128,
+    "orig_chars": 146,
+    "loss_pct": 12.3
+  },
+  {
+    "page": "magazine/bitcoin-2026-las-vegas.html",
+    "line": 338,
+    "key": "magazine.lasvegas.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1799,
+    "html_dates": [
+      "aprile 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 4602,
+    "i18n_chars": 3682,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1799,
+        "i18n_chars": 3682,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 3696,
+    "orig_chars": 4604,
+    "loss_pct": 19.7
+  },
+  {
+    "page": "magazine/comprare-bitcoin-senza-kyc.html",
+    "line": 383,
+    "key": "magazine.nokyc.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8943,
+    "html_dates": [
+      "dicembre 2024",
+      "luglio 2026"
+    ],
+    "i18n_dates": [
+      "luglio 2026"
+    ],
+    "html_chars": 15666,
+    "i18n_chars": 13779,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8943,
+        "i18n_chars": 13779,
+        "i18n_dates": [
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 12373,
+    "orig_chars": 15666,
+    "loss_pct": 21.0
+  },
+  {
+    "page": "magazine/etp-bitcoin-italia.html",
+    "line": 338,
+    "key": "magazine.etp.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9752,
+    "html_dates": [
+      "febbraio 2026",
+      "gennaio 2024"
+    ],
+    "i18n_dates": [
+      "febbraio 2026",
+      "gennaio 2024"
+    ],
+    "html_chars": 9432,
+    "i18n_chars": 9009,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9752,
+        "i18n_chars": 9009,
+        "i18n_dates": [
+          "febbraio 2026",
+          "gennaio 2024"
+        ]
+      }
+    },
+    "rendered_chars": 9043,
+    "orig_chars": 9433,
+    "loss_pct": 4.1
+  },
+  {
+    "page": "magazine/kraken-bitnomial-acquisition-2026.html",
+    "line": 149,
+    "key": "magazine.kraken.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.9729,
+    "html_dates": [
+      "april 2026",
+      "february 2026",
+      "june 2026",
+      "march 2025",
+      "november 2024",
+      "november 2025",
+      "september 2026"
+    ],
+    "i18n_dates": [
+      "april 2026",
+      "february 2026",
+      "june 2026",
+      "march 2025",
+      "november 2024",
+      "november 2025",
+      "september 2026"
+    ],
+    "html_chars": 6150,
+    "i18n_chars": 5825,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.9729,
+        "i18n_chars": 5825,
+        "i18n_dates": [
+          "april 2026",
+          "february 2026",
+          "june 2026",
+          "march 2025",
+          "november 2024",
+          "november 2025",
+          "september 2026"
+        ]
+      }
+    },
+    "rendered_chars": 5866,
+    "orig_chars": 6175,
+    "loss_pct": 5.0
+  },
+  {
+    "page": "magazine/morgan-stanley-bitcoin-etf-msbt.html",
+    "line": 301,
+    "key": "magazine.msbt.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1947,
+    "html_dates": [
+      "aprile 2026",
+      "ottobre 2025"
+    ],
+    "i18n_dates": [
+      "october 2025"
+    ],
+    "html_chars": 5085,
+    "i18n_chars": 3646,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1947,
+        "i18n_chars": 3646,
+        "i18n_dates": [
+          "october 2025"
+        ]
+      }
+    },
+    "rendered_chars": 3659,
+    "orig_chars": 5091,
+    "loss_pct": 28.1
+  },
+  {
+    "page": "privacy.html",
+    "line": 103,
+    "key": "privacy.content",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.1476,
+    "html_dates": [
+      "aprile 2026",
+      "marzo 2026"
+    ],
+    "i18n_dates": [],
+    "html_chars": 5426,
+    "i18n_chars": 3570,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.1476,
+        "i18n_chars": 3570,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 3594,
+    "orig_chars": 5426,
+    "loss_pct": 33.8
+  },
+  {
+    "page": "reviews/binance.html",
+    "line": 210,
+    "key": "review.binance.heroMeta",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9862,
+    "html_dates": [
+      "giugno 2026"
+    ],
+    "i18n_dates": [
+      "marzo 2026"
+    ],
+    "html_chars": 438,
+    "i18n_chars": 434,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9862,
+        "i18n_chars": 434,
+        "i18n_dates": [
+          "marzo 2026"
+        ]
+      }
+    },
+    "rendered_chars": 436,
+    "orig_chars": 439,
+    "loss_pct": 0.7
+  },
+  {
+    "page": "reviews/binance.html",
+    "line": 218,
+    "key": "review.binance.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8291,
+    "html_dates": [
+      "19/6/2026",
+      "aprile 2026",
+      "dicembre 2025",
+      "gennaio 2026",
+      "giugno 2026",
+      "luglio 2026",
+      "maggio 2026",
+      "marzo 2025"
+    ],
+    "i18n_dates": [],
+    "html_chars": 17663,
+    "i18n_chars": 13243,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8291,
+        "i18n_chars": 13243,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 11771,
+    "orig_chars": 17698,
+    "loss_pct": 33.5
+  },
+  {
+    "page": "reviews/bitget-de.html",
+    "line": 209,
+    "key": "review.bitget.heroMeta",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.2114,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 453,
+    "i18n_chars": 408,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.2114,
+        "i18n_chars": 408,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 409,
+    "orig_chars": 453,
+    "loss_pct": 9.7
+  },
+  {
+    "page": "reviews/bitget-de.html",
+    "line": 217,
+    "key": "review.bitget.article",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.3133,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026",
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 12579,
+    "i18n_chars": 10717,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.3133,
+        "i18n_chars": 10717,
+        "i18n_dates": [
+          "aprile 2026",
+          "giugno 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 9324,
+    "orig_chars": 12611,
+    "loss_pct": 26.1
+  },
+  {
+    "page": "reviews/bitget-en.html",
+    "line": 209,
+    "key": "review.bitget.heroMeta",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.3096,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 419,
+    "i18n_chars": 408,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.3096,
+        "i18n_chars": 408,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 409,
+    "orig_chars": 419,
+    "loss_pct": 2.4
+  },
+  {
+    "page": "reviews/bitget-en.html",
+    "line": 217,
+    "key": "review.bitget.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.3769,
+    "html_dates": [
+      "july 2026",
+      "march 2025"
+    ],
+    "i18n_dates": [
+      "april 2026",
+      "aprile 2026"
+    ],
+    "html_chars": 11293,
+    "i18n_chars": 10254,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.3769,
+        "i18n_chars": 10254,
+        "i18n_dates": [
+          "april 2026",
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 8957,
+    "orig_chars": 11329,
+    "loss_pct": 20.9
+  },
+  {
+    "page": "reviews/bitget-es.html",
+    "line": 209,
+    "key": "review.bitget.heroMeta",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.4386,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 431,
+    "i18n_chars": 408,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.4386,
+        "i18n_chars": 408,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 409,
+    "orig_chars": 431,
+    "loss_pct": 5.1
+  },
+  {
+    "page": "reviews/bitget-es.html",
+    "line": 217,
+    "key": "review.bitget.article",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.3907,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026",
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 12526,
+    "i18n_chars": 10717,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.3907,
+        "i18n_chars": 10717,
+        "i18n_dates": [
+          "aprile 2026",
+          "giugno 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 9324,
+    "orig_chars": 12554,
+    "loss_pct": 25.7
+  },
+  {
+    "page": "reviews/bitget.html",
+    "line": 210,
+    "key": "review.bitget.heroMeta",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9853,
+    "html_dates": [
+      "luglio 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 408,
+    "i18n_chars": 408,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9853,
+        "i18n_chars": 408,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 409,
+    "orig_chars": 408,
+    "loss_pct": -0.2
+  },
+  {
+    "page": "reviews/bitget.html",
+    "line": 218,
+    "key": "review.bitget.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8461,
+    "html_dates": [
+      "luglio 2026",
+      "marzo 2025"
+    ],
+    "i18n_dates": [
+      "aprile 2026",
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 12216,
+    "i18n_chars": 10717,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8461,
+        "i18n_chars": 10717,
+        "i18n_dates": [
+          "aprile 2026",
+          "giugno 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 9324,
+    "orig_chars": 12244,
+    "loss_pct": 23.8
+  },
+  {
+    "page": "reviews/bitunix-de.html",
+    "line": 208,
+    "key": "review.bitunix.heroMeta",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.0945,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 443,
+    "i18n_chars": 404,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.0945,
+        "i18n_chars": 404,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 405,
+    "orig_chars": 443,
+    "loss_pct": 8.6
+  },
+  {
+    "page": "reviews/bitunix-de.html",
+    "line": 216,
+    "key": "review.bitunix.article",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.1372,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 10422,
+    "i18n_chars": 9377,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.1372,
+        "i18n_chars": 9377,
+        "i18n_dates": [
+          "aprile 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 8357,
+    "orig_chars": 10427,
+    "loss_pct": 19.9
+  },
+  {
+    "page": "reviews/bitunix-en.html",
+    "line": 208,
+    "key": "review.bitunix.heroMeta",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.3395,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 409,
+    "i18n_chars": 404,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.3395,
+        "i18n_chars": 404,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 405,
+    "orig_chars": 409,
+    "loss_pct": 1.0
+  },
+  {
+    "page": "reviews/bitunix-en.html",
+    "line": 216,
+    "key": "review.bitunix.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.2111,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "aprile 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 9454,
+    "i18n_chars": 9377,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.2111,
+        "i18n_chars": 9377,
+        "i18n_dates": [
+          "aprile 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 8357,
+    "orig_chars": 9459,
+    "loss_pct": 11.7
+  },
+  {
+    "page": "reviews/bitunix-es.html",
+    "line": 208,
+    "key": "review.bitunix.heroMeta",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.2732,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026"
+    ],
+    "html_chars": 438,
+    "i18n_chars": 404,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.2732,
+        "i18n_chars": 404,
+        "i18n_dates": [
+          "aprile 2026"
+        ]
+      }
+    },
+    "rendered_chars": 405,
+    "orig_chars": 438,
+    "loss_pct": 7.5
+  },
+  {
+    "page": "reviews/bitunix-es.html",
+    "line": 216,
+    "key": "review.bitunix.article",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.2469,
+    "html_dates": [],
+    "i18n_dates": [
+      "aprile 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 10793,
+    "i18n_chars": 9377,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.2469,
+        "i18n_chars": 9377,
+        "i18n_dates": [
+          "aprile 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 8357,
+    "orig_chars": 10794,
+    "loss_pct": 22.6
+  },
+  {
+    "page": "reviews/bitunix.html",
+    "line": 217,
+    "key": "review.bitunix.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8482,
+    "html_dates": [
+      "aprile 2026",
+      "luglio 2026",
+      "marzo 2025"
+    ],
+    "i18n_dates": [
+      "aprile 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 9812,
+    "i18n_chars": 9377,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8482,
+        "i18n_chars": 9377,
+        "i18n_dates": [
+          "aprile 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 8357,
+    "orig_chars": 9813,
+    "loss_pct": 14.8
+  },
+  {
+    "page": "reviews/bybit-de.html",
+    "line": 211,
+    "key": "review.bybit.heroMeta",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.2547,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "marzo 2026"
+    ],
+    "html_chars": 412,
+    "i18n_chars": 389,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.2547,
+        "i18n_chars": 389,
+        "i18n_dates": [
+          "marzo 2026"
+        ]
+      }
+    },
+    "rendered_chars": 391,
+    "orig_chars": 413,
+    "loss_pct": 5.3
+  },
+  {
+    "page": "reviews/bybit-de.html",
+    "line": 219,
+    "key": "review.bybit.article",
+    "page_lang": "de",
+    "status": "DRIFT",
+    "ratio": 0.1997,
+    "html_dates": [
+      "april 2025",
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "april 2026"
+    ],
+    "html_chars": 16303,
+    "i18n_chars": 11337,
+    "per_lang": {
+      "de": {
+        "status": "DRIFT",
+        "ratio": 0.1997,
+        "i18n_chars": 11337,
+        "i18n_dates": [
+          "april 2026"
+        ]
+      }
+    },
+    "rendered_chars": 9959,
+    "orig_chars": 16349,
+    "loss_pct": 39.1
+  },
+  {
+    "page": "reviews/bybit-en.html",
+    "line": 196,
+    "key": "review.bybit.heroMeta",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.3632,
+    "html_dates": [
+      "april 2026"
+    ],
+    "i18n_dates": [
+      "marzo 2026"
+    ],
+    "html_chars": 360,
+    "i18n_chars": 389,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.3632,
+        "i18n_chars": 389,
+        "i18n_dates": [
+          "marzo 2026"
+        ]
+      }
+    },
+    "rendered_chars": 391,
+    "orig_chars": 361,
+    "loss_pct": -8.3
+  },
+  {
+    "page": "reviews/bybit-en.html",
+    "line": 204,
+    "key": "review.bybit.article",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.3129,
+    "html_dates": [
+      "april 2025",
+      "april 2026",
+      "february 2025",
+      "march 2025"
+    ],
+    "i18n_dates": [
+      "april 2026"
+    ],
+    "html_chars": 13986,
+    "i18n_chars": 11237,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.3129,
+        "i18n_chars": 11237,
+        "i18n_dates": [
+          "april 2026"
+        ]
+      }
+    },
+    "rendered_chars": 9945,
+    "orig_chars": 14038,
+    "loss_pct": 29.2
+  },
+  {
+    "page": "reviews/bybit-es.html",
+    "line": 211,
+    "key": "review.bybit.heroMeta",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.4467,
+    "html_dates": [],
+    "i18n_dates": [
+      "marzo 2026"
+    ],
+    "html_chars": 390,
+    "i18n_chars": 389,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.4467,
+        "i18n_chars": 389,
+        "i18n_dates": [
+          "marzo 2026"
+        ]
+      }
+    },
+    "rendered_chars": 391,
+    "orig_chars": 391,
+    "loss_pct": 0.0
+  },
+  {
+    "page": "reviews/bybit-es.html",
+    "line": 219,
+    "key": "review.bybit.article",
+    "page_lang": "es",
+    "status": "DRIFT",
+    "ratio": 0.3633,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 16846,
+    "i18n_chars": 11426,
+    "per_lang": {
+      "es": {
+        "status": "DRIFT",
+        "ratio": 0.3633,
+        "i18n_chars": 11426,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 9959,
+    "orig_chars": 16872,
+    "loss_pct": 41.0
+  },
+  {
+    "page": "reviews/bybit.html",
+    "line": 204,
+    "key": "review.bybit.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.7721,
+    "html_dates": [
+      "aprile 2025",
+      "aprile 2026",
+      "febbraio 2025",
+      "gennaio 2026",
+      "luglio 2026"
+    ],
+    "i18n_dates": [
+      "gennaio 2026"
+    ],
+    "html_chars": 15026,
+    "i18n_chars": 11461,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.7721,
+        "i18n_chars": 11461,
+        "i18n_dates": [
+          "gennaio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 9943,
+    "orig_chars": 15053,
+    "loss_pct": 33.9
+  },
+  {
+    "page": "reviews/coinbase.html",
+    "line": 220,
+    "key": "review.coinbase.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9523,
+    "html_dates": [
+      "aprile 2026",
+      "dicembre 2024",
+      "giugno 2025"
+    ],
+    "i18n_dates": [],
+    "html_chars": 18769,
+    "i18n_chars": 17958,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9523,
+        "i18n_chars": 17958,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 15756,
+    "orig_chars": 18800,
+    "loss_pct": 16.2
+  },
+  {
+    "page": "reviews/crypto-com.html",
+    "line": 219,
+    "key": "review.cryptocom.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9817,
+    "html_dates": [
+      "27/01/2025",
+      "30/06/2026",
+      "dicembre 2023",
+      "gennaio 2025"
+    ],
+    "i18n_dates": [
+      "27/01/2025",
+      "30/06/2026",
+      "dicembre 2023",
+      "gennaio 2025"
+    ],
+    "html_chars": 10932,
+    "i18n_chars": 10539,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9817,
+        "i18n_chars": 10539,
+        "i18n_dates": [
+          "27/01/2025",
+          "30/06/2026",
+          "dicembre 2023",
+          "gennaio 2025"
+        ]
+      }
+    },
+    "rendered_chars": 9475,
+    "orig_chars": 10933,
+    "loss_pct": 13.3
+  },
+  {
+    "page": "reviews/index.html",
+    "line": 150,
+    "key": "reviews.index.riskWarning",
+    "page_lang": "en",
+    "status": "DRIFT",
+    "ratio": 0.0,
+    "html_dates": [],
+    "i18n_dates": [],
+    "html_chars": 0,
+    "i18n_chars": 245,
+    "per_lang": {
+      "en": {
+        "status": "DRIFT",
+        "ratio": 0.0,
+        "i18n_chars": 245,
+        "i18n_dates": []
+      }
+    },
+    "rendered_chars": 245,
+    "orig_chars": 0,
+    "loss_pct": 0.0
+  },
+  {
+    "page": "reviews/kraken.html",
+    "line": 218,
+    "key": "review.kraken.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.9243,
+    "html_dates": [
+      "gennaio 2025",
+      "luglio 2022",
+      "luglio 2026",
+      "maggio 2026"
+    ],
+    "i18n_dates": [
+      "luglio 2022"
+    ],
+    "html_chars": 15827,
+    "i18n_chars": 13599,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.9243,
+        "i18n_chars": 13599,
+        "i18n_dates": [
+          "luglio 2022"
+        ]
+      }
+    },
+    "rendered_chars": 11711,
+    "orig_chars": 15852,
+    "loss_pct": 26.1
+  },
+  {
+    "page": "reviews/kucoin.html",
+    "line": 218,
+    "key": "review.kucoin.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8704,
+    "html_dates": [
+      "18/05/2026",
+      "19/02/2026",
+      "27/11/2025",
+      "febbraio 2026",
+      "giugno 2026",
+      "luglio 2026",
+      "maggio 2026",
+      "marzo 2024",
+      "marzo 2025",
+      "novembre 2025",
+      "settembre 2020"
+    ],
+    "i18n_dates": [
+      "18/05/2026",
+      "27/11/2025",
+      "febbraio 2026",
+      "maggio 2026",
+      "settembre 2020"
+    ],
+    "html_chars": 17684,
+    "i18n_chars": 14457,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8704,
+        "i18n_chars": 14457,
+        "i18n_dates": [
+          "18/05/2026",
+          "27/11/2025",
+          "febbraio 2026",
+          "maggio 2026",
+          "settembre 2020"
+        ]
+      }
+    },
+    "rendered_chars": 12456,
+    "orig_chars": 17710,
+    "loss_pct": 29.7
+  },
+  {
+    "page": "reviews/mexc.html",
+    "line": 218,
+    "key": "review.mexc.article",
+    "page_lang": "it",
+    "status": "DRIFT",
+    "ratio": 0.8909,
+    "html_dates": [
+      "1/7/2026",
+      "giugno 2026",
+      "luglio 2026",
+      "maggio 2025",
+      "marzo 2025",
+      "novembre 2025"
+    ],
+    "i18n_dates": [
+      "giugno 2026",
+      "luglio 2026"
+    ],
+    "html_chars": 14096,
+    "i18n_chars": 12074,
+    "per_lang": {
+      "it": {
+        "status": "DRIFT",
+        "ratio": 0.8909,
+        "i18n_chars": 12074,
+        "i18n_dates": [
+          "giugno 2026",
+          "luglio 2026"
+        ]
+      }
+    },
+    "rendered_chars": 10199,
+    "orig_chars": 14115,
+    "loss_pct": 27.7
+  }
+]

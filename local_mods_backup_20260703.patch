@@ -1,0 +1,721 @@
+diff --git a/frontend-svelte/src/pages/Settings.svelte b/frontend-svelte/src/pages/Settings.svelte
+index 508f8e4..0ca8539 100644
+--- a/frontend-svelte/src/pages/Settings.svelte
++++ b/frontend-svelte/src/pages/Settings.svelte
+@@ -85,6 +85,23 @@
+     let totalCostUsd = 0;
+     let agentCosts = [];
+ 
++
++    // Account profile switch (LOCAL CUSTOMIZATION — personal ↔ work)
++    let accountProfile = { profile: 'personal', email: '', work_available: false, tunnel_active: false };
++    let switchingAccount = false;
++    async function loadAccountProfile() {
++        try { accountProfile = await api('GET', '/settings/account/profile'); } catch (e) { /* ignore */ }
++    }
++    async function switchAccount(profile) {
++        switchingAccount = true;
++        try {
++            await api('POST', '/settings/account/switch', { profile, restart_sessions: true });
++            await loadAccountProfile();
++            await loadAccountInfo();
++        } catch(e) { console.error('Switch failed', e); }
++        finally { switchingAccount = false; }
++    }
++
+     // Auth status
+     let authStatus = {};
+     let uiAuthStatus = {};
+@@ -748,6 +765,7 @@
+         loadHeartbeatSettings().then(loadCalendarAgentStatuses);
+         loadOwnerProfile();
+         loadAccountInfo();
++        loadAccountProfile();
+         loadApiKeys();
+         loadServerInfo();
+         loadCalendarStatus();
+@@ -1689,6 +1707,24 @@
+                         {accountInfo.email || '--'}
+                     </div>
+                 </div>
++                {#if accountProfile.work_available || accountProfile.profile === 'work'}
++                <div>
++                    <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">ACCOUNT</span>
++                    <div style="display:flex;gap:0.4rem;margin-top:0.4rem">
++                        <button
++                            style="padding:0.25rem 0.75rem;font-size:0.8rem;border-radius:4px;cursor:pointer;border:1px solid {accountProfile.profile === 'personal' ? 'var(--accent)' : 'var(--gray-border)'};background:{accountProfile.profile === 'personal' ? 'var(--accent)' : 'transparent'};color:{accountProfile.profile === 'personal' ? '#000' : 'var(--gray-mid)'};transition:all 0.15s"
++                            on:click={() => switchAccount('personal')}
++                            disabled={switchingAccount || accountProfile.profile === 'personal'}
++                        >personale</button>
++                        <button
++                            style="padding:0.25rem 0.75rem;font-size:0.8rem;border-radius:4px;cursor:pointer;border:1px solid {accountProfile.profile === 'work' ? 'var(--accent)' : 'var(--gray-border)'};background:{accountProfile.profile === 'work' ? 'var(--accent)' : 'transparent'};color:{accountProfile.profile === 'work' ? '#000' : 'var(--gray-mid)'};transition:all 0.15s"
++                            on:click={() => switchAccount('work')}
++                            disabled={switchingAccount || accountProfile.profile === 'work'}
++                        >lavoro</button>
++                    </div>
++                    {#if switchingAccount}<span style="font-size:0.75rem;color:var(--gray-mid)">switching...</span>{/if}
++                </div>
++                {/if}
+                 <div>
+                     <span style="font-size:0.75rem;text-transform:uppercase;color:var(--gray-mid);letter-spacing:0.05em">{$_('settings.acct_lifetime_cost_label')}</span>
+                     <div style="font-size:1.3rem;font-weight:700;margin-top:0.2rem;color:{lifetimeCostUsd > 0 ? 'var(--accent)' : 'var(--gray-mid)'}">
+diff --git a/src/pinky_daemon/api.py b/src/pinky_daemon/api.py
+index 6ac0612..f3efd7d 100644
+--- a/src/pinky_daemon/api.py
++++ b/src/pinky_daemon/api.py
+@@ -9,8 +9,8 @@ Usage:
+     curl -X POST http://localhost:8888/sessions -d '{"model": "sonnet"}'
+     curl -X POST http://localhost:8888/sessions/{id}/message -d '{"content": "Hello"}'
+ """
+-
+ from __future__ import annotations
++from pydantic import BaseModel
+ 
+ import asyncio
+ import contextlib
+@@ -1221,6 +1221,23 @@ def _frontend_build_status(
+     return base
+ 
+ 
++# ── AIena Admin: module-level request models ─────────────────
++# Must be at module scope so FastAPI can resolve type hints via globalns
++# (PEP 563). If nested inside create_api(), FastAPI treats `req` as a
++# query parameter and returns 422 on every POST.
++
++class _AienaApproveRequest(BaseModel):
++    slug: str
++    title: str = ""
++    category: str = ""
++
++
++class _AienaPromoteRequest(BaseModel):
++    slug: str
++    title: str = ""
++    category: str = ""
++
++
+ # ── API Server ───────────────────────────────────────────────
+ 
+ 
+@@ -1663,6 +1680,28 @@ def create_api(
+         blocks: str = "",
+     ) -> dict:
+         """Send a message back to the platform on behalf of an agent."""
++        # OpenClaw bridge: agent replies for the openclaw "platform" are not sent
++        # via a platform adapter — they're routed back over the OpenClaw Gateway
++        # WebSocket (chat_id carries the OpenClaw sessionKey). See
++        # openclaw_gateway.deliver_agent_reply. Non-fatal if no client is
++        # connected (agent replied after the app disconnected).
++        if platform == "openclaw":
++            try:
++                from pinky_daemon import openclaw_gateway as _ocg
++
++                delivered = await _ocg.deliver_agent_reply(chat_id, content)
++            except Exception as e:  # noqa: BLE001 — bridge must not break agent turn
++                _log(f"openclaw: deliver_agent_reply failed: {e}")
++                delivered = False
++            broker._stop_typing(agent_name, chat_id)
++            return {
++                "sent": bool(delivered),
++                "agent": agent_name,
++                "platform": platform,
++                "chat_id": chat_id,
++                "message_id": "",
++            }
++
+         loop = asyncio.get_running_loop()
+ 
+         async def _deliver() -> dict:
+@@ -3105,6 +3144,21 @@ def create_api(
+         except Exception as e:
+             _log(f"streaming-start: ensure_workspace_hooks({agent_name}) — {e}")
+ 
++        # Build system prompt; if it exceeds Linux MAX_ARG_STRLEN (~128 KB)
++        # pass it via a file to avoid CLIConnectionError [Errno 7] E2BIG.
++        _MAX_ARG_STRLEN = 128 * 1024  # conservative threshold (real limit 131072)
++        _raw_system_prompt = agents.build_system_prompt(agent_name, skill_store=skills)
++        if len(_raw_system_prompt.encode("utf-8")) >= _MAX_ARG_STRLEN:
++            _sp_file = Path(work_dir) / ".pinky_system_prompt"
++            _sp_file.write_text(_raw_system_prompt, encoding="utf-8")
++            _effective_system_prompt: str | dict = {"path": str(_sp_file)}
++            _log(
++                f"streaming-start: system prompt {len(_raw_system_prompt.encode())} bytes "
++                f"exceeds MAX_ARG_STRLEN — using file: {_sp_file}"
++            )
++        else:
++            _effective_system_prompt = _raw_system_prompt
++
+         config = StreamingSessionConfig(
+             agent_name=agent_name,
+             label=label,
+@@ -3115,7 +3169,7 @@ def create_api(
+             mcp_servers=codex_mcp_servers,
+             permission_mode=agent.permission_mode or "bypassPermissions",
+             max_turns=agent.max_turns,
+-            system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
++            system_prompt=_effective_system_prompt,
+             resume_handle=resume_id,
+             # commit=False here: the connect-time rebuild via
+             # ``wake_context_builder`` is the delivered (committed) build
+@@ -9693,6 +9747,32 @@ npm run build</pre>
+             except Exception as exc:  # never let log rotation abort startup
+                 _log(f"startup: log rotation not started ({exc})")
+ 
++        # Conversation pruning — delete messages older than PINKY_CONV_RETENTION_DAYS
++        # (default 30). Runs every 6 hours in a background thread to avoid blocking
++        # the event loop during bulk deletes on a large messages table.
++        _conv_retention_days = int(os.environ.get("PINKY_CONV_RETENTION_DAYS", "30"))
++        if _conv_retention_days > 0:
++            try:
++                async def _conversation_prune_loop(
++                    _store: "ConversationStore" = store,
++                    _days: int = _conv_retention_days,
++                ) -> None:
++                    import asyncio as _asyncio
++                    _CHECK_INTERVAL = 6 * 3600  # every 6 hours
++                    while True:
++                        try:
++                            deleted = await _asyncio.to_thread(_store.prune, max_age_days=_days)
++                            if deleted:
++                                _log(f"conv_prune: deleted {deleted:,} messages older than {_days}d")
++                        except Exception as _exc:
++                            _log(f"conv_prune: error ({_exc})")
++                        await _asyncio.sleep(_CHECK_INTERVAL)
++
++                app.state.conv_prune_task = asyncio.create_task(_conversation_prune_loop())
++                _log(f"startup: conversation pruning started (retention={_conv_retention_days}d)")
++            except Exception as exc:  # never let pruning abort startup
++                _log(f"startup: conversation pruning not started ({exc})")
++
+         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
+         if SHARED_MCP_ENABLED:
+             def _resolve_memory_db(agent_name: str) -> str:
+@@ -10484,10 +10564,21 @@ npm run build</pre>
+         return result
+ 
+     @app.post("/admin/restart")
+-    async def admin_restart():
++    async def admin_restart(request: Request):
+         """Graceful daemon restart. Requires process manager for auto-restart."""
+         import signal
+ 
++        # Log caller details for auditing
++        caller_ip = request.client.host if request.client else "unknown"
++        caller_ua = request.headers.get("user-agent", "unknown")
++        caller_ref = request.headers.get("referer", "")
++        _log(f"admin: /admin/restart called — ip={caller_ip} ua={caller_ua!r} referer={caller_ref!r}")
++
++        # Block restart if account switch is in progress
++        if _account_switch_in_progress[0]:
++            _log("admin: /admin/restart blocked — account switch in progress")
++            raise HTTPException(409, "Account switch in progress — restart blocked to prevent instability")
++
+         async def _delayed_exit():
+             await asyncio.sleep(1)
+             _log("admin: SIGTERM self for restart")
+@@ -10916,6 +11007,131 @@ npm run build</pre>
+             "lifetime_agents": lifetime_costs,
+         }
+ 
++    _account_switch_in_progress = [False]  # mutable flag: blocks /admin/restart during account switch
++
++
++    # ── Account Switch (LOCAL CUSTOMIZATION) ───────────────
++
++    @app.get("/settings/account/profile")
++    async def get_account_profile():
++        """Returns which Claude account profile is active (personal or work).
++
++        Detection is based on the ~/.local/bin/claude symlink target:
++        - points to claude-work-wrapper.sh → work mode (iMac tunnel)
++        - points to anything else → personal mode (local)
++        """
++        import subprocess as _sp2
++        claude_link = Path.home() / ".local" / "bin" / "claude"
++        work_wrapper = Path.home() / ".pinkybot" / "scripts" / "claude-work-wrapper.sh"
++        email_map = {
++            "personal": "alberto.fraccoli@gmail.com",
++            "work": "web@foodandco.eu",
++        }
++        try:
++            target = str(claude_link.resolve())
++            profile = "work" if str(work_wrapper) in target or "work-wrapper" in target else "personal"
++            # Check tunnel availability
++            tunnel_active = False
++            nc = _sp2.run(
++                ["nc", "-z", "localhost", "2222"], capture_output=True, timeout=3
++            )
++            tunnel_active = nc.returncode == 0
++            if profile == "work":
++                tunnel_active = True  # already in work mode → tunnel must be active
++            return {
++                "profile": profile,
++                "email": email_map[profile],
++                "work_available": tunnel_active,
++                "tunnel_active": tunnel_active,
++            }
++        except Exception:
++            return {"profile": "personal", "email": "", "work_available": False, "tunnel_active": False}
++
++    @app.post("/settings/account/switch")
++    async def switch_account_profile(req: dict):
++        """Switch between personal and work Claude Max account.
++
++        Optional: pass restart_sessions=true to also reconnect all streaming sessions
++        after the switch (agents pick up the new binary/credentials).
++        """
++        import subprocess as _sp3
++        target = req.get("profile", "")
++        do_restart_sessions = req.get("restart_sessions", False)
++        if target not in ("personal", "work"):
++            raise HTTPException(400, "profile must be \'personal\' or \'work\'")
++        script = Path.home() / ".pinkybot" / "scripts" / "switch_claude_account.sh"
++        if not script.exists():
++            raise HTTPException(500, "Switch script not found")
++        _account_switch_in_progress[0] = True
++        try:
++            result = _sp3.run(
++                ["bash", str(script), target], capture_output=True, text=True, timeout=15
++            )
++            if result.returncode != 0:
++                raise HTTPException(500, result.stderr or "Switch failed")
++            _log(f"account: switch to \'{target}\' complete — restart lock OFF")
++
++            if do_restart_sessions:
++                async def _do_session_restart(agent_name: str, ss) -> bool:
++                    try:
++                        await ss.disconnect()
++                        agents.set_streaming_session_id(agent_name, "", label="main")
++                        ss._config.wake_context = _build_streaming_wake_context(agent_name)
++                        ss._config.resume_session_id = ""
++                        ss._config.restart_reason = "account_switch"
++                        ss.session_id = ""
++                        if hasattr(ss, "codex_session_id"):
++                            ss.codex_session_id = ""
++                        await ss.connect()
++                        _log(f"account: restarted streaming session for {agent_name} (account switch)")
++                        return True
++                    except Exception as e:
++                        _log(f"account: failed to restart {agent_name}: {e}")
++                        return False
++
++                def _is_idle(ss, idle_threshold_s: float = 30.0) -> bool:
++                    return (time.time() - ss.last_active) >= idle_threshold_s
++
++                async def _restart_sessions_background():
++                    await asyncio.sleep(1)
++                    all_sessions = dict(broker._streaming)
++                    main_agents = []
++
++                    for agent_name, sessions in all_sessions.items():
++                        ss = sessions.get("main")
++                        if not ss:
++                            continue
++                        agent_obj = agents.get(agent_name)
++                        is_main = agent_obj and getattr(agent_obj, "is_main", False)
++                        if is_main:
++                            main_agents.append((agent_name, ss))
++                            continue
++                        if _is_idle(ss):
++                            await _do_session_restart(agent_name, ss)
++                        else:
++                            _log(f"account: skip restart for {agent_name} — active in last 30s")
++
++                    if main_agents:
++                        for agent_name, ss in main_agents:
++                            _log(f"account: sending save prompt to {agent_name} before restart")
++                            await ss.send(
++                                "[SYSTEM] Account switch in progress. "
++                                "Call save_my_context now with your current task state, "
++                                "then await reconnection on the new account.",
++                                platform="", chat_id="",
++                            )
++                        await asyncio.sleep(10)
++                        for agent_name, ss in main_agents:
++                            await _do_session_restart(agent_name, ss)
++
++                asyncio.create_task(_restart_sessions_background())
++                return {"switched": True, "profile": target, "output": result.stdout.strip(),
++                        "sessions_restart": "scheduled"}
++
++            return {"switched": True, "profile": target, "output": result.stdout.strip()}
++        finally:
++            _account_switch_in_progress[0] = False
++
+     # ── Autonomy Engine ────────────────────────────────────
+ 
+     @app.get("/autonomy/status")
+@@ -11210,4 +11426,282 @@ npm run build</pre>
+     except ImportError:
+         pass
+ 
++    # OpenClaw Gateway Protocol v4 bridge — lets the OpenClaw Android app
++    # connect and chat with the target agent (default: satoshi) without a
++    # separate OpenClaw Gateway server. Additive: no existing route is touched.
++    try:
++        from pinky_daemon import openclaw_gateway as _ocg
++
++        _ocg.set_dependencies(
++            broker=broker,
++            ensure_session=_ensure_streaming_session,
++            agents=agents,
++            transport_session_state=TransportSessionState,
++            target_agent=os.environ.get("OPENCLAW_TARGET_AGENT", "satoshi"),
++        )
++
++        @app.websocket("/openclaw/ws")
++        async def openclaw_ws(ws: WebSocket):
++            await _ocg.handle_connection(ws)
++
++        # Common alternate paths OpenClaw clients probe for the gateway socket.
++        @app.websocket("/gateway/ws")
++        async def openclaw_gateway_ws(ws: WebSocket):
++            await _ocg.handle_connection(ws)
++
++        # ── OpenClaw device invoke REST endpoint ─────────────────────────────
++        # Allows the AI agent (Satoshi) to call device methods on the connected
++        # Android node via HTTP, without needing a WebSocket connection.
++        # Usage: POST /openclaw/device {"method": "camera.snap", "params": {}}
++        @app.post("/openclaw/device")
++        async def openclaw_device_invoke(request: Request):
++            from fastapi.responses import JSONResponse as _JSONResponse
++            body = await request.json()
++            method = str(body.get("method") or "")
++            params = dict(body.get("params") or {})
++            timeout = float(body.get("timeout") or 15.0)
++            if not method:
++                return _JSONResponse({"ok": False, "error": "method required"}, status_code=400)
++            try:
++                result = await _ocg._forward_to_node(method, params, timeout=timeout)
++                return _JSONResponse({"ok": True, "payload": result})
++            except ValueError as exc:
++                return _JSONResponse({"ok": False, "error": str(exc), "code": "NODE_UNAVAILABLE"}, status_code=503)
++            except TimeoutError:
++                return _JSONResponse({"ok": False, "error": f"{method} timed out", "code": "TIMEOUT"}, status_code=504)
++            except Exception as exc:  # noqa: BLE001
++                return _JSONResponse({"ok": False, "error": str(exc), "code": "DEVICE_ERROR"}, status_code=500)
++
++        _log("openclaw: gateway WS registered at /openclaw/ws and /gateway/ws")
++    except Exception as _ocg_exc:  # noqa: BLE001 — bridge is optional
++        _log(f"openclaw: gateway not registered ({_ocg_exc})")
++
++    # ── AIena: approve article ─────────────────────────────────────────────────
++    # Called from admin.aiena.it when Mirko clicks APPROVATO on a preview card.
++    # Validates slug against pipeline.json investigations[status=preview] before
++    # inserting into Supabase article_approvals. Prevents test/garbage entries.
++    import json as _json_mod
++    import urllib.request as _urllib_req
++    import urllib.error as _urllib_err
++    import datetime as _dt_mod
++    import logging as _logging_mod
++    import os as _os_mod
++    import tempfile as _tmp_mod
++    import subprocess as _sp_mod
++
++    _aiena_logger = _logging_mod.getLogger("aiena.approve")
++    _AIENA_PIPELINE = "/var/www/aiena.it/data/pipeline.json"
++    _AIENA_SB_URL   = "https://fwyjxolljcogblvwvfca.supabase.co"
++    _AIENA_SB_KEY   = "sb_secret_mIKFJoDc9O-8fyPJ2N8uuA_hml1hf-4"
++    _AIENA_SB_HDR   = {
++        "apikey": _AIENA_SB_KEY,
++        "Authorization": f"Bearer {_AIENA_SB_KEY}",
++        "Content-Type": "application/json",
++        "Prefer": "return=minimal",
++    }
++
++    def _aiena_slug_in_pipeline(slug: str) -> bool:
++        """Return True if slug exists in investigations[] with status='preview'."""
++        try:
++            pipeline = _json_mod.loads(open(_AIENA_PIPELINE, encoding="utf-8").read())
++            for inv in pipeline.get("investigations", []):
++                if inv.get("slug") == slug and inv.get("status") == "preview":
++                    return True
++        except Exception as exc:
++            _aiena_logger.warning("pipeline.json read error: %s", exc)
++        return False
++
++    def _aiena_sb_exists(slug: str) -> bool:
++        """Return True if slug already in Supabase article_approvals."""
++        try:
++            req = _urllib_req.Request(
++                f"{_AIENA_SB_URL}/rest/v1/article_approvals?slug=eq.{slug}&select=slug",
++                headers={k: v for k, v in _AIENA_SB_HDR.items() if k != "Prefer"},
++            )
++            with _urllib_req.urlopen(req, timeout=8) as r:
++                data = _json_mod.loads(r.read())
++                return len(data) > 0
++        except Exception as exc:
++            _aiena_logger.warning("Supabase exists check failed: %s", exc)
++            return False
++
++    def _aiena_sb_insert(slug: str, title: str, category: str) -> bool:
++        """INSERT into article_approvals using service role key."""
++        payload = {
++            "slug": slug,
++            "title": title,
++            "category": category,
++            "approved_at": _dt_mod.datetime.now(_dt_mod.timezone.utc).isoformat(),
++            "status": "pending",
++        }
++        data = _json_mod.dumps(payload).encode("utf-8")
++        req = _urllib_req.Request(
++            f"{_AIENA_SB_URL}/rest/v1/article_approvals",
++            data=data,
++            headers=_AIENA_SB_HDR,
++            method="POST",
++        )
++        try:
++            with _urllib_req.urlopen(req, timeout=10) as r:
++                _aiena_logger.info("Supabase INSERT OK slug=%s status=%s", slug, r.status)
++                return True
++        except _urllib_err.HTTPError as exc:
++            body = exc.read().decode()
++            _aiena_logger.error("Supabase INSERT HTTP %s slug=%s body=%s", exc.code, slug, body[:300])
++            return False
++        except Exception as exc:
++            _aiena_logger.error("Supabase INSERT error slug=%s exc=%s", slug, exc)
++            return False
++
++    def _aiena_pipeline_set_approved(slug: str) -> bool:
++        """Atomically update pipeline.json: set investigation[slug].status = 'approvato'."""
++        try:
++            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
++                pipeline = _json_mod.load(f)
++            updated = False
++            for inv in pipeline.get("investigations", []):
++                if inv.get("slug") == slug and inv.get("status") == "preview":
++                    inv["status"] = "approvato"
++                    pipeline["updated_at"] = _dt_mod.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++                    updated = True
++                    break
++            if not updated:
++                _aiena_logger.warning("pipeline_set_approved: slug=%s not found in preview", slug)
++                return False
++            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
++            fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
++            try:
++                with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
++                    _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
++                _os_mod.replace(tmp, _AIENA_PIPELINE)
++            except Exception:
++                try:
++                    _os_mod.unlink(tmp)
++                except OSError:
++                    pass
++                raise
++            _aiena_logger.info("pipeline_set_approved: slug=%s → approvato", slug)
++            return True
++        except Exception as exc:
++            _aiena_logger.error("pipeline_set_approved ERROR slug=%s exc=%s", slug, exc)
++            return False
++
++    @app.post("/api/aiena/approve-article")
++    async def aiena_approve_article(req: _AienaApproveRequest, request: Request):
++        """Approve an AIena article: validates slug, then inserts into Supabase.
++
++        Returns 422 if slug is not a known investigation with status='preview'.
++        Idempotent: returns 200 if already in Supabase.
++        """
++        caller_ip = request.client.host if request.client else "unknown"
++        slug = req.slug.strip()
++        _aiena_logger.info(
++            "approve-article called: slug=%s title=%r caller=%s",
++            slug, req.title[:60], caller_ip
++        )
++
++        if not _aiena_slug_in_pipeline(slug):
++            _aiena_logger.warning(
++                "approve-article REJECTED: slug=%s not in pipeline investigations[preview] caller=%s",
++                slug, caller_ip
++            )
++            raise HTTPException(
++                status_code=422,
++                detail=f"Slug '{slug}' not found in AIena pipeline investigations with status='preview'. "
++                       "Only valid preview articles can be approved."
++            )
++
++        if _aiena_sb_exists(slug):
++            _aiena_logger.info("approve-article: slug=%s already in Supabase — skip INSERT", slug)
++            return {"ok": True, "slug": slug, "inserted": False, "message": "Already approved"}
++
++        ok = _aiena_sb_insert(slug, req.title, req.category)
++        if not ok:
++            raise HTTPException(status_code=500, detail="Supabase INSERT failed")
++
++        # Sync pipeline.json: preview → approvato (best-effort)
++        _aiena_pipeline_set_approved(slug)
++
++        # Trigger immediate admin data refresh
++        _sp_mod.Popen(
++            ["/home/pinky/.pinkybot/.venv/bin/python3",
++             "/home/pinky/.pinkybot/scripts/update_admin_data.py"],
++            stdout=_sp_mod.DEVNULL, stderr=_sp_mod.DEVNULL
++        )
++
++        _aiena_logger.info("approve-article SUCCESS: slug=%s caller=%s", slug, caller_ip)
++        return {"ok": True, "slug": slug, "inserted": True}
++
++    _log("aiena: /api/aiena/approve-article registered")
++
++    # ── AIena: promote lead → investigation ────────────────────────────────────
++    @app.post("/api/leads/promote")
++    async def aiena_promote_lead(req: _AienaPromoteRequest, request: Request):
++        """Promote a lead to active investigation in pipeline.json."""
++        import datetime as _dt2
++        caller_ip = request.client.host if request.client else "unknown"
++        slug = req.slug.strip()
++        _aiena_logger.info("promote-lead called: slug=%s caller=%s", slug, caller_ip)
++
++        try:
++            with open(_AIENA_PIPELINE, "r", encoding="utf-8") as f:
++                pipeline = _json_mod.load(f)
++        except Exception as exc:
++            _aiena_logger.error("promote-lead: pipeline read error: %s", exc)
++            raise HTTPException(status_code=500, detail="Cannot read pipeline.json")
++
++        leads = pipeline.get("leads", [])
++        investigations = pipeline.get("investigations", [])
++
++        lead = next((l for l in leads if l.get("slug") == slug), None)
++        if not lead:
++            return {"success": False, "promoted": False,
++                    "message": f"Lead '{slug}' not found in pipeline.json leads[]"}
++
++        if any(inv.get("slug") == slug for inv in investigations):
++            return {"success": True, "promoted": True,
++                    "message": "Already an active investigation"}
++
++        now_str = _dt2.datetime.now().strftime("%Y-%m-%d")
++        investigation = {
++            "title": req.title or lead.get("title", slug),
++            "slug": slug,
++            "status": "ricerca",
++            "category": req.category or lead.get("category", "Indagine"),
++            "description": lead.get("description", lead.get("summary", "")),
++            "priority_score": lead.get("priority_score", lead.get("score", 0)),
++            "sources": lead.get("sources", []),
++            "research_notes": lead.get("research_notes", lead.get("notes", [])),
++            "added": lead.get("added", now_str),
++            "promoted_at": _dt2.datetime.now(_dt2.timezone.utc).isoformat(),
++            "signal_source": lead.get("signal_source", "admin_panel"),
++        }
++
++        investigations.append(investigation)
++        pipeline["leads"] = [l for l in leads if l.get("slug") != slug]
++        pipeline["investigations"] = investigations
++        pipeline["updated_at"] = _dt2.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
++
++        try:
++            dir_ = _os_mod.path.dirname(_AIENA_PIPELINE)
++            fd, tmp = _tmp_mod.mkstemp(dir=dir_, suffix=".json.tmp")
++            with _os_mod.fdopen(fd, "w", encoding="utf-8") as f:
++                _json_mod.dump(pipeline, f, ensure_ascii=False, indent=4)
++            _os_mod.replace(tmp, _AIENA_PIPELINE)
++        except Exception as exc:
++            _aiena_logger.error("promote-lead: pipeline write error: %s", exc)
++            raise HTTPException(status_code=500, detail="Cannot write pipeline.json")
++
++        _sp_mod.Popen(
++            ["/home/pinky/.pinkybot/.venv/bin/python3",
++             "/home/pinky/.pinkybot/scripts/update_admin_data.py"],
++            stdout=_sp_mod.DEVNULL, stderr=_sp_mod.DEVNULL
++        )
++
++        _aiena_logger.info("promote-lead SUCCESS: slug=%s", slug)
++        return {"success": True, "promoted": True, "slug": slug,
++                "message": f"Lead '{slug}' promosso a indagine attiva (ricerca)"}
++
++    _log("aiena: /api/leads/promote registered")
++
+     return app
+diff --git a/src/pinky_daemon/broker.py b/src/pinky_daemon/broker.py
+index 2952e1a..615c230 100644
+--- a/src/pinky_daemon/broker.py
++++ b/src/pinky_daemon/broker.py
+@@ -1360,6 +1360,17 @@ class MessageBroker:
+         if used_outreach:
+             _log(f"broker: {agent_name} handled turn via outreach tools")
+             return
++
++        # OpenClaw is an internal WebSocket bridge — always deliver plain text
++        # directly, bypassing the fallback_enabled flag and the external-channel
++        # surface guard below. The _send_callback routes platform="openclaw"
++        # to openclaw_gateway.deliver_agent_reply which enqueues the reply for
++        # the waiting _route_chat coroutine.
++        if platform == "openclaw" and stripped and chat_id:
++            _log(f"broker: openclaw direct delivery for {agent_name}/{chat_id}")
++            await self._send_message(agent_name, platform, chat_id, stripped)
++            return
++
+         if not stripped or not fallback_enabled or not chat_id:
+             return
+ 
+diff --git a/src/pinky_daemon/conversation_store.py b/src/pinky_daemon/conversation_store.py
+index 9656860..de8fd56 100644
+--- a/src/pinky_daemon/conversation_store.py
++++ b/src/pinky_daemon/conversation_store.py
+@@ -366,6 +366,35 @@ class ConversationStore:
+         self._conn.commit()
+         return cursor.rowcount
+ 
++    def prune(self, *, max_age_days: int = 30) -> int:
++        """Delete messages older than *max_age_days* and compact the DB.
++
++        The DELETE trigger ``messages_ad`` keeps the FTS5 index consistent, so
++        no manual FTS cleanup is needed. After deletion the WAL is checkpointed
++        and the FTS shadow tables are optimised (merges tombstones) to reclaim
++        space without a full VACUUM (which requires an exclusive lock).
++
++        Returns the number of rows deleted.
++        """
++        cutoff = time.time() - max_age_days * 86400
++        cursor = self._conn.execute(
++            "DELETE FROM messages WHERE timestamp < ?", (cutoff,)
++        )
++        self._conn.commit()
++        deleted = cursor.rowcount
++        if deleted > 0:
++            # Merge FTS5 tombstones without a full exclusive-lock rebuild.
++            try:
++                self._conn.execute("INSERT INTO messages_fts(messages_fts) VALUES('optimize')")
++                self._conn.commit()
++            except Exception:
++                pass
++            # NOTE: do NOT run wal_checkpoint(TRUNCATE) here — the daemon keeps
++            # an active connection in WAL mode and a TRUNCATE checkpoint while
++            # writers are active corrupts the FTS5 shadow tables (Tree 7).
++            # Space is reclaimed gradually by SQLite's automatic checkpointing.
++        return deleted
++
+     def close(self) -> None:
+         self._conn.close()
+ 
+diff --git a/src/pinky_daemon/dream_runner.py b/src/pinky_daemon/dream_runner.py
+index f85d901..c2cdbb1 100644
+--- a/src/pinky_daemon/dream_runner.py
++++ b/src/pinky_daemon/dream_runner.py
+@@ -94,7 +94,23 @@ class DreamRunner:
+         # env does NOT carry ANTHROPIC_API_KEY (it lives in system_settings), so
+         # KG extraction's LLM caller must resolve the key through this. May be None.
+         self._setting_provider = setting_provider
+-        self._db.execute("PRAGMA journal_mode=WAL")
++        self._db.execute("PRAGMA busy_timeout=5000")
++        # Switch to rollback (TRUNCATE) mode — mirrors _configure_agents_db_connection
++        # fix for conversations_agents.db (#797/#220). WAL -shm mmap goes stale
++        # under long-lived daemon connections and causes "disk I/O error" on commit.
++        # TRUNCATE journal has no -shm at all, so the daemon never maps it.
++        try:
++            _cur = self._db.execute("PRAGMA journal_mode").fetchone()
++            if _cur and str(_cur[0]).lower() == "wal":
++                self._db.execute("PRAGMA wal_checkpoint(TRUNCATE)")
++        except Exception:
++            pass
++        for _attempt in range(6):
++            _row = self._db.execute("PRAGMA journal_mode=TRUNCATE").fetchone()
++            if _row and str(_row[0]).lower() == "truncate":
++                break
++            import time as _time
++            _time.sleep(0.2 * (_attempt + 1))
+         self._init_tables()
+ 
+     def _init_tables(self) -> None:

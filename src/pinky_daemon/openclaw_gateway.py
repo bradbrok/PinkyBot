@@ -45,6 +45,7 @@ import asyncio
 import base64
 import json
 import logging
+import logging.handlers
 import os
 import time
 import uuid
@@ -157,7 +158,14 @@ def set_dependencies(
                 os.path.join(os.path.expanduser("~"), ".pinkybot", "logs"),
             )
             os.makedirs(_log_dir, exist_ok=True)
-            _log_fh = logging.FileHandler(os.path.join(_log_dir, "openclaw.log"))
+            # Rotating, not plain: every frame is logged at DEBUG (see the
+            # inbound/outbound log calls below), so an unrotated file grows
+            # ~2 MB/day forever. Caps the log at 40 MB total.
+            _log_fh = logging.handlers.RotatingFileHandler(
+                os.path.join(_log_dir, "openclaw.log"),
+                maxBytes=10 * 1024 * 1024,
+                backupCount=3,
+            )
             _log_fh.setLevel(logging.DEBUG)
             _log_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
             log.addHandler(_log_fh)

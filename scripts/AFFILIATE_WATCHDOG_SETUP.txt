@@ -1,0 +1,148 @@
+============================================================
+AFFILIATE LINK WATCHDOG - SETUP INSTRUCTIONS
+============================================================
+
+OVERVIEW
+--------
+This script scans your bitcoinmarket.net HTML files daily and
+reports exchange mentions that are missing affiliate/referral links.
+
+
+PREREQUISITES
+-------------
+1. Python 3.11+
+2. beautifulsoup4
+
+Install on Mac Mini production server:
+    pip3 install beautifulsoup4
+
+
+CONFIGURATION
+-------------
+Edit: scripts/affiliate_config.json
+
+1. Set "site_root" to actual path of your HTML files:
+   - Typical: /var/www/bitcoinmarket.net/html
+   - Or: /Users/oleg/Sites/bitcoinmarket.net
+
+2. Update ref_url for each exchange with your actual affiliate links:
+   - Replace YOUR_BINANCE_REF with actual ref code
+   - Replace YOUR_COINBASE_REF with actual ref code
+   - etc.
+
+3. Optionally add more exchanges to the "exchanges" object
+
+
+MANUAL RUN (TEST)
+-----------------
+# From the project directory:
+cd /path/to/pinkybot/scripts
+
+# Dry run - see what files would be scanned:
+python3 affiliate_link_watchdog.py --dry-run
+
+# Full scan:
+python3 affiliate_link_watchdog.py
+
+# Verbose mode:
+python3 affiliate_link_watchdog.py -v
+
+
+OUTPUT
+------
+Reports are saved to: scripts/reports/
+- affiliate_report_YYYY-MM-DD.json  (machine-readable)
+- affiliate_report_YYYY-MM-DD.txt   (human-readable summary)
+
+
+CRON SETUP (MAC MINI - oleg@10.0.0.32)
+--------------------------------------
+1. SSH into the Mac Mini:
+   ssh oleg@10.0.0.32
+
+2. Edit crontab:
+   crontab -e
+
+3. Add this line (runs daily at 6:00 AM):
+   0 6 * * * /usr/bin/python3 /path/to/pinkybot/scripts/affiliate_link_watchdog.py >> /var/log/affiliate_watchdog.log 2>&1
+
+   Or with email notification on errors:
+   MAILTO=your@email.com
+   0 6 * * * /usr/bin/python3 /path/to/pinkybot/scripts/affiliate_link_watchdog.py
+
+4. Verify cron is set:
+   crontab -l
+
+
+ALTERNATIVE: LAUNCHD (macOS native)
+-----------------------------------
+Create: ~/Library/LaunchAgents/com.bitcoinmarket.affiliate-watchdog.plist
+
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.bitcoinmarket.affiliate-watchdog</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>/usr/bin/python3</string>
+        <string>/path/to/pinkybot/scripts/affiliate_link_watchdog.py</string>
+    </array>
+    <key>StartCalendarInterval</key>
+    <dict>
+        <key>Hour</key>
+        <integer>6</integer>
+        <key>Minute</key>
+        <integer>0</integer>
+    </dict>
+    <key>StandardOutPath</key>
+    <string>/var/log/affiliate_watchdog.log</string>
+    <key>StandardErrorPath</key>
+    <string>/var/log/affiliate_watchdog_error.log</string>
+</dict>
+</plist>
+
+Load it:
+    launchctl load ~/Library/LaunchAgents/com.bitcoinmarket.affiliate-watchdog.plist
+
+
+EXIT CODES
+----------
+0 = Success, all links are proper
+1 = Missing affiliate links found (check report)
+
+
+EXAMPLE REPORT OUTPUT
+---------------------
+============================================================
+AFFILIATE LINK WATCHDOG REPORT
+Scan Date: 2026-04-15T06:00:00
+Site: /var/www/bitcoinmarket.net/html
+============================================================
+
+SUMMARY
+----------------------------------------
+Files scanned: 157
+Files with exchange mentions: 89
+Total missing affiliate links: 12
+Total proper affiliate links: 234
+
+BREAKDOWN BY EXCHANGE
+----------------------------------------
+  Binance: MISSING: 3 (proper: 45)
+  Coinbase: OK (proper: 28)
+  Kraken: MISSING: 5 (proper: 31)
+  ...
+
+FILES WITH MISSING LINKS
+----------------------------------------
+  reviews/kraken-review.html
+    - Line 142: Kraken (no link)
+      Context: "Kraken is one of the oldest crypto exchanges..."
+    - Line 287: Kraken (has link to: https://kraken.com/...)
+      Context: "Sign up for Kraken today..."
+
+============================================================
+END OF REPORT
+============================================================

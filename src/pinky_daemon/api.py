@@ -4686,11 +4686,21 @@ def create_api(
         # The agent's own key (if provisioned) is checked first; the global
         # secret remains valid through the migration window.
         agent_key = None
+        key_lookup_failed = False
         if agent_name:
             try:
                 agent_key = agents.get_signing_key(agent_name)
-            except Exception:
+            except Exception as e:
+                # DIAG: this used to swallow the error silently, making a failed
+                # per-agent-key lookup indistinguishable from "agent has no key".
+                # A caller that SIGNED with its per-agent key then gets verified
+                # against the global secret only -> mismatch -> unexplained 401.
                 agent_key = None
+                key_lookup_failed = True
+                _log(
+                    f"auth-diag: signing-key lookup failed for '{agent_name}' "
+                    f"on {request.method} {request.url.path}: {type(e).__name__}: {e}"
+                )
         # #149 phase-3 inc2: the global secret is a universal bearer credential
         # (accepted for every name), so it may authenticate ONLY a proven
         # existing non-isolated agent. Isolated callers must use their own
@@ -4700,9 +4710,29 @@ def create_api(
         # fleet-wide (#623) so legitimate callers are unaffected.
         allow_global_secret = _global_secret_allowed_for(agent_name)
         usable_secret = secret if allow_global_secret else ""
+
+        def _diag_deny(reason: str) -> None:
+            # DIAG: only for requests that actually CLAIM an agent identity, so
+            # internet scanners (no headers) don't flood the journal.
+            if not agent_name:
+                return
+            try:
+                ts_delta: Any = int(time.time()) - int(timestamp)
+            except Exception:
+                ts_delta = "unparsable"
+            _log(
+                f"auth-diag: deny {request.method} {request.url.path} "
+                f"agent='{agent_name}' reason={reason} "
+                f"agent_key={'yes' if agent_key else 'no'} "
+                f"key_lookup_failed={key_lookup_failed} "
+                f"allow_global={allow_global_secret} "
+                f"global_secret_set={bool(secret)} ts_delta={ts_delta}"
+            )
+
         if not usable_secret and not agent_key:
+            _diag_deny("no-usable-credential")
             return False
-        return verify_internal_request(
+        verified = verify_internal_request(
             secret,
             agent_name=agent_name,
             method=request.method,
@@ -4712,6 +4742,9 @@ def create_api(
             agent_key=agent_key,
             allow_global_secret=allow_global_secret,
         )
+        if not verified:
+            _diag_deny("verify-failed")
+        return verified
 
     def _internal_isolation_denied(request: Request, caller_name: str) -> bool:
         """#149 tenant isolation (PATH-target surfaces): an authenticated

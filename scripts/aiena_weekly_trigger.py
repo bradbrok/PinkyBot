@@ -1,0 +1,152 @@
+#!/usr/bin/env python3
+"""
+Trigger settimanale AIena — sabato e domenica.
+Sabato: trigger ricerca profonda
+Domenica: trigger scrittura bozza
+Gira ogni giorno alle 09:00, agisce solo sab/dom.
+Legge pipeline.json v2 (investigations[], leads[]).
+"""
+import base64
+import hashlib
+import hmac
+import json
+import os
+import sys
+import time
+import requests
+
+sys.path.insert(0, "/home/pinky/lib")
+import broker_auth  # noqa: E402  (path aggiunto sopra)
+from datetime import datetime
+from zoneinfo import ZoneInfo
+from pathlib import Path
+
+AIENA_ENDPOINT = "http://localhost:8888/agents/aiena/message"
+PIPELINE_JSON = Path("/var/www/aiena.it/data/pipeline.json")
+_ENV_FILE = Path("/home/pinky/.pinkybot/.env")
+
+# Lifecycle: idea -> valutazione -> ricerca -> scrittura -> approvato -> preview -> pubblicato
+# Solo gli articoli in "scrittura" sono ancora bozze da scrivere. Gli stati avanzati
+# (approvato/preview/pubblicato) NON devono generare una writing-session domenicale:
+# farlo ripesca articoli già chiusi e produce falsi trigger (bug segnalato da AIena).
+WRITABLE_STATUS = "scrittura"
+ADVANCED_STATUSES = {"approvato", "preview", "pubblicato", "published", "archiviato", "archived"}
+
+
+def _norm_status(item: dict) -> str:
+    return str(item.get("status") or "").strip().lower()
+
+
+def _writable_investigations(investigations: list) -> list:
+    """Solo gli articoli ancora in fase di scrittura (bozza aperta)."""
+    return [inv for inv in investigations if _norm_status(inv) == WRITABLE_STATUS]
+
+
+def _read_signing_secret() -> str:
+    """Read PINKY_SESSION_SECRET from env or .env file (cron doesn't load env)."""
+    secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
+    if not secret and _ENV_FILE.exists():
+        for line in _ENV_FILE.read_text().splitlines():
+            line = line.strip()
+            if line.startswith("PINKY_SESSION_SECRET="):
+                secret = line.partition("=")[2].strip().strip('"').strip("'")
+                break
+    return secret
+
+
+def _build_auth_headers(secret: str, agent_name: str, method: str, path: str) -> dict:
+    """Delega a /home/pinky/lib/broker_auth.py (sorgente unica della firma).
+
+    Il parametro `secret` resta per compatibilita' con i chiamanti ma non e'
+    piu' usato: broker_auth legge il secret da environment o da .env e SOLLEVA
+    se non lo trova. Prima qui c'era `return {}`, cioe' la richiesta partiva
+    non firmata e si prendeva un 401 che nessuno notava.
+    """
+    return broker_auth.build_headers(method, path, agent=agent_name)
+
+
+def trigger_aiena(message: str):
+    try:
+        secret = _read_signing_secret()
+        auth_headers = _build_auth_headers(secret, "satoshi", "POST", "/agents/aiena/message")
+        headers = {"Content-Type": "application/json", **auth_headers}
+        resp = requests.post(
+            AIENA_ENDPOINT,
+            json={"from_agent": "satoshi", "message": message},
+            headers=headers,
+            timeout=10
+        )
+        print(f"[trigger] AIena triggered: {resp.status_code}")
+    except Exception as e:
+        print(f"[trigger] Errore trigger AIena: {e}")
+
+
+def main():
+    now = datetime.now(ZoneInfo("Europe/Rome"))
+    dow = now.weekday()  # 5=Sab, 6=Dom
+
+    if dow not in (5, 6):
+        print(f"[trigger] Non è weekend ({now.strftime('%A')}) — skip")
+        return
+
+    try:
+        data = json.loads(PIPELINE_JSON.read_text())
+    except Exception:
+        data = {}
+
+    # pipeline.json v2: investigations[] contiene articoli in lavorazione, leads[] contiene early-stage
+    investigations = data.get("investigations", [])
+    leads = data.get("leads", [])
+
+    # Filtro di stato: considera solo le indagini ancora in "scrittura".
+    # Gli stati avanzati (approvato/preview/pubblicato) sono chiusi lato scrittura
+    # e non devono innescare una nuova bozza (fix falsi trigger domenicali).
+    writable = _writable_investigations(investigations)
+
+    cur = writable[0] if writable else {}
+    cur_title = cur.get("title", "indagine corrente") if cur else "indagine corrente"
+    leads_titles = [b["title"] for b in leads[:3]] if leads else []
+
+    if dow == 5:  # Sabato — ricerca profonda
+        topics = ", ".join(leads_titles) if leads_titles else "appalti, PNRR, patrimonio pubblico"
+        msg = (
+            f"Sabato — è il momento della ricerca profonda. Oggi non pubblicare, non rispondere a nessuno su Bluesky se non necessario. "
+            f"Concentrati su:\n"
+            f"1. Scansiona fonti ANAC, OpenData, portale trasparenza su: {cur_title}\n"
+            f"2. Raccogli materiale grezzo: contratti, delibere, dati rilevanti\n"
+            f"3. Cerca correlazioni tra fornitori/enti per l'indagine in corso\n"
+            f"4. Se trovi lead interessanti per il backlog ({topics}), salvali in memoria\n"
+            f"5. Se aggiorni pipeline.json, esegui SEMPRE dopo: "
+            f"`import subprocess; subprocess.run(['/home/pinky/.pinkybot/.venv/bin/python3', "
+            f"'/home/pinky/.pinkybot/scripts/aiena_admin_rebuild.py'], timeout=60)`\n"
+            f"Lavora in modo autonomo, nessuna notifica a Mirko oggi."
+        )
+        print(f"[trigger] Sabato — trigger ricerca profonda")
+
+    else:  # Domenica — scrittura bozza
+        # Nessun articolo in "scrittura": non c'è nulla da scrivere. Evita il falso
+        # trigger che ripescava articoli già approvati/in preview (bug AIena).
+        if not writable:
+            print(
+                "[trigger] Domenica — nessuna indagine in stato 'scrittura' "
+                f"(su {len(investigations)} in pipeline) — skip writing-session"
+            )
+            return
+        msg = (
+            f"Domenica — è il momento di scrivere. Lavora sulla bozza dell'articolo su: {cur_title}\n"
+            f"Usa il materiale raccolto ieri e nelle settimane precedenti.\n"
+            f"Struttura: titolo forte, apertura con il fatto più rilevante, sviluppo con documenti/dati, conclusione con domande aperte.\n"
+            f"Tono: freddo, preciso, giornalistico. Zero aggettivi inutili. Solo fatti verificati.\n"
+            f"Quando la bozza è pronta salvala o notificami — domani Satoshi la valida e la manda a SEO Pro.\n"
+            f"Se aggiorni pipeline.json, esegui SEMPRE dopo: "
+            f"`import subprocess; subprocess.run(['/home/pinky/.pinkybot/.venv/bin/python3', "
+            f"'/home/pinky/.pinkybot/scripts/aiena_admin_rebuild.py'], timeout=60)`\n"
+            f"Nessuna notifica a Mirko oggi."
+        )
+        print(f"[trigger] Domenica — trigger scrittura bozza")
+
+    trigger_aiena(msg)
+
+
+if __name__ == "__main__":
+    main()

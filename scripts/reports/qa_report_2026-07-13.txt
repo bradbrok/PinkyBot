@@ -1,0 +1,54 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-07-13T16:00:56.272766
+Files Scanned: 621
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 2
+  WARNING issues:  8
+
+BY CATEGORY:
+  SEO: 2 critical, 0 warning
+
+BY PAGE TYPE:
+  generic: 30 pages, 0 issues
+  guide: 306 pages, 1 issues
+  landing: 1 pages, 0 issues
+  magazine: 202 pages, 1 issues
+  review: 82 pages, 0 issues
+
+SITE-LEVEL ISSUES
+--------------------------------------------------
+  [~] Orphan page: magazine/bitcoin-etf-abfluesse-rekord-juni-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/bitcoin-etf-outflows-record-june-2026-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/etf-bitcoin-deflussi-record-giugno-2026.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/etf-bitcoin-salidas-record-junio-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-corea-nord-bitcoin-missili-miliardi.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-corea-norte-bitcoin-misiles-miles-millones-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-nordkorea-bitcoin-raketen-milliarden-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/lazarus-group-north-korea-bitcoin-missiles-billions-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+
+CRITICAL ISSUES
+--------------------------------------------------
+
+  guide/mica-exchange-compliance-2026.html (guide)
+    [!] Meta description too long (166 chars)
+        Max 160 chars. Current: 'Migliori exchange MiCA 2026 con licenza CASP: tabella E
+
+  magazine/clarity-act-crypto-2026-en.html (magazine)
+    [!] Meta description too long (168 chars)
+        Max 160 chars. Current: 'CLARITY Act Senate floor vote expected week of July 20.
+
+======================================================================
+END OF REPORT
+======================================================================

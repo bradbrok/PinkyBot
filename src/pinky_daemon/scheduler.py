@@ -721,7 +721,12 @@ class AgentScheduler:
         for pending in pending_wakes:
             current_schedule = self._registry.get_schedule(pending.schedule_id)
             zombie_reason = ""
-            if current_schedule is None:
+
+            # Discard wakes older than 24 hours to prevent stale phantom fires
+            age_seconds = time.time() - pending.fired_at
+            if age_seconds > (24 * 3600):
+                zombie_reason = f"persisted wake stale ({age_seconds / 3600:.1f}h old)"
+            elif current_schedule is None:
                 zombie_reason = "schedule deleted"
             elif current_schedule.agent_name != pending.agent_name:
                 zombie_reason = "schedule reassigned to another agent"
@@ -731,8 +736,13 @@ class AgentScheduler:
                 retired = self._registry.discard_pending_schedule_wake(
                     pending.id
                 )
+                log_tag = (
+                    "PERSISTED_WAKE_STALE_DROPPED"
+                    if "stale" in zombie_reason
+                    else "PERSISTED_WAKE_ZOMBIE_DROPPED"
+                )
                 _log(
-                    f"scheduler: PERSISTED_WAKE_ZOMBIE_DROPPED pending "
+                    f"scheduler: {log_tag} pending "
                     f"#{pending.id}, schedule #{pending.schedule_id} for "
                     f"agent '{pending.agent_name}': {zombie_reason}; "
                     f"outbox_retired={retired}"

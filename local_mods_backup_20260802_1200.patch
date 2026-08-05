@@ -1,0 +1,116 @@
+diff --git a/src/pinky_daemon/openclaw_gateway.py b/src/pinky_daemon/openclaw_gateway.py
+index 38bdab8..2a43233 100644
+--- a/src/pinky_daemon/openclaw_gateway.py
++++ b/src/pinky_daemon/openclaw_gateway.py
+@@ -45,6 +45,7 @@ import asyncio
+ import base64
+ import json
+ import logging
++import logging.handlers
+ import os
+ import time
+ import uuid
+@@ -157,7 +158,14 @@ def set_dependencies(
+                 os.path.join(os.path.expanduser("~"), ".pinkybot", "logs"),
+             )
+             os.makedirs(_log_dir, exist_ok=True)
+-            _log_fh = logging.FileHandler(os.path.join(_log_dir, "openclaw.log"))
++            # Rotating, not plain: every frame is logged at DEBUG (see the
++            # inbound/outbound log calls below), so an unrotated file grows
++            # ~2 MB/day forever. Caps the log at 40 MB total.
++            _log_fh = logging.handlers.RotatingFileHandler(
++                os.path.join(_log_dir, "openclaw.log"),
++                maxBytes=10 * 1024 * 1024,
++                backupCount=3,
++            )
+             _log_fh.setLevel(logging.DEBUG)
+             _log_fh.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+             log.addHandler(_log_fh)
+diff --git a/src/pinky_memory/server.py b/src/pinky_memory/server.py
+index 4469cdd..83caaf5 100644
+--- a/src/pinky_memory/server.py
++++ b/src/pinky_memory/server.py
+@@ -20,6 +20,7 @@ from pinky_memory.types import (
+     ReflectInput,
+     Reflection,
+     ReflectionType,
++    coerce_reflection_type,
+ )
+ 
+ if TYPE_CHECKING:
+@@ -33,15 +34,13 @@ def _log(msg: str) -> None:
+ 
+ 
+ def _parse_reflection_type(type_str: str) -> ReflectionType:
+-    """Coerce a caller-supplied type to ReflectionType, defaulting to `fact`
+-    on an unrecognized value instead of raising. Callers (including dream
+-    runs) occasionally pass a plausible-sounding but invalid type; failing
+-    hard here previously aborted the entire dream run (#session_log bug)."""
+-    try:
+-        return ReflectionType(type_str)
+-    except ValueError:
++    """Coerce a caller-supplied type to ReflectionType, logging when it falls
++    back to `fact` (callers, including dream runs, occasionally pass a
++    plausible-sounding but invalid type — see #session_log bug)."""
++    coerced = coerce_reflection_type(type_str)
++    if coerced.value != type_str:
+         _log(f"reflect: invalid type={type_str!r}, defaulting to 'fact'")
+-        return ReflectionType.fact
++    return coerced
+ 
+ 
+ # Strict agent-name slug for cross-agent memory targets (#614/#145). Mirrors
+diff --git a/src/pinky_memory/store.py b/src/pinky_memory/store.py
+index 7f329ae..5ed5a8a 100644
+--- a/src/pinky_memory/store.py
++++ b/src/pinky_memory/store.py
+@@ -23,6 +23,7 @@ from pinky_memory.types import (
+     Reflection,
+     ReflectionLink,
+     ReflectionType,
++    coerce_reflection_type,
+     resolve_preset,
+ )
+ 
+@@ -1527,9 +1528,17 @@ class ReflectionStore:
+         source_message_ids = json.loads(raw_msg_ids) if raw_msg_ids else []
+         next_review_date = row["next_review_date"] if "next_review_date" in keys else None
+         review_interval_days = row["review_interval_days"] if "review_interval_days" in keys else 7
++        row_type = row["type"]
++        coerced_type = coerce_reflection_type(row_type)
++        if coerced_type.value != row_type:
++            logger.warning(
++                "row_to_reflection: invalid stored type=%r for id=%r, defaulting to 'fact'",
++                row_type,
++                row["id"],
++            )
+         return Reflection(
+             id=row["id"],
+-            type=ReflectionType(row["type"]),
++            type=coerced_type,
+             content=row["content"],
+             context=row["context"],
+             project=row["project"],
+diff --git a/src/pinky_memory/types.py b/src/pinky_memory/types.py
+index 07371d4..9eccb9f 100644
+--- a/src/pinky_memory/types.py
++++ b/src/pinky_memory/types.py
+@@ -15,6 +15,18 @@ class ReflectionType(str, Enum):
+     fact = "fact"
+ 
+ 
++def coerce_reflection_type(type_str: str) -> ReflectionType:
++    """Coerce a caller- or DB-supplied type to ReflectionType, defaulting to
++    `fact` on an unrecognized value instead of raising. Used both when writing
++    a new reflection (a caller passed a plausible-sounding but invalid type)
++    and when hydrating a row written before this type was retired/renamed —
++    a stale value must not crash every future read of that row."""
++    try:
++        return ReflectionType(type_str)
++    except ValueError:
++        return ReflectionType.fact
++
++
+ class Reflection(BaseModel):
+     model_config = ConfigDict(extra="ignore")
+ 

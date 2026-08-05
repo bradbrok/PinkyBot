@@ -1,0 +1,23 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-07-08T20:39:28.429574
+Files Scanned: 617
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 0
+  WARNING issues:  0
+
+BY CATEGORY:
+
+BY PAGE TYPE:
+  generic: 30 pages, 0 issues
+  guide: 306 pages, 0 issues
+  landing: 1 pages, 0 issues
+  magazine: 198 pages, 0 issues
+  review: 82 pages, 0 issues
+
+======================================================================
+END OF REPORT
+======================================================================
