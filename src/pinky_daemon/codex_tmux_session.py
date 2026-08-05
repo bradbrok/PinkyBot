@@ -312,6 +312,11 @@ class CodexTmuxSession(TmuxSession):
                 agent_name=self.agent_name,
                 model=self._codex_model,
                 path_discovery=self._discover_transcript_path,
+                # Scheduler receipts use the same exact transcript-observation
+                # contract as Claude tmux.  Codex records acceptance as an
+                # event_msg/user_message entry instead of Claude's user or
+                # queue-operation rows.
+                on_entry=self._on_transcript_entry,
             )
             if guessed is not None:
                 # Warm-wake / resume: seek to EOF so we don't replay history.
@@ -320,6 +325,63 @@ class CodexTmuxSession(TmuxSession):
                 except OSError:
                     pass
         await super()._start_tailer()
+
+    # ── seam: scheduler queued-route delivery (#1006) ──────────────────────
+    def _scheduler_pane_busy(self, candidate=None) -> bool:
+        """Use Codex-local turn state instead of Claude hook status.
+
+        The base tmux implementation deliberately requires a fresh persisted
+        ``idle`` row from Claude Code's working/idle hooks before it pastes a
+        scheduler turn.  Codex does not run those hooks, so that row is stale
+        or absent and every trigger wake waits forever despite an idle pane.
+
+        Keep the same conservative no-overlap rule using the evidence Codex
+        does own: ordinary work in hand/queued, transcript-backed inflight
+        metadata, tool activity, and the rollout tailer's active-turn flag.
+        The inherited scheduler task, REPL lock, logs, exact receipt, and
+        retirement paths remain unchanged.
+        """
+        candidate_in_worker = (
+            candidate is not None and self._inflight_turn is candidate
+        )
+        if (
+            self._inflight_tool_calls
+            or (
+                self._inflight_turn is not None
+                and not candidate_in_worker
+            )
+            or (
+                not self._message_queue.empty()
+                and not candidate_in_worker
+            )
+            or self._inflight_metas
+        ):
+            return True
+        return bool(getattr(self._tailer, "_active", False))
+
+    def _on_transcript_entry(self, entry: dict) -> None:
+        """Map Codex rollout acceptance onto the shared exact-receipt path."""
+        if entry.get("type") == "event_msg":
+            payload = entry.get("payload") or {}
+            if payload.get("type") == "user_message":
+                prompt = payload.get("message")
+                if isinstance(prompt, str):
+                    turn = self._match_acceptance_turn(prompt)
+                    # The rollout tailer can observe user_message and a very
+                    # fast task_complete in one read while paste_text's final
+                    # tmux subprocess is still returning.  Reserve FIFO
+                    # metadata before resolving the exact scheduler receipt so
+                    # that same-read completion has a head to retire.  The
+                    # normal post-paste path is idempotent on this flag.
+                    if (
+                        turn is not None
+                        and turn.scheduler_delivery is not None
+                        and not turn.pane_delivery_recorded
+                    ):
+                        self._finish_turn_delivery(turn)
+                    self._mark_transport_accepted(turn)
+                return
+        super()._on_transcript_entry(entry)
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     async def _spawn_tmux_repl(self) -> None:

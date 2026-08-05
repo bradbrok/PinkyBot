@@ -317,6 +317,77 @@ async def test_oauth_watcher_is_noop():
     ss._tmux.capture_pane.assert_not_called()
 
 
+# ── #1006 scheduler queued-route delivery ──────────────────────────────────
+@pytest.mark.asyncio
+async def test_scheduler_queued_route_reaches_codex_pane_with_stale_cc_status(
+    capsys,
+):
+    """Codex has no Claude working/idle hooks, so their persisted status is
+    not a delivery gate.  A scheduler wake must use Codex-local in-flight
+    state, reach the pane, and keep the inherited exact-receipt contract."""
+    tmux = _mock_tmux()
+    ss = _session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": time.time(),
+    }
+
+    receipt = await ss.send_scheduler_prompt("scheduled codex wake")
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1:
+            break
+        await asyncio.sleep(0.01)
+
+    tmux.paste_text.assert_awaited_once_with(
+        "scheduled codex wake", enter=True
+    )
+    assert not receipt.done(), "pane keystrokes alone are not acceptance"
+    assert "tmux[murzik]: queued message (chat=)" in capsys.readouterr().err
+
+    # Codex's rollout user_message is the exact transport-acceptance edge.
+    ss._on_transcript_entry({
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "scheduled codex wake",
+        },
+    })
+    assert await receipt is True
+
+
+@pytest.mark.asyncio
+async def test_codex_acceptance_reserves_meta_before_same_read_completion():
+    """A user_message + task_complete pair can beat paste_text's return."""
+    ss = _session()
+    ss._state_machine._state = SessionState.CONNECTED
+    receipt = asyncio.get_running_loop().create_future()
+    turn = _QueuedTurn(
+        prompt="fast scheduled wake",
+        scheduler_delivery=receipt,
+        scheduler_serialized=True,
+        pane_delivery_started=True,
+    )
+    ss._scheduler_pending_turns.append(turn)
+
+    ss._on_transcript_entry({
+        "type": "event_msg",
+        "payload": {
+            "type": "user_message",
+            "message": "fast scheduled wake",
+        },
+    })
+
+    assert await receipt is True
+    assert turn.pane_delivery_recorded is True
+    assert len(ss._inflight_metas) == 1
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="done", stop_reason="task_complete")
+    )
+    assert len(ss._inflight_metas) == 0
+
+
 # ── StopFailure hook is a no-op for codex (#795 P2) ─────────────────────────
 @pytest.mark.asyncio
 async def test_handle_stop_failure_is_noop_for_codex():
