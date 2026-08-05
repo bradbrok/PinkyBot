@@ -677,12 +677,12 @@ def export_messaging_continuity(
             raise ValueError(
                 "Lease-stop record must contain an 'activeChats' list"
             )
-        lease_stop_ids = set()
+        lease_entries: dict[str, dict] = {}
         for entry in active_chats:
             chat_id = str(entry.get("chatId", "")).strip()
             if not chat_id:
                 raise ValueError("Lease-stop activeChats entry lacks chatId")
-            lease_stop_ids.add(chat_id)
+            lease_entries[chat_id] = entry
             if chat_id in {p["externalPrincipalId"] for p in proposals}:
                 continue
             proposals.append({
@@ -697,15 +697,37 @@ def export_messaging_continuity(
                 "proposedRole": "UNASSIGNED_PENDING_OWNER_DECISION",
                 "gateSource": "lease-stop-record",
             })
+        # The record settles provenance, not just membership (review round
+        # 3): a lease platform RESOLVES a V2-unresolved row, and a
+        # disagreement with a V2-resolved row is a CONFLICT the owner must
+        # see — silently calling either side "confirmed" hides exactly the
+        # divergence this input exists to expose.
         for p in proposals:
             if p["gateSource"] == "lease-stop-record":
                 p["leaseStop"] = "only-in-lease-stop"
-            else:
+                continue
+            entry = lease_entries.get(p["externalPrincipalId"])
+            if entry is None:
+                p["leaseStop"] = "absent-at-lease-stop"
+                continue
+            lease_platform = str(entry.get("platform", "")).strip()
+            if not lease_platform:
+                p["leaseStop"] = "confirmed"
+            elif p["platformSource"] == PLATFORM_SOURCE_UNRESOLVED:
+                p["platform"] = lease_platform
+                p["platformSource"] = "lease-stop-record"
+                p["leaseStop"] = "resolved-by-lease-stop"
+            elif p["platform"] != lease_platform:
+                # Keep V2's value in provider; the conflict marker carries
+                # both sides so the owner decides, not the exporter.
                 p["leaseStop"] = (
-                    "confirmed"
-                    if p["externalPrincipalId"] in lease_stop_ids
-                    else "absent-at-lease-stop"
+                    f"platform-conflict(v2={p['platform']},"
+                    f"lease={lease_platform})"
                 )
+            else:
+                p["leaseStop"] = "confirmed"
+            if not p["displayName"] and entry.get("title"):
+                p["displayName"] = str(entry["title"])
         lease_stop_status = "reconciled"
     else:
         for p in proposals:
@@ -757,6 +779,9 @@ def export_messaging_continuity(
     unresolved = [p for p in proposals if p["platformSource"] == PLATFORM_SOURCE_UNRESOLVED]
     held_total = sum(p["heldPendingInbound"] for p in proposals)
     lease_stop_only = [p for p in proposals if p["gateSource"] == "lease-stop-record"]
+    platform_conflicts = [
+        p for p in proposals if str(p["leaseStop"]).startswith("platform-conflict")
+    ]
     lines = [
         f"# Phase-5 principal proposal — {agent_name} ({snapshot_at})",
         "",
@@ -787,6 +812,7 @@ def export_messaging_continuity(
         f"- [ ] {len(unresolved)} unresolved-platform row(s) settled against the lease-stop record.",
         f"- [ ] {held_total} gate-pending inbound message(s) drained/classified before old-lease stop.",
         f"- [ ] {len(lease_stop_only)} lease-stop-only chat(s) (active at stop, unknown to V2 tables) decided.",
+        f"- [ ] {len(platform_conflicts)} platform conflict(s) (V2 vs lease-stop disagree) decided.",
         "- [ ] NEGATIVE CONTROL after enable: a known-unapproved chat id still gets the",
         "      generic denial — the gate itself must survive the migration, not just the approvals.",
     ]
@@ -801,6 +827,7 @@ def export_messaging_continuity(
             1 for p in proposals if p["gateStatus"] == "pending-inbound-without-gate-row"
         ),
         "leaseStopOnly": len(lease_stop_only),
+        "platformConflicts": len(platform_conflicts),
         "leaseStopStatus": lease_stop_status,
     }
     return records, summary, "\n".join(lines) + "\n"

@@ -387,6 +387,39 @@ def test_lease_stop_reconciliation_surfaces_unknown_chats(
     assert "1 lease-stop-only chat(s)" in doc
 
 
+def test_lease_platform_resolves_unresolved_and_conflicts_surface(
+    tmp_path: Path,
+) -> None:
+    agents_db = tmp_path / "agents.db"
+    registry = AgentRegistry(db_path=str(agents_db))
+    registry.register("barsik", soul="soul", working_dir=str(tmp_path / "home"))
+    registry.approve_user("barsik", "9" * 14, display_name="Unresolvable")
+    registry.approve_user("barsik", "6770805286", display_name="Brad")
+    registry.close()
+    record = tmp_path / "lease-stop.json"
+    record.write_text(json.dumps({"activeChats": [
+        {"chatId": "9" * 14, "platform": "telegram"},
+        {"chatId": "6770805286", "platform": "discord"},
+    ]}))
+    records, summary, doc = export_messaging_continuity(
+        agents_db, "barsik", SNAPSHOT_AT, lease_stop_record_path=record
+    )
+    by_ref = {r["details"]["conversationRef"]: r["details"] for r in records}
+    # Unresolved V2 row: lease platform APPLIES and provenance says so.
+    assert by_ref["9" * 14]["provider"] == "telegram"
+    assert "platformSource=lease-stop-record" in by_ref["9" * 14]["notes"]
+    assert "leaseStop=resolved-by-lease-stop" in by_ref["9" * 14]["notes"]
+    assert summary["unresolvedPlatform"] == 0
+    # Resolved V2 row disagreeing with lease: V2 value kept, conflict surfaced.
+    assert by_ref["6770805286"]["provider"] == "telegram"
+    assert (
+        "leaseStop=platform-conflict(v2=telegram,lease=discord)"
+        in by_ref["6770805286"]["notes"]
+    )
+    assert summary["platformConflicts"] == 1
+    assert "1 platform conflict(s)" in doc
+
+
 def test_no_lease_stop_record_keeps_manual_crosscheck(
     v2_gate_edge_state: Path,
 ) -> None:
