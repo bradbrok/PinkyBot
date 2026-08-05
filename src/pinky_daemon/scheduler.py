@@ -149,6 +149,33 @@ def next_cron_description(cron_expr: str) -> str:
 
 # ── Scheduler ────────────────────────────────────────────────
 
+
+class ScheduleWakeReceipt:
+    """Capability that durably accepts one exact scheduler fire.
+
+    The transport calls ``accept`` at its real acceptance edge and only then
+    resolves the process-local Future.  This ordering is the load-bearing
+    crash-gap guarantee for issue #991.
+    """
+
+    def __init__(
+        self,
+        registry: AgentRegistry,
+        schedule_id: int,
+        fired_at: float,
+    ) -> None:
+        self.schedule_id = schedule_id
+        self.fired_at = fired_at
+        self._registry = registry
+
+    def accept(self) -> bool:
+        """Commit the positive receipt synchronously and idempotently."""
+        return self._registry.confirm_pending_schedule_wake_by_fire(
+            self.schedule_id,
+            self.fired_at,
+            delivered_at=time.time(),
+        )
+
 class AgentScheduler:
     """Background scheduler for agent wake schedules and heartbeats.
 
@@ -184,7 +211,10 @@ class AgentScheduler:
         schedule_delivery_timeout: float = 600.0,
     ) -> None:
         self._registry = registry
-        # async fn(agent_name, session_id, prompt) -> bool | Awaitable[bool].
+        # async fn(agent_name, session_id, prompt, *, schedule_receipt=None)
+        # -> bool | Awaitable[bool]. Production API callbacks accept the
+        # optional durable receipt capability; legacy/test callbacks retain
+        # the original three-argument contract.
         # An awaitable return is a per-prompt delivery receipt; same-agent
         # schedules are not advanced until it resolves.
         self._wake_callback = wake_callback
@@ -383,11 +413,26 @@ class AgentScheduler:
                     continue
 
             if cron_matches(schedule.cron, dt):
-                claimed = self._registry.update_schedule_last_run(
-                    schedule.id,
-                    now,
-                    expected_last_run=schedule.last_run,
-                )
+                if schedule.direct_send:
+                    claimed = self._registry.update_schedule_last_run(
+                        schedule.id,
+                        now,
+                        expected_last_run=schedule.last_run,
+                    )
+                else:
+                    claimed, _ledger_row = (
+                        self._registry.claim_schedule_fire(
+                            schedule.id,
+                            timestamp=now,
+                            expected_last_run=schedule.last_run,
+                            agent_name=schedule.agent_name,
+                            schedule_name=schedule.name,
+                            prompt=(
+                                schedule.prompt
+                                or f"Scheduled wake: {schedule.name}"
+                            ),
+                        )
+                    )
                 if not claimed:
                     _log(
                         f"scheduler: lost last_run claim race for "
@@ -512,6 +557,18 @@ class AgentScheduler:
         confirmed = False
         failure_reason = "no delivery callback configured"
 
+        # Direct unit/in-process callers can bypass ``_check_schedules``. Keep
+        # their exact fire represented too; production fires already have this
+        # row from the atomic claim transaction above.
+        if not schedule.direct_send and schedule.last_run > 0:
+            self._registry.persist_schedule_wake(
+                schedule.id,
+                agent_name=schedule.agent_name,
+                schedule_name=schedule.name,
+                prompt=self._wake_prompt(schedule),
+                fired_at=schedule.last_run,
+            )
+
         if schedule.direct_send:
             if attempt_started is not None:
                 attempt_started.set()
@@ -555,14 +612,14 @@ class AgentScheduler:
 
         if confirmed:
             delivered_at = time.time()
-            retired_pending = (
+            receipted_pending = (
                 self._registry.confirm_pending_schedule_wake_by_fire(
                     schedule.id,
                     schedule.last_run,
                     delivered_at=delivered_at,
                 )
             )
-            if not retired_pending:
+            if not receipted_pending:
                 self._registry.update_schedule_last_delivered(
                     schedule.id, delivered_at
                 )
@@ -596,7 +653,7 @@ class AgentScheduler:
         alert_this_failure = True
         if not schedule.direct_send:
             try:
-                _, created = self._registry.persist_schedule_wake(
+                row, _created = self._registry.persist_schedule_wake(
                     schedule.id,
                     agent_name=schedule.agent_name,
                     schedule_name=schedule.name,
@@ -607,7 +664,31 @@ class AgentScheduler:
                     fired_at=schedule.last_run,
                 )
                 persisted = True
-                alert_this_failure = created
+                row, alert_this_failure = (
+                    self._registry.record_schedule_wake_failure(
+                        schedule.id,
+                        schedule.last_run,
+                        failure_reason,
+                    )
+                )
+                if row is not None and row.accepted_at > 0:
+                    _log(
+                        f"scheduler: durable receipt won teardown race for "
+                        f"schedule '{schedule.name}' (#{schedule.id}) for "
+                        f"agent '{schedule.agent_name}' "
+                        f"(fired_at={schedule.last_run}); suppressing stale "
+                        "negative delivery verdict"
+                    )
+                    return
+                if row is not None and row.parked_at > 0:
+                    _log(
+                        f"scheduler: schedule '{schedule.name}' "
+                        f"(#{schedule.id}) for agent "
+                        f"'{schedule.agent_name}' is already quarantined "
+                        f"(fired_at={schedule.last_run}); suppressing "
+                        "duplicate undelivered verdict"
+                    )
+                    return
             except Exception as exc:
                 _log(
                     f"scheduler: SCHEDULER_WAKE_PERSIST_FAILURE schedule "
@@ -768,7 +849,7 @@ class AgentScheduler:
         task.add_done_callback(_done)
 
     async def _replay_pending_for_agent(self, agent_name: str) -> None:
-        """Deliver one agent's persisted wakes FIFO and retire exact successes."""
+        """Deliver one agent's persisted wakes FIFO and receipt exact successes."""
         lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
         async with lock:
             await self._replay_pending_locked(agent_name)
@@ -802,8 +883,8 @@ class AgentScheduler:
                 f"#{pending.id} for schedule '{pending.schedule_name}' "
                 f"(#{pending.schedule_id}) on agent '{pending.agent_name}' "
                 f"reached {attempts} unconfirmed delivery attempts. Replay "
-                "is stopped for this row to prevent a storm; delete the row "
-                "manually to unpark it."
+                "is stopped to prevent a storm; the exact fire remains in "
+                "the ledger as a queryable quarantine."
             ),
         )
         return True
@@ -824,14 +905,15 @@ class AgentScheduler:
             elif not current_schedule.enabled and not current_schedule.one_shot:
                 zombie_reason = "schedule disabled"
             if zombie_reason:
-                retired = self._registry.discard_pending_schedule_wake(
-                    pending.id
+                quarantined = self._registry.park_pending_schedule_wake(
+                    pending.id,
+                    reason=f"terminal replay policy: {zombie_reason}",
                 )
                 _log(
-                    f"scheduler: PERSISTED_WAKE_ZOMBIE_DROPPED pending "
+                    f"scheduler: PERSISTED_WAKE_ZOMBIE_QUARANTINED pending "
                     f"#{pending.id}, schedule #{pending.schedule_id} for "
                     f"agent '{pending.agent_name}': {zombie_reason}; "
-                    f"outbox_retired={retired}"
+                    f"quarantined={quarantined}"
                 )
                 continue
             if pending.parked_at == 0:
@@ -871,7 +953,7 @@ class AgentScheduler:
             ):
                 _log(
                     f"scheduler: persisted wake #{pending.id} for "
-                    f"'{agent_name}' was confirmed but outbox retirement "
+                    f"'{agent_name}' was confirmed but receipt persistence "
                     "did not match a row"
                 )
                 break
@@ -934,10 +1016,27 @@ class AgentScheduler:
         if attempt_started is not None:
             attempt_started.set()
         main_session_id = f"{schedule.agent_name}-main"
+        fired_at = (
+            schedule.fired_at
+            if hasattr(schedule, "fired_at")
+            else schedule.last_run
+        )
+        receipt = ScheduleWakeReceipt(
+            self._registry, schedule.id, fired_at
+        )
+        callback_kwargs = {}
+        try:
+            signature = inspect.signature(self._wake_callback)
+            if "schedule_receipt" in signature.parameters:
+                callback_kwargs["schedule_receipt"] = receipt
+        except (TypeError, ValueError):
+            # Opaque callables keep the historical three-argument contract.
+            pass
         result = await self._wake_callback(
             schedule.agent_name,
             main_session_id,
             self._wake_prompt(schedule),
+            **callback_kwargs,
         )
         if inspect.isawaitable(result):
             result = await result

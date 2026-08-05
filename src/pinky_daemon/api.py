@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
@@ -10091,6 +10092,28 @@ npm run build</pre>
             "count": len(schedules),
         }
 
+    @app.get("/scheduler/wake-ledger")
+    async def list_scheduler_wake_ledger(
+        agent_name: str | None = None,
+        state: str | None = None,
+        fired_after: float = 0.0,
+        limit: int = 200,
+    ):
+        """Query exact-fire scheduler outcomes without interpreting logs."""
+        try:
+            rows = agents.list_schedule_wake_ledger(
+                agent_name,
+                state=state,
+                fired_after=fired_after,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {
+            "records": [row.to_dict() for row in rows],
+            "count": len(rows),
+        }
+
     # ── Heartbeat Endpoints ────────────────────────────────
 
     @app.post("/agents/{agent_name}/heartbeat")
@@ -10329,7 +10352,13 @@ npm run build</pre>
             "connected": ss.state == TransportSessionState.CONNECTED,
         }
 
-    async def _wake_callback(agent_name: str, session_id: str, prompt: str):
+    async def _wake_callback(
+        agent_name: str,
+        session_id: str,
+        prompt: str,
+        *,
+        schedule_receipt=None,
+    ):
         """Queue a wake and return its exact per-prompt delivery receipt."""
         del session_id  # Streaming is now the canonical main runtime.
         ss = await _ensure_streaming_session(agent_name, label="main")
@@ -10339,7 +10368,17 @@ npm run build</pre>
 
         scheduler_send = getattr(ss, "send_scheduler_prompt", None)
         if callable(scheduler_send):
-            receipt = await scheduler_send(prompt)
+            scheduler_kwargs = {}
+            if schedule_receipt is not None:
+                try:
+                    signature = inspect.signature(scheduler_send)
+                    if "on_accept" in signature.parameters:
+                        scheduler_kwargs["on_accept"] = (
+                            schedule_receipt.accept
+                        )
+                except (TypeError, ValueError):
+                    pass
+            receipt = await scheduler_send(prompt, **scheduler_kwargs)
             _log(
                 f"scheduler: queued confirmed-delivery wake for "
                 f"{agent_name} via streaming main"
@@ -10352,6 +10391,21 @@ npm run build</pre>
             and getattr(ss, "injection_confirms_consumption", False)
         )
         if confirmed:
+            if schedule_receipt is not None:
+                try:
+                    persisted = schedule_receipt.accept()
+                except Exception as exc:
+                    persisted = False
+                    _log(
+                        "scheduler: SCHEDULER_RECEIPT_PERSIST_FAILURE "
+                        f"for {agent_name}: {type(exc).__name__}: {exc}"
+                    )
+                if persisted is not True:
+                    _log(
+                        "scheduler: SCHEDULER_RECEIPT_PERSIST_FAILURE "
+                        f"for {agent_name}: no durable positive evidence; "
+                        "suppressing unsafe replay"
+                    )
             _log(
                 f"scheduler: wake accepted for {agent_name} via "
                 f"streaming main"

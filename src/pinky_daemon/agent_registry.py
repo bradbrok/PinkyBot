@@ -654,7 +654,12 @@ class AgentSchedule:
 
 @dataclass
 class PendingScheduleWake:
-    """A fired scheduler prompt awaiting confirmed transport acceptance."""
+    """One durable exact-fire scheduler ledger record.
+
+    The historical class name is retained because active rows are also the
+    replay outbox.  ``accepted_at`` and ``parked_at`` make the terminal state
+    explicit without deleting the forensic receipt.
+    """
 
     id: int = 0
     schedule_id: int = 0
@@ -665,11 +670,40 @@ class PendingScheduleWake:
     created_at: float = 0.0
     attempts: int = 0
     parked_at: float = 0.0
+    accepted_at: float = 0.0
+    failed_at: float = 0.0
+    last_error: str = ""
 
     @property
     def name(self) -> str:
         """Match the ``AgentSchedule`` interface used by receipt waiting."""
         return self.schedule_name
+
+    @property
+    def ledger_state(self) -> str:
+        """Return the exact operational outcome used by fleet health."""
+        if self.accepted_at > 0:
+            return "receipted-ran-once"
+        if self.parked_at > 0:
+            return "quarantined"
+        return "pending"
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "schedule_id": self.schedule_id,
+            "agent_name": self.agent_name,
+            "schedule_name": self.schedule_name,
+            "prompt": self.prompt,
+            "fired_at": self.fired_at,
+            "created_at": self.created_at,
+            "attempts": self.attempts,
+            "parked_at": self.parked_at,
+            "accepted_at": self.accepted_at,
+            "failed_at": self.failed_at,
+            "last_error": self.last_error,
+            "state": self.ledger_state,
+        }
 
 
 class ScheduleNameConflictError(ValueError):
@@ -1279,6 +1313,9 @@ class AgentRegistry:
                 created_at REAL NOT NULL,
                 attempts INTEGER NOT NULL DEFAULT 0,
                 parked_at REAL NOT NULL DEFAULT 0,
+                accepted_at REAL NOT NULL DEFAULT 0,
+                failed_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -1619,6 +1656,9 @@ class AgentRegistry:
         wake_migrations = [
             ("attempts", "INTEGER NOT NULL DEFAULT 0"),
             ("parked_at", "REAL NOT NULL DEFAULT 0"),
+            ("accepted_at", "REAL NOT NULL DEFAULT 0"),
+            ("failed_at", "REAL NOT NULL DEFAULT 0"),
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in wake_migrations:
             if col not in wake_existing:
@@ -1629,6 +1669,13 @@ class AgentRegistry:
                     "agent_registry: migrated — added "
                     f"{col} to pending_schedule_wakes"
                 )
+        self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_schedule_wake_ledger_state
+               ON pending_schedule_wakes(
+                   agent_name, accepted_at, parked_at, fired_at
+               )"""
+        )
+        self._db.commit()
 
         # Migrate agent_heartbeats table
         hb_existing = {
@@ -3284,6 +3331,66 @@ except Exception as exc:
         )
         self._db.commit()
 
+    def claim_schedule_fire(
+        self,
+        schedule_id: int,
+        *,
+        timestamp: float,
+        expected_last_run: float,
+        agent_name: str,
+        schedule_name: str,
+        prompt: str,
+    ) -> tuple[bool, PendingScheduleWake | None]:
+        """Atomically claim one fire and create its durable ledger/outbox row.
+
+        A crash must never leave ``last_run`` advanced without an exact-fire
+        row that startup can classify.  This transaction closes that earlier
+        fire-claim/outbox gap while preserving the compare-and-swap race guard.
+        """
+        if timestamp <= 0:
+            raise ValueError("timestamp must be a positive exact-fire timestamp")
+        created_at = time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE agent_schedules SET last_run=?
+                   WHERE id=? AND last_run=?""",
+                (timestamp, schedule_id, expected_last_run),
+            )
+            if cursor.rowcount == 0:
+                self._db.commit()
+                return False, None
+            self._db.execute(
+                """INSERT OR IGNORE INTO pending_schedule_wakes (
+                       schedule_id, agent_name, schedule_name, prompt,
+                       fired_at, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    schedule_id,
+                    agent_name,
+                    schedule_name,
+                    prompt,
+                    timestamp,
+                    created_at,
+                ),
+            )
+            row = self._select_schedule_wake_by_fire(
+                schedule_id, timestamp
+            )
+            self._db.commit()
+        return True, PendingScheduleWake(*row)
+
+    def _select_schedule_wake_by_fire(
+        self, schedule_id: int, fired_at: float
+    ):
+        return self._db.execute(
+            """SELECT id, schedule_id, agent_name, schedule_name, prompt,
+                      fired_at, created_at, attempts, parked_at, accepted_at,
+                      failed_at, last_error
+               FROM pending_schedule_wakes
+               WHERE schedule_id=? AND fired_at=?""",
+            (schedule_id, fired_at),
+        ).fetchone()
+
     def persist_schedule_wake(
         self,
         schedule_id: int,
@@ -3321,7 +3428,8 @@ except Exception as exc:
             created = cursor.rowcount > 0
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
-                          fired_at, created_at, attempts, parked_at
+                          fired_at, created_at, attempts, parked_at, accepted_at,
+                          failed_at, last_error
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -3337,18 +3445,20 @@ except Exception as exc:
     ) -> list[PendingScheduleWake]:
         """Return pending scheduler wakes oldest-first.
 
-        Parked rows are dead letters and are excluded by default. Pass
-        ``include_parked=True`` to inspect them. For now, deleting a parked row
-        manually is the only supported way to unpark it.
+        Accepted receipts are always excluded. Quarantined rows are excluded
+        by default; pass ``include_parked=True`` to inspect those terminal
+        records alongside the active replay outbox.
         """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
-                        fired_at, created_at, attempts, parked_at
+                        fired_at, created_at, attempts, parked_at, accepted_at,
+                        failed_at, last_error
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
         if agent_name is not None:
             conditions.append("agent_name=?")
             params.append(agent_name)
+        conditions.append("accepted_at=0")
         if not include_parked:
             conditions.append("parked_at=0")
         if conditions:
@@ -3356,6 +3466,82 @@ except Exception as exc:
         sql += " ORDER BY fired_at ASC, id ASC"
         rows = self._db.execute(sql, params).fetchall()
         return [PendingScheduleWake(*row) for row in rows]
+
+    def list_schedule_wake_ledger(
+        self,
+        agent_name: str | None = None,
+        *,
+        state: str | None = None,
+        fired_after: float = 0.0,
+        limit: int = 200,
+    ) -> list[PendingScheduleWake]:
+        """Return queryable exact-fire outcomes newest-first for fleet health."""
+        if state not in {
+            None,
+            "pending",
+            "receipted-ran-once",
+            "quarantined",
+        }:
+            raise ValueError(f"invalid scheduler wake ledger state: {state}")
+        sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
+                        fired_at, created_at, attempts, parked_at, accepted_at,
+                        failed_at, last_error
+                 FROM pending_schedule_wakes"""
+        conditions: list[str] = []
+        params: list = []
+        if agent_name is not None:
+            conditions.append("agent_name=?")
+            params.append(agent_name)
+        if fired_after > 0:
+            conditions.append("fired_at>=?")
+            params.append(fired_after)
+        if state == "pending":
+            conditions.extend(("accepted_at=0", "parked_at=0"))
+        elif state == "receipted-ran-once":
+            conditions.append("accepted_at>0")
+        elif state == "quarantined":
+            conditions.extend(("accepted_at=0", "parked_at>0"))
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY fired_at DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self._db.execute(sql, params).fetchall()
+        return [PendingScheduleWake(*row) for row in rows]
+
+    def get_schedule_wake_by_fire(
+        self, schedule_id: int, fired_at: float
+    ) -> PendingScheduleWake | None:
+        """Return one exact-fire ledger row regardless of terminal state."""
+        row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
+        return PendingScheduleWake(*row) if row is not None else None
+
+    def record_schedule_wake_failure(
+        self, schedule_id: int, fired_at: float, reason: str
+    ) -> tuple[PendingScheduleWake | None, bool]:
+        """Record a negative hint unless durable terminal evidence exists.
+
+        Returns the current row and whether this was its first negative hint.
+        A retained accepted receipt always wins over a cancelled/stale Future.
+        """
+        timestamp = time.time()
+        with self._rmw_lock:
+            row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
+            if row is None:
+                return None, False
+            current = PendingScheduleWake(*row)
+            if current.accepted_at > 0 or current.parked_at > 0:
+                return current, False
+            first_failure = current.failed_at == 0
+            self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND accepted_at=0 AND parked_at=0""",
+                (timestamp, reason, current.id),
+            )
+            row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
+            self._db.commit()
+        return PendingScheduleWake(*row), first_failure
 
     def increment_pending_schedule_wake_attempts(
         self, pending_id: int
@@ -3379,16 +3565,22 @@ except Exception as exc:
         return int(row[0])
 
     def park_pending_schedule_wake(
-        self, pending_id: int, *, parked_at: float = 0.0
+        self,
+        pending_id: int,
+        *,
+        parked_at: float = 0.0,
+        reason: str = "delivery attempts exhausted",
     ) -> bool:
-        """Atomically move an active wake to dead-letter parked state once."""
+        """Atomically move an active wake to terminal quarantine once."""
         timestamp = parked_at or time.time()
         with self._rmw_lock:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
-                   SET parked_at=?
-                   WHERE id=? AND parked_at=0""",
-                (timestamp, pending_id),
+                   SET parked_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND parked_at=0 AND accepted_at=0""",
+                (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
         return cursor.rowcount > 0
@@ -3396,25 +3588,33 @@ except Exception as exc:
     def confirm_pending_schedule_wake(
         self, pending_id: int, *, delivered_at: float = 0.0
     ) -> bool:
-        """Atomically stamp the schedule delivered and retire its outbox row."""
+        """Atomically retain a positive receipt and retire it from replay."""
         timestamp = delivered_at or time.time()
         with self._rmw_lock:
             row = self._db.execute(
-                "SELECT schedule_id FROM pending_schedule_wakes WHERE id=?",
+                """SELECT schedule_id, accepted_at
+                   FROM pending_schedule_wakes WHERE id=?""",
                 (pending_id,),
             ).fetchone()
             if row is None:
                 return False
             self._db.execute(
-                "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
+                """UPDATE agent_schedules
+                   SET last_delivered=MAX(last_delivered, ?)
+                   WHERE id=?""",
                 (timestamp, row[0]),
             )
-            cursor = self._db.execute(
-                "DELETE FROM pending_schedule_wakes WHERE id=?",
-                (pending_id,),
+            self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET accepted_at=CASE
+                           WHEN accepted_at=0 THEN ? ELSE accepted_at END,
+                       parked_at=0,
+                       last_error=''
+                   WHERE id=?""",
+                (timestamp, pending_id),
             )
             self._db.commit()
-        return cursor.rowcount > 0
+        return True
 
     def confirm_pending_schedule_wake_by_fire(
         self,
@@ -3423,34 +3623,40 @@ except Exception as exc:
         *,
         delivered_at: float = 0.0,
     ) -> bool:
-        """Atomically confirm and retire the outbox row for one exact fire."""
+        """Atomically persist acceptance for one exact fire before replay."""
         timestamp = delivered_at or time.time()
         with self._rmw_lock:
             row = self._db.execute(
-                """SELECT id FROM pending_schedule_wakes
+                """SELECT id, accepted_at FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
             ).fetchone()
             if row is None:
                 return False
             self._db.execute(
-                "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
+                """UPDATE agent_schedules
+                   SET last_delivered=MAX(last_delivered, ?)
+                   WHERE id=?""",
                 (timestamp, schedule_id),
             )
-            cursor = self._db.execute(
-                """DELETE FROM pending_schedule_wakes
+            self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET accepted_at=CASE
+                           WHEN accepted_at=0 THEN ? ELSE accepted_at END,
+                       parked_at=0,
+                       last_error=''
                    WHERE schedule_id=? AND fired_at=?""",
-                (schedule_id, fired_at),
+                (timestamp, schedule_id, fired_at),
             )
             self._db.commit()
-        retired = cursor.rowcount > 0
-        if retired:
+        newly_receipted = float(row[1]) == 0
+        if newly_receipted:
             _log(
-                "agent_registry: PERSISTED_WAKE_RETIRED_ON_LATE_CONFIRM "
+                "agent_registry: SCHEDULE_WAKE_RECEIPTED "
                 f"pending #{row[0]}, schedule #{schedule_id}, "
                 f"fired_at={fired_at}"
             )
-        return retired
+        return True
 
     def discard_pending_schedule_wake(self, pending_id: int) -> bool:
         """Retire a pending wake without marking its schedule delivered."""

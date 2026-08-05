@@ -862,6 +862,10 @@ class _QueuedTurn:
     # transcript user row, or queue enqueue followed by dequeue; successful
     # tmux keystrokes alone are not a receipt.
     scheduler_delivery: asyncio.Future[bool] | None = None
+    # Exact-fire durable acceptance callback. It MUST run successfully before
+    # ``scheduler_delivery`` resolves True; otherwise a process death can lose
+    # the only positive evidence and replay work that already entered the pane.
+    scheduler_accept: object = None  # Callable() -> bool
     scheduler_serialized: bool = False
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
@@ -3463,7 +3467,7 @@ class TmuxSession:
         )
 
     async def send_scheduler_prompt(
-        self, prompt: str
+        self, prompt: str, *, on_accept=None
     ) -> asyncio.Future[bool]:
         """Start a scheduler turn and return its exact acceptance receipt.
 
@@ -3475,6 +3479,7 @@ class TmuxSession:
         queued = await self._queue_external_turn(
             prompt,
             scheduler_delivery=receipt,
+            scheduler_accept=on_accept,
             scheduler_serialized=True,
         )
         if not queued and not receipt.done():
@@ -3527,6 +3532,7 @@ class TmuxSession:
         message_id: str = "",
         agent_hint: str = "",
         scheduler_delivery: asyncio.Future[bool] | None = None,
+        scheduler_accept=None,
         scheduler_serialized: bool = False,
     ) -> bool:
         """Apply external-send side effects and enqueue one pane turn."""
@@ -3558,6 +3564,7 @@ class TmuxSession:
             chat_id=chat_id,
             message_id=message_id,
             scheduler_delivery=scheduler_delivery,
+            scheduler_accept=scheduler_accept,
             scheduler_serialized=scheduler_serialized,
         )
         if scheduler_serialized:
@@ -6803,6 +6810,26 @@ class TmuxSession:
         # callback has an entry to pop. _finish_turn_delivery is idempotent.
         if self._wake_requires_submission_receipt(turn):
             self._finish_turn_delivery(turn, fire_on_delivered=False)
+        if turn.scheduler_accept is not None:
+            try:
+                persisted = turn.scheduler_accept()
+            except Exception as exc:
+                persisted = False
+                _log(
+                    f"tmux[{self.agent_name}]: "
+                    "SCHEDULER_RECEIPT_PERSIST_FAILURE after exact transport "
+                    f"acceptance ({type(exc).__name__}: {exc})"
+                )
+            if persisted is not True:
+                # The prompt is already accepted and cannot safely be replayed.
+                # Resolve the in-process receipt positively so the scheduler
+                # gets one more chance to persist before shutdown, while the
+                # loud log makes the degraded durability visible.
+                _log(
+                    f"tmux[{self.agent_name}]: "
+                    "SCHEDULER_RECEIPT_PERSIST_FAILURE returned no durable "
+                    "positive evidence; suppressing unsafe replay"
+                )
         turn.transport_accepted = True
         for receipt in (turn.scheduler_delivery, turn.submission_receipt):
             if receipt is not None and not receipt.done():
@@ -7185,11 +7212,10 @@ class TmuxSession:
                     gate_subtype = "timeout"
                     _log(
                         f"tmux[{self.agent_name}]: wake-prompt readiness "
-                        f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s "
-                        f"— proceeding with paste anyway "
-                        f"(reason={turn.reason}). Hook may have failed to "
-                        f"fire; check the agent's "
-                        f".claude/hook_tmux_session_start.py."
+                        f"gate still pending after "
+                        f"{_SESSION_READY_GATE_TIMEOUT_SEC}s — proceeding "
+                        f"with paste; exact transcript receipt remains the "
+                        f"delivery verdict (reason={turn.reason})"
                     )
 
             if self._analytics_store:
