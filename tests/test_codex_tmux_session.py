@@ -388,6 +388,162 @@ async def test_codex_acceptance_reserves_meta_before_same_read_completion():
     assert len(ss._inflight_metas) == 0
 
 
+@pytest.mark.asyncio
+async def test_coalesced_multi_message_turn_releases_waiting_scheduler_wake(
+    capsys,
+):
+    """#1006 regression: rapid ordinary pastes can be accepted inside one
+    Codex rollout turn, which emits one task_complete.  The extra accepted meta
+    must not keep a mid-turn scheduler wake parked after the pane becomes idle.
+    """
+    tmux = _mock_tmux()
+    ss = _session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._tailer = MagicMock()
+    ss._tailer._active = True
+    ss._worker_task = asyncio.create_task(ss._message_worker())
+    receipt = None
+    try:
+        assert await ss.send("cluster A") is True
+        assert await ss.send("cluster B") is True
+        for _ in range(100):
+            if tmux.paste_text.await_count == 2:
+                break
+            await asyncio.sleep(0.01)
+        assert tmux.paste_text.await_count == 2
+        assert len(ss._inflight_metas) == 2
+
+        for prompt in ("cluster A", "cluster B"):
+            ss._on_transcript_entry({
+                "type": "event_msg",
+                "payload": {"type": "user_message", "message": prompt},
+            })
+        assert all(meta.turn.transport_accepted for meta in ss._inflight_metas)
+
+        receipt = await ss.send_scheduler_prompt("wake after cluster")
+        await asyncio.sleep(0.02)
+        assert tmux.paste_text.await_count == 2
+
+        # The real tailer flips this before invoking _handle_turn_complete.
+        ss._tailer._active = False
+        await ss._handle_turn_complete(
+            TurnResponse(text="cluster complete", stop_reason="task_complete")
+        )
+
+        for _ in range(100):
+            if tmux.paste_text.await_count == 3:
+                break
+            await asyncio.sleep(0.01)
+        assert tmux.paste_text.await_count == 3
+        assert tmux.paste_text.await_args_list[-1].args == (
+            "wake after cluster",
+        )
+        logs = capsys.readouterr().err
+        assert (
+            "CODEX_SCHEDULER_GATE tools=False in_hand=False queued=False "
+            "metas=True tailer_active=True busy=True"
+        ) in logs
+        assert "reason=accepted_before_task_close reconciled=1" in logs
+    finally:
+        if receipt is not None and not receipt.done():
+            receipt.cancel()
+        await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_unaccepted_meta_reconciles_only_after_two_explicit_idle_reads(
+    monkeypatch,
+):
+    """A lost submit leaves a pasted/unaccepted meta.  Two literal Codex idle
+    pane reads release it; one read or a busy footer never does."""
+    import pinky_daemon.codex_tmux_session as codex_tmux_session
+
+    monkeypatch.setattr(codex_tmux_session, "_CODEX_IDLE_CONFIRM_SEC", 0.001)
+    tmux = _mock_tmux()
+    idle = (
+        "\x1b[2m• \x1b[0mNo action needed.\n\n"
+        "\x1b[1m›\x1b[0m \x1b[2mExplain this codebase\x1b[0m\n\n"
+        "  \x1b[38;2;246;226;183mgpt-5.6-sol xhigh\x1b[2m\x1b[39m "
+        "· \x1b[0m\x1b[38;2;171;223;167m~/PinkyBot/data/agents/murzik"
+        "\x1b[39m\n"
+    )
+    tmux.capture_pane = AsyncMock(side_effect=[_ok(idle), _ok(idle)])
+    ss = _session(tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._tailer = MagicMock()
+    ss._tailer._active = False
+    stale = _QueuedTurn(prompt="lost ordinary paste")
+    stale.pane_delivery_started = True
+    ss._finish_turn_delivery(stale)
+    ss._tailer._active = False
+
+    receipt = await ss.send_scheduler_prompt("wake after lost paste")
+    try:
+        for _ in range(100):
+            if tmux.paste_text.await_count == 1:
+                break
+            await asyncio.sleep(0.01)
+        assert tmux.capture_pane.await_count == 2
+        assert all(
+            awaited.kwargs == {"lines": 12, "escapes": True}
+            for awaited in tmux.capture_pane.await_args_list
+        )
+        tmux.paste_text.assert_awaited_once_with(
+            "wake after lost paste", enter=True
+        )
+        assert all(
+            meta.turn.prompt != "lost ordinary paste"
+            for meta in ss._inflight_metas
+        )
+    finally:
+        if not receipt.done():
+            receipt.cancel()
+        await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_idle_override_never_retires_unresolved_exact_receipt():
+    """Pane appearance cannot negate an already-pasted exact-fire contract."""
+    ss = _session()
+    ss._state_machine._state = SessionState.CONNECTED
+    ss._tailer = MagicMock()
+    ss._tailer._active = False
+    receipt = asyncio.get_running_loop().create_future()
+    exact = _QueuedTurn(
+        prompt="exact fire",
+        scheduler_delivery=receipt,
+        scheduler_serialized=True,
+    )
+    exact.pane_delivery_started = True
+    ss._finish_turn_delivery(exact)
+    ss._tailer._active = False
+
+    assert ss._codex_gate_blocked_only_by_metas() is False
+    assert len(ss._inflight_metas) == 1
+    assert not receipt.done()
+    receipt.cancel()
+
+
+def test_codex_explicit_idle_classifier_requires_footer_and_no_busy_literal():
+    footer = (
+        "  \x1b[38;2;246;226;183mgpt-5.6-sol xhigh\x1b[2m\x1b[39m "
+        "· \x1b[0m\x1b[38;2;171;223;167m~/PinkyBot/data/agents/murzik"
+        "\x1b[39m\n"
+    )
+    idle = "\x1b[1m›\x1b[0m \x1b[2mExplain this codebase\x1b[0m\n" + footer
+    busy = (
+        "• Working (2m 54s • esc to interrupt)\n"
+        + idle
+    )
+    no_footer = "\x1b[1m›\x1b[0m \x1b[2mExplain this codebase\x1b[0m\n"
+
+    assert CodexTmuxSession._codex_pane_is_explicitly_idle(idle, "murzik")
+    assert not CodexTmuxSession._codex_pane_is_explicitly_idle(busy, "murzik")
+    assert not CodexTmuxSession._codex_pane_is_explicitly_idle(
+        no_footer, "murzik"
+    )
+
+
 # ── StopFailure hook is a no-op for codex (#795 P2) ─────────────────────────
 @pytest.mark.asyncio
 async def test_handle_stop_failure_is_noop_for_codex():
