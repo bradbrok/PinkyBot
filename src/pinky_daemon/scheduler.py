@@ -36,6 +36,9 @@ def _log(msg: str) -> None:
 _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
 _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 
+# ── Persisted Wake Retry Limits ───────────────────────────────
+_MAX_WAKE_CONFIRMATION_ATTEMPTS = 3  # Discard after 3 failed confirmations
+
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
     """Return True if this agent runs on Claude Code (not Codex or other provider)."""
@@ -758,12 +761,34 @@ class AgentScheduler:
                     f"'{agent_name}' remains pending after replay: "
                     f"{type(exc).__name__}: {exc}"
                 )
+                # Increment attempt count and check if we should give up
+                new_attempt = self._registry.increment_pending_wake_attempt(pending.id)
+                if new_attempt >= _MAX_WAKE_CONFIRMATION_ATTEMPTS:
+                    retired = self._registry.discard_pending_schedule_wake(pending.id)
+                    _log(
+                        f"scheduler: PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED pending "
+                        f"#{pending.id}, schedule #{pending.schedule_id} for "
+                        f"agent '{pending.agent_name}': exception after {new_attempt} attempts; "
+                        f"outbox_retired={retired}"
+                    )
+                    continue
                 break
             if not confirmed:
                 _log(
                     f"scheduler: persisted wake #{pending.id} for "
                     f"'{agent_name}' remains pending: no positive receipt"
                 )
+                # Increment attempt count and check if we should give up
+                new_attempt = self._registry.increment_pending_wake_attempt(pending.id)
+                if new_attempt >= _MAX_WAKE_CONFIRMATION_ATTEMPTS:
+                    retired = self._registry.discard_pending_schedule_wake(pending.id)
+                    _log(
+                        f"scheduler: PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED pending "
+                        f"#{pending.id}, schedule #{pending.schedule_id} for "
+                        f"agent '{pending.agent_name}': no confirmation after {new_attempt} attempts; "
+                        f"outbox_retired={retired}"
+                    )
+                    continue
                 break
             delivered_at = time.time()
             if not self._registry.confirm_pending_schedule_wake(

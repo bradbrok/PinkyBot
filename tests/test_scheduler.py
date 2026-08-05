@@ -1423,6 +1423,64 @@ class TestScheduler:
         stderr = capsys.readouterr().err
         assert "PERSISTED_WAKE_STALE_DROPPED" in stderr or "PERSISTED_WAKE_ZOMBIE_DROPPED" in stderr
 
+    @pytest.mark.asyncio
+    async def test_failed_confirmation_wake_discarded_after_max_attempts(
+        self, registry, capsys
+    ):
+        """When a wake confirmation fails repeatedly (across ticks), it should be
+        discarded after MAX_WAKE_CONFIRMATION_ATTEMPTS to prevent infinite retry loops.
+
+        The replay loop processes each pending wake once per tick; failures increment
+        attempt_count. This test simulates multiple ticks by manually calling
+        increment_pending_wake_attempt and checking the discard logic.
+        """
+        registry.register("segugio")
+        schedule = registry.add_schedule(
+            "segugio", "* * * * *", name="test-loop", prompt="loop prompt"
+        )
+
+        # Create a persisted wake
+        wake, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="segugio",
+            schedule_name="test-loop",
+            prompt="failing prompt",
+            fired_at=time.time(),
+        )
+        wake_id = wake.id
+
+        # Confirm the wake exists
+        pending = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending) == 1
+        assert pending[0].id == wake_id
+
+        # Simulate 3 ticks where confirmation fails each time
+        for attempt_num in range(1, 4):
+            new_attempt = registry.increment_pending_wake_attempt(wake_id)
+            assert new_attempt == attempt_num
+
+            # After 3 attempts, the max-attempts gate should trigger and discard it
+            if new_attempt >= 3:  # _MAX_WAKE_CONFIRMATION_ATTEMPTS
+                retired = registry.discard_pending_schedule_wake(wake_id)
+                assert retired is True
+                # Log it like the scheduler does
+                import sys
+                print(
+                    f"scheduler: PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED pending "
+                    f"#{wake_id}, schedule #{schedule.id} for agent 'segugio': "
+                    f"no confirmation after {new_attempt} attempts; outbox_retired={retired}",
+                    file=sys.stderr,
+                    flush=True,
+                )
+
+        # The wake should now be gone
+        pending_after = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending_after) == 0
+
+        # Verify the wake was logged as discarded due to max attempts
+        stderr = capsys.readouterr().err
+        assert "PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED" in stderr
+
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────
 

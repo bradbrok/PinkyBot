@@ -1645,6 +1645,18 @@ class AgentRegistry:
             )
             _log("agent_registry: migrated — added wake_action to agent_contexts")
 
+        # Migrate pending_schedule_wakes table — add attempt_count to prevent
+        # infinite retry loops when wake confirmation fails. Wakes stuck in
+        # confirmation failure will be discarded after MAX_ATTEMPTS (3).
+        psw_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(pending_schedule_wakes)").fetchall()
+        }
+        if "attempt_count" not in psw_existing:
+            self._db.execute(
+                "ALTER TABLE pending_schedule_wakes ADD COLUMN attempt_count INTEGER NOT NULL DEFAULT 0"
+            )
+            _log("agent_registry: migrated — added attempt_count to pending_schedule_wakes")
+
         # Migrate pending_messages table — reply_chat_id preserves the true reply
         # destination (e.g. the Slack/Telegram channel a group message arrived in).
         # The chat_id column is the per-user approval key (the sender's id); in a
@@ -3350,6 +3362,26 @@ except Exception as exc:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    def increment_pending_wake_attempt(self, pending_id: int) -> int:
+        """Increment attempt_count for a pending wake and return the new count.
+
+        Used to track confirmation failures in the retry loop. Returns the new
+        attempt_count value, or -1 if the wake was not found.
+        """
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                "UPDATE pending_schedule_wakes SET attempt_count = attempt_count + 1 WHERE id = ?",
+                (pending_id,),
+            )
+            if cursor.rowcount == 0:
+                return -1
+            row = self._db.execute(
+                "SELECT attempt_count FROM pending_schedule_wakes WHERE id = ?",
+                (pending_id,),
+            ).fetchone()
+            self._db.commit()
+            return row[0] if row else -1
 
     # ── Heartbeats ─────────────────────────────────────────
 
