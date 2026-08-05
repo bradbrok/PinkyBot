@@ -458,14 +458,16 @@ class CodexSession:
         )
 
     async def send_scheduler_prompt(
-        self, prompt: str
+        self, prompt: str, *, on_accept=None
     ) -> asyncio.Future[bool]:
         """Queue a scheduler prompt and confirm transport acceptance."""
         receipt: asyncio.Future[bool] = (
             asyncio.get_running_loop().create_future()
         )
         queued = await self._queue_external_message(
-            prompt, scheduler_delivery=receipt
+            prompt,
+            scheduler_delivery=receipt,
+            scheduler_accept=on_accept,
         )
         if not queued and not receipt.done():
             receipt.set_result(False)
@@ -479,6 +481,32 @@ class CodexSession:
         if receipt is not None and not receipt.done():
             receipt.set_result(accepted)
 
+    def _accept_scheduler_delivery(
+        self,
+        receipt: asyncio.Future[bool] | None,
+        scheduler_accept=None,
+    ) -> None:
+        """Persist the exact-fire receipt before resolving the Future True."""
+        if scheduler_accept is not None:
+            try:
+                persisted = scheduler_accept()
+            except Exception as exc:
+                persisted = False
+                _log(
+                    f"codex[{self.agent_name}]: "
+                    "SCHEDULER_RECEIPT_PERSIST_FAILURE after exact transport "
+                    f"acceptance ({type(exc).__name__}: {exc})"
+                )
+            if persisted is not True:
+                # The turn is already accepted. A negative receipt would make
+                # replay more dangerous than the durability degradation.
+                _log(
+                    f"codex[{self.agent_name}]: "
+                    "SCHEDULER_RECEIPT_PERSIST_FAILURE returned no durable "
+                    "positive evidence; suppressing unsafe replay"
+                )
+        self._resolve_scheduler_delivery(receipt, True)
+
     async def _queue_external_message(
         self,
         prompt: str,
@@ -488,6 +516,7 @@ class CodexSession:
         message_id: str = "",
         agent_hint: str = "",
         scheduler_delivery: asyncio.Future[bool] | None = None,
+        scheduler_accept=None,
     ) -> bool:
         """Apply external-send side effects and enqueue one Codex turn."""
         if self.state != SessionState.CONNECTED:
@@ -529,6 +558,7 @@ class CodexSession:
                 chat_id,
                 message_id,
                 scheduler_delivery,
+                scheduler_accept,
             )
         await self._message_queue.put(queued)
         _log(f"codex[{self.agent_name}]: queued message (chat={chat_id})")
@@ -547,6 +577,7 @@ class CodexSession:
                 queued = await self._message_queue.get()
                 prompt, platform, chat_id, message_id = queued[:4]
                 scheduler_delivery = queued[4] if len(queued) > 4 else None
+                scheduler_accept = queued[5] if len(queued) > 5 else None
                 if (
                     scheduler_delivery is not None
                     and scheduler_delivery.cancelled()
@@ -558,6 +589,12 @@ class CodexSession:
                     async with self._exec_lock:
                         if scheduler_delivery is None:
                             result = await self._exec_codex(prompt)
+                        elif scheduler_accept is not None:
+                            result = await self._exec_codex(
+                                prompt,
+                                scheduler_delivery=scheduler_delivery,
+                                scheduler_accept=scheduler_accept,
+                            )
                         else:
                             result = await self._exec_codex(
                                 prompt,
@@ -876,6 +913,7 @@ class CodexSession:
         prompt: str,
         *,
         scheduler_delivery: asyncio.Future[bool] | None = None,
+        scheduler_accept=None,
     ) -> CodexTurnResult:
         """Run a single codex exec invocation and parse JSONL output.
 
@@ -885,7 +923,9 @@ class CodexSession:
             if scheduler_delivery is None:
                 return await self._exec_codex_app_server(prompt)
             return await self._exec_codex_app_server(
-                prompt, scheduler_delivery=scheduler_delivery
+                prompt,
+                scheduler_delivery=scheduler_delivery,
+                scheduler_accept=scheduler_accept,
             )
 
         result = CodexTurnResult()
@@ -934,7 +974,9 @@ class CodexSession:
             # The exact prompt has crossed the exec transport boundary.
             # Merely acquiring _exec_lock or spawning the process is not a
             # receipt: stdin write+drain+EOF is the first observed acceptance.
-            self._resolve_scheduler_delivery(scheduler_delivery, True)
+            self._accept_scheduler_delivery(
+                scheduler_delivery, scheduler_accept
+            )
 
             # Stream stdout line-by-line for real-time activity tracking.
             # Defensive: skip-and-continue on a single oversized line rather
@@ -1147,6 +1189,7 @@ class CodexSession:
         prompt: str,
         *,
         scheduler_delivery: asyncio.Future[bool] | None = None,
+        scheduler_accept=None,
     ) -> CodexTurnResult:
         """Run a single turn over the long-lived app-server connection."""
         result = CodexTurnResult()
@@ -1228,7 +1271,9 @@ class CodexSession:
             await client.request("turn/start", turn_params)
             # Successful turn/start response is the app-server's exact prompt
             # acceptance edge. Thread start/resume alone is not sufficient.
-            self._resolve_scheduler_delivery(scheduler_delivery, True)
+            self._accept_scheduler_delivery(
+                scheduler_delivery, scheduler_accept
+            )
 
             # turn/start returns immediately; notifications drive the turn.
             # _on_appserver_notification resolves _turn_done on turn/completed.

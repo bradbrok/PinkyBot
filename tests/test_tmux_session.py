@@ -9322,6 +9322,30 @@ class TestWakeSubmissionVerification:
         assert fires == ["delivered"]
 
     @pytest.mark.asyncio
+    async def test_scheduler_acceptance_persists_before_future_resolves(
+        self,
+    ) -> None:
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        receipt = asyncio.get_running_loop().create_future()
+        ordering: list[bool] = []
+
+        def persist_exact_fire() -> bool:
+            ordering.append(receipt.done())
+            return True
+
+        turn = _QueuedTurn(
+            prompt="scheduled exact fire",
+            scheduler_delivery=receipt,
+            scheduler_accept=persist_exact_fire,
+            scheduler_serialized=True,
+        )
+
+        ss._mark_transport_accepted(turn)
+
+        assert ordering == [False]
+        assert await receipt is True
+
+    @pytest.mark.asyncio
     async def test_missing_receipt_retries_enter_only_then_verifies(
         self, monkeypatch,
     ) -> None:

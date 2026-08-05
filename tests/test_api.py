@@ -5340,6 +5340,40 @@ class TestAgentScheduleEndpoints:
 
         assert response.status_code == 400
 
+    def test_wake_ledger_endpoint_filters_queryable_receipts(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(
+            client,
+            direct_send=False,
+            target_channel="",
+        ).json()
+        registry = client.app.state.agents
+        row, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="Original",
+            fired_at=100.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            row.id, delivered_at=110.0
+        )
+
+        response = client.get(
+            "/scheduler/wake-ledger",
+            params={
+                "agent_name": "alice",
+                "state": "receipted-ran-once",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 1
+        assert body["records"][0]["state"] == "receipted-ran-once"
+        assert body["records"][0]["fired_at"] == 100.0
+
 
 # ── Agent CRUD ───────────────────────────────────────────────
 

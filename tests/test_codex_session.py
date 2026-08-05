@@ -1296,12 +1296,20 @@ class TestCodexAppServerTurn:
         fake = _FakeAppClient(s, notifications)
         _patch_ensure(s, fake)
         receipt = asyncio.get_running_loop().create_future()
+        acceptance_order: list[bool] = []
+
+        def persist_exact_fire() -> bool:
+            acceptance_order.append(receipt.done())
+            return True
 
         result = await s._exec_codex_app_server(
-            "hi there", scheduler_delivery=receipt
+            "hi there",
+            scheduler_delivery=receipt,
+            scheduler_accept=persist_exact_fire,
         )
 
         assert not result.failed
+        assert acceptance_order == [False]
         assert await receipt is True
         assert result.text_parts == ["hello"]
         assert result.input_tokens == 100
