@@ -138,6 +138,63 @@ def _row_to_skill(row: tuple) -> Skill:
     )
 
 
+class SkillDbConfigError(RuntimeError):
+    """Raised when the skills DB cannot be confirmed in the required rollback
+    (TRUNCATE) journal mode. We refuse to run the skills DB on WAL: a WAL whose
+    ``-wal`` sidecar is unlinked under the live daemon leaves committed writes
+    (skill assignments) invisible to every subsequent reader, silently."""
+
+
+def _configure_skills_db_connection(
+    conn: sqlite3.Connection, *, retries: int = 6, busy_ms: int = 5000
+) -> str:
+    """Put the skills-DB connection into rollback (TRUNCATE) journal mode.
+
+    Mirrors ``_configure_agents_db_connection`` (agent_registry) rather than
+    importing it: ``dream_runner`` already mirrors the same logic inline, and
+    importing would couple skill_store -> agent_registry for four PRAGMAs.
+
+    Why not WAL: in WAL mode the committed content of a transaction lives in the
+    ``-wal`` sidecar until checkpoint. If that sidecar is removed while the
+    daemon holds the DB open (#797/#220 fallout — the agents DB was already
+    moved off WAL and survived; this DB was not and lost every skill
+    assignment), the writes are simply gone for later readers while the daemon
+    keeps reporting success. Rollback mode keeps committed data in the main DB
+    file and maps no ``-shm`` at all.
+
+    Runs BEFORE table init, so an existing WAL file is converted in place.
+
+    Fails LOUD: if the connection cannot be confirmed in ``truncate`` mode after
+    bounded retries, raises :class:`SkillDbConfigError` rather than silently
+    running on WAL. Returns the effective journal mode (``"truncate"``).
+    """
+    conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
+    last: str | None = None
+    for attempt in range(retries):
+        # If still on WAL, drain it first so no committed WAL content is
+        # stranded before the wal-index is dropped. Busy here is non-fatal —
+        # the mode switch below retries.
+        try:
+            cur = conn.execute("PRAGMA journal_mode").fetchone()
+            if cur and str(cur[0]).lower() == "wal":
+                conn.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+        except sqlite3.OperationalError:
+            pass
+        try:
+            row = conn.execute("PRAGMA journal_mode=TRUNCATE").fetchone()
+            last = str(row[0]).lower() if row else None
+            if last == "truncate":
+                return last
+        except sqlite3.OperationalError as exc:
+            last = f"error:{exc}"
+        time.sleep(0.2 * (attempt + 1))
+    raise SkillDbConfigError(
+        f"skills DB refused to leave WAL: journal_mode={last!r} after {retries} "
+        f"attempts — refusing to run on WAL, where an unlinked -wal silently "
+        f"discards skill assignments (#797/#220)."
+    )
+
+
 class SkillStore:
     """SQLite-backed skill registry with per-agent assignment."""
 
@@ -153,8 +210,11 @@ class SkillStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=30000")
+            # Rollback (TRUNCATE), never WAL — see _configure_skills_db_connection.
+            # Runs before any table use so an existing WAL DB is converted in place.
+            # busy_ms matches the 30s standardised for thread-local store
+            # connections in #942.
+            _configure_skills_db_connection(connection, busy_ms=30000)
             connection.execute("PRAGMA foreign_keys=ON")
             self._thread_local.connection = connection
         return connection
