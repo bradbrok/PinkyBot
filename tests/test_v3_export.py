@@ -200,3 +200,107 @@ def test_refuses_to_overwrite_legacy_artifact(v2_instruction_authority: dict[str
         _export(paths, paths["legacy"])
 
     assert paths["legacy"].read_bytes() == original
+
+
+# ── messaging continuity (task #516 / V3#12 item 4) ──────────────────────────
+
+from scripts.v3_export import (  # noqa: E402
+    PLATFORM_SOURCE_GROUP_TABLE,
+    PLATFORM_SOURCE_ID_SHAPE,
+    PLATFORM_SOURCE_UNRESOLVED,
+    _resolve_platform,
+    export_messaging_continuity,
+)
+
+
+@pytest.fixture
+def v2_messaging_state(tmp_path: Path) -> Path:
+    agents_db = tmp_path / "conversations_agents.db"
+    registry = AgentRegistry(db_path=str(agents_db))
+    registry.register("barsik", soul="soul", working_dir=str(tmp_path / "home"))
+    registry.approve_user("barsik", "6770805286", display_name="Brad", approved_by="owner")
+    registry.approve_user("barsik", "-5270435808", display_name="B & Barsik", approved_by="owner")
+    registry.approve_user(
+        "barsik", "754027672526389310", display_name="bradbrok", approved_by="owner"
+    )
+    registry.approve_user("barsik", "web", display_name="Console", approved_by="owner")
+    # A gate-approved group with an explicit platform row.
+    registry.upsert_group_chat(
+        "barsik", "-5270435808", chat_title="B & Barsik, Yulia", platform="telegram"
+    )
+    # The orphaned-group failure class: active group, NO approved_users row.
+    registry.upsert_group_chat(
+        "barsik", "-5476255431", chat_title="B, Barsik and Yulia", platform="telegram"
+    )
+    # Gate-pending inbound that must be drained before old-lease stop.
+    registry.queue_pending_message(
+        "barsik", "telegram", "999999999999999", "Stranger", "hello?"
+    )
+    registry.approve_user("barsik", "999999999999999", display_name="Fourteen Digits")
+    registry.close()
+    return agents_db
+
+
+def test_platform_resolution_provenance() -> None:
+    groups = {"-5476255431": "telegram"}
+    assert _resolve_platform("-5476255431", groups) == ("telegram", PLATFORM_SOURCE_GROUP_TABLE)
+    assert _resolve_platform("6770805286", {}) == ("telegram", PLATFORM_SOURCE_ID_SHAPE)
+    assert _resolve_platform("-5270435808", {}) == ("telegram", PLATFORM_SOURCE_ID_SHAPE)
+    assert _resolve_platform("754027672526389310", {}) == ("discord", PLATFORM_SOURCE_ID_SHAPE)
+    assert _resolve_platform("web", {}) == ("web", PLATFORM_SOURCE_ID_SHAPE)
+    assert _resolve_platform("999999999999999", {})[1] == PLATFORM_SOURCE_UNRESOLVED
+    assert _resolve_platform("ferry://pi/geordi", {})[1] == PLATFORM_SOURCE_UNRESOLVED
+
+
+def test_every_proposal_is_deferred_never_imported(v2_messaging_state: Path) -> None:
+    records, summary, doc = export_messaging_continuity(
+        v2_messaging_state, "barsik", SNAPSHOT_AT
+    )
+    assert records, "expected at least one proposal record"
+    assert all(r["disposition"] == "defer-with-owner-approval" for r in records)
+    assert all(r["inventoryKind"] == "connector-binding" for r in records)
+    assert all(r["scope"] == {"kind": "agent", "id": "barsik"} for r in records)
+    allowed = {
+        "provider", "accountRef", "appRef", "botRef", "communityRef",
+        "conversationRef", "channelRef", "agentRef", "endpointRef", "secretRef",
+        "legacyId", "notes", "reason", "replacement", "status", "version",
+    }
+    for r in records:
+        assert set(r["details"]) <= allowed, set(r["details"]) - allowed
+        assert "role=PENDING_OWNER_DECISION" in r["details"]["notes"]
+    assert "NEGATIVE CONTROL" in doc
+
+
+def test_orphaned_active_group_is_surfaced_not_dropped(v2_messaging_state: Path) -> None:
+    records, summary, _doc = export_messaging_continuity(
+        v2_messaging_state, "barsik", SNAPSHOT_AT
+    )
+    orphans = [
+        r for r in records
+        if r["details"]["status"] == "group-active-without-gate-row"
+    ]
+    assert [r["details"]["conversationRef"] for r in orphans] == ["-5476255431"]
+    assert summary["groupsWithoutGateRow"] == 1
+
+
+def test_held_pending_inbound_counted_and_unresolved_flagged(
+    v2_messaging_state: Path,
+) -> None:
+    records, summary, doc = export_messaging_continuity(
+        v2_messaging_state, "barsik", SNAPSHOT_AT
+    )
+    by_id = {r["details"]["conversationRef"]: r["details"] for r in records}
+    assert "heldPendingInbound=1" in by_id["999999999999999"]["notes"]
+    assert f"platformSource={PLATFORM_SOURCE_UNRESOLVED}" in by_id["999999999999999"]["notes"]
+    assert summary["heldPendingInbound"] == 1
+    assert summary["unresolvedPlatform"] == 1
+    assert "1 gate-pending inbound" in doc
+
+
+def test_group_platform_row_beats_id_heuristic(v2_messaging_state: Path) -> None:
+    records, _summary, _doc = export_messaging_continuity(
+        v2_messaging_state, "barsik", SNAPSHOT_AT
+    )
+    by_id = {r["details"]["conversationRef"]: r["details"] for r in records}
+    assert f"platformSource={PLATFORM_SOURCE_GROUP_TABLE}" in by_id["-5270435808"]["notes"]
+    assert "group=yes" in by_id["-5270435808"]["notes"]
