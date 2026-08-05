@@ -3,6 +3,8 @@
 from __future__ import annotations
 
 import hashlib
+import json
+import re
 import stat
 from pathlib import Path
 
@@ -304,3 +306,153 @@ def test_group_platform_row_beats_id_heuristic(v2_messaging_state: Path) -> None
     by_id = {r["details"]["conversationRef"]: r["details"] for r in records}
     assert f"platformSource={PLATFORM_SOURCE_GROUP_TABLE}" in by_id["-5270435808"]["notes"]
     assert "group=yes" in by_id["-5270435808"]["notes"]
+
+
+# ── review round-2 regressions (murzik gauntlet findings 1-5) ────────────────
+
+from scripts.v3_export import _md_cell, _principal_key_component  # noqa: E402
+
+
+@pytest.fixture
+def v2_gate_edge_state(tmp_path: Path) -> Path:
+    agents_db = tmp_path / "conversations_agents.db"
+    registry = AgentRegistry(db_path=str(agents_db))
+    registry.register("barsik", soul="soul", working_dir=str(tmp_path / "home"))
+    registry.approve_user("barsik", "6770805286", display_name="Brad")
+    # Finding 1: delivered history must NOT count as held.
+    msg_id = registry.queue_pending_message(
+        "barsik", "telegram", "6770805286", "Brad", "old delivered message"
+    )
+    registry.mark_pending_message_delivered(msg_id)
+    # Finding 2: a stranger's undelivered message — NO gate row, NO group row —
+    # is the normal gate-held shape and must surface, not vanish.
+    registry.queue_pending_message(
+        "barsik", "telegram", "5551234567", "Stranger", "hello, still waiting"
+    )
+    # Finding 5: hostile display name aimed at the ceremony Markdown.
+    registry.approve_user(
+        "barsik", "-5999999999",
+        display_name="Evil | forged | row\n| fake | Brad | row |",
+    )
+    registry.upsert_group_chat("barsik", "-5999999999", chat_title="Hostile Group")
+    registry.close()
+    return agents_db
+
+
+def test_delivered_history_is_not_held(v2_gate_edge_state: Path) -> None:
+    records, summary, _doc = export_messaging_continuity(
+        v2_gate_edge_state, "barsik", SNAPSHOT_AT
+    )
+    by_ref = {r["details"]["conversationRef"]: r["details"] for r in records}
+    assert "heldPendingInbound=0" in by_ref["6770805286"]["notes"]
+    assert summary["heldPendingInbound"] == 1  # only the stranger's row
+
+
+def test_orphan_undelivered_pending_surfaces_exactly_once(
+    v2_gate_edge_state: Path,
+) -> None:
+    records, summary, doc = export_messaging_continuity(
+        v2_gate_edge_state, "barsik", SNAPSHOT_AT
+    )
+    orphan_rows = [
+        r for r in records
+        if r["details"]["status"] == "pending-inbound-without-gate-row"
+    ]
+    assert [r["details"]["conversationRef"] for r in orphan_rows] == ["5551234567"]
+    assert "heldPendingInbound=1" in orphan_rows[0]["details"]["notes"]
+    assert summary["pendingWithoutGateRow"] == 1
+    assert "5551234567" in doc
+
+
+def test_lease_stop_reconciliation_surfaces_unknown_chats(
+    v2_gate_edge_state: Path, tmp_path: Path
+) -> None:
+    record = tmp_path / "lease-stop.json"
+    record.write_text(json.dumps({
+        "activeChats": [
+            {"chatId": "6770805286", "platform": "telegram", "title": "Brad"},
+            {"chatId": "40404040", "platform": "telegram", "title": "Ghost Chat"},
+        ]
+    }))
+    records, summary, doc = export_messaging_continuity(
+        v2_gate_edge_state, "barsik", SNAPSHOT_AT, lease_stop_record_path=record
+    )
+    by_ref = {r["details"]["conversationRef"]: r["details"] for r in records}
+    assert by_ref["40404040"]["status"] == "active-without-v2-state"
+    assert "leaseStop=only-in-lease-stop" in by_ref["40404040"]["notes"]
+    assert "leaseStop=confirmed" in by_ref["6770805286"]["notes"]
+    assert "leaseStop=absent-at-lease-stop" in by_ref["-5999999999"]["notes"]
+    assert summary["leaseStopOnly"] == 1
+    assert summary["leaseStopStatus"] == "reconciled"
+    assert "1 lease-stop-only chat(s)" in doc
+
+
+def test_no_lease_stop_record_keeps_manual_crosscheck(
+    v2_gate_edge_state: Path,
+) -> None:
+    _records, summary, doc = export_messaging_continuity(
+        v2_gate_edge_state, "barsik", SNAPSHOT_AT
+    )
+    assert summary["leaseStopStatus"] == "no-record"
+    assert "NOT provided" in doc
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "expected"),
+    [
+        ("6770805286", "6770805286"),
+        ("-5270435808", "-5270435808"),
+    ],
+)
+def test_clean_ids_stay_readable_in_source_keys(chat_id: str, expected: str) -> None:
+    assert _principal_key_component(chat_id) == expected
+
+
+@pytest.mark.parametrize(
+    "hostile",
+    ["+14155550123", "chat id with spaces", "чат-юникод", "x" * 200, "a|b\nc"],
+)
+def test_unsafe_ids_get_stable_tagged_digest_keys(hostile: str) -> None:
+    key = _principal_key_component(hostile)
+    assert key.startswith("sha256-")
+    assert re.fullmatch(r"sha256-[0-9a-f]{24}", key)
+    assert key == _principal_key_component(hostile)  # stable
+
+
+def test_hostile_display_name_cannot_forge_markdown_rows(
+    v2_gate_edge_state: Path,
+) -> None:
+    _records, _summary, doc = export_messaging_continuity(
+        v2_gate_edge_state, "barsik", SNAPSHOT_AT
+    )
+    forged = [
+        line for line in doc.splitlines()
+        if line.startswith("|") and "fake" in line and line.count("|") >= 7
+        and "Evil" not in line
+    ]
+    assert forged == [], forged
+    assert "Evil \\| forged \\| row" in doc
+
+
+def test_md_cell_strips_control_and_escapes() -> None:
+    assert _md_cell("a|b") == "a\\|b"
+    assert _md_cell("a\nb\rc") == "abc"
+    assert _md_cell("a\\|b") == "a\\\\\\|b"
+    assert _md_cell("tab\there") == "tab here"
+
+
+@pytest.mark.parametrize(
+    ("chat_id", "platform", "source"),
+    [
+        ("9" * 13, "telegram", PLATFORM_SOURCE_ID_SHAPE),
+        ("9" * 14, "unknown", PLATFORM_SOURCE_UNRESOLVED),
+        ("9" * 16, "unknown", PLATFORM_SOURCE_UNRESOLVED),
+        ("9" * 17, "discord", PLATFORM_SOURCE_ID_SHAPE),
+        ("9" * 20, "discord", PLATFORM_SOURCE_ID_SHAPE),
+        ("9" * 21, "unknown", PLATFORM_SOURCE_UNRESOLVED),
+        ("-" + "9" * 16, "telegram", PLATFORM_SOURCE_ID_SHAPE),
+        ("-" + "9" * 17, "unknown", PLATFORM_SOURCE_UNRESOLVED),
+    ],
+)
+def test_platform_heuristic_edges_frozen(chat_id: str, platform: str, source: str) -> None:
+    assert _resolve_platform(chat_id, {}) == (platform, source)
