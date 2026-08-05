@@ -502,6 +502,337 @@ def export_agent(
     }, skipped
 
 
+# V2's approval gate is keyed by (agent_name, chat_id) with NO platform column
+# (agent_registry.approved_users), while V3 principals bind per connector. The
+# platform is therefore RESOLVED here, never assumed: group_chats rows carry an
+# explicit platform; DM ids fall back to a shape heuristic; anything else is
+# UNRESOLVED and must be settled by the owner at Phase-5 qualification against
+# the old-lease-stop record. Every proposal row ships disposition
+# "defer-with-owner-approval" so the V3 dry-run classifies it
+# INVENTORY_DEFERRED_OWNER_APPROVAL — visible for the ceremony, never imported
+# as an enabled principal.
+PLATFORM_SOURCE_GROUP_TABLE = "group_chats"
+PLATFORM_SOURCE_ID_SHAPE = "id-shape-heuristic"
+PLATFORM_SOURCE_UNRESOLVED = "unresolved"
+
+
+def _resolve_platform(chat_id: str, group_platforms: dict[str, str]) -> tuple[str, str]:
+    if chat_id in group_platforms:
+        return group_platforms[chat_id], PLATFORM_SOURCE_GROUP_TABLE
+    text = chat_id.strip()
+    if text in ("web", "admin"):
+        return "web", PLATFORM_SOURCE_ID_SHAPE
+    if re.fullmatch(r"-\d{1,16}", text):
+        return "telegram", PLATFORM_SOURCE_ID_SHAPE
+    if re.fullmatch(r"\d{17,20}", text):
+        return "discord", PLATFORM_SOURCE_ID_SHAPE
+    if re.fullmatch(r"\d{1,13}", text):
+        return "telegram", PLATFORM_SOURCE_ID_SHAPE
+    return "unknown", PLATFORM_SOURCE_UNRESOLVED
+
+
+_SAFE_SOURCE_KEY_COMPONENT = re.compile(r"[A-Za-z0-9._:@-]{1,80}")
+
+
+def _principal_key_component(chat_id: str) -> str:
+    """Return a V3 source-key-safe component for an arbitrary V2 chat id.
+
+    Realistic V2 identities include +phone, whitespace, and Unicode, all of
+    which fatal V3's SOURCE_KEY_INVALID. Clean ids stay readable under a
+    ``raw-`` prefix; anything else becomes a stable ``sha256-`` digest. The
+    prefixes make the two namespaces disjoint BY CONSTRUCTION — a raw id
+    that happens to look like a digest can never collide with a hashed one
+    (review round 2 found exactly that SOURCE_KEY_DUPLICATE). Raw ids are
+    preserved in conversationRef/legacyId either way.
+    """
+    if _SAFE_SOURCE_KEY_COMPONENT.fullmatch(chat_id):
+        return f"raw-{chat_id}"
+    return f"sha256-{sha256_text(chat_id)[:24]}"
+
+
+def _md_cell(value) -> str:
+    """Escape a DB-sourced value for the owner-decision Markdown table.
+
+    A crafted display name containing pipes/newlines could otherwise forge
+    rows in the artifact the owner signs off against.
+    """
+    text = str(value)
+    text = "".join(
+        ch for ch in text
+        if (ord(ch) >= 0x20 and not (0x7F <= ord(ch) <= 0x9F)) or ch == "\t"
+    )
+    return text.replace("\\", "\\\\").replace("|", "\\|").replace("\t", " ")
+
+
+def export_messaging_continuity(
+    agents_db_path: Path,
+    agent_name: str,
+    snapshot_at: str,
+    lease_stop_record_path: Path | None = None,
+) -> tuple[list[dict], dict, str]:
+    """Propose the V3 connector-principal set from V2 gate + group state.
+
+    Returns (records, summary, proposal_markdown). Records carry
+    disposition "defer-with-owner-approval" by design: enabling principals
+    is the Phase-5 owner ceremony's decision, not an import side effect.
+
+    ``lease_stop_record_path`` is the Phase-5 step-2 old-lease-stop record
+    (``{"activeChats": [{"chatId": ..., "platform": ..., "title": ...}]}``).
+    When present, chats active at lease stop but absent from every V2 table
+    are surfaced as their own status instead of relying on the operator's
+    manual cross-check; pre-cutover exports may omit it.
+    """
+    with tempfile.TemporaryDirectory() as tmp:
+        copy = Path(tmp) / "agents.db"
+        _copy_sqlite_bundle(agents_db_path.resolve(), copy)
+        conn = sqlite3.connect(f"file:{copy}?mode=ro", uri=True)
+        conn.row_factory = sqlite3.Row
+        approved = conn.execute(
+            "SELECT chat_id, display_name, status, approved_by, timezone"
+            "  FROM approved_users WHERE agent_name=? ORDER BY created_at, id",
+            (agent_name,),
+        ).fetchall()
+        groups = conn.execute(
+            "SELECT chat_id, platform, chat_title, alias, chat_type, active"
+            "  FROM group_chats WHERE agent_name=? ORDER BY joined_at, id",
+            (agent_name,),
+        ).fetchall()
+        # delivered=1 rows are retained delivery HISTORY (V2 checkpoints, not
+        # deletes); counting them ordered phantom drains in review round 1.
+        held = {
+            row["chat_id"]: row["held"]
+            for row in conn.execute(
+                "SELECT chat_id, COUNT(*) AS held FROM pending_messages"
+                "  WHERE agent_name=? AND delivered=0 GROUP BY chat_id",
+                (agent_name,),
+            ).fetchall()
+        }
+        conn.close()
+
+    group_platforms = {row["chat_id"]: row["platform"] for row in groups}
+    group_meta = {row["chat_id"]: row for row in groups}
+    approved_ids = {row["chat_id"] for row in approved}
+
+    proposals: list[dict] = []
+    for row in approved:
+        platform, source = _resolve_platform(row["chat_id"], group_platforms)
+        meta = group_meta.get(row["chat_id"])
+        proposals.append({
+            "externalPrincipalId": row["chat_id"],
+            "platform": platform,
+            "platformSource": source,
+            "displayName": row["display_name"] or (meta["chat_title"] if meta else ""),
+            "gateStatus": row["status"],
+            "approvedBy": row["approved_by"],
+            "isGroup": meta is not None and meta["chat_type"] != "dm",
+            "heldPendingInbound": held.get(row["chat_id"], 0),
+            "proposedRole": "UNASSIGNED_PENDING_OWNER_DECISION",
+            "gateSource": "approved_users",
+        })
+    # Active groups the gate table never recorded are the V2 "orphaned group"
+    # failure class in the making — surface them rather than silently dropping.
+    for row in groups:
+        if row["chat_id"] in approved_ids or not row["active"]:
+            continue
+        proposals.append({
+            "externalPrincipalId": row["chat_id"],
+            "platform": row["platform"],
+            "platformSource": PLATFORM_SOURCE_GROUP_TABLE,
+            "displayName": row["chat_title"] or row["alias"],
+            "gateStatus": "group-active-without-gate-row",
+            "approvedBy": "",
+            "isGroup": True,
+            "heldPendingInbound": held.get(row["chat_id"], 0),
+            "proposedRole": "UNASSIGNED_PENDING_OWNER_DECISION",
+            "gateSource": "group_chats",
+        })
+    # Undelivered inbound from senders with NO gate row and NO group row is
+    # the NORMAL gate-held shape (a stranger's message is why the gate
+    # exists) — round 1 silently dropped exactly this class.
+    covered = {p["externalPrincipalId"] for p in proposals}
+    for chat_id, count in sorted(held.items()):
+        if chat_id in covered:
+            continue
+        platform, source = _resolve_platform(chat_id, group_platforms)
+        proposals.append({
+            "externalPrincipalId": chat_id,
+            "platform": platform,
+            "platformSource": source,
+            "displayName": "",
+            "gateStatus": "pending-inbound-without-gate-row",
+            "approvedBy": "",
+            "isGroup": False,
+            "heldPendingInbound": count,
+            "proposedRole": "UNASSIGNED_PENDING_OWNER_DECISION",
+            "gateSource": "pending_messages",
+        })
+
+    # Phase-5 continuity hole closure: anything alive at old-lease stop but
+    # unknown to every V2 table must confront the owner explicitly.
+    lease_stop_status = "no-record"
+    if lease_stop_record_path is not None:
+        lease_stop = json.loads(lease_stop_record_path.read_text())
+        active_chats = lease_stop.get("activeChats")
+        if not isinstance(active_chats, list):
+            raise ValueError(
+                "Lease-stop record must contain an 'activeChats' list"
+            )
+        lease_entries: dict[str, dict] = {}
+        for entry in active_chats:
+            chat_id = str(entry.get("chatId", "")).strip()
+            if not chat_id:
+                raise ValueError("Lease-stop activeChats entry lacks chatId")
+            lease_entries[chat_id] = entry
+            if chat_id in {p["externalPrincipalId"] for p in proposals}:
+                continue
+            proposals.append({
+                "externalPrincipalId": chat_id,
+                "platform": str(entry.get("platform", "unknown")),
+                "platformSource": "lease-stop-record",
+                "displayName": str(entry.get("title", "")),
+                "gateStatus": "active-without-v2-state",
+                "approvedBy": "",
+                "isGroup": bool(entry.get("isGroup", False)),
+                "heldPendingInbound": held.get(chat_id, 0),
+                "proposedRole": "UNASSIGNED_PENDING_OWNER_DECISION",
+                "gateSource": "lease-stop-record",
+            })
+        # The record settles provenance, not just membership (review round
+        # 3): a lease platform RESOLVES a V2-unresolved row, and a
+        # disagreement with a V2-resolved row is a CONFLICT the owner must
+        # see — silently calling either side "confirmed" hides exactly the
+        # divergence this input exists to expose.
+        for p in proposals:
+            if p["gateSource"] == "lease-stop-record":
+                p["leaseStop"] = "only-in-lease-stop"
+                continue
+            entry = lease_entries.get(p["externalPrincipalId"])
+            if entry is None:
+                p["leaseStop"] = "absent-at-lease-stop"
+                continue
+            lease_platform = str(entry.get("platform", "")).strip()
+            if not lease_platform:
+                p["leaseStop"] = "confirmed"
+            elif p["platformSource"] == PLATFORM_SOURCE_UNRESOLVED:
+                p["platform"] = lease_platform
+                p["platformSource"] = "lease-stop-record"
+                p["leaseStop"] = "resolved-by-lease-stop"
+            elif p["platform"] != lease_platform:
+                # Keep V2's value in provider; the conflict marker carries
+                # both sides so the owner decides, not the exporter.
+                p["leaseStop"] = (
+                    f"platform-conflict(v2={p['platform']},"
+                    f"lease={lease_platform})"
+                )
+            else:
+                p["leaseStop"] = "confirmed"
+            if not p["displayName"] and entry.get("title"):
+                p["displayName"] = str(entry["title"])
+        lease_stop_status = "reconciled"
+    else:
+        for p in proposals:
+            p["leaseStop"] = "no-record"
+
+    # The connector-binding detail schema is a FATAL-enforced allowlist of
+    # bounded identity refs plus the common keys (import-format.ts
+    # INVENTORY_DETAIL_KEYS) — verified against the real inspector, which
+    # rejected the first draft's free-form fields. Rich provenance lives in
+    # the ceremony proposal document; the ledger row carries only bounded
+    # facts, with the human-facing fields folded into `notes`.
+    scope = {"kind": "agent", "id": agent_name}
+    records = [
+        {
+            "kind": "inventory",
+            "sourceKey": (
+                f"inventory:connector-principal:{agent_name}:"
+                f"{_principal_key_component(item['externalPrincipalId'])}"
+            ),
+            "scope": scope,
+            "inventoryKind": "connector-binding",
+            "name": (
+                f"inventory:connector-principal:{agent_name}:"
+                f"{_principal_key_component(item['externalPrincipalId'])}"
+            ),
+            "disposition": "defer-with-owner-approval",
+            "details": {
+                "provider": item["platform"],
+                "conversationRef": item["externalPrincipalId"],
+                "agentRef": agent_name,
+                "legacyId": item["externalPrincipalId"],
+                "status": item["gateStatus"],
+                "notes": (
+                    f"display={item['displayName'] or '-'};"
+                    f" platformSource={item['platformSource']};"
+                    f" group={'yes' if item['isGroup'] else 'no'};"
+                    f" heldPendingInbound={item['heldPendingInbound']};"
+                    f" approvedBy={item['approvedBy'] or '-'};"
+                    f" gateSource={item['gateSource']};"
+                    f" leaseStop={item['leaseStop']};"
+                    f" role=PENDING_OWNER_DECISION;"
+                    f" snapshotAt={snapshot_at}"
+                ),
+            },
+        }
+        for item in proposals
+    ]
+
+    unresolved = [p for p in proposals if p["platformSource"] == PLATFORM_SOURCE_UNRESOLVED]
+    held_total = sum(p["heldPendingInbound"] for p in proposals)
+    lease_stop_only = [p for p in proposals if p["gateSource"] == "lease-stop-record"]
+    platform_conflicts = [
+        p for p in proposals if str(p["leaseStop"]).startswith("platform-conflict")
+    ]
+    lines = [
+        f"# Phase-5 principal proposal — {agent_name} ({snapshot_at})",
+        "",
+        "Every row requires an explicit owner enable at qualification; nothing",
+        "below is imported as an enabled principal.",
+        (
+            "Lease-stop record: RECONCILED below."
+            if lease_stop_status == "reconciled"
+            else "Lease-stop record: NOT provided — cross-check active"
+            " chats/topics/senders manually before enabling."
+        ),
+        "",
+        "| principal id | platform (source) | name | gate status | group | held inbound | lease stop |",
+        "|---|---|---|---|---|---|---|",
+    ]
+    for p in proposals:
+        lines.append(
+            f"| {_md_cell(p['externalPrincipalId'])} "
+            f"| {_md_cell(p['platform'])} ({_md_cell(p['platformSource'])}) "
+            f"| {_md_cell(p['displayName'])} | {_md_cell(p['gateStatus'])} "
+            f"| {p['isGroup']} | {p['heldPendingInbound']} "
+            f"| {_md_cell(p['leaseStop'])} |"
+        )
+    lines += [
+        "",
+        "## Ceremony checklist",
+        "- [ ] Every expected chat above is present (owner DM + all groups).",
+        f"- [ ] {len(unresolved)} unresolved-platform row(s) settled against the lease-stop record.",
+        f"- [ ] {held_total} gate-pending inbound message(s) drained/classified before old-lease stop.",
+        f"- [ ] {len(lease_stop_only)} lease-stop-only chat(s) (active at stop, unknown to V2 tables) decided.",
+        f"- [ ] {len(platform_conflicts)} platform conflict(s) (V2 vs lease-stop disagree) decided.",
+        "- [ ] NEGATIVE CONTROL after enable: a known-unapproved chat id still gets the",
+        "      generic denial — the gate itself must survive the migration, not just the approvals.",
+    ]
+    summary = {
+        "proposals": len(proposals),
+        "unresolvedPlatform": len(unresolved),
+        "heldPendingInbound": held_total,
+        "groupsWithoutGateRow": sum(
+            1 for p in proposals if p["gateStatus"] == "group-active-without-gate-row"
+        ),
+        "pendingWithoutGateRow": sum(
+            1 for p in proposals if p["gateStatus"] == "pending-inbound-without-gate-row"
+        ),
+        "leaseStopOnly": len(lease_stop_only),
+        "platformConflicts": len(platform_conflicts),
+        "leaseStopStatus": lease_stop_status,
+    }
+    return records, summary, "\n".join(lines) + "\n"
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("db", type=Path)
@@ -514,6 +845,7 @@ if __name__ == "__main__":
     ap.add_argument("--legacy-artifact", type=Path)
     ap.add_argument("--instructions-out", type=Path)
     ap.add_argument("--authority-decision-id", required=True)
+    ap.add_argument("--lease-stop-record", type=Path)
     ap.add_argument("-o", "--out", type=Path, required=True)
     args = ap.parse_args()
     snapshot_at = canonical_now_utc()
@@ -539,7 +871,15 @@ if __name__ == "__main__":
         instructions_out,
         args.legacy_artifact,
     )
-    result["records"] = instruction_records + result["records"]
+    continuity_records, continuity_summary, proposal_doc = export_messaging_continuity(
+        args.agents_db,
+        args.agent,
+        snapshot_at,
+        lease_stop_record_path=args.lease_stop_record,
+    )
+    proposal_out = args.out.with_name(f"{args.out.stem}.{args.agent}.principals.md")
+    proposal_out.write_text(proposal_doc)
+    result["records"] = instruction_records + continuity_records + result["records"]
     args.out.write_text(json.dumps(result, indent=1, ensure_ascii=False))
     counts: dict[str, int] = {}
     for record in result["records"]:
@@ -555,6 +895,7 @@ if __name__ == "__main__":
                     "instruction_authority": "V2_DB_COMPOSED",
                 },
                 "instructions": instruction_summary,
+                "messagingContinuity": {**continuity_summary, "proposal": str(proposal_out)},
                 "out": str(args.out),
             },
             indent=1,
