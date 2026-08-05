@@ -400,12 +400,22 @@ def test_no_lease_stop_record_keeps_manual_crosscheck(
 @pytest.mark.parametrize(
     ("chat_id", "expected"),
     [
-        ("6770805286", "6770805286"),
-        ("-5270435808", "-5270435808"),
+        ("6770805286", "raw-6770805286"),
+        ("-5270435808", "raw--5270435808"),
     ],
 )
 def test_clean_ids_stay_readable_in_source_keys(chat_id: str, expected: str) -> None:
     assert _principal_key_component(chat_id) == expected
+
+
+def test_digest_shaped_raw_id_cannot_collide_with_hashed_id() -> None:
+    hostile = "+14155550123"
+    digest_component = _principal_key_component(hostile)
+    assert digest_component.startswith("sha256-")
+    # An attacker-controlled RAW id crafted to equal the digest component.
+    crafted_raw = digest_component
+    assert _principal_key_component(crafted_raw) == f"raw-{crafted_raw}"
+    assert _principal_key_component(crafted_raw) != digest_component
 
 
 @pytest.mark.parametrize(
@@ -439,6 +449,7 @@ def test_md_cell_strips_control_and_escapes() -> None:
     assert _md_cell("a\nb\rc") == "abc"
     assert _md_cell("a\\|b") == "a\\\\\\|b"
     assert _md_cell("tab\there") == "tab here"
+    assert _md_cell("a\x7fb\x85c\x9fd") == "abcd"
 
 
 @pytest.mark.parametrize(
@@ -446,8 +457,11 @@ def test_md_cell_strips_control_and_escapes() -> None:
     [
         ("9" * 13, "telegram", PLATFORM_SOURCE_ID_SHAPE),
         ("9" * 14, "unknown", PLATFORM_SOURCE_UNRESOLVED),
+        ("9" * 15, "unknown", PLATFORM_SOURCE_UNRESOLVED),
         ("9" * 16, "unknown", PLATFORM_SOURCE_UNRESOLVED),
         ("9" * 17, "discord", PLATFORM_SOURCE_ID_SHAPE),
+        ("9" * 18, "discord", PLATFORM_SOURCE_ID_SHAPE),
+        ("9" * 19, "discord", PLATFORM_SOURCE_ID_SHAPE),
         ("9" * 20, "discord", PLATFORM_SOURCE_ID_SHAPE),
         ("9" * 21, "unknown", PLATFORM_SOURCE_UNRESOLVED),
         ("-" + "9" * 16, "telegram", PLATFORM_SOURCE_ID_SHAPE),

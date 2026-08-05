@@ -538,12 +538,15 @@ def _principal_key_component(chat_id: str) -> str:
     """Return a V3 source-key-safe component for an arbitrary V2 chat id.
 
     Realistic V2 identities include +phone, whitespace, and Unicode, all of
-    which fatal V3's SOURCE_KEY_INVALID. Clean ids stay readable; anything
-    else becomes a stable tagged digest, with the raw id preserved in
-    conversationRef/legacyId.
+    which fatal V3's SOURCE_KEY_INVALID. Clean ids stay readable under a
+    ``raw-`` prefix; anything else becomes a stable ``sha256-`` digest. The
+    prefixes make the two namespaces disjoint BY CONSTRUCTION — a raw id
+    that happens to look like a digest can never collide with a hashed one
+    (review round 2 found exactly that SOURCE_KEY_DUPLICATE). Raw ids are
+    preserved in conversationRef/legacyId either way.
     """
     if _SAFE_SOURCE_KEY_COMPONENT.fullmatch(chat_id):
-        return chat_id
+        return f"raw-{chat_id}"
     return f"sha256-{sha256_text(chat_id)[:24]}"
 
 
@@ -554,7 +557,10 @@ def _md_cell(value) -> str:
     rows in the artifact the owner signs off against.
     """
     text = str(value)
-    text = "".join(ch for ch in text if ch >= " " or ch == "\t")
+    text = "".join(
+        ch for ch in text
+        if (ord(ch) >= 0x20 and not (0x7F <= ord(ch) <= 0x9F)) or ch == "\t"
+    )
     return text.replace("\\", "\\\\").replace("|", "\\|").replace("\t", " ")
 
 
