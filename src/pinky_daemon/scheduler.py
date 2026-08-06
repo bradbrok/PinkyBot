@@ -35,6 +35,12 @@ _PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
     {"alive", "ok", "busy", "finishing"}
 )
 
+# How recent an agent-origin heartbeat must be to suppress the owner alert on
+# an unconfirmed schedule delivery. Deliberately short: it must cover "the
+# agent was demonstrably running while the receipt window elapsed", not "the
+# agent was up at some point today".
+_UNDELIVERED_ALERT_LIVENESS_WINDOW = 120.0
+
 
 # ── Rate Limit Gating ───────────────────────────────────────
 
@@ -709,6 +715,18 @@ class AgentScheduler:
             f"'{schedule.name}' (#{schedule.id}) for agent "
             f"'{schedule.agent_name}': {failure_reason}"
         )
+        if alert_this_failure and self._agent_recently_proved_live(
+            schedule.agent_name
+        ):
+            _log(
+                f"scheduler: agent '{schedule.agent_name}' posted an "
+                f"agent-origin heartbeat within "
+                f"{_UNDELIVERED_ALERT_LIVENESS_WINDOW:g}s of schedule "
+                f"'{schedule.name}' (#{schedule.id}) going unconfirmed; "
+                "suppressing owner alert (the persisted wake replays on its "
+                "own)"
+            )
+            alert_this_failure = False
         if alert_this_failure:
             recovery = (
                 " The wake was persisted for the agent's next session."
@@ -771,6 +789,32 @@ class AgentScheduler:
             delivery.cancel()
             await asyncio.gather(delivery, return_exceptions=True)
             raise
+
+    def _agent_recently_proved_live(self, agent_name: str) -> bool:
+        """Return True if the agent itself said it was alive very recently.
+
+        Reads ``get_latest_agent_heartbeat`` — NOT ``get_latest_heartbeat`` —
+        because the latter includes the synthetic ``server_presence`` rows this
+        scheduler writes when it sees a CONNECTED transport. The dominant cause
+        of an unconfirmed wake is exactly "transport CONNECTED but reader loop
+        wedged on an LLM call", so using ``get_latest_heartbeat`` would accept
+        the daemon's own writing as proof of life and hide a real crash.
+
+        Fails closed: any error, missing row, or non-agent-authored status
+        leaves the alert in place. This never widens the delivery timeout — a
+        genuinely dead agent still pages the owner.
+        """
+        try:
+            hb = self._registry.get_latest_agent_heartbeat(agent_name)
+        except Exception as exc:
+            _log(
+                f"scheduler: liveness lookup failed for '{agent_name}': "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        if hb is None or hb.status not in _PROVEN_LIVE_HEARTBEAT_STATUSES:
+            return False
+        return (time.time() - hb.timestamp) <= _UNDELIVERED_ALERT_LIVENESS_WINDOW
 
     def _agent_busy_not_wedged(self, agent_name: str) -> bool:
         """Read the transport's live positive-liveness signal, failing closed."""
