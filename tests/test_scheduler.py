@@ -1756,7 +1756,7 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="storm-head",
             prompt="retry me",
-            fired_at=100.0,
+            fired_at=time.time() - 60,
         )
         attempts: list[str] = []
         alerts: list[tuple[str, str]] = []
@@ -1814,7 +1814,7 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="eventual",
             prompt="confirm me",
-            fired_at=100.0,
+            fired_at=time.time() - 60,
         )
         for expected in range(1, AgentScheduler.PERSISTED_WAKE_ATTEMPT_CAP):
             assert (
@@ -1853,14 +1853,14 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="stuck",
             prompt="stuck head",
-            fired_at=100.0,
+            fired_at=time.time() - 120,
         )
         registry.persist_schedule_wake(
             zombie.id,
             agent_name="oleg",
             schedule_name="zombie",
             prompt="never deliver",
-            fired_at=200.0,
+            fired_at=time.time() - 60,
         )
         registry.remove_schedule(zombie.id)
         attempts: list[str] = []
