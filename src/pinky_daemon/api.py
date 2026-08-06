@@ -61,6 +61,7 @@ from pinky_daemon.api_models import (
     AssignSkillRequest,
     AuthLoginRequest,
     AuthSetupRequest,
+    BindBuzzIdentityRequest,
     CloneWorkerRequest,
     ContainerizeRequest,
     ContextResponse,
@@ -1780,6 +1781,27 @@ def create_api(
         if key in _platform_adapters:
             return _platform_adapters[key]
 
+        if platform == "buzz":
+            from pinky_outreach.buzz_dependency import missing_buzz_dependencies
+
+            missing = missing_buzz_dependencies()
+            if missing:
+                agents.mark_buzz_dependency_refused(agent_name, f"missing:{','.join(missing)}")
+                return None
+            agents.mark_buzz_dependency_ready(agent_name)
+            material = agents.get_buzz_signing_material(agent_name)
+            if material is None:
+                return None
+            from pinky_outreach.buzz import BuzzAdapter
+
+            adapter = BuzzAdapter(
+                material.private_key,
+                relay_url=material.relay_url,
+                community_id=material.community_id,
+            )
+            _platform_adapters[key] = adapter
+            return adapter
+
         token = (
             agents.get_raw_token_for_account(agent_name, platform, account_id)
             if account_id
@@ -1807,7 +1829,12 @@ def create_api(
         """Drop generic and account-bound adapters after token mutation."""
         for key in list(_platform_adapters):
             if len(key) >= 2 and key[0] == agent_name and key[1] == platform:
-                _platform_adapters.pop(key, None)
+                adapter = _platform_adapters.pop(key, None)
+                if platform == "buzz" and adapter is not None:
+                    try:
+                        adapter.close()
+                    except Exception:
+                        pass
 
     def _get_imessage_adapter(agent_name: str = ""):
         """Get or create the iMessage adapter for an agent."""
@@ -1864,6 +1891,23 @@ def create_api(
             raise HTTPException(404, f"Message context '{message_id}' not found for {agent_name}")
         return ctx
 
+    def _buzz_reply_metadata(ctx) -> dict | None:
+        """Copy only verified public routing fields from durable context."""
+        if ctx.platform != "buzz" or not isinstance(ctx.metadata, dict):
+            return None
+        candidate = ctx.metadata.get("buzz_verified_event")
+        if not isinstance(candidate, dict):
+            return None
+        return {
+            "buzz_verified_event": {
+                "verified": candidate.get("verified"),
+                "event_id": candidate.get("event_id"),
+                "kind": candidate.get("kind"),
+                "author_pubkey": candidate.get("author_pubkey"),
+                "channel_id": candidate.get("channel_id"),
+            }
+        }
+
     def _extract_message_id(result) -> str:
         """Extract a message ID from a platform adapter response."""
         if hasattr(result, "message_id"):
@@ -1900,6 +1944,7 @@ def create_api(
         link_preview_options: dict | None = None,
         quote: str = "",
         blocks: str = "",
+        reply_metadata: dict | None = None,
     ) -> SimpleNamespace:
         """Send a text message and return SimpleNamespace(message_id=...).
 
@@ -2047,6 +2092,15 @@ def create_api(
             )
             return SimpleNamespace(message_id=_extract_message_id(result))
 
+        if platform == "buzz":
+            result = adapter.send_message(
+                chat_id,
+                content,
+                reply_to=reply_to or None,
+                reply_metadata=reply_metadata,
+            )
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
         raise HTTPException(400, f"Unsupported platform: {platform}")
 
     def _send_file_message(
@@ -2143,6 +2197,7 @@ def create_api(
         link_preview_options: dict | None = None,
         quote: str = "",
         blocks: str = "",
+        reply_metadata: dict | None = None,
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         if account_id and not agents.get_raw_token_for_account(
@@ -2169,6 +2224,7 @@ def create_api(
                     link_preview_options=link_preview_options,
                     quote=quote,
                     blocks=blocks,
+                    reply_metadata=reply_metadata,
                 ),
             )
             # Once an outbound message lands, the typing indicator becomes noise —
@@ -2197,7 +2253,7 @@ def create_api(
         # Plain sends keep key_extra="" — their historical dedupe behaviour is
         # unchanged. The dict is serialized (never used raw) so the key stays
         # hashable.
-        if account_id or parse_mode or link_preview_options or quote or blocks:
+        if account_id or parse_mode or link_preview_options or quote or blocks or reply_metadata:
             key_extra = json.dumps(
                 {
                     "acct": account_id or "",
@@ -2205,6 +2261,7 @@ def create_api(
                     "lpo": link_preview_options or None,
                     "q": quote or "",
                     "blk": blocks or "",
+                    "reply_meta": reply_metadata or None,
                 },
                 sort_keys=True, separators=(",", ":"),
             )
@@ -2232,6 +2289,8 @@ def create_api(
                 if platform == "discord":
                     await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
                 elif platform == "slack":
+                    await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
+                elif platform == "buzz":
                     await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
                 return
             except Exception as e:
@@ -4778,6 +4837,23 @@ def create_api(
         if not secret:
             return False
         return bool(verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, "")))
+
+    def _owner_control_actor(request: Request) -> str:
+        """Require a browser owner session and derive its authority principal.
+
+        Valid internal agent HMAC auth intentionally does not satisfy this
+        gate: Buzz ToS provenance is owner control, never minting/agent data.
+        """
+        secret = _session_secret()
+        session = (
+            verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, ""))
+            if secret
+            else None
+        )
+        if not session:
+            raise HTTPException(403, "authenticated owner session required")
+        user = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(session.get("user") or "admin"))
+        return f"ui:{user[:120]}"
 
     def _needs_browser_api_auth(request: Request) -> bool:
         path = request.url.path
@@ -7534,6 +7610,87 @@ npm run build</pre>
             raise HTTPException(404, "Directive not found")
         return {"id": directive_id, "active": active}
 
+    # ── Buzz identity owner control (#541 inc1) ────────────
+
+    @app.get("/system/buzz-identities")
+    async def list_buzz_identities(request: Request):
+        """List redacted Buzz identities for the authenticated owner."""
+        _owner_control_actor(request)
+        identities = agents.list_buzz_identities()
+        return {"identities": identities, "count": len(identities)}
+
+    @app.get("/system/buzz-identities/{name}")
+    async def get_buzz_identity(name: str, request: Request):
+        """Read one redacted Buzz identity for the authenticated owner."""
+        _owner_control_actor(request)
+        identity = agents.get_buzz_identity(name)
+        if identity is None:
+            raise HTTPException(404, "Buzz identity not found")
+        return identity
+
+    @app.put("/system/buzz-identities/{name}")
+    async def bind_buzz_identity(
+        name: str,
+        req: BindBuzzIdentityRequest,
+        request: Request,
+    ):
+        """One-step owner-approved Buzz bind; raw key is immediately wrapped."""
+        actor = _owner_control_actor(request)
+        receipt = req.tos_receipt.strip()
+        approval_ref = (
+            f"owner-control:{uuid.uuid4().hex}:sha256:"
+            f"{hashlib.sha256(receipt.encode('utf-8')).hexdigest()}"
+        )
+        try:
+            identity = agents.bind_buzz_identity_owner_control(
+                name,
+                private_key=req.private_key,
+                relay_url=req.relay_url,
+                community_id=req.community_id,
+                enabled=req.enabled,
+                tos_receipt=receipt,
+                tos_approved_by=actor,
+                tos_approved_at=time.time(),
+                tos_approval_ref=approval_ref,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            status = 409 if "rotation" in str(exc) or "conflicts" in str(exc) else 400
+            raise HTTPException(status, str(exc)) from exc
+        _evict_platform_adapters(name, "buzz")
+        audit.log(
+            "buzz_identity_bound",
+            agent_name=name,
+            tool_name="owner_control",
+            tool_input_summary=json.dumps(
+                {
+                    "agent": name,
+                    "pubkey": identity["pubkey"],
+                    "community_id": identity["community_id"],
+                    "enabled": identity["enabled"],
+                    "tos_approval_ref": identity["tos_approval_ref"],
+                },
+                separators=(",", ":"),
+            ),
+        )
+        return identity
+
+    @app.post("/system/buzz-identities/{name}/disable")
+    async def disable_buzz_identity(name: str, request: Request):
+        """Disable outbound Buzz without deleting the encrypted authority row."""
+        actor = _owner_control_actor(request)
+        if not agents.disable_buzz_identity(name):
+            raise HTTPException(404, "Buzz identity not found")
+        _evict_platform_adapters(name, "buzz")
+        audit.log(
+            "buzz_identity_disabled",
+            agent_name=name,
+            tool_name="owner_control",
+            tool_input_summary=json.dumps({"agent": name, "actor": actor}),
+        )
+        return agents.get_buzz_identity(name)
+
     # ── Agent Tokens ────────────────────────────────────────
 
     @app.put("/agents/{name}/tokens/{platform}")
@@ -8424,7 +8581,11 @@ npm run build</pre>
         _deny_isolated_cross_actor(request, agent_name)
 
         ctx = _resolve_message_context(agent_name, source_message_id)
-        effective_thread_root = ctx.reply_to or ctx.message_id
+        # Buzz/Nostr's reply marker targets the exact source event. Slack's
+        # thread_ts model instead collapses child replies to their stored root.
+        effective_thread_root = (
+            ctx.message_id if ctx.platform == "buzz" else ctx.reply_to or ctx.message_id
+        )
         voice_settings = _get_voice_reply_settings(agent_name, ctx.platform)
 
         if ctx.source_was_voice and voice_settings:
@@ -8465,6 +8626,7 @@ npm run build</pre>
             parse_mode=parse_mode,
             link_preview_options=link_preview_options,
             quote=quote,
+            reply_metadata=_buzz_reply_metadata(ctx),
         )
         _record_outbound_message(
             agent_name,
@@ -11171,6 +11333,20 @@ npm run build</pre>
                     )
             except Exception as exc:  # never let log rotation abort startup
                 _log(f"startup: log rotation not started ({exc})")
+
+        # Buzz is a required-dependency outbound platform. A broken/partially
+        # healed venv must refuse every enabled identity and page the owner;
+        # silently leaving send() registered but non-functional is unsafe.
+        from pinky_daemon.buzz_runtime import register_buzz_outbound_platforms
+
+        app.state.buzz_registration = await register_buzz_outbound_platforms(
+            agents, _notify_owner_undelivered
+        )
+        if app.state.buzz_registration["refused"]:
+            _log(
+                "startup: Buzz platform registration REFUSED for "
+                f"{app.state.buzz_registration['refused']} identity(s)"
+            )
 
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:

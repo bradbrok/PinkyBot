@@ -52,6 +52,9 @@ dependencies = [
     # include its SDK and async transport without relying on an optional extra.
     "slack-sdk>=3.0",
     "aiohttp>=3.9",
+    # Native Buzz/Nostr outbound signing. This is a daemon runtime path, so it
+    # must survive a base-install venv heal rather than living only in an extra.
+    "coincurve>=21.0",
 ]
 
 [project.optional-dependencies]
@@ -60,6 +63,8 @@ telegram = ["python-telegram-bot[webhooks]>=21.0"]
 discord = ["discord.py>=2.3"]
 # Backward-compatible no-op while hosts migrate off `uv run --extra slack`.
 slack = []
+# Backward-compatible named extra; required Buzz deps live in the base install.
+buzz = []
 google = ["google-auth>=2.0", "google-api-python-client>=2.0"]
 calendar = [
     "google-api-python-client>=2.0",
@@ -74,7 +79,7 @@ web = ["camoufox>=0.4", "markdownify>=1.0", "beautifulsoup4>=4.12"]
 voice = ["twilio>=9.0", "anthropic>=0.98"]
 local-embeddings = ["sentence-transformers>=2.0"]
 all = [
-    "pinky-ai[telegram,discord,slack,google,calendar,voice]",
+    "pinky-ai[telegram,discord,slack,buzz,google,calendar,voice]",
 ]
 dev = [
     "pytest>=9.0",

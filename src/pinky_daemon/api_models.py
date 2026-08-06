@@ -568,6 +568,16 @@ class SetAgentTokenRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+class BindBuzzIdentityRequest(BaseModel):
+    """Owner-control request to bind one encrypted Buzz identity."""
+
+    private_key: str
+    relay_url: str
+    community_id: str
+    tos_receipt: str
+    enabled: bool = True
+
+
 class AddMcpServerRequest(BaseModel):
     """Add a custom MCP server to an agent."""
 

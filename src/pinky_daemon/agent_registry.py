@@ -1213,12 +1213,22 @@ def _configure_agents_db_connection(
 class AgentRegistry:
     """SQLite-backed agent registry."""
 
-    def __init__(self, db_path: str = "data/agents.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/agents.db",
+        *,
+        buzz_device_key_path: str | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         # Absolute path retained so callers (e.g. _write_mcp_json) can hand
         # stdio MCP subprocesses an explicit DB location for request-time
         # signing-key lookup (#641) rather than relying on their cwd.
         self._db_path = str(Path(db_path).resolve())
+        self._buzz_device_key_path = str(
+            Path(buzz_device_key_path).resolve()
+            if buzz_device_key_path
+            else Path(self._db_path).parent / "identity" / ".device_key"
+        )
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         # #797/#220: the agents DB runs in ROLLBACK (TRUNCATE) journal mode, NOT
         # WAL. The WAL wal-index (-shm) is always mmap'd; under the long-lived
@@ -1548,6 +1558,34 @@ class AgentRegistry:
                 signing_key TEXT NOT NULL,
                 created_at REAL NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS buzz_identities (
+                agent TEXT PRIMARY KEY NOT NULL,
+                pubkey TEXT NOT NULL
+                    CHECK(length(pubkey)=64 AND pubkey=lower(pubkey)
+                          AND pubkey NOT GLOB '*[^0-9a-f]*'),
+                wrap_version INTEGER NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                relay_url TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+                status TEXT NOT NULL DEFAULT 'disabled',
+                last_error TEXT NOT NULL DEFAULT '',
+                tos_receipt TEXT NOT NULL,
+                tos_approved_by TEXT NOT NULL,
+                tos_approved_at REAL NOT NULL,
+                tos_approval_ref TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (agent) REFERENCES agents(name) ON DELETE CASCADE,
+                CHECK(
+                    enabled=0 OR (
+                        tos_receipt != '' AND tos_approved_by != ''
+                        AND tos_approved_at > 0 AND tos_approval_ref != ''
+                    )
+                )
+            );
         """)
         self._db.commit()
         self._migrate()
@@ -1775,6 +1813,38 @@ class AgentRegistry:
                 "ADD COLUMN high_signal_alerted_at REAL NOT NULL DEFAULT 0"
             )
             _log("agent_registry: migrated — added high_signal_alerted_at to approval_requests")
+
+        # Buzz identity storage is forward-migrated column-by-column rather
+        # than relying only on CREATE TABLE. This keeps fleet-local DBs safe if
+        # an increment adds lifecycle metadata after the first rollout.
+        buzz_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(buzz_identities)").fetchall()
+        }
+        buzz_migrations = [
+            ("pubkey", "TEXT NOT NULL DEFAULT ''"),
+            ("wrap_version", "INTEGER NOT NULL DEFAULT 1"),
+            ("nonce", "BLOB NOT NULL DEFAULT X''"),
+            ("ciphertext", "BLOB NOT NULL DEFAULT X''"),
+            ("relay_url", "TEXT NOT NULL DEFAULT ''"),
+            ("community_id", "TEXT NOT NULL DEFAULT ''"),
+            ("enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'disabled'"),
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            ("tos_receipt", "TEXT NOT NULL DEFAULT ''"),
+            ("tos_approved_by", "TEXT NOT NULL DEFAULT ''"),
+            ("tos_approved_at", "REAL NOT NULL DEFAULT 0"),
+            ("tos_approval_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "REAL NOT NULL DEFAULT 0"),
+            ("updated_at", "REAL NOT NULL DEFAULT 0"),
+        ]
+        for col, typedef in buzz_migrations:
+            if col not in buzz_existing:
+                self._db.execute(f"ALTER TABLE buzz_identities ADD COLUMN {col} {typedef}")
+                _log(f"agent_registry: migrated — added {col} to buzz_identities")
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_pubkey "
+            "ON buzz_identities(pubkey) WHERE pubkey != ''"
+        )
 
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
@@ -2627,6 +2697,275 @@ except Exception as exc:
                 _log(f"agent_registry: skipped signing-key backfill for {name!r}: {e}")
         if generated:
             _log(f"agent_registry: backfilled signing keys for {generated} agent(s)")
+
+    # ── Buzz identities (#541 inc1) ────────────────────────────────────
+
+    @staticmethod
+    def _buzz_identity_dict(row) -> dict:
+        """Public identity DTO. Secret envelope and receipt stay daemon-only."""
+        return {
+            "agent": row[0],
+            "pubkey": row[1],
+            "wrap_version": row[2],
+            "relay_url": row[3],
+            "community_id": row[4],
+            "enabled": bool(row[5]),
+            "status": row[6],
+            "last_error": row[7],
+            "tos_approved": bool(row[8] and row[9] and row[10]),
+            "tos_approved_by": row[8],
+            "tos_approved_at": row[9],
+            "tos_approval_ref": row[10],
+            "created_at": row[11],
+            "updated_at": row[12],
+        }
+
+    def get_buzz_identity(self, agent_name: str) -> dict | None:
+        """Return public Buzz identity state without receipt or key envelope."""
+        row = self._db.execute(
+            "SELECT agent, pubkey, wrap_version, relay_url, community_id, enabled, "
+            "status, last_error, tos_approved_by, tos_approved_at, "
+            "tos_approval_ref, created_at, updated_at "
+            "FROM buzz_identities WHERE agent=?",
+            (agent_name,),
+        ).fetchone()
+        return self._buzz_identity_dict(row) if row else None
+
+    def list_buzz_identities(self, *, enabled_only: bool = False) -> list[dict]:
+        """List public Buzz identity state, never encrypted or raw secret fields."""
+        sql = (
+            "SELECT agent, pubkey, wrap_version, relay_url, community_id, enabled, "
+            "status, last_error, tos_approved_by, tos_approved_at, "
+            "tos_approval_ref, created_at, updated_at FROM buzz_identities"
+        )
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY agent"
+        return [self._buzz_identity_dict(row) for row in self._db.execute(sql).fetchall()]
+
+    def bind_buzz_identity_owner_control(
+        self,
+        agent_name: str,
+        *,
+        private_key: str,
+        relay_url: str,
+        community_id: str,
+        enabled: bool,
+        tos_receipt: str,
+        tos_approved_by: str,
+        tos_approved_at: float,
+        tos_approval_ref: str,
+    ) -> dict:
+        """Bind one identity from the authenticated owner-control route only.
+
+        The HTTP composition root derives the actor, timestamp, and approval
+        reference. There is intentionally no generic token/settings mutation
+        path for these authority columns.
+        """
+        import hashlib
+        from urllib.parse import urlsplit
+
+        from pinky_daemon.buzz_identity import wrap_buzz_private_key
+        from pinky_identity.keystore import DeviceKey
+
+        agent = _validate_agent_name(agent_name)
+        if not self.get(agent):
+            raise KeyError(f"Agent '{agent}' not found")
+        relay = str(relay_url or "").strip()
+        parsed = urlsplit(relay)
+        if (
+            parsed.scheme not in {"ws", "wss"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Buzz relay_url must be a plain ws:// or wss:// URL")
+        community = str(community_id or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", community):
+            raise ValueError("Buzz community_id is invalid")
+        receipt = str(tos_receipt or "").strip()
+        approver = str(tos_approved_by or "").strip()
+        approval_ref = str(tos_approval_ref or "").strip()
+        approved_at = float(tos_approved_at or 0)
+        if not receipt or len(receipt.encode("utf-8")) > 8192:
+            raise ValueError("Buzz ToS receipt is required and must be at most 8192 bytes")
+        if not approver or len(approver) > 128 or approved_at <= 0:
+            raise ValueError("Buzz ToS approval authority is invalid")
+        expected_digest = hashlib.sha256(receipt.encode("utf-8")).hexdigest()
+        if not re.fullmatch(
+            r"owner-control:[0-9a-f]{32}:sha256:[0-9a-f]{64}", approval_ref
+        ) or not approval_ref.endswith(expected_digest):
+            raise ValueError("Buzz ToS approval reference does not match its receipt")
+
+        # Refuse accidental secret duplication into any durable text column.
+        secret_text = str(private_key or "").strip().lower()
+        if secret_text and any(
+            secret_text in value.lower()
+            for value in (relay, community, receipt, approver, approval_ref)
+        ):
+            raise ValueError("Buzz private key must not appear in identity metadata")
+
+        device_key = DeviceKey.load_or_create(self._buzz_device_key_path)
+        envelope = wrap_buzz_private_key(
+            private_key,
+            agent=agent,
+            device_key=device_key,
+        )
+        now = time.time()
+        status = "active" if enabled else "disabled"
+        with self._rmw_lock:
+            existing = self._db.execute(
+                "SELECT pubkey, tos_receipt FROM buzz_identities WHERE agent=?",
+                (agent,),
+            ).fetchone()
+            if existing and (
+                not secrets.compare_digest(existing[0], envelope.pubkey)
+                or not secrets.compare_digest(existing[1], receipt)
+            ):
+                raise ValueError(
+                    "Buzz identity or ToS receipt rotation requires an explicit rotation operation"
+                )
+            try:
+                if existing:
+                    # Same identity + same immutable receipt: safe idempotent
+                    # re-bind. Preserve the original authority actor/timestamp/ref.
+                    self._db.execute(
+                        """UPDATE buzz_identities
+                           SET wrap_version=?, nonce=?, ciphertext=?, relay_url=?,
+                               community_id=?, enabled=?, status=?, last_error='',
+                               updated_at=? WHERE agent=?""",
+                        (
+                            envelope.wrap_version,
+                            envelope.nonce,
+                            envelope.ciphertext,
+                            relay,
+                            community,
+                            int(enabled),
+                            status,
+                            now,
+                            agent,
+                        ),
+                    )
+                else:
+                    self._db.execute(
+                        """INSERT INTO buzz_identities (
+                               agent, pubkey, wrap_version, nonce, ciphertext,
+                               relay_url, community_id, enabled, status, last_error,
+                               tos_receipt, tos_approved_by, tos_approved_at,
+                               tos_approval_ref, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
+                        (
+                            agent,
+                            envelope.pubkey,
+                            envelope.wrap_version,
+                            envelope.nonce,
+                            envelope.ciphertext,
+                            relay,
+                            community,
+                            int(enabled),
+                            status,
+                            receipt,
+                            approver,
+                            approved_at,
+                            approval_ref,
+                            now,
+                            now,
+                        ),
+                    )
+                self._db.commit()
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                raise ValueError("Buzz identity conflicts with an existing binding") from exc
+        result = self.get_buzz_identity(agent)
+        if result is None:  # pragma: no cover - defensive after successful write
+            raise RuntimeError("Buzz identity write did not persist")
+        return result
+
+    def get_buzz_signing_material(self, agent_name: str):
+        """Unwrap one active identity or disable it on any integrity failure."""
+        from pinky_daemon.buzz_identity import (
+            BuzzDependencyError,
+            BuzzIdentityUnhealthyError,
+            BuzzKeyEnvelope,
+            BuzzSigningMaterial,
+            unwrap_buzz_private_key,
+        )
+        from pinky_identity.keystore import DeviceKey
+
+        row = self._db.execute(
+            """SELECT agent, pubkey, wrap_version, nonce, ciphertext, relay_url,
+                      community_id, enabled, status, tos_receipt, tos_approved_by,
+                      tos_approved_at, tos_approval_ref
+               FROM buzz_identities WHERE agent=?""",
+            (agent_name,),
+        ).fetchone()
+        if not row or not row[7] or row[8] != "active":
+            return None
+        if not row[9] or not row[10] or not row[11] or not row[12]:
+            self.mark_buzz_identity_unhealthy(agent_name, "missing_tos_authority")
+            raise BuzzIdentityUnhealthyError("Buzz identity lacks ToS authority")
+        try:
+            envelope = BuzzKeyEnvelope(
+                agent=row[0],
+                pubkey=row[1],
+                wrap_version=row[2],
+                nonce=bytes(row[3]),
+                ciphertext=bytes(row[4]),
+            )
+            device_key = DeviceKey.load_or_create(self._buzz_device_key_path)
+            private_key = unwrap_buzz_private_key(envelope, device_key=device_key)
+        except BuzzDependencyError:
+            self.mark_buzz_dependency_refused(agent_name, "missing_runtime_dependency")
+            raise
+        except Exception as exc:
+            self.mark_buzz_identity_unhealthy(agent_name, type(exc).__name__)
+            raise BuzzIdentityUnhealthyError("Buzz identity is unhealthy and was disabled") from exc
+        return BuzzSigningMaterial(
+            agent=row[0],
+            pubkey=row[1],
+            private_key=private_key,
+            relay_url=row[5],
+            community_id=row[6],
+        )
+
+    def mark_buzz_identity_unhealthy(self, agent_name: str, reason: str) -> None:
+        """Disable an identity after AEAD/KEK/public-key integrity failure."""
+        self._db.execute(
+            "UPDATE buzz_identities SET enabled=0, status='unhealthy', "
+            "last_error=?, updated_at=? WHERE agent=?",
+            (str(reason or "integrity_failure")[:160], time.time(), agent_name),
+        )
+        self._db.commit()
+
+    def mark_buzz_dependency_refused(self, agent_name: str, reason: str) -> None:
+        """Refuse registration without destroying an otherwise valid identity."""
+        self._db.execute(
+            "UPDATE buzz_identities SET status='dependency_refused', "
+            "last_error=?, updated_at=? WHERE agent=? AND enabled=1",
+            (str(reason or "missing_runtime_dependency")[:160], time.time(), agent_name),
+        )
+        self._db.commit()
+
+    def mark_buzz_dependency_ready(self, agent_name: str) -> None:
+        """Restore an enabled dependency-refused identity after venv healing."""
+        self._db.execute(
+            "UPDATE buzz_identities SET status='active', last_error='', updated_at=? "
+            "WHERE agent=? AND enabled=1 AND status='dependency_refused'",
+            (time.time(), agent_name),
+        )
+        self._db.commit()
+
+    def disable_buzz_identity(self, agent_name: str) -> bool:
+        """Owner-control lifecycle operation; encrypted material remains recoverable."""
+        cursor = self._db.execute(
+            "UPDATE buzz_identities SET enabled=0, status='disabled', "
+            "last_error='', updated_at=? WHERE agent=?",
+            (time.time(), agent_name),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
 
     def list(self, *, parent: str = "", group: str = "", enabled_only: bool = False,
              include_retired: bool = False) -> list[Agent]:
