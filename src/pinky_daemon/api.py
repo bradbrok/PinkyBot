@@ -12895,6 +12895,57 @@ npm run build</pre>
             _aiena_logger.error("pipeline_set_approved ERROR slug=%s exc=%s", slug, exc)
             return False
 
+    @app.get("/api/aiena/admin-data")
+    async def aiena_admin_data(request: Request):
+        """Serve i dati editoriali del pannello AIena, dietro autenticazione (#397).
+
+        Prima questi dati stavano su https://admin.aiena.it/data.json: 198KB di
+        materiale editoriale interno, raggiungibili da chiunque senza credenziali.
+        Il 04/08/2026 alle 16:38 il crawler di Telegram li ha effettivamente
+        scaricati (200, 51.710 byte nei log di accesso): non era un rischio
+        teorico. Stando sotto /api/aiena/, questo percorso passa dal gate di
+        autenticazione del daemon (_protected_api_prefixes).
+
+        Il file continua a essere scritto su filesystem dagli script che lo
+        generano: questo endpoint lo espone soltanto in lettura.
+
+        NON usato dal pannello. Il 05/08/2026 #397 e' stato chiuso in modo
+        diverso: HTTP Basic auth di nginx su tutto admin.aiena.it, che protegge
+        in un colpo la pagina, /data.json e /review-reports/. La migrazione del
+        pannello a questo endpoint non poteva funzionare, perche' su
+        admin.aiena.it non esiste una rotta di login (404) e il cookie di
+        sessione del daemon e' host-only + SameSite=strict: nessun browser puo'
+        ottenere una credenziale valida per quell'host. Resta qui come lettura
+        autenticata alternativa per chiamanti che una sessione ce l'hanno gia'
+        (SPA del daemon, agenti con firma HMAC interna).
+        """
+        data_path = Path("/var/www/aiena.it/admin/data.json")
+        caller_ip = request.client.host if request.client else "unknown"
+        if not data_path.is_file():
+            _aiena_logger.warning(
+                "admin-data: file assente (%s), caller=%s", data_path, caller_ip
+            )
+            raise HTTPException(status_code=404, detail="data.json non disponibile")
+        try:
+            payload = data_path.read_bytes()
+        except OSError as exc:
+            _aiena_logger.error("admin-data: lettura fallita: %s", exc)
+            raise HTTPException(status_code=500, detail="lettura non riuscita") from exc
+        _aiena_logger.info(
+            "admin-data servito: %d byte, caller=%s", len(payload), caller_ip
+        )
+        # Dati vivi e riservati: non devono restare in nessuna cache, ne' del
+        # browser ne' della CDN. Il 05/08 una cache di 4 ore su un altro file ha
+        # tenuto invisibile un deploy per mezza giornata.
+        return Response(
+            content=payload,
+            media_type="application/json",
+            headers={
+                "Cache-Control": "no-store, no-cache, must-revalidate",
+                "Cloudflare-CDN-Cache-Control": "no-store",
+            },
+        )
+
     @app.post("/api/aiena/approve-article")
     async def aiena_approve_article(req: _AienaApproveRequest, request: Request):
         """Approve an AIena article: validates slug, then inserts into Supabase.
