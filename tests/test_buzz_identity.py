@@ -2,13 +2,15 @@
 
 from __future__ import annotations
 
-import hashlib
+import json
 import sqlite3
 
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.buzz_identity import (
+    BUZZ_TOS_POLICY,
+    BUZZ_TOS_POLICY_VERSION,
     BuzzIdentityUnhealthyError,
     BuzzKeyEnvelope,
     unwrap_buzz_private_key,
@@ -18,12 +20,6 @@ from pinky_identity.keystore import DeviceKey
 
 PRIVATE_KEY = "11" * 32
 OTHER_PRIVATE_KEY = "22" * 32
-TOS_RECEIPT = "telegram:6770805286:15921|buzz-tos-and-18-plus-approved"
-
-
-def _approval_ref(receipt: str = TOS_RECEIPT) -> str:
-    digest = hashlib.sha256(receipt.encode()).hexdigest()
-    return f"owner-control:{'a' * 32}:sha256:{digest}"
 
 
 @pytest.fixture
@@ -43,10 +39,7 @@ def _bind(registry: AgentRegistry, **overrides) -> dict:
         "relay_url": "wss://example.communities.buzz.xyz",
         "community_id": "example",
         "enabled": True,
-        "tos_receipt": TOS_RECEIPT,
-        "tos_approved_by": "ui:admin",
-        "tos_approved_at": 1234.5,
-        "tos_approval_ref": _approval_ref(),
+        "owner_actor": "ui:admin",
     }
     values.update(overrides)
     return registry.bind_buzz_identity_owner_control("barsik", **values)
@@ -65,14 +58,30 @@ def test_private_key_is_encrypted_and_absent_from_public_surfaces(registry, tmp_
     columns = {row[1] for row in registry._db.execute("PRAGMA table_info(buzz_identities)")}
     assert "private_key" not in columns
     assert "secret_key" not in columns
+    unique_indexes = {
+        row[1] for row in registry._db.execute("PRAGMA index_list(buzz_identities)") if row[2]
+    }
+    assert "idx_buzz_identities_pubkey" in unique_indexes
+    assert "idx_buzz_identities_approval_ref" in unique_indexes
+    assert "idx_buzz_identities_tos_receipt" in unique_indexes
     assert public["tos_approved"] is True
 
     row = registry._db.execute(
-        "SELECT nonce, ciphertext FROM buzz_identities WHERE agent='barsik'"
+        "SELECT nonce, ciphertext, tos_receipt FROM buzz_identities WHERE agent='barsik'"
     ).fetchone()
     assert len(row[0]) == 24
     assert len(row[1]) == 48
     assert row[1] != bytes.fromhex(PRIVATE_KEY)
+    receipt = json.loads(row[2])
+    assert receipt == {
+        "action": "buzz.identity.bind",
+        "agent": "barsik",
+        "community_id": "example",
+        "policy": BUZZ_TOS_POLICY,
+        "policy_version": BUZZ_TOS_POLICY_VERSION,
+        "pubkey": public["pubkey"],
+        "relay_url": "wss://example.communities.buzz.xyz",
+    }
 
     material = registry.get_buzz_signing_material("barsik")
     assert material.private_key == bytes.fromhex(PRIVATE_KEY)
@@ -151,21 +160,29 @@ def test_wrong_device_kek_disables_identity(registry, tmp_path):
         other.close()
 
 
-def test_enable_refuses_missing_tos_authority(registry):
-    with pytest.raises(ValueError, match="ToS receipt"):
-        _bind(registry, tos_receipt="", tos_approval_ref=_approval_ref(""))
+def test_enable_refuses_untrusted_owner_actor(registry):
+    with pytest.raises(ValueError, match="owner approval actor"):
+        _bind(registry, owner_actor="agent:forged")
     assert registry.get_buzz_identity("barsik") is None
 
 
-def test_tos_receipt_is_immutable_without_explicit_rotation(registry):
+def test_server_generated_tos_receipt_is_immutable_without_explicit_rotation(registry):
     original = _bind(registry)
-    replacement = "a different owner receipt"
+    stored_receipt = registry._db.execute(
+        "SELECT tos_receipt FROM buzz_identities WHERE agent='barsik'"
+    ).fetchone()[0]
+    rebound = _bind(registry, owner_actor="ui:different-owner")
+    assert rebound["tos_approval_ref"] == original["tos_approval_ref"]
+    assert rebound["tos_approved_by"] == original["tos_approved_by"]
+    assert (
+        registry._db.execute(
+            "SELECT tos_receipt FROM buzz_identities WHERE agent='barsik'"
+        ).fetchone()[0]
+        == stored_receipt
+    )
+
     with pytest.raises(ValueError, match="rotation"):
-        _bind(
-            registry,
-            tos_receipt=replacement,
-            tos_approval_ref=_approval_ref(replacement),
-        )
+        _bind(registry, community_id="different")
     assert registry.get_buzz_identity("barsik")["tos_approval_ref"] == original["tos_approval_ref"]
 
 
@@ -173,6 +190,56 @@ def test_identity_rotation_is_not_implicit(registry):
     _bind(registry)
     with pytest.raises(ValueError, match="rotation"):
         _bind(registry, private_key=OTHER_PRIVATE_KEY)
+
+
+def test_one_approval_reference_cannot_be_reused_for_a_second_identity(registry, tmp_path):
+    _bind(registry)
+    registry.register("murzik", model="sonnet", working_dir=str(tmp_path / "murzik"))
+    source = registry._db.execute(
+        "SELECT tos_receipt, tos_approved_by, tos_approved_at, tos_approval_ref "
+        "FROM buzz_identities WHERE agent='barsik'"
+    ).fetchone()
+
+    with pytest.raises(sqlite3.IntegrityError):
+        registry._db.execute(
+            """INSERT INTO buzz_identities (
+                   agent, pubkey, wrap_version, nonce, ciphertext, relay_url,
+                   community_id, enabled, status, last_error, tos_receipt,
+                   tos_approved_by, tos_approved_at, tos_approval_ref,
+                   created_at, updated_at
+               ) VALUES (?, ?, 1, X'00', X'00', ?, ?, 1, 'active', '',
+                         ?, ?, ?, ?, 1, 1)""",
+            (
+                "murzik",
+                "f" * 64,
+                "wss://example.communities.buzz.xyz",
+                "example",
+                *source,
+            ),
+        )
+
+
+@pytest.mark.parametrize(
+    ("column", "value"),
+    [
+        ("tos_receipt", "arbitrary caller text"),
+        ("tos_approved_by", "agent:forged"),
+        ("tos_approval_ref", "owner-control:" + "b" * 32 + ":sha256:" + "c" * 64),
+    ],
+)
+def test_tampered_owner_authority_disables_identity(registry, column, value):
+    _bind(registry)
+    registry._db.execute(
+        f"UPDATE buzz_identities SET {column}=? WHERE agent='barsik'",
+        (value,),
+    )
+    registry._db.commit()
+
+    with pytest.raises(BuzzIdentityUnhealthyError):
+        registry.get_buzz_signing_material("barsik")
+    state = registry.get_buzz_identity("barsik")
+    assert state["enabled"] is False
+    assert state["status"] == "unhealthy"
 
 
 def test_legacy_buzz_table_gets_all_forward_columns(tmp_path):

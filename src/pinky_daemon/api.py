@@ -7636,11 +7636,6 @@ npm run build</pre>
     ):
         """One-step owner-approved Buzz bind; raw key is immediately wrapped."""
         actor = _owner_control_actor(request)
-        receipt = req.tos_receipt.strip()
-        approval_ref = (
-            f"owner-control:{uuid.uuid4().hex}:sha256:"
-            f"{hashlib.sha256(receipt.encode('utf-8')).hexdigest()}"
-        )
         try:
             identity = agents.bind_buzz_identity_owner_control(
                 name,
@@ -7648,10 +7643,7 @@ npm run build</pre>
                 relay_url=req.relay_url,
                 community_id=req.community_id,
                 enabled=req.enabled,
-                tos_receipt=receipt,
-                tos_approved_by=actor,
-                tos_approved_at=time.time(),
-                tos_approval_ref=approval_ref,
+                owner_actor=actor,
             )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc

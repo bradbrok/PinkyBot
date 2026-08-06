@@ -1845,6 +1845,14 @@ class AgentRegistry:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_pubkey "
             "ON buzz_identities(pubkey) WHERE pubkey != ''"
         )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_approval_ref "
+            "ON buzz_identities(tos_approval_ref) WHERE tos_approval_ref != ''"
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_tos_receipt "
+            "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
+        )
 
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
@@ -2751,21 +2759,22 @@ except Exception as exc:
         relay_url: str,
         community_id: str,
         enabled: bool,
-        tos_receipt: str,
-        tos_approved_by: str,
-        tos_approved_at: float,
-        tos_approval_ref: str,
+        owner_actor: str,
     ) -> dict:
         """Bind one identity from the authenticated owner-control route only.
 
-        The HTTP composition root derives the actor, timestamp, and approval
-        reference. There is intentionally no generic token/settings mutation
-        path for these authority columns.
+        The HTTP composition root derives only the authenticated owner actor.
+        Receipt, timestamp, and reference are generated here and bound to the
+        exact identity/policy/scope; callers cannot supply authority bytes.
         """
-        import hashlib
         from urllib.parse import urlsplit
 
-        from pinky_daemon.buzz_identity import wrap_buzz_private_key
+        from pinky_daemon.buzz_identity import (
+            issue_buzz_owner_approval,
+            validate_buzz_owner_actor,
+            validate_buzz_owner_approval,
+            wrap_buzz_private_key,
+        )
         from pinky_identity.keystore import DeviceKey
 
         agent = _validate_agent_name(agent_name)
@@ -2785,25 +2794,13 @@ except Exception as exc:
         community = str(community_id or "").strip().lower()
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", community):
             raise ValueError("Buzz community_id is invalid")
-        receipt = str(tos_receipt or "").strip()
-        approver = str(tos_approved_by or "").strip()
-        approval_ref = str(tos_approval_ref or "").strip()
-        approved_at = float(tos_approved_at or 0)
-        if not receipt or len(receipt.encode("utf-8")) > 8192:
-            raise ValueError("Buzz ToS receipt is required and must be at most 8192 bytes")
-        if not approver or len(approver) > 128 or approved_at <= 0:
-            raise ValueError("Buzz ToS approval authority is invalid")
-        expected_digest = hashlib.sha256(receipt.encode("utf-8")).hexdigest()
-        if not re.fullmatch(
-            r"owner-control:[0-9a-f]{32}:sha256:[0-9a-f]{64}", approval_ref
-        ) or not approval_ref.endswith(expected_digest):
-            raise ValueError("Buzz ToS approval reference does not match its receipt")
+        approver = validate_buzz_owner_actor(owner_actor)
 
         # Refuse accidental secret duplication into any durable text column.
         secret_text = str(private_key or "").strip().lower()
         if secret_text and any(
             secret_text in value.lower()
-            for value in (relay, community, receipt, approver, approval_ref)
+            for value in (relay, community, approver)
         ):
             raise ValueError("Buzz private key must not appear in identity metadata")
 
@@ -2817,18 +2814,31 @@ except Exception as exc:
         status = "active" if enabled else "disabled"
         with self._rmw_lock:
             existing = self._db.execute(
-                "SELECT pubkey, tos_receipt FROM buzz_identities WHERE agent=?",
+                "SELECT pubkey, relay_url, community_id, tos_receipt, "
+                "tos_approved_by, tos_approved_at, tos_approval_ref "
+                "FROM buzz_identities WHERE agent=?",
                 (agent,),
             ).fetchone()
             if existing and (
                 not secrets.compare_digest(existing[0], envelope.pubkey)
-                or not secrets.compare_digest(existing[1], receipt)
+                or not secrets.compare_digest(existing[1], relay)
+                or not secrets.compare_digest(existing[2], community)
             ):
                 raise ValueError(
-                    "Buzz identity or ToS receipt rotation requires an explicit rotation operation"
+                    "Buzz identity or approval scope rotation requires an explicit rotation operation"
                 )
             try:
                 if existing:
+                    validate_buzz_owner_approval(
+                        agent=agent,
+                        pubkey=existing[0],
+                        relay_url=existing[1],
+                        community_id=existing[2],
+                        receipt=existing[3],
+                        approved_by=existing[4],
+                        approved_at=existing[5],
+                        approval_ref=existing[6],
+                    )
                     # Same identity + same immutable receipt: safe idempotent
                     # re-bind. Preserve the original authority actor/timestamp/ref.
                     self._db.execute(
@@ -2849,6 +2859,13 @@ except Exception as exc:
                         ),
                     )
                 else:
+                    approval = issue_buzz_owner_approval(
+                        owner_actor=approver,
+                        agent=agent,
+                        pubkey=envelope.pubkey,
+                        relay_url=relay,
+                        community_id=community,
+                    )
                     self._db.execute(
                         """INSERT INTO buzz_identities (
                                agent, pubkey, wrap_version, nonce, ciphertext,
@@ -2866,10 +2883,10 @@ except Exception as exc:
                             community,
                             int(enabled),
                             status,
-                            receipt,
-                            approver,
-                            approved_at,
-                            approval_ref,
+                            approval.receipt,
+                            approval.approved_by,
+                            approval.approved_at,
+                            approval.approval_ref,
                             now,
                             now,
                         ),
@@ -2891,6 +2908,7 @@ except Exception as exc:
             BuzzKeyEnvelope,
             BuzzSigningMaterial,
             unwrap_buzz_private_key,
+            validate_buzz_owner_approval,
         )
         from pinky_identity.keystore import DeviceKey
 
@@ -2903,10 +2921,17 @@ except Exception as exc:
         ).fetchone()
         if not row or not row[7] or row[8] != "active":
             return None
-        if not row[9] or not row[10] or not row[11] or not row[12]:
-            self.mark_buzz_identity_unhealthy(agent_name, "missing_tos_authority")
-            raise BuzzIdentityUnhealthyError("Buzz identity lacks ToS authority")
         try:
+            validate_buzz_owner_approval(
+                agent=row[0],
+                pubkey=row[1],
+                relay_url=row[5],
+                community_id=row[6],
+                receipt=row[9],
+                approved_by=row[10],
+                approved_at=row[11],
+                approval_ref=row[12],
+            )
             envelope = BuzzKeyEnvelope(
                 agent=row[0],
                 pubkey=row[1],

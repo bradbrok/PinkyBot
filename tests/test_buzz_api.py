@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 from datetime import datetime, timezone
 from types import SimpleNamespace
@@ -18,7 +19,7 @@ from pinky_daemon.broker import BrokerMessage
 from pinky_outreach.types import Message, Platform
 
 PRIVATE_KEY = "11" * 32
-RECEIPT = "telegram:6770805286:15921|buzz-tos-and-18-plus-approved"
+OTHER_PRIVATE_KEY = "22" * 32
 CHANNEL = "00000000-0000-4000-8000-000000000001"
 
 
@@ -33,7 +34,6 @@ def _body(**overrides):
         "private_key": PRIVATE_KEY,
         "relay_url": "wss://example.communities.buzz.xyz",
         "community_id": "example",
-        "tos_receipt": RECEIPT,
         "enabled": True,
     }
     body.update(overrides)
@@ -56,18 +56,11 @@ def _register_and_bind(client: TestClient):
     return bound
 
 
-def test_owner_bind_is_one_step_server_derived_and_redacted(tmp_path):
+def test_owner_bind_generates_identity_scoped_authority_and_redacts_it(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:
         client.post("/agents", json={"name": "barsik", "model": "sonnet"})
-        response = client.put(
-            "/system/buzz-identities/barsik",
-            json=_body(
-                tos_approved_by="agent:forged",
-                tos_approved_at=1,
-                tos_approval_ref="forged",
-            ),
-        )
+        response = client.put("/system/buzz-identities/barsik", json=_body())
 
         assert response.status_code == 200, response.text
         identity = response.json()
@@ -79,21 +72,122 @@ def test_owner_bind_is_one_step_server_derived_and_redacted(tmp_path):
             r"owner-control:[0-9a-f]{32}:sha256:[0-9a-f]{64}",
             identity["tos_approval_ref"],
         )
-        assert identity["tos_approval_ref"].endswith(hashlib.sha256(RECEIPT.encode()).hexdigest())
         assert PRIVATE_KEY not in response.text
-        assert RECEIPT not in response.text
         assert "ciphertext" not in identity
         assert "nonce" not in identity
 
+        receipt = app.state.agents._db.execute(
+            "SELECT tos_receipt FROM buzz_identities WHERE agent='barsik'"
+        ).fetchone()[0]
+        assert json.loads(receipt) == {
+            "action": "buzz.identity.bind",
+            "agent": "barsik",
+            "community_id": "example",
+            "policy": "buzz-tos-and-18-plus",
+            "policy_version": 1,
+            "pubkey": identity["pubkey"],
+            "relay_url": "wss://example.communities.buzz.xyz",
+        }
+        assert identity["tos_approval_ref"].endswith(hashlib.sha256(receipt.encode()).hexdigest())
+
         listed = client.get("/system/buzz-identities").text
         assert PRIVATE_KEY not in listed
-        assert RECEIPT not in listed
+        assert receipt not in listed
 
     agents_db = tmp_path / "conversations_agents.db"
     audit_db = tmp_path / "conversations_audit.db"
     assert PRIVATE_KEY.encode() not in agents_db.read_bytes()
     assert PRIVATE_KEY.encode() not in audit_db.read_bytes()
-    assert RECEIPT.encode() not in audit_db.read_bytes()
+    assert receipt.encode() not in audit_db.read_bytes()
+
+
+def test_arbitrary_or_caller_supplied_authority_cannot_enable(tmp_path):
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+        schema = client.get("/openapi.json").json()["components"]["schemas"][
+            "BindBuzzIdentityRequest"
+        ]
+        assert set(schema["properties"]) == {
+            "private_key",
+            "relay_url",
+            "community_id",
+            "enabled",
+        }
+        assert schema["additionalProperties"] is False
+        response = client.put(
+            "/system/buzz-identities/barsik",
+            json=_body(
+                tos_receipt="THIS IS ARBITRARY CALLER TEXT, NOT A RESOLVED APPROVAL RECORD",
+                tos_approved_by="agent:forged",
+                tos_approved_at=1,
+                tos_approval_ref="forged",
+            ),
+        )
+
+        assert response.status_code == 422
+        assert app.state.agents.get_buzz_identity("barsik") is None
+        assert PRIVATE_KEY not in response.text
+
+
+def test_one_approval_cannot_enable_a_second_identity(tmp_path):
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        for name in ("barsik", "murzik"):
+            response = client.post("/agents", json={"name": name, "model": "sonnet"})
+            assert response.status_code == 200
+        first = client.put("/system/buzz-identities/barsik", json=_body())
+        assert first.status_code == 200
+        first_state = first.json()
+        first_receipt = app.state.agents._db.execute(
+            "SELECT tos_receipt FROM buzz_identities WHERE agent='barsik'"
+        ).fetchone()[0]
+
+        replay = client.put(
+            "/system/buzz-identities/murzik",
+            json=_body(
+                private_key=OTHER_PRIVATE_KEY,
+                tos_receipt=first_receipt,
+                tos_approved_by=first_state["tos_approved_by"],
+                tos_approved_at=first_state["tos_approved_at"],
+                tos_approval_ref=first_state["tos_approval_ref"],
+            ),
+        )
+        assert replay.status_code == 422
+        assert app.state.agents.get_buzz_identity("murzik") is None
+
+        second = client.put(
+            "/system/buzz-identities/murzik",
+            json=_body(private_key=OTHER_PRIVATE_KEY),
+        )
+        assert second.status_code == 200
+        second_state = second.json()
+        second_receipt = app.state.agents._db.execute(
+            "SELECT tos_receipt FROM buzz_identities WHERE agent='murzik'"
+        ).fetchone()[0]
+        assert second_state["tos_approval_ref"] != first_state["tos_approval_ref"]
+        assert second_receipt != first_receipt
+        assert json.loads(second_receipt)["agent"] == "murzik"
+        assert json.loads(second_receipt)["pubkey"] == second_state["pubkey"]
+
+
+def test_rebind_preserves_immutable_server_authority(tmp_path):
+    app = _app(tmp_path)
+    with TestClient(app) as client:
+        first = _register_and_bind(client).json()
+        before = app.state.agents._db.execute(
+            "SELECT tos_receipt, tos_approved_by, tos_approved_at, tos_approval_ref "
+            "FROM buzz_identities WHERE agent='barsik'"
+        ).fetchone()
+
+        rebound = client.put("/system/buzz-identities/barsik", json=_body())
+        assert rebound.status_code == 200
+        after = app.state.agents._db.execute(
+            "SELECT tos_receipt, tos_approved_by, tos_approved_at, tos_approval_ref "
+            "FROM buzz_identities WHERE agent='barsik'"
+        ).fetchone()
+        assert after == before
+        assert rebound.json()["tos_approval_ref"] == first["tos_approval_ref"]
 
 
 def test_valid_internal_agent_auth_cannot_write_tos_authority(tmp_path):
@@ -220,17 +314,13 @@ def test_startup_refuses_enabled_identity_when_buzz_dependency_is_missing(tmp_pa
         buzz_device_key_path=str(tmp_path / "identity" / ".device_key"),
     )
     registry.register("barsik", model="sonnet", working_dir=str(tmp_path / "barsik"))
-    digest = hashlib.sha256(RECEIPT.encode()).hexdigest()
     registry.bind_buzz_identity_owner_control(
         "barsik",
         private_key=PRIVATE_KEY,
         relay_url="wss://example.communities.buzz.xyz",
         community_id="example",
         enabled=True,
-        tos_receipt=RECEIPT,
-        tos_approved_by="ui:admin",
-        tos_approved_at=1234.5,
-        tos_approval_ref=f"owner-control:{'a' * 32}:sha256:{digest}",
+        owner_actor="ui:admin",
     )
     registry.close()
     monkeypatch.setattr(

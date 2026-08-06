@@ -7,9 +7,12 @@ material.
 
 from __future__ import annotations
 
+import hashlib
 import hmac
+import json
 import re
 import secrets
+import time
 from dataclasses import dataclass
 
 from nacl.bindings import (
@@ -22,8 +25,12 @@ from pinky_identity.keystore import DeviceKey
 
 BUZZ_WRAP_VERSION = 1
 BUZZ_PRIVATE_KEY_BYTES = 32
+BUZZ_TOS_POLICY = "buzz-tos-and-18-plus"
+BUZZ_TOS_POLICY_VERSION = 1
 _BUZZ_AAD_PREFIX = b"pinky-identity/v1/buzz-secp256k1"
 _HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+_OWNER_ACTOR_RE = re.compile(r"^ui:[a-zA-Z0-9_.-]{1,120}$")
+_APPROVAL_REF_RE = re.compile(r"^owner-control:[0-9a-f]{32}:sha256:[0-9a-f]{64}$")
 
 
 class BuzzIdentityError(ValueError):
@@ -72,6 +79,111 @@ class BuzzSigningMaterial:
             f"relay_url={self.relay_url!r}, community_id={self.community_id!r}, "
             "private_key=<redacted>)"
         )
+
+
+@dataclass(frozen=True)
+class BuzzOwnerApproval:
+    """Server-issued authority record for one exact Buzz identity binding."""
+
+    receipt: str
+    approved_by: str
+    approved_at: float
+    approval_ref: str
+
+
+def canonical_buzz_tos_receipt(
+    *,
+    agent: str,
+    pubkey: str,
+    relay_url: str,
+    community_id: str,
+) -> str:
+    """Build the canonical, identity-scoped receipt for an owner bind action."""
+    if not agent or not _HEX_64_RE.fullmatch(pubkey):
+        raise BuzzIdentityError("invalid Buzz approval identity metadata")
+    return json.dumps(
+        {
+            "action": "buzz.identity.bind",
+            "agent": agent,
+            "community_id": community_id,
+            "policy": BUZZ_TOS_POLICY,
+            "policy_version": BUZZ_TOS_POLICY_VERSION,
+            "pubkey": pubkey,
+            "relay_url": relay_url,
+        },
+        ensure_ascii=True,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+
+
+def validate_buzz_owner_actor(owner_actor: str) -> str:
+    """Validate the trusted owner principal derived by the HTTP session gate."""
+    actor = str(owner_actor or "").strip()
+    if not _OWNER_ACTOR_RE.fullmatch(actor):
+        raise BuzzIdentityError("Buzz owner approval actor is invalid")
+    return actor
+
+
+def issue_buzz_owner_approval(
+    *,
+    owner_actor: str,
+    agent: str,
+    pubkey: str,
+    relay_url: str,
+    community_id: str,
+) -> BuzzOwnerApproval:
+    """Issue fresh provenance for one authenticated owner action.
+
+    The API caller supplies none of these bytes. The trusted route derives the
+    actor from its session, while this function derives the receipt, time, and
+    single-use reference inside the daemon.
+    """
+    actor = validate_buzz_owner_actor(owner_actor)
+    receipt = canonical_buzz_tos_receipt(
+        agent=agent,
+        pubkey=pubkey,
+        relay_url=relay_url,
+        community_id=community_id,
+    )
+    digest = hashlib.sha256(receipt.encode("utf-8")).hexdigest()
+    return BuzzOwnerApproval(
+        receipt=receipt,
+        approved_by=actor,
+        approved_at=time.time(),
+        approval_ref=f"owner-control:{secrets.token_hex(16)}:sha256:{digest}",
+    )
+
+
+def validate_buzz_owner_approval(
+    *,
+    agent: str,
+    pubkey: str,
+    relay_url: str,
+    community_id: str,
+    receipt: str,
+    approved_by: str,
+    approved_at: float,
+    approval_ref: str,
+) -> None:
+    """Validate stored provenance against its exact identity and policy scope."""
+    expected = canonical_buzz_tos_receipt(
+        agent=agent,
+        pubkey=pubkey,
+        relay_url=relay_url,
+        community_id=community_id,
+    )
+    if not hmac.compare_digest(str(receipt or ""), expected):
+        raise BuzzIdentityUnhealthyError("Buzz owner approval receipt is invalid")
+    actor = str(approved_by or "")
+    if not _OWNER_ACTOR_RE.fullmatch(actor) or float(approved_at or 0) <= 0:
+        raise BuzzIdentityUnhealthyError("Buzz owner approval provenance is invalid")
+    ref = str(approval_ref or "")
+    expected_digest = hashlib.sha256(expected.encode("utf-8")).hexdigest()
+    if not _APPROVAL_REF_RE.fullmatch(ref) or not hmac.compare_digest(
+        ref.rsplit(":", 1)[-1], expected_digest
+    ):
+        raise BuzzIdentityUnhealthyError("Buzz owner approval reference is invalid")
 
 
 def _coincurve():
@@ -188,14 +300,21 @@ def unwrap_buzz_private_key(
 
 
 __all__ = [
+    "BUZZ_TOS_POLICY",
+    "BUZZ_TOS_POLICY_VERSION",
     "BUZZ_WRAP_VERSION",
     "BuzzDependencyError",
     "BuzzIdentityError",
     "BuzzIdentityUnhealthyError",
     "BuzzKeyEnvelope",
+    "BuzzOwnerApproval",
     "BuzzSigningMaterial",
+    "canonical_buzz_tos_receipt",
     "derive_xonly_pubkey",
+    "issue_buzz_owner_approval",
     "normalize_private_key",
     "unwrap_buzz_private_key",
+    "validate_buzz_owner_actor",
+    "validate_buzz_owner_approval",
     "wrap_buzz_private_key",
 ]
