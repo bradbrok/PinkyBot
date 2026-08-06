@@ -4482,6 +4482,10 @@ def create_api(
         "/icons.svg",
         # OpenClaw device WebSocket — external Android client connects here;
         # auth is handled inside the WS handshake, not via session cookie.
+        # Inert since #359: these two routes are only registered when
+        # OPENCLAW_ENABLED=1 (default 0), so with the bridge off nothing
+        # matches these entries. They stay listed so flipping the flag back on
+        # doesn't 401 the handshake.
         "/openclaw/ws",
         "/gateway/ws",
     }
@@ -12737,52 +12741,68 @@ npm run build</pre>
     # OpenClaw Gateway Protocol v4 bridge — lets the OpenClaw Android app
     # connect and chat with the target agent (default: satoshi) without a
     # separate OpenClaw Gateway server. Additive: no existing route is touched.
-    try:
-        from pinky_daemon import openclaw_gateway as _ocg
+    #
+    # Default OFF since #359. The only client that ever used this bridge was the
+    # OpenClaw Android app, uninstalled on 06/08/2026; while connected it looped
+    # on unimplemented methods (~5.7k chat.metadata/day, all METHOD_NOT_FOUND).
+    # These two WebSockets are also carved out of the route auth gate as public,
+    # so leaving them registered means two unauthenticated sockets exposed for a
+    # client that no longer exists. Re-enable with OPENCLAW_ENABLED=1 (one
+    # daemon restart) if the bridge is ever needed again; the code below is
+    # unchanged, only its registration is gated.
+    _openclaw_enabled = os.environ.get(
+        "OPENCLAW_ENABLED", "0"
+    ).strip().lower() in ("1", "true", "yes", "on")
+    if not _openclaw_enabled:
+        _log("openclaw: gateway disabled (OPENCLAW_ENABLED=0) — routes not registered")
+    else:
+        try:
+            from pinky_daemon import openclaw_gateway as _ocg
 
-        _ocg.set_dependencies(
-            broker=broker,
-            ensure_session=_ensure_streaming_session,
-            agents=agents,
-            transport_session_state=TransportSessionState,
-            target_agent=os.environ.get("OPENCLAW_TARGET_AGENT", "satoshi"),
-        )
+            _ocg.set_dependencies(
+                broker=broker,
+                ensure_session=_ensure_streaming_session,
+                agents=agents,
+                transport_session_state=TransportSessionState,
+                target_agent=os.environ.get("OPENCLAW_TARGET_AGENT", "satoshi"),
+            )
 
-        @app.websocket("/openclaw/ws")
-        async def openclaw_ws(ws: WebSocket):
-            await _ocg.handle_connection(ws)
+            @app.websocket("/openclaw/ws")
+            async def openclaw_ws(ws: WebSocket):
+                await _ocg.handle_connection(ws)
 
-        # Common alternate paths OpenClaw clients probe for the gateway socket.
-        @app.websocket("/gateway/ws")
-        async def openclaw_gateway_ws(ws: WebSocket):
-            await _ocg.handle_connection(ws)
+            # Common alternate paths OpenClaw clients probe for the gateway socket.
+            @app.websocket("/gateway/ws")
+            async def openclaw_gateway_ws(ws: WebSocket):
+                await _ocg.handle_connection(ws)
 
-        # ── OpenClaw device invoke REST endpoint ─────────────────────────────
-        # Allows the AI agent (Satoshi) to call device methods on the connected
-        # Android node via HTTP, without needing a WebSocket connection.
-        # Usage: POST /openclaw/device {"method": "camera.snap", "params": {}}
-        @app.post("/openclaw/device")
-        async def openclaw_device_invoke(request: Request):
-            from fastapi.responses import JSONResponse as _JSONResponse
-            body = await request.json()
-            method = str(body.get("method") or "")
-            params = dict(body.get("params") or {})
-            timeout = float(body.get("timeout") or 15.0)
-            if not method:
-                return _JSONResponse({"ok": False, "error": "method required"}, status_code=400)
-            try:
-                result = await _ocg._forward_to_node(method, params, timeout=timeout)
-                return _JSONResponse({"ok": True, "payload": result})
-            except ValueError as exc:
-                return _JSONResponse({"ok": False, "error": str(exc), "code": "NODE_UNAVAILABLE"}, status_code=503)
-            except TimeoutError:
-                return _JSONResponse({"ok": False, "error": f"{method} timed out", "code": "TIMEOUT"}, status_code=504)
-            except Exception as exc:  # noqa: BLE001
-                return _JSONResponse({"ok": False, "error": str(exc), "code": "DEVICE_ERROR"}, status_code=500)
+            # ── OpenClaw device invoke REST endpoint ─────────────────────────
+            # Allows the AI agent (Satoshi) to call device methods on the
+            # connected Android node via HTTP, without needing a WebSocket
+            # connection.
+            # Usage: POST /openclaw/device {"method": "camera.snap", "params": {}}
+            @app.post("/openclaw/device")
+            async def openclaw_device_invoke(request: Request):
+                from fastapi.responses import JSONResponse as _JSONResponse
+                body = await request.json()
+                method = str(body.get("method") or "")
+                params = dict(body.get("params") or {})
+                timeout = float(body.get("timeout") or 15.0)
+                if not method:
+                    return _JSONResponse({"ok": False, "error": "method required"}, status_code=400)
+                try:
+                    result = await _ocg._forward_to_node(method, params, timeout=timeout)
+                    return _JSONResponse({"ok": True, "payload": result})
+                except ValueError as exc:
+                    return _JSONResponse({"ok": False, "error": str(exc), "code": "NODE_UNAVAILABLE"}, status_code=503)
+                except TimeoutError:
+                    return _JSONResponse({"ok": False, "error": f"{method} timed out", "code": "TIMEOUT"}, status_code=504)
+                except Exception as exc:  # noqa: BLE001
+                    return _JSONResponse({"ok": False, "error": str(exc), "code": "DEVICE_ERROR"}, status_code=500)
 
-        _log("openclaw: gateway WS registered at /openclaw/ws and /gateway/ws")
-    except Exception as _ocg_exc:  # noqa: BLE001 — bridge is optional
-        _log(f"openclaw: gateway not registered ({_ocg_exc})")
+            _log("openclaw: gateway WS registered at /openclaw/ws and /gateway/ws")
+        except Exception as _ocg_exc:  # noqa: BLE001 — bridge is optional
+            _log(f"openclaw: gateway not registered ({_ocg_exc})")
 
     # ── AIena: approve article ─────────────────────────────────────────────────
     # Called from admin.aiena.it when Mirko clicks APPROVATO on a preview card.
