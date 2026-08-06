@@ -31,13 +31,18 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+_PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
+    {"alive", "ok", "busy", "finishing"}
+)
+
+
 # ── Rate Limit Gating ───────────────────────────────────────
 
 _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
 _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 
-# ── Persisted Wake Retry Limits ───────────────────────────────
-_MAX_WAKE_CONFIRMATION_ATTEMPTS = 3  # Discard after 3 failed confirmations
+# Il limite di retry sui wake persistiti vive ora in
+# AgentScheduler.PERSISTED_WAKE_ATTEMPT_CAP (parcheggio, non discard).
 
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
@@ -147,6 +152,33 @@ def next_cron_description(cron_expr: str) -> str:
 
 # ── Scheduler ────────────────────────────────────────────────
 
+
+class ScheduleWakeReceipt:
+    """Capability that durably accepts one exact scheduler fire.
+
+    The transport calls ``accept`` at its real acceptance edge and only then
+    resolves the process-local Future.  This ordering is the load-bearing
+    crash-gap guarantee for issue #991.
+    """
+
+    def __init__(
+        self,
+        registry: AgentRegistry,
+        schedule_id: int,
+        fired_at: float,
+    ) -> None:
+        self.schedule_id = schedule_id
+        self.fired_at = fired_at
+        self._registry = registry
+
+    def accept(self) -> bool:
+        """Commit the positive receipt synchronously and idempotently."""
+        return self._registry.confirm_pending_schedule_wake_by_fire(
+            self.schedule_id,
+            self.fired_at,
+            delivered_at=time.time(),
+        )
+
 class AgentScheduler:
     """Background scheduler for agent wake schedules and heartbeats.
 
@@ -157,6 +189,8 @@ class AgentScheduler:
     Also supports auto-sleep: agents are put to sleep after a configurable
     number of hours with no activity.
     """
+
+    PERSISTED_WAKE_ATTEMPT_CAP = 5
 
     def __init__(
         self,
@@ -172,6 +206,7 @@ class AgentScheduler:
         is_resurrectable_fn=None,
         comms_cleanup_fn=None,
         delivery_busy_fn=None,
+        delivery_inflight_fn=None,
         owner_notify_callback=None,
         trigger_store=None,
         activity=None,
@@ -179,7 +214,10 @@ class AgentScheduler:
         schedule_delivery_timeout: float = 600.0,
     ) -> None:
         self._registry = registry
-        # async fn(agent_name, session_id, prompt) -> bool | Awaitable[bool].
+        # async fn(agent_name, session_id, prompt, *, schedule_receipt=None)
+        # -> bool | Awaitable[bool]. Production API callbacks accept the
+        # optional durable receipt capability; legacy/test callbacks retain
+        # the original three-argument contract.
         # An awaitable return is a per-prompt delivery receipt; same-agent
         # schedules are not advanced until it resolves.
         self._wake_callback = wake_callback
@@ -200,6 +238,27 @@ class AgentScheduler:
         # positive busy-not-wedged evidence, so a pending scheduler receipt
         # must keep waiting instead of expiring behind a healthy long turn.
         self._delivery_busy_fn = delivery_busy_fn
+        # fn(agent_name, prompt) -> bool. True means THIS wake's prompt has
+        # already been pasted to the transport with its receipt unresolved.
+        # Past that point a cancel cannot recall the prompt — the pane will
+        # execute it regardless — so declaring the wake undelivered and
+        # re-persisting it would mint a phantom outbox row whose later
+        # replay is a DUPLICATE EXECUTION. The receipt wait must extend
+        # instead. Distinct from delivery_busy_fn: that reads watchdog
+        # liveness (can blip false between turns at the timeout boundary);
+        # this reads the turn's own transport execution state.
+        #
+        # The extension is DELIBERATELY unbounded while the probe keeps
+        # reporting pasted-unresolved: in that state any timeout action
+        # either drops the wake or duplicates it, so the scheduler holds.
+        # The hold ends when the receipt resolves (acceptance observed),
+        # the session leaves CONNECTED (receipt resolves False), or a
+        # force_restart resets the turn's pasted flag (probe reads False
+        # and the durable cancel+persist path resumes). Operational cost
+        # while held: same-agent schedule cohorts queue behind the
+        # per-agent delivery lock — surfaced by the "extending" log line
+        # each timeout period (Murzik review, PR #983).
+        self._delivery_inflight_fn = delivery_inflight_fn
         # async fn(agent_name, text) -> bool. FIRED BUT UNDELIVERED must leave
         # journald and reach the owner through an out-of-band transport.
         self._owner_notify_callback = owner_notify_callback
@@ -357,13 +416,38 @@ class AgentScheduler:
                     continue
 
             if cron_matches(schedule.cron, dt):
+                if schedule.direct_send:
+                    claimed = self._registry.update_schedule_last_run(
+                        schedule.id,
+                        now,
+                        expected_last_run=schedule.last_run,
+                    )
+                else:
+                    claimed, _ledger_row = (
+                        self._registry.claim_schedule_fire(
+                            schedule.id,
+                            timestamp=now,
+                            expected_last_run=schedule.last_run,
+                            agent_name=schedule.agent_name,
+                            schedule_name=schedule.name,
+                            prompt=(
+                                schedule.prompt
+                                or f"Scheduled wake: {schedule.name}"
+                            ),
+                        )
+                    )
+                if not claimed:
+                    _log(
+                        f"scheduler: lost last_run claim race for "
+                        f"#{schedule.id} — skipping fire"
+                    )
+                    continue
                 _log(f"scheduler: firing schedule '{schedule.name}' for agent '{schedule.agent_name}' (direct_send={schedule.direct_send}, one_shot={schedule.one_shot})")
                 if self._activity:
                     try:
                         self._activity.log(schedule.agent_name, "schedule_fired", f"Schedule '{schedule.name}' fired")
                     except Exception:
                         pass
-                self._registry.update_schedule_last_run(schedule.id, now)
                 # Carry the exact fire identity on this queued snapshot. A
                 # later minute can advance the DB row while this cohort still
                 # waits behind a long turn, so failure paths must never reread
@@ -476,6 +560,18 @@ class AgentScheduler:
         confirmed = False
         failure_reason = "no delivery callback configured"
 
+        # Direct unit/in-process callers can bypass ``_check_schedules``. Keep
+        # their exact fire represented too; production fires already have this
+        # row from the atomic claim transaction above.
+        if not schedule.direct_send and schedule.last_run > 0:
+            self._registry.persist_schedule_wake(
+                schedule.id,
+                agent_name=schedule.agent_name,
+                schedule_name=schedule.name,
+                prompt=self._wake_prompt(schedule),
+                fired_at=schedule.last_run,
+            )
+
         if schedule.direct_send:
             if attempt_started is not None:
                 attempt_started.set()
@@ -519,9 +615,17 @@ class AgentScheduler:
 
         if confirmed:
             delivered_at = time.time()
-            self._registry.update_schedule_last_delivered(
-                schedule.id, delivered_at
+            receipted_pending = (
+                self._registry.confirm_pending_schedule_wake_by_fire(
+                    schedule.id,
+                    schedule.last_run,
+                    delivered_at=delivered_at,
+                )
             )
+            if not receipted_pending:
+                self._registry.update_schedule_last_delivered(
+                    schedule.id, delivered_at
+                )
             if self._activity:
                 try:
                     self._activity.log(
@@ -538,7 +642,7 @@ class AgentScheduler:
             _log(
                 f"scheduler: delivery confirmed for schedule "
                 f"'{schedule.name}' (#{schedule.id}) for agent "
-                f"'{schedule.agent_name}'"
+                f"'{schedule.agent_name}' (fired_at={schedule.last_run})"
             )
             return
 
@@ -552,7 +656,7 @@ class AgentScheduler:
         alert_this_failure = True
         if not schedule.direct_send:
             try:
-                _, created = self._registry.persist_schedule_wake(
+                row, _created = self._registry.persist_schedule_wake(
                     schedule.id,
                     agent_name=schedule.agent_name,
                     schedule_name=schedule.name,
@@ -563,7 +667,31 @@ class AgentScheduler:
                     fired_at=schedule.last_run,
                 )
                 persisted = True
-                alert_this_failure = created
+                row, alert_this_failure = (
+                    self._registry.record_schedule_wake_failure(
+                        schedule.id,
+                        schedule.last_run,
+                        failure_reason,
+                    )
+                )
+                if row is not None and row.accepted_at > 0:
+                    _log(
+                        f"scheduler: durable receipt won teardown race for "
+                        f"schedule '{schedule.name}' (#{schedule.id}) for "
+                        f"agent '{schedule.agent_name}' "
+                        f"(fired_at={schedule.last_run}); suppressing stale "
+                        "negative delivery verdict"
+                    )
+                    return
+                if row is not None and row.parked_at > 0:
+                    _log(
+                        f"scheduler: schedule '{schedule.name}' "
+                        f"(#{schedule.id}) for agent "
+                        f"'{schedule.agent_name}' is already quarantined "
+                        f"(fired_at={schedule.last_run}); suppressing "
+                        "duplicate undelivered verdict"
+                    )
+                    return
             except Exception as exc:
                 _log(
                     f"scheduler: SCHEDULER_WAKE_PERSIST_FAILURE schedule "
@@ -626,6 +754,17 @@ class AgentScheduler:
                             f"'{schedule.name}' (#{schedule.id}) for agent "
                             f"'{schedule.agent_name}', but inflight watchdog "
                             "reports busy-not-wedged; extending delivery timeout"
+                        )
+                        continue
+                    if self._wake_prompt_inflight(schedule):
+                        _log(
+                            f"scheduler: receipt still pending for schedule "
+                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.agent_name}', but its prompt is "
+                            "already pasted to the transport — a cancel "
+                            "cannot recall it, and declaring undelivered "
+                            "would re-persist a wake that is about to "
+                            "execute (duplicate execution); extending"
                         )
                         continue
                     delivery.cancel()
@@ -713,15 +852,53 @@ class AgentScheduler:
         task.add_done_callback(_done)
 
     async def _replay_pending_for_agent(self, agent_name: str) -> None:
-        """Deliver one agent's persisted wakes FIFO and retire exact successes."""
+        """Deliver one agent's persisted wakes FIFO and receipt exact successes."""
         lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
         async with lock:
             await self._replay_pending_locked(agent_name)
 
+    def _park_pending_wake_if_capped(self, pending, attempts: int) -> bool:
+        """Park one capped wake once and emit its single owner alert."""
+        if attempts < self.PERSISTED_WAKE_ATTEMPT_CAP:
+            return False
+        try:
+            parked = self._registry.park_pending_schedule_wake(pending.id)
+        except Exception as exc:
+            _log(
+                f"scheduler: PERSISTED_WAKE_PARK_FAILURE pending "
+                f"#{pending.id}, schedule '{pending.schedule_name}' "
+                f"(#{pending.schedule_id}) for agent '{pending.agent_name}': "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        if not parked:
+            return False
+        _log(
+            f"scheduler: PERSISTED_WAKE_PARKED pending #{pending.id}, "
+            f"schedule '{pending.schedule_name}' (#{pending.schedule_id}), "
+            f"fired_at={pending.fired_at}, attempts={attempts} for agent "
+            f"'{pending.agent_name}'"
+        )
+        self._queue_owner_alert(
+            pending.agent_name,
+            (
+                "🚨 PERSISTED WAKE PARKED: outbox row "
+                f"#{pending.id} for schedule '{pending.schedule_name}' "
+                f"(#{pending.schedule_id}) on agent '{pending.agent_name}' "
+                f"reached {attempts} unconfirmed delivery attempts. Replay "
+                "is stopped to prevent a storm; the exact fire remains in "
+                "the ledger as a queryable quarantine."
+            ),
+        )
+        return True
+
     async def _replay_pending_locked(self, agent_name: str) -> None:
-        """Replay FIFO pending wakes while the caller holds the agent lock."""
-        pending_wakes = self._registry.list_pending_schedule_wakes(agent_name)
-        for pending in pending_wakes:
+        """Reap all zombies, then replay active wakes FIFO under the agent lock."""
+        all_pending_wakes = self._registry.list_pending_schedule_wakes(
+            agent_name, include_parked=True
+        )
+        pending_wakes = []
+        for pending in all_pending_wakes:
             current_schedule = self._registry.get_schedule(pending.schedule_id)
             zombie_reason = ""
 
@@ -736,20 +913,33 @@ class AgentScheduler:
             elif not current_schedule.enabled and not current_schedule.one_shot:
                 zombie_reason = "schedule disabled"
             if zombie_reason:
-                retired = self._registry.discard_pending_schedule_wake(
-                    pending.id
+                quarantined = self._registry.park_pending_schedule_wake(
+                    pending.id,
+                    reason=f"terminal replay policy: {zombie_reason}",
                 )
                 log_tag = (
                     "PERSISTED_WAKE_STALE_DROPPED"
                     if "stale" in zombie_reason
-                    else "PERSISTED_WAKE_ZOMBIE_DROPPED"
+                    else "PERSISTED_WAKE_ZOMBIE_QUARANTINED"
                 )
                 _log(
                     f"scheduler: {log_tag} pending "
                     f"#{pending.id}, schedule #{pending.schedule_id} for "
                     f"agent '{pending.agent_name}': {zombie_reason}; "
-                    f"outbox_retired={retired}"
+                    f"quarantined={quarantined}"
                 )
+                continue
+            if pending.parked_at == 0:
+                pending_wakes.append(pending)
+
+        for pending in pending_wakes:
+            if pending.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP:
+                self._park_pending_wake_if_capped(pending, pending.attempts)
+                break
+            attempts = self._registry.increment_pending_schedule_wake_attempts(
+                pending.id
+            )
+            if attempts is None:
                 continue
             try:
                 confirmed = await self._wait_for_wake_confirmation(pending)
@@ -761,34 +951,14 @@ class AgentScheduler:
                     f"'{agent_name}' remains pending after replay: "
                     f"{type(exc).__name__}: {exc}"
                 )
-                # Increment attempt count and check if we should give up
-                new_attempt = self._registry.increment_pending_wake_attempt(pending.id)
-                if new_attempt >= _MAX_WAKE_CONFIRMATION_ATTEMPTS:
-                    retired = self._registry.discard_pending_schedule_wake(pending.id)
-                    _log(
-                        f"scheduler: PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED pending "
-                        f"#{pending.id}, schedule #{pending.schedule_id} for "
-                        f"agent '{pending.agent_name}': exception after {new_attempt} attempts; "
-                        f"outbox_retired={retired}"
-                    )
-                    continue
+                self._park_pending_wake_if_capped(pending, attempts)
                 break
             if not confirmed:
                 _log(
                     f"scheduler: persisted wake #{pending.id} for "
                     f"'{agent_name}' remains pending: no positive receipt"
                 )
-                # Increment attempt count and check if we should give up
-                new_attempt = self._registry.increment_pending_wake_attempt(pending.id)
-                if new_attempt >= _MAX_WAKE_CONFIRMATION_ATTEMPTS:
-                    retired = self._registry.discard_pending_schedule_wake(pending.id)
-                    _log(
-                        f"scheduler: PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED pending "
-                        f"#{pending.id}, schedule #{pending.schedule_id} for "
-                        f"agent '{pending.agent_name}': no confirmation after {new_attempt} attempts; "
-                        f"outbox_retired={retired}"
-                    )
-                    continue
+                self._park_pending_wake_if_capped(pending, attempts)
                 break
             delivered_at = time.time()
             if not self._registry.confirm_pending_schedule_wake(
@@ -796,7 +966,7 @@ class AgentScheduler:
             ):
                 _log(
                     f"scheduler: persisted wake #{pending.id} for "
-                    f"'{agent_name}' was confirmed but outbox retirement "
+                    f"'{agent_name}' was confirmed but receipt persistence "
                     "did not match a row"
                 )
                 break
@@ -820,6 +990,35 @@ class AgentScheduler:
                 f"(#{pending.schedule_id}) for agent '{agent_name}'"
             )
 
+    @staticmethod
+    def _wake_prompt(schedule) -> str:
+        """The exact prompt text a schedule's wake delivers to the transport."""
+        return schedule.prompt or f"Scheduled wake: {schedule.name}"
+
+    def _wake_prompt_inflight(self, schedule) -> bool:
+        """True when this wake's prompt is pasted with its receipt unresolved.
+
+        Reads the transport's per-turn execution state via
+        ``delivery_inflight_fn``, failing closed (False) so a missing or
+        broken probe degrades to the pre-probe behavior rather than
+        extending forever.
+        """
+        if self._delivery_inflight_fn is None:
+            return False
+        try:
+            return (
+                self._delivery_inflight_fn(
+                    schedule.agent_name, self._wake_prompt(schedule)
+                )
+                is True
+            )
+        except Exception as exc:
+            _log(
+                f"scheduler: wake-inflight check failed for "
+                f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return False
+
     async def _wake_and_confirm(
         self,
         schedule,
@@ -830,10 +1029,27 @@ class AgentScheduler:
         if attempt_started is not None:
             attempt_started.set()
         main_session_id = f"{schedule.agent_name}-main"
+        fired_at = (
+            schedule.fired_at
+            if hasattr(schedule, "fired_at")
+            else schedule.last_run
+        )
+        receipt = ScheduleWakeReceipt(
+            self._registry, schedule.id, fired_at
+        )
+        callback_kwargs = {}
+        try:
+            signature = inspect.signature(self._wake_callback)
+            if "schedule_receipt" in signature.parameters:
+                callback_kwargs["schedule_receipt"] = receipt
+        except (TypeError, ValueError):
+            # Opaque callables keep the historical three-argument contract.
+            pass
         result = await self._wake_callback(
             schedule.agent_name,
             main_session_id,
-            schedule.prompt or f"Scheduled wake: {schedule.name}",
+            self._wake_prompt(schedule),
+            **callback_kwargs,
         )
         if inspect.isawaitable(result):
             result = await result
@@ -867,6 +1083,9 @@ class AgentScheduler:
 
             hb = self._registry.get_latest_heartbeat(agent.name)
             if self._reconcile_server_liveness(agent, hb, now, streaming_sessions):
+                # Server-side transport evidence proves this agent is live —
+                # a safe boot boundary to drain any stranded wake outbox.
+                self._drain_outbox_if_pending(agent.name)
                 continue
             if not hb:
                 # No heartbeat ever recorded — mark stale
@@ -900,6 +1119,54 @@ class AgentScheduler:
                         message_count=hb.message_count,
                         metadata={"reason": f"heartbeat overdue by {int(age - agent.heartbeat_interval)}s"},
                     )
+            elif hb.status in _PROVEN_LIVE_HEARTBEAT_STATUSES:
+                # Fresh agent/hook activity is transport-observed execution
+                # evidence: SDK hooks write "alive" and tmux-rails agents POST
+                # "ok"/"busy"/"finishing" themselves while running. This
+                # scheduler's own current-timestamp writes use only
+                # "stale"/"dead", which remain excluded, so accepting the full
+                # agent-authored vocabulary preserves #981's proven-live-only
+                # policy and never drains on scheduler-authored or aged rows.
+                self._drain_outbox_if_pending(agent.name)
+
+    def _drain_outbox_if_pending(self, agent_name: str) -> None:
+        """Replay a proven-live agent's stranded wake outbox.
+
+        The durable outbox otherwise drains only at daemon ``start()`` or on a
+        confirmed wake-prompt turn (``on_wake_delivered``). A session revived
+        WITHOUT such a turn — e.g. a ``context_restart`` whose orientation wake
+        never produced an exact receipt, then kept alive by heartbeats — stays
+        alive yet never replays, stranding every cron it missed while dark
+        (live incident 2026-08-01: 20 rows still pending after a mid-day heartbeat, all
+        fired 06:00–10:15 into the gap). ``_check_heartbeats`` calls this once
+        it has proof the session is live, closing that gap without touching the
+        deliberate "a new cron fire never replays backlog into the old session"
+        contract: replay still happens only at a proven-live boundary.
+
+        Idempotent and self-limiting: skips when a replay is already in flight,
+        only reads the (indexed) outbox for a genuinely-live agent, and excludes
+        parked dead letters from its pending check. FIFO receipt failures remain
+        pending only through the bounded attempt cap, preventing one
+        never-confirming row from spawning replay tasks forever while preserving
+        the proven-live-only drain policy.
+        """
+        existing = self._pending_replay_tasks.get(agent_name)
+        if existing is not None and not existing.done():
+            return
+        try:
+            if not self._registry.list_pending_schedule_wakes(agent_name):
+                return
+        except Exception as exc:
+            _log(
+                f"scheduler: outbox drain check failed for '{agent_name}': "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        _log(
+            f"scheduler: proven-live agent '{agent_name}' has a stranded wake "
+            "outbox; triggering durable replay"
+        )
+        self.replay_pending_for_agent(agent_name)
 
     # Resurrection cap: at most this many attempts per RESURRECTION_WINDOW_SECONDS
     # per agent. Prevents thrashing on a persistently-broken session while still

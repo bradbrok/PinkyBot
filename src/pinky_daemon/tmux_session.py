@@ -862,6 +862,10 @@ class _QueuedTurn:
     # transcript user row, or queue enqueue followed by dequeue; successful
     # tmux keystrokes alone are not a receipt.
     scheduler_delivery: asyncio.Future[bool] | None = None
+    # Exact-fire durable acceptance callback. It MUST run successfully before
+    # ``scheduler_delivery`` resolves True; otherwise a process death can lose
+    # the only positive evidence and replay work that already entered the pane.
+    scheduler_accept: object = None  # Callable() -> bool
     scheduler_serialized: bool = False
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
@@ -3463,7 +3467,7 @@ class TmuxSession:
         )
 
     async def send_scheduler_prompt(
-        self, prompt: str
+        self, prompt: str, *, on_accept=None
     ) -> asyncio.Future[bool]:
         """Start a scheduler turn and return its exact acceptance receipt.
 
@@ -3475,11 +3479,49 @@ class TmuxSession:
         queued = await self._queue_external_turn(
             prompt,
             scheduler_delivery=receipt,
+            scheduler_accept=on_accept,
             scheduler_serialized=True,
         )
         if not queued and not receipt.done():
             receipt.set_result(False)
         return receipt
+
+    def scheduler_wake_inflight(self, prompt: str) -> bool:
+        """True when this prompt is pasted to the pane with an unresolved receipt.
+
+        The scheduler consults this at its receipt-timeout boundary. Once
+        ``pane_delivery_started`` is set the prompt is physically in (or
+        entering) the pane and cancellation cannot recall it — the REPL will
+        execute it regardless — so timing out and re-persisting the wake
+        would mint an outbox row whose later replay duplicates the
+        execution. Prompt-text matching mirrors ``_match_acceptance_turn``:
+        scheduler turns are enqueued without an agent hint, so the queued
+        prompt is the schedule's exact wake prompt.
+
+        Scans ``_acceptance_candidates()`` — NOT just
+        ``_scheduler_pending_turns`` — because the #943 watchdog
+        unaccepted-head path removes a preserved scheduler head from the
+        pending list and requeues it through the ordinary worker; after the
+        post-restart repaste that turn lives in ``_inflight_turn`` /
+        ``_inflight_metas`` only. Scanning the narrow list would report
+        False for exactly that pasted-with-open-receipt replay and re-open
+        the duplicate path (Murzik review, PR #983). While the replayed
+        turn is still queued-unpasted, ``pane_delivery_started`` is False
+        (reset by the watchdog) and a cancel remains safe: the shared
+        in-lock cancelled-receipt check covers the ordinary worker's paste
+        path too.
+        """
+        for turn in self._acceptance_candidates():
+            receipt = turn.scheduler_delivery
+            if (
+                turn.scheduler_serialized
+                and receipt is not None
+                and not receipt.done()
+                and turn.pane_delivery_started
+                and turn.prompt == prompt
+            ):
+                return True
+        return False
 
     async def _queue_external_turn(
         self,
@@ -3490,6 +3532,7 @@ class TmuxSession:
         message_id: str = "",
         agent_hint: str = "",
         scheduler_delivery: asyncio.Future[bool] | None = None,
+        scheduler_accept=None,
         scheduler_serialized: bool = False,
     ) -> bool:
         """Apply external-send side effects and enqueue one pane turn."""
@@ -3521,6 +3564,7 @@ class TmuxSession:
             chat_id=chat_id,
             message_id=message_id,
             scheduler_delivery=scheduler_delivery,
+            scheduler_accept=scheduler_accept,
             scheduler_serialized=scheduler_serialized,
         )
         if scheduler_serialized:
@@ -6766,6 +6810,26 @@ class TmuxSession:
         # callback has an entry to pop. _finish_turn_delivery is idempotent.
         if self._wake_requires_submission_receipt(turn):
             self._finish_turn_delivery(turn, fire_on_delivered=False)
+        if turn.scheduler_accept is not None:
+            try:
+                persisted = turn.scheduler_accept()
+            except Exception as exc:
+                persisted = False
+                _log(
+                    f"tmux[{self.agent_name}]: "
+                    "SCHEDULER_RECEIPT_PERSIST_FAILURE after exact transport "
+                    f"acceptance ({type(exc).__name__}: {exc})"
+                )
+            if persisted is not True:
+                # The prompt is already accepted and cannot safely be replayed.
+                # Resolve the in-process receipt positively so the scheduler
+                # gets one more chance to persist before shutdown, while the
+                # loud log makes the degraded durability visible.
+                _log(
+                    f"tmux[{self.agent_name}]: "
+                    "SCHEDULER_RECEIPT_PERSIST_FAILURE returned no durable "
+                    "positive evidence; suppressing unsafe replay"
+                )
         turn.transport_accepted = True
         for receipt in (turn.scheduler_delivery, turn.submission_receipt):
             if receipt is not None and not receipt.done():
@@ -7148,11 +7212,10 @@ class TmuxSession:
                     gate_subtype = "timeout"
                     _log(
                         f"tmux[{self.agent_name}]: wake-prompt readiness "
-                        f"gate TIMEOUT after {_SESSION_READY_GATE_TIMEOUT_SEC}s "
-                        f"— proceeding with paste anyway "
-                        f"(reason={turn.reason}). Hook may have failed to "
-                        f"fire; check the agent's "
-                        f".claude/hook_tmux_session_start.py."
+                        f"gate still pending after "
+                        f"{_SESSION_READY_GATE_TIMEOUT_SEC}s — proceeding "
+                        f"with paste; exact transcript receipt remains the "
+                        f"delivery verdict (reason={turn.reason})"
                     )
 
             if self._analytics_store:
@@ -7247,6 +7310,19 @@ class TmuxSession:
         # interleave with this paste — two send paths into one pane.
         while True:
             async with self._repl_control_lock:
+                # A scheduler-side cancel can land while this task awaits the
+                # REPL lock; pasting after that point would execute a turn
+                # whose wake was already re-persisted as undelivered — the
+                # replay then duplicates the execution. Last-instant check
+                # under the lock: past ``pane_delivery_started = True`` the
+                # scheduler's inflight probe takes over and blocks the cancel
+                # instead.
+                if (
+                    turn.scheduler_serialized
+                    and turn.scheduler_delivery is not None
+                    and turn.scheduler_delivery.cancelled()
+                ):
+                    raise _SchedulerDeliveryCancelled
                 # An ordinary send can win the REPL lock after the scheduler's
                 # outer idle wait. Recheck under the shared lock so a scheduler
                 # paste never races behind newly queued steering input.

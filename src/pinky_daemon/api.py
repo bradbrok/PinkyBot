@@ -16,6 +16,7 @@ import asyncio
 import contextlib
 import hashlib
 import hmac
+import inspect
 import json
 import os
 import re
@@ -6332,6 +6333,11 @@ npm run build</pre>
         """List all approved users across all agents."""
         return {"users": agents.list_all_approved_users()}
 
+    @app.get("/system/approval-backlog")
+    async def approval_backlog():
+        """Fleet-wide owner/operator view of undelivered approval-gate rows."""
+        return agents.get_approval_backlog_health()
+
     # ── Outreach Platform Configuration Routes ──────────
     from pinky_daemon.routes.outreach import router as _outreach_router
     from pinky_daemon.routes.outreach import set_dependencies as _outreach_set_deps
@@ -8338,6 +8344,7 @@ npm run build</pre>
             "pending_users": len(by_chat),
             "total_messages": len(messages),
             "by_sender": by_chat,
+            "approval_backlog": agents.get_approval_backlog_health(name),
         }
 
     @app.delete("/agents/{name}/pending-messages/{chat_id}")
@@ -10233,6 +10240,28 @@ npm run build</pre>
             "count": len(schedules),
         }
 
+    @app.get("/scheduler/wake-ledger")
+    async def list_scheduler_wake_ledger(
+        agent_name: str | None = None,
+        state: str | None = None,
+        fired_after: float = 0.0,
+        limit: int = 200,
+    ):
+        """Query exact-fire scheduler outcomes without interpreting logs."""
+        try:
+            rows = agents.list_schedule_wake_ledger(
+                agent_name,
+                state=state,
+                fired_after=fired_after,
+                limit=limit,
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {
+            "records": [row.to_dict() for row in rows],
+            "count": len(rows),
+        }
+
     # ── Heartbeat Endpoints ────────────────────────────────
 
     @app.post("/agents/{agent_name}/heartbeat")
@@ -10471,7 +10500,13 @@ npm run build</pre>
             "connected": ss.state == TransportSessionState.CONNECTED,
         }
 
-    async def _wake_callback(agent_name: str, session_id: str, prompt: str):
+    async def _wake_callback(
+        agent_name: str,
+        session_id: str,
+        prompt: str,
+        *,
+        schedule_receipt=None,
+    ):
         """Queue a wake and return its exact per-prompt delivery receipt."""
         del session_id  # Streaming is now the canonical main runtime.
         ss = await _ensure_streaming_session(agent_name, label="main")
@@ -10481,7 +10516,17 @@ npm run build</pre>
 
         scheduler_send = getattr(ss, "send_scheduler_prompt", None)
         if callable(scheduler_send):
-            receipt = await scheduler_send(prompt)
+            scheduler_kwargs = {}
+            if schedule_receipt is not None:
+                try:
+                    signature = inspect.signature(scheduler_send)
+                    if "on_accept" in signature.parameters:
+                        scheduler_kwargs["on_accept"] = (
+                            schedule_receipt.accept
+                        )
+                except (TypeError, ValueError):
+                    pass
+            receipt = await scheduler_send(prompt, **scheduler_kwargs)
             _log(
                 f"scheduler: queued confirmed-delivery wake for "
                 f"{agent_name} via streaming main"
@@ -10494,6 +10539,21 @@ npm run build</pre>
             and getattr(ss, "injection_confirms_consumption", False)
         )
         if confirmed:
+            if schedule_receipt is not None:
+                try:
+                    persisted = schedule_receipt.accept()
+                except Exception as exc:
+                    persisted = False
+                    _log(
+                        "scheduler: SCHEDULER_RECEIPT_PERSIST_FAILURE "
+                        f"for {agent_name}: {type(exc).__name__}: {exc}"
+                    )
+                if persisted is not True:
+                    _log(
+                        "scheduler: SCHEDULER_RECEIPT_PERSIST_FAILURE "
+                        f"for {agent_name}: no durable positive evidence; "
+                        "suppressing unsafe replay"
+                    )
             _log(
                 f"scheduler: wake accepted for {agent_name} via "
                 f"streaming main"
@@ -10650,37 +10710,158 @@ npm run build</pre>
             or stats.get("inflight_active") is True
         )
 
+    def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
+        """Per-turn execution state: is this wake pasted with an open receipt?
+
+        Transports without the probe (e.g. Codex sessions) fall through to
+        False, preserving their pre-probe timeout behavior.
+        """
+        ss = broker._get_streaming_session(agent_name)
+        probe = getattr(ss, "scheduler_wake_inflight", None) if ss else None
+        if not callable(probe):
+            return False
+        return probe(prompt) is True
+
     async def _notify_owner_undelivered(
         agent_name: str, message: str
     ) -> bool:
-        """Send scheduler failures through canonical owner destinations."""
+        """Send scheduler failures through canonical and host-local fallbacks."""
         send_callback = broker.send_callback
         destinations = agents.get_owner_notification_destinations()
-        if not send_callback or not destinations:
+        if not send_callback:
             return False
-        last_error = "no configured destination accepted the alert"
-        for destination in destinations:
+
+        sender_names = [agent_name] + [
+            agent.name
+            for agent in agents.list(enabled_only=True)
+            if agent.name != agent_name
+        ]
+        attempted_routes: set[tuple[str, str, str, str]] = set()
+        failures: list[str] = []
+
+        async def _attempt(
+            sender_name: str,
+            platform: str,
+            account_id: str,
+            conversation_id: str,
+        ) -> bool:
+            route = (sender_name, platform, account_id, conversation_id)
+            if route in attempted_routes:
+                return False
+            attempted_routes.add(route)
             try:
                 result = await send_callback(
-                    agent_name,
-                    destination["platform"],
-                    destination["conversation_id"],
+                    sender_name,
+                    platform,
+                    conversation_id,
                     message,
-                    account_id=destination["account_id"],
+                    account_id=account_id,
                 )
                 if not (
                     isinstance(result, dict)
                     and result.get("sent") is True
                 ):
-                    raise RuntimeError(
-                        "send callback did not confirm delivery"
-                    )
+                    raise RuntimeError("send callback did not confirm delivery")
             except Exception as exc:
-                last_error = f"{type(exc).__name__}: {exc}"
-                continue
+                error = f"{type(exc).__name__}: {exc}"
+                failures.append(error)
+                _log(
+                    "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                    f"agent '{agent_name}' via sender '{sender_name}' route "
+                    f"{platform}/{account_id}/{conversation_id}: {error}"
+                )
+                return False
             return True
+
+        for index, destination in enumerate(destinations):
+            platform = destination["platform"]
+            account_id = destination["account_id"]
+            conversation_id = destination["conversation_id"]
+            preferred_bound = bool(agents.get_raw_token_for_account(
+                agent_name, platform, account_id,
+            ))
+            sender_name = next((
+                candidate
+                for candidate in sender_names
+                if agents.get_raw_token_for_account(candidate, platform, account_id)
+            ), "")
+
+            if not preferred_bound:
+                error = (
+                    f"no {platform} token bound to destination account "
+                    f"{account_id} for preferred sender {agent_name}"
+                )
+                failures.append(error)
+                _log(
+                    "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                    f"agent '{agent_name}' via sender '{agent_name}' route "
+                    f"{platform}/{account_id}/{conversation_id}: {error}"
+                )
+
+            if not sender_name:
+                continue
+            if index > 0 or sender_name != agent_name:
+                _log(
+                    "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
+                    f"agent '{agent_name}': using canonical route "
+                    f"{platform}/{account_id}/{conversation_id} via local "
+                    f"sender '{sender_name}'"
+                )
+            if await _attempt(sender_name, platform, account_id, conversation_id):
+                return True
+
+        try:
+            default_conversation_id, default_platform = resolve_operator_chat(
+                get_setting=agents.get_setting,
+                list_all_approved_users=agents.list_all_approved_users,
+            )
+        except Exception as exc:
+            error = f"default owner channel resolution failed: {type(exc).__name__}: {exc}"
+            failures.append(error)
+            _log(
+                "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                f"agent '{agent_name}': {error}"
+            )
+            default_conversation_id, default_platform = "", ""
+
+        default_sender = ""
+        default_account = ""
+        if default_conversation_id and default_platform:
+            for candidate in sender_names:
+                account_id = agents.get_token_account_id(candidate, default_platform)
+                if account_id and agents.get_raw_token_for_account(
+                    candidate, default_platform, account_id,
+                ):
+                    default_sender = candidate
+                    default_account = account_id
+                    break
+
+        if default_sender:
+            _log(
+                "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
+                f"agent '{agent_name}': using daemon default owner channel "
+                f"{default_platform}/{default_account}/{default_conversation_id} "
+                f"via local sender '{default_sender}'"
+            )
+            if await _attempt(
+                default_sender,
+                default_platform,
+                default_account,
+                default_conversation_id,
+            ):
+                return True
+        elif default_conversation_id and default_platform:
+            error = f"no local token bound for default owner platform {default_platform}"
+            failures.append(error)
+            _log(
+                "api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+                f"agent '{agent_name}' route {default_platform}/"
+                f"{default_conversation_id}: {error}"
+            )
+
+        last_error = failures[-1] if failures else "no owner alert route is configured"
         _log(
-            f"api: OWNER_NOTIFY_DELIVERY_FAILURE for scheduler alert "
+            "api: OWNER_NOTIFY_TERMINAL_FAILURE for scheduler alert "
             f"agent '{agent_name}': {last_error}"
         )
         return False
@@ -10696,6 +10877,7 @@ npm run build</pre>
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
         delivery_busy_fn=_scheduler_delivery_busy,
+        delivery_inflight_fn=_scheduler_wake_inflight,
         owner_notify_callback=_notify_owner_undelivered,
         trigger_store=trigger_store,
         activity=activity,
@@ -11232,6 +11414,18 @@ npm run build</pre>
         # platform poller can ingest new traffic. The same durable journal then
         # carries the one-time owner digest until confirmed delivery.
         await _resume_grandfather_migration(agents, broker)
+
+        # #998: heal every approved-but-undelivered backlog, not only rows
+        # created by the grandfather migration. This catches approval changes
+        # made by older migrations/direct registry paths before any poller can
+        # accept new traffic; the broker's maintenance loop keeps reconciling
+        # later runtime transitions as well.
+        reconciled = await broker.reconcile_approved_pending_messages()
+        if reconciled:
+            _log(
+                "startup: reconciled "
+                f"{reconciled} approved pending message(s)"
+            )
 
         # Boot policy: the main agent always starts. Enabled siblings start only
         # when the shutdown manifest proves they had a live streaming transport;
@@ -11888,14 +12082,42 @@ npm run build</pre>
                     deps_drift = []
 
                 if changed or force_deps or deps_drift:
-                    # Prefer project venv pip if present, else use the running daemon's
-                    # interpreter (sys.executable). This works for both venv and
-                    # system-python deployments — the prior `.venv/bin/pip`-only path
-                    # silently skipped rebuilds on system-python hosts.
+                    # Prefer a functional project venv pip, else use the running
+                    # daemon's interpreter (sys.executable). A vestigial .venv can
+                    # retain bin/pip even after pip disappears from its interpreter,
+                    # so file existence alone is not enough to select it.
                     venv_pip = Path(repo_dir) / ".venv" / "bin" / "pip"
+                    venv_python = Path(repo_dir) / ".venv" / "bin" / "python"
+                    pip_cmd: list[str] | None = None
                     if venv_pip.exists():
-                        pip_cmd = [str(venv_pip), "install", "-e", ".[all]", "--quiet"]
-                    else:
+                        try:
+                            sp.check_output(
+                                [str(venv_python), "-m", "pip", "--version"],
+                                cwd=repo_dir, stderr=sp.STDOUT, timeout=10,
+                            )
+                        except Exception as probe_exc:
+                            probe_output = getattr(probe_exc, "output", None)
+                            if isinstance(probe_output, bytes):
+                                probe_detail = probe_output.decode(errors="replace")
+                            elif probe_output:
+                                probe_detail = str(probe_output)
+                            else:
+                                probe_detail = f"{type(probe_exc).__name__}: {probe_exc}"
+                            probe_detail = " ".join(probe_detail.split())[:500]
+                            if not probe_detail:
+                                probe_detail = f"{type(probe_exc).__name__}: {probe_exc}"
+                            _log(
+                                "admin: .venv exists but its pip is broken "
+                                f"({probe_detail}) — treating it as vestigial and "
+                                f"falling back to {sys.executable}"
+                            )
+                        else:
+                            pip_cmd = [
+                                str(venv_python), "-m", "pip", "install",
+                                "-e", ".[all]", "--quiet",
+                            ]
+
+                    if pip_cmd is None:
                         # PEP 668: system pythons (Homebrew, Debian) mark themselves
                         # externally-managed. --break-system-packages lets us install
                         # into the same env the daemon imports from.
@@ -11975,6 +12197,20 @@ npm run build</pre>
             return result
 
         result = await asyncio.to_thread(_run_update)
+
+        if result.get("deps_error"):
+            try:
+                delivered = await scheduler._owner_notify_callback(
+                    "admin",
+                    "ADMIN UPDATE DEPENDENCY REBUILD FAILED: "
+                    f"{result['deps_error']}. The code update may have landed "
+                    "without required dependencies; inspect the daemon log and "
+                    "rerun the dependency rebuild.",
+                )
+                if not delivered:
+                    _log("admin: dependency rebuild owner alert was not delivered")
+            except Exception as notify_exc:
+                _log(f"admin: dependency rebuild owner alert failed: {notify_exc}")
 
         # Schedule graceful restart if anything changed
         if result.get("restarting"):
@@ -12580,7 +12816,11 @@ npm run build</pre>
         approval_notification_health = agents.get_approval_notification_health(
             agent_name,
         )
-        checks = {"approval_notifications": approval_notification_health}
+        approval_backlog_health = agents.get_approval_backlog_health(agent_name)
+        checks = {
+            "approval_notifications": approval_notification_health,
+            "approval_backlog": approval_backlog_health,
+        }
 
         return {
             "agent": agent_name,
@@ -12616,10 +12856,17 @@ npm run build</pre>
         if len(errors) >= 3:
             issues.append("high_error_rate")
         approval_check = (checks or {}).get("approval_notifications", {})
+        backlog_check = (checks or {}).get("approval_backlog", {})
         if approval_check.get("failed"):
             issues.append("owner_notification_failed")
         elif approval_check.get("retrying"):
             issues.append("owner_notification_retrying")
+        if backlog_check.get("approved_stranded_chats"):
+            issues.append("approved_messages_stranded")
+        if backlog_check.get("high_signal_chats"):
+            issues.append("approved_principal_blocked")
+        elif backlog_check.get("pending_chats"):
+            issues.append("approval_pending")
 
         if not issues:
             return "healthy"
@@ -12630,6 +12877,8 @@ npm run build</pre>
         if "high_error_rate" in issues:
             return "unstable"
         if "owner_notification_failed" in issues:
+            return "needs_attention"
+        if "approved_messages_stranded" in issues or "approved_principal_blocked" in issues:
             return "needs_attention"
         return "degraded"
 

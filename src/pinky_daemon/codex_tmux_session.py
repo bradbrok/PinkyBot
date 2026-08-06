@@ -46,7 +46,10 @@ from __future__ import annotations
 
 import asyncio
 import os
+import re
 import shlex
+import time
+from collections import deque
 from pathlib import Path
 
 from pinky_daemon.codex_tmux_transcript import (
@@ -58,6 +61,7 @@ from pinky_daemon.tmux_session import (
     _PLACEHOLDER_TRANSCRIPT_PATH,
     TmuxSession,
     _log,
+    _SchedulerDeliveryCancelled,
     _TmuxControl,
 )
 
@@ -70,6 +74,15 @@ _CODEX_ENTER_DELAY_MS = 4000
 # Cold-start NUX-dismissal budget (update-available + trust prompts).
 _CODEX_NUX_TIMEOUT_SEC = 25.0
 _CODEX_NUX_POLL_SEC = 0.5
+
+# A task-close can leave accepted FIFO metadata behind when several native
+# queue pastes were consumed by one Codex turn.  If an unaccepted paste is left
+# instead (for example, its submit Enter was lost), require two matching live
+# pane reads before reconciling it.  The literal Codex 0.146.1 production
+# discriminator is ``esc to interrupt`` while busy; an agent-cwd footer proves
+# a capture without that literal is rendered rather than empty/garbled.
+_CODEX_IDLE_CONFIRM_SEC = 0.25
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
 
 
 class _CodexTmuxControl(_TmuxControl):
@@ -145,6 +158,7 @@ class CodexTmuxSession(TmuxSession):
         self._openai_api_key = config.provider_key or os.environ.get("OPENAI_API_KEY", "")
         self._reasoning_effort = config.thinking_effort or "medium"
         self._codex_mcp_servers = config.mcp_servers or {}
+        self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
 
     # ── seam: session name ──────────────────────────────────────────────────
     def _build_session_name(self) -> str:
@@ -312,6 +326,11 @@ class CodexTmuxSession(TmuxSession):
                 agent_name=self.agent_name,
                 model=self._codex_model,
                 path_discovery=self._discover_transcript_path,
+                # Scheduler receipts use the same exact transcript-observation
+                # contract as Claude tmux.  Codex records acceptance as an
+                # event_msg/user_message entry instead of Claude's user or
+                # queue-operation rows.
+                on_entry=self._on_transcript_entry,
             )
             if guessed is not None:
                 # Warm-wake / resume: seek to EOF so we don't replay history.
@@ -320,6 +339,209 @@ class CodexTmuxSession(TmuxSession):
                 except OSError:
                     pass
         await super()._start_tailer()
+
+    # ── seam: scheduler queued-route delivery (#1006) ──────────────────────
+    def _codex_scheduler_evidence(self, candidate=None) -> tuple[bool, ...]:
+        """Return the five Codex-owned scheduler gate inputs, in log order."""
+        candidate_in_worker = (
+            candidate is not None and self._inflight_turn is candidate
+        )
+        return (
+            bool(self._inflight_tool_calls),
+            bool(
+                self._inflight_turn is not None
+                and not candidate_in_worker
+            ),
+            bool(
+                not self._message_queue.empty()
+                and not candidate_in_worker
+            ),
+            bool(self._inflight_metas),
+            bool(getattr(self._tailer, "_active", False)),
+        )
+
+    def _scheduler_pane_busy(self, candidate=None) -> bool:
+        """Use Codex-local turn state instead of Claude hook status.
+
+        The base tmux implementation deliberately requires a fresh persisted
+        ``idle`` row from Claude Code's working/idle hooks before it pastes a
+        scheduler turn.  Codex does not run those hooks, so that row is stale
+        or absent and every trigger wake waits forever despite an idle pane.
+
+        Keep the same conservative no-overlap rule using the evidence Codex
+        does own: ordinary work in hand/queued, transcript-backed inflight
+        metadata, tool activity, and the rollout tailer's active-turn flag.
+        The inherited scheduler task, REPL lock, logs, exact receipt, and
+        retirement paths remain unchanged.
+        """
+        evidence = self._codex_scheduler_evidence(candidate)
+        busy = any(evidence)
+        signature = (*evidence, busy)
+        if signature != self._codex_last_scheduler_gate_signature:
+            self._codex_last_scheduler_gate_signature = signature
+            tools, in_hand, queued, metas, tailer_active = evidence
+            _log(
+                f"tmux[{self.agent_name}]: CODEX_SCHEDULER_GATE "
+                f"tools={tools} in_hand={in_hand} queued={queued} "
+                f"metas={metas} tailer_active={tailer_active} busy={busy} "
+                f"meta_depth={len(self._inflight_metas)} "
+                f"queue_depth={self._message_queue.qsize()}"
+            )
+        return busy
+
+    def _codex_gate_blocked_only_by_metas(self, candidate=None) -> bool:
+        tools, in_hand, queued, metas, tailer_active = (
+            self._codex_scheduler_evidence(candidate)
+        )
+        if not (metas and not any((tools, in_hand, queued, tailer_active))):
+            return False
+        # Exact scheduler/wake receipts remain authoritative. Pane-idle proof
+        # may retire ordinary lost-submit metadata, but it must not turn a
+        # pasted-without-receipt exact fire into a negative result and replay.
+        return all(
+            all(
+                receipt is None or receipt.done()
+                for receipt in (
+                    meta.turn.scheduler_delivery,
+                    meta.turn.submission_receipt,
+                )
+            )
+            for meta in self._inflight_metas
+        )
+
+    @staticmethod
+    def _codex_pane_is_explicitly_idle(snapshot: str, agent_name: str) -> bool:
+        """Recognize the literal Codex no-busy-marker + footer pane shape.
+
+        The composer placeholder persists while Codex is working, so it is not
+        evidence either way. ``esc to interrupt`` is the observed Codex busy
+        literal and always vetoes idle. The model/cwd footer is required so an
+        empty, truncated, or garbled capture fails closed as unknown/busy.
+        """
+        if not snapshot or "esc to interrupt" in snapshot:
+            return False
+        plain_lines = [
+            _ANSI_RE.sub("", raw).strip()
+            for raw in snapshot.splitlines()
+        ]
+        return any(
+            " · " in line and line.rstrip("/").endswith(f"/{agent_name}")
+            for line in plain_lines
+        )
+
+    async def _codex_capture_explicit_idle(self) -> bool:
+        try:
+            result = await self._tmux.capture_pane(lines=12, escapes=True)
+        except Exception:
+            return False
+        return bool(
+            result.ok
+            and self._codex_pane_is_explicitly_idle(
+                result.stdout or "", self.agent_name
+            )
+        )
+
+    def _reconcile_codex_phantom_metas(self, metas, *, reason: str) -> int:
+        """Remove proven historical Codex FIFO entries without a restart."""
+        stale = list(metas)
+        if not stale:
+            return 0
+        stale_ids = {id(meta) for meta in stale}
+        stale_turn_ids = {id(meta.turn) for meta in stale}
+        kept = [
+            meta for meta in self._inflight_metas
+            if id(meta) not in stale_ids
+        ]
+        self._inflight_metas.clear()
+        self._inflight_metas.extend(kept)
+        self._pane_queue_operations = deque(
+            turn for turn in self._pane_queue_operations
+            if turn is None or id(turn) not in stale_turn_ids
+        )
+        self._pane_dequeued_turns = deque(
+            turn for turn in self._pane_dequeued_turns
+            if turn is None or id(turn) not in stale_turn_ids
+        )
+        for meta in stale:
+            event = meta.completion_event
+            if event is not None and not event.is_set():
+                event.set()
+            delivery = meta.turn.scheduler_delivery
+            if delivery is not None and not delivery.done():
+                delivery.set_result(bool(meta.turn.transport_accepted))
+        self._head_started_at = time.time() if kept else None
+        self._inflight_pane_ext_anchor = None
+        _log(
+            f"tmux[{self.agent_name}]: CODEX_PHANTOM_META_RECONCILE "
+            f"reason={reason} reconciled={len(stale)} remaining={len(kept)}"
+        )
+        return len(stale)
+
+    async def _wait_for_scheduler_delivery_slot(self, turn) -> None:
+        """Wait for Codex work, with a literal idle-pane stale-meta exit."""
+        if not turn.scheduler_serialized:
+            return
+        while self._scheduler_pane_busy(turn):
+            delivery = turn.scheduler_delivery
+            if delivery is not None and delivery.cancelled():
+                raise _SchedulerDeliveryCancelled
+            if self._codex_gate_blocked_only_by_metas(turn):
+                first_idle = await self._codex_capture_explicit_idle()
+                if first_idle:
+                    await asyncio.sleep(_CODEX_IDLE_CONFIRM_SEC)
+                    if (
+                        self._codex_gate_blocked_only_by_metas(turn)
+                        and await self._codex_capture_explicit_idle()
+                    ):
+                        self._reconcile_codex_phantom_metas(
+                            list(self._inflight_metas),
+                            reason="explicit_idle_pane",
+                        )
+                        continue
+            await asyncio.sleep(0.25)
+        delivery = turn.scheduler_delivery
+        if delivery is not None and delivery.cancelled():
+            raise _SchedulerDeliveryCancelled
+
+    async def _handle_turn_complete(self, response) -> None:
+        """Retire Codex metas coalesced into the just-closed rollout turn."""
+        await super()._handle_turn_complete(response)
+        # ``on_entry`` runs before the tailer feeds the following task_complete.
+        # Therefore any remaining turn already transport-accepted at this exact
+        # callback boundary was accepted inside the turn that just closed. It
+        # cannot own a future task_complete; leaving it behind is the #1006
+        # stale-busy recurrence.
+        coalesced = [
+            meta for meta in self._inflight_metas
+            if meta.turn.transport_accepted
+        ]
+        self._reconcile_codex_phantom_metas(
+            coalesced, reason="accepted_before_task_close"
+        )
+
+    def _on_transcript_entry(self, entry: dict) -> None:
+        """Map Codex rollout acceptance onto the shared exact-receipt path."""
+        if entry.get("type") == "event_msg":
+            payload = entry.get("payload") or {}
+            if payload.get("type") == "user_message":
+                prompt = payload.get("message")
+                if isinstance(prompt, str):
+                    turn = self._match_acceptance_turn(prompt)
+                    # The rollout tailer can observe user_message and a very
+                    # fast task_complete in one read while paste_text's final
+                    # tmux subprocess is still returning.  Reserve FIFO
+                    # metadata before resolving the exact scheduler receipt so
+                    # that same-read completion has a head to retire.  The
+                    # normal post-paste path is idempotent on this flag.
+                    if (
+                        turn is not None
+                        and turn.scheduler_delivery is not None
+                        and not turn.pane_delivery_recorded
+                    ):
+                        self._finish_turn_delivery(turn)
+                    self._mark_transport_accepted(turn)
+                return
+        super()._on_transcript_entry(entry)
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     async def _spawn_tmux_repl(self) -> None:

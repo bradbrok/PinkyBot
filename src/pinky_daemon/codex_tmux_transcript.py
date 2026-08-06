@@ -293,6 +293,7 @@ class CodexTmuxTranscriptTailer:
         fallback_poll_sec: float = _FALLBACK_POLL_SEC,
         active_poll_sec: float = _ACTIVE_POLL_SEC,
         path_discovery: Callable[[], Path | None] | None = None,
+        on_entry: Callable[[dict], None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
         self._on_turn_complete = on_turn_complete
@@ -303,6 +304,7 @@ class CodexTmuxTranscriptTailer:
         # Self-heal: when the watched path doesn't exist, call this to
         # scan for the real rollout by cwd match (mirrors #515).
         self._path_discovery = path_discovery
+        self._on_entry = on_entry
 
         self._offset: int = 0
         # Bumped on every path-changing ``set_transcript_path``. Lets
@@ -608,6 +610,16 @@ class CodexTmuxTranscriptTailer:
                         self.session_id = payload.get("id", "")
                     if not self.session_cwd:
                         self.session_cwd = payload.get("cwd", "")
+
+                if self._on_entry is not None:
+                    try:
+                        self._on_entry(dict(entry))
+                    except Exception as e:
+                        self._stats["callback_errors"] += 1
+                        _log(
+                            f"codex_tailer[{self._agent_name}]: on_entry raised "
+                            f"({type(e).__name__}: {e}); continuing"
+                        )
 
                 closes_turn = False
                 aborted = False

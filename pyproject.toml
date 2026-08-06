@@ -38,7 +38,7 @@ dependencies = [
     "fastapi>=0.135",
     "uvicorn>=0.44",
     "websockets>=15.0",
-    "claude-agent-sdk>=0.2.126,<0.3",
+    "claude-agent-sdk>=0.2.129,<0.3",
     "Pillow>=10.0",
     # Federation crypto (sealed_box_v1): X25519, Ed25519, HKDF, XChaCha20-Poly1305.
     "cryptography>=41.0",
@@ -48,14 +48,18 @@ dependencies = [
     # http-message-signatures and is already a transitive dependency.
     "http-message-signatures>=2.0",
     "requests>=2.32",
+    # Slack Socket Mode is a daemon runtime path, so clean base installs must
+    # include its SDK and async transport without relying on an optional extra.
+    "slack-sdk>=3.0",
+    "aiohttp>=3.9",
 ]
 
 [project.optional-dependencies]
 acp = ["agent-client-protocol>=0.11,<0.12", "httpx"]
 telegram = ["python-telegram-bot[webhooks]>=21.0"]
 discord = ["discord.py>=2.3"]
-# slack-sdk's async Socket Mode client (slack_sdk.socket_mode.aiohttp) needs aiohttp.
-slack = ["slack-sdk>=3.0", "aiohttp>=3.9"]
+# Backward-compatible no-op while hosts migrate off `uv run --extra slack`.
+slack = []
 google = ["google-auth>=2.0", "google-api-python-client>=2.0"]
 calendar = [
     "google-api-python-client>=2.0",

@@ -654,7 +654,12 @@ class AgentSchedule:
 
 @dataclass
 class PendingScheduleWake:
-    """A fired scheduler prompt awaiting confirmed transport acceptance."""
+    """One durable exact-fire scheduler ledger record.
+
+    The historical class name is retained because active rows are also the
+    replay outbox.  ``accepted_at`` and ``parked_at`` make the terminal state
+    explicit without deleting the forensic receipt.
+    """
 
     id: int = 0
     schedule_id: int = 0
@@ -663,11 +668,42 @@ class PendingScheduleWake:
     prompt: str = ""
     fired_at: float = 0.0
     created_at: float = 0.0
+    attempts: int = 0
+    parked_at: float = 0.0
+    accepted_at: float = 0.0
+    failed_at: float = 0.0
+    last_error: str = ""
 
     @property
     def name(self) -> str:
         """Match the ``AgentSchedule`` interface used by receipt waiting."""
         return self.schedule_name
+
+    @property
+    def ledger_state(self) -> str:
+        """Return the exact operational outcome used by fleet health."""
+        if self.accepted_at > 0:
+            return "receipted-ran-once"
+        if self.parked_at > 0:
+            return "quarantined"
+        return "pending"
+
+    def to_dict(self) -> dict:
+        return {
+            "id": self.id,
+            "schedule_id": self.schedule_id,
+            "agent_name": self.agent_name,
+            "schedule_name": self.schedule_name,
+            "prompt": self.prompt,
+            "fired_at": self.fired_at,
+            "created_at": self.created_at,
+            "attempts": self.attempts,
+            "parked_at": self.parked_at,
+            "accepted_at": self.accepted_at,
+            "failed_at": self.failed_at,
+            "last_error": self.last_error,
+            "state": self.ledger_state,
+        }
 
 
 class ScheduleNameConflictError(ValueError):
@@ -1275,6 +1311,11 @@ class AgentRegistry:
                 prompt TEXT NOT NULL DEFAULT '',
                 fired_at REAL NOT NULL,
                 created_at REAL NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                parked_at REAL NOT NULL DEFAULT 0,
+                accepted_at REAL NOT NULL DEFAULT 0,
+                failed_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -1349,6 +1390,8 @@ class AgentRegistry:
                 last_error TEXT NOT NULL DEFAULT '',
                 notification_destination TEXT NOT NULL DEFAULT '{}',
                 fallback_path TEXT NOT NULL DEFAULT '[]',
+                aging_reprompt_count INTEGER NOT NULL DEFAULT 0,
+                high_signal_alerted_at REAL NOT NULL DEFAULT 0,
                 created_at REAL NOT NULL,
                 updated_at REAL NOT NULL,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
@@ -1604,6 +1647,37 @@ class AgentRegistry:
                 self._db.execute(f"ALTER TABLE agent_schedules ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to agent_schedules")
 
+        # Migrate pending_schedule_wakes table
+        wake_existing = {
+            row[1]
+            for row in self._db.execute(
+                "PRAGMA table_info(pending_schedule_wakes)"
+            ).fetchall()
+        }
+        wake_migrations = [
+            ("attempts", "INTEGER NOT NULL DEFAULT 0"),
+            ("parked_at", "REAL NOT NULL DEFAULT 0"),
+            ("accepted_at", "REAL NOT NULL DEFAULT 0"),
+            ("failed_at", "REAL NOT NULL DEFAULT 0"),
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+        ]
+        for col, typedef in wake_migrations:
+            if col not in wake_existing:
+                self._db.execute(
+                    f"ALTER TABLE pending_schedule_wakes ADD COLUMN {col} {typedef}"
+                )
+                _log(
+                    "agent_registry: migrated — added "
+                    f"{col} to pending_schedule_wakes"
+                )
+        self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_schedule_wake_ledger_state
+               ON pending_schedule_wakes(
+                   agent_name, accepted_at, parked_at, fired_at
+               )"""
+        )
+        self._db.commit()
+
         # Migrate agent_heartbeats table
         hb_existing = {
             row[1] for row in self._db.execute("PRAGMA table_info(agent_heartbeats)").fetchall()
@@ -1694,6 +1768,26 @@ class AgentRegistry:
                 "UPDATE pending_messages SET sender_id=chat_id WHERE sender_id=''"
             )
             _log("agent_registry: migrated — added sender_id to pending_messages")
+
+        # Approval maintenance metadata (#998). Aging re-prompts are bounded
+        # independently from transport retries/new-message notifications, and
+        # high-signal alerts are durable so one approved principal does not
+        # page the owner on every message while its channel awaits approval.
+        ar_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(approval_requests)").fetchall()
+        }
+        if "aging_reprompt_count" not in ar_existing:
+            self._db.execute(
+                "ALTER TABLE approval_requests "
+                "ADD COLUMN aging_reprompt_count INTEGER NOT NULL DEFAULT 0"
+            )
+            _log("agent_registry: migrated — added aging_reprompt_count to approval_requests")
+        if "high_signal_alerted_at" not in ar_existing:
+            self._db.execute(
+                "ALTER TABLE approval_requests "
+                "ADD COLUMN high_signal_alerted_at REAL NOT NULL DEFAULT 0"
+            )
+            _log("agent_registry: migrated — added high_signal_alerted_at to approval_requests")
 
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
@@ -3251,14 +3345,27 @@ except Exception as exc:
             self._db.commit()
             return cursor.rowcount > 0
 
-    def update_schedule_last_run(self, schedule_id: int, timestamp: float = 0.0) -> None:
-        """Record when the scheduler decided to fire a schedule."""
+    def update_schedule_last_run(
+        self,
+        schedule_id: int,
+        timestamp: float = 0.0,
+        *,
+        expected_last_run: float | None = None,
+    ) -> bool:
+        """Record a fire, optionally only if ``last_run`` is unchanged."""
         ts = timestamp or time.time()
-        self._db.execute(
-            "UPDATE agent_schedules SET last_run=? WHERE id=?",
-            (ts, schedule_id),
-        )
+        if expected_last_run is None:
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET last_run=? WHERE id=?",
+                (ts, schedule_id),
+            )
+        else:
+            cursor = self._db.execute(
+                "UPDATE agent_schedules SET last_run=? WHERE id=? AND last_run=?",
+                (ts, schedule_id, expected_last_run),
+            )
         self._db.commit()
+        return cursor.rowcount > 0
 
     def update_schedule_last_delivered(
         self, schedule_id: int, timestamp: float = 0.0
@@ -3270,6 +3377,66 @@ except Exception as exc:
             (ts, schedule_id),
         )
         self._db.commit()
+
+    def claim_schedule_fire(
+        self,
+        schedule_id: int,
+        *,
+        timestamp: float,
+        expected_last_run: float,
+        agent_name: str,
+        schedule_name: str,
+        prompt: str,
+    ) -> tuple[bool, PendingScheduleWake | None]:
+        """Atomically claim one fire and create its durable ledger/outbox row.
+
+        A crash must never leave ``last_run`` advanced without an exact-fire
+        row that startup can classify.  This transaction closes that earlier
+        fire-claim/outbox gap while preserving the compare-and-swap race guard.
+        """
+        if timestamp <= 0:
+            raise ValueError("timestamp must be a positive exact-fire timestamp")
+        created_at = time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE agent_schedules SET last_run=?
+                   WHERE id=? AND last_run=?""",
+                (timestamp, schedule_id, expected_last_run),
+            )
+            if cursor.rowcount == 0:
+                self._db.commit()
+                return False, None
+            self._db.execute(
+                """INSERT OR IGNORE INTO pending_schedule_wakes (
+                       schedule_id, agent_name, schedule_name, prompt,
+                       fired_at, created_at
+                   ) VALUES (?, ?, ?, ?, ?, ?)""",
+                (
+                    schedule_id,
+                    agent_name,
+                    schedule_name,
+                    prompt,
+                    timestamp,
+                    created_at,
+                ),
+            )
+            row = self._select_schedule_wake_by_fire(
+                schedule_id, timestamp
+            )
+            self._db.commit()
+        return True, PendingScheduleWake(*row)
+
+    def _select_schedule_wake_by_fire(
+        self, schedule_id: int, fired_at: float
+    ):
+        return self._db.execute(
+            """SELECT id, schedule_id, agent_name, schedule_name, prompt,
+                      fired_at, created_at, attempts, parked_at, accepted_at,
+                      failed_at, last_error
+               FROM pending_schedule_wakes
+               WHERE schedule_id=? AND fired_at=?""",
+            (schedule_id, fired_at),
+        ).fetchone()
 
     def persist_schedule_wake(
         self,
@@ -3308,7 +3475,8 @@ except Exception as exc:
             created = cursor.rowcount > 0
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
-                          fired_at, created_at
+                          fired_at, created_at, attempts, parked_at, accepted_at,
+                          failed_at, last_error
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -3317,42 +3485,225 @@ except Exception as exc:
         return PendingScheduleWake(*row), created
 
     def list_pending_schedule_wakes(
-        self, agent_name: str | None = None
+        self,
+        agent_name: str | None = None,
+        *,
+        include_parked: bool = False,
     ) -> list[PendingScheduleWake]:
-        """Return pending scheduler wakes oldest-first."""
+        """Return pending scheduler wakes oldest-first.
+
+        Accepted receipts are always excluded. Quarantined rows are excluded
+        by default; pass ``include_parked=True`` to inspect those terminal
+        records alongside the active replay outbox.
+        """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
-                        fired_at, created_at
+                        fired_at, created_at, attempts, parked_at, accepted_at,
+                        failed_at, last_error
                  FROM pending_schedule_wakes"""
-        params: tuple = ()
+        conditions: list[str] = []
+        params: list = []
         if agent_name is not None:
-            sql += " WHERE agent_name=?"
-            params = (agent_name,)
+            conditions.append("agent_name=?")
+            params.append(agent_name)
+        conditions.append("accepted_at=0")
+        if not include_parked:
+            conditions.append("parked_at=0")
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at ASC, id ASC"
         rows = self._db.execute(sql, params).fetchall()
         return [PendingScheduleWake(*row) for row in rows]
 
+    def list_schedule_wake_ledger(
+        self,
+        agent_name: str | None = None,
+        *,
+        state: str | None = None,
+        fired_after: float = 0.0,
+        limit: int = 200,
+    ) -> list[PendingScheduleWake]:
+        """Return queryable exact-fire outcomes newest-first for fleet health."""
+        if state not in {
+            None,
+            "pending",
+            "receipted-ran-once",
+            "quarantined",
+        }:
+            raise ValueError(f"invalid scheduler wake ledger state: {state}")
+        sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
+                        fired_at, created_at, attempts, parked_at, accepted_at,
+                        failed_at, last_error
+                 FROM pending_schedule_wakes"""
+        conditions: list[str] = []
+        params: list = []
+        if agent_name is not None:
+            conditions.append("agent_name=?")
+            params.append(agent_name)
+        if fired_after > 0:
+            conditions.append("fired_at>=?")
+            params.append(fired_after)
+        if state == "pending":
+            conditions.extend(("accepted_at=0", "parked_at=0"))
+        elif state == "receipted-ran-once":
+            conditions.append("accepted_at>0")
+        elif state == "quarantined":
+            conditions.extend(("accepted_at=0", "parked_at>0"))
+        if conditions:
+            sql += " WHERE " + " AND ".join(conditions)
+        sql += " ORDER BY fired_at DESC, id DESC LIMIT ?"
+        params.append(max(1, min(int(limit), 1000)))
+        rows = self._db.execute(sql, params).fetchall()
+        return [PendingScheduleWake(*row) for row in rows]
+
+    def get_schedule_wake_by_fire(
+        self, schedule_id: int, fired_at: float
+    ) -> PendingScheduleWake | None:
+        """Return one exact-fire ledger row regardless of terminal state."""
+        row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
+        return PendingScheduleWake(*row) if row is not None else None
+
+    def record_schedule_wake_failure(
+        self, schedule_id: int, fired_at: float, reason: str
+    ) -> tuple[PendingScheduleWake | None, bool]:
+        """Record a negative hint unless durable terminal evidence exists.
+
+        Returns the current row and whether this was its first negative hint.
+        A retained accepted receipt always wins over a cancelled/stale Future.
+        """
+        timestamp = time.time()
+        with self._rmw_lock:
+            row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
+            if row is None:
+                return None, False
+            current = PendingScheduleWake(*row)
+            if current.accepted_at > 0 or current.parked_at > 0:
+                return current, False
+            first_failure = current.failed_at == 0
+            self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND accepted_at=0 AND parked_at=0""",
+                (timestamp, reason, current.id),
+            )
+            row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
+            self._db.commit()
+        return PendingScheduleWake(*row), first_failure
+
+    def increment_pending_schedule_wake_attempts(
+        self, pending_id: int
+    ) -> int | None:
+        """Persist one delivery attempt and return its new count."""
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET attempts=attempts + 1
+                   WHERE id=? AND parked_at=0""",
+                (pending_id,),
+            )
+            if cursor.rowcount == 0:
+                self._db.commit()
+                return None
+            row = self._db.execute(
+                "SELECT attempts FROM pending_schedule_wakes WHERE id=?",
+                (pending_id,),
+            ).fetchone()
+            self._db.commit()
+        return int(row[0])
+
+    def park_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        parked_at: float = 0.0,
+        reason: str = "delivery attempts exhausted",
+    ) -> bool:
+        """Atomically move an active wake to terminal quarantine once."""
+        timestamp = parked_at or time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET parked_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND parked_at=0 AND accepted_at=0""",
+                (timestamp, timestamp, reason, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
     def confirm_pending_schedule_wake(
         self, pending_id: int, *, delivered_at: float = 0.0
     ) -> bool:
-        """Atomically stamp the schedule delivered and retire its outbox row."""
+        """Atomically retain a positive receipt and retire it from replay."""
         timestamp = delivered_at or time.time()
         with self._rmw_lock:
             row = self._db.execute(
-                "SELECT schedule_id FROM pending_schedule_wakes WHERE id=?",
+                """SELECT schedule_id, accepted_at
+                   FROM pending_schedule_wakes WHERE id=?""",
                 (pending_id,),
             ).fetchone()
             if row is None:
                 return False
             self._db.execute(
-                "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
+                """UPDATE agent_schedules
+                   SET last_delivered=MAX(last_delivered, ?)
+                   WHERE id=?""",
                 (timestamp, row[0]),
             )
-            cursor = self._db.execute(
-                "DELETE FROM pending_schedule_wakes WHERE id=?",
-                (pending_id,),
+            self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET accepted_at=CASE
+                           WHEN accepted_at=0 THEN ? ELSE accepted_at END,
+                       parked_at=0,
+                       last_error=''
+                   WHERE id=?""",
+                (timestamp, pending_id),
             )
             self._db.commit()
-        return cursor.rowcount > 0
+        return True
+
+    def confirm_pending_schedule_wake_by_fire(
+        self,
+        schedule_id: int,
+        fired_at: float,
+        *,
+        delivered_at: float = 0.0,
+    ) -> bool:
+        """Atomically persist acceptance for one exact fire before replay."""
+        timestamp = delivered_at or time.time()
+        with self._rmw_lock:
+            row = self._db.execute(
+                """SELECT id, accepted_at FROM pending_schedule_wakes
+                   WHERE schedule_id=? AND fired_at=?""",
+                (schedule_id, fired_at),
+            ).fetchone()
+            if row is None:
+                return False
+            self._db.execute(
+                """UPDATE agent_schedules
+                   SET last_delivered=MAX(last_delivered, ?)
+                   WHERE id=?""",
+                (timestamp, schedule_id),
+            )
+            self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET accepted_at=CASE
+                           WHEN accepted_at=0 THEN ? ELSE accepted_at END,
+                       parked_at=0,
+                       last_error=''
+                   WHERE schedule_id=? AND fired_at=?""",
+                (timestamp, schedule_id, fired_at),
+            )
+            self._db.commit()
+        newly_receipted = float(row[1]) == 0
+        if newly_receipted:
+            _log(
+                "agent_registry: SCHEDULE_WAKE_RECEIPTED "
+                f"pending #{row[0]}, schedule #{schedule_id}, "
+                f"fired_at={fired_at}"
+            )
+        return True
 
     def discard_pending_schedule_wake(self, pending_id: int) -> bool:
         """Retire a pending wake without marking its schedule delivered."""
@@ -3862,6 +4213,14 @@ except Exception as exc:
                             approved_by=excluded.approved_by, updated_at=excluded.updated_at""",
             (agent_name, chat_id, display_name, approved_by, now, now),
         )
+        # Approval state and its durable notification aggregate must transition
+        # together regardless of caller (API, owner command, or migration).
+        self._db.execute(
+            """UPDATE approval_requests
+               SET gate_state='approved', next_retry_at=0, updated_at=?
+               WHERE agent_name=? AND chat_id=?""",
+            (now, agent_name, chat_id),
+        )
         self._db.commit()
         _log(f"agents: approved user {chat_id} for {agent_name}")
         row = self._db.execute(
@@ -3884,6 +4243,12 @@ except Exception as exc:
                ON CONFLICT (agent_name, chat_id)
                DO UPDATE SET status='denied', updated_at=excluded.updated_at""",
             (agent_name, chat_id, now, now),
+        )
+        self._db.execute(
+            """UPDATE approval_requests
+               SET gate_state='denied', next_retry_at=0, updated_at=?
+               WHERE agent_name=? AND chat_id=?""",
+            (now, agent_name, chat_id),
         )
         self._db.commit()
         return cursor.rowcount > 0
@@ -4135,6 +4500,94 @@ except Exception as exc:
         self._db.commit()
         return cursor.rowcount
 
+    def list_approval_backlogs(
+        self,
+        agent_name: str = "",
+        chat_id: str = "",
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """Return every undelivered approval backlog, grouped by agent/chat.
+
+        This deliberately mirrors the fleet-wide incident diagnostic: group
+        undelivered ``pending_messages`` by ``(agent_name, chat_id)`` and join
+        both the gate status and the original sender's approval status. The
+        latter identifies the high-signal case where an approved principal is
+        being silently held behind a still-pending group/channel gate.
+        """
+        where = ["pm.delivered=0"]
+        params: list[object] = []
+        if agent_name:
+            where.append("pm.agent_name=?")
+            params.append(agent_name)
+        if chat_id:
+            where.append("pm.chat_id=?")
+            params.append(chat_id)
+        rows = self._db.execute(
+            f"""SELECT pm.agent_name, pm.chat_id,
+                       COALESCE(gate.status, 'missing'),
+                       COALESCE(gate.display_name, ''),
+                       COUNT(*), MIN(pm.created_at), MAX(pm.created_at),
+                       COALESCE(ar.id, 0),
+                       COALESCE(ar.notification_state, 'missing'),
+                       COALESCE(ar.last_notified_at, 0),
+                       COUNT(DISTINCT CASE WHEN principal.status='approved'
+                                           THEN pm.sender_id END),
+                       GROUP_CONCAT(DISTINCT CASE WHEN principal.status='approved'
+                                                  THEN pm.sender_id END)
+                FROM pending_messages AS pm
+                LEFT JOIN approved_users AS gate
+                  ON gate.agent_name=pm.agent_name AND gate.chat_id=pm.chat_id
+                LEFT JOIN approved_users AS principal
+                  ON principal.agent_name=pm.agent_name
+                 AND principal.chat_id=pm.sender_id
+                LEFT JOIN approval_requests AS ar
+                  ON ar.agent_name=pm.agent_name AND ar.chat_id=pm.chat_id
+                WHERE {' AND '.join(where)}
+                GROUP BY pm.agent_name, pm.chat_id, gate.status,
+                         gate.display_name, ar.id, ar.notification_state,
+                         ar.last_notified_at
+                ORDER BY MIN(pm.created_at), pm.agent_name, pm.chat_id""",
+            params,
+        ).fetchall()
+        observed_at = time.time() if now is None else now
+        return [
+            {
+                "agent_name": row[0],
+                "chat_id": row[1],
+                "gate_status": row[2],
+                "display_name": row[3],
+                "undelivered_count": row[4],
+                "oldest_held_at": row[5],
+                "newest_held_at": row[6],
+                "oldest_age_seconds": max(0, int(observed_at - row[5])),
+                "request_id": row[7],
+                "notification_state": row[8],
+                "last_notified_at": row[9],
+                "approved_principal_count": row[10],
+                "approved_principal_ids": row[11].split(",") if row[11] else [],
+                "high_signal": row[2] != "approved" and row[10] > 0,
+            }
+            for row in rows
+        ]
+
+    def get_approval_backlog_health(self, agent_name: str = "") -> dict:
+        """Owner/operator-facing summary of every undelivered approval row."""
+        backlogs = self.list_approval_backlogs(agent_name)
+        pending = [row for row in backlogs if row["gate_status"] in ("pending", "missing")]
+        approved = [row for row in backlogs if row["gate_status"] == "approved"]
+        denied = [row for row in backlogs if row["gate_status"] == "denied"]
+        high_signal = [row for row in backlogs if row["high_signal"]]
+        return {
+            "healthy": not backlogs,
+            "pending_chats": len(pending),
+            "approved_stranded_chats": len(approved),
+            "denied_stranded_chats": len(denied),
+            "high_signal_chats": len(high_signal),
+            "undelivered_messages": sum(row["undelivered_count"] for row in backlogs),
+            "backlogs": backlogs,
+        }
+
     # ── Approval Requests (#863 emergency lane) ─────────────
 
     @staticmethod
@@ -4150,7 +4603,29 @@ except Exception as exc:
             "notification_destination": json.loads(row[14] or "{}"),
             "fallback_path": json.loads(row[15] or "[]"),
             "created_at": row[16], "updated_at": row[17],
+            "aging_reprompt_count": row[18],
+            "high_signal_alerted_at": row[19],
         }
+
+    def _enrich_approval_request(self, request: dict) -> dict:
+        backlogs = self.list_approval_backlogs(
+            request["agent_name"], request["chat_id"],
+        )
+        if backlogs:
+            request.update({
+                "undelivered_count": backlogs[0]["undelivered_count"],
+                "approved_principal_count": backlogs[0]["approved_principal_count"],
+                "approved_principal_ids": backlogs[0]["approved_principal_ids"],
+                "high_signal": backlogs[0]["high_signal"],
+            })
+        else:
+            request.update({
+                "undelivered_count": 0,
+                "approved_principal_count": 0,
+                "approved_principal_ids": [],
+                "high_signal": False,
+            })
+        return request
 
     def get_approval_request(self, agent_name: str, chat_id: str) -> dict | None:
         """Return the stable request for a legacy ``(agent, chat_id)`` gate.
@@ -4163,11 +4638,12 @@ except Exception as exc:
                       gate_state, held_count, oldest_held_at, notification_state,
                       notification_attempts, notified_held_count, last_notified_at,
                       next_retry_at, last_error, notification_destination,
-                      fallback_path, created_at, updated_at
+                      fallback_path, created_at, updated_at,
+                      aging_reprompt_count, high_signal_alerted_at
                FROM approval_requests WHERE agent_name=? AND chat_id=?""",
             (agent_name, chat_id),
         ).fetchone()
-        return self._approval_request_dict(row) if row else None
+        return self._enrich_approval_request(self._approval_request_dict(row)) if row else None
 
     def record_approval_hold(
         self, agent_name: str, chat_id: str, *, target_name: str = "",
@@ -4246,15 +4722,21 @@ except Exception as exc:
             raise RuntimeError("approval request missing after atomic hold commit")
         return message_id, request
 
-    def begin_approval_notification(self, request_id: int, *, reset_attempts: bool) -> None:
+    def begin_approval_notification(
+        self,
+        request_id: int,
+        *,
+        reset_attempts: bool,
+        aging_reprompt: bool = False,
+    ) -> None:
         """Mark a notification cycle active, optionally resetting re-notify attempts."""
-        reset_sql = ", notification_attempts=0" if reset_attempts else ""
         self._db.execute(
-            f"""UPDATE approval_requests
-                SET notification_state='retrying', last_error='', updated_at=?
-                    {reset_sql}
-                WHERE id=? AND gate_state='pending'""",
-            (time.time(), request_id),
+            """UPDATE approval_requests
+               SET notification_state='retrying', last_error='', updated_at=?,
+                   notification_attempts=CASE WHEN ? THEN 0 ELSE notification_attempts END,
+                   aging_reprompt_count=aging_reprompt_count + ?
+               WHERE id=? AND gate_state='pending'""",
+            (time.time(), int(reset_attempts), int(aging_reprompt), request_id),
         )
         self._db.commit()
 
@@ -4276,18 +4758,25 @@ except Exception as exc:
         self._db.commit()
 
     def record_approval_notification_delivered(
-        self, request_id: int, *, destination: dict, fallback_path: list[dict],
+        self,
+        request_id: int,
+        *,
+        destination: dict,
+        fallback_path: list[dict],
+        high_signal: bool = False,
     ) -> None:
         now = time.time()
         self._db.execute(
             """UPDATE approval_requests
                SET notification_state='delivered', notification_attempts=0,
                    notified_held_count=held_count, last_notified_at=?, next_retry_at=0,
-                   last_error='', notification_destination=?, fallback_path=?, updated_at=?
+                   last_error='', notification_destination=?, fallback_path=?, updated_at=?,
+                   high_signal_alerted_at=CASE WHEN ? THEN ? ELSE high_signal_alerted_at END
                WHERE id=? AND gate_state='pending'""",
             (
                 now, json.dumps(destination, separators=(",", ":")),
-                json.dumps(fallback_path, separators=(",", ":")), now, request_id,
+                json.dumps(fallback_path, separators=(",", ":")), now,
+                int(high_signal), now, request_id,
             ),
         )
         self._db.commit()
@@ -4304,19 +4793,31 @@ except Exception as exc:
         self._db.commit()
 
     def list_due_approval_notifications(self, now: float | None = None) -> list[dict]:
+        """Return retry-due rows plus delivered rows eligible for maintenance.
+
+        The broker applies the aging/new-hold/high-signal policy to delivered
+        candidates. Including them here lets the daemon re-prompt without a new
+        inbound message waking the approval path.
+        """
         due_at = time.time() if now is None else now
         rows = self._db.execute(
             """SELECT id, agent_name, chat_id, target_name, is_channel,
                       gate_state, held_count, oldest_held_at, notification_state,
                       notification_attempts, notified_held_count, last_notified_at,
                       next_retry_at, last_error, notification_destination,
-                      fallback_path, created_at, updated_at
+                      fallback_path, created_at, updated_at,
+                      aging_reprompt_count, high_signal_alerted_at
                FROM approval_requests
-               WHERE gate_state='pending' AND notification_state='retrying'
-                 AND next_retry_at <= ? ORDER BY next_retry_at, id""",
+               WHERE gate_state='pending'
+                 AND ((notification_state='retrying' AND next_retry_at <= ?)
+                      OR notification_state IN ('delivered', 'failed'))
+               ORDER BY next_retry_at, id""",
             (due_at,),
         ).fetchall()
-        return [self._approval_request_dict(row) for row in rows]
+        return [
+            self._enrich_approval_request(self._approval_request_dict(row))
+            for row in rows
+        ]
 
     def get_approval_notification_health(self, agent_name: str) -> dict:
         rows = self._db.execute(

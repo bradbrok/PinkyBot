@@ -3668,6 +3668,102 @@ async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
 
 
 @pytest.mark.asyncio
+async def test_scheduler_wake_inflight_probe_tracks_pasted_turn() -> None:
+    """The probe reports pasted-with-open-receipt, per exact prompt."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    for _ in range(100):
+        if tmux.paste_text.await_count == 1:
+            break
+        await asyncio.sleep(0.01)
+
+    assert ss.scheduler_wake_inflight("scheduled") is True
+    assert ss.scheduler_wake_inflight("some other prompt") is False
+
+    ss._on_transcript_entry({
+        "type": "queue-operation",
+        "operation": "enqueue",
+        "content": "scheduled",
+    })
+    ss._on_transcript_entry({
+        "type": "queue-operation",
+        "operation": "dequeue",
+    })
+    assert await receipt is True
+    assert ss.scheduler_wake_inflight("scheduled") is False
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_before_paste_never_pastes() -> None:
+    """A queued-unpasted turn reports not-inflight and honors a cancel.
+
+    This is the safe half of the timeout split: while the prompt has not
+    been pasted, the probe returns False (so the scheduler may cancel and
+    durably persist the wake) and the cancelled turn must never reach the
+    pane afterwards — otherwise the persisted row replays a wake that also
+    executed (the 2026-08-01 duplicate-execution incident).
+    """
+    live = {"status": "working", "last_updated": _time.time()}
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: live
+
+    receipt = await ss.send_scheduler_prompt("scheduled")
+    await asyncio.sleep(0.02)
+    assert tmux.paste_text.await_count == 0
+    assert ss.scheduler_wake_inflight("scheduled") is False
+
+    receipt.cancel()
+    live["status"] = "idle"
+    live["last_updated"] = _time.time()
+    await asyncio.sleep(0.35)  # > slot-wait poll interval
+    assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_during_repl_lock_wait_never_pastes() -> None:
+    """Murzik review (PR #983): the IN-LOCK cancelled-receipt check must fire.
+
+    The slot-wait check catches a cancel that lands while the pane is busy;
+    this test targets the residual race AFTER the outer idle gate: the
+    delivery task is parked on ``_repl_control_lock`` when the cancel lands,
+    so only the check inside the lock stands between the cancel and a paste
+    of an already-re-persisted wake.
+    """
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+
+    await ss._repl_control_lock.acquire()
+    try:
+        receipt = await ss.send_scheduler_prompt("scheduled")
+        # Idle pane → the delivery task passes the outer slot gate and its
+        # final pre-lock cancelled check, then parks on the held lock.
+        await asyncio.sleep(0.3)
+        assert tmux.paste_text.await_count == 0
+        receipt.cancel()
+    finally:
+        ss._repl_control_lock.release()
+
+    # The task acquires the lock, sees the cancelled receipt inside it, and
+    # must abort without ever pasting.
+    for _ in range(50):
+        if not ss._scheduler_delivery_tasks:
+            break
+        await asyncio.sleep(0.01)
+    assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_watchdog_force_restart_replays_unaccepted_scheduler_head(
     monkeypatch,
 ) -> None:
@@ -3730,6 +3826,12 @@ async def test_watchdog_force_restart_replays_unaccepted_scheduler_head(
     assert original.replay_count == 1
     assert not original.transport_accepted
     assert not receipt.done(), "force_restart must preserve the exact receipt"
+    # Murzik review (PR #983): the replayed head now lives outside
+    # _scheduler_pending_turns (the watchdog removed it and requeued via the
+    # ordinary worker) but it is pasted with an open receipt — the inflight
+    # probe must still see it, or the scheduler's timeout path re-opens the
+    # cancel+persist duplicate hole for exactly this turn.
+    assert ss.scheduler_wake_inflight("one-shot scheduled wake") is True
 
     ss._on_transcript_entry({
         "type": "user",
@@ -9218,6 +9320,30 @@ class TestWakeSubmissionVerification:
 
         assert await receipt is True
         assert fires == ["delivered"]
+
+    @pytest.mark.asyncio
+    async def test_scheduler_acceptance_persists_before_future_resolves(
+        self,
+    ) -> None:
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        receipt = asyncio.get_running_loop().create_future()
+        ordering: list[bool] = []
+
+        def persist_exact_fire() -> bool:
+            ordering.append(receipt.done())
+            return True
+
+        turn = _QueuedTurn(
+            prompt="scheduled exact fire",
+            scheduler_delivery=receipt,
+            scheduler_accept=persist_exact_fire,
+            scheduler_serialized=True,
+        )
+
+        ss._mark_transport_accepted(turn)
+
+        assert ordering == [False]
+        assert await receipt is True
 
     @pytest.mark.asyncio
     async def test_missing_receipt_retries_enter_only_then_verifies(

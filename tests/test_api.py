@@ -3607,6 +3607,33 @@ class TestAPI:
                 assert stored["metadata"] == {"direction": "outbound"}
                 assert send.call_args_list[1].kwargs["reply_to_message_id"] == 501
 
+    def test_broker_send_reply_to_reaches_slack_text_thread(self):
+        """#341: /broker/send reply_to reaches text send_message.thread_ts."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            with TestClient(app) as client:
+                client.post("/agents", json={"name": "barsik", "model": "sonnet"})
+                app.state.agents.set_token("barsik", "slack", "xoxb-test")
+
+                with patch(
+                    "pinky_outreach.slack.SlackAdapter.send_message",
+                    return_value=SimpleNamespace(message_id="1711584001.000200"),
+                ) as send:
+                    response = client.post(
+                        "/broker/send",
+                        json={
+                            "agent_name": "barsik",
+                            "platform": "slack",
+                            "chat_id": "C123",
+                            "content": "reply in thread",
+                            "reply_to": "1711584000.000100",
+                        },
+                    )
+
+                assert response.status_code == 200, response.text
+                send.assert_called_once()
+                assert send.call_args.kwargs["thread_ts"] == "1711584000.000100"
+
     def test_broker_thread_fails_closed_on_chat_scoped_message_id_collision(self):
         with tempfile.TemporaryDirectory() as tmpdir:
             db_path = os.path.join(tmpdir, "test.db")
@@ -5312,6 +5339,40 @@ class TestAgentScheduleEndpoints:
         response = self._create_schedule(client, cron="not a cron")
 
         assert response.status_code == 400
+
+    def test_wake_ledger_endpoint_filters_queryable_receipts(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(
+            client,
+            direct_send=False,
+            target_channel="",
+        ).json()
+        registry = client.app.state.agents
+        row, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="Original",
+            fired_at=100.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            row.id, delivered_at=110.0
+        )
+
+        response = client.get(
+            "/scheduler/wake-ledger",
+            params={
+                "agent_name": "alice",
+                "state": "receipted-ran-once",
+            },
+        )
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["count"] == 1
+        assert body["records"][0]["state"] == "receipted-ran-once"
+        assert body["records"][0]["fired_at"] == 100.0
 
 
 # ── Agent CRUD ───────────────────────────────────────────────
@@ -7775,6 +7836,10 @@ class TestBuildStreamingWakeContextReasonGating:
         """#949 alerting uses the durable #863 owner-notify configuration."""
         with tempfile.TemporaryDirectory() as tmpdir:
             app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.register("dymok", model="sonnet")
+            app.state.agents.set_token(
+                "dymok", "telegram", "token", settings={"account_id": "acct-1"},
+            )
             app.state.agents.set_owner_notification_destinations([
                 {
                     "platform": "telegram",
@@ -7797,6 +7862,106 @@ class TestBuildStreamingWakeContextReasonGating:
                 "owner-dm",
                 "FIRED BUT UNDELIVERED test",
                 account_id="acct-1",
+            )
+
+    @pytest.mark.asyncio
+    async def test_scheduler_owner_alert_uses_exact_account_on_another_local_agent(
+        self, monkeypatch,
+    ):
+        """#985: an absent preferred binding falls back without hiding the rot."""
+        import pinky_daemon.api as api_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.register("geordi", model="sonnet")
+            app.state.agents.register("local-notifier", model="sonnet")
+            app.state.agents.set_token(
+                "local-notifier",
+                "telegram",
+                "token",
+                settings={"account_id": "brad-telegram"},
+            )
+            app.state.agents.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "brad-telegram",
+                    "conversation_id": "owner-dm",
+                    "principal_id": "owner-user",
+                }
+            ])
+            send = AsyncMock(return_value={"sent": True})
+            app.state.broker._send_callback = send
+            logs: list[str] = []
+            monkeypatch.setattr(api_mod, "_log", logs.append)
+
+            delivered = await app.state.scheduler._owner_notify_callback(
+                "geordi", "FIRED BUT UNDELIVERED test"
+            )
+
+            assert delivered is True
+            send.assert_awaited_once_with(
+                "local-notifier",
+                "telegram",
+                "owner-dm",
+                "FIRED BUT UNDELIVERED test",
+                account_id="brad-telegram",
+            )
+            assert any("OWNER_NOTIFY_DELIVERY_FAILURE" in line for line in logs)
+            assert any(
+                "OWNER_NOTIFY_ROUTE_FALLBACK" in line and "local-notifier" in line
+                for line in logs
+            )
+
+    @pytest.mark.asyncio
+    async def test_scheduler_owner_alert_uses_default_channel_with_any_local_account(
+        self, monkeypatch,
+    ):
+        """#985: total canonical-binding absence falls back to the daemon default."""
+        import pinky_daemon.api as api_mod
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            app.state.agents.register("geordi", model="sonnet")
+            app.state.agents.set_token(
+                "geordi", "slack", "token", settings={"team_id": "T_PI"},
+            )
+            app.state.agents.set_setting("operator_chat_id", "D_OWNER")
+            app.state.agents.set_setting("operator_platform", "slack")
+            app.state.agents.set_owner_notification_destinations([
+                {
+                    "platform": "telegram",
+                    "account_id": "brad-telegram",
+                    "conversation_id": "telegram-owner-dm",
+                    "principal_id": "telegram-owner",
+                }
+            ])
+            send = AsyncMock(return_value={"sent": True})
+            app.state.broker._send_callback = send
+            logs: list[str] = []
+            monkeypatch.setattr(api_mod, "_log", logs.append)
+
+            delivered = await app.state.scheduler._owner_notify_callback(
+                "geordi", "FIRED BUT UNDELIVERED test"
+            )
+
+            assert delivered is True
+            send.assert_awaited_once_with(
+                "geordi",
+                "slack",
+                "D_OWNER",
+                "FIRED BUT UNDELIVERED test",
+                account_id="T_PI",
+            )
+            assert any(
+                "OWNER_NOTIFY_DELIVERY_FAILURE" in line
+                and "brad-telegram" in line
+                for line in logs
+            )
+            assert any(
+                "OWNER_NOTIFY_ROUTE_FALLBACK" in line
+                and "daemon default owner channel" in line
+                and "slack/T_PI/D_OWNER" in line
+                for line in logs
             )
 
     def test_central_wake_log_failure_does_not_advance_gate(self):

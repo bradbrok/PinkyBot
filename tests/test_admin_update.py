@@ -4,14 +4,17 @@ from __future__ import annotations
 
 import os
 import subprocess as sp
+import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.self_update import DeployDecision
+
+_REAL_PATH_EXISTS = Path.exists
 
 
 @pytest.fixture(autouse=True)
@@ -513,6 +516,12 @@ class TestAdminUpdateForceDepsIntegration:
 
         return wrapped
 
+    @staticmethod
+    def _with_venv_pip(path: Path) -> bool:
+        if str(path).endswith("/.venv/bin/pip"):
+            return True
+        return _REAL_PATH_EXISTS(path)
+
     def test_force_deps_triggers_pip_install_even_on_clean_pull(self):
         """force_deps=True → pip install runs even when nothing changed in git."""
         gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
@@ -600,6 +609,109 @@ class TestAdminUpdateForceDepsIntegration:
         assert body.get("deps_error")
         assert "pip install failed" in body["deps_error"]
 
+    def test_broken_venv_pip_falls_back_and_logs_vestigial_warning(self):
+        gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
+        calls: list[list[str]] = []
+        logs: list[str] = []
+
+        def broken_venv_pip(cmd, **kwargs):
+            cmd_list = list(cmd)
+            calls.append(cmd_list)
+            if cmd_list[1:] == ["-m", "pip", "--version"]:
+                raise sp.CalledProcessError(
+                    1, cmd, output=b".venv/bin/python: No module named pip",
+                )
+            if "install" in cmd_list and "pip" in cmd_list:
+                return b""
+            return gm(cmd, **kwargs)
+
+        with (
+            patch("subprocess.check_output", side_effect=broken_venv_pip),
+            patch("pathlib.Path.exists", autospec=True, side_effect=self._with_venv_pip),
+            patch("pinky_daemon.api._log", side_effect=logs.append),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=main&force_deps=true")
+
+        assert r.status_code == 200
+        assert r.json()["deps_rebuilt"] is True
+        assert any(
+            call[:4] == [sys.executable, "-m", "pip", "install"]
+            and "--break-system-packages" in call
+            for call in calls
+        )
+        install_calls = [call for call in calls if "install" in call and "pip" in call]
+        assert len(install_calls) == 1
+        assert "--break-system-packages" in install_calls[0]
+        warnings = [line for line in logs if "treating it as vestigial" in line]
+        assert len(warnings) == 1
+        assert "No module named pip" in warnings[0]
+        assert f"falling back to {sys.executable}" in warnings[0]
+
+    def test_functional_venv_pip_is_still_preferred(self):
+        gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
+        calls: list[list[str]] = []
+        project_venv_python: list[str] = []
+
+        def functional_venv_pip(cmd, **kwargs):
+            cmd_list = list(cmd)
+            calls.append(cmd_list)
+            if cmd_list[1:] == ["-m", "pip", "--version"]:
+                project_venv_python.append(cmd_list[0])
+                return b"pip 26.0"
+            if cmd_list[0].endswith("/.venv/bin/python") and "install" in cmd_list:
+                return b""
+            return gm(cmd, **kwargs)
+
+        with (
+            patch("subprocess.check_output", side_effect=functional_venv_pip),
+            patch("pathlib.Path.exists", autospec=True, side_effect=self._with_venv_pip),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            r = client.post("/admin/update?branch=main&force_deps=true")
+
+        assert r.status_code == 200
+        assert r.json()["deps_rebuilt"] is True
+        assert any(call[1:] == ["-m", "pip", "--version"] for call in calls)
+        assert any(
+            call[0] == project_venv_python[0]
+            and call[1:4] == ["-m", "pip", "install"]
+            and "--break-system-packages" not in call
+            for call in calls
+        )
+        install_calls = [call for call in calls if "install" in call and "pip" in call]
+        assert len(install_calls) == 1
+        assert "--break-system-packages" not in install_calls[0]
+
+    def test_deps_error_alerts_owner_once(self):
+        gm = _GitMock(dirty_files=[], before_hash="same1", after_hash="same1")
+
+        def fail_on_pip(cmd, **kwargs):
+            cmd_list = list(cmd)
+            if "install" in cmd_list and "pip" in cmd_list:
+                raise sp.CalledProcessError(1, cmd, output=b"ERROR: package not found")
+            return gm(cmd, **kwargs)
+
+        with (
+            patch("subprocess.check_output", side_effect=fail_on_pip),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            client = _make_client()
+            owner_notify = AsyncMock(return_value=True)
+            client.app.state.scheduler._owner_notify_callback = owner_notify
+            r = client.post("/admin/update?branch=main&force_deps=true")
+
+        assert r.status_code == 200
+        assert r.json()["deps_error"]
+        owner_notify.assert_awaited_once()
+        assert owner_notify.await_args.args[0] == "admin"
+        assert "ADMIN UPDATE DEPENDENCY REBUILD FAILED" in owner_notify.await_args.args[1]
+
 
 class TestInstalledDepsDriftDetection:
     """Direct unit tests for `_check_installed_deps_drift`.
@@ -662,6 +774,23 @@ class TestInstalledDepsDriftDetection:
         assert entry["package"] == "pytest"
         assert entry["installed"] == installed
         assert str(major) in entry["specifier"]
+
+    def test_claude_agent_sdk_security_floor_flags_pre_fix_install(self):
+        """The security floor must make a stale pre-fix SDK visible."""
+        from pinky_daemon.api import _check_installed_deps_drift
+
+        with tempfile.TemporaryDirectory() as tmp:
+            self._write_pyproject(tmp, ["claude-agent-sdk>=0.2.129,<0.3"])
+            with patch("importlib.metadata.version", return_value="0.2.128"):
+                drifts = _check_installed_deps_drift(tmp)
+
+        assert drifts == [
+            {
+                "package": "claude-agent-sdk",
+                "specifier": "<0.3,>=0.2.129",
+                "installed": "0.2.128",
+            }
+        ]
 
     def test_missing_package_records_installed_none(self):
         """A pyproject dep that isn't installed at all shows up with
