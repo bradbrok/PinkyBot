@@ -20,6 +20,7 @@ from pinky_memory.types import (
     ReflectInput,
     Reflection,
     ReflectionType,
+    coerce_reflection_type,
 )
 
 if TYPE_CHECKING:
@@ -30,6 +31,16 @@ if TYPE_CHECKING:
 def _log(msg: str) -> None:
     """Log to stderr (stdout is MCP protocol)."""
     print(msg, file=sys.stderr, flush=True)
+
+
+def _parse_reflection_type(type_str: str) -> ReflectionType:
+    """Coerce a caller-supplied type to ReflectionType, logging when it falls
+    back to `fact` (callers, including dream runs, occasionally pass a
+    plausible-sounding but invalid type — see #session_log bug)."""
+    coerced = coerce_reflection_type(type_str)
+    if coerced.value != type_str:
+        _log(f"reflect: invalid type={type_str!r}, defaulting to 'fact'")
+    return coerced
 
 
 # Strict agent-name slug for cross-agent memory targets (#614/#145). Mirrors
@@ -369,7 +380,7 @@ def create_server(
         """
         input_data = ReflectInput(
             content=content,
-            type=ReflectionType(type),
+            type=_parse_reflection_type(type),
             context=context,
             project=project,
             salience=salience,
@@ -430,7 +441,7 @@ def create_server(
             s = _resolve_target_store(target_agent)
             input_data = ReflectInput(
                 content=content,
-                type=ReflectionType(type),
+                type=_parse_reflection_type(type),
                 context=context,
                 project=project,
                 salience=salience,
