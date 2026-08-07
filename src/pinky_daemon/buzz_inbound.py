@@ -506,7 +506,11 @@ class BrokerBuzzPoller:
             [
                 "REQ",
                 main_sub,
-                {"kinds": [9, 20002], "#h": channels, "since": since},
+                # The production Buzz relay does not live-fanout events to a
+                # subscription whose filter carries ``since``.  Keep the wire
+                # subscription open-ended and enforce this exact floor in the
+                # client before any cache, authorization gate, or durable write.
+                {"kinds": [9, 20002], "#h": channels},
             ],
         )
         await self._wait_for_eose(
