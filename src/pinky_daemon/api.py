@@ -7694,6 +7694,7 @@ npm run build</pre>
                     private_key=req.private_key,
                     relay_url=req.relay_url,
                     community_id=req.community_id,
+                    relay_signing_pubkey=req.relay_signing_pubkey,
                     enabled=req.enabled,
                     owner_pubkey=req.inbound.owner_pubkey,
                     channels=[item.model_dump() for item in req.inbound.channels],
@@ -7706,6 +7707,7 @@ npm run build</pre>
                     private_key=req.private_key,
                     relay_url=req.relay_url,
                     community_id=req.community_id,
+                    relay_signing_pubkey=req.relay_signing_pubkey,
                     enabled=req.enabled,
                     owner_actor=actor,
                 )

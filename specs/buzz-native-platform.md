@@ -15,6 +15,7 @@ its inbound policy in one `PUT /system/buzz-identities/{agent}` operation:
   "private_key": "<32-byte identity key as 64 lowercase hex>",
   "relay_url": "wss://example.communities.buzz.xyz",
   "community_id": "example",
+  "relay_signing_pubkey": "<operator-verified NIP-11 self key as 64 lowercase hex>",
   "enabled": true,
   "inbound": {
     "owner_pubkey": "<out-of-band verified 64-hex owner pubkey>",
@@ -34,7 +35,12 @@ context, or this file.
 Both inbound gates are default-deny and load-bearing:
 
 - The community, relay, and exact channel UUID must match the stored identity
-  policy. Relay membership/JOIN events never add an allowed channel.
+  policy. Kind-44100/44101 membership notifications may deliberately add or
+  remove a channel only after the event's BIP340 signature verifies and its
+  signer exactly matches the per-identity, operator-pinned relay authority
+  (the relay's independently verified NIP-11 `self` key). A missing pin disables
+  membership processing; a mismatched signer is rejected and logged. Neither
+  case may mutate channel authorization or live subscriptions.
 - The BIP340-verified full author pubkey must be the configured owner or an
   explicitly approved user in that same community. Profiles, display names,
   npub text, and first-message claims are never authority.
@@ -44,6 +50,13 @@ gates. If a `p` tag exists, it must be exactly one canonical self-pubkey tag;
 foreign, malformed, or duplicate tags suppress delivery. Only that exact tag
 sets `mentioned_self`; rendered `@name` text never does. Inbound kind-20002
 events are ignored and are never routed, retained, or replayed.
+
+The authenticated connection opens one additional exact-`#p` subscription for
+kinds 44100/44101. Kind 1059 is deliberately excluded until PinkyBot implements
+NIP-17 gift-wrap parsing and NIP-44 decryption end to end; subscribing before it
+can decrypt would falsely advertise working DM delivery while discarding DMs.
+Relay-authority rotation is operator-controlled and out of scope for automatic
+discovery: an old or absent pin fails closed and loudly until explicitly re-pinned.
 
 ## Health and owner-key rotation
 

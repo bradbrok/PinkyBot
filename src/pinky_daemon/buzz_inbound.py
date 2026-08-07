@@ -77,6 +77,7 @@ def validate_buzz_membership_event(
     event: object,
     *,
     identity_pubkey: str,
+    relay_signing_pubkey: str,
     now: float | None = None,
 ) -> ValidatedBuzzMembershipEvent:
     """Validate one relay-delivered, identity-targeted membership notification.
@@ -94,6 +95,10 @@ def validate_buzz_membership_event(
         raise BuzzInboundRejectedError("membership_event_not_json") from exc
     if len(encoded) > _MAX_FRAME_BYTES:
         raise BuzzInboundRejectedError("membership_event_too_large")
+    if not _is_hex_64(relay_signing_pubkey):
+        raise BuzzInboundRejectedError("membership_relay_authority_missing")
+    if event.get("pubkey") != relay_signing_pubkey:
+        raise BuzzInboundRejectedError("membership_signer_invalid")
     if not verify_nostr_event(event):
         raise BuzzInboundRejectedError("membership_signature_or_id_invalid")
     if event["kind"] not in _MEMBERSHIP_KINDS:
@@ -426,9 +431,15 @@ class BrokerBuzzPoller:
         self._pubkey = signing_material.pubkey
         self._relay_url = signing_material.relay_url
         self._community_id = signing_material.community_id
+        self._relay_signing_pubkey = signing_material.relay_signing_pubkey
         self._signer = BuzzNostrSigner(signing_material.private_key)
         if not secrets.compare_digest(self._signer.pubkey, self._pubkey):
             raise BuzzRelayProtocolError("signing material pubkey mismatch")
+        if not _is_hex_64(self._relay_signing_pubkey):
+            _log(
+                "buzz-inbound: WARNING membership processing disabled for "
+                f"{self._agent_name}: relay signing authority is absent"
+            )
         self._broker = broker
         self._registry = registry
         self._owner_notify = owner_notify
@@ -902,8 +913,19 @@ class BrokerBuzzPoller:
             membership = validate_buzz_membership_event(
                 event,
                 identity_pubkey=self._pubkey,
+                relay_signing_pubkey=self._relay_signing_pubkey,
             )
-        except BuzzInboundRejectedError:
+        except BuzzInboundRejectedError as exc:
+            if str(exc) == "membership_signer_invalid":
+                signer = event.get("pubkey") if isinstance(event, dict) else None
+                fingerprint = (
+                    f"{signer[:12]}…" if _is_hex_64(signer) else "invalid"
+                )
+                _log(
+                    "buzz-inbound: WARNING rejected membership event for "
+                    f"{self._agent_name}: signer {fingerprint} does not match "
+                    "the pinned relay authority"
+                )
             return
         channel_id = membership.channel_id
         event_version = (

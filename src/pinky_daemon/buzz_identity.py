@@ -72,6 +72,7 @@ class BuzzSigningMaterial:
     private_key: bytes
     relay_url: str
     community_id: str
+    relay_signing_pubkey: str
 
     def __repr__(self) -> str:
         return (

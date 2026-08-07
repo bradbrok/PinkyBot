@@ -16,6 +16,8 @@ from pinky_outreach.buzz import BuzzNostrSigner, verify_nostr_event
 AGENT_KEY = "11" * 32
 OWNER = BuzzNostrSigner(bytes.fromhex("33" * 32))
 USER = BuzzNostrSigner(bytes.fromhex("44" * 32))
+STRANGER = BuzzNostrSigner(bytes.fromhex("55" * 32))
+RELAY_AUTHORITY = BuzzNostrSigner(bytes.fromhex("66" * 32))
 CHANNEL = "00000000-0000-4000-8000-000000000001"
 OTHER_CHANNEL = "00000000-0000-4000-8000-000000000002"
 COMMUNITY = "example"
@@ -43,6 +45,7 @@ def _registry(tmp_path, relay_url: str, *, channels: list[dict] | None = None):
         private_key=AGENT_KEY,
         relay_url=relay_url,
         community_id=COMMUNITY,
+        relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
         enabled=True,
         owner_actor="ui:admin",
     )
@@ -654,12 +657,12 @@ async def test_live_fanout_uses_one_req_per_channel_and_waits_for_every_eose(tmp
 async def test_membership_add_opens_channel_live_and_remove_closes_it(tmp_path):
     relay_url = ""
     agent_pubkey = BuzzNostrSigner(bytes.fromhex(AGENT_KEY)).pubkey
-    added = OWNER.sign_event(
+    added = RELAY_AUTHORITY.sign_event(
         kind=44100,
         tags=[["p", agent_pubkey], ["h", OTHER_CHANNEL], ["name", "#support"]],
         content="",
     )
-    removed = OWNER.sign_event(
+    removed = RELAY_AUTHORITY.sign_event(
         kind=44101,
         tags=[["p", agent_pubkey], ["h", OTHER_CHANNEL]],
         content="",
@@ -774,13 +777,13 @@ async def test_membership_history_newest_removal_cannot_be_reopened_by_older_add
     material = store.get_buzz_signing_material("barsik")
     poller = BrokerBuzzPoller(material, FakeBroker(), store, lambda *_args: True)
     now = int(time.time())
-    removed = OWNER.sign_event(
+    removed = RELAY_AUTHORITY.sign_event(
         kind=44101,
         tags=[["p", material.pubkey], ["h", OTHER_CHANNEL]],
         content="",
         created_at=now - 5,
     )
-    older_add = OWNER.sign_event(
+    older_add = RELAY_AUTHORITY.sign_event(
         kind=44100,
         tags=[["p", material.pubkey], ["h", OTHER_CHANNEL]],
         content="",
@@ -814,6 +817,75 @@ async def test_membership_history_newest_removal_cannot_be_reopened_by_older_add
     assert OTHER_CHANNEL not in channels
     assert channel_subscriptions == {}
     assert ws.sent == []
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_pin", "signer", "expected_log"),
+    [
+        ("", RELAY_AUTHORITY, "membership processing disabled"),
+        (RELAY_AUTHORITY.pubkey, STRANGER, "rejected membership event"),
+    ],
+    ids=["absent-pin", "stranger-55-scalar"],
+)
+async def test_membership_authority_failures_are_inert_and_loud(
+    tmp_path,
+    capsys,
+    stored_pin,
+    signer,
+    expected_log,
+):
+    relay_url = "ws://127.0.0.1:1"
+    store = _registry(tmp_path, relay_url)
+    if not stored_pin:
+        store._db.execute(
+            "UPDATE buzz_identities SET relay_signing_pubkey='' WHERE agent='barsik'"
+        )
+        store._db.commit()
+    material = store.get_buzz_signing_material("barsik")
+    poller = BrokerBuzzPoller(material, FakeBroker(), store, lambda *_args: True)
+    forged = signer.sign_event(
+        kind=44100,
+        tags=[["p", material.pubkey], ["h", OTHER_CHANNEL], ["name", "#forged"]],
+        content="",
+    )
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):  # noqa: ANN001
+            self.sent.append(json.loads(payload))
+
+    ws = FakeSocket()
+    channels = [CHANNEL]
+    channel_subscriptions: dict[str, str] = {}
+    await poller._handle_membership_event(
+        ws,
+        forged,
+        subscription_since={},
+        channel_subscriptions=channel_subscriptions,
+        channels=channels,
+        subscription_floor=int(time.time()) - 60,
+        connection_token="test",
+    )
+
+    assert store.get_buzz_inbound_channel(
+        "barsik", COMMUNITY, relay_url, OTHER_CHANNEL
+    ) is None
+    assert all(
+        chat["chat_id"] != OTHER_CHANNEL
+        for chat in store.list_group_chats("barsik", active_only=False)
+    )
+    assert channels == [CHANNEL]
+    assert channel_subscriptions == {}
+    assert poller._membership_versions == {}
+    assert ws.sent == []
+    captured = capsys.readouterr().err
+    assert expected_log in captured
+    if stored_pin:
+        assert f"{signer.pubkey[:12]}…" in captured
     store.close()
 
 

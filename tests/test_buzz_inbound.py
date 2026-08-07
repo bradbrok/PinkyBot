@@ -25,6 +25,7 @@ STRANGER_KEY = bytes.fromhex("55" * 32)
 OWNER = BuzzNostrSigner(OWNER_KEY)
 USER = BuzzNostrSigner(USER_KEY)
 STRANGER = BuzzNostrSigner(STRANGER_KEY)
+RELAY_AUTHORITY = BuzzNostrSigner(bytes.fromhex("66" * 32))
 CHANNEL = "00000000-0000-4000-8000-000000000001"
 OTHER_CHANNEL = "00000000-0000-4000-8000-000000000002"
 RELAY = "wss://example.communities.buzz.xyz"
@@ -53,6 +54,7 @@ def registry(tmp_path):
         private_key=AGENT_KEY,
         relay_url=RELAY,
         community_id=COMMUNITY,
+        relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
         enabled=True,
         owner_actor="ui:admin",
     )
@@ -251,7 +253,7 @@ async def test_membership_events_never_expand_channels_or_reach_persona(registry
 
 def test_membership_validation_requires_exact_self_p_and_canonical_h(registry):
     _store, identity_pubkey = registry
-    valid = OWNER.sign_event(
+    valid = RELAY_AUTHORITY.sign_event(
         kind=44100,
         tags=[["p", identity_pubkey], ["h", OTHER_CHANNEL], ["name", "#support"]],
         content="",
@@ -259,15 +261,16 @@ def test_membership_validation_requires_exact_self_p_and_canonical_h(registry):
     membership = validate_buzz_membership_event(
         valid,
         identity_pubkey=identity_pubkey,
+        relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
     )
     assert (membership.channel_id, membership.chat_title) == (OTHER_CHANNEL, "#support")
 
-    foreign = OWNER.sign_event(
+    foreign = RELAY_AUTHORITY.sign_event(
         kind=44100,
         tags=[["p", STRANGER.pubkey], ["h", OTHER_CHANNEL]],
         content="",
     )
-    duplicate = OWNER.sign_event(
+    duplicate = RELAY_AUTHORITY.sign_event(
         kind=44100,
         tags=[
             ["p", identity_pubkey],
@@ -277,9 +280,43 @@ def test_membership_validation_requires_exact_self_p_and_canonical_h(registry):
         content="",
     )
     with pytest.raises(BuzzInboundRejectedError, match="membership_target_invalid"):
-        validate_buzz_membership_event(foreign, identity_pubkey=identity_pubkey)
+        validate_buzz_membership_event(
+            foreign,
+            identity_pubkey=identity_pubkey,
+            relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
+        )
     with pytest.raises(BuzzInboundRejectedError, match="membership_target_invalid"):
-        validate_buzz_membership_event(duplicate, identity_pubkey=identity_pubkey)
+        validate_buzz_membership_event(
+            duplicate,
+            identity_pubkey=identity_pubkey,
+            relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
+        )
+
+
+@pytest.mark.parametrize("kind", [44100, 44101])
+@pytest.mark.parametrize(
+    "signer",
+    [OWNER, USER, STRANGER],
+    ids=["owner", "other-user", "stranger-55-scalar"],
+)
+def test_membership_validation_rejects_every_non_relay_signer(
+    registry,
+    kind,
+    signer,
+):
+    _store, identity_pubkey = registry
+    forged = signer.sign_event(
+        kind=kind,
+        tags=[["p", identity_pubkey], ["h", OTHER_CHANNEL]],
+        content="",
+    )
+
+    with pytest.raises(BuzzInboundRejectedError, match="membership_signer_invalid"):
+        validate_buzz_membership_event(
+            forged,
+            identity_pubkey=identity_pubkey,
+            relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
+        )
 
 
 @pytest.mark.asyncio

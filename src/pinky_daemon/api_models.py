@@ -664,8 +664,19 @@ class BindBuzzIdentityRequest(BaseModel):
     private_key: str
     relay_url: str
     community_id: str
+    relay_signing_pubkey: str
     enabled: bool = True
     inbound: ConfigureBuzzInboundRequest | None = None
+
+    @field_validator("relay_signing_pubkey")
+    @classmethod
+    def validate_relay_signing_pubkey(cls, value: str) -> str:
+        pubkey = str(value or "")
+        if not _BUZZ_PUBKEY_RE.fullmatch(pubkey):
+            raise ValueError(
+                "Buzz relay_signing_pubkey must be exactly 64 lowercase hex characters"
+            )
+        return pubkey
 
 
 class AddMcpServerRequest(BaseModel):

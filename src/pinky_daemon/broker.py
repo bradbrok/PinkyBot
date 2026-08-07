@@ -1428,10 +1428,14 @@ class MessageBroker:
                 contact = self._registry.get_verified_contact(
                     message.agent_name, "buzz", buzz_principal
                 )
-            except Exception:
+            except Exception as exc:
                 # Fail closed on trust but open on rendering: an absent legacy
                 # table or lookup failure must preserve the full-principal
                 # untrusted header instead of crashing inbound delivery.
+                _log(
+                    "broker: WARNING verified-contact lookup failed for "
+                    f"{message.agent_name} ({type(exc).__name__}); rendering untrusted"
+                )
                 contact_lookup_failed = True
             if contact is not None:
                 role = f" ({contact['role']})" if contact.get("role") else ""
@@ -1451,8 +1455,15 @@ class MessageBroker:
                             ),
                             "",
                         )
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        # Collision enrichment is optional. Preserve the explicit
+                        # untrusted/full-principal fallback, but make registry
+                        # degradation observable instead of silently hiding it.
+                        _log(
+                            "broker: WARNING verified-contact collision lookup failed for "
+                            f"{message.agent_name} ({type(exc).__name__}); "
+                            "rendering untrusted"
+                        )
                 trust_label = (
                     f"untrusted+collides:{collision}" if collision else "untrusted"
                 )
