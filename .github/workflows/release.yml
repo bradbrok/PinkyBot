@@ -35,14 +35,17 @@ jobs:
     steps:
       - name: Check version format + branch
         id: check
+        env:
+          RELEASE_VERSION: ${{ inputs.version }}
+          WORKFLOW_REF: ${{ github.ref }}
         run: |
-          version="${{ inputs.version }}"
+          version="$RELEASE_VERSION"
           if [[ ! "$version" =~ ^[0-9]{2}\.[0-9]{2}\.[0-9]{2,3}$ ]]; then
             echo "::error::Version must be calver YY.MM.NNN (e.g. 26.05.071), got: $version"
             exit 1
           fi
-          if [[ "${{ github.ref }}" != "refs/heads/main" ]]; then
-            echo "::error::Releases can only be cut from main (got: ${{ github.ref }})"
+          if [[ "$WORKFLOW_REF" != "refs/heads/main" ]]; then
+            echo "::error::Releases can only be cut from main (got: $WORKFLOW_REF)"
             exit 1
           fi
           echo "version=$version" >> "$GITHUB_OUTPUT"
@@ -62,24 +65,28 @@ jobs:
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
 
       - name: Verify tag doesn't exist
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          if git rev-parse "${{ needs.validate.outputs.version }}" >/dev/null 2>&1; then
-            echo "::error::Tag ${{ needs.validate.outputs.version }} already exists"
+          if git rev-parse "$RELEASE_VERSION" >/dev/null 2>&1; then
+            echo "::error::Tag $RELEASE_VERSION already exists"
             exit 1
           fi
 
       - name: Generate release notes
         id: notes
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
+          CUSTOM_NOTES: ${{ inputs.release_notes }}
         run: |
-          version="${{ needs.validate.outputs.version }}"
-          custom_notes="${{ inputs.release_notes }}"
+          version="$RELEASE_VERSION"
           prior_tag=$(git describe --tags --abbrev=0 2>/dev/null || echo "")
 
           {
             echo "## Release $version"
             echo
-            if [ -n "$custom_notes" ]; then
-              echo "$custom_notes"
+            if [ -n "$CUSTOM_NOTES" ]; then
+              printf '%s\n' "$CUSTOM_NOTES"
               echo
             fi
             echo "### Changes"
@@ -101,10 +108,11 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Create annotated tag
+        env:
+          RELEASE_VERSION: ${{ needs.validate.outputs.version }}
         run: |
-          version="${{ needs.validate.outputs.version }}"
-          git tag -a "$version" -m "Release $version"
-          git push origin "$version"
+          git tag -a "$RELEASE_VERSION" -m "Release $RELEASE_VERSION"
+          git push origin "$RELEASE_VERSION"
 
       - name: Create GitHub Release
         uses: softprops/action-gh-release@v3
