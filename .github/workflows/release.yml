@@ -74,7 +74,6 @@ jobs:
           fi
 
       - name: Generate release notes
-        id: notes
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
           CUSTOM_NOTES: ${{ inputs.release_notes }}
@@ -100,13 +99,6 @@ jobs:
             echo "Production hosts running \`PINKYBOT_CHANNEL=stable\` (the only channel) will pull this tag on the next \`update_and_restart\`."
           } > /tmp/notes.md
 
-          # Multiline output via heredoc
-          {
-            echo 'body<<NOTES_EOF'
-            cat /tmp/notes.md
-            echo NOTES_EOF
-          } >> "$GITHUB_OUTPUT"
-
       - name: Create annotated tag
         env:
           RELEASE_VERSION: ${{ needs.validate.outputs.version }}
@@ -119,6 +111,6 @@ jobs:
         with:
           tag_name: ${{ needs.validate.outputs.version }}
           name: ${{ needs.validate.outputs.version }}
-          body: ${{ steps.notes.outputs.body }}
+          body_path: /tmp/notes.md
           draft: false
           prerelease: false
