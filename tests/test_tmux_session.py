@@ -10589,3 +10589,20 @@ def test_stats_inflight_inactive_when_idle(tmp_path) -> None:
     assert stats["inflight_active"] is False
     assert stats["inflight_busy_not_wedged"] is False
     assert stats["inflight_liveness_reason"] == "no_inflight_turn"
+
+
+def test_normalize_prompt_unicode() -> None:
+    """Test _normalize_prompt() normalizes Unicode to NFC form."""
+    import unicodedata
+
+    # Create strings in different normalization forms
+    nfc = unicodedata.normalize("NFC", "café")
+    nfd = unicodedata.normalize("NFD", "café")
+
+    # They should be different at byte level
+    assert nfc != nfd
+
+    # But _normalize_prompt should make them equal
+    assert (
+        tmux_session._normalize_prompt(nfc) == tmux_session._normalize_prompt(nfd)
+    )

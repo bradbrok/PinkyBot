@@ -64,6 +64,7 @@ import re
 import shlex
 import threading
 import time
+import unicodedata
 from collections import OrderedDict, deque
 from dataclasses import dataclass, field, replace
 from pathlib import Path
@@ -133,6 +134,16 @@ FRESH_CONTEXT_RESPAWN_GRACE_SEC = 180.0
 # and not per-agent because the lock signals daemon-wide intent, not
 # agent-internal state.
 _TRANSPORT_LOCK_DIR = Path("data/transport-locks")
+
+
+def _normalize_prompt(text: str) -> str:
+    """Normalize text to NFC form for consistent string comparison.
+
+    Fixes Unicode normalization mismatches where identical prompts may have
+    different byte sequences due to combining characters or ligatures.
+    See #420.
+    """
+    return unicodedata.normalize("NFC", text)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -3518,7 +3529,7 @@ class TmuxSession:
                 and receipt is not None
                 and not receipt.done()
                 and turn.pane_delivery_started
-                and turn.prompt == prompt
+                and _normalize_prompt(turn.prompt) == _normalize_prompt(prompt)
             ):
                 return True
         return False
@@ -6787,7 +6798,7 @@ class TmuxSession:
             if (
                 not turn.pane_delivery_started
                 or turn.transport_accepted
-                or turn.prompt != prompt
+                or _normalize_prompt(turn.prompt) != _normalize_prompt(prompt)
                 or (
                     turn.submission_receipt is not None
                     and turn.submission_receipt.done()
@@ -6861,7 +6872,7 @@ class TmuxSession:
             if prompt is not None:
                 if self._pane_dequeued_turns:
                     dequeued = self._pane_dequeued_turns[0]
-                    if dequeued is None or dequeued.prompt == prompt:
+                    if dequeued is None or _normalize_prompt(dequeued.prompt) == _normalize_prompt(prompt):
                         self._pane_dequeued_turns.popleft()
                         self._mark_transport_accepted(dequeued)
                         return

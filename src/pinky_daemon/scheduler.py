@@ -302,6 +302,10 @@ class AgentScheduler:
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
         self._resurrection_attempts: dict[str, list[float]] = {}
+        # In-process dedup for replayed wakes during this startup session.
+        # Prevents duplicate delivery when daemon restarts before receipt
+        # persists to DB: (schedule_id, fired_at) tuples already delivered.
+        self._replayed_wakes_this_startup: set[tuple[int, float]] = set()
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -980,6 +984,16 @@ class AgentScheduler:
             if pending.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP:
                 self._park_pending_wake_if_capped(pending, pending.attempts)
                 break
+            # Skip if this wake was already delivered earlier in this startup session.
+            # Prevents duplicate delivery when daemon restarts before receipt persists.
+            dedup_key = (pending.schedule_id, pending.fired_at)
+            if dedup_key in self._replayed_wakes_this_startup:
+                _log(
+                    f"scheduler: skipping already-delivered persisted wake "
+                    f"#{pending.id} for schedule #{pending.schedule_id} on "
+                    f"agent '{pending.agent_name}' (dedup key {dedup_key})"
+                )
+                continue
             attempts = self._registry.increment_pending_schedule_wake_attempts(
                 pending.id
             )
@@ -1014,6 +1028,11 @@ class AgentScheduler:
                     "did not match a row"
                 )
                 break
+            # Mark as replayed to prevent duplicate delivery if daemon restarts
+            # before the next replay attempt reads the confirmed row.
+            self._replayed_wakes_this_startup.add(
+                (pending.schedule_id, pending.fired_at)
+            )
             if self._activity:
                 try:
                     self._activity.log(

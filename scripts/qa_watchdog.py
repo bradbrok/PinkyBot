@@ -35,6 +35,16 @@ except ImportError:
     print("WARNING: aiohttp not installed. Link checking disabled.")
     aiohttp = None
 
+# Add lib and scripts to path for importing audit_config
+sys.path.insert(0, "/home/pinky/lib")
+sys.path.insert(0, "/home/pinky/scripts")
+
+try:
+    from bitcoinmarket_check_config import get_site_config
+except ImportError:
+    get_site_config = None
+    print("WARNING: bitcoinmarket_check_config not available. Config-driven mode disabled.")
+
 
 # --- Configuration ---
 
@@ -268,7 +278,12 @@ class QAWatchdog:
             ))
 
     def _check_schema(self, soup: BeautifulSoup, report: PageReport, page_type_config: dict):
-        """Check for JSON-LD schema markup."""
+        """Check for JSON-LD schema markup. Skip if not required by site config."""
+        # Skip schema checks if not required by site config (e.g., aiena)
+        if hasattr(self, 'site_config') and self.site_config:
+            if not self.site_config.standards.require_schema:
+                return  # Schema not required for this site
+
         schema_scripts = soup.find_all("script", type="application/ld+json")
         report.schema_types = []
 
@@ -450,7 +465,12 @@ class QAWatchdog:
             ))
 
     def _check_hreflang_xdefault(self, soup: BeautifulSoup, report: PageReport):
-        """Verify x-default hreflang points to an EN URL, not a non-English page."""
+        """Verify x-default hreflang points to an EN URL, not a non-English page. Skip for monolang sites."""
+        # Skip hreflang checks if site is monolang (e.g., aiena)
+        if hasattr(self, 'site_config') and self.site_config:
+            if len(self.site_config.languages) <= 1:
+                return  # Monolang site, no hreflang needed
+
         hreflang_tags = soup.find_all("link", rel="alternate", hreflang=True)
         if not hreflang_tags:
             return
@@ -1103,6 +1123,11 @@ async def main_async():
         description="Scan HTML files for SEO and content quality issues"
     )
     parser.add_argument(
+        "--site", "-s",
+        default="bitcoinmarket",
+        help="Site name (bitcoinmarket, aiena, etc.) — loads per-site standards from audit_config"
+    )
+    parser.add_argument(
         "--config", "-c",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
@@ -1148,6 +1173,23 @@ async def main_async():
         logger.error(str(e))
         sys.exit(1)
 
+    # Load site-specific audit config (for standards and asset requirements)
+    site_config = None
+    if get_site_config:
+        try:
+            site_config = get_site_config(args.site)
+            logger.info(f"Loaded audit config for site: {args.site} ({site_config.url})")
+            # Store in watchdog for access during checks
+            watchdog.site_config = site_config
+            watchdog.site_name = args.site
+        except Exception as e:
+            logger.warning(f"Could not load site config: {e}. Continuing with defaults.")
+            watchdog.site_config = None
+            watchdog.site_name = args.site
+    else:
+        watchdog.site_config = None
+        watchdog.site_name = args.site
+
     if args.dry_run:
         files = watchdog.find_html_files(limit=args.limit)
         print(f"Would scan {len(files)} HTML files:")
@@ -1168,10 +1210,11 @@ async def main_async():
     output_dir = args.output or watchdog.output_dir
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    # Generate filenames with date
+    # Generate filenames with date and site name
     date_str = datetime.now().strftime("%Y-%m-%d")
-    json_path = output_dir / f"qa_report_{date_str}.json"
-    txt_path = output_dir / f"qa_report_{date_str}.txt"
+    site_label = f"_{args.site}" if args.site != "bitcoinmarket" else ""
+    json_path = output_dir / f"qa_report{site_label}_{date_str}.json"
+    txt_path = output_dir / f"qa_report{site_label}_{date_str}.txt"
 
     # Write JSON report
     with open(json_path, "w", encoding="utf-8") as f:

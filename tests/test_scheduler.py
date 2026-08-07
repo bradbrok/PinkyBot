@@ -1176,6 +1176,58 @@ class TestScheduler:
         assert attempts == ["run once"]
 
     @pytest.mark.asyncio
+    async def test_persisted_wake_dedup_prevents_double_delivery_on_restart(
+        self, registry, capsys
+    ):
+        """Verify that daemon restart before receipt persists doesn't replay.
+
+        Simulates the scenario from #420: multiple daemon restarts before the
+        pending_schedule_wake receipt is persisted. The in-process dedup set
+        should prevent delivering the same prompt more than once per session.
+        """
+        registry.register("segugio")
+        schedule = registry.add_schedule(
+            "segugio", "* * * * *", name="test_dedup", prompt="dedup test"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        delivery_count = [0]
+
+        # Callback that never confirms, leaving wake pending
+        async def never_confirms(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            delivery_count[0] += 1
+            return asyncio.get_running_loop().create_future()
+
+        # First scheduler fires: callback never confirms, so wake stays pending
+        scheduler1 = AgentScheduler(
+            registry, wake_callback=never_confirms, schedule_delivery_timeout=0.01
+        )
+        await scheduler1._deliver_schedule(schedule)
+        pending = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending) == 1
+        assert delivery_count[0] == 1
+
+        # Simulate daemon restart: create new scheduler with the same callback
+        scheduler2 = AgentScheduler(
+            registry, wake_callback=never_confirms, schedule_delivery_timeout=0.01
+        )
+        # Manually mark this wake as already delivered in this session
+        # (simulating the in-process state after first delivery)
+        scheduler2._replayed_wakes_this_startup.add((schedule.id, fired_at))
+
+        # Now replay: should skip because dedup set has it
+        await scheduler2._replay_pending_locked("segugio")
+
+        # Delivery count should still be 1 (no additional delivery)
+        assert delivery_count[0] == 1
+        captured = capsys.readouterr().err
+        # Should see the dedup skip log
+        assert "skipping already-delivered persisted wake" in captured
+
+    @pytest.mark.asyncio
     async def test_kill_after_durable_accept_before_future_resolve_never_replays(
         self, capsys
     ):

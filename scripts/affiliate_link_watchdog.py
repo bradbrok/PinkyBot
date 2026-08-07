@@ -27,6 +27,16 @@ except ImportError:
     print("ERROR: beautifulsoup4 required. Install with: pip install beautifulsoup4")
     sys.exit(1)
 
+# Add lib and scripts to path for importing audit_config
+sys.path.insert(0, "/home/pinky/lib")
+sys.path.insert(0, "/home/pinky/scripts")
+
+try:
+    from bitcoinmarket_check_config import get_site_config
+except ImportError:
+    get_site_config = None
+    print("WARNING: bitcoinmarket_check_config not available. Config-driven mode disabled.")
+
 
 # --- Configuration ---
 
@@ -383,6 +393,11 @@ def main():
         description="Scan HTML files for exchange mentions missing affiliate links"
     )
     parser.add_argument(
+        "--site", "-s",
+        default="bitcoinmarket",
+        help="Site name (bitcoinmarket, aiena, etc.) — skips affiliate checks if not required by site config"
+    )
+    parser.add_argument(
         "--config", "-c",
         type=Path,
         default=DEFAULT_CONFIG_PATH,
@@ -417,6 +432,30 @@ def main():
         logger.error(str(e))
         sys.exit(1)
 
+    # Load site-specific audit config (to check if affiliate disclosure is required)
+    site_config = None
+    if get_site_config:
+        try:
+            site_config = get_site_config(args.site)
+            logger.info(f"Loaded audit config for site: {args.site} ({site_config.url})")
+
+            # Skip affiliate checks if not required by site config (e.g., aiena has no affiliate program)
+            if not site_config.standards.require_affiliate_disclosure:
+                logger.info(f"Affiliate disclosure not required for {args.site} — skipping scan")
+                print(f"Affiliate checks skipped for {args.site} (no affiliate program)")
+                sys.exit(0)
+
+            # Store in watchdog for reference
+            watchdog.site_config = site_config
+            watchdog.site_name = args.site
+        except Exception as e:
+            logger.warning(f"Could not load site config: {e}. Continuing with defaults.")
+            watchdog.site_config = None
+            watchdog.site_name = args.site
+    else:
+        watchdog.site_config = None
+        watchdog.site_name = args.site
+
     if args.dry_run:
         files = watchdog.find_html_files()
         print(f"Would scan {len(files)} HTML files:")
@@ -433,10 +472,11 @@ def main():
     # Ensure output directory exists
     args.output.mkdir(parents=True, exist_ok=True)
 
-    # Generate filenames with date
+    # Generate filenames with date and site name
     date_str = datetime.now().strftime("%Y-%m-%d")
-    json_path = args.output / f"affiliate_report_{date_str}.json"
-    txt_path = args.output / f"affiliate_report_{date_str}.txt"
+    site_label = f"_{args.site}" if args.site != "bitcoinmarket" else ""
+    json_path = args.output / f"affiliate_report{site_label}_{date_str}.json"
+    txt_path = args.output / f"affiliate_report{site_label}_{date_str}.txt"
 
     # Write JSON report
     with open(json_path, "w", encoding="utf-8") as f:

@@ -1,0 +1,38 @@
+======================================================================
+QA WATCHDOG REPORT - bitcoinmarket.net
+Scan Date: 2026-08-06T23:50:30.273408
+Files Scanned: 666
+======================================================================
+
+SUMMARY
+--------------------------------------------------
+  CRITICAL issues: 0
+  WARNING issues:  11
+
+BY CATEGORY:
+  SEO: 0 critical, 1 warning
+  SCHEMA: 0 critical, 5 warning
+
+BY PAGE TYPE:
+  generic: 31 pages, 1 issues
+  guide: 310 pages, 4 issues
+  landing: 1 pages, 0 issues
+  magazine: 238 pages, 0 issues
+  review: 86 pages, 1 issues
+
+SITE-LEVEL ISSUES
+--------------------------------------------------
+  [~] Orphan page: magazine/bear-market-dca-bitcoin-exchange-mica-europe-2026-en.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/pump-fun-mil-millones-rug-pull-demanda-colectiva-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/pump-fun-milliarde-rug-pull-sammelklage-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/qivalis-euro-stablecoin-europaeische-banken-2026-de.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+  [~] Orphan page: magazine/qivalis-stablecoin-euro-bancos-europeos-2026-es.html (0 inbound internal links)
+      Add at least one contextual link from a related guide or review.
+
+======================================================================
+END OF REPORT
+======================================================================
