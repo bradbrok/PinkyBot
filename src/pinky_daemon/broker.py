@@ -1422,11 +1422,53 @@ class MessageBroker:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
             mentioned = "true" if message.metadata.get("buzz_mentioned_self") is True else "false"
+            contact = None
+            contact_lookup_failed = False
+            try:
+                contact = self._registry.get_verified_contact(
+                    message.agent_name, "buzz", buzz_principal
+                )
+            except Exception:
+                # Fail closed on trust but open on rendering: an absent legacy
+                # table or lookup failure must preserve the full-principal
+                # untrusted header instead of crashing inbound delivery.
+                contact_lookup_failed = True
+            if contact is not None:
+                role = f" ({contact['role']})" if contact.get("role") else ""
+                fingerprint = buzz_principal.rsplit(":", 1)[-1][:12]
+                sender = f"from:{contact['name']}{role} principal:{fingerprint}…"
+            else:
+                collision = ""
+                if not contact_lookup_failed:
+                    try:
+                        collision = next(
+                            (
+                                item["name"]
+                                for item in self._registry.list_verified_contacts(
+                                    message.agent_name
+                                )
+                                if item["name"].casefold() == message.sender_name.casefold()
+                            ),
+                            "",
+                        )
+                    except Exception:
+                        pass
+                trust_label = (
+                    f"untrusted+collides:{collision}" if collision else "untrusted"
+                )
+                sender = (
+                    f"display_name({trust_label}):{message.sender_name} | "
+                    f"principal:{buzz_principal}"
+                )
+            # When no name is available the full raw ID already occupies the
+            # display slot; do not print it a second time. Named channels keep
+            # the explicit chat_id field required by send()/thread().
+            chat_id = (
+                f" | chat_id:{message.chat_id}" if display != message.chat_id else ""
+            )
             header = (
-                f"[buzz | channel | {display} | "
-                f"display_name(untrusted):{message.sender_name} | "
-                f"principal:{buzz_principal} | mentioned_self:{mentioned} | "
-                f"{message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+                f"[buzz | {display} | {sender} | mentioned_self:{mentioned}"
+                f"{chat_id} | {ts}{msg_id}{thread_provenance}]"
             )
         elif message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)

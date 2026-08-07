@@ -20,6 +20,7 @@ from pinky_outreach.buzz import BuzzNostrSigner, verify_nostr_event
 
 _HEX_64 = frozenset("0123456789abcdef")
 _ALLOWED_KINDS = {9, 20002}
+_MEMBERSHIP_KINDS = {44100, 44101}
 _MAX_FRAME_BYTES = 128 * 1024
 _MAX_CONTENT_BYTES = 32 * 1024
 _MAX_TAGS = 64
@@ -61,8 +62,87 @@ class ValidatedBuzzInboundEvent:
     reply_to: str
 
 
+@dataclass(frozen=True)
+class ValidatedBuzzMembershipEvent:
+    event: dict
+    channel_id: str
+    chat_title: str
+
+
 def _is_hex_64(value: object) -> bool:
     return isinstance(value, str) and len(value) == 64 and not (set(value) - _HEX_64)
+
+
+def validate_buzz_membership_event(
+    event: object,
+    *,
+    identity_pubkey: str,
+    now: float | None = None,
+) -> ValidatedBuzzMembershipEvent:
+    """Validate one relay-delivered, identity-targeted membership notification.
+
+    Buzz only admits relay-signed 44100/44101 events. The configured relay is
+    therefore the authority for the signer identity; locally we still verify
+    the Nostr signature and require one exact ``p`` target plus one canonical
+    channel ``h`` tag before changing subscriptions or authorization state.
+    """
+    if not isinstance(event, dict):
+        raise BuzzInboundRejectedError("membership_event_not_object")
+    try:
+        encoded = json.dumps(event, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
+    except (TypeError, ValueError) as exc:
+        raise BuzzInboundRejectedError("membership_event_not_json") from exc
+    if len(encoded) > _MAX_FRAME_BYTES:
+        raise BuzzInboundRejectedError("membership_event_too_large")
+    if not verify_nostr_event(event):
+        raise BuzzInboundRejectedError("membership_signature_or_id_invalid")
+    if event["kind"] not in _MEMBERSHIP_KINDS:
+        raise BuzzInboundRejectedError("membership_kind_not_allowed")
+    current = time.time() if now is None else float(now)
+    if event["created_at"] > int(current + _MAX_FUTURE_SECONDS):
+        raise BuzzInboundRejectedError("membership_event_from_future")
+    tags = event["tags"]
+    if len(tags) > _MAX_TAGS:
+        raise BuzzInboundRejectedError("membership_too_many_tags")
+    if any(
+        len(tag) < 2
+        or len(tag) > _MAX_TAG_PARTS
+        or any(len(part.encode("utf-8")) > _MAX_TAG_PART_BYTES for part in tag)
+        for tag in tags
+    ):
+        raise BuzzInboundRejectedError("membership_tag_bounds_invalid")
+
+    p_tags = [tag for tag in tags if tag[0] == "p"]
+    if (
+        len(p_tags) != 1
+        or len(p_tags[0]) != 2
+        or not _is_hex_64(p_tags[0][1])
+        or p_tags[0][1] != identity_pubkey
+    ):
+        raise BuzzInboundRejectedError("membership_target_invalid")
+    channel_tags = [tag for tag in tags if tag[0] == "h"]
+    if len(channel_tags) != 1 or len(channel_tags[0]) != 2:
+        raise BuzzInboundRejectedError("membership_channel_invalid")
+    channel_id = channel_tags[0][1]
+    try:
+        if str(UUID(channel_id)) != channel_id:
+            raise ValueError
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise BuzzInboundRejectedError("membership_channel_invalid") from exc
+
+    name_tags = [tag for tag in tags if tag[0] == "name"]
+    if len(name_tags) > 1 or any(len(tag) != 2 for tag in name_tags):
+        raise BuzzInboundRejectedError("membership_name_invalid")
+    chat_title = name_tags[0][1].strip() if name_tags else ""
+    if len(chat_title) > 80 or any(
+        ord(ch) < 32 or ord(ch) == 127 for ch in chat_title
+    ):
+        raise BuzzInboundRejectedError("membership_name_invalid")
+    return ValidatedBuzzMembershipEvent(
+        event=event,
+        channel_id=channel_id,
+        chat_title=chat_title,
+    )
 
 
 def validate_buzz_inbound_event(
@@ -231,6 +311,16 @@ class BuzzInboundProcessor:
             self.stats["unlisted_channel"] += 1
             return "unlisted_channel"
 
+        # Buzz has no Telegram-style join callback. Ensure every authorized
+        # first inbound creates the row that alias management expects.
+        self._registry.upsert_group_chat(
+            self.agent_name,
+            validated.channel_id,
+            chat_title=channel["label"],
+            chat_type="channel",
+            platform="buzz",
+        )
+
         # Gate B: full, platform-qualified, community-scoped verified author.
         author = self._registry.get_buzz_inbound_principal(
             self.agent_name,
@@ -357,6 +447,7 @@ class BrokerBuzzPoller:
         self._last_error = ""
         self._last_liveness_at = 0.0
         self._last_event_at = 0.0
+        self._membership_versions: dict[str, tuple[int, int, str]] = {}
         self._processor = BuzzInboundProcessor(
             registry=registry,
             broker=broker,
@@ -454,10 +545,18 @@ class BrokerBuzzPoller:
 
     async def _run_connection(self) -> None:
         policy = self._registry.get_buzz_inbound_policy(self._agent_name)
-        if not policy or not policy["channels"] or not policy["principals"]:
+        if not policy or not policy["principals"]:
             raise BuzzRelayProtocolError("inbound_policy_default_deny")
         if policy["community_id"] != self._community_id or policy["relay_url"] != self._relay_url:
             raise BuzzRelayProtocolError("inbound_policy_identity_scope_mismatch")
+        for item in policy["channels"]:
+            self._registry.upsert_group_chat(
+                self._agent_name,
+                item["channel_id"],
+                chat_title=item["label"],
+                chat_type="channel",
+                platform="buzz",
+            )
         channels = [item["channel_id"] for item in policy["channels"]]
         connect = self._connect_factory(
             self._relay_url,
@@ -498,30 +597,67 @@ class BrokerBuzzPoller:
             raise BuzzRelayProtocolError("relay_auth_refused")
 
         await self._processor.replay_pending()
+        self._membership_versions.clear()
         since = self._registry.get_buzz_subscription_since(self._agent_name)
         main_subscription_since: dict[str, int] = {}
+        channel_subscriptions: dict[str, str] = {}
         connection_token = secrets.token_hex(8)
-        for index, channel_id in enumerate(channels):
-            main_sub = f"pinky-{self._agent_name}-{connection_token}-{index}"
-            main_subscription_since[main_sub] = since
-            await self._send_frame(
+        membership_sub = f"pinky-membership-{self._agent_name}-{connection_token}"
+        await self._send_frame(
+            ws,
+            [
+                "REQ",
+                membership_sub,
+                # Do not add kind 1059 until NIP-17 unwrap/decrypt exists. A
+                # p-gated subscription that silently discards DMs would falsely
+                # advertise working delivery. Membership is independently useful.
+                {"kinds": [44100, 44101], "#p": [self._pubkey]},
+            ],
+        )
+        await self._wait_for_eose(
+            ws,
+            subscription_ids={membership_sub},
+            timeout=self._liveness_timeout,
+            # Reconcile the stored membership history before opening any
+            # channel stream. This prevents a stale persisted allowlist row
+            # from admitting messages ahead of its stored removal event.
+            subscription_since=None,
+            membership_subscription=membership_sub,
+            channel_subscriptions=channel_subscriptions,
+            channels=channels,
+            subscription_floor=since,
+            connection_token=connection_token,
+        )
+        current_policy = self._registry.get_buzz_inbound_policy(self._agent_name)
+        if current_policy is None:
+            raise BuzzRelayProtocolError("inbound_policy_default_deny")
+        channels[:] = [item["channel_id"] for item in current_policy["channels"]]
+        for item in current_policy["channels"]:
+            self._registry.upsert_group_chat(
+                self._agent_name,
+                item["channel_id"],
+                chat_title=item["label"],
+                chat_type="channel",
+                platform="buzz",
+            )
+            await self._open_channel_subscription(
                 ws,
-                [
-                    "REQ",
-                    main_sub,
-                    # The production Buzz relay does not live-fanout events to
-                    # subscriptions carrying ``since`` or multiple ``#h``
-                    # values. Keep each live REQ open-ended and channel-local,
-                    # then enforce the shared floor in the client before any
-                    # cache, authorization gate, or durable write.
-                    {"kinds": [9, 20002], "#h": [channel_id]},
-                ],
+                item["channel_id"],
+                subscription_since=main_subscription_since,
+                channel_subscriptions=channel_subscriptions,
+                floor=since,
+                connection_token=connection_token,
             )
         await self._wait_for_eose(
             ws,
             subscription_ids=set(main_subscription_since),
             timeout=self._liveness_timeout,
             subscription_since=main_subscription_since,
+            membership_subscription=membership_sub,
+            channel_subscriptions=channel_subscriptions,
+            channels=channels,
+            subscription_floor=since,
+            connection_token=connection_token,
         )
         now = time.time()
         self._status = "connected"
@@ -546,6 +682,10 @@ class BrokerBuzzPoller:
                     ws,
                     channels,
                     main_subscription_since=main_subscription_since,
+                    membership_subscription=membership_sub,
+                    channel_subscriptions=channel_subscriptions,
+                    subscription_floor=since,
+                    connection_token=connection_token,
                 )
                 next_heartbeat = loop.time() + self._heartbeat_interval
                 await self._processor.replay_pending()
@@ -559,7 +699,43 @@ class BrokerBuzzPoller:
                 ws,
                 frame,
                 subscription_since=main_subscription_since,
+                membership_subscription=membership_sub,
+                channel_subscriptions=channel_subscriptions,
+                channels=channels,
+                subscription_floor=since,
+                connection_token=connection_token,
             )
+
+    async def _open_channel_subscription(
+        self,
+        ws,
+        channel_id: str,
+        *,
+        subscription_since: dict[str, int],
+        channel_subscriptions: dict[str, str],
+        floor: int,
+        connection_token: str,
+    ) -> bool:
+        if channel_id in channel_subscriptions:
+            return False
+        subscription_id = (
+            f"pinky-{self._agent_name}-{connection_token}-{secrets.token_hex(4)}"
+        )
+        channel_subscriptions[channel_id] = subscription_id
+        subscription_since[subscription_id] = floor
+        await self._send_frame(
+            ws,
+            [
+                "REQ",
+                subscription_id,
+                # The production Buzz relay does not live-fanout events to
+                # subscriptions carrying ``since`` or multiple ``#h`` values.
+                # Keep each live REQ open-ended and channel-local, then enforce
+                # the shared floor in the client before any durable write.
+                {"kinds": [9, 20002], "#h": [channel_id]},
+            ],
+        )
+        return True
 
     async def _active_liveness_probe(
         self,
@@ -567,35 +743,48 @@ class BrokerBuzzPoller:
         channels: list[str],
         *,
         main_subscription_since: dict[str, int],
+        membership_subscription: str,
+        channel_subscriptions: dict[str, str],
+        subscription_floor: int,
+        connection_token: str,
     ) -> None:
         heartbeat_sub = f"pinky-live-{secrets.token_hex(8)}"
         heartbeat_since = int(time.time())
+        heartbeat_filter = (
+            {"kinds": [9, 20002], "#h": channels, "since": heartbeat_since, "limit": 1}
+            if channels
+            else {
+                "kinds": [44100, 44101],
+                "#p": [self._pubkey],
+                "since": heartbeat_since,
+                "limit": 1,
+            }
+        )
         await self._send_frame(
             ws,
             [
                 "REQ",
                 heartbeat_sub,
-                {
-                    "kinds": [9, 20002],
-                    "#h": channels,
-                    "since": heartbeat_since,
-                    "limit": 1,
-                },
+                heartbeat_filter,
             ],
         )
+        main_subscription_since[heartbeat_sub] = heartbeat_since
         try:
             await self._wait_for_eose(
                 ws,
                 subscription_ids={heartbeat_sub},
                 timeout=self._liveness_timeout,
-                subscription_since={
-                    **main_subscription_since,
-                    heartbeat_sub: heartbeat_since,
-                },
+                subscription_since=main_subscription_since,
+                membership_subscription=membership_subscription,
+                channel_subscriptions=channel_subscriptions,
+                channels=channels,
+                subscription_floor=subscription_floor,
+                connection_token=connection_token,
             )
         except asyncio.TimeoutError as exc:
             raise BuzzRelayLivenessError("relay_eose_heartbeat_timed_out") from exc
         finally:
+            main_subscription_since.pop(heartbeat_sub, None)
             try:
                 await self._send_frame(ws, ["CLOSE", heartbeat_sub])
             except Exception:
@@ -615,7 +804,12 @@ class BrokerBuzzPoller:
         *,
         subscription_ids: set[str],
         timeout: float,
-        subscription_since: dict[str, int],
+        subscription_since: dict[str, int] | None,
+        membership_subscription: str,
+        channel_subscriptions: dict[str, str],
+        channels: list[str],
+        subscription_floor: int,
+        connection_token: str,
     ) -> None:
         pending_eose = set(subscription_ids)
         deadline = asyncio.get_running_loop().time() + timeout
@@ -631,6 +825,11 @@ class BrokerBuzzPoller:
                 ws,
                 frame,
                 subscription_since=subscription_since,
+                membership_subscription=membership_subscription,
+                channel_subscriptions=channel_subscriptions,
+                channels=channels,
+                subscription_floor=subscription_floor,
+                connection_token=connection_token,
             )
 
     async def _handle_frame(
@@ -639,6 +838,11 @@ class BrokerBuzzPoller:
         frame: list,
         *,
         subscription_since: dict[str, int] | None,
+        membership_subscription: str,
+        channel_subscriptions: dict[str, str],
+        channels: list[str],
+        subscription_floor: int,
+        connection_token: str,
     ) -> None:
         if not frame:
             raise BuzzRelayProtocolError("relay_frame_empty")
@@ -646,6 +850,17 @@ class BrokerBuzzPoller:
         if kind == "EVENT":
             if len(frame) != 3 or not isinstance(frame[1], str):
                 raise BuzzRelayProtocolError("relay_event_frame_invalid")
+            if frame[1] == membership_subscription:
+                await self._handle_membership_event(
+                    ws,
+                    frame[2],
+                    subscription_since=subscription_since,
+                    channel_subscriptions=channel_subscriptions,
+                    channels=channels,
+                    subscription_floor=subscription_floor,
+                    connection_token=connection_token,
+                )
+                return
             if subscription_since is not None and frame[1] not in subscription_since:
                 raise BuzzRelayProtocolError("relay_event_subscription_mismatch")
             result = await self._processor.process_event(
@@ -661,13 +876,96 @@ class BrokerBuzzPoller:
             auth_event = self._signer.sign_relay_auth(self._relay_url, frame[1])
             await self._send_frame(ws, ["AUTH", auth_event])
             return
-        if kind == "CLOSED" and (
-            subscription_since is None or (len(frame) >= 2 and frame[1] in subscription_since)
-        ):
-            raise BuzzRelayProtocolError("relay_subscription_closed")
+        if kind == "CLOSED" and len(frame) >= 2:
+            if (
+                subscription_since is None
+                or frame[1] in subscription_since
+                or frame[1] == membership_subscription
+            ):
+                raise BuzzRelayProtocolError("relay_subscription_closed")
         if kind == "NOTICE":
             raise BuzzRelayProtocolError("relay_notice")
         # OK/EOSE for another request are control frames, not inbound content.
+
+    async def _handle_membership_event(
+        self,
+        ws,
+        event: object,
+        *,
+        subscription_since: dict[str, int] | None,
+        channel_subscriptions: dict[str, str],
+        channels: list[str],
+        subscription_floor: int,
+        connection_token: str,
+    ) -> None:
+        try:
+            membership = validate_buzz_membership_event(
+                event,
+                identity_pubkey=self._pubkey,
+            )
+        except BuzzInboundRejectedError:
+            return
+        channel_id = membership.channel_id
+        event_version = (
+            membership.event["created_at"],
+            membership.event["kind"],
+            membership.event["id"],
+        )
+        previous = self._membership_versions.get(channel_id)
+        if previous is not None:
+            if event_version[0] < previous[0] or event_version[2] == previous[2]:
+                return
+            if event_version[0] == previous[0]:
+                # Nostr timestamps have one-second precision. On an ambiguous
+                # add/remove tie, removal wins so history order cannot reopen a
+                # channel after a same-second revoke.
+                if previous[1] == 44101 or event_version[1] == previous[1]:
+                    return
+        self._membership_versions[channel_id] = event_version
+        if membership.event["kind"] == 44100:
+            channel = self._registry.upsert_buzz_inbound_channel_from_membership(
+                self._agent_name,
+                self._community_id,
+                self._relay_url,
+                channel_id,
+                label=membership.chat_title,
+            )
+            self._registry.upsert_group_chat(
+                self._agent_name,
+                channel_id,
+                chat_title=channel["label"],
+                chat_type="channel",
+                platform="buzz",
+            )
+            if channel_id not in channels:
+                channels.append(channel_id)
+            if subscription_since is not None:
+                await self._open_channel_subscription(
+                    ws,
+                    channel_id,
+                    subscription_since=subscription_since,
+                    channel_subscriptions=channel_subscriptions,
+                    # A newly granted membership must not replay signed
+                    # commands from before the relay says this identity joined.
+                    floor=max(subscription_floor, membership.event["created_at"]),
+                    connection_token=connection_token,
+                )
+            return
+
+        self._registry.remove_buzz_inbound_channel_from_membership(
+            self._agent_name,
+            self._community_id,
+            self._relay_url,
+            channel_id,
+        )
+        self._registry.deactivate_group_chat(self._agent_name, channel_id)
+        if channel_id in channels:
+            channels.remove(channel_id)
+        subscription_id = channel_subscriptions.pop(channel_id, "")
+        if subscription_id:
+            if subscription_since is not None:
+                subscription_since.pop(subscription_id, None)
+            await self._send_frame(ws, ["CLOSE", subscription_id])
 
     async def _receive_frame(self, ws, *, timeout: float) -> list:
         raw = await asyncio.wait_for(ws.recv(), timeout=timeout)
@@ -728,5 +1026,7 @@ __all__ = [
     "BuzzRelayLivenessError",
     "BuzzRelayProtocolError",
     "ValidatedBuzzInboundEvent",
+    "ValidatedBuzzMembershipEvent",
     "validate_buzz_inbound_event",
+    "validate_buzz_membership_event",
 ]

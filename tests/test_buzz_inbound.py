@@ -14,6 +14,7 @@ from pinky_daemon.buzz_inbound import (
     BuzzInboundProcessor,
     BuzzInboundRejectedError,
     validate_buzz_inbound_event,
+    validate_buzz_membership_event,
 )
 from pinky_outreach.buzz import BuzzNostrSigner
 
@@ -167,10 +168,17 @@ async def test_verified_no_p_broadcast_reaches_persona_with_full_principal(regis
     formatter = object.__new__(MessageBroker)
     formatter._registry = store
     prompt = MessageBroker._format_prompt(formatter, message)
-    assert "[buzz | channel | #general" in prompt
-    assert "display_name(untrusted):Brad" in prompt
+    assert "[buzz | #general" in prompt
+    assert "display_name(untrusted+collides:Brad):Brad" in prompt
     assert f"principal:buzz:{COMMUNITY}:{USER.pubkey}" in prompt
     assert "mentioned_self:false" in prompt
+    [chat] = store.list_group_chats("barsik")
+    assert (chat["platform"], chat["chat_id"], chat["chat_title"], chat["chat_type"]) == (
+        "buzz",
+        CHANNEL,
+        "#general",
+        "channel",
+    )
 
 
 @pytest.mark.asyncio
@@ -239,6 +247,39 @@ async def test_membership_events_never_expand_channels_or_reach_persona(registry
     assert broker.calls == []
     assert store.get_buzz_inbound_policy("barsik")["channels"] == before
     assert store.get_buzz_inbound_channel("barsik", COMMUNITY, RELAY, OTHER_CHANNEL) is None
+
+
+def test_membership_validation_requires_exact_self_p_and_canonical_h(registry):
+    _store, identity_pubkey = registry
+    valid = OWNER.sign_event(
+        kind=44100,
+        tags=[["p", identity_pubkey], ["h", OTHER_CHANNEL], ["name", "#support"]],
+        content="",
+    )
+    membership = validate_buzz_membership_event(
+        valid,
+        identity_pubkey=identity_pubkey,
+    )
+    assert (membership.channel_id, membership.chat_title) == (OTHER_CHANNEL, "#support")
+
+    foreign = OWNER.sign_event(
+        kind=44100,
+        tags=[["p", STRANGER.pubkey], ["h", OTHER_CHANNEL]],
+        content="",
+    )
+    duplicate = OWNER.sign_event(
+        kind=44100,
+        tags=[
+            ["p", identity_pubkey],
+            ["p", identity_pubkey],
+            ["h", OTHER_CHANNEL],
+        ],
+        content="",
+    )
+    with pytest.raises(BuzzInboundRejectedError, match="membership_target_invalid"):
+        validate_buzz_membership_event(foreign, identity_pubkey=identity_pubkey)
+    with pytest.raises(BuzzInboundRejectedError, match="membership_target_invalid"):
+        validate_buzz_membership_event(duplicate, identity_pubkey=identity_pubkey)
 
 
 @pytest.mark.asyncio
