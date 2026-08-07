@@ -2490,6 +2490,209 @@ class TestScheduler:
         stderr = capsys.readouterr().err
         assert "PERSISTED_WAKE_MAX_ATTEMPTS_EXCEEDED" in stderr
 
+    # ── UTF-8 Encoding Regression Tests (issue #420) ────────────────────────
+
+    @pytest.mark.asyncio
+    async def test_persisted_wake_utf8_emoji_no_redelivery(self, registry):
+        """Verify emoji prompts fire exactly once without redelivery (#420).
+
+        Ensures UTF-8 multibyte characters (emoji 📊) are persisted and
+        replayed without triggering Unicode normalization mismatches that
+        cause redelivery loops.
+        """
+        registry.register("segugio")
+        prompt_with_emoji = "📊 Dashboard Report — SEO metrics"
+        schedule = registry.add_schedule(
+            "segugio",
+            "* * * * *",
+            name="emoji_test",
+            prompt=prompt_with_emoji,
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        delivery_count = [0]
+        confirmed_count = [0]
+
+        async def emoji_callback(
+            agent_name, session_id, prompt, *, schedule_receipt=None
+        ):
+            # Track delivery count
+            delivery_count[0] += 1
+            # Verify prompt integrity through round-trip
+            assert "📊" in prompt, f"Emoji lost in transit: {prompt!r}"
+            assert "Dashboard Report" in prompt
+            # Confirm receipt on first delivery only
+            if delivery_count[0] == 1 and schedule_receipt:
+                confirmed_count[0] += 1
+                return schedule_receipt.accept()
+            return False
+
+        scheduler = AgentScheduler(
+            registry, wake_callback=emoji_callback, schedule_delivery_timeout=1.0
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        # Should deliver exactly once
+        assert delivery_count[0] == 1, f"Emoji prompt delivered {delivery_count[0]} times"
+        assert confirmed_count[0] == 1, "Emoji receipt not confirmed"
+
+        # Verify wake is marked delivered in DB
+        pending = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending) == 0, f"Emoji wake still pending: {pending}"
+
+    @pytest.mark.asyncio
+    async def test_persisted_wake_utf8_accents_no_redelivery(self, registry):
+        """Verify accented Unicode prompts fire exactly once without redelivery.
+
+        Tests characters like: À/á, ñ, ü, é, ç (French/Spanish accents).
+        Ensures NFC normalization handles combining diacritics correctly.
+        """
+        registry.register("segugio")
+        prompt_with_accents = "Café résumé Zürich naïve français español"
+        schedule = registry.add_schedule(
+            "segugio",
+            "* * * * *",
+            name="accents_test",
+            prompt=prompt_with_accents,
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        delivery_count = [0]
+        confirmed_count = [0]
+
+        async def accents_callback(
+            agent_name, session_id, prompt, *, schedule_receipt=None
+        ):
+            delivery_count[0] += 1
+            # Verify accents preserved
+            assert "Café" in prompt, f"Accents lost: {prompt!r}"
+            assert "Zürich" in prompt
+            assert "naïve" in prompt
+            if delivery_count[0] == 1 and schedule_receipt:
+                confirmed_count[0] += 1
+                return schedule_receipt.accept()
+            return False
+
+        scheduler = AgentScheduler(
+            registry, wake_callback=accents_callback, schedule_delivery_timeout=1.0
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        assert delivery_count[0] == 1, f"Accents prompt delivered {delivery_count[0]} times"
+        assert confirmed_count[0] == 1, "Accents receipt not confirmed"
+
+        pending = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending) == 0, f"Accents wake still pending: {pending}"
+
+    @pytest.mark.asyncio
+    async def test_persisted_wake_utf8_em_dash_no_redelivery(self, registry):
+        """Verify em-dash (—) prompts fire exactly once without redelivery (#420).
+
+        The em-dash (U+2014 — not hyphen-minus) is a known case from #420.
+        Ensures this specific multibyte character doesn't trigger loops.
+        """
+        registry.register("segugio")
+        prompt_with_emdash = "SEO Report — Analysis of keyword rankings and traffic"
+        schedule = registry.add_schedule(
+            "segugio",
+            "* * * * *",
+            name="emdash_test",
+            prompt=prompt_with_emdash,
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        delivery_count = [0]
+        confirmed_count = [0]
+
+        async def emdash_callback(
+            agent_name, session_id, prompt, *, schedule_receipt=None
+        ):
+            delivery_count[0] += 1
+            # Verify em-dash preserved (not replaced with hyphen)
+            assert "—" in prompt, f"Em-dash lost: {prompt!r}"
+            assert "SEO Report" in prompt
+            if delivery_count[0] == 1 and schedule_receipt:
+                confirmed_count[0] += 1
+                return schedule_receipt.accept()
+            return False
+
+        scheduler = AgentScheduler(
+            registry, wake_callback=emdash_callback, schedule_delivery_timeout=1.0
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        assert delivery_count[0] == 1, f"Em-dash prompt delivered {delivery_count[0]} times"
+        assert confirmed_count[0] == 1, "Em-dash receipt not confirmed"
+
+        pending = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending) == 0, f"Em-dash wake still pending: {pending}"
+
+    @pytest.mark.asyncio
+    async def test_persisted_wake_mixed_utf8_survive_replay(self, registry):
+        """Verify mixed UTF-8 content survives persist→replay cycle.
+
+        Combines emoji, accents, and em-dashes in one prompt.
+        Simulates daemon restart and verifies the wake is NOT replayed.
+        """
+        registry.register("segugio")
+        mixed_prompt = "📊 Café — Q4 résumé naïve français"
+        schedule = registry.add_schedule(
+            "segugio",
+            "* * * * *",
+            name="mixed_utf8_test",
+            prompt=mixed_prompt,
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+
+        delivery_count = [0]
+
+        async def mixed_callback(agent_name, session_id, prompt, *, schedule_receipt=None):
+            delivery_count[0] += 1
+            # Verify all UTF-8 content
+            assert "📊" in prompt and "Café" in prompt
+            assert "résumé" in prompt and "—" in prompt
+            if delivery_count[0] == 1 and schedule_receipt:
+                return schedule_receipt.accept()
+            return False
+
+        # First scheduler run
+        scheduler1 = AgentScheduler(
+            registry, wake_callback=mixed_callback, schedule_delivery_timeout=1.0
+        )
+        await scheduler1._deliver_schedule(schedule)
+        first_delivery = delivery_count[0]
+        assert first_delivery == 1, "Mixed UTF-8 not delivered on first run"
+
+        # Verify wake is confirmed (receipt persisted)
+        ledger = registry.list_schedule_wake_ledger("segugio", state="receipted-ran-once")
+        assert len(ledger) == 1, "Mixed UTF-8 receipt not persisted to ledger"
+
+        # Simulate daemon restart: create new scheduler, check no replay
+        # (since receipt is already persisted in DB)
+        scheduler2 = AgentScheduler(
+            registry, wake_callback=mixed_callback, schedule_delivery_timeout=1.0
+        )
+
+        # Directly call the replay logic under lock
+        await scheduler2._replay_pending_locked("segugio")
+
+        # Should NOT replay (receipt already persisted)
+        assert delivery_count[0] == 1, (
+            f"Mixed UTF-8 replayed {delivery_count[0] - first_delivery} times "
+            "after restart (should be 0)"
+        )
+
+        pending = registry.list_pending_schedule_wakes("segugio")
+        assert len(pending) == 0, f"Mixed UTF-8 wake still pending: {pending}"
+
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────
 
