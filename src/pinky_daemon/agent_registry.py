@@ -32,6 +32,7 @@ import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID
 
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
@@ -45,6 +46,37 @@ from pinky_daemon.effort import is_ultracode
 # the same guarantee the API layer enforces, and so CodeQL's taint analysis
 # sees an explicit sanitizer at the source-of-path-construction.
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+_BUZZ_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+BUZZ_OWNER_SILENCE_DAYS = 14
+BUZZ_INBOUND_CLAIM_LEASE_SECONDS = 5 * 60
+
+
+def _validate_buzz_pubkey(value: str, *, field_name: str = "pubkey") -> str:
+    pubkey = str(value or "")
+    if not _BUZZ_HEX_64_RE.fullmatch(pubkey):
+        raise ValueError(f"Buzz {field_name} must be exactly 64 lowercase hex characters")
+    return pubkey
+
+
+def _validate_buzz_channel_id(value: str) -> str:
+    try:
+        canonical = str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Buzz channel_id must be a UUID") from exc
+    if canonical != str(value):
+        raise ValueError("Buzz channel_id must be a canonical lowercase UUID")
+    return canonical
+
+
+def _validate_buzz_annotation(value: str, *, field_name: str, limit: int) -> str:
+    annotation = str(value or "").strip()
+    if len(annotation) > limit or any(
+        ord(ch) < 32 or ord(ch) == 127 for ch in annotation
+    ):
+        raise ValueError(
+            f"Buzz {field_name} must be at most {limit} printable characters"
+        )
+    return annotation
 
 
 def _validate_agent_name(name: str) -> str:
@@ -1586,6 +1618,76 @@ class AgentRegistry:
                     )
                 )
             );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_policies (
+                agent TEXT PRIMARY KEY NOT NULL,
+                community_id TEXT NOT NULL,
+                relay_url TEXT NOT NULL,
+                owner_pubkey TEXT NOT NULL
+                    CHECK(length(owner_pubkey)=64 AND owner_pubkey=lower(owner_pubkey)
+                          AND owner_pubkey NOT GLOB '*[^0-9a-f]*'),
+                owner_configured_at REAL NOT NULL,
+                owner_last_seen_at REAL NOT NULL DEFAULT 0,
+                owner_silence_notified_at REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'configured',
+                last_connect_at REAL NOT NULL DEFAULT 0,
+                last_liveness_at REAL NOT NULL DEFAULT 0,
+                last_event_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_by TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (agent) REFERENCES buzz_identities(agent) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_channels (
+                agent TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                relay_url TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent) REFERENCES buzz_inbound_policies(agent) ON DELETE CASCADE,
+                PRIMARY KEY (agent, community_id, channel_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_principals (
+                agent TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                pubkey TEXT NOT NULL
+                    CHECK(length(pubkey)=64 AND pubkey=lower(pubkey)
+                          AND pubkey NOT GLOB '*[^0-9a-f]*'),
+                role TEXT NOT NULL CHECK(role IN ('owner', 'approved')),
+                display_name TEXT NOT NULL DEFAULT '',
+                approved_by TEXT NOT NULL,
+                approved_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY (agent) REFERENCES buzz_inbound_policies(agent) ON DELETE CASCADE,
+                PRIMARY KEY (agent, community_id, pubkey)
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_events (
+                agent TEXT NOT NULL,
+                event_id TEXT NOT NULL
+                    CHECK(length(event_id)=64 AND event_id=lower(event_id)
+                          AND event_id NOT GLOB '*[^0-9a-f]*'),
+                community_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                author_pubkey TEXT NOT NULL,
+                kind INTEGER NOT NULL CHECK(kind=9),
+                event_created_at REAL NOT NULL,
+                event_json TEXT NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(delivery_status IN ('pending', 'delivered')),
+                claimed_at REAL NOT NULL DEFAULT 0,
+                delivered_at REAL NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (agent) REFERENCES buzz_inbound_policies(agent) ON DELETE CASCADE,
+                PRIMARY KEY (agent, event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_buzz_inbound_events_pending
+                ON buzz_inbound_events(agent, delivery_status, event_created_at);
         """)
         self._db.commit()
         self._migrate()
@@ -2760,6 +2862,7 @@ except Exception as exc:
         community_id: str,
         enabled: bool,
         owner_actor: str,
+        _commit: bool = True,
     ) -> dict:
         """Bind one identity from the authenticated owner-control route only.
 
@@ -2891,7 +2994,8 @@ except Exception as exc:
                             now,
                         ),
                     )
-                self._db.commit()
+                if _commit:
+                    self._db.commit()
             except sqlite3.IntegrityError as exc:
                 self._db.rollback()
                 raise ValueError("Buzz identity conflicts with an existing binding") from exc
@@ -2991,6 +3095,504 @@ except Exception as exc:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    # ── Buzz inbound authorization + durable delivery (#541 inc2) ─────
+
+    def configure_buzz_inbound_owner_control(
+        self,
+        agent_name: str,
+        *,
+        owner_pubkey: str,
+        channels: list[dict],
+        approved_users: list[dict],
+        owner_actor: str,
+        _commit: bool = True,
+    ) -> dict:
+        """Atomically replace one identity-scoped, default-deny inbound policy."""
+        from pinky_daemon.buzz_identity import validate_buzz_owner_actor
+
+        actor = validate_buzz_owner_actor(owner_actor)
+        owner = _validate_buzz_pubkey(owner_pubkey, field_name="owner_pubkey")
+        identity = self._db.execute(
+            "SELECT pubkey, relay_url, community_id FROM buzz_identities WHERE agent=?",
+            (agent_name,),
+        ).fetchone()
+        if not identity:
+            raise KeyError(f"Buzz identity not found for agent: {agent_name}")
+        if owner == identity[0]:
+            raise ValueError("Buzz owner_pubkey must not equal the agent identity pubkey")
+        if not channels:
+            raise ValueError("Buzz inbound channel allowlist must not be empty")
+        if len(channels) > 128 or len(approved_users) > 256:
+            raise ValueError("Buzz inbound policy exceeds configured bounds")
+
+        clean_channels: list[tuple[str, str]] = []
+        channel_ids: set[str] = set()
+        for item in channels:
+            channel = _validate_buzz_channel_id(item.get("channel_id", ""))
+            if channel in channel_ids:
+                raise ValueError("Buzz channel allowlist contains a duplicate channel_id")
+            channel_ids.add(channel)
+            label = _validate_buzz_annotation(
+                item.get("label", ""), field_name="channel label", limit=80
+            )
+            clean_channels.append((channel, label))
+
+        clean_users: list[tuple[str, str]] = []
+        user_pubkeys: set[str] = {owner}
+        for item in approved_users:
+            pubkey = _validate_buzz_pubkey(item.get("pubkey", ""))
+            if pubkey in user_pubkeys:
+                raise ValueError("Buzz approved principals contain a duplicate pubkey")
+            if pubkey == identity[0]:
+                raise ValueError("Buzz approved principal must not equal the agent identity")
+            user_pubkeys.add(pubkey)
+            display = _validate_buzz_annotation(
+                item.get("display_name", ""), field_name="display_name", limit=120
+            )
+            clean_users.append((pubkey, display))
+
+        relay_url = identity[1]
+        community_id = identity[2]
+        now = time.time()
+        with self._rmw_lock:
+            prior_policy = self._db.execute(
+                "SELECT owner_pubkey, owner_configured_at, owner_last_seen_at, "
+                "owner_silence_notified_at FROM buzz_inbound_policies WHERE agent=?",
+                (agent_name,),
+            ).fetchone()
+            prior_seen = {
+                row[0]: float(row[1])
+                for row in self._db.execute(
+                    "SELECT pubkey, last_seen_at FROM buzz_inbound_principals WHERE agent=?",
+                    (agent_name,),
+                ).fetchall()
+            }
+            same_owner = bool(prior_policy and prior_policy[0] == owner)
+            configured_at = float(prior_policy[1]) if same_owner else now
+            owner_seen = float(prior_policy[2]) if same_owner else 0.0
+            silence_notified = float(prior_policy[3]) if same_owner else 0.0
+            try:
+                self._db.execute(
+                    """INSERT INTO buzz_inbound_policies
+                       (agent, community_id, relay_url, owner_pubkey,
+                        owner_configured_at, owner_last_seen_at,
+                        owner_silence_notified_at, status, last_connect_at,
+                        last_liveness_at, last_event_at, last_error,
+                        updated_by, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'configured', 0, 0, 0, '', ?, ?)
+                       ON CONFLICT(agent) DO UPDATE SET
+                         community_id=excluded.community_id,
+                         relay_url=excluded.relay_url,
+                         owner_pubkey=excluded.owner_pubkey,
+                         owner_configured_at=excluded.owner_configured_at,
+                         owner_last_seen_at=excluded.owner_last_seen_at,
+                         owner_silence_notified_at=excluded.owner_silence_notified_at,
+                         status='configured', last_error='',
+                         updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
+                    (
+                        agent_name,
+                        community_id,
+                        relay_url,
+                        owner,
+                        configured_at,
+                        owner_seen,
+                        silence_notified,
+                        actor,
+                        now,
+                    ),
+                )
+                self._db.execute("DELETE FROM buzz_inbound_channels WHERE agent=?", (agent_name,))
+                self._db.execute("DELETE FROM buzz_inbound_principals WHERE agent=?", (agent_name,))
+                self._db.executemany(
+                    """INSERT INTO buzz_inbound_channels
+                       (agent, community_id, relay_url, channel_id, label, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        (agent_name, community_id, relay_url, channel, label, now)
+                        for channel, label in clean_channels
+                    ],
+                )
+                principals = [(owner, "owner", "")] + [
+                    (pubkey, "approved", display) for pubkey, display in clean_users
+                ]
+                self._db.executemany(
+                    """INSERT INTO buzz_inbound_principals
+                       (agent, community_id, pubkey, role, display_name,
+                        approved_by, approved_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            agent_name,
+                            community_id,
+                            pubkey,
+                            role,
+                            display,
+                            actor,
+                            now,
+                            prior_seen.get(pubkey, 0.0),
+                        )
+                        for pubkey, role, display in principals
+                    ],
+                )
+                # A policy replacement is an authorization-boundary change.
+                # Pending events whose channel or author was revoked must not
+                # become deliverable if that authority is added back later.
+                revoked_pending = [
+                    (agent_name, row[0])
+                    for row in self._db.execute(
+                        """SELECT event_id, channel_id, author_pubkey
+                           FROM buzz_inbound_events
+                           WHERE agent=? AND delivery_status='pending'""",
+                        (agent_name,),
+                    ).fetchall()
+                    if row[1] not in channel_ids or row[2] not in user_pubkeys
+                ]
+                self._db.executemany(
+                    "DELETE FROM buzz_inbound_events WHERE agent=? AND event_id=?",
+                    revoked_pending,
+                )
+                if _commit:
+                    self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        policy = self.get_buzz_inbound_policy(agent_name)
+        if policy is None:  # pragma: no cover - defensive after successful transaction
+            raise RuntimeError("Buzz inbound policy write did not persist")
+        return policy
+
+    def bind_buzz_identity_with_inbound_owner_control(
+        self,
+        agent_name: str,
+        *,
+        private_key: str,
+        relay_url: str,
+        community_id: str,
+        enabled: bool,
+        owner_pubkey: str,
+        channels: list[dict],
+        approved_users: list[dict],
+        owner_actor: str,
+    ) -> tuple[dict, dict]:
+        """Atomically bind an identity and its complete inbound policy."""
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                identity = self.bind_buzz_identity_owner_control(
+                    agent_name,
+                    private_key=private_key,
+                    relay_url=relay_url,
+                    community_id=community_id,
+                    enabled=enabled,
+                    owner_actor=owner_actor,
+                    _commit=False,
+                )
+                policy = self.configure_buzz_inbound_owner_control(
+                    agent_name,
+                    owner_pubkey=owner_pubkey,
+                    channels=channels,
+                    approved_users=approved_users,
+                    owner_actor=owner_actor,
+                    _commit=False,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return identity, policy
+
+    def get_buzz_inbound_policy(self, agent_name: str) -> dict | None:
+        row = self._db.execute(
+            """SELECT agent, community_id, relay_url, owner_pubkey,
+                      owner_configured_at, owner_last_seen_at,
+                      owner_silence_notified_at, status, last_connect_at,
+                      last_liveness_at, last_event_at, last_error,
+                      updated_by, updated_at
+               FROM buzz_inbound_policies WHERE agent=?""",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        channels = [
+            {"channel_id": item[0], "label": item[1]}
+            for item in self._db.execute(
+                "SELECT channel_id, label FROM buzz_inbound_channels "
+                "WHERE agent=? AND community_id=? AND relay_url=? ORDER BY channel_id",
+                (agent_name, row[1], row[2]),
+            ).fetchall()
+        ]
+        principal_rows = self._db.execute(
+            """SELECT pubkey, role, display_name, approved_by, approved_at, last_seen_at
+               FROM buzz_inbound_principals
+               WHERE agent=? AND community_id=? ORDER BY role DESC, pubkey""",
+            (agent_name, row[1]),
+        ).fetchall()
+        principals = [
+            {
+                "principal": f"buzz:{row[1]}:{item[0]}",
+                "pubkey": item[0],
+                "role": item[1],
+                "display_name": item[2],
+                "approved_by": item[3],
+                "approved_at": item[4],
+                "last_seen_at": item[5],
+            }
+            for item in principal_rows
+        ]
+        return {
+            "agent": row[0],
+            "community_id": row[1],
+            "relay_url": row[2],
+            "owner_pubkey": row[3],
+            "owner_principal": f"buzz:{row[1]}:{row[3]}",
+            "owner_configured_at": row[4],
+            "owner_last_seen_at": row[5],
+            "owner_silence_notified_at": row[6],
+            "owner_silence_days": BUZZ_OWNER_SILENCE_DAYS,
+            "channels": channels,
+            "approved_users": [item for item in principals if item["role"] == "approved"],
+            "principals": principals,
+            "status": row[7],
+            "last_connect_at": row[8],
+            "last_liveness_at": row[9],
+            "last_event_at": row[10],
+            "last_error": row[11],
+            "updated_by": row[12],
+            "updated_at": row[13],
+        }
+
+    def get_buzz_inbound_channel(
+        self, agent_name: str, community_id: str, relay_url: str, channel_id: str
+    ) -> dict | None:
+        row = self._db.execute(
+            """SELECT channel_id, label FROM buzz_inbound_channels
+               WHERE agent=? AND community_id=? AND relay_url=? AND channel_id=?""",
+            (agent_name, community_id, relay_url, channel_id),
+        ).fetchone()
+        return {"channel_id": row[0], "label": row[1]} if row else None
+
+    def get_buzz_inbound_principal(
+        self, agent_name: str, community_id: str, pubkey: str
+    ) -> dict | None:
+        row = self._db.execute(
+            """SELECT pubkey, role, display_name, approved_by, approved_at, last_seen_at
+               FROM buzz_inbound_principals
+               WHERE agent=? AND community_id=? AND pubkey=?""",
+            (agent_name, community_id, pubkey),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "principal": f"buzz:{community_id}:{row[0]}",
+            "pubkey": row[0],
+            "role": row[1],
+            "display_name": row[2],
+            "approved_by": row[3],
+            "approved_at": row[4],
+            "last_seen_at": row[5],
+        }
+
+    def note_buzz_inbound_principal_seen(
+        self, agent_name: str, community_id: str, pubkey: str, seen_at: float
+    ) -> None:
+        with self._rmw_lock:
+            self._db.execute(
+                """UPDATE buzz_inbound_principals
+                   SET last_seen_at=MAX(last_seen_at, ?)
+                   WHERE agent=? AND community_id=? AND pubkey=?""",
+                (seen_at, agent_name, community_id, pubkey),
+            )
+            self._db.execute(
+                """UPDATE buzz_inbound_policies
+                   SET owner_last_seen_at=MAX(owner_last_seen_at, ?),
+                       owner_silence_notified_at=0
+                   WHERE agent=? AND community_id=? AND owner_pubkey=?""",
+                (seen_at, agent_name, community_id, pubkey),
+            )
+            self._db.commit()
+
+    def buzz_owner_silence_alert_due(
+        self, agent_name: str, *, now: float | None = None
+    ) -> dict | None:
+        row = self._db.execute(
+            """SELECT community_id, owner_pubkey, owner_configured_at,
+                      owner_last_seen_at, owner_silence_notified_at
+               FROM buzz_inbound_policies WHERE agent=?""",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        current = time.time() if now is None else float(now)
+        basis = float(row[3] or row[2])
+        if basis <= 0 or current - basis < BUZZ_OWNER_SILENCE_DAYS * 86400:
+            return None
+        if float(row[4]) >= basis:
+            return None
+        return {
+            "agent": agent_name,
+            "community_id": row[0],
+            "owner_principal": f"buzz:{row[0]}:{row[1]}",
+            "last_seen_at": float(row[3]),
+            "configured_at": float(row[2]),
+            "days": BUZZ_OWNER_SILENCE_DAYS,
+        }
+
+    def mark_buzz_owner_silence_notified(
+        self, agent_name: str, *, notified_at: float | None = None
+    ) -> None:
+        self._db.execute(
+            "UPDATE buzz_inbound_policies SET owner_silence_notified_at=? WHERE agent=?",
+            (time.time() if notified_at is None else float(notified_at), agent_name),
+        )
+        self._db.commit()
+
+    def begin_buzz_inbound_event_delivery(
+        self,
+        agent_name: str,
+        event: dict,
+        *,
+        community_id: str,
+        channel_id: str,
+        replay: bool = False,
+    ) -> bool:
+        """Claim one verified durable kind-9; ephemeral events never enter this table."""
+        if event.get("kind") != 9:
+            raise ValueError("only durable Buzz kind-9 events may be claimed")
+        event_id = _validate_buzz_pubkey(event.get("id", ""), field_name="event id")
+        author = _validate_buzz_pubkey(event.get("pubkey", ""))
+        payload = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        now = time.time()
+        with self._rmw_lock:
+            row = self._db.execute(
+                "SELECT delivery_status, claimed_at FROM buzz_inbound_events "
+                "WHERE agent=? AND event_id=?",
+                (agent_name, event_id),
+            ).fetchone()
+            if row:
+                if row[0] == "delivered" or not replay:
+                    return False
+                cursor = self._db.execute(
+                    """UPDATE buzz_inbound_events
+                       SET claimed_at=?, attempts=attempts+1, last_error=''
+                       WHERE agent=? AND event_id=? AND delivery_status='pending'
+                         AND (claimed_at=0 OR claimed_at<=?)""",
+                    (
+                        now,
+                        agent_name,
+                        event_id,
+                        now - BUZZ_INBOUND_CLAIM_LEASE_SECONDS,
+                    ),
+                )
+                self._db.commit()
+                return cursor.rowcount > 0
+            else:
+                self._db.execute(
+                    """INSERT INTO buzz_inbound_events
+                       (agent, event_id, community_id, channel_id, author_pubkey,
+                        kind, event_created_at, event_json, delivery_status,
+                        claimed_at, delivered_at, attempts, last_error)
+                       VALUES (?, ?, ?, ?, ?, 9, ?, ?, 'pending', ?, 0, 1, '')""",
+                    (
+                        agent_name,
+                        event_id,
+                        community_id,
+                        channel_id,
+                        author,
+                        float(event["created_at"]),
+                        payload,
+                        now,
+                    ),
+                )
+            self._db.commit()
+        return True
+
+    def list_pending_buzz_inbound_events(self, agent_name: str) -> list[dict]:
+        stale_before = time.time() - BUZZ_INBOUND_CLAIM_LEASE_SECONDS
+        rows = self._db.execute(
+            """SELECT event_json FROM buzz_inbound_events
+               WHERE agent=? AND delivery_status='pending'
+                 AND (claimed_at=0 OR claimed_at<=?)
+               ORDER BY event_created_at, event_id""",
+            (agent_name, stale_before),
+        ).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            try:
+                event = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(event, dict):
+                result.append(event)
+        return result
+
+    def reset_buzz_inbound_event_claims_after_restart(self) -> int:
+        """Release claims whose owning daemon process can no longer exist."""
+        cursor = self._db.execute(
+            """UPDATE buzz_inbound_events SET claimed_at=0
+               WHERE delivery_status='pending' AND claimed_at!=0"""
+        )
+        self._db.commit()
+        return cursor.rowcount
+
+    def mark_buzz_inbound_event_delivered(self, agent_name: str, event_id: str) -> None:
+        now = time.time()
+        self._db.execute(
+            """UPDATE buzz_inbound_events
+               SET delivery_status='delivered', delivered_at=?, last_error='', event_json=''
+               WHERE agent=? AND event_id=? AND delivery_status='pending'""",
+            (now, agent_name, event_id),
+        )
+        self._db.commit()
+
+    def mark_buzz_inbound_event_retry(self, agent_name: str, event_id: str, reason: str) -> None:
+        self._db.execute(
+            """UPDATE buzz_inbound_events SET claimed_at=0, last_error=?
+               WHERE agent=? AND event_id=? AND delivery_status='pending'""",
+            (str(reason or "delivery_failed")[:160], agent_name, event_id),
+        )
+        self._db.commit()
+
+    def get_buzz_subscription_since(self, agent_name: str, *, now: float | None = None) -> int:
+        row = self._db.execute(
+            "SELECT MAX(event_created_at) FROM buzz_inbound_events WHERE agent=?",
+            (agent_name,),
+        ).fetchone()
+        if row and row[0]:
+            return max(0, int(float(row[0])) - 2)
+        current = time.time() if now is None else float(now)
+        return max(0, int(current) - 60)
+
+    def update_buzz_inbound_health(
+        self,
+        agent_name: str,
+        *,
+        status: str,
+        last_error: str = "",
+        connected_at: float | None = None,
+        liveness_at: float | None = None,
+        event_at: float | None = None,
+    ) -> None:
+        connected = float(connected_at) if connected_at is not None else None
+        liveness = float(liveness_at) if liveness_at is not None else None
+        event = float(event_at) if event_at is not None else None
+        self._db.execute(
+            """UPDATE buzz_inbound_policies
+               SET status=?, last_error=?,
+                   last_connect_at=COALESCE(MAX(last_connect_at, ?), last_connect_at),
+                   last_liveness_at=COALESCE(MAX(last_liveness_at, ?), last_liveness_at),
+                   last_event_at=COALESCE(MAX(last_event_at, ?), last_event_at)
+               WHERE agent=?""",
+            (
+                str(status or "unknown")[:40],
+                str(last_error or "")[:160],
+                connected,
+                liveness,
+                event,
+                agent_name,
+            ),
+        )
+        self._db.commit()
 
     def list(self, *, parent: str = "", group: str = "", enabled_only: bool = False,
              include_retired: bool = False) -> list[Agent]:

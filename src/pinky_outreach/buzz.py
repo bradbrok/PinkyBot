@@ -126,7 +126,7 @@ def verify_nostr_event(event: dict) -> bool:
         return False
 
 
-class _NostrSigner:
+class BuzzNostrSigner:
     """Small signing helper whose repr never contains the private scalar."""
 
     def __init__(self, private_key: bytes) -> None:
@@ -139,7 +139,7 @@ class _NostrSigner:
         self.pubkey = self._key.public_key_xonly.format().hex()
 
     def __repr__(self) -> str:
-        return f"_NostrSigner(pubkey={self.pubkey!r}, private_key=<redacted>)"
+        return f"BuzzNostrSigner(pubkey={self.pubkey!r}, private_key=<redacted>)"
 
     def sign_event(
         self,
@@ -168,6 +168,22 @@ class _NostrSigner:
             "content": content,
             "sig": self._key.sign_schnorr(bytes.fromhex(event_id)).hex(),
         }
+
+    def sign_relay_auth(self, relay_url: str, challenge: str) -> dict:
+        """Sign a NIP-42 transport-auth event; it is never channel-published."""
+        relay, _ = _validate_relay_url(relay_url)
+        if (
+            not isinstance(challenge, str)
+            or not challenge
+            or len(challenge) > 512
+            or any(ord(ch) < 32 or ord(ch) == 127 for ch in challenge)
+        ):
+            raise BuzzProtocolError("Buzz relay AUTH challenge is invalid")
+        return self.sign_event(
+            kind=22242,
+            tags=[["relay", relay], ["challenge", challenge]],
+            content="",
+        )
 
 
 def _validate_channel_id(channel_id: str) -> str:
@@ -209,7 +225,7 @@ class BuzzAdapter:
         timeout: float = 20.0,
         transport: httpx.BaseTransport | None = None,
     ) -> None:
-        self._signer = _NostrSigner(private_key)
+        self._signer = BuzzNostrSigner(private_key)
         self.relay_url, self._http_base = _validate_relay_url(relay_url)
         community = str(community_id or "").lower()
         if not _COMMUNITY_RE.fullmatch(community):
@@ -407,6 +423,7 @@ class BuzzAdapter:
 __all__ = [
     "BuzzAdapter",
     "BuzzError",
+    "BuzzNostrSigner",
     "BuzzProtocolError",
     "BuzzTransportError",
     "MentionNormalization",
