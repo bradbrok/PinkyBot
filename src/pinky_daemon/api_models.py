@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -17,6 +18,7 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 # alerts on PR #510 that surfaced agent_registry.py's path construction.
 # Lowercase + digits + underscore + hyphen, starts with [a-z0-9], 1-63 chars.
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+_BUZZ_PUBKEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # ── Session Models ───────────────────────────────────────────
 
@@ -568,6 +570,92 @@ class SetAgentTokenRequest(BaseModel):
     settings: dict = Field(default_factory=dict)
 
 
+class BuzzInboundChannelRequest(BaseModel):
+    """One exact Buzz channel admitted to an agent's persona session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str
+    label: str = ""
+
+    @field_validator("channel_id")
+    @classmethod
+    def validate_channel_id(cls, value: str) -> str:
+        try:
+            canonical = str(UUID(str(value)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Buzz channel_id must be a UUID") from exc
+        if canonical != str(value):
+            raise ValueError("Buzz channel_id must be a canonical lowercase UUID")
+        return canonical
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        label = str(value or "").strip()
+        if len(label) > 80 or any(ord(ch) < 32 or ord(ch) == 127 for ch in label):
+            raise ValueError("Buzz channel label must be at most 80 printable characters")
+        return label
+
+
+class BuzzApprovedPrincipalRequest(BaseModel):
+    """One out-of-band approved Buzz author for one community."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pubkey: str
+    display_name: str = ""
+
+    @field_validator("pubkey")
+    @classmethod
+    def validate_pubkey(cls, value: str) -> str:
+        pubkey = str(value or "")
+        if not _BUZZ_PUBKEY_RE.fullmatch(pubkey):
+            raise ValueError("Buzz pubkey must be exactly 64 lowercase hex characters")
+        return pubkey
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str) -> str:
+        display = str(value or "").strip()
+        if len(display) > 120 or any(ord(ch) < 32 or ord(ch) == 127 for ch in display):
+            raise ValueError("Buzz display_name must be at most 120 printable characters")
+        return display
+
+
+class ConfigureBuzzInboundRequest(BaseModel):
+    """Owner-only default-deny Buzz persona-routing policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_pubkey: str
+    channels: list[BuzzInboundChannelRequest] = Field(min_length=1, max_length=128)
+    approved_users: list[BuzzApprovedPrincipalRequest] = Field(
+        default_factory=list,
+        max_length=256,
+    )
+
+    @field_validator("owner_pubkey")
+    @classmethod
+    def validate_owner_pubkey(cls, value: str) -> str:
+        pubkey = str(value or "")
+        if not _BUZZ_PUBKEY_RE.fullmatch(pubkey):
+            raise ValueError("Buzz owner_pubkey must be exactly 64 lowercase hex characters")
+        return pubkey
+
+    @model_validator(mode="after")
+    def validate_uniqueness(self):
+        channel_ids = [item.channel_id for item in self.channels]
+        if len(channel_ids) != len(set(channel_ids)):
+            raise ValueError("Buzz channel allowlist contains a duplicate channel_id")
+        pubkeys = [item.pubkey for item in self.approved_users]
+        if self.owner_pubkey in pubkeys:
+            raise ValueError("Buzz owner_pubkey must not be repeated in approved_users")
+        if len(pubkeys) != len(set(pubkeys)):
+            raise ValueError("Buzz approved_users contains a duplicate pubkey")
+        return self
+
+
 class BindBuzzIdentityRequest(BaseModel):
     """Owner-control request to bind one encrypted Buzz identity."""
 
@@ -577,6 +665,7 @@ class BindBuzzIdentityRequest(BaseModel):
     relay_url: str
     community_id: str
     enabled: bool = True
+    inbound: ConfigureBuzzInboundRequest | None = None
 
 
 class AddMcpServerRequest(BaseModel):

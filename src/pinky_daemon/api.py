@@ -63,6 +63,7 @@ from pinky_daemon.api_models import (
     AuthSetupRequest,
     BindBuzzIdentityRequest,
     CloneWorkerRequest,
+    ConfigureBuzzInboundRequest,
     ContainerizeRequest,
     ContextResponse,
     ConversationListResponse,
@@ -7612,6 +7613,55 @@ npm run build</pre>
 
     # ── Buzz identity owner control (#541 inc1) ────────────
 
+    app.state.buzz_poller_tasks = set()
+
+    async def _restart_buzz_poller(name: str) -> bool:
+        """Apply one identity's current owner policy without restarting the daemon."""
+        from pinky_daemon.buzz_inbound import BrokerBuzzPoller
+
+        for poller in list(_broker_pollers):
+            if isinstance(poller, BrokerBuzzPoller) and poller.agent_name == name:
+                poller.stop()
+                _broker_pollers.remove(poller)
+        identity = agents.get_buzz_identity(name)
+        policy = agents.get_buzz_inbound_policy(name)
+        if (
+            not identity
+            or not identity["enabled"]
+            or identity["status"] != "active"
+            or not policy
+            or not policy["channels"]
+            or not policy["principals"]
+        ):
+            return False
+        material = agents.get_buzz_signing_material(name)
+        if material is None:
+            return False
+        poller = BrokerBuzzPoller(
+            material,
+            broker,
+            agents,
+            _notify_owner_undelivered,
+        )
+        _broker_pollers.append(poller)
+        task = asyncio.create_task(poller.start())
+        app.state.buzz_poller_tasks.add(task)
+
+        def _release_buzz_task(done: asyncio.Task) -> None:
+            app.state.buzz_poller_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                exc = done.exception()
+            except Exception:
+                return
+            if exc is not None:
+                _log(f"api: Buzz poller task failed for {name} ({type(exc).__name__})")
+
+        task.add_done_callback(_release_buzz_task)
+        _log(f"api: native Buzz inbound poller started for {name}")
+        return True
+
     @app.get("/system/buzz-identities")
     async def list_buzz_identities(request: Request):
         """List redacted Buzz identities for the authenticated owner."""
@@ -7645,12 +7695,24 @@ npm run build</pre>
                 enabled=req.enabled,
                 owner_actor=actor,
             )
+            inbound_policy = None
+            if req.inbound is not None:
+                inbound_policy = agents.configure_buzz_inbound_owner_control(
+                    name,
+                    owner_pubkey=req.inbound.owner_pubkey,
+                    channels=[item.model_dump() for item in req.inbound.channels],
+                    approved_users=[
+                        item.model_dump() for item in req.inbound.approved_users
+                    ],
+                    owner_actor=actor,
+                )
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:
             status = 409 if "rotation" in str(exc) or "conflicts" in str(exc) else 400
             raise HTTPException(status, str(exc)) from exc
         _evict_platform_adapters(name, "buzz")
+        await _restart_buzz_poller(name)
         audit.log(
             "buzz_identity_bound",
             agent_name=name,
@@ -7666,7 +7728,56 @@ npm run build</pre>
                 separators=(",", ":"),
             ),
         )
+        if inbound_policy is not None:
+            return {**identity, "inbound": inbound_policy}
         return identity
+
+    @app.get("/system/buzz-identities/{name}/inbound")
+    async def get_buzz_inbound_policy(name: str, request: Request):
+        """Read the exact community-scoped inbound authorization policy."""
+        _owner_control_actor(request)
+        policy = agents.get_buzz_inbound_policy(name)
+        if policy is None:
+            raise HTTPException(404, "Buzz inbound policy not configured")
+        return policy
+
+    @app.put("/system/buzz-identities/{name}/inbound")
+    async def configure_buzz_inbound_policy(
+        name: str,
+        req: ConfigureBuzzInboundRequest,
+        request: Request,
+    ):
+        """Owner-control replace of both load-bearing Buzz inbound gates."""
+        actor = _owner_control_actor(request)
+        try:
+            policy = agents.configure_buzz_inbound_owner_control(
+                name,
+                owner_pubkey=req.owner_pubkey,
+                channels=[item.model_dump() for item in req.channels],
+                approved_users=[item.model_dump() for item in req.approved_users],
+                owner_actor=actor,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        started = await _restart_buzz_poller(name)
+        audit.log(
+            "buzz_inbound_policy_configured",
+            agent_name=name,
+            tool_name="owner_control",
+            tool_input_summary=json.dumps(
+                {
+                    "agent": name,
+                    "community_id": policy["community_id"],
+                    "channel_count": len(policy["channels"]),
+                    "approved_principal_count": len(policy["principals"]),
+                    "actor": actor,
+                },
+                separators=(",", ":"),
+            ),
+        )
+        return {**policy, "poller_started": started}
 
     @app.post("/system/buzz-identities/{name}/disable")
     async def disable_buzz_identity(name: str, request: Request):
@@ -7675,6 +7786,7 @@ npm run build</pre>
         if not agents.disable_buzz_identity(name):
             raise HTTPException(404, "Buzz identity not found")
         _evict_platform_adapters(name, "buzz")
+        await _restart_buzz_poller(name)
         audit.log(
             "buzz_identity_disabled",
             agent_name=name,
@@ -11339,6 +11451,12 @@ npm run build</pre>
                 "startup: Buzz platform registration REFUSED for "
                 f"{app.state.buzz_registration['refused']} identity(s)"
             )
+        released_buzz_claims = agents.reset_buzz_inbound_event_claims_after_restart()
+        if released_buzz_claims:
+            _log(
+                f"startup: released {released_buzz_claims} interrupted Buzz "
+                "inbound delivery claim(s)"
+            )
 
         # Start shared MCP server BEFORE agent sessions so SSE URLs are ready
         if SHARED_MCP_ENABLED:
@@ -11552,6 +11670,18 @@ npm run build</pre>
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
 
+            # Buzz poller — native NIP-42 relay subscription. The helper is
+            # default-deny unless the encrypted identity AND both inbound
+            # authorization-gate tables are fully configured.
+            try:
+                if await _restart_buzz_poller(agent.name):
+                    _log(f"startup: Buzz inbound poller started for {agent.name}")
+            except Exception as e:
+                _log(
+                    f"startup: Buzz inbound poller refused for {agent.name}: "
+                    f"{type(e).__name__}"
+                )
+
             # iMessage poller — check if agent has imessage enabled in DB
             if agents.get_raw_token(agent.name, "imessage"):
                 try:
@@ -11720,6 +11850,11 @@ npm run build</pre>
         for poller in _broker_pollers:
             poller.stop()
         _broker_pollers.clear()
+        for task in list(app.state.buzz_poller_tasks):
+            task.cancel()
+        if app.state.buzz_poller_tasks:
+            await asyncio.gather(*app.state.buzz_poller_tasks, return_exceptions=True)
+        app.state.buzz_poller_tasks.clear()
         await autonomy.stop()
         await scheduler.stop()
         await watchdog.stop()
@@ -12804,9 +12939,37 @@ npm run build</pre>
             agent_name,
         )
         approval_backlog_health = agents.get_approval_backlog_health(agent_name)
+        buzz_poller = next(
+            (
+                poller
+                for poller in _broker_pollers
+                if getattr(poller, "agent_name", "") == agent_name
+                and getattr(poller, "health", {}).get("platform") == "buzz"
+            ),
+            None,
+        )
+        buzz_policy = agents.get_buzz_inbound_policy(agent_name)
+        buzz_identity = (
+            agents.get_buzz_identity(agent_name) if buzz_policy is not None else None
+        )
+        buzz_health = None
+        if buzz_poller is not None:
+            buzz_health = {**buzz_poller.health, "enabled": True}
+        elif buzz_policy is not None:
+            buzz_health = {
+                "platform": "buzz",
+                "agent": agent_name,
+                "enabled": bool(buzz_identity and buzz_identity["enabled"]),
+                "status": buzz_policy["status"],
+                "running": False,
+                "last_error": buzz_policy["last_error"],
+                "last_liveness_at": buzz_policy["last_liveness_at"],
+                "last_event_at": buzz_policy["last_event_at"],
+            }
         checks = {
             "approval_notifications": approval_notification_health,
             "approval_backlog": approval_backlog_health,
+            "buzz_inbound": buzz_health,
         }
 
         return {
@@ -12844,6 +13007,7 @@ npm run build</pre>
             issues.append("high_error_rate")
         approval_check = (checks or {}).get("approval_notifications", {})
         backlog_check = (checks or {}).get("approval_backlog", {})
+        buzz_check = (checks or {}).get("buzz_inbound") or {}
         if approval_check.get("failed"):
             issues.append("owner_notification_failed")
         elif approval_check.get("retrying"):
@@ -12854,6 +13018,10 @@ npm run build</pre>
             issues.append("approved_principal_blocked")
         elif backlog_check.get("pending_chats"):
             issues.append("approval_pending")
+        if buzz_check and buzz_check.get("enabled", True) and (
+            not buzz_check.get("running") or buzz_check.get("status") != "connected"
+        ):
+            issues.append("buzz_inbound_unhealthy")
 
         if not issues:
             return "healthy"

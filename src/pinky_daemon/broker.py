@@ -1371,7 +1371,7 @@ class MessageBroker:
 
     async def dispatch_pre_authorized(
         self, agent_name: str, message: BrokerMessage,
-    ) -> None:
+    ) -> bool:
         """Dispatch a message whose sender is already authorized upstream.
 
         Bypasses the human-platform onboarding flow that ``handle_inbound``
@@ -1394,7 +1394,7 @@ class MessageBroker:
         platforms (sender/preview formatting). If a future caller wants
         broker-side activity logs, expose that as a separate flag.
         """
-        await self._route_streaming(agent_name, message)
+        return await self._route_streaming(agent_name, message)
 
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
@@ -1417,7 +1417,18 @@ class MessageBroker:
             f" | thread_root_ts:{message.reply_to} | is_thread_reply:true"
             if message.reply_to else ""
         )
-        if message.is_group:
+        buzz_principal = message.metadata.get("buzz_verified_principal", "")
+        if message.platform == "buzz" and buzz_principal:
+            alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
+            display = alias or message.chat_title or message.chat_id
+            mentioned = "true" if message.metadata.get("buzz_mentioned_self") is True else "false"
+            header = (
+                f"[buzz | channel | {display} | "
+                f"display_name(untrusted):{message.sender_name} | "
+                f"principal:{buzz_principal} | mentioned_self:{mentioned} | "
+                f"{message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            )
+        elif message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
             header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
