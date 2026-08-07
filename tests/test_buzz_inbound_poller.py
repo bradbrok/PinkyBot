@@ -16,6 +16,8 @@ from pinky_outreach.buzz import BuzzNostrSigner, verify_nostr_event
 AGENT_KEY = "11" * 32
 OWNER = BuzzNostrSigner(bytes.fromhex("33" * 32))
 USER = BuzzNostrSigner(bytes.fromhex("44" * 32))
+STRANGER = BuzzNostrSigner(bytes.fromhex("55" * 32))
+RELAY_AUTHORITY = BuzzNostrSigner(bytes.fromhex("66" * 32))
 CHANNEL = "00000000-0000-4000-8000-000000000001"
 OTHER_CHANNEL = "00000000-0000-4000-8000-000000000002"
 COMMUNITY = "example"
@@ -43,6 +45,7 @@ def _registry(tmp_path, relay_url: str, *, channels: list[dict] | None = None):
         private_key=AGENT_KEY,
         relay_url=relay_url,
         community_id=COMMUNITY,
+        relay_signing_pubkey=RELAY_AUTHORITY.pubkey,
         enabled=True,
         owner_actor="ui:admin",
     )
@@ -89,6 +92,7 @@ class LiveFanoutQuirkRelayRig:
         self.hold_final_eose = hold_final_eose
         self.captured: list[list] = []
         self.main_requests: list[list] = []
+        self.membership_request: list | None = None
         self.main_requests_received = asyncio.Event()
         self.partial_eose_sent = asyncio.Event()
         self.release_final_eose = asyncio.Event()
@@ -103,6 +107,11 @@ class LiveFanoutQuirkRelayRig:
 
     async def handler(self, ws) -> None:  # noqa: ANN001
         await _authenticate(ws, self.relay_url, self.captured)
+        membership = json.loads(await ws.recv())
+        self.captured.append(membership)
+        assert membership[0] == "REQ"
+        self.membership_request = membership
+        await ws.send(json.dumps(["EOSE", membership[1]]))
         for _ in self.channels:
             main = json.loads(await ws.recv())
             self.captured.append(main)
@@ -168,6 +177,9 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
 
     async def handler(ws):  # noqa: ANN001
         await _authenticate(ws, relay_url, captured)
+        membership = json.loads(await ws.recv())
+        captured.append(membership)
+        await ws.send(json.dumps(["EOSE", membership[1]]))
         main = json.loads(await ws.recv())
         captured.append(main)
         assert main[0] == "REQ"
@@ -181,7 +193,7 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
             except websockets.ConnectionClosed:
                 return
             captured.append(frame)
-            if frame[0] == "REQ":
+            if frame[0] == "REQ" and frame[1].startswith("pinky-live-"):
                 heartbeat_seen.set()
                 await ws.send(json.dumps(["EOSE", frame[1]]))
 
@@ -216,6 +228,14 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
         assert initial_filter["kinds"] == [9, 20002]
         assert initial_filter["#h"] == [CHANNEL]
         assert "since" not in initial_filter
+        membership_filters = [
+            frame[2]
+            for frame in captured
+            if frame[0] == "REQ" and frame[1].startswith("pinky-membership-")
+        ]
+        assert membership_filters == [
+            {"kinds": [44100, 44101], "#p": [material.pubkey]}
+        ]
         assert len(broker.calls) == 1
         assert broker.calls[0][1].content == "hello from Brad"
         assert poller.health["delivered"] == 1
@@ -250,6 +270,8 @@ async def test_socket_open_without_eose_heartbeat_pages_owner_and_reconnects(tmp
         nonlocal connections
         connections += 1
         await _authenticate(ws, relay_url, [])
+        membership = json.loads(await ws.recv())
+        await ws.send(json.dumps(["EOSE", membership[1]]))
         main = json.loads(await ws.recv())
         await ws.send(json.dumps(["EOSE", main[1]]))
         # Keep the TCP/WebSocket open but intentionally never answer the next
@@ -301,6 +323,9 @@ async def test_control_frame_trickle_cannot_starve_periodic_eose_probe(tmp_path)
 
     async def handler(ws):  # noqa: ANN001
         await _authenticate(ws, relay_url, captured)
+        membership = json.loads(await ws.recv())
+        captured.append(membership)
+        await ws.send(json.dumps(["EOSE", membership[1]]))
         main = json.loads(await ws.recv())
         captured.append(main)
         await ws.send(json.dumps(["EOSE", main[1]]))
@@ -372,6 +397,8 @@ async def test_wire_subscription_omits_since_but_client_floor_rejects_stale_even
 
     async def handler(ws):  # noqa: ANN001
         await _authenticate(ws, relay_url, [])
+        membership = json.loads(await ws.recv())
+        await ws.send(json.dumps(["EOSE", membership[1]]))
         main = json.loads(await ws.recv())
         subscription_filter.update(main[2])
         stale = USER.sign_event(
@@ -589,6 +616,11 @@ async def test_live_fanout_uses_one_req_per_channel_and_waits_for_every_eose(tmp
         }
         assert all(frame[2]["kinds"] == [9, 20002] for frame in rig.main_requests)
         assert all("since" not in frame[2] for frame in rig.main_requests)
+        assert rig.membership_request is not None
+        assert rig.membership_request[2] == {
+            "kinds": [44100, 44101],
+            "#p": [store.get_buzz_identity("barsik")["pubkey"]],
+        }
 
         rig.release_final_eose.set()
         await asyncio.wait_for(rig.all_eose_sent.wait(), timeout=2)
@@ -622,6 +654,242 @@ async def test_live_fanout_uses_one_req_per_channel_and_waits_for_every_eose(tmp
 
 
 @pytest.mark.asyncio
+async def test_membership_add_opens_channel_live_and_remove_closes_it(tmp_path):
+    relay_url = ""
+    agent_pubkey = BuzzNostrSigner(bytes.fromhex(AGENT_KEY)).pubkey
+    added = RELAY_AUTHORITY.sign_event(
+        kind=44100,
+        tags=[["p", agent_pubkey], ["h", OTHER_CHANNEL], ["name", "#support"]],
+        content="",
+    )
+    removed = RELAY_AUTHORITY.sign_event(
+        kind=44101,
+        tags=[["p", agent_pubkey], ["h", OTHER_CHANNEL]],
+        content="",
+    )
+    channel_message = USER.sign_event(
+        kind=9,
+        tags=[["h", OTHER_CHANNEL]],
+        content="live after membership add",
+    )
+    pre_membership_message = USER.sign_event(
+        kind=9,
+        tags=[["h", OTHER_CHANNEL]],
+        content="stale before membership add",
+        created_at=added["created_at"] - 1,
+    )
+    dynamic_opened = asyncio.Event()
+    release_remove = asyncio.Event()
+    dynamic_closed = asyncio.Event()
+    captured: list[list] = []
+
+    async def handler(ws):  # noqa: ANN001
+        await _authenticate(ws, relay_url, captured)
+        membership = json.loads(await ws.recv())
+        captured.append(membership)
+        await ws.send(json.dumps(["EOSE", membership[1]]))
+        initial = json.loads(await ws.recv())
+        captured.append(initial)
+        await ws.send(json.dumps(["EOSE", initial[1]]))
+        await ws.send(json.dumps(["EVENT", membership[1], added]))
+
+        dynamic = json.loads(await ws.recv())
+        captured.append(dynamic)
+        assert dynamic[0] == "REQ"
+        assert dynamic[2] == {"kinds": [9, 20002], "#h": [OTHER_CHANNEL]}
+        dynamic_opened.set()
+        await ws.send(json.dumps(["EOSE", dynamic[1]]))
+        await ws.send(json.dumps(["EVENT", dynamic[1], pre_membership_message]))
+        await ws.send(json.dumps(["EVENT", dynamic[1], channel_message]))
+
+        await release_remove.wait()
+        await ws.send(json.dumps(["EVENT", membership[1], removed]))
+        close = json.loads(await ws.recv())
+        captured.append(close)
+        assert close == ["CLOSE", dynamic[1]]
+        dynamic_closed.set()
+        try:
+            while True:
+                frame = json.loads(await ws.recv())
+                captured.append(frame)
+                if frame[0] == "REQ":
+                    await ws.send(json.dumps(["EOSE", frame[1]]))
+        except websockets.ConnectionClosed:
+            return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        relay_url = f"ws://127.0.0.1:{port}"
+        store = _registry(tmp_path, relay_url)
+        broker = FakeBroker()
+
+        async def notify(_agent, _message):
+            return True
+
+        poller = BrokerBuzzPoller(
+            store.get_buzz_signing_material("barsik"),
+            broker,
+            store,
+            notify,
+            heartbeat_interval=10,
+            liveness_timeout=1,
+        )
+        task = asyncio.create_task(poller.start())
+        await asyncio.wait_for(dynamic_opened.wait(), timeout=2)
+        await asyncio.wait_for(broker.delivered.wait(), timeout=2)
+
+        channel = store.get_buzz_inbound_channel(
+            "barsik", COMMUNITY, relay_url, OTHER_CHANNEL
+        )
+        assert channel == {"channel_id": OTHER_CHANNEL, "label": "#support"}
+        support = next(
+            chat for chat in store.list_group_chats("barsik")
+            if chat["chat_id"] == OTHER_CHANNEL
+        )
+        assert (support["platform"], support["chat_title"], support["active"]) == (
+            "buzz",
+            "#support",
+            True,
+        )
+        assert [call[1].content for call in broker.calls] == ["live after membership add"]
+        assert poller.health["rejected"] == 1
+
+        release_remove.set()
+        await asyncio.wait_for(dynamic_closed.wait(), timeout=2)
+        assert store.get_buzz_inbound_channel(
+            "barsik", COMMUNITY, relay_url, OTHER_CHANNEL
+        ) is None
+        support = next(
+            chat for chat in store.list_group_chats("barsik", active_only=False)
+            if chat["chat_id"] == OTHER_CHANNEL
+        )
+        assert support["active"] is False
+
+        poller.stop()
+        await asyncio.wait_for(task, timeout=2)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_membership_history_newest_removal_cannot_be_reopened_by_older_add(tmp_path):
+    relay_url = "ws://127.0.0.1:1"
+    store = _registry(tmp_path, relay_url)
+    material = store.get_buzz_signing_material("barsik")
+    poller = BrokerBuzzPoller(material, FakeBroker(), store, lambda *_args: True)
+    now = int(time.time())
+    removed = RELAY_AUTHORITY.sign_event(
+        kind=44101,
+        tags=[["p", material.pubkey], ["h", OTHER_CHANNEL]],
+        content="",
+        created_at=now - 5,
+    )
+    older_add = RELAY_AUTHORITY.sign_event(
+        kind=44100,
+        tags=[["p", material.pubkey], ["h", OTHER_CHANNEL]],
+        content="",
+        created_at=now - 10,
+    )
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):  # noqa: ANN001
+            self.sent.append(json.loads(payload))
+
+    ws = FakeSocket()
+    subscription_since: dict[str, int] = {}
+    channel_subscriptions: dict[str, str] = {}
+    channels = [CHANNEL]
+    kwargs = {
+        "subscription_since": subscription_since,
+        "channel_subscriptions": channel_subscriptions,
+        "channels": channels,
+        "subscription_floor": now - 60,
+        "connection_token": "test",
+    }
+    await poller._handle_membership_event(ws, removed, **kwargs)
+    await poller._handle_membership_event(ws, older_add, **kwargs)
+
+    assert store.get_buzz_inbound_channel(
+        "barsik", COMMUNITY, relay_url, OTHER_CHANNEL
+    ) is None
+    assert OTHER_CHANNEL not in channels
+    assert channel_subscriptions == {}
+    assert ws.sent == []
+    store.close()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("stored_pin", "signer", "expected_log"),
+    [
+        ("", RELAY_AUTHORITY, "membership processing disabled"),
+        (RELAY_AUTHORITY.pubkey, STRANGER, "rejected membership event"),
+    ],
+    ids=["absent-pin", "stranger-55-scalar"],
+)
+async def test_membership_authority_failures_are_inert_and_loud(
+    tmp_path,
+    capsys,
+    stored_pin,
+    signer,
+    expected_log,
+):
+    relay_url = "ws://127.0.0.1:1"
+    store = _registry(tmp_path, relay_url)
+    if not stored_pin:
+        store._db.execute(
+            "UPDATE buzz_identities SET relay_signing_pubkey='' WHERE agent='barsik'"
+        )
+        store._db.commit()
+    material = store.get_buzz_signing_material("barsik")
+    poller = BrokerBuzzPoller(material, FakeBroker(), store, lambda *_args: True)
+    forged = signer.sign_event(
+        kind=44100,
+        tags=[["p", material.pubkey], ["h", OTHER_CHANNEL], ["name", "#forged"]],
+        content="",
+    )
+
+    class FakeSocket:
+        def __init__(self):
+            self.sent = []
+
+        async def send(self, payload):  # noqa: ANN001
+            self.sent.append(json.loads(payload))
+
+    ws = FakeSocket()
+    channels = [CHANNEL]
+    channel_subscriptions: dict[str, str] = {}
+    await poller._handle_membership_event(
+        ws,
+        forged,
+        subscription_since={},
+        channel_subscriptions=channel_subscriptions,
+        channels=channels,
+        subscription_floor=int(time.time()) - 60,
+        connection_token="test",
+    )
+
+    assert store.get_buzz_inbound_channel(
+        "barsik", COMMUNITY, relay_url, OTHER_CHANNEL
+    ) is None
+    assert all(
+        chat["chat_id"] != OTHER_CHANNEL
+        for chat in store.list_group_chats("barsik", active_only=False)
+    )
+    assert channels == [CHANNEL]
+    assert channel_subscriptions == {}
+    assert poller._membership_versions == {}
+    assert ws.sent == []
+    captured = capsys.readouterr().err
+    assert expected_log in captured
+    if stored_pin:
+        assert f"{signer.pubkey[:12]}…" in captured
+    store.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_replays_overlap_but_dedupes_delivered_event(tmp_path):
     relay_url = ""
     connection_number = 0
@@ -633,6 +901,8 @@ async def test_restart_replays_overlap_but_dedupes_delivered_event(tmp_path):
         connection_number += 1
         this_connection = connection_number
         await _authenticate(ws, relay_url, [])
+        membership = json.loads(await ws.recv())
+        await ws.send(json.dumps(["EOSE", membership[1]]))
         main = json.loads(await ws.recv())
         await ws.send(json.dumps(["EVENT", main[1], first]))
         if this_connection >= 2:

@@ -33,6 +33,7 @@ from typing import Any, Literal
 from fastapi import (
     FastAPI,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
@@ -7693,6 +7694,7 @@ npm run build</pre>
                     private_key=req.private_key,
                     relay_url=req.relay_url,
                     community_id=req.community_id,
+                    relay_signing_pubkey=req.relay_signing_pubkey,
                     enabled=req.enabled,
                     owner_pubkey=req.inbound.owner_pubkey,
                     channels=[item.model_dump() for item in req.inbound.channels],
@@ -7705,6 +7707,7 @@ npm run build</pre>
                     private_key=req.private_key,
                     relay_url=req.relay_url,
                     community_id=req.community_id,
+                    relay_signing_pubkey=req.relay_signing_pubkey,
                     enabled=req.enabled,
                     owner_actor=actor,
                 )
@@ -8492,6 +8495,44 @@ npm run build</pre>
         if not agents.deactivate_group_chat(name, chat_id):
             raise HTTPException(404, "Group chat not found")
         return {"deactivated": True, "chat_id": chat_id}
+
+    # ── Verified Contacts ──────────────────────────────────
+
+    @app.get("/agents/{name}/verified-contacts")
+    async def list_verified_contacts(name: str):
+        """List explicit principal-to-name trust decisions for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        contacts = agents.list_verified_contacts(name)
+        return {"agent": name, "verified_contacts": contacts, "count": len(contacts)}
+
+    @app.put("/agents/{name}/verified-contacts")
+    async def upsert_verified_contact(
+        name: str,
+        platform: str,
+        principal: str,
+        contact_name: str = Query(..., alias="name"),
+        role: str = "",
+    ):
+        """Upsert one explicit verified contact."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        try:
+            contact = agents.upsert_verified_contact(
+                name, platform, principal, contact_name, role
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"updated": True, "verified_contact": contact}
+
+    @app.delete("/agents/{name}/verified-contacts")
+    async def delete_verified_contact(name: str, platform: str, principal: str):
+        """Delete one explicit verified contact."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if not agents.delete_verified_contact(name, platform, principal):
+            raise HTTPException(404, "Verified contact not found")
+        return {"deleted": True, "platform": platform, "principal": principal}
 
     # ── Channel → Session Assignment ──────────────────────
 

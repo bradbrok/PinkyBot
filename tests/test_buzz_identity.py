@@ -17,9 +17,14 @@ from pinky_daemon.buzz_identity import (
     wrap_buzz_private_key,
 )
 from pinky_identity.keystore import DeviceKey
+from pinky_outreach.buzz import BuzzNostrSigner
 
 PRIVATE_KEY = "11" * 32
 OTHER_PRIVATE_KEY = "22" * 32
+RELAY_SIGNING_PUBKEY = BuzzNostrSigner(bytes.fromhex("66" * 32)).pubkey
+PRODUCTION_RELAY_SIGNING_PUBKEY = (
+    "12f6870117eff1a6318bd38c82a65d51dd19879b7489f57247114d0ee8a96de3"
+)
 
 
 @pytest.fixture
@@ -38,6 +43,7 @@ def _bind(registry: AgentRegistry, **overrides) -> dict:
         "private_key": PRIVATE_KEY,
         "relay_url": "wss://example.communities.buzz.xyz",
         "community_id": "example",
+        "relay_signing_pubkey": RELAY_SIGNING_PUBKEY,
         "enabled": True,
         "owner_actor": "ui:admin",
     }
@@ -65,6 +71,7 @@ def test_private_key_is_encrypted_and_absent_from_public_surfaces(registry, tmp_
     assert "idx_buzz_identities_approval_ref" in unique_indexes
     assert "idx_buzz_identities_tos_receipt" in unique_indexes
     assert public["tos_approved"] is True
+    assert public["relay_signing_pubkey"] == RELAY_SIGNING_PUBKEY
 
     row = registry._db.execute(
         "SELECT nonce, ciphertext, tos_receipt FROM buzz_identities WHERE agent='barsik'"
@@ -85,6 +92,7 @@ def test_private_key_is_encrypted_and_absent_from_public_surfaces(registry, tmp_
 
     material = registry.get_buzz_signing_material("barsik")
     assert material.private_key == bytes.fromhex(PRIVATE_KEY)
+    assert material.relay_signing_pubkey == RELAY_SIGNING_PUBKEY
     assert PRIVATE_KEY not in repr(material)
 
 
@@ -192,6 +200,13 @@ def test_identity_rotation_is_not_implicit(registry):
         _bind(registry, private_key=OTHER_PRIVATE_KEY)
 
 
+def test_relay_signing_authority_rotation_is_not_implicit(registry):
+    _bind(registry)
+    replacement = BuzzNostrSigner(bytes.fromhex("77" * 32)).pubkey
+    with pytest.raises(ValueError, match="relay signing authority rotation"):
+        _bind(registry, relay_signing_pubkey=replacement)
+
+
 def test_one_approval_reference_cannot_be_reused_for_a_second_identity(registry, tmp_path):
     _bind(registry)
     registry.register("murzik", model="sonnet", working_dir=str(tmp_path / "murzik"))
@@ -260,6 +275,7 @@ def test_legacy_buzz_table_gets_all_forward_columns(tmp_path):
             "ciphertext",
             "relay_url",
             "community_id",
+            "relay_signing_pubkey",
             "enabled",
             "status",
             "last_error",
@@ -272,3 +288,42 @@ def test_legacy_buzz_table_gets_all_forward_columns(tmp_path):
         } <= columns
     finally:
         registry.close()
+
+
+def test_existing_barsik_identity_migration_seeds_verified_relay_authority(tmp_path):
+    db_path = tmp_path / "agents.db"
+    registry = AgentRegistry(
+        str(db_path),
+        buzz_device_key_path=str(tmp_path / "identity" / ".device_key"),
+    )
+    registry.register("barsik", model="sonnet", working_dir=str(tmp_path / "barsik"))
+    _bind(registry)
+    registry.close()
+
+    with sqlite3.connect(db_path) as db:
+        db.execute("ALTER TABLE buzz_identities DROP COLUMN relay_signing_pubkey")
+
+    migrated = AgentRegistry(
+        str(db_path),
+        buzz_device_key_path=str(tmp_path / "identity" / ".device_key"),
+    )
+    try:
+        assert (
+            migrated.get_buzz_identity("barsik")["relay_signing_pubkey"]
+            == PRODUCTION_RELAY_SIGNING_PUBKEY
+        )
+    finally:
+        migrated.close()
+
+    with sqlite3.connect(db_path) as db:
+        db.execute(
+            "UPDATE buzz_identities SET relay_signing_pubkey='' WHERE agent='barsik'"
+        )
+    reopened = AgentRegistry(
+        str(db_path),
+        buzz_device_key_path=str(tmp_path / "identity" / ".device_key"),
+    )
+    try:
+        assert reopened.get_buzz_identity("barsik")["relay_signing_pubkey"] == ""
+    finally:
+        reopened.close()

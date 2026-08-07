@@ -25,6 +25,7 @@ OTHER_PRIVATE_KEY = "22" * 32
 CHANNEL = "00000000-0000-4000-8000-000000000001"
 OWNER_PUBKEY = BuzzNostrSigner(bytes.fromhex("33" * 32)).pubkey
 APPROVED_PUBKEY = BuzzNostrSigner(bytes.fromhex("44" * 32)).pubkey
+RELAY_SIGNING_PUBKEY = BuzzNostrSigner(bytes.fromhex("66" * 32)).pubkey
 
 
 @pytest.fixture(autouse=True)
@@ -38,6 +39,7 @@ def _body(**overrides):
         "private_key": PRIVATE_KEY,
         "relay_url": "wss://example.communities.buzz.xyz",
         "community_id": "example",
+        "relay_signing_pubkey": RELAY_SIGNING_PUBKEY,
         "enabled": True,
     }
     body.update(overrides)
@@ -80,6 +82,7 @@ def test_owner_bind_generates_identity_scoped_authority_and_redacts_it(tmp_path)
         identity = response.json()
         assert identity["enabled"] is True
         assert identity["status"] == "active"
+        assert identity["relay_signing_pubkey"] == RELAY_SIGNING_PUBKEY
         assert identity["tos_approved_by"] == "ui:admin"
         assert identity["tos_approved_at"] > 0
         assert re.fullmatch(
@@ -126,6 +129,7 @@ def test_arbitrary_or_caller_supplied_authority_cannot_enable(tmp_path):
             "private_key",
             "relay_url",
             "community_id",
+            "relay_signing_pubkey",
             "enabled",
             "inbound",
         }
@@ -363,6 +367,7 @@ def test_daemon_restart_resumes_configured_native_buzz_poller(tmp_path, monkeypa
         private_key=PRIVATE_KEY,
         relay_url="wss://example.communities.buzz.xyz",
         community_id="example",
+        relay_signing_pubkey=RELAY_SIGNING_PUBKEY,
         enabled=True,
         owner_actor="ui:admin",
     )
@@ -510,6 +515,7 @@ def test_startup_refuses_enabled_identity_when_buzz_dependency_is_missing(tmp_pa
         private_key=PRIVATE_KEY,
         relay_url="wss://example.communities.buzz.xyz",
         community_id="example",
+        relay_signing_pubkey=RELAY_SIGNING_PUBKEY,
         enabled=True,
         owner_actor="ui:admin",
     )

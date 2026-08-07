@@ -10,6 +10,12 @@ from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.sessions import SessionManager
 
+BRAD_BUZZ_PRINCIPAL = (
+    "buzz:posspecialists:"
+    "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b"
+)
+BUZZ_CHANNEL = "00000000-0000-4000-8000-000000000001"
+
 
 class TestMessageBrokerRouting:
     def _make_broker(self):
@@ -121,6 +127,188 @@ class TestMessageBrokerRouting:
             assert header == (
                 "[slack | group | C123 | Alex | C123 | "
                 "1970-01-01 00:00:00 UTC | msg_id:1711584000.000100]"
+            )
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_known_contact_uses_registry_name_role_and_fingerprint(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            prompt = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="attacker-controlled name",
+                    sender_id=BRAD_BUZZ_PRINCIPAL,
+                    content="hello",
+                    agent_name="barsik",
+                    message_id="ab" * 32,
+                    timestamp=0,
+                    is_group=True,
+                    metadata={
+                        "buzz_verified_principal": BRAD_BUZZ_PRINCIPAL,
+                        "buzz_mentioned_self": False,
+                    },
+                )
+            )
+            assert prompt.splitlines()[0] == (
+                f"[buzz | #general | from:Brad (owner) principal:90425c785cf2… | "
+                f"mentioned_self:false | chat_id:{BUZZ_CHANNEL} | "
+                f"1970-01-01 00:00:00 UTC | msg_id:{'ab' * 32}]"
+            )
+            assert "display_name" not in prompt.splitlines()[0]
+            assert BRAD_BUZZ_PRINCIPAL not in prompt.splitlines()[0]
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_unknown_contact_keeps_untrusted_name_and_full_principal(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            principal = f"buzz:posspecialists:{'aa' * 32}"
+            header = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="Somebody",
+                    sender_id=principal,
+                    content="hello",
+                    agent_name="barsik",
+                    timestamp=0,
+                    is_group=True,
+                    metadata={"buzz_verified_principal": principal},
+                )
+            ).splitlines()[0]
+            assert header == (
+                f"[buzz | #general | display_name(untrusted):Somebody | "
+                f"principal:{principal} | mentioned_self:false | "
+                f"chat_id:{BUZZ_CHANNEL} | 1970-01-01 00:00:00 UTC]"
+            )
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_unknown_contact_flags_registered_name_collision(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            principal = f"buzz:posspecialists:{'bb' * 32}"
+            header = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="bRaD",
+                    sender_id=principal,
+                    content="hello",
+                    agent_name="barsik",
+                    timestamp=0,
+                    is_group=True,
+                    metadata={"buzz_verified_principal": principal},
+                )
+            ).splitlines()[0]
+            assert "display_name(untrusted+collides:Brad):bRaD" in header
+            assert f"principal:{principal}" in header
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_absent_verified_contacts_table_falls_back_without_exception(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            registry._db.execute("DROP TABLE verified_contacts")
+            registry._db.commit()
+            principal = f"buzz:posspecialists:{'cc' * 32}"
+            header = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="Somebody",
+                    sender_id=principal,
+                    content="hello",
+                    agent_name="barsik",
+                    timestamp=0,
+                    is_group=True,
+                    metadata={"buzz_verified_principal": principal},
+                )
+            ).splitlines()[0]
+            assert "display_name(untrusted):Somebody" in header
+            assert f"principal:{principal}" in header
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_channel_id_is_rendered_exactly_once_with_or_without_alias(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            registry.upsert_group_chat(
+                "barsik", BUZZ_CHANNEL, chat_type="channel", platform="buzz"
+            )
+            principal = f"buzz:posspecialists:{'dd' * 32}"
+            message = BrokerMessage(
+                platform="buzz",
+                chat_id=BUZZ_CHANNEL,
+                sender_name="Somebody",
+                sender_id=principal,
+                content="hello",
+                agent_name="barsik",
+                timestamp=0,
+                is_group=True,
+                metadata={"buzz_verified_principal": principal},
+            )
+            raw_header = broker._format_prompt(message).splitlines()[0]
+            assert raw_header.startswith(f"[buzz | {BUZZ_CHANNEL} |")
+            assert raw_header.count(BUZZ_CHANNEL) == 1
+
+            assert registry.update_group_chat_alias("barsik", BUZZ_CHANNEL, "#general")
+            named_header = broker._format_prompt(message).splitlines()[0]
+            assert named_header.startswith("[buzz | #general |")
+            assert named_header.count(BUZZ_CHANNEL) == 1
+            assert f"chat_id:{BUZZ_CHANNEL}" in named_header
+        finally:
+            tmpdir.cleanup()
+
+    def test_non_buzz_group_and_dm_headers_remain_byte_identical(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            group = broker._format_prompt(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="-100123",
+                    chat_title="Ops",
+                    sender_name="Alex",
+                    sender_id="42",
+                    content="group body",
+                    agent_name="barsik",
+                    message_id="7",
+                    timestamp=0,
+                    is_group=True,
+                )
+            )
+            dm = broker._format_prompt(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="42",
+                    sender_name="Alex",
+                    sender_id="42",
+                    content="dm body",
+                    agent_name="barsik",
+                    message_id="8",
+                    timestamp=0,
+                    is_group=False,
+                )
+            )
+            assert group == (
+                "[telegram | group | Ops | Alex | -100123 | "
+                "1970-01-01 00:00:00 UTC | msg_id:7]\ngroup body"
+            )
+            assert dm == (
+                "[telegram | dm | Alex | 42 | "
+                "1970-01-01 00:00:00 UTC | msg_id:8]\ndm body"
             )
         finally:
             tmpdir.cleanup()

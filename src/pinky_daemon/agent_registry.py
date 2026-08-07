@@ -47,6 +47,9 @@ from pinky_daemon.effort import is_ultracode
 # sees an explicit sanitizer at the source-of-path-construction.
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 _BUZZ_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+_BARSIK_BUZZ_RELAY_SIGNING_PUBKEY = (
+    "12f6870117eff1a6318bd38c82a65d51dd19879b7489f57247114d0ee8a96de3"
+)
 BUZZ_OWNER_SILENCE_DAYS = 14
 BUZZ_INBOUND_CLAIM_LEASE_SECONDS = 5 * 60
 
@@ -1455,6 +1458,17 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS verified_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                added_at REAL NOT NULL,
+                UNIQUE(agent_name, platform, principal)
+            );
+
             CREATE TABLE IF NOT EXISTS agent_costs (
                 agent_name TEXT NOT NULL,
                 cost_usd REAL NOT NULL DEFAULT 0,
@@ -1515,6 +1529,8 @@ class AgentRegistry:
                 ON approval_requests(gate_state, notification_state, next_retry_at);
             CREATE INDEX IF NOT EXISTS idx_group_chats_agent
                 ON group_chats(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_verified_contacts_agent
+                ON verified_contacts(agent_name);
             CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
                 ON streaming_session_labels(agent_name);
             CREATE INDEX IF NOT EXISTS idx_mcp_servers_agent
@@ -1601,6 +1617,14 @@ class AgentRegistry:
                 ciphertext BLOB NOT NULL,
                 relay_url TEXT NOT NULL,
                 community_id TEXT NOT NULL,
+                relay_signing_pubkey TEXT NOT NULL DEFAULT ''
+                    CHECK(
+                        relay_signing_pubkey='' OR (
+                            length(relay_signing_pubkey)=64
+                            AND relay_signing_pubkey=lower(relay_signing_pubkey)
+                            AND relay_signing_pubkey NOT GLOB '*[^0-9a-f]*'
+                        )
+                    ),
                 enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
                 status TEXT NOT NULL DEFAULT 'disabled',
                 last_error TEXT NOT NULL DEFAULT '',
@@ -1922,6 +1946,7 @@ class AgentRegistry:
         buzz_existing = {
             row[1] for row in self._db.execute("PRAGMA table_info(buzz_identities)").fetchall()
         }
+        relay_signing_pubkey_added = "relay_signing_pubkey" not in buzz_existing
         buzz_migrations = [
             ("pubkey", "TEXT NOT NULL DEFAULT ''"),
             ("wrap_version", "INTEGER NOT NULL DEFAULT 1"),
@@ -1929,6 +1954,7 @@ class AgentRegistry:
             ("ciphertext", "BLOB NOT NULL DEFAULT X''"),
             ("relay_url", "TEXT NOT NULL DEFAULT ''"),
             ("community_id", "TEXT NOT NULL DEFAULT ''"),
+            ("relay_signing_pubkey", "TEXT NOT NULL DEFAULT ''"),
             ("enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("status", "TEXT NOT NULL DEFAULT 'disabled'"),
             ("last_error", "TEXT NOT NULL DEFAULT ''"),
@@ -1943,6 +1969,17 @@ class AgentRegistry:
             if col not in buzz_existing:
                 self._db.execute(f"ALTER TABLE buzz_identities ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to buzz_identities")
+        if relay_signing_pubkey_added:
+            # One-time deployment migration for the operator-verified production
+            # authority. New/future identities receive their own explicit pin at
+            # provisioning; migrations never fetch NIP-11 or trust network data.
+            cursor = self._db.execute(
+                "UPDATE buzz_identities SET relay_signing_pubkey=? "
+                "WHERE agent='barsik' AND relay_signing_pubkey=''",
+                (_BARSIK_BUZZ_RELAY_SIGNING_PUBKEY,),
+            )
+            if cursor.rowcount:
+                _log("agent_registry: seeded barsik Buzz relay signing authority")
         self._db.execute(
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_pubkey "
             "ON buzz_identities(pubkey) WHERE pubkey != ''"
@@ -1955,6 +1992,11 @@ class AgentRegistry:
             "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_tos_receipt "
             "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
         )
+
+        # Deployment seed for the explicitly verified owner principal in #545.
+        # The registry and all runtime lookups remain agent-keyed; this is only
+        # the caller-specified bootstrap row and never auto-learns from traffic.
+        self._seed_verified_contacts()
 
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
@@ -1974,6 +2016,34 @@ class AgentRegistry:
 
         # Seed default models
         self._seed_models()
+
+    def _seed_verified_contacts(self) -> None:
+        """Install caller-specified verified contacts when their agent exists."""
+        marker = "migration:verified_contacts_brad_owner_seed_v1"
+        if self.get_setting(marker) == "1":
+            return
+        if self._db.execute("SELECT 1 FROM agents WHERE name='barsik'").fetchone() is None:
+            return
+        cursor = self._db.execute(
+            """INSERT INTO verified_contacts
+               (agent_name, platform, principal, name, role, added_at)
+               VALUES ('barsik', 'buzz', ?, 'Brad', 'owner', ?)
+               ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
+                 name='Brad', role='owner'""",
+            (
+                "buzz:posspecialists:"
+                "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b",
+                time.time(),
+            ),
+        )
+        self._db.execute(
+            """INSERT INTO system_settings (key, value) VALUES (?, '1')
+               ON CONFLICT(key) DO UPDATE SET value='1'""",
+            (marker,),
+        )
+        self._db.commit()
+        if cursor.rowcount:
+            _log("agent_registry: seeded barsik Buzz owner verified contact")
 
     def _backfill_runtime_from_provider_url(self) -> None:
         """One-shot migration from legacy provider_url runtime selection."""
@@ -2615,6 +2685,7 @@ except Exception as exc:
             # Preserve register()'s historical signing-key backfill contract
             # for legacy rows even though the field mutation is delegated.
             self.get_or_create_signing_key(name)
+            self._seed_verified_contacts()
             return updated
         else:
             # Set up workspace — always store absolute path for portability.
@@ -2724,6 +2795,10 @@ except Exception as exc:
         # Ensure the agent has a per-agent signing key (#623). Idempotent —
         # returns the existing key on re-registration / update.
         self.get_or_create_signing_key(name)
+        # Fresh databases initialize before any agents exist. Retry the
+        # caller-specified bootstrap after registration so the seed ships for
+        # both upgrades and new installs without weakening the unique key.
+        self._seed_verified_contacts()
 
         return self.get(name)  # type: ignore
 
@@ -2819,22 +2894,24 @@ except Exception as exc:
             "wrap_version": row[2],
             "relay_url": row[3],
             "community_id": row[4],
-            "enabled": bool(row[5]),
-            "status": row[6],
-            "last_error": row[7],
-            "tos_approved": bool(row[8] and row[9] and row[10]),
-            "tos_approved_by": row[8],
-            "tos_approved_at": row[9],
-            "tos_approval_ref": row[10],
-            "created_at": row[11],
-            "updated_at": row[12],
+            "relay_signing_pubkey": row[5],
+            "enabled": bool(row[6]),
+            "status": row[7],
+            "last_error": row[8],
+            "tos_approved": bool(row[9] and row[10] and row[11]),
+            "tos_approved_by": row[9],
+            "tos_approved_at": row[10],
+            "tos_approval_ref": row[11],
+            "created_at": row[12],
+            "updated_at": row[13],
         }
 
     def get_buzz_identity(self, agent_name: str) -> dict | None:
         """Return public Buzz identity state without receipt or key envelope."""
         row = self._db.execute(
-            "SELECT agent, pubkey, wrap_version, relay_url, community_id, enabled, "
-            "status, last_error, tos_approved_by, tos_approved_at, "
+            "SELECT agent, pubkey, wrap_version, relay_url, community_id, "
+            "relay_signing_pubkey, enabled, status, last_error, "
+            "tos_approved_by, tos_approved_at, "
             "tos_approval_ref, created_at, updated_at "
             "FROM buzz_identities WHERE agent=?",
             (agent_name,),
@@ -2844,8 +2921,9 @@ except Exception as exc:
     def list_buzz_identities(self, *, enabled_only: bool = False) -> list[dict]:
         """List public Buzz identity state, never encrypted or raw secret fields."""
         sql = (
-            "SELECT agent, pubkey, wrap_version, relay_url, community_id, enabled, "
-            "status, last_error, tos_approved_by, tos_approved_at, "
+            "SELECT agent, pubkey, wrap_version, relay_url, community_id, "
+            "relay_signing_pubkey, enabled, status, last_error, "
+            "tos_approved_by, tos_approved_at, "
             "tos_approval_ref, created_at, updated_at FROM buzz_identities"
         )
         if enabled_only:
@@ -2860,6 +2938,7 @@ except Exception as exc:
         private_key: str,
         relay_url: str,
         community_id: str,
+        relay_signing_pubkey: str,
         enabled: bool,
         owner_actor: str,
         _commit: bool = True,
@@ -2897,13 +2976,17 @@ except Exception as exc:
         community = str(community_id or "").strip().lower()
         if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", community):
             raise ValueError("Buzz community_id is invalid")
+        relay_signer = _validate_buzz_pubkey(
+            relay_signing_pubkey,
+            field_name="relay_signing_pubkey",
+        )
         approver = validate_buzz_owner_actor(owner_actor)
 
         # Refuse accidental secret duplication into any durable text column.
         secret_text = str(private_key or "").strip().lower()
         if secret_text and any(
             secret_text in value.lower()
-            for value in (relay, community, approver)
+            for value in (relay, community, relay_signer, approver)
         ):
             raise ValueError("Buzz private key must not appear in identity metadata")
 
@@ -2917,7 +3000,7 @@ except Exception as exc:
         status = "active" if enabled else "disabled"
         with self._rmw_lock:
             existing = self._db.execute(
-                "SELECT pubkey, relay_url, community_id, tos_receipt, "
+                "SELECT pubkey, relay_url, community_id, relay_signing_pubkey, tos_receipt, "
                 "tos_approved_by, tos_approved_at, tos_approval_ref "
                 "FROM buzz_identities WHERE agent=?",
                 (agent,),
@@ -2930,6 +3013,12 @@ except Exception as exc:
                 raise ValueError(
                     "Buzz identity or approval scope rotation requires an explicit rotation operation"
                 )
+            if existing and existing[3] and not secrets.compare_digest(
+                existing[3], relay_signer
+            ):
+                raise ValueError(
+                    "Buzz relay signing authority rotation requires an explicit rotation operation"
+                )
             try:
                 if existing:
                     validate_buzz_owner_approval(
@@ -2937,17 +3026,17 @@ except Exception as exc:
                         pubkey=existing[0],
                         relay_url=existing[1],
                         community_id=existing[2],
-                        receipt=existing[3],
-                        approved_by=existing[4],
-                        approved_at=existing[5],
-                        approval_ref=existing[6],
+                        receipt=existing[4],
+                        approved_by=existing[5],
+                        approved_at=existing[6],
+                        approval_ref=existing[7],
                     )
                     # Same identity + same immutable receipt: safe idempotent
                     # re-bind. Preserve the original authority actor/timestamp/ref.
                     self._db.execute(
                         """UPDATE buzz_identities
                            SET wrap_version=?, nonce=?, ciphertext=?, relay_url=?,
-                               community_id=?, enabled=?, status=?, last_error='',
+                               community_id=?, relay_signing_pubkey=?, enabled=?, status=?, last_error='',
                                updated_at=? WHERE agent=?""",
                         (
                             envelope.wrap_version,
@@ -2955,6 +3044,7 @@ except Exception as exc:
                             envelope.ciphertext,
                             relay,
                             community,
+                            relay_signer,
                             int(enabled),
                             status,
                             now,
@@ -2972,10 +3062,11 @@ except Exception as exc:
                     self._db.execute(
                         """INSERT INTO buzz_identities (
                                agent, pubkey, wrap_version, nonce, ciphertext,
-                               relay_url, community_id, enabled, status, last_error,
+                               relay_url, community_id, relay_signing_pubkey,
+                               enabled, status, last_error,
                                tos_receipt, tos_approved_by, tos_approved_at,
                                tos_approval_ref, created_at, updated_at
-                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
                         (
                             agent,
                             envelope.pubkey,
@@ -2984,6 +3075,7 @@ except Exception as exc:
                             envelope.ciphertext,
                             relay,
                             community,
+                            relay_signer,
                             int(enabled),
                             status,
                             approval.receipt,
@@ -3018,12 +3110,12 @@ except Exception as exc:
 
         row = self._db.execute(
             """SELECT agent, pubkey, wrap_version, nonce, ciphertext, relay_url,
-                      community_id, enabled, status, tos_receipt, tos_approved_by,
-                      tos_approved_at, tos_approval_ref
+                      community_id, relay_signing_pubkey, enabled, status,
+                      tos_receipt, tos_approved_by, tos_approved_at, tos_approval_ref
                FROM buzz_identities WHERE agent=?""",
             (agent_name,),
         ).fetchone()
-        if not row or not row[7] or row[8] != "active":
+        if not row or not row[8] or row[9] != "active":
             return None
         try:
             validate_buzz_owner_approval(
@@ -3031,10 +3123,10 @@ except Exception as exc:
                 pubkey=row[1],
                 relay_url=row[5],
                 community_id=row[6],
-                receipt=row[9],
-                approved_by=row[10],
-                approved_at=row[11],
-                approval_ref=row[12],
+                receipt=row[10],
+                approved_by=row[11],
+                approved_at=row[12],
+                approval_ref=row[13],
             )
             envelope = BuzzKeyEnvelope(
                 agent=row[0],
@@ -3057,6 +3149,7 @@ except Exception as exc:
             private_key=private_key,
             relay_url=row[5],
             community_id=row[6],
+            relay_signing_pubkey=row[7],
         )
 
     def mark_buzz_identity_unhealthy(self, agent_name: str, reason: str) -> None:
@@ -3269,6 +3362,7 @@ except Exception as exc:
         private_key: str,
         relay_url: str,
         community_id: str,
+        relay_signing_pubkey: str,
         enabled: bool,
         owner_pubkey: str,
         channels: list[dict],
@@ -3284,6 +3378,7 @@ except Exception as exc:
                     private_key=private_key,
                     relay_url=relay_url,
                     community_id=community_id,
+                    relay_signing_pubkey=relay_signing_pubkey,
                     enabled=enabled,
                     owner_actor=owner_actor,
                     _commit=False,
@@ -3371,6 +3466,68 @@ except Exception as exc:
             (agent_name, community_id, relay_url, channel_id),
         ).fetchone()
         return {"channel_id": row[0], "label": row[1]} if row else None
+
+    def upsert_buzz_inbound_channel_from_membership(
+        self,
+        agent_name: str,
+        community_id: str,
+        relay_url: str,
+        channel_id: str,
+        *,
+        label: str = "",
+    ) -> dict:
+        """Admit one relay-notified membership into the scoped inbound gate."""
+        channel = _validate_buzz_channel_id(channel_id)
+        clean_label = _validate_buzz_annotation(label, field_name="channel label", limit=80)
+        with self._rmw_lock:
+            policy = self._db.execute(
+                """SELECT 1 FROM buzz_inbound_policies
+                   WHERE agent=? AND community_id=? AND relay_url=?""",
+                (agent_name, community_id, relay_url),
+            ).fetchone()
+            if policy is None:
+                raise ValueError("Buzz membership notification is outside the inbound policy scope")
+            self._db.execute(
+                """INSERT INTO buzz_inbound_channels
+                   (agent, community_id, relay_url, channel_id, label, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(agent, community_id, channel_id) DO UPDATE SET
+                     relay_url=excluded.relay_url,
+                     label=CASE WHEN excluded.label != '' THEN excluded.label
+                                ELSE buzz_inbound_channels.label END""",
+                (agent_name, community_id, relay_url, channel, clean_label, time.time()),
+            )
+            self._db.commit()
+        result = self.get_buzz_inbound_channel(
+            agent_name, community_id, relay_url, channel
+        )
+        if result is None:  # pragma: no cover - defensive after successful write
+            raise RuntimeError("Buzz membership channel write did not persist")
+        return result
+
+    def remove_buzz_inbound_channel_from_membership(
+        self,
+        agent_name: str,
+        community_id: str,
+        relay_url: str,
+        channel_id: str,
+    ) -> bool:
+        """Revoke a relay-notified membership and any undelivered channel rows."""
+        channel = _validate_buzz_channel_id(channel_id)
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """DELETE FROM buzz_inbound_channels
+                   WHERE agent=? AND community_id=? AND relay_url=? AND channel_id=?""",
+                (agent_name, community_id, relay_url, channel),
+            )
+            self._db.execute(
+                """DELETE FROM buzz_inbound_events
+                   WHERE agent=? AND community_id=? AND channel_id=?
+                     AND delivery_status='pending'""",
+                (agent_name, community_id, channel),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
 
     def get_buzz_inbound_principal(
         self, agent_name: str, community_id: str, pubkey: str
@@ -5759,7 +5916,13 @@ except Exception as exc:
                (agent_name, platform, chat_id, chat_title, chat_type, member_count, joined_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (agent_name, chat_id)
-               DO UPDATE SET chat_title=excluded.chat_title,
+               DO UPDATE SET platform=CASE WHEN excluded.platform='buzz'
+                                            THEN excluded.platform
+                                            ELSE group_chats.platform END,
+                            chat_title=CASE WHEN excluded.platform='buzz'
+                                                 AND excluded.chat_title=''
+                                            THEN group_chats.chat_title
+                                            ELSE excluded.chat_title END,
                             chat_type=excluded.chat_type,
                             member_count=excluded.member_count,
                             active=1""",
@@ -5827,6 +5990,93 @@ except Exception as exc:
         cursor = self._db.execute(
             "UPDATE group_chats SET active=0 WHERE agent_name=? AND chat_id=?",
             (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    # ── Verified Contacts ────────────────────────────────────
+
+    @staticmethod
+    def _verified_contact_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "agent_name": row[1],
+            "platform": row[2],
+            "principal": row[3],
+            "name": row[4],
+            "role": row[5],
+            "added_at": row[6],
+        }
+
+    def get_verified_contact(
+        self, agent_name: str, platform: str, principal: str
+    ) -> dict | None:
+        """Return one explicitly registered contact, never traffic-derived."""
+        row = self._db.execute(
+            """SELECT id, agent_name, platform, principal, name, role, added_at
+               FROM verified_contacts
+               WHERE agent_name=? AND platform=? AND principal=?""",
+            (agent_name, platform, principal),
+        ).fetchone()
+        return self._verified_contact_dict(row) if row else None
+
+    def upsert_verified_contact(
+        self,
+        agent_name: str,
+        platform: str,
+        principal: str,
+        name: str,
+        role: str = "",
+    ) -> dict:
+        """Create or replace an explicit principal-to-name trust decision."""
+        agent = _validate_agent_name(agent_name)
+        clean_platform = str(platform or "").strip().lower()
+        clean_principal = str(principal or "").strip()
+        clean_name = str(name or "").strip()
+        clean_role = str(role or "").strip().lower()
+        if not clean_platform or len(clean_platform) > 64:
+            raise ValueError("verified contact platform must be 1-64 characters")
+        if not clean_principal or len(clean_principal) > 512:
+            raise ValueError("verified contact principal must be 1-512 characters")
+        if not clean_name or len(clean_name) > 120 or any(
+            ord(ch) < 32 or ord(ch) == 127 for ch in clean_name
+        ):
+            raise ValueError("verified contact name must be 1-120 printable characters")
+        if clean_role not in {"", "owner", "agent"}:
+            raise ValueError("verified contact role must be owner, agent, or empty")
+        now = time.time()
+        self._db.execute(
+            """INSERT INTO verified_contacts
+               (agent_name, platform, principal, name, role, added_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
+                 name=excluded.name, role=excluded.role, added_at=excluded.added_at""",
+            (agent, clean_platform, clean_principal, clean_name, clean_role, now),
+        )
+        self._db.commit()
+        result = self.get_verified_contact(agent, clean_platform, clean_principal)
+        if result is None:  # pragma: no cover - defensive after successful write
+            raise RuntimeError("verified contact write did not persist")
+        return result
+
+    def list_verified_contacts(self, agent_name: str) -> list[dict]:
+        """List explicitly registered contacts for one agent."""
+        rows = self._db.execute(
+            """SELECT id, agent_name, platform, principal, name, role, added_at
+               FROM verified_contacts WHERE agent_name=?
+               ORDER BY platform, name COLLATE NOCASE, principal""",
+            (agent_name,),
+        ).fetchall()
+        return [self._verified_contact_dict(row) for row in rows]
+
+    def delete_verified_contact(
+        self, agent_name: str, platform: str, principal: str
+    ) -> bool:
+        """Delete one explicit verified-contact trust decision."""
+        cursor = self._db.execute(
+            """DELETE FROM verified_contacts
+               WHERE agent_name=? AND platform=? AND principal=?""",
+            (agent_name, str(platform or "").strip().lower(), str(principal or "").strip()),
         )
         self._db.commit()
         return cursor.rowcount > 0
