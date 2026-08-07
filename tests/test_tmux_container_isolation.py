@@ -866,7 +866,7 @@ class TestSpawnRebindsCommandRunner:
         monkeypatch.setattr(ss, "_seed_container_trust", fake_seed_trust)
         monkeypatch.setattr(ss, "_build_claude_cmd", lambda: "claude")
         monkeypatch.setattr(ss, "_start_tailer", fake_start_tailer)
-        ss._tmux.has_session = AsyncMock(return_value=False)
+        ss._tmux.has_session = AsyncMock(side_effect=[False, True])
         ss._tmux.kill_session = AsyncMock()
         ss._tmux.new_session = AsyncMock(
             return_value=TmuxCommandResult(returncode=0, stdout="", stderr="")
