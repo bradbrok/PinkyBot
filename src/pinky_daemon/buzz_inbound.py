@@ -302,7 +302,6 @@ class BuzzInboundProcessor:
         self._registry.mark_buzz_inbound_event_delivered(self.agent_name, event_id)
         self._registry.update_buzz_inbound_health(
             self.agent_name,
-            status="connected",
             event_at=self._clock(),
         )
         self.stats["delivered"] += 1
@@ -499,25 +498,30 @@ class BrokerBuzzPoller:
             raise BuzzRelayProtocolError("relay_auth_refused")
 
         await self._processor.replay_pending()
-        main_sub = f"pinky-{self._agent_name}-{secrets.token_hex(8)}"
         since = self._registry.get_buzz_subscription_since(self._agent_name)
-        await self._send_frame(
-            ws,
-            [
-                "REQ",
-                main_sub,
-                # The production Buzz relay does not live-fanout events to a
-                # subscription whose filter carries ``since``.  Keep the wire
-                # subscription open-ended and enforce this exact floor in the
-                # client before any cache, authorization gate, or durable write.
-                {"kinds": [9, 20002], "#h": channels},
-            ],
-        )
+        main_subscription_since: dict[str, int] = {}
+        connection_token = secrets.token_hex(8)
+        for index, channel_id in enumerate(channels):
+            main_sub = f"pinky-{self._agent_name}-{connection_token}-{index}"
+            main_subscription_since[main_sub] = since
+            await self._send_frame(
+                ws,
+                [
+                    "REQ",
+                    main_sub,
+                    # The production Buzz relay does not live-fanout events to
+                    # subscriptions carrying ``since`` or multiple ``#h``
+                    # values. Keep each live REQ open-ended and channel-local,
+                    # then enforce the shared floor in the client before any
+                    # cache, authorization gate, or durable write.
+                    {"kinds": [9, 20002], "#h": [channel_id]},
+                ],
+            )
         await self._wait_for_eose(
             ws,
-            subscription_id=main_sub,
+            subscription_ids=set(main_subscription_since),
             timeout=self._liveness_timeout,
-            subscription_since={main_sub: since},
+            subscription_since=main_subscription_since,
         )
         now = time.time()
         self._status = "connected"
@@ -541,8 +545,7 @@ class BrokerBuzzPoller:
                 await self._active_liveness_probe(
                     ws,
                     channels,
-                    main_subscription=main_sub,
-                    main_since=since,
+                    main_subscription_since=main_subscription_since,
                 )
                 next_heartbeat = loop.time() + self._heartbeat_interval
                 await self._processor.replay_pending()
@@ -555,7 +558,7 @@ class BrokerBuzzPoller:
             await self._handle_frame(
                 ws,
                 frame,
-                subscription_since={main_sub: since},
+                subscription_since=main_subscription_since,
             )
 
     async def _active_liveness_probe(
@@ -563,8 +566,7 @@ class BrokerBuzzPoller:
         ws,
         channels: list[str],
         *,
-        main_subscription: str,
-        main_since: int,
+        main_subscription_since: dict[str, int],
     ) -> None:
         heartbeat_sub = f"pinky-live-{secrets.token_hex(8)}"
         heartbeat_since = int(time.time())
@@ -584,10 +586,10 @@ class BrokerBuzzPoller:
         try:
             await self._wait_for_eose(
                 ws,
-                subscription_id=heartbeat_sub,
+                subscription_ids={heartbeat_sub},
                 timeout=self._liveness_timeout,
                 subscription_since={
-                    main_subscription: main_since,
+                    **main_subscription_since,
                     heartbeat_sub: heartbeat_since,
                 },
             )
@@ -611,18 +613,20 @@ class BrokerBuzzPoller:
         self,
         ws,
         *,
-        subscription_id: str,
+        subscription_ids: set[str],
         timeout: float,
         subscription_since: dict[str, int],
     ) -> None:
+        pending_eose = set(subscription_ids)
         deadline = asyncio.get_running_loop().time() + timeout
-        while True:
+        while pending_eose:
             remaining = deadline - asyncio.get_running_loop().time()
             if remaining <= 0:
                 raise asyncio.TimeoutError
             frame = await self._receive_frame(ws, timeout=remaining)
-            if len(frame) >= 2 and frame[0] == "EOSE" and frame[1] == subscription_id:
-                return
+            if len(frame) >= 2 and frame[0] == "EOSE" and frame[1] in pending_eose:
+                pending_eose.remove(frame[1])
+                continue
             await self._handle_frame(
                 ws,
                 frame,

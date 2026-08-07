@@ -17,6 +17,7 @@ AGENT_KEY = "11" * 32
 OWNER = BuzzNostrSigner(bytes.fromhex("33" * 32))
 USER = BuzzNostrSigner(bytes.fromhex("44" * 32))
 CHANNEL = "00000000-0000-4000-8000-000000000001"
+OTHER_CHANNEL = "00000000-0000-4000-8000-000000000002"
 COMMUNITY = "example"
 
 
@@ -31,7 +32,7 @@ class FakeBroker:
         return True
 
 
-def _registry(tmp_path, relay_url: str):
+def _registry(tmp_path, relay_url: str, *, channels: list[dict] | None = None):
     store = AgentRegistry(
         str(tmp_path / "agents.db"),
         buzz_device_key_path=str(tmp_path / "identity" / ".device_key"),
@@ -48,7 +49,7 @@ def _registry(tmp_path, relay_url: str):
     store.configure_buzz_inbound_owner_control(
         "barsik",
         owner_pubkey=OWNER.pubkey,
-        channels=[{"channel_id": CHANNEL, "label": "#general"}],
+        channels=channels or [{"channel_id": CHANNEL, "label": "#general"}],
         approved_users=[{"pubkey": USER.pubkey, "display_name": "Brad"}],
         owner_actor="ui:admin",
     )
@@ -70,39 +71,78 @@ async def _authenticate(ws, relay_url: str, captured: list[list]) -> list:
     return event
 
 
-class SinceBlindLiveRelayRig:
-    """Model Buzz: stored queries work, but wire-``since`` disables live push."""
+class LiveFanoutQuirkRelayRig:
+    """Model Buzz live suppression for wire-``since`` or multi-``#h`` REQs."""
 
-    def __init__(self, *, stored_events: list[dict], live_event: dict) -> None:
+    def __init__(
+        self,
+        *,
+        channels: list[str],
+        stored_events: list[dict],
+        live_events: list[dict],
+        hold_final_eose: bool = False,
+    ) -> None:
         self.relay_url = ""
+        self.channels = channels
         self.stored_events = stored_events
-        self.live_event = live_event
+        self.live_events = live_events
+        self.hold_final_eose = hold_final_eose
         self.captured: list[list] = []
-        self.main_filter: dict = {}
+        self.main_requests: list[list] = []
+        self.main_requests_received = asyncio.Event()
+        self.partial_eose_sent = asyncio.Event()
+        self.release_final_eose = asyncio.Event()
+        self.all_eose_sent = asyncio.Event()
         self.stored_batch_sent = asyncio.Event()
-        self.release_live_event = asyncio.Event()
-        self.live_event_pushed = asyncio.Event()
+        self.release_live_events = asyncio.Event()
+        self.live_events_pushed = asyncio.Event()
+
+    @staticmethod
+    def _channel_id(event: dict) -> str:
+        return next(tag[1] for tag in event["tags"] if tag[0] == "h")
 
     async def handler(self, ws) -> None:  # noqa: ANN001
         await _authenticate(ws, self.relay_url, self.captured)
-        main = json.loads(await ws.recv())
-        self.captured.append(main)
-        assert main[0] == "REQ"
-        self.main_filter.update(main[2])
+        for _ in self.channels:
+            main = json.loads(await ws.recv())
+            self.captured.append(main)
+            assert main[0] == "REQ"
+            self.main_requests.append(main)
+        self.main_requests_received.set()
 
         # Stored-query delivery works for every filter shape on the real
-        # relay, including filters with ``since``.  A no-since main REQ can
-        # therefore receive the channel's full history before EOSE.
+        # relay, including filters with ``since`` or multiple ``#h`` values.
         for event in self.stored_events:
-            await ws.send(json.dumps(["EVENT", main[1], event]))
-        await ws.send(json.dumps(["EOSE", main[1]]))
+            channel_id = self._channel_id(event)
+            for main in self.main_requests:
+                if channel_id in main[2].get("#h", []):
+                    await ws.send(json.dumps(["EVENT", main[1], event]))
+        eose_requests = self.main_requests
+        if self.hold_final_eose:
+            eose_requests = self.main_requests[:-1]
+        for main in eose_requests:
+            await ws.send(json.dumps(["EOSE", main[1]]))
+        if self.hold_final_eose:
+            self.partial_eose_sent.set()
+            await self.release_final_eose.wait()
+            await ws.send(json.dumps(["EOSE", self.main_requests[-1][1]]))
+        self.all_eose_sent.set()
         self.stored_batch_sent.set()
 
-        await self.release_live_event.wait()
-        # This is the production quirk isolated by the live probe matrix.
-        if "since" not in self.main_filter:
-            await ws.send(json.dumps(["EVENT", main[1], self.live_event]))
-            self.live_event_pushed.set()
+        await self.release_live_events.wait()
+        pushed = 0
+        for main in self.main_requests:
+            subscription_filter = main[2]
+            # These are the two independent production quirks isolated by the
+            # controlled live probe matrices: either shape suppresses fan-out.
+            if "since" in subscription_filter or len(subscription_filter.get("#h", [])) != 1:
+                continue
+            for event in self.live_events:
+                if self._channel_id(event) in subscription_filter["#h"]:
+                    await ws.send(json.dumps(["EVENT", main[1], event]))
+                    pushed += 1
+        if pushed:
+            self.live_events_pushed.set()
 
         try:
             while True:
@@ -415,7 +455,11 @@ async def test_since_blind_relay_live_push_survives_large_stale_eose_burst(
         content="live event after EOSE",
         created_at=subscription_floor,
     )
-    rig = SinceBlindLiveRelayRig(stored_events=stored_burst, live_event=live_event)
+    rig = LiveFanoutQuirkRelayRig(
+        channels=[CHANNEL],
+        stored_events=stored_burst,
+        live_events=[live_event],
+    )
 
     async with websockets.serve(rig.handler, "127.0.0.1", 0) as server:
         port = server.sockets[0].getsockname()[1]
@@ -448,7 +492,7 @@ async def test_since_blind_relay_live_push_survives_large_stale_eose_burst(
             await asyncio.sleep(0.01)
         assert poller.health["status"] == "connected"
 
-        assert rig.main_filter == {"kinds": [9, 20002], "#h": [CHANNEL]}
+        assert rig.main_requests[0][2] == {"kinds": [9, 20002], "#h": [CHANNEL]}
         assert poller.health["rejected"] == len(stored_burst)
         assert poller._processor._recent_ids == set()
         assert broker.calls == []
@@ -459,8 +503,8 @@ async def test_since_blind_relay_live_push_survives_large_stale_eose_burst(
             "SELECT last_seen_at FROM buzz_inbound_principals WHERE agent='barsik'"
         ).fetchall() == [(0.0,), (0.0,)]
 
-        rig.release_live_event.set()
-        await asyncio.wait_for(rig.live_event_pushed.wait(), timeout=2)
+        rig.release_live_events.set()
+        await asyncio.wait_for(rig.live_events_pushed.wait(), timeout=2)
         await asyncio.wait_for(broker.delivered.wait(), timeout=2)
         poller.stop()
         await asyncio.wait_for(task, timeout=2)
@@ -471,6 +515,108 @@ async def test_since_blind_relay_live_push_survives_large_stale_eose_burst(
         assert store._db.execute(
             "SELECT event_id, delivery_status FROM buzz_inbound_events"
         ).fetchall() == [(live_event["id"], "delivered")]
+        assert not any(frame[0] == "EVENT" for frame in rig.captured)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_live_fanout_uses_one_req_per_channel_and_waits_for_every_eose(tmp_path):
+    stored_event = USER.sign_event(
+        kind=9,
+        tags=[["h", CHANNEL]],
+        content="stored event before all EOSE",
+    )
+    live_events = [
+        USER.sign_event(
+            kind=9,
+            tags=[["h", CHANNEL]],
+            content="live event in general",
+        ),
+        USER.sign_event(
+            kind=9,
+            tags=[["h", OTHER_CHANNEL]],
+            content="live event in support",
+        ),
+    ]
+    rig = LiveFanoutQuirkRelayRig(
+        channels=[CHANNEL, OTHER_CHANNEL],
+        stored_events=[stored_event],
+        live_events=live_events,
+        hold_final_eose=True,
+    )
+
+    async with websockets.serve(rig.handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        rig.relay_url = f"ws://127.0.0.1:{port}"
+        store = _registry(
+            tmp_path,
+            rig.relay_url,
+            channels=[
+                {"channel_id": CHANNEL, "label": "#general"},
+                {"channel_id": OTHER_CHANNEL, "label": "#support"},
+            ],
+        )
+        broker = FakeBroker()
+
+        async def notify(_agent, _message):
+            return True
+
+        poller = BrokerBuzzPoller(
+            store.get_buzz_signing_material("barsik"),
+            broker,
+            store,
+            notify,
+            heartbeat_interval=10,
+            liveness_timeout=1,
+        )
+        task = asyncio.create_task(poller.start())
+        await asyncio.wait_for(rig.main_requests_received.wait(), timeout=2)
+        await asyncio.wait_for(rig.partial_eose_sent.wait(), timeout=2)
+        await asyncio.wait_for(broker.delivered.wait(), timeout=2)
+        for _ in range(200):
+            if poller.poll_count >= 4:
+                break
+            await asyncio.sleep(0.01)
+
+        assert poller.poll_count >= 4
+        assert poller.health["status"] == "starting"
+        assert store.get_buzz_inbound_policy("barsik")["status"] != "connected"
+        assert len(rig.main_requests) == 2
+        assert len({frame[1] for frame in rig.main_requests}) == 2
+        assert {tuple(frame[2]["#h"]) for frame in rig.main_requests} == {
+            (CHANNEL,),
+            (OTHER_CHANNEL,),
+        }
+        assert all(frame[2]["kinds"] == [9, 20002] for frame in rig.main_requests)
+        assert all("since" not in frame[2] for frame in rig.main_requests)
+
+        rig.release_final_eose.set()
+        await asyncio.wait_for(rig.all_eose_sent.wait(), timeout=2)
+        for _ in range(200):
+            if poller.health["status"] == "connected":
+                break
+            await asyncio.sleep(0.01)
+        assert poller.health["status"] == "connected"
+        assert store.get_buzz_inbound_policy("barsik")["status"] == "connected"
+
+        rig.release_live_events.set()
+        await asyncio.wait_for(rig.live_events_pushed.wait(), timeout=2)
+        for _ in range(200):
+            if len(broker.calls) == len(live_events) + 1:
+                break
+            await asyncio.sleep(0.01)
+        poller.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+        delivered_ids = [call[1].message_id for call in broker.calls]
+        assert delivered_ids[0] == stored_event["id"]
+        assert all(delivered_ids.count(event["id"]) == 1 for event in live_events)
+        assert len(delivered_ids) == len(set(delivered_ids)) == 3
+        assert store._db.execute(
+            "SELECT event_id, delivery_status FROM buzz_inbound_events ORDER BY event_id"
+        ).fetchall() == sorted(
+            (event["id"], "delivered") for event in [stored_event, *live_events]
+        )
         assert not any(frame[0] == "EVENT" for frame in rig.captured)
         store.close()
 
