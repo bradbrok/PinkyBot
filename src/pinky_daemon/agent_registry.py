@@ -3567,7 +3567,7 @@ except Exception as exc:
         self,
         agent_name: str,
         *,
-        status: str,
+        status: str | None = None,
         last_error: str = "",
         connected_at: float | None = None,
         liveness_at: float | None = None,
@@ -3576,15 +3576,16 @@ except Exception as exc:
         connected = float(connected_at) if connected_at is not None else None
         liveness = float(liveness_at) if liveness_at is not None else None
         event = float(event_at) if event_at is not None else None
+        status_value = str(status or "unknown")[:40] if status is not None else None
         self._db.execute(
             """UPDATE buzz_inbound_policies
-               SET status=?, last_error=?,
+               SET status=COALESCE(?, status), last_error=?,
                    last_connect_at=COALESCE(MAX(last_connect_at, ?), last_connect_at),
                    last_liveness_at=COALESCE(MAX(last_liveness_at, ?), last_liveness_at),
                    last_event_at=COALESCE(MAX(last_event_at, ?), last_event_at)
                WHERE agent=?""",
             (
-                str(status or "unknown")[:40],
+                status_value,
                 str(last_error or "")[:160],
                 connected,
                 liveness,
