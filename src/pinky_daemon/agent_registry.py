@@ -2862,6 +2862,7 @@ except Exception as exc:
         community_id: str,
         enabled: bool,
         owner_actor: str,
+        _commit: bool = True,
     ) -> dict:
         """Bind one identity from the authenticated owner-control route only.
 
@@ -2993,7 +2994,8 @@ except Exception as exc:
                             now,
                         ),
                     )
-                self._db.commit()
+                if _commit:
+                    self._db.commit()
             except sqlite3.IntegrityError as exc:
                 self._db.rollback()
                 raise ValueError("Buzz identity conflicts with an existing binding") from exc
@@ -3104,6 +3106,7 @@ except Exception as exc:
         channels: list[dict],
         approved_users: list[dict],
         owner_actor: str,
+        _commit: bool = True,
     ) -> dict:
         """Atomically replace one identity-scoped, default-deny inbound policy."""
         from pinky_daemon.buzz_identity import validate_buzz_owner_actor
@@ -3249,7 +3252,8 @@ except Exception as exc:
                     "DELETE FROM buzz_inbound_events WHERE agent=? AND event_id=?",
                     revoked_pending,
                 )
-                self._db.commit()
+                if _commit:
+                    self._db.commit()
             except Exception:
                 self._db.rollback()
                 raise
@@ -3257,6 +3261,46 @@ except Exception as exc:
         if policy is None:  # pragma: no cover - defensive after successful transaction
             raise RuntimeError("Buzz inbound policy write did not persist")
         return policy
+
+    def bind_buzz_identity_with_inbound_owner_control(
+        self,
+        agent_name: str,
+        *,
+        private_key: str,
+        relay_url: str,
+        community_id: str,
+        enabled: bool,
+        owner_pubkey: str,
+        channels: list[dict],
+        approved_users: list[dict],
+        owner_actor: str,
+    ) -> tuple[dict, dict]:
+        """Atomically bind an identity and its complete inbound policy."""
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                identity = self.bind_buzz_identity_owner_control(
+                    agent_name,
+                    private_key=private_key,
+                    relay_url=relay_url,
+                    community_id=community_id,
+                    enabled=enabled,
+                    owner_actor=owner_actor,
+                    _commit=False,
+                )
+                policy = self.configure_buzz_inbound_owner_control(
+                    agent_name,
+                    owner_pubkey=owner_pubkey,
+                    channels=channels,
+                    approved_users=approved_users,
+                    owner_actor=owner_actor,
+                    _commit=False,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return identity, policy
 
     def get_buzz_inbound_policy(self, agent_name: str) -> dict | None:
         row = self._db.execute(

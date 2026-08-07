@@ -198,6 +198,136 @@ async def test_socket_open_without_eose_heartbeat_pages_owner_and_reconnects(tmp
 
 
 @pytest.mark.asyncio
+async def test_control_frame_trickle_cannot_starve_periodic_eose_probe(tmp_path):
+    relay_url = ""
+    heartbeat_seen = asyncio.Event()
+    heartbeat_closed = asyncio.Event()
+    captured: list[list] = []
+
+    async def handler(ws):  # noqa: ANN001
+        await _authenticate(ws, relay_url, captured)
+        main = json.loads(await ws.recv())
+        captured.append(main)
+        await ws.send(json.dumps(["EOSE", main[1]]))
+        counter = 0
+        try:
+            while True:
+                try:
+                    raw = await asyncio.wait_for(ws.recv(), timeout=0.01)
+                except asyncio.TimeoutError:
+                    # Alternate an ignorable OK with an unknown control shape.
+                    # Neither proves the subscription is alive.
+                    frame = (
+                        ["OK", "00" * 32, True, "control trickle"]
+                        if counter % 2 == 0
+                        else ["IGNORED", counter]
+                    )
+                    counter += 1
+                    await ws.send(json.dumps(frame))
+                    continue
+                frame = json.loads(raw)
+                captured.append(frame)
+                if frame[0] == "REQ":
+                    heartbeat_seen.set()
+                    await ws.send(json.dumps(["EOSE", frame[1]]))
+                elif frame[0] == "CLOSE":
+                    heartbeat_closed.set()
+        except websockets.ConnectionClosed:
+            return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        relay_url = f"ws://127.0.0.1:{port}"
+        store = _registry(tmp_path, relay_url)
+        notices = []
+
+        async def notify(agent, message):  # noqa: ANN001
+            notices.append((agent, message))
+            return True
+
+        poller = BrokerBuzzPoller(
+            store.get_buzz_signing_material("barsik"),
+            FakeBroker(),
+            store,
+            notify,
+            heartbeat_interval=0.05,
+            liveness_timeout=0.3,
+        )
+        task = asyncio.create_task(poller.start())
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=2)
+        await asyncio.wait_for(heartbeat_closed.wait(), timeout=2)
+        poller.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+        assert any(frame[0] == "REQ" and frame[1].startswith("pinky-live-") for frame in captured)
+        assert poller.health["last_liveness_at"] > 0
+        assert notices == []
+        assert not any(frame[0] == "EVENT" for frame in captured)
+        store.close()
+
+
+@pytest.mark.asyncio
+async def test_real_relay_event_older_than_req_since_is_rejected_client_side(tmp_path):
+    relay_url = ""
+    subscription_filter = {}
+
+    async def handler(ws):  # noqa: ANN001
+        await _authenticate(ws, relay_url, [])
+        main = json.loads(await ws.recv())
+        subscription_filter.update(main[2])
+        stale = USER.sign_event(
+            kind=9,
+            tags=[["h", CHANNEL]],
+            content="historic signed command",
+            created_at=main[2]["since"] - 86340,
+        )
+        fresh = USER.sign_event(
+            kind=9,
+            tags=[["h", CHANNEL]],
+            content="current signed command",
+            created_at=main[2]["since"],
+        )
+        await ws.send(json.dumps(["EVENT", main[1], stale]))
+        await ws.send(json.dumps(["EVENT", main[1], fresh]))
+        await ws.send(json.dumps(["EOSE", main[1]]))
+        try:
+            while True:
+                await ws.recv()
+        except websockets.ConnectionClosed:
+            return
+
+    async with websockets.serve(handler, "127.0.0.1", 0) as server:
+        port = server.sockets[0].getsockname()[1]
+        relay_url = f"ws://127.0.0.1:{port}"
+        store = _registry(tmp_path, relay_url)
+        broker = FakeBroker()
+
+        async def notify(_agent, _message):
+            return True
+
+        poller = BrokerBuzzPoller(
+            store.get_buzz_signing_material("barsik"),
+            broker,
+            store,
+            notify,
+            heartbeat_interval=10,
+            liveness_timeout=1,
+        )
+        task = asyncio.create_task(poller.start())
+        await asyncio.wait_for(broker.delivered.wait(), timeout=2)
+        poller.stop()
+        await asyncio.wait_for(task, timeout=2)
+
+        assert isinstance(subscription_filter["since"], int)
+        assert [call[1].content for call in broker.calls] == ["current signed command"]
+        assert poller.health["rejected"] == 1
+        assert store._db.execute(
+            "SELECT event_created_at, delivery_status FROM buzz_inbound_events"
+        ).fetchall() == [(float(subscription_filter["since"]), "delivered")]
+        store.close()
+
+
+@pytest.mark.asyncio
 async def test_restart_replays_overlap_but_dedupes_delivered_event(tmp_path):
     relay_url = ""
     connection_number = 0

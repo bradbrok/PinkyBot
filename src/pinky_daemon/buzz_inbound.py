@@ -70,6 +70,7 @@ def validate_buzz_inbound_event(
     *,
     identity_pubkey: str,
     now: float | None = None,
+    subscription_since: int | None = None,
 ) -> ValidatedBuzzInboundEvent:
     """Strictly validate one event before either inbound authorization gate."""
     if not isinstance(event, dict):
@@ -89,6 +90,10 @@ def validate_buzz_inbound_event(
     current = time.time() if now is None else float(now)
     if event["created_at"] > int(current + _MAX_FUTURE_SECONDS):
         raise BuzzInboundRejectedError("event_from_future")
+    if subscription_since is not None and event["created_at"] < int(subscription_since):
+        # A relay filter is advisory, not an authorization boundary. Enforce
+        # the exact REQ floor again before any gate, cache, or durable write.
+        raise BuzzInboundRejectedError("event_before_subscription_since")
     if len(event["content"].encode("utf-8")) > _MAX_CONTENT_BYTES:
         raise BuzzInboundRejectedError("content_too_large")
     tags = event["tags"]
@@ -184,16 +189,31 @@ class BuzzInboundProcessor:
             self._recent_ids.discard(self._recent_order.popleft())
         return True
 
-    async def process_event(self, event: object, *, replay: bool = False) -> str:
+    async def process_event(
+        self,
+        event: object,
+        *,
+        replay: bool = False,
+        subscription_since: int | None = None,
+    ) -> str:
         try:
             validated = validate_buzz_inbound_event(
                 event,
                 identity_pubkey=self.identity_pubkey,
                 now=self._clock(),
+                # Durable pending rows were admitted under an earlier live
+                # subscription and are the only sanctioned freshness bypass.
+                subscription_since=None if replay else subscription_since,
             )
         except BuzzInboundRejectedError:
             self.stats["rejected"] += 1
             return "rejected"
+
+        # kind-20002 is typing/diagnostic only. Return before the in-memory
+        # duplicate cache, either authorization lookup, or any durable write.
+        if validated.event["kind"] == 20002:
+            self.stats["ephemeral_ignored"] += 1
+            return "ephemeral_ignored"
 
         event_id = validated.event["id"]
         if not replay and not self._remember(event_id):
@@ -227,12 +247,6 @@ class BuzzInboundProcessor:
             author["pubkey"],
             float(validated.event["created_at"]),
         )
-
-        # kind-20002 is typing/diagnostic only. It never enters the durable
-        # event ledger, broker, conversation store, replay queue, or prompt.
-        if validated.event["kind"] == 20002:
-            self.stats["ephemeral_ignored"] += 1
-            return "ephemeral_ignored"
 
         if not self._registry.begin_buzz_inbound_event_delivery(
             self.agent_name,
@@ -436,6 +450,7 @@ class BrokerBuzzPoller:
             try:
                 asyncio.get_running_loop().create_task(self._ws.close())
             except RuntimeError:
+                # No running loop means an asynchronous close cannot be scheduled.
                 pass
 
     async def _run_connection(self) -> None:
@@ -498,6 +513,7 @@ class BrokerBuzzPoller:
             ws,
             subscription_id=main_sub,
             timeout=self._liveness_timeout,
+            subscription_since={main_sub: since},
         )
         now = time.time()
         self._status = "connected"
@@ -513,31 +529,41 @@ class BrokerBuzzPoller:
         )
         await self._check_owner_silence()
 
+        loop = asyncio.get_running_loop()
+        next_heartbeat = loop.time() + self._heartbeat_interval
         while self._running:
-            try:
-                frame = await self._receive_frame(
-                    ws,
-                    timeout=self._heartbeat_interval,
-                )
-            except asyncio.TimeoutError:
+            remaining = next_heartbeat - loop.time()
+            if remaining <= 0:
                 await self._active_liveness_probe(
                     ws,
                     channels,
                     main_subscription=main_sub,
+                    main_since=since,
                 )
+                next_heartbeat = loop.time() + self._heartbeat_interval
                 await self._processor.replay_pending()
                 await self._check_owner_silence()
+                continue
+            try:
+                frame = await self._receive_frame(ws, timeout=remaining)
+            except asyncio.TimeoutError:
                 continue
             await self._handle_frame(
                 ws,
                 frame,
-                allowed_subscriptions={main_sub},
+                subscription_since={main_sub: since},
             )
 
     async def _active_liveness_probe(
-        self, ws, channels: list[str], *, main_subscription: str
+        self,
+        ws,
+        channels: list[str],
+        *,
+        main_subscription: str,
+        main_since: int,
     ) -> None:
         heartbeat_sub = f"pinky-live-{secrets.token_hex(8)}"
+        heartbeat_since = int(time.time())
         await self._send_frame(
             ws,
             [
@@ -546,7 +572,7 @@ class BrokerBuzzPoller:
                 {
                     "kinds": [9, 20002],
                     "#h": channels,
-                    "since": int(time.time()),
+                    "since": heartbeat_since,
                     "limit": 1,
                 },
             ],
@@ -556,7 +582,10 @@ class BrokerBuzzPoller:
                 ws,
                 subscription_id=heartbeat_sub,
                 timeout=self._liveness_timeout,
-                other_subscription=main_subscription,
+                subscription_since={
+                    main_subscription: main_since,
+                    heartbeat_sub: heartbeat_since,
+                },
             )
         except asyncio.TimeoutError as exc:
             raise BuzzRelayLivenessError("relay_eose_heartbeat_timed_out") from exc
@@ -564,6 +593,7 @@ class BrokerBuzzPoller:
             try:
                 await self._send_frame(ws, ["CLOSE", heartbeat_sub])
             except Exception:
+                # Best-effort CLOSE must not hide the measured liveness result.
                 pass
         now = time.time()
         self._last_liveness_at = now
@@ -579,7 +609,7 @@ class BrokerBuzzPoller:
         *,
         subscription_id: str,
         timeout: float,
-        other_subscription: str | None = None,
+        subscription_since: dict[str, int],
     ) -> None:
         deadline = asyncio.get_running_loop().time() + timeout
         while True:
@@ -589,17 +619,18 @@ class BrokerBuzzPoller:
             frame = await self._receive_frame(ws, timeout=remaining)
             if len(frame) >= 2 and frame[0] == "EOSE" and frame[1] == subscription_id:
                 return
-            allowed = {subscription_id}
-            if other_subscription:
-                allowed.add(other_subscription)
-            await self._handle_frame(ws, frame, allowed_subscriptions=allowed)
+            await self._handle_frame(
+                ws,
+                frame,
+                subscription_since=subscription_since,
+            )
 
     async def _handle_frame(
         self,
         ws,
         frame: list,
         *,
-        allowed_subscriptions: set[str] | None,
+        subscription_since: dict[str, int] | None,
     ) -> None:
         if not frame:
             raise BuzzRelayProtocolError("relay_frame_empty")
@@ -607,17 +638,23 @@ class BrokerBuzzPoller:
         if kind == "EVENT":
             if len(frame) != 3 or not isinstance(frame[1], str):
                 raise BuzzRelayProtocolError("relay_event_frame_invalid")
-            if allowed_subscriptions is not None and frame[1] not in allowed_subscriptions:
+            if subscription_since is not None and frame[1] not in subscription_since:
                 raise BuzzRelayProtocolError("relay_event_subscription_mismatch")
-            await self._processor.process_event(frame[2])
-            self._last_event_at = time.time()
+            result = await self._processor.process_event(
+                frame[2],
+                subscription_since=(
+                    subscription_since[frame[1]] if subscription_since is not None else None
+                ),
+            )
+            if result == "delivered":
+                self._last_event_at = time.time()
             return
         if kind == "AUTH" and len(frame) == 2 and isinstance(frame[1], str):
             auth_event = self._signer.sign_relay_auth(self._relay_url, frame[1])
             await self._send_frame(ws, ["AUTH", auth_event])
             return
         if kind == "CLOSED" and (
-            allowed_subscriptions is None or (len(frame) >= 2 and frame[1] in allowed_subscriptions)
+            subscription_since is None or (len(frame) >= 2 and frame[1] in subscription_since)
         ):
             raise BuzzRelayProtocolError("relay_subscription_closed")
         if kind == "NOTICE":

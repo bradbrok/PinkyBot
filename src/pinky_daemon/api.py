@@ -7687,25 +7687,28 @@ npm run build</pre>
         """One-step owner-approved Buzz bind; raw key is immediately wrapped."""
         actor = _owner_control_actor(request)
         try:
-            identity = agents.bind_buzz_identity_owner_control(
-                name,
-                private_key=req.private_key,
-                relay_url=req.relay_url,
-                community_id=req.community_id,
-                enabled=req.enabled,
-                owner_actor=actor,
-            )
-            inbound_policy = None
             if req.inbound is not None:
-                inbound_policy = agents.configure_buzz_inbound_owner_control(
+                identity, inbound_policy = agents.bind_buzz_identity_with_inbound_owner_control(
                     name,
+                    private_key=req.private_key,
+                    relay_url=req.relay_url,
+                    community_id=req.community_id,
+                    enabled=req.enabled,
                     owner_pubkey=req.inbound.owner_pubkey,
                     channels=[item.model_dump() for item in req.inbound.channels],
-                    approved_users=[
-                        item.model_dump() for item in req.inbound.approved_users
-                    ],
+                    approved_users=[item.model_dump() for item in req.inbound.approved_users],
                     owner_actor=actor,
                 )
+            else:
+                identity = agents.bind_buzz_identity_owner_control(
+                    name,
+                    private_key=req.private_key,
+                    relay_url=req.relay_url,
+                    community_id=req.community_id,
+                    enabled=req.enabled,
+                    owner_actor=actor,
+                )
+                inbound_policy = None
         except KeyError as exc:
             raise HTTPException(404, str(exc)) from exc
         except ValueError as exc:

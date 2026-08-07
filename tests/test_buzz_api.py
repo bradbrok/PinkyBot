@@ -273,6 +273,50 @@ def test_one_step_bind_configures_inbound_gates_and_starts_native_poller(
         assert health["recommendation"] != "degraded"
 
 
+def test_failed_one_step_bind_rolls_back_identity_and_policy_together(tmp_path):
+    app = _app(tmp_path)
+    agent_pubkey = BuzzNostrSigner(bytes.fromhex(PRIVATE_KEY)).pubkey
+    other_pubkey = BuzzNostrSigner(bytes.fromhex(OTHER_PRIVATE_KEY)).pubkey
+    with TestClient(app) as client:
+        for name in ("barsik", "murzik"):
+            created = client.post("/agents", json={"name": name, "model": "sonnet"})
+            assert created.status_code == 200
+
+        initial = client.put(
+            "/system/buzz-identities/barsik",
+            json=_body(enabled=False),
+        )
+        assert initial.status_code == 200
+        identity_before = app.state.agents._db.execute(
+            "SELECT * FROM buzz_identities WHERE agent='barsik'"
+        ).fetchone()
+
+        failed_rebind = client.put(
+            "/system/buzz-identities/barsik",
+            json=_body(enabled=True, inbound=_inbound_body(owner_pubkey=agent_pubkey)),
+        )
+        failed_first_bind = client.put(
+            "/system/buzz-identities/murzik",
+            json=_body(
+                private_key=OTHER_PRIVATE_KEY,
+                inbound=_inbound_body(owner_pubkey=other_pubkey),
+            ),
+        )
+
+        assert failed_rebind.status_code == 400
+        assert failed_first_bind.status_code == 400
+        assert (
+            app.state.agents._db.execute(
+                "SELECT * FROM buzz_identities WHERE agent='barsik'"
+            ).fetchone()
+            == identity_before
+        )
+        assert app.state.agents.get_buzz_identity("barsik")["enabled"] is False
+        assert app.state.agents.get_buzz_inbound_policy("barsik") is None
+        assert app.state.agents.get_buzz_identity("murzik") is None
+        assert app.state.agents.get_buzz_inbound_policy("murzik") is None
+
+
 def test_inbound_policy_rejects_caller_authority_and_internal_agent_auth(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:

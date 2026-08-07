@@ -264,9 +264,15 @@ async def test_kind_20002_is_verified_but_never_retained_or_dispatched(registry)
     broker = FakeBroker()
     processor = _processor(store, identity_pubkey, broker)
     ephemeral = _event(kind=20002, content="")
+    policy_before = store.get_buzz_inbound_policy("barsik")
+    changes_before = store._db.total_changes
 
     assert await processor.process_event(ephemeral) == "ephemeral_ignored"
+    assert await processor.process_event(ephemeral) == "ephemeral_ignored"
     assert broker.calls == []
+    assert processor._recent_ids == set()
+    assert store.get_buzz_inbound_policy("barsik") == policy_before
+    assert store._db.total_changes == changes_before
     assert store._db.execute("SELECT COUNT(*) FROM buzz_inbound_events").fetchone()[0] == 0
     with pytest.raises(ValueError, match="kind-9"):
         store.begin_buzz_inbound_event_delivery(
@@ -291,6 +297,33 @@ async def test_kind_20002_is_verified_but_never_retained_or_dispatched(registry)
             ),
         )
     store._db.rollback()
+
+
+@pytest.mark.asyncio
+async def test_subscription_floor_rejects_stale_relay_event_but_pending_replay_is_allowed(
+    registry,
+):
+    store, identity_pubkey = registry
+    now = int(time.time())
+    stale = _event(content="historic signed command", created_at=now - 86400)
+    broker = FakeBroker()
+    processor = _processor(store, identity_pubkey, broker)
+
+    assert await processor.process_event(stale, subscription_since=now - 60) == "rejected"
+    assert broker.calls == []
+    assert store._db.execute("SELECT COUNT(*) FROM buzz_inbound_events").fetchone()[0] == 0
+
+    # Only the daemon's already-verified durable retry ledger may bypass a
+    # newly computed relay subscription floor after restart/reconnect.
+    assert store.begin_buzz_inbound_event_delivery(
+        "barsik",
+        stale,
+        community_id=COMMUNITY,
+        channel_id=CHANNEL,
+    )
+    store.mark_buzz_inbound_event_retry("barsik", stale["id"], "interrupted")
+    assert await processor.replay_pending() == 1
+    assert [call[1].content for call in broker.calls] == ["historic signed command"]
 
 
 @pytest.mark.asyncio
