@@ -982,6 +982,12 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
+# A detached tmux session can reap itself just after ``new-session`` reports
+# success when the in-pane command exits immediately. Give that failure time
+# to surface, then verify the session still exists before starting the tailer
+# or declaring the transport connected (issue #513).
+_POST_SPAWN_LIVENESS_DELAY_SEC = 0.15
+
 # Per-turn timeout: how long ANY single in-flight turn can be at the
 # HEAD of ``_inflight_metas`` without its ``stop_hook_summary`` landing
 # before the watchdog considers it stuck and triggers ``force_restart``.
@@ -2853,6 +2859,31 @@ class TmuxSession:
                 f"tmux[{self.agent_name}]: cold-start timed out after "
                 f"{_COLD_START_TIMEOUT_SEC}s"
             ) from None
+
+        # ``tmux new-session -d`` only proves that tmux launched the in-pane
+        # command. The command can then fail fast (bad CLI flag, auth error,
+        # rejected model, and so on), causing tmux to auto-reap the detached
+        # session after ``new-session`` has already returned 0. Without this
+        # delayed check the transport proceeds to CONNECTED against no REPL.
+        try:
+            await asyncio.sleep(_POST_SPAWN_LIVENESS_DELAY_SEC)
+            if not await self._tmux.has_session():
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: session died immediately after "
+                    "spawn; the in-pane command exited before the REPL became "
+                    "available (inspect in-pane startup and authentication errors)"
+                )
+        except BaseException:
+            # ``new-session`` already succeeded, so cancellation during the
+            # delay or an exception from the liveness probe can otherwise
+            # leave a live tmux REPL unmanaged while the caller transitions
+            # the Python state machine to DEAD. Reap best-effort and preserve
+            # the original failure (including CancelledError).
+            try:
+                await self._tmux.kill_session()
+            except BaseException:
+                pass
+            raise
 
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
         # the end of this method (after tailer startup also succeeds),

@@ -39,6 +39,12 @@ from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 
 
+@pytest.fixture(autouse=True)
+def _skip_post_spawn_liveness_delay(monkeypatch) -> None:
+    """Keep unit tests fast while preserving the production 150 ms gate."""
+    monkeypatch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0)
+
+
 def _seed_inflight(
     ss: TmuxSession,
     *,
@@ -103,7 +109,16 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     """
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "pinky-test"
-    tmux.has_session = AsyncMock(return_value=has_session_initial)
+    # Every successful spawn now verifies that the detached session survived
+    # long enough to still exist. Alternate pre-spawn/post-spawn answers so
+    # the default mock models a healthy tmux lifecycle across reconnects.
+    async def _has_session() -> bool:
+        call_number = tmux.has_session.await_count
+        if call_number == 1:
+            return has_session_initial
+        return call_number % 2 == 0
+
+    tmux.has_session = AsyncMock(side_effect=_has_session)
     tmux.new_session = AsyncMock(return_value=_ok())
     tmux.kill_session = AsyncMock(return_value=_ok())
     tmux.rename_session = AsyncMock(return_value=_ok())
@@ -220,6 +235,87 @@ async def test_cold_start_failure_drives_to_dead_via_boot_failed() -> None:
     ss, _ = _make_session(tmux=tmux)
     with pytest.raises(RuntimeError, match="tmux new-session failed"):
         await ss.connect()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_verifies_spawned_session_before_connected() -> None:
+    """A surviving session passes the delayed post-spawn liveness gate."""
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+
+    await ss.connect()
+
+    assert tmux.has_session.await_count == 2
+    assert ss.state == SessionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_cold_start_self_reaped_session_fails_loudly_via_boot_failed() -> None:
+    """A successful spawn followed by self-reap must never look connected."""
+    tmux = _make_mock_tmux()
+    tmux.has_session = AsyncMock(side_effect=[False, False])
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="session died immediately after spawn.*inspect in-pane startup",
+    ):
+        await ss.connect()
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_liveness_probe_error_reaps_spawned_session() -> None:
+    """A failed post-spawn probe must not leave the new tmux session live."""
+    tmux = _make_mock_tmux()
+    tmux.has_session = AsyncMock(
+        side_effect=[False, RuntimeError("liveness probe timed out")]
+    )
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="liveness probe timed out"):
+        await ss.connect()
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_cancellation_during_liveness_delay_reaps_session(
+    monkeypatch,
+) -> None:
+    """Cancellation after spawn success rolls back the unmanaged REPL."""
+    delay_started = asyncio.Event()
+    release_delay = asyncio.Event()
+
+    async def blocking_sleep(_delay: float) -> None:
+        delay_started.set()
+        await release_delay.wait()
+
+    monkeypatch.setattr(tmux_session.asyncio, "sleep", blocking_sleep)
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    connect_task = asyncio.create_task(ss.connect())
+    await delay_started.wait()
+    connect_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
     assert ss.state == SessionState.DEAD
 
 
@@ -7730,6 +7826,7 @@ class TestForceFreshContextOnceDeferredConsume:
         tmux = _make_mock_tmux()
         # First call fails, second call succeeds.
         tmux.new_session = AsyncMock(side_effect=[_fail("rc=1"), _ok()])
+        tmux.has_session = AsyncMock(side_effect=[False, False, True])
         ss, _ = _make_session(tmux=tmux)
 
         # Seed flag + prior transcript so suppression is meaningful.
