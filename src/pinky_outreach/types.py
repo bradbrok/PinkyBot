@@ -11,6 +11,7 @@ class Platform(str, Enum):
     telegram = "telegram"
     discord = "discord"
     slack = "slack"
+    buzz = "buzz"
     imessage = "imessage"
     email = "email"
     whatsapp = "whatsapp"

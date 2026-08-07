@@ -9,7 +9,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character
@@ -566,6 +566,17 @@ class SetAgentTokenRequest(BaseModel):
     token_ref: str = ""
     enabled: bool = True
     settings: dict = Field(default_factory=dict)
+
+
+class BindBuzzIdentityRequest(BaseModel):
+    """Owner-control request to bind one encrypted Buzz identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    private_key: str
+    relay_url: str
+    community_id: str
+    enabled: bool = True
 
 
 class AddMcpServerRequest(BaseModel):
