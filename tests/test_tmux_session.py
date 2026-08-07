@@ -10606,3 +10606,59 @@ def test_normalize_prompt_unicode() -> None:
     assert (
         tmux_session._normalize_prompt(nfc) == tmux_session._normalize_prompt(nfd)
     )
+
+
+def test_match_acceptance_turn_handles_nfd_nfc_mismatch() -> None:
+    """End-to-end: _match_acceptance_turn matches prompts despite NFC/NFD mismatch.
+
+    Tests the full acceptance-turn matching logic from #420 fix. When a transcript
+    prompt comes in as NFD (combining characters) but the scheduled prompt was
+    persisted as NFC (or vice versa), the match should succeed via normalized
+    comparison. This verifies the fix for the redelivery loop bug.
+    """
+    import unicodedata
+    import time
+
+    ss, _ = _make_session()
+
+    # Create a turn with prompt in NFC form (as persisted from scheduler)
+    nfc_prompt = unicodedata.normalize("NFC", "📊 Café résumé — report")
+    nfd_prompt = unicodedata.normalize("NFD", "📊 Café résumé — report")
+
+    # They should be different at byte level
+    assert nfc_prompt != nfd_prompt
+
+    # Create a queued turn with NFC prompt
+    turn = tmux_session._QueuedTurn(prompt=nfc_prompt)
+    turn.pane_delivery_started = True
+    turn.transport_accepted = False
+    turn.submission_receipt = None
+
+    # Add to scheduler pending turns (where _match_acceptance_turn looks)
+    ss._scheduler_pending_turns.append(turn)
+
+    # Now try to match with NFD prompt (as would come from transcript)
+    matched_turn = ss._match_acceptance_turn(nfd_prompt)
+
+    # Should match successfully despite NFC/NFD mismatch
+    assert matched_turn is not None, (
+        f"Failed to match NFC prompt {nfc_prompt!r} against NFD "
+        f"prompt {nfd_prompt!r} — normalization fix not working"
+    )
+    assert matched_turn.prompt == nfc_prompt
+
+    # Also test the reverse: NFC in queue, NFD from transcript
+    nfd_turn = tmux_session._QueuedTurn(prompt=nfd_prompt)
+    nfd_turn.pane_delivery_started = True
+    nfd_turn.transport_accepted = False
+    nfd_turn.submission_receipt = None
+
+    ss._scheduler_pending_turns = [nfd_turn]
+
+    # Match with NFC from transcript
+    matched_turn = ss._match_acceptance_turn(nfc_prompt)
+    assert matched_turn is not None, (
+        f"Failed to match NFD prompt {nfd_prompt!r} against NFC "
+        f"prompt {nfc_prompt!r} — normalization asymmetry"
+    )
+    assert matched_turn.prompt == nfd_prompt
