@@ -1945,6 +1945,39 @@ class TestScheduler:
         )
 
     @pytest.mark.asyncio
+    async def test_replay_logs_live_zombie_park_noop(
+        self, registry, monkeypatch, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="zombie",
+            prompt="never deliver",
+            fired_at=100.0,
+        )
+        registry.remove_schedule(schedule.id)
+        monkeypatch.setattr(
+            registry,
+            "park_pending_schedule_wake",
+            lambda pending_id, **kwargs: False,
+        )
+
+        scheduler = AgentScheduler(registry)
+        await scheduler._replay_pending_locked("oleg")
+
+        stored = registry.get_schedule_wake_by_fire(schedule.id, 100.0)
+        assert stored is not None
+        assert stored.to_dict() == pending.to_dict()
+        error_log = capsys.readouterr().err
+        assert "PERSISTED_WAKE_ZOMBIE_PARK_NOOP" in error_log
+        assert f"pending #{pending.id}" in error_log
+        assert "PERSISTED_WAKE_ZOMBIE_QUARANTINED" not in error_log
+
+    @pytest.mark.asyncio
     async def test_terminal_zombie_head_retires_and_fifo_advances(
         self, registry, capsys
     ):
