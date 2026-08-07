@@ -2865,13 +2865,25 @@ class TmuxSession:
         # rejected model, and so on), causing tmux to auto-reap the detached
         # session after ``new-session`` has already returned 0. Without this
         # delayed check the transport proceeds to CONNECTED against no REPL.
-        await asyncio.sleep(_POST_SPAWN_LIVENESS_DELAY_SEC)
-        if not await self._tmux.has_session():
-            raise RuntimeError(
-                f"tmux[{self.agent_name}]: session died immediately after "
-                "spawn; the in-pane command exited before the REPL became "
-                "available (inspect in-pane startup and authentication errors)"
-            )
+        try:
+            await asyncio.sleep(_POST_SPAWN_LIVENESS_DELAY_SEC)
+            if not await self._tmux.has_session():
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: session died immediately after "
+                    "spawn; the in-pane command exited before the REPL became "
+                    "available (inspect in-pane startup and authentication errors)"
+                )
+        except BaseException:
+            # ``new-session`` already succeeded, so cancellation during the
+            # delay or an exception from the liveness probe can otherwise
+            # leave a live tmux REPL unmanaged while the caller transitions
+            # the Python state machine to DEAD. Reap best-effort and preserve
+            # the original failure (including CancelledError).
+            try:
+                await self._tmux.kill_session()
+            except BaseException:
+                pass
+            raise
 
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
         # the end of this method (after tailer startup also succeeds),

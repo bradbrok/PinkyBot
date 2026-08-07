@@ -265,6 +265,56 @@ async def test_cold_start_self_reaped_session_fails_loudly_via_boot_failed() -> 
         await ss.connect()
 
     tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_liveness_probe_error_reaps_spawned_session() -> None:
+    """A failed post-spawn probe must not leave the new tmux session live."""
+    tmux = _make_mock_tmux()
+    tmux.has_session = AsyncMock(
+        side_effect=[False, RuntimeError("liveness probe timed out")]
+    )
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="liveness probe timed out"):
+        await ss.connect()
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_cancellation_during_liveness_delay_reaps_session(
+    monkeypatch,
+) -> None:
+    """Cancellation after spawn success rolls back the unmanaged REPL."""
+    delay_started = asyncio.Event()
+    release_delay = asyncio.Event()
+
+    async def blocking_sleep(_delay: float) -> None:
+        delay_started.set()
+        await release_delay.wait()
+
+    monkeypatch.setattr(tmux_session.asyncio, "sleep", blocking_sleep)
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    connect_task = asyncio.create_task(ss.connect())
+    await delay_started.wait()
+    connect_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
     ss._start_tailer.assert_not_awaited()
     assert ss.state == SessionState.DEAD
 
