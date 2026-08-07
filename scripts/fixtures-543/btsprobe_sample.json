@@ -1,0 +1,239 @@
+{
+  "asUser": "<redacted>",
+  "from": "2026-08-07",
+  "to": "2026-08-10",
+  "access": {
+    "danielson": true,
+    "daniel": true,
+    "aldo": true,
+    "julie": true,
+    "group": true
+  },
+  "api": {
+    "danielson": {
+      "n": 3,
+      "sample": [
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T10:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T13:00:00-07:00",
+          "transparency": "transparent",
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T15:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        }
+      ]
+    },
+    "daniel": {
+      "n": 3,
+      "sample": [
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T13:00:00-07:00",
+          "transparency": "transparent",
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T11:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T09:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        }
+      ]
+    },
+    "aldo": {
+      "n": 1,
+      "sample": [
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T08:30:00-07:00",
+          "transparency": "transparent",
+          "eventType": "default"
+        }
+      ]
+    },
+    "julie": {
+      "n": 4,
+      "sample": [
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T08:30:00-07:00",
+          "transparency": "transparent",
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T16:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T09:30:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        }
+      ]
+    },
+    "group": {
+      "n": 5,
+      "sample": [
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T16:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T09:30:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        },
+        {
+          "summary": "<redacted>",
+          "start": "2026-08-07T09:00:00-07:00",
+          "transparency": null,
+          "eventType": "default"
+        }
+      ]
+    }
+  },
+    "freebusy": {
+      "aldo@posspecialists.com": "0 busy blocks",
+      "daniel@posspecialists.com": "2 busy blocks",
+      "julie@posspecialists.com": "3 busy blocks",
+      "c_a9f78bede90bb320f7110b1ece4dc19fab768ed7c47a848abaa87e3d1c34a9c0@group.calendar.google.com": "3 busy blocks",
+      "dmartinez@posspecialists.com": "2 busy blocks"
+    },
+    "scan": {
+      "members": {
+        "danielson": {
+          "2026-08-07": [
+            {
+              "type": "appt",
+              "h0": 10,
+              "h1": 12,
+              "rsvp": ""
+            },
+            {
+              "type": "queue",
+              "h0": 13,
+              "h1": 17,
+              "rsvp": "accepted"
+            },
+            {
+              "type": "build",
+              "h0": 15,
+              "h1": 16,
+              "rsvp": "needsAction"
+            }
+          ]
+        },
+        "daniel": {
+          "2026-08-07": [
+            {
+              "type": "queue",
+              "h0": 13,
+              "h1": 17,
+              "rsvp": "accepted"
+            },
+            {
+              "type": "appt",
+              "h0": 11,
+              "h1": 12,
+              "rsvp": "accepted"
+            },
+            {
+              "type": "build",
+              "h0": 9,
+              "h1": 10,
+              "rsvp": "accepted"
+            }
+          ]
+        },
+        "aldo": {
+          "2026-08-07": [
+            {
+              "type": "queue",
+              "h0": 8,
+              "h1": 13,
+              "rsvp": "accepted"
+            }
+          ]
+        },
+        "julie": {
+          "2026-08-07": [
+            {
+              "type": "queue",
+              "h0": 8,
+              "h1": 13,
+              "rsvp": "accepted"
+            },
+            {
+              "type": "build",
+              "h0": 16,
+              "h1": 17,
+              "rsvp": "accepted"
+            },
+            {
+              "type": "build",
+              "h0": 9,
+              "h1": 11,
+              "rsvp": "accepted"
+            },
+            {
+              "type": "build",
+              "h0": 11,
+              "h1": 12,
+              "rsvp": "accepted"
+            }
+          ]
+        }
+      },
+      "group": {
+        "2026-08-07": [
+          {
+            "title": "<redacted>",
+            "h0": 16,
+            "h1": 17
+          },
+          {
+            "title": "<redacted>",
+            "h0": 9,
+            "h1": 11
+          },
+          {
+            "title": "<redacted>",
+            "h0": 9,
+            "h1": 10
+          },
+          {
+            "title": "<redacted>",
+            "h0": 11,
+            "h1": 12
+          },
+          {
+            "title": "<redacted>",
+            "h0": 15,
+            "h1": 16
+          }
+        ]
+      }
+    }
+}
