@@ -1886,6 +1886,65 @@ class TestScheduler:
         assert f"schedule #{zombie.id}" in error_log
 
     @pytest.mark.asyncio
+    async def test_replay_quarantines_live_zombie_once_then_skips_terminal_row(
+        self, registry, monkeypatch, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="zombie",
+            prompt="never deliver",
+            fired_at=100.0,
+        )
+        registry.remove_schedule(schedule.id)
+        park_calls: list[int] = []
+        original_park = registry.park_pending_schedule_wake
+
+        def tracked_park(pending_id, **kwargs):
+            park_calls.append(pending_id)
+            return original_park(pending_id, **kwargs)
+
+        monkeypatch.setattr(
+            registry, "park_pending_schedule_wake", tracked_park
+        )
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        first_boot = AgentScheduler(registry, wake_callback=confirmed)
+        await first_boot._replay_pending_locked("oleg")
+        first_terminal_state = registry.get_schedule_wake_by_fire(
+            schedule.id, 100.0
+        ).to_dict()
+
+        for _ in range(5):
+            later_boot = AgentScheduler(registry, wake_callback=confirmed)
+            await later_boot._replay_pending_locked("oleg")
+
+        assert attempts == []
+        assert park_calls == [pending.id]
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, 100.0
+        ).to_dict() == first_terminal_state
+        assert first_terminal_state["state"] == "quarantined"
+        assert first_terminal_state["last_error"].endswith(
+            "schedule deleted"
+        )
+        assert (
+            capsys.readouterr().err.count(
+                "PERSISTED_WAKE_ZOMBIE_QUARANTINED"
+            )
+            == 1
+        )
+
+    @pytest.mark.asyncio
     async def test_terminal_zombie_head_retires_and_fifo_advances(
         self, registry, capsys
     ):

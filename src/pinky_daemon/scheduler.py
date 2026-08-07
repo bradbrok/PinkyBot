@@ -905,16 +905,19 @@ class AgentScheduler:
             elif not current_schedule.enabled and not current_schedule.one_shot:
                 zombie_reason = "schedule disabled"
             if zombie_reason:
+                if pending.parked_at != 0:
+                    continue
                 quarantined = self._registry.park_pending_schedule_wake(
                     pending.id,
                     reason=f"terminal replay policy: {zombie_reason}",
                 )
-                _log(
-                    f"scheduler: PERSISTED_WAKE_ZOMBIE_QUARANTINED pending "
-                    f"#{pending.id}, schedule #{pending.schedule_id} for "
-                    f"agent '{pending.agent_name}': {zombie_reason}; "
-                    f"quarantined={quarantined}"
-                )
+                if quarantined:
+                    _log(
+                        f"scheduler: PERSISTED_WAKE_ZOMBIE_QUARANTINED pending "
+                        f"#{pending.id}, schedule #{pending.schedule_id} for "
+                        f"agent '{pending.agent_name}': {zombie_reason}; "
+                        "quarantined=True"
+                    )
                 continue
             if pending.parked_at == 0:
                 pending_wakes.append(pending)
