@@ -8,7 +8,7 @@ import json
 import secrets
 import sys
 import time
-from collections import deque
+from collections import OrderedDict, deque
 from dataclasses import dataclass
 from typing import Any, Callable
 from uuid import UUID
@@ -28,6 +28,14 @@ _MAX_TAG_PARTS = 4
 _MAX_TAG_PART_BYTES = 512
 _MAX_FUTURE_SECONDS = 5 * 60
 _RECENT_EVENT_IDS = 4096
+_POLICY_DROP_LOG_INTERVAL_SECONDS = 15 * 60
+_POLICY_DROP_LOG_KEYS = 4096
+_POLICY_DROP_PUBKEY_PREFIX = 12
+
+_POLICY_DROP_REASONS = {
+    "target_pubkey_foreign": "foreign_p",
+    "event_kind_not_allowed": "unknown_kind",
+}
 
 
 def _log(message: str) -> None:
@@ -256,6 +264,7 @@ class BuzzInboundProcessor:
         self._clock = clock
         self._recent_order: deque[str] = deque()
         self._recent_ids: set[str] = set()
+        self._policy_drop_logs: OrderedDict[tuple[str, str, str], tuple[float, int]] = OrderedDict()
         self.stats = {
             "delivered": 0,
             "duplicates": 0,
@@ -274,6 +283,52 @@ class BuzzInboundProcessor:
             self._recent_ids.discard(self._recent_order.popleft())
         return True
 
+    def _log_policy_drop(self, reason: str, sender_pubkey: str, channel_id: str) -> None:
+        """Emit one bounded line per policy tuple and summarize later repeats."""
+        key = (sender_pubkey, channel_id, reason)
+        now = float(self._clock())
+        previous = self._policy_drop_logs.pop(key, None)
+        if previous is not None:
+            last_logged_at, suppressed = previous
+            if now - last_logged_at < _POLICY_DROP_LOG_INTERVAL_SECONDS:
+                self._policy_drop_logs[key] = (last_logged_at, suppressed + 1)
+                return
+        else:
+            suppressed = 0
+
+        self._policy_drop_logs[key] = (now, 0)
+        while len(self._policy_drop_logs) > _POLICY_DROP_LOG_KEYS:
+            self._policy_drop_logs.popitem(last=False)
+
+        sender = f"buzz:{self.community_id}:{sender_pubkey[:_POLICY_DROP_PUBKEY_PREFIX]}…"
+        summary = f" suppressed_since_last={suppressed}" if suppressed else ""
+        _log(
+            "buzz-inbound: policy drop "
+            f"reason={reason} sender={sender} channel={channel_id}{summary}"
+        )
+
+    def _log_rejected_policy_event(self, event: object, rejection: str) -> None:
+        reason = _POLICY_DROP_REASONS.get(rejection)
+        if reason is None or not isinstance(event, dict):
+            return
+        sender_pubkey = event.get("pubkey")
+        if not _is_hex_64(sender_pubkey):
+            return
+        channel_id = "unknown"
+        tags = event.get("tags")
+        if isinstance(tags, list):
+            channel_tags = [
+                tag for tag in tags if isinstance(tag, list) and len(tag) == 2 and tag[0] == "h"
+            ]
+            if len(channel_tags) == 1:
+                candidate = channel_tags[0][1]
+                try:
+                    if str(UUID(candidate)) == candidate:
+                        channel_id = candidate
+                except (TypeError, ValueError, AttributeError):
+                    pass
+        self._log_policy_drop(reason, sender_pubkey, channel_id)
+
     async def process_event(
         self,
         event: object,
@@ -290,8 +345,9 @@ class BuzzInboundProcessor:
                 # subscription and are the only sanctioned freshness bypass.
                 subscription_since=None if replay else subscription_since,
             )
-        except BuzzInboundRejectedError:
+        except BuzzInboundRejectedError as exc:
             self.stats["rejected"] += 1
+            self._log_rejected_policy_event(event, str(exc))
             return "rejected"
 
         # kind-20002 is typing/diagnostic only. Return before the in-memory
@@ -334,6 +390,11 @@ class BuzzInboundProcessor:
         )
         if author is None:
             self.stats["unapproved_principal"] += 1
+            self._log_policy_drop(
+                "unverified_sender",
+                validated.event["pubkey"],
+                validated.channel_id,
+            )
             return "unapproved_principal"
 
         self._registry.note_buzz_inbound_principal_seen(

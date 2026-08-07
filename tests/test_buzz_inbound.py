@@ -7,6 +7,7 @@ import time
 
 import pytest
 
+import pinky_daemon.buzz_inbound as buzz_inbound
 from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.broker import MessageBroker
 from pinky_daemon.buzz_inbound import (
@@ -231,6 +232,72 @@ async def test_both_gates_signature_self_and_dedupe_fail_closed(registry):
     assert await processor.process_event(valid) == "delivered"
     assert await processor.process_event(valid) == "duplicate"
     assert len(broker.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_policy_drops_log_once_per_tuple_without_full_pubkeys(registry, capsys):
+    store, identity_pubkey = registry
+    broker = FakeBroker()
+    now = [time.time()]
+    processor = BuzzInboundProcessor(
+        registry=store,
+        broker=broker,
+        agent_name="barsik",
+        identity_pubkey=identity_pubkey,
+        community_id=COMMUNITY,
+        relay_url=RELAY,
+        clock=lambda: now[0],
+    )
+    foreign_p = _event(
+        signer=OWNER,
+        content="@Ryan reply here again",
+        p_tags=[STRANGER.pubkey],
+    )
+    unverified = _event(signer=STRANGER, content="no")
+    unknown_kind = _event(signer=USER, kind=42, content="unknown")
+
+    assert await processor.process_event(foreign_p) == "rejected"
+    assert await processor.process_event(unverified) == "unapproved_principal"
+    assert await processor.process_event(unknown_kind) == "rejected"
+    assert broker.calls == []
+
+    lines = capsys.readouterr().err.splitlines()
+    assert len(lines) == 3
+    assert any(
+        f"reason=foreign_p sender=buzz:{COMMUNITY}:{OWNER.pubkey[:12]}… channel={CHANNEL}" in line
+        for line in lines
+    )
+    assert any(
+        f"reason=unverified_sender sender=buzz:{COMMUNITY}:{STRANGER.pubkey[:12]}… "
+        f"channel={CHANNEL}" in line
+        for line in lines
+    )
+    assert any(
+        f"reason=unknown_kind sender=buzz:{COMMUNITY}:{USER.pubkey[:12]}… channel={CHANNEL}" in line
+        for line in lines
+    )
+    for pubkey in (OWNER.pubkey, USER.pubkey, STRANGER.pubkey):
+        assert pubkey not in "\n".join(lines)
+    assert all(len(line) < 192 for line in lines)
+
+    assert await processor.process_event(foreign_p) == "rejected"
+    assert (
+        await processor.process_event(_event(signer=STRANGER, content="still chatty"))
+        == "unapproved_principal"
+    )
+    assert await processor.process_event(unknown_kind) == "rejected"
+    assert capsys.readouterr().err == ""
+
+    now[0] += buzz_inbound._POLICY_DROP_LOG_INTERVAL_SECONDS
+    assert (
+        await processor.process_event(_event(signer=STRANGER, content="after window"))
+        == "unapproved_principal"
+    )
+    summary = capsys.readouterr().err
+    assert summary.count("\n") == 1
+    assert "reason=unverified_sender" in summary
+    assert "suppressed_since_last=1" in summary
+    assert STRANGER.pubkey not in summary
 
 
 @pytest.mark.asyncio
