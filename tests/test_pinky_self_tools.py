@@ -2111,6 +2111,49 @@ class TestResearchPipeline:
             result = _tools(srv)["get_my_research_assignments"]()
         assert "Failed" in result
 
+    def test_update_research_status_sends_put_with_status(self, srv):
+        """The RESEARCH LIFECYCLE directive tells agents to call this tool."""
+        calls = []
+
+        def _urlopen(req, timeout=30):
+            calls.append((req.method, req.full_url, json.loads(req.data)))
+            body = json.dumps({"id": 7, "title": "MiCA", "status": "researching"}).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            result = _tools(srv)["update_research_status"](topic_id=7, status="researching")
+
+        assert calls, "no HTTP call was made"
+        method, url, body = calls[0]
+        assert method == "PUT"
+        assert url.endswith("/research/7")
+        assert body == {"status": "researching"}
+        assert "researching" in result
+
+    def test_update_research_status_rejects_invalid_status(self, srv):
+        """An unknown status must fail fast, without touching the API."""
+        calls = []
+
+        def _urlopen(req, timeout=30):
+            calls.append(req.full_url)
+            raise AssertionError("API must not be called for an invalid status")
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            result = _tools(srv)["update_research_status"](topic_id=7, status="banana")
+
+        assert not calls
+        assert "banana" in result
+        assert "researching" in result, "the error should list the valid statuses"
+
+    def test_update_research_status_error(self, srv):
+        with _ok({"error": "Topic not found"}):
+            result = _tools(srv)["update_research_status"](topic_id=999, status="in_review")
+        assert "Failed" in result
+
 
 # ── render_pdf ────────────────────────────────────────────────────────────────
 
@@ -2281,13 +2324,14 @@ class TestToolGates:
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_72_tools(self):
+    def test_all_gates_has_73_tools(self):
         """All gates → full tool set.
 
         +1 in #145 with ``register_agent`` (admin gate) → 69, then +1 in #663
         with the core ``mcp_probe`` tool → 70. (Had dropped 69→68 in #552 with
         the removal of ``request_sleep``.) #924 adds ``update_wake_schedule``
-        → 71; #984 adds sanctioned pending-wake discard → 72.
+        → 71; #984 adds sanctioned pending-wake discard → 72; #358 adds
+        ``update_research_status`` (research gate) → 73.
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2295,7 +2339,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 72
+        assert len(tools) == 73
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""
