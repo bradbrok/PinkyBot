@@ -12579,11 +12579,16 @@ npm run build</pre>
         """Get scheduler status."""
         all_schedules = agents.get_all_schedules(enabled_only=False)
         auto_start = agents.list_auto_start_agents()
+        pending_health = agents.get_pending_schedule_wake_health()
         return {
             "running": scheduler.running,
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
+            "pending_schedule_wakes": pending_health,
+            "pending_schedule_wake_count": sum(
+                row["count"] for row in pending_health
+            ),
         }
 
     @app.get("/settings/heartbeat")

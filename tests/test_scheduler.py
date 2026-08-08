@@ -465,6 +465,54 @@ class TestAgentSchedules:
         stored = registry.get_schedules("oleg")[0]
         assert stored.last_delivered == pytest.approx(delivered_at)
 
+    def test_pending_schedule_wake_health_counts_active_rows_only(self, registry):
+        registry.register("oleg")
+        registry.register("barsik")
+        first = registry.add_schedule(
+            "oleg", "* * * * *", name="first", prompt="one"
+        )
+        second = registry.add_schedule(
+            "barsik", "* * * * *", name="second", prompt="two"
+        )
+        old, _ = registry.persist_schedule_wake(
+            first.id,
+            agent_name="oleg",
+            schedule_name="first",
+            prompt="one",
+            fired_at=100.0,
+        )
+        quarantined, _ = registry.persist_schedule_wake(
+            first.id,
+            agent_name="oleg",
+            schedule_name="first",
+            prompt="parked",
+            fired_at=200.0,
+        )
+        accepted, _ = registry.persist_schedule_wake(
+            second.id,
+            agent_name="barsik",
+            schedule_name="second",
+            prompt="accepted",
+            fired_at=300.0,
+        )
+        assert registry.park_pending_schedule_wake(quarantined.id)
+        assert registry.confirm_pending_schedule_wake(
+            accepted.id, delivered_at=400.0
+        )
+
+        health = registry.get_pending_schedule_wake_health(now=500.0)
+
+        assert health == [
+            {
+                "agent_name": "oleg",
+                "count": 1,
+                "oldest_fired_at": 100.0,
+                "newest_fired_at": 100.0,
+                "oldest_age_seconds": 400.0,
+            }
+        ]
+        assert old.id > 0
+
     def test_schedule_wake_ledger_exposes_exact_terminal_states(self, registry):
         registry.register("oleg")
         schedule = registry.add_schedule(
@@ -1256,6 +1304,98 @@ class TestScheduler:
         assert attempts == ["run once"]
 
     @pytest.mark.asyncio
+    async def test_replay_drops_row_older_than_its_fire_interval(
+        self, registry, monkeypatch, capsys
+    ):
+        """A frozen prompt older than the schedule cadence never executes."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="minutely", prompt="frozen"
+        )
+        now = 1_800_000_000.0
+        stale, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="minutely",
+            prompt="stale frozen prompt",
+            fired_at=now - 61.0,
+        )
+        boundary, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="minutely",
+            prompt="boundary frozen prompt",
+            fired_at=now - 60.0,
+        )
+        fresh, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="minutely",
+            prompt="fresh frozen prompt",
+            fired_at=now - 59.0,
+        )
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        await scheduler._replay_pending_locked("oleg")
+
+        assert attempts == ["boundary frozen prompt", "fresh frozen prompt"]
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, stale.fired_at
+        ) is None
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, boundary.fired_at
+        ).accepted_at == pytest.approx(now)
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fresh.fired_at
+        ).accepted_at == pytest.approx(now)
+        logs = capsys.readouterr().err
+        assert f"PERSISTED_WAKE_STALE_DROPPED pending #{stale.id}" in logs
+        assert "count=3" in logs
+        assert "oldest_age_s=61.0" in logs
+
+    @pytest.mark.asyncio
+    async def test_replay_ceiling_drops_sparse_schedule_before_next_fire(
+        self, registry, monkeypatch
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="daily", prompt="too late"
+        )
+        now = 1_800_000_000.0
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="daily",
+            prompt="too late",
+            fired_at=now - 3_601.0,
+        )
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            attempts.append(prompt)
+            return True
+
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            pending_wake_max_age_sec=3_600.0,
+        )
+        await scheduler._replay_pending_locked("oleg")
+
+        assert attempts == []
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ) is None
+
+    @pytest.mark.asyncio
     async def test_kill_after_durable_accept_before_future_resolve_never_replays(
         self, capsys
     ):
@@ -1790,19 +1930,20 @@ class TestScheduler:
         schedule = registry.add_schedule(
             "oleg", "* * * * *", name="fifo", prompt="unused"
         )
+        now = time.time()
         registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="fifo",
             prompt="oldest",
-            fired_at=100.0,
+            fired_at=now - 2.0,
         )
         registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="fifo",
             prompt="newer",
-            fired_at=200.0,
+            fired_at=now - 1.0,
         )
         attempts: list[str] = []
 
@@ -1834,7 +1975,7 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="storm-head",
             prompt="retry me",
-            fired_at=100.0,
+            fired_at=time.time(),
         )
         attempts: list[str] = []
         alerts: list[tuple[str, str]] = []
@@ -1892,7 +2033,7 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="eventual",
             prompt="confirm me",
-            fired_at=100.0,
+            fired_at=time.time(),
         )
         for expected in range(1, AgentScheduler.PERSISTED_WAKE_ATTEMPT_CAP):
             assert (
@@ -1926,12 +2067,13 @@ class TestScheduler:
         zombie = registry.add_schedule(
             "oleg", "* * * * *", name="zombie", prompt="never deliver"
         )
+        now = time.time()
         registry.persist_schedule_wake(
             stuck.id,
             agent_name="oleg",
             schedule_name="stuck",
             prompt="stuck head",
-            fired_at=100.0,
+            fired_at=now - 1.0,
         )
         registry.persist_schedule_wake(
             zombie.id,
@@ -2068,6 +2210,7 @@ class TestScheduler:
         live = registry.add_schedule(
             "oleg", "* * * * *", name="live", prompt="unused"
         )
+        now = time.time()
         registry.persist_schedule_wake(
             zombie.id,
             agent_name="oleg",
@@ -2080,14 +2223,14 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="live",
             prompt="live one",
-            fired_at=200.0,
+            fired_at=now - 2.0,
         )
         registry.persist_schedule_wake(
             live.id,
             agent_name="oleg",
             schedule_name="live",
             prompt="live two",
-            fired_at=300.0,
+            fired_at=now - 1.0,
         )
         registry.remove_schedule(zombie.id)
         attempts: list[str] = []

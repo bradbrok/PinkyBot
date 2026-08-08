@@ -5374,6 +5374,28 @@ class TestAgentScheduleEndpoints:
         assert body["records"][0]["state"] == "receipted-ran-once"
         assert body["records"][0]["fired_at"] == 100.0
 
+    def test_scheduler_status_surfaces_pending_count_and_age(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+        registry = client.app.state.agents
+        registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="frozen",
+            fired_at=time.time() - 120.0,
+        )
+
+        response = client.get("/scheduler/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["pending_schedule_wake_count"] == 1
+        assert body["pending_schedule_wakes"][0]["agent_name"] == "alice"
+        assert body["pending_schedule_wakes"][0]["count"] == 1
+        assert body["pending_schedule_wakes"][0]["oldest_age_seconds"] >= 119
+
 
 # ── Agent CRUD ───────────────────────────────────────────────
 
