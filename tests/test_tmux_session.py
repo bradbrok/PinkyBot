@@ -952,19 +952,31 @@ async def test_run_delegates_built_argv_to_injected_runner() -> None:
         def __init__(self):
             self.argv = None
             self.timeout = None
+            self.stdin_data = None
 
-        async def run(self, argv, *, timeout=None, stdin=None):
+        async def run(self, argv, *, timeout=None, stdin_data=None):
             self.argv = argv
             self.timeout = timeout
+            self.stdin_data = stdin_data
             return CommandResult(0, b"out", b"err")
 
     rec = _Recording()
     tmux = _TmuxControl("pinky-test", socket_name="pinkysock", command_runner=rec)
-    result = await tmux._run("has-session", "-t", "pinky-test", timeout=5.0)
+    result = await tmux._run(
+        "load-buffer",
+        "-b",
+        "pinky-test",
+        "-",
+        timeout=5.0,
+        stdin_data=b"prompt bytes",
+    )
 
     # Built argv includes the base cmd (binary + socket flag) then the args.
-    assert rec.argv == ["tmux", "-L", "pinkysock", "has-session", "-t", "pinky-test"]
+    assert rec.argv == [
+        "tmux", "-L", "pinkysock", "load-buffer", "-b", "pinky-test", "-",
+    ]
     assert rec.timeout == 5.0
+    assert rec.stdin_data == b"prompt bytes"
     assert result.returncode == 0
     assert result.stdout == "out"  # bytes decoded
     assert result.stderr == "err"
@@ -977,7 +989,7 @@ async def test_run_propagates_runner_timeout() -> None:
     from pinky_daemon.command_runner import CommandRunner
 
     class _TimingOut(CommandRunner):
-        async def run(self, argv, *, timeout=None, stdin=None):
+        async def run(self, argv, *, timeout=None, stdin_data=None):
             raise asyncio.TimeoutError
 
     tmux = _TmuxControl("pinky-test", command_runner=_TimingOut())
@@ -1086,18 +1098,20 @@ async def test_resize_pane_swallows_subprocess_exceptions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paste_text_sets_buffer_pastes_and_sends_enter() -> None:
+async def test_paste_text_loads_buffer_pastes_and_sends_enter() -> None:
     """``_TmuxControl.paste_text`` must invoke three tmux subcommands
-    in order: ``set-buffer``, ``paste-buffer -p`` (bracketed paste),
+    in order: ``load-buffer -`` (stdin), ``paste-buffer -p`` (bracketed paste),
     then ``send-keys Enter``. The bracketed-paste mode is what makes
     this reliable across the claude cold-start splash UI (#514).
     """
     tmux = _TmuxControl("pinky-test")
 
     calls: list[tuple[str, ...]] = []
+    stdin_payloads: list[bytes | None] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
+        stdin_payloads.append(stdin_data)
         return _ok()
 
     tmux._run = fake_run
@@ -1105,13 +1119,47 @@ async def test_paste_text_sets_buffer_pastes_and_sends_enter() -> None:
 
     # Expect three commands in order.
     assert len(calls) == 3
-    assert calls[0][:3] == ("set-buffer", "-b", "pinky-pinky-test")
-    assert calls[0][3] == "hello world"
+    assert calls[0] == ("load-buffer", "-b", "pinky-pinky-test", "-")
+    assert stdin_payloads == [b"hello world", None, None]
+    assert not any("set-buffer" in call for call in calls)
     assert "paste-buffer" in calls[1][0]
     assert "-p" in calls[1]  # bracketed paste mode
     assert "-d" in calls[1]  # delete buffer after paste
     assert calls[2] == ("send-keys", "-t", "pinky-test", "Enter")
     assert result.ok
+
+
+@pytest.mark.asyncio
+async def test_paste_text_large_prompt_avoids_tmux_argv_limit() -> None:
+    """Regression for #1029: a >20 KiB prompt must travel over stdin.
+
+    The recording runner models tmux's old argv ceiling by rejecting any
+    individual argument over 16 KiB. The complete paste path still succeeds
+    because ``load-buffer -`` keeps the prompt out of argv.
+    """
+    from pinky_daemon.command_runner import CommandResult, CommandRunner
+
+    class _ArgLimitedRunner(CommandRunner):
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], bytes | None]] = []
+
+        async def run(self, argv, *, timeout=None, stdin_data=None):
+            self.calls.append((argv, stdin_data))
+            if any(len(arg.encode("utf-8")) > 16 * 1024 for arg in argv):
+                return CommandResult(1, b"", b"command too long")
+            return CommandResult(0, b"", b"")
+
+    runner = _ArgLimitedRunner()
+    tmux = _TmuxControl("pinky-test", command_runner=runner)
+    prompt = "x" * (20 * 1024 + 1)
+
+    result = await tmux.paste_text(prompt, enter=False, enter_delay_ms=0)
+
+    assert result.ok
+    load_argv, load_stdin = runner.calls[0]
+    assert load_argv[-4:] == ["load-buffer", "-b", "pinky-pinky-test", "-"]
+    assert load_stdin == prompt.encode("utf-8")
+    assert all(prompt not in arg for argv, _ in runner.calls for arg in argv)
 
 
 @pytest.mark.asyncio
@@ -1123,29 +1171,29 @@ async def test_paste_text_skips_enter_when_enter_false() -> None:
 
     calls: list[tuple[str, ...]] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
         return _ok()
 
     tmux._run = fake_run
     await tmux.paste_text("hello", enter=False, enter_delay_ms=0)
 
-    assert len(calls) == 2  # set-buffer + paste-buffer only
+    assert len(calls) == 2  # load-buffer + paste-buffer only
     assert not any("send-keys" in c[0] for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_paste_text_short_circuits_on_set_buffer_failure() -> None:
-    """If ``set-buffer`` fails (tmux server down, bad session name),
+async def test_paste_text_short_circuits_on_load_buffer_failure() -> None:
+    """If ``load-buffer`` fails (tmux server down, bad session name),
     paste_text returns the failure immediately without trying paste
     or Enter."""
     tmux = _TmuxControl("pinky-test")
 
     calls: list[tuple[str, ...]] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
-        return _fail("set-buffer broke")
+        return _fail("load-buffer broke")
 
     tmux._run = fake_run
     result = await tmux.paste_text("hello", enter_delay_ms=0)
@@ -1156,7 +1204,7 @@ async def test_paste_text_short_circuits_on_set_buffer_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_paste_text_short_circuits_on_paste_failure() -> None:
-    """If ``paste-buffer`` fails after a successful ``set-buffer``,
+    """If ``paste-buffer`` fails after a successful ``load-buffer``,
     paste_text returns the failure without trying Enter. Skipping the
     Enter avoids submitting stale buffer content from a previous turn.
     """
@@ -1164,7 +1212,7 @@ async def test_paste_text_short_circuits_on_paste_failure() -> None:
 
     calls: list[tuple[str, ...]] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
         if args[0] == "paste-buffer":
             return _fail("paste broke")
@@ -1173,7 +1221,7 @@ async def test_paste_text_short_circuits_on_paste_failure() -> None:
     tmux._run = fake_run
     result = await tmux.paste_text("hello", enter_delay_ms=0)
 
-    assert len(calls) == 2  # set-buffer + paste-buffer; no send-keys
+    assert len(calls) == 2  # load-buffer + paste-buffer; no send-keys
     assert not result.ok
 
 
@@ -1194,7 +1242,7 @@ async def test_paste_text_waits_enter_delay_between_paste_and_enter() -> None:
         # No-op the actual sleep so the test runs fast.
         await original_sleep(0)
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         return _ok()
 
     tmux._run = fake_run
@@ -9802,7 +9850,7 @@ class TestWakeSubmissionVerification:
     async def test_worker_wake_timeout_enters_one_way_no_repaste_verifier(
         self, monkeypatch,
     ) -> None:
-        """An exact row during retry set-buffer can never cause paste two."""
+        """An exact row during retry load-buffer can never cause paste two."""
         monkeypatch.setattr(
             tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.1
         )
@@ -9813,18 +9861,18 @@ class TestWakeSubmissionVerification:
             tmux_session, "_adaptive_paste_enter_delay_ms", lambda _text: 0
         )
         tmux = _TmuxControl("pinky-test")
-        set_buffers = 0
+        load_buffers = 0
         pane_pastes = 0
         first_enter_timed_out = asyncio.Event()
 
         async def run_command(*args, **_kwargs):
-            nonlocal set_buffers, pane_pastes
+            nonlocal load_buffers, pane_pastes
             command = args[0]
-            if command == "set-buffer":
-                set_buffers += 1
-                if set_buffers == 2:
+            if command == "load-buffer":
+                load_buffers += 1
+                if load_buffers == 2:
                     # Reproduce the rejected-head TOCTOU: retry passed its
-                    # last receipt check, then yielded inside set-buffer.
+                    # last receipt check, then yielded inside load-buffer.
                     await asyncio.sleep(0.02)
                 return _ok()
             if command == "paste-buffer":
@@ -9847,7 +9895,7 @@ class TestWakeSubmissionVerification:
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
         turn = _QueuedTurn(
-            prompt="receipt lands during forbidden retry set-buffer",
+            prompt="receipt lands during forbidden retry load-buffer",
             internal=True,
             reason="wake_context_restart",
             on_delivered=lambda: fires.append("delivered"),
@@ -9858,7 +9906,7 @@ class TestWakeSubmissionVerification:
         async def inject_exact_receipt() -> None:
             await first_enter_timed_out.wait()
             # On rejected a11de3cd, worker pane-probe/backoff reaches the
-            # second set-buffer before this row. The set-buffer then resumes
+            # second load-buffer before this row. The load-buffer then resumes
             # and executes a duplicate paste-buffer despite receipt=True.
             await asyncio.sleep(0.01)
             ss._on_transcript_entry(
@@ -9867,7 +9915,7 @@ class TestWakeSubmissionVerification:
                     "message": {
                         "role": "user",
                         "content": (
-                            "receipt lands during forbidden retry set-buffer"
+                            "receipt lands during forbidden retry load-buffer"
                         ),
                     },
                 }
@@ -9888,7 +9936,7 @@ class TestWakeSubmissionVerification:
         assert await receipt is True
         assert fires == ["delivered"]
         assert ss._stats["turns"] == 1
-        assert set_buffers == 1, "verified wake must never enter retry paste"
+        assert load_buffers == 1, "verified wake must never enter retry paste"
         assert pane_pastes == 1, "accepted wake must remain pane_pastes=1"
 
     @pytest.mark.asyncio

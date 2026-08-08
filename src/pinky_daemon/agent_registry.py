@@ -4316,6 +4316,29 @@ except Exception as exc:
         return [self._row_to_schedule(r) for r in rows
         ]
 
+    def get_oversized_enabled_schedule_prompts(
+        self,
+        min_length: int,
+    ) -> list[tuple[int, str, str, int]]:
+        """Return enabled schedules whose prompts exceed ``min_length``.
+
+        Only prompt metadata is selected; the prompt content itself never
+        leaves SQLite or reaches the warning log.
+        """
+        if min_length < 0:
+            raise ValueError("min_length must be non-negative")
+        rows = self._db.execute(
+            """SELECT id, agent_name, name, LENGTH(prompt)
+               FROM agent_schedules
+               WHERE enabled=1 AND LENGTH(prompt) > ?
+               ORDER BY LENGTH(prompt) DESC""",
+            (min_length,),
+        ).fetchall()
+        return [
+            (int(row[0]), str(row[1]), str(row[2]), int(row[3]))
+            for row in rows
+        ]
+
     def get_schedule(self, schedule_id: int) -> AgentSchedule | None:
         """Return one schedule regardless of enabled state."""
         row = self._db.execute(

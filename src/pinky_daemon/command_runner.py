@@ -63,9 +63,9 @@ class CommandRunner(ABC):
         argv: list[str],
         *,
         timeout: float | None = None,
-        stdin: bytes | None = None,
+        stdin_data: bytes | None = None,
     ) -> CommandResult:
-        """Execute ``argv``, optionally feeding ``stdin``.
+        """Execute ``argv``, optionally feeding ``stdin_data`` to stdin.
 
         ``timeout`` (seconds) bounds the wait; on expiry the child is killed
         and ``asyncio.TimeoutError`` propagates, matching the prior inline
@@ -86,17 +86,17 @@ class LocalCommandRunner(CommandRunner):
         argv: list[str],
         *,
         timeout: float | None = None,
-        stdin: bytes | None = None,
+        stdin_data: bytes | None = None,
     ) -> CommandResult:
         proc = await asyncio.create_subprocess_exec(
             *argv,
-            stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+            stdin=asyncio.subprocess.PIPE if stdin_data is not None else None,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
         )
         try:
             stdout, stderr = await asyncio.wait_for(
-                proc.communicate(input=stdin), timeout=timeout
+                proc.communicate(input=stdin_data), timeout=timeout
             )
         except asyncio.TimeoutError:
             try:
@@ -149,9 +149,11 @@ class RunuserCommandRunner(CommandRunner):
         argv: list[str],
         *,
         timeout: float | None = None,
-        stdin: bytes | None = None,
+        stdin_data: bytes | None = None,
     ) -> CommandResult:
-        return await self._inner.run(self.wrap(argv), timeout=timeout, stdin=stdin)
+        return await self._inner.run(
+            self.wrap(argv), timeout=timeout, stdin_data=stdin_data
+        )
 
 
 class ContainerCommandRunner(CommandRunner):
@@ -210,6 +212,14 @@ class ContainerCommandRunner(CommandRunner):
         argv: list[str],
         *,
         timeout: float | None = None,
-        stdin: bytes | None = None,
+        stdin_data: bytes | None = None,
     ) -> CommandResult:
-        return await self._inner.run(self.wrap(argv), timeout=timeout, stdin=stdin)
+        wrapped = self.wrap(argv)
+        if stdin_data is not None:
+            # ``podman exec`` only attaches its stdin to the containerized
+            # command with ``-i``. Without it, bytes reach podman but never the
+            # inner tmux ``load-buffer -`` process.
+            wrapped.insert(2, "-i")
+        return await self._inner.run(
+            wrapped, timeout=timeout, stdin_data=stdin_data
+        )

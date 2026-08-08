@@ -49,7 +49,7 @@ class _RecordingInner:
     def __init__(self):
         self.calls: list[list[str]] = []
 
-    async def run(self, argv, *, timeout=None, stdin=None):
+    async def run(self, argv, *, timeout=None, stdin_data=None):
         from pinky_daemon.command_runner import CommandResult
 
         self.calls.append(list(argv))
@@ -65,7 +65,7 @@ class _StubInner:
         self.exc = exc
         self.calls: list[list[str]] = []
 
-    async def run(self, argv, *, timeout=None, stdin=None):
+    async def run(self, argv, *, timeout=None, stdin_data=None):
         self.calls.append(list(argv))
         if self.exc is not None:
             raise self.exc

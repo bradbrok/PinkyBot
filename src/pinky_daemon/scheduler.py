@@ -41,6 +41,12 @@ _PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
 _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
 _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 
+# #1029 transport-health guard. tmux builds can reject command argvs around
+# 8–16 KiB; prompts now travel over stdin, but surfacing large enabled rows
+# makes regressions and mixed-version fleet nodes visible in the journal.
+_SCHEDULE_PROMPT_WARN_THRESHOLD = 8_000
+_SCHEDULE_PROMPT_WARN_INTERVAL_SEC = 15 * 60
+
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
     """Return True if this agent runs on Claude Code (not Codex or other provider)."""
@@ -289,6 +295,7 @@ class AgentScheduler:
         self._schedule_delivery_locks: dict[str, asyncio.Lock] = {}
         self._pending_replay_tasks: dict[str, asyncio.Task] = {}
         self._owner_alert_tasks: set[asyncio.Task] = set()
+        self._last_schedule_prompt_warn_at: float | None = None
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -299,6 +306,7 @@ class AgentScheduler:
         if self._running:
             return
         self._running = True
+        self._warn_oversized_schedule_prompts(time.time(), force=True)
         for pending in self._registry.list_pending_schedule_wakes():
             self.replay_pending_for_agent(pending.agent_name)
         # Queue startup catch-up before the first live tick can enqueue newer
@@ -361,6 +369,8 @@ class AgentScheduler:
         """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, dreams, and url watchers."""
         now = time.time()
 
+        self._warn_oversized_schedule_prompts(now)
+
         # Check cron schedules
         await self._check_schedules(now)
 
@@ -387,6 +397,40 @@ class AgentScheduler:
 
         # Check URL watcher triggers
         await self._check_url_watchers(now)
+
+    def _warn_oversized_schedule_prompts(
+        self,
+        now: float,
+        *,
+        force: bool = False,
+    ) -> None:
+        """Warn at startup and periodically for large enabled prompts."""
+        last_warn = self._last_schedule_prompt_warn_at
+        if (
+            not force
+            and last_warn is not None
+            and now - last_warn < _SCHEDULE_PROMPT_WARN_INTERVAL_SEC
+        ):
+            return
+        self._last_schedule_prompt_warn_at = now
+
+        try:
+            schedules = self._registry.get_oversized_enabled_schedule_prompts(
+                _SCHEDULE_PROMPT_WARN_THRESHOLD
+            )
+        except Exception as exc:
+            # A health guard must never prevent scheduler startup or a tick.
+            _log(f"scheduler: large-prompt health check failed: {exc}")
+            return
+
+        for schedule_id, agent_name, name, prompt_length in schedules:
+            _log(
+                "scheduler: warning — large enabled schedule prompt "
+                f"id={schedule_id} agent={agent_name[:64]!r} "
+                f"name={name[:80]!r} prompt_chars={prompt_length} "
+                f"threshold={_SCHEDULE_PROMPT_WARN_THRESHOLD}; "
+                "tmux delivery requires stdin-backed load-buffer"
+            )
 
     async def _check_schedules(self, now: float) -> None:
         """Stamp due schedules fired, then deliver each agent's cohort in order."""
