@@ -188,6 +188,11 @@ SHARED_MCP_ENABLED = os.environ.get("PINKY_SHARED_MCP", "0") == "1"
 
 _RESPONSE_SENT_HANDOFF_SCOPE_KEY = "pinky.response_sent_handoff"
 
+# Deploy guard-rail (#425): an untracked file at the repo root that pins a
+# machine to its current code. Untracked on purpose — a deploy must never be
+# able to remove its own brake.
+DEPLOY_LOCK_FILENAME = ".pinky-deploy-lock"
+
 try:
     from pinky_memory.store import ReflectionStore
     from pinky_memory.types import MemoryQueryFilters
@@ -11857,6 +11862,7 @@ npm run build</pre>
         dry_run: bool = False,
         force: bool = False,
         force_deps: bool = False,
+        override_guard: bool = False,
     ):
         """Update to a verified release (or a pinned ref) and restart.
 
@@ -11884,6 +11890,16 @@ npm run build</pre>
         commit-SHA target is always an operator pin (existence-checked only).
 
         force_deps=True: reinstall dependencies even when HEAD didn't change.
+
+        Guard-rail (#425) — two independent layers refuse the deploy:
+        (1) a ``.pinky-deploy-lock`` file at the repo root (explicit intent),
+        (2) a divergent HEAD, i.e. commits reachable from HEAD but not from
+            the deploy ref, which a checkout would silently discard.
+        ``force`` does not lift either — it only skips release verification.
+        ``override_guard=True`` disarms both; it is intentionally NOT exposed
+        through the pinky-self MCP tool, so disarming requires a deliberate
+        human API call. ``dry_run`` still works while blocked and reports
+        which layer would stop the deploy.
         """
         import shutil
         import subprocess as sp
@@ -11912,6 +11928,33 @@ npm run build</pre>
         # take minutes; run it off the event loop so the daemon keeps
         # routing messages while the update proceeds.
         def _run_update() -> dict:
+            # Guard layer 1 (#425): an explicit, untracked lock file. Checked
+            # before any git command so a locked machine is never fetched into
+            # or reset. `force` does NOT lift it — force means "skip release
+            # verification", not "permission to deploy". Only override_guard
+            # (API-only, deliberately absent from the pinky-self MCP tool)
+            # disarms it, so no agent can unblock itself.
+            lock_block: dict | None = None
+            lock_path = Path(repo_dir) / DEPLOY_LOCK_FILENAME
+            if not override_guard and lock_path.exists():
+                try:
+                    reason = lock_path.read_text(
+                        encoding="utf-8", errors="replace"
+                    ).strip()[:500]
+                except OSError as e:
+                    reason = f"<unreadable lock file: {e}>"
+                lock_block = {
+                    "error": (
+                        f"deploy refused: {DEPLOY_LOCK_FILENAME} is present. "
+                        "Remove the file (or pass override_guard=true) to deploy."
+                    ),
+                    "blocked_by": "deploy_lock",
+                    "lock_reason": reason,
+                }
+                _log(f"admin: update refused — {DEPLOY_LOCK_FILENAME} present ({reason!r})")
+                if not dry_run:
+                    return lock_block
+
             # Current state
             try:
                 before_hash = sp.check_output(
@@ -11963,6 +12006,41 @@ npm run build</pre>
             )
             target_tag = self_update.latest_release_tag(repo_dir)
 
+            # Guard layer 2 (#425): divergence. Independent of the lock file —
+            # it survives someone deleting it, because it checks a fact rather
+            # than an intention. On an aligned machine `rev-list <ref>..HEAD` is
+            # empty and this is a no-op, so legitimate deploys are unaffected.
+            local_only: list[str] = []
+            if decision.ref and not override_guard:
+                try:
+                    revs = sp.check_output(
+                        ["git", "rev-list", f"{decision.ref}..HEAD"],
+                        cwd=repo_dir, stderr=sp.DEVNULL, timeout=15,
+                    ).decode().strip()
+                    local_only = [r for r in revs.splitlines() if r.strip()]
+                except Exception as e:
+                    # Never fail open on a broken check — but never block on it
+                    # either; layer 1 and release verification still apply.
+                    _log(f"admin: divergence check failed ({e}) — not blocking on it")
+            divergence_block: dict | None = None
+            if local_only:
+                divergence_block = {
+                    "error": (
+                        f"deploy refused: HEAD carries {len(local_only)} commit(s) "
+                        f"not present in {decision.ref}; checking it out would "
+                        f"discard them. Inspect with "
+                        f"`git log --oneline {decision.ref}..HEAD`, then either "
+                        "land them upstream or pass override_guard=true."
+                    ),
+                    "blocked_by": "divergent_head",
+                    "local_only_count": len(local_only),
+                    "local_only_commits": [r[:8] for r in local_only[:10]],
+                }
+                _log(
+                    f"admin: update refused — HEAD diverges from {decision.ref} "
+                    f"by {len(local_only)} commit(s)"
+                )
+
             # Preview mode — report the planned deploy without mutating anything.
             if dry_run:
                 try:
@@ -11989,12 +12067,27 @@ npm run build</pre>
                     result["latest_release"] = target_tag
                 if decision.error:
                     result["verify_error"] = decision.error
+                # Preview is read-only, so it runs even while blocked — and says
+                # which layer would stop the real deploy.
+                if lock_block:
+                    result.update(lock_block)
+                elif divergence_block:
+                    result.update(divergence_block)
                 return result
 
             # Refuse before touching the working tree if verification failed.
             if decision.error:
                 return {
                     "error": decision.error,
+                    "current_release": current_tag,
+                    "staying_on_version": before_hash,
+                }
+
+            # Guard layer 2 refusal — must land before the force block, so a
+            # forced deploy cannot discard tracked files on the way out.
+            if divergence_block:
+                return {
+                    **divergence_block,
                     "current_release": current_tag,
                     "staying_on_version": before_hash,
                 }

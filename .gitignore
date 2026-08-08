@@ -69,3 +69,6 @@ src/pinky_email/
 # pattern DENTRO quella PR — non prima. Rileggere il task #424.
 tools/
 templates/aiena_article_template.html
+
+# Deploy guard-rail (#425) — must never become a tracked file a deploy can remove
+.pinky-deploy-lock
