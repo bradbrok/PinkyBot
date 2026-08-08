@@ -556,7 +556,12 @@ class _TmuxControl:
             cmd.extend(["-L", self.socket_name])
         return cmd
 
-    async def _run(self, *args: str, timeout: float = 5.0) -> TmuxCommandResult:
+    async def _run(
+        self,
+        *args: str,
+        timeout: float = 5.0,
+        stdin_data: bytes | None = None,
+    ) -> TmuxCommandResult:
         """Run ``tmux <args>`` and return its result.
 
         ``timeout`` defends against a hung tmux server. A timeout raises
@@ -578,7 +583,11 @@ class _TmuxControl:
         # argv in ``runuser -u pinky-<agent> --`` so tmux runs under the
         # agent's uid. Timeout/kill semantics live in the runner; a timeout
         # still raises asyncio.TimeoutError for the caller to handle.
-        result = await self._runner.run(cmd, timeout=timeout)
+        result = await self._runner.run(
+            cmd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
         return TmuxCommandResult(
             returncode=result.returncode,
             stdout=result.stdout.decode("utf-8", errors="replace"),
@@ -717,8 +726,8 @@ class _TmuxControl:
         a permanently wedged session.
 
         Args:
-            text: Prompt payload. Passed as a single tmux arg via
-                ``set-buffer``, so no shell-metachar interpretation.
+            text: Prompt payload. Fed to ``tmux load-buffer -`` over stdin,
+                avoiding tmux's command-argument length ceiling.
             enter: If True (default), send a submit Enter after
                 ``enter_delay_ms`` ms. If False, leaves the pasted text
                 in the input buffer unsubmitted.
@@ -735,7 +744,13 @@ class _TmuxControl:
         # sessions don't race on a shared buffer.
         buf_name = f"pinky-{self.session_name}"
 
-        set_result = await self._run("set-buffer", "-b", buf_name, text)
+        set_result = await self._run(
+            "load-buffer",
+            "-b",
+            buf_name,
+            "-",
+            stdin_data=text.encode("utf-8"),
+        )
         if not set_result.ok:
             return set_result
 
@@ -5630,7 +5645,7 @@ class TmuxSession:
                     # wake's initial paste_text has timed out, no pane snapshot
                     # or pre-paste boolean can prove a retry safe: an exact row
                     # can arrive while the retry is suspended between
-                    # set-buffer and paste-buffer. Enter the wake's one-way
+                    # load-buffer and paste-buffer. Enter the wake's one-way
                     # receipt/Enter-only/fail-closed verifier instead. This
                     # branch can never return to worker re-paste.
                     if (

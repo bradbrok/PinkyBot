@@ -14,7 +14,12 @@ from datetime import datetime
 import pytest
 
 from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
-from pinky_daemon.scheduler import AgentScheduler, cron_matches, next_cron_description
+from pinky_daemon.scheduler import (
+    _SCHEDULE_PROMPT_WARN_INTERVAL_SEC,
+    AgentScheduler,
+    cron_matches,
+    next_cron_description,
+)
 
 # ── Cron Parser Tests ──────────────────────────────────────
 
@@ -212,6 +217,30 @@ class TestAgentSchedules:
 
         all_schedules = registry.get_all_schedules()
         assert len(all_schedules) == 2
+
+    def test_get_oversized_enabled_schedule_prompts_filters_and_orders(self, registry):
+        registry.register("oleg")
+        exact = registry.add_schedule(
+            "oleg", "0 8 * * *", name="exact", prompt="x" * 8_000
+        )
+        smaller_hit = registry.add_schedule(
+            "oleg", "0 9 * * *", name="large", prompt="x" * 8_001
+        )
+        larger_hit = registry.add_schedule(
+            "oleg", "0 10 * * *", name="larger", prompt="x" * 20_001
+        )
+        disabled = registry.add_schedule(
+            "oleg", "0 11 * * *", name="disabled", prompt="x" * 30_000
+        )
+        registry.toggle_schedule(disabled.id, False)
+
+        rows = registry.get_oversized_enabled_schedule_prompts(8_000)
+
+        assert rows == [
+            (larger_hit.id, "oleg", "larger", 20_001),
+            (smaller_hit.id, "oleg", "large", 8_001),
+        ]
+        assert exact.id not in {row[0] for row in rows}
 
     def test_remove_schedule(self, registry):
         registry.register("oleg")
@@ -902,6 +931,57 @@ class TestScheduler:
         assert scheduler.running is True
         await scheduler.stop()
         assert scheduler.running is False
+
+    @pytest.mark.asyncio
+    async def test_start_warns_once_for_each_large_enabled_prompt(
+        self, registry, capsys, monkeypatch
+    ):
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg", "0 8 * * *", name="large", prompt="x" * 8_001
+        )
+        disabled = registry.add_schedule(
+            "oleg", "0 9 * * *", name="disabled", prompt="x" * 20_000
+        )
+        registry.toggle_schedule(disabled.id, False)
+        scheduler = AgentScheduler(registry)
+
+        async def no_loop():
+            return None
+
+        monkeypatch.setattr(scheduler, "_loop", no_loop)
+        await scheduler.start()
+        await asyncio.sleep(0)
+        await scheduler.stop()
+
+        err = capsys.readouterr().err
+        warnings = [line for line in err.splitlines() if "large enabled" in line]
+        assert len(warnings) == 1
+        assert "name='large'" in warnings[0]
+        assert "prompt_chars=8001" in warnings[0]
+        assert "disabled" not in warnings[0]
+        assert "x" * 100 not in warnings[0]  # prompt content is never logged
+
+    def test_large_prompt_warning_repeats_only_after_periodic_window(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        registry.add_schedule(
+            "oleg", "0 8 * * *", name="large", prompt="x" * 8_001
+        )
+        scheduler = AgentScheduler(registry)
+
+        scheduler._warn_oversized_schedule_prompts(100.0, force=True)
+        capsys.readouterr()
+        scheduler._warn_oversized_schedule_prompts(
+            100.0 + _SCHEDULE_PROMPT_WARN_INTERVAL_SEC - 0.001
+        )
+        assert "large enabled" not in capsys.readouterr().err
+
+        scheduler._warn_oversized_schedule_prompts(
+            100.0 + _SCHEDULE_PROMPT_WARN_INTERVAL_SEC
+        )
+        assert "large enabled" in capsys.readouterr().err
 
     @pytest.mark.asyncio
     async def test_fire_now(self, registry):
