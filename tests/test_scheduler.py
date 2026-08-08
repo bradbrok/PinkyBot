@@ -1396,6 +1396,80 @@ class TestScheduler:
         ) is None
 
     @pytest.mark.asyncio
+    async def test_replay_skips_stale_healthy_parked_row_without_drop_log(
+        self, registry, monkeypatch, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="parked", prompt="held for review"
+        )
+        now = 1_800_000_000.0
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="parked",
+            prompt="held for review",
+            fired_at=now - 61.0,
+        )
+        assert registry.park_pending_schedule_wake(pending.id)
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        scheduler = AgentScheduler(registry)
+
+        await scheduler._replay_pending_locked("oleg")
+
+        retained = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert retained is not None
+        assert retained.parked_at > 0
+        assert "PERSISTED_WAKE_STALE_DROPPED" not in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_replay_alerts_owner_when_stale_one_shot_is_dropped(
+        self, registry, monkeypatch
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="one-time-enumeration",
+            prompt="enumerate owed work",
+            one_shot=True,
+        )
+        now = 1_800_000_000.0
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 3_601.0,
+        )
+        alerts: list[tuple[str, str]] = []
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        scheduler = AgentScheduler(
+            registry,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=3_600.0,
+        )
+
+        await scheduler._replay_pending_locked("oleg")
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ) is None
+        assert len(alerts) == 1
+        assert alerts[0][0] == "oleg"
+        assert "STALE ONE-SHOT WAKE DROPPED" in alerts[0][1]
+        assert f"outbox row #{pending.id}" in alerts[0][1]
+        assert "has no next occurrence" in alerts[0][1]
+
+    @pytest.mark.asyncio
     async def test_kill_after_durable_accept_before_future_resolve_never_replays(
         self, capsys
     ):

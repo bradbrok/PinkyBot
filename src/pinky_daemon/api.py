@@ -10387,9 +10387,24 @@ npm run build</pre>
         "/agents/{agent_name}/pending-schedule-wakes/{pending_id}"
     )
     async def discard_pending_schedule_wake(
-        agent_name: str, pending_id: int
+        agent_name: str, pending_id: int, request: Request
     ):
         """Discard one active stranded wake owned by ``agent_name``."""
+        # Browser sessions carry operator authority across agents. Internal
+        # HMAC callers do not: repeat the destructive self-scope at the route
+        # even though the middleware already authenticated the signature.
+        if not _has_valid_session(request):
+            caller_name = request.headers.get(INTERNAL_AGENT_HEADER, "").strip()
+            if (
+                not caller_name
+                or not _has_valid_internal_auth(request)
+                or caller_name != agent_name
+            ):
+                raise HTTPException(
+                    403,
+                    "internal caller may only discard its own pending "
+                    "schedule wakes",
+                )
         if not agents.get(agent_name):
             raise HTTPException(404, f"Agent '{agent_name}' not found")
         if not agents.discard_pending_schedule_wake(

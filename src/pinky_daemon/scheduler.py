@@ -992,6 +992,8 @@ class AgentScheduler:
                         "park returned no state change"
                     )
                 continue
+            if pending.parked_at != 0:
+                continue
             replay_max_age = self._pending_wake_replay_max_age(
                 current_schedule, pending.fired_at
             )
@@ -1007,9 +1009,24 @@ class AgentScheduler:
                     f"'{pending.agent_name}': age_s={row_age:.1f} "
                     f"max_age_s={replay_max_age:.1f} discarded={discarded}"
                 )
+                if discarded and current_schedule.one_shot:
+                    self._queue_owner_alert(
+                        pending.agent_name,
+                        (
+                            "🚨 STALE ONE-SHOT WAKE DROPPED: outbox row "
+                            f"#{pending.id} for schedule "
+                            f"'{pending.schedule_name}' "
+                            f"(#{pending.schedule_id}) on agent "
+                            f"'{pending.agent_name}' aged past its replay "
+                            f"window ({row_age:.1f}s > "
+                            f"{replay_max_age:.1f}s). The stale wake was "
+                            "discarded and this one-shot has no next "
+                            "occurrence; verify the owed work and re-arm it "
+                            "if needed."
+                        ),
+                    )
                 continue
-            if pending.parked_at == 0:
-                pending_wakes.append(pending)
+            pending_wakes.append(pending)
 
         for pending in pending_wakes:
             if pending.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP:

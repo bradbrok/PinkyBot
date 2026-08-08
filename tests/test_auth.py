@@ -915,6 +915,105 @@ class TestAuthMiddlewareDefaultDeny:
         os.unlink(path)
 
 
+class TestPendingWakeDiscardAuth:
+    """The destructive wake cleanup route scopes signed callers to self."""
+
+    def _make_client(self, monkeypatch, tmp_path):
+        monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
+        monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
+        app = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=str(tmp_path / "pending-wake-auth.db"),
+        )
+        registry = app.state.agents
+        registry.register(
+            "agent-a", model="opus", working_dir=str(tmp_path / "agent-a")
+        )
+        registry.register(
+            "agent-b", model="opus", working_dir=str(tmp_path / "agent-b")
+        )
+        return TestClient(app)
+
+    @staticmethod
+    def _pending(client, agent_name):
+        registry = client.app.state.agents
+        schedule = registry.add_schedule(
+            agent_name,
+            "* * * * *",
+            name=f"{agent_name}-wake",
+            prompt="owed work",
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name=agent_name,
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=time.time(),
+        )
+        return schedule, pending
+
+    @staticmethod
+    def _signed_delete(client, caller_name, target_name, pending_id):
+        path = f"/agents/{target_name}/pending-schedule-wakes/{pending_id}"
+        signing_key = client.app.state.agents.get_signing_key(caller_name)
+        assert signing_key
+        headers = build_internal_auth_headers(
+            signing_key,
+            agent_name=caller_name,
+            method="DELETE",
+            path=path,
+        )
+        return client.delete(path, headers=headers)
+
+    def test_signed_cross_agent_delete_is_denied_and_preserves_row(
+        self, monkeypatch, tmp_path
+    ):
+        client = self._make_client(monkeypatch, tmp_path)
+        schedule, pending = self._pending(client, "agent-b")
+
+        response = self._signed_delete(
+            client, "agent-a", "agent-b", pending.id
+        )
+
+        assert response.status_code == 403
+        assert client.app.state.agents.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ) is not None
+
+    def test_signed_self_delete_succeeds(self, monkeypatch, tmp_path):
+        client = self._make_client(monkeypatch, tmp_path)
+        schedule, pending = self._pending(client, "agent-a")
+
+        response = self._signed_delete(
+            client, "agent-a", "agent-a", pending.id
+        )
+
+        assert response.status_code == 200
+        assert client.app.state.agents.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ) is None
+
+    def test_operator_session_may_delete_cross_agent_row(
+        self, monkeypatch, tmp_path
+    ):
+        client = self._make_client(monkeypatch, tmp_path)
+        schedule, pending = self._pending(client, "agent-b")
+        setup = client.post(
+            "/auth/setup", json={"password": "hunter22", "next": "/"}
+        )
+        assert setup.status_code == 200
+
+        response = client.delete(
+            f"/agents/agent-b/pending-schedule-wakes/{pending.id}"
+        )
+
+        assert response.status_code == 200
+        assert client.app.state.agents.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ) is None
+
+
 class TestAgentIsolationScoping:
     """#149: an authenticated *isolated* agent may only act on its OWN
     resources; cross-agent access is denied 403 even with a valid signature.
