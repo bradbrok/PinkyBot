@@ -60,3 +60,12 @@ db.sqlite3
 ANALISI_CODICE_WEB_UI.md
 ISSUE_WAL_FIX.md
 src/pinky_email/
+
+# --- #424: utility CLI standalone di prod, de-tracciate l'08/08/2026 (opzione A) ---
+# Stesso motivo di #423: codice vero che vive solo su prod, mai esistito upstream
+# (origin/main non ha affatto tools/). Nessun file del repo li importa, non sono
+# in crontab. Tracciati => `git checkout <tag>` li cancellerebbe dal disco.
+# Se un giorno vanno portati upstream come codice di progetto, si rimuovono questi
+# pattern DENTRO quella PR — non prima. Rileggere il task #424.
+tools/
+templates/aiena_article_template.html
