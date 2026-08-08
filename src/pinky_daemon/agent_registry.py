@@ -4614,6 +4614,38 @@ except Exception as exc:
         rows = self._db.execute(sql, params).fetchall()
         return [PendingScheduleWake(*row) for row in rows]
 
+    def get_pending_schedule_wake_health(
+        self,
+        agent_name: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """Return active outbox count and oldest-row age per agent.
+
+        Accepted receipts and quarantined rows are terminal ledger history,
+        not stranded replay work, so they are intentionally excluded.
+        """
+        sql = """SELECT agent_name, COUNT(*), MIN(fired_at), MAX(fired_at)
+                 FROM pending_schedule_wakes
+                 WHERE accepted_at=0 AND parked_at=0"""
+        params: list = []
+        if agent_name is not None:
+            sql += " AND agent_name=?"
+            params.append(agent_name)
+        sql += " GROUP BY agent_name ORDER BY agent_name"
+        rows = self._db.execute(sql, params).fetchall()
+        observed_at = time.time() if now is None else float(now)
+        return [
+            {
+                "agent_name": str(row[0]),
+                "count": int(row[1]),
+                "oldest_fired_at": float(row[2]),
+                "newest_fired_at": float(row[3]),
+                "oldest_age_seconds": max(0.0, observed_at - float(row[2])),
+            }
+            for row in rows
+        ]
+
     def list_schedule_wake_ledger(
         self,
         agent_name: str | None = None,
@@ -4805,14 +4837,28 @@ except Exception as exc:
             )
         return True
 
-    def discard_pending_schedule_wake(self, pending_id: int) -> bool:
-        """Retire a pending wake without marking its schedule delivered."""
-        cursor = self._db.execute(
-            "DELETE FROM pending_schedule_wakes WHERE id=?",
-            (pending_id,),
-        )
-        self._db.commit()
-        return cursor.rowcount > 0
+    def discard_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        agent_name: str | None = None,
+    ) -> bool:
+        """Retire an active pending wake without marking it delivered.
+
+        ``agent_name`` scopes self-service callers to their own outbox. Ledger
+        rows that are already accepted or quarantined are terminal evidence and
+        cannot be erased through this cleanup primitive.
+        """
+        sql = """DELETE FROM pending_schedule_wakes
+                 WHERE id=? AND accepted_at=0 AND parked_at=0"""
+        params: list = [pending_id]
+        if agent_name is not None:
+            sql += " AND agent_name=?"
+            params.append(agent_name)
+        with self._rmw_lock:
+            cursor = self._db.execute(sql, params)
+            self._db.commit()
+            return cursor.rowcount > 0
 
     # ── Heartbeats ─────────────────────────────────────────
 

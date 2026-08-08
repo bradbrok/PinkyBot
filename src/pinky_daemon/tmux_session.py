@@ -897,6 +897,11 @@ class _QueuedTurn:
     submission_receipt: asyncio.Future[bool] | None = None
 
 
+_TRANSCRIPT_MATERIALIZE_PROMPT = (
+    "[SYSTEM] Transport initialization probe. Reply with exactly: ready"
+)
+
+
 @dataclass
 class _InflightMeta:
     """One in-flight turn's routing metadata + completion signal.
@@ -1452,6 +1457,9 @@ class TmuxSession:
         # so a torn-down session doesn't have a stray task firing
         # ``set_transcript_path`` against a stopped tailer.
         self._first_bind_recovery_task: asyncio.Task[None] | None = None
+        # #984: one short-lived enqueue task for the tailer's
+        # bound-path-never-materialized recovery signal.
+        self._transcript_materialize_task: asyncio.Task[None] | None = None
 
         # Issue #570 — wake-prompt readiness gate. Set when
         # ``set_transcript_path`` is called by the SessionStart hook
@@ -5228,6 +5236,11 @@ class TmuxSession:
                 # Scheduler receipts require an exact user/dequeue transcript
                 # observation; successful external-pane keystrokes are weaker.
                 on_entry=self._on_transcript_entry,
+                # #984: a real bind that never appears on disk means Claude
+                # Code has never taken its first turn. Force one harmless
+                # internal turn instead of waiting unboundedly for a receipt
+                # source that cannot exist yet.
+                on_bound_path_wedge=self._on_bound_path_wedge,
             )
             await self._tailer.start()
             if guessed is None:
@@ -5305,6 +5318,51 @@ class TmuxSession:
         self._first_bind_recovery_task = asyncio.create_task(
             self._delayed_first_bind_recovery()
         )
+
+    def _on_bound_path_wedge(self, path: Path, bind_age: float) -> None:
+        """Force one harmless turn so Claude Code creates its bound JSONL."""
+        if self.state != SessionState.CONNECTED:
+            _log(
+                f"tmux[{self.agent_name}]: ignoring bound-path wedge while "
+                f"state={self.state.value} path={path}"
+            )
+            return
+        existing = self._transcript_materialize_task
+        if existing is not None and not existing.done():
+            return
+        _log(
+            f"tmux[{self.agent_name}]: forcing transcript-initialization "
+            f"turn after bound path stayed absent {bind_age:.1f}s"
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _log(
+                f"tmux[{self.agent_name}]: cannot force transcript "
+                "initialization without a running event loop"
+            )
+            return
+        task = loop.create_task(
+            self._enqueue_internal_prompt(
+                _TRANSCRIPT_MATERIALIZE_PROMPT,
+                reason="wake_transcript_materialize",
+                front=True,
+                verify_submission=True,
+            )
+        )
+        self._transcript_materialize_task = task
+
+        def _done(done: asyncio.Task[None]) -> None:
+            if self._transcript_materialize_task is done:
+                self._transcript_materialize_task = None
+            if not done.cancelled() and done.exception() is not None:
+                error = done.exception()
+                _log(
+                    f"tmux[{self.agent_name}]: transcript-initialization "
+                    f"enqueue failed ({type(error).__name__}: {error})"
+                )
+
+        task.add_done_callback(_done)
 
     async def _delayed_first_bind_recovery(self) -> None:
         """Issue #565 — wait, then attempt first-bind recovery.
@@ -5425,6 +5483,12 @@ class TmuxSession:
         ):
             self._first_bind_recovery_task.cancel()
         self._first_bind_recovery_task = None
+        if (
+            self._transcript_materialize_task is not None
+            and not self._transcript_materialize_task.done()
+        ):
+            self._transcript_materialize_task.cancel()
+        self._transcript_materialize_task = None
         # Cancel any in-flight mid-turn context emit — it belongs to the
         # session that just ended; the next spawn re-emits fresh state.
         if (

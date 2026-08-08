@@ -901,6 +901,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "update_wake_schedule",
         "list_my_schedules",
         "remove_wake_schedule",
+        "discard_pending_schedule_wake",
     ],
     "tasks-admin": [
         "decompose_project", "bulk_create_tasks",
@@ -10382,6 +10383,48 @@ npm run build</pre>
             raise HTTPException(404, f"Schedule {schedule_id} not found")
         return {"deleted": True}
 
+    @app.delete(
+        "/agents/{agent_name}/pending-schedule-wakes/{pending_id}"
+    )
+    async def discard_pending_schedule_wake(
+        agent_name: str, pending_id: int, request: Request
+    ):
+        """Discard one active stranded wake owned by ``agent_name``."""
+        # Browser sessions carry operator authority across agents. Internal
+        # HMAC callers do not: repeat the destructive self-scope at the route
+        # even though the middleware already authenticated the signature.
+        if not _has_valid_session(request):
+            caller_name = request.headers.get(INTERNAL_AGENT_HEADER, "").strip()
+            if (
+                not caller_name
+                or not _has_valid_internal_auth(request)
+                or caller_name != agent_name
+            ):
+                raise HTTPException(
+                    403,
+                    "internal caller may only discard its own pending "
+                    "schedule wakes",
+                )
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not agents.discard_pending_schedule_wake(
+            pending_id, agent_name=agent_name
+        ):
+            raise HTTPException(
+                404,
+                f"Active pending schedule wake {pending_id} not found "
+                f"for agent '{agent_name}'",
+            )
+        _log(
+            f"scheduler: PERSISTED_WAKE_DISCARDED pending #{pending_id} "
+            f"by agent '{agent_name}'"
+        )
+        return {
+            "discarded": True,
+            "pending_id": pending_id,
+            "agent": agent_name,
+        }
+
     @app.post("/agents/{agent_name}/schedules/{schedule_id}/toggle")
     async def toggle_schedule(agent_name: str, schedule_id: int, enabled: bool = True):
         """Enable/disable a schedule."""
@@ -12579,11 +12622,16 @@ npm run build</pre>
         """Get scheduler status."""
         all_schedules = agents.get_all_schedules(enabled_only=False)
         auto_start = agents.list_auto_start_agents()
+        pending_health = agents.get_pending_schedule_wake_health()
         return {
             "running": scheduler.running,
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
+            "pending_schedule_wakes": pending_health,
+            "pending_schedule_wake_count": sum(
+                row["count"] for row in pending_health
+            ),
         }
 
     @app.get("/settings/heartbeat")

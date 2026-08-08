@@ -18,7 +18,7 @@ import inspect
 import json
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
 from pinky_daemon.agent_registry import AgentRegistry
@@ -46,6 +46,12 @@ _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 # makes regressions and mixed-version fleet nodes visible in the journal.
 _SCHEDULE_PROMPT_WARN_THRESHOLD = 8_000
 _SCHEDULE_PROMPT_WARN_INTERVAL_SEC = 15 * 60
+
+# A replay row is useful only while the work is timely. Its schedule's next
+# fire is the natural cutoff; this ceiling bounds sparse/daily schedules too
+# so a daemon restart can never deliver hours-old frozen prompts. Constructor
+# injection below keeps fleet policy configurable and tests deterministic.
+_PERSISTED_WAKE_MAX_AGE_SEC = 60 * 60
 
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
@@ -215,6 +221,7 @@ class AgentScheduler:
         activity=None,
         tick_interval: int = 30,
         schedule_delivery_timeout: float = 600.0,
+        pending_wake_max_age_sec: float = _PERSISTED_WAKE_MAX_AGE_SEC,
     ) -> None:
         self._registry = registry
         # async fn(agent_name, session_id, prompt, *, schedule_receipt=None)
@@ -269,6 +276,9 @@ class AgentScheduler:
         self._activity = activity  # ActivityStore | None
         self._tick_interval = tick_interval
         self._schedule_delivery_timeout = schedule_delivery_timeout
+        if pending_wake_max_age_sec <= 0:
+            raise ValueError("pending_wake_max_age_sec must be positive")
+        self._pending_wake_max_age_sec = float(pending_wake_max_age_sec)
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
@@ -935,6 +945,18 @@ class AgentScheduler:
 
     async def _replay_pending_locked(self, agent_name: str) -> None:
         """Reap all zombies, then replay active wakes FIFO under the agent lock."""
+        replay_now = time.time()
+        health = self._registry.get_pending_schedule_wake_health(
+            agent_name, now=replay_now
+        )
+        if health:
+            summary = health[0]
+            _log(
+                f"scheduler: PERSISTED_WAKE_OUTBOX_HEALTH agent="
+                f"'{agent_name}' count={summary['count']} "
+                f"oldest_age_s={summary['oldest_age_seconds']:.1f} "
+                f"oldest_fired_at={summary['oldest_fired_at']}"
+            )
         all_pending_wakes = self._registry.list_pending_schedule_wakes(
             agent_name, include_parked=True
         )
@@ -970,8 +992,41 @@ class AgentScheduler:
                         "park returned no state change"
                     )
                 continue
-            if pending.parked_at == 0:
-                pending_wakes.append(pending)
+            if pending.parked_at != 0:
+                continue
+            replay_max_age = self._pending_wake_replay_max_age(
+                current_schedule, pending.fired_at
+            )
+            row_age = max(0.0, replay_now - pending.fired_at)
+            if row_age > replay_max_age:
+                discarded = self._registry.discard_pending_schedule_wake(
+                    pending.id
+                )
+                _log(
+                    f"scheduler: PERSISTED_WAKE_STALE_DROPPED pending "
+                    f"#{pending.id}, schedule '{pending.schedule_name}' "
+                    f"(#{pending.schedule_id}) for agent "
+                    f"'{pending.agent_name}': age_s={row_age:.1f} "
+                    f"max_age_s={replay_max_age:.1f} discarded={discarded}"
+                )
+                if discarded and current_schedule.one_shot:
+                    self._queue_owner_alert(
+                        pending.agent_name,
+                        (
+                            "🚨 STALE ONE-SHOT WAKE DROPPED: outbox row "
+                            f"#{pending.id} for schedule "
+                            f"'{pending.schedule_name}' "
+                            f"(#{pending.schedule_id}) on agent "
+                            f"'{pending.agent_name}' aged past its replay "
+                            f"window ({row_age:.1f}s > "
+                            f"{replay_max_age:.1f}s). The stale wake was "
+                            "discarded and this one-shot has no next "
+                            "occurrence; verify the owed work and re-arm it "
+                            "if needed."
+                        ),
+                    )
+                continue
+            pending_wakes.append(pending)
 
         for pending in pending_wakes:
             if pending.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP:
@@ -1030,6 +1085,33 @@ class AgentScheduler:
                 f"schedule '{pending.schedule_name}' "
                 f"(#{pending.schedule_id}) for agent '{agent_name}'"
             )
+
+    def _pending_wake_replay_max_age(self, schedule, fired_at: float) -> float:
+        """Return ``min(next fire interval, configured replay ceiling)``.
+
+        We only search through the configured ceiling. If a sparse schedule
+        has no next fire inside that window, the ceiling wins. This bounds the
+        work to at most 60 minute checks under the production one-hour policy.
+        """
+        ceiling = self._pending_wake_max_age_sec
+        try:
+            tz = ZoneInfo(schedule.timezone)
+        except (KeyError, ValueError):
+            tz = ZoneInfo("America/Los_Angeles")
+
+        fired_minute = datetime.fromtimestamp(fired_at, tz=tz).replace(
+            second=0, microsecond=0
+        )
+        candidate = fired_minute + timedelta(minutes=1)
+        horizon = fired_minute + timedelta(seconds=ceiling)
+        while candidate <= horizon:
+            if cron_matches(schedule.cron, candidate):
+                return min(
+                    ceiling,
+                    max(60.0, candidate.timestamp() - fired_minute.timestamp()),
+                )
+            candidate += timedelta(minutes=1)
+        return ceiling
 
     @staticmethod
     def _wake_prompt(schedule) -> str:
