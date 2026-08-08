@@ -37,6 +37,7 @@ class TestSelfServerCreation:
             "update_wake_schedule",
             "list_my_schedules",
             "remove_wake_schedule",
+            "discard_pending_schedule_wake",
             "save_my_context",
             "load_my_context",
             "get_next_task",

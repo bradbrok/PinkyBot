@@ -4837,14 +4837,28 @@ except Exception as exc:
             )
         return True
 
-    def discard_pending_schedule_wake(self, pending_id: int) -> bool:
-        """Retire a pending wake without marking its schedule delivered."""
-        cursor = self._db.execute(
-            "DELETE FROM pending_schedule_wakes WHERE id=?",
-            (pending_id,),
-        )
-        self._db.commit()
-        return cursor.rowcount > 0
+    def discard_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        agent_name: str | None = None,
+    ) -> bool:
+        """Retire an active pending wake without marking it delivered.
+
+        ``agent_name`` scopes self-service callers to their own outbox. Ledger
+        rows that are already accepted or quarantined are terminal evidence and
+        cannot be erased through this cleanup primitive.
+        """
+        sql = """DELETE FROM pending_schedule_wakes
+                 WHERE id=? AND accepted_at=0 AND parked_at=0"""
+        params: list = [pending_id]
+        if agent_name is not None:
+            sql += " AND agent_name=?"
+            params.append(agent_name)
+        with self._rmw_lock:
+            cursor = self._db.execute(sql, params)
+            self._db.commit()
+            return cursor.rowcount > 0
 
     # ── Heartbeats ─────────────────────────────────────────
 

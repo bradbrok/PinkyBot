@@ -634,6 +634,44 @@ class TestRemoveWakeSchedule:
         assert "Failed" in result or "not found" in result
 
 
+class TestDiscardPendingScheduleWake:
+    def test_success_uses_agent_scoped_delete(self, srv):
+        captured = {}
+
+        def _urlopen(req, timeout=30):
+            del timeout
+            captured["method"] = req.method
+            captured["url"] = req.full_url
+            body = json.dumps({"discarded": True}).encode()
+            response = MagicMock()
+            response.read.return_value = body
+            response.__enter__ = lambda value: value
+            response.__exit__ = MagicMock(return_value=False)
+            return response
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            result = _tools(srv)["discard_pending_schedule_wake"](
+                pending_id=94
+            )
+
+        assert captured == {
+            "method": "DELETE",
+            "url": (
+                "http://localhost:9999/agents/barsik/"
+                "pending-schedule-wakes/94"
+            ),
+        }
+        assert "#94 discarded" in result
+
+    def test_failure_is_loud(self, srv):
+        with _ok({"error": "not found", "status": 404}):
+            result = _tools(srv)["discard_pending_schedule_wake"](
+                pending_id=999
+            )
+        assert "Failed to discard" in result
+        assert "#999" in result
+
+
 # ── save_my_context ───────────────────────────────────────────────────────────
 
 class TestSaveMyContext:
@@ -2243,12 +2281,13 @@ class TestToolGates:
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_71_tools(self):
+    def test_all_gates_has_72_tools(self):
         """All gates → full tool set.
 
         +1 in #145 with ``register_agent`` (admin gate) → 69, then +1 in #663
         with the core ``mcp_probe`` tool → 70. (Had dropped 69→68 in #552 with
-        the removal of ``request_sleep``.) #924 adds ``update_wake_schedule`` → 71.
+        the removal of ``request_sleep``.) #924 adds ``update_wake_schedule``
+        → 71; #984 adds sanctioned pending-wake discard → 72.
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2256,7 +2295,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 71
+        assert len(tools) == 72
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""

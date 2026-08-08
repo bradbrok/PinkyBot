@@ -5396,6 +5396,69 @@ class TestAgentScheduleEndpoints:
         assert body["pending_schedule_wakes"][0]["count"] == 1
         assert body["pending_schedule_wakes"][0]["oldest_age_seconds"] >= 119
 
+    def test_discard_pending_wake_is_agent_scoped(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        self._register(client, "bob")
+        created = self._create_schedule(
+            client, agent_name="alice", name="alice-morning"
+        ).json()
+        registry = client.app.state.agents
+        pending, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="alice-morning",
+            prompt="frozen",
+            fired_at=time.time(),
+        )
+
+        wrong_agent = client.delete(
+            f"/agents/bob/pending-schedule-wakes/{pending.id}"
+        )
+        assert wrong_agent.status_code == 404
+        assert registry.get_schedule_wake_by_fire(
+            created["id"], pending.fired_at
+        ) is not None
+
+        response = client.delete(
+            f"/agents/alice/pending-schedule-wakes/{pending.id}"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "discarded": True,
+            "pending_id": pending.id,
+            "agent": "alice",
+        }
+        assert registry.get_schedule_wake_by_fire(
+            created["id"], pending.fired_at
+        ) is None
+
+    def test_discard_pending_wake_preserves_terminal_ledger_row(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+        registry = client.app.state.agents
+        pending, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="frozen",
+            fired_at=100.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            pending.id, delivered_at=110.0
+        )
+
+        response = client.delete(
+            f"/agents/alice/pending-schedule-wakes/{pending.id}"
+        )
+
+        assert response.status_code == 404
+        assert registry.get_schedule_wake_by_fire(
+            created["id"], pending.fired_at
+        ) is not None
+
 
 # ── Agent CRUD ───────────────────────────────────────────────
 

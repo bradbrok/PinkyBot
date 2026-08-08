@@ -901,6 +901,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "update_wake_schedule",
         "list_my_schedules",
         "remove_wake_schedule",
+        "discard_pending_schedule_wake",
     ],
     "tasks-admin": [
         "decompose_project", "bulk_create_tasks",
@@ -10381,6 +10382,33 @@ npm run build</pre>
         if not agents.remove_schedule(schedule_id):
             raise HTTPException(404, f"Schedule {schedule_id} not found")
         return {"deleted": True}
+
+    @app.delete(
+        "/agents/{agent_name}/pending-schedule-wakes/{pending_id}"
+    )
+    async def discard_pending_schedule_wake(
+        agent_name: str, pending_id: int
+    ):
+        """Discard one active stranded wake owned by ``agent_name``."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not agents.discard_pending_schedule_wake(
+            pending_id, agent_name=agent_name
+        ):
+            raise HTTPException(
+                404,
+                f"Active pending schedule wake {pending_id} not found "
+                f"for agent '{agent_name}'",
+            )
+        _log(
+            f"scheduler: PERSISTED_WAKE_DISCARDED pending #{pending_id} "
+            f"by agent '{agent_name}'"
+        )
+        return {
+            "discarded": True,
+            "pending_id": pending_id,
+            "agent": agent_name,
+        }
 
     @app.post("/agents/{agent_name}/schedules/{schedule_id}/toggle")
     async def toggle_schedule(agent_name: str, schedule_id: int, enabled: bool = True):

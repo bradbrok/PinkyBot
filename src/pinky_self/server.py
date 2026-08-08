@@ -241,6 +241,24 @@ def create_server(
                 return f"Schedule #{schedule_id} removed."
             return f"Failed to remove schedule: {result.get('error', 'not found')}"
 
+        @mcp.tool()
+        def discard_pending_schedule_wake(pending_id: int) -> str:
+            """Discard one stranded wake from your own durable outbox by row ID.
+
+            This removes the frozen pending prompt without marking its schedule
+            delivered. It cannot erase another agent's or a terminal ledger row.
+            """
+            result = _api(
+                "DELETE",
+                f"/agents/{agent_name}/pending-schedule-wakes/{pending_id}",
+            )
+            if result.get("discarded"):
+                return f"Pending schedule wake #{pending_id} discarded."
+            return (
+                f"Failed to discard pending schedule wake #{pending_id}: "
+                f"{result.get('error', 'not found')}"
+            )
+
 
     # ── MCP transport probe (issue #663) ──────────────────────
 
