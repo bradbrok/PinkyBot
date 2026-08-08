@@ -21,6 +21,7 @@ import os
 import re
 import shlex
 import time as _time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -3254,6 +3255,36 @@ async def test_start_tailer_schedules_recovery_task() -> None:
         "recovery task must be live until the deadline or cancellation"
     )
     await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_bound_path_wedge_forces_one_internal_materialization_turn() -> None:
+    """#984: the tailer signal becomes a real no-op turn, not a passive log."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    calls: list[tuple[str, str, bool, bool]] = []
+
+    async def _record(
+        prompt, *, reason, front=False, verify_submission=False, **kwargs
+    ):
+        del kwargs
+        calls.append((prompt, reason, front, verify_submission))
+
+    ss._enqueue_internal_prompt = _record
+    missing = Path("/tmp/never-materialized-session.jsonl")
+
+    ss._on_bound_path_wedge(missing, 300.0)
+    # A duplicate signal while the first enqueue task is alive is coalesced.
+    ss._on_bound_path_wedge(missing, 301.0)
+    await asyncio.sleep(0)
+
+    assert calls == [
+        (
+            tmux_session._TRANSCRIPT_MATERIALIZE_PROMPT,
+            "wake_transcript_materialize",
+            True,
+            True,
+        )
+    ]
 
 
 @pytest.mark.asyncio

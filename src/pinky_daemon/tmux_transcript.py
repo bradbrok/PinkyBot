@@ -77,6 +77,13 @@ _ACTIVE_POLL_SEC = 0.2
 # so active polling cannot flood the journal at 5 lines/second.
 _STALE_DISCOVERY_LOG_INTERVAL_SEC = 30.0
 
+# A SessionStart bind can legitimately precede Claude Code creating the JSONL:
+# CC writes a session transcript lazily on its first turn.  Seconds of absence
+# are normal; minutes of absence means the session has never taken a turn and
+# receipt-backed delivery cannot make progress.  Report that distinct state
+# once per bind so the transport can force a harmless turn to create the file.
+_BOUND_PATH_MATERIALIZE_GRACE_SEC = 5 * 60
+
 # Max bytes read per ``_read_and_dispatch`` invocation. Bounds memory if the
 # transcript path ever points at something pathologically large (per
 # Pushok's PR #496 round-1 Case 4a: the daemon endpoint's docstring claims
@@ -301,6 +308,7 @@ class TmuxTranscriptTailer:
         path_discovery: Callable[[], Path | None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
         on_entry: Callable[[dict], None] | None = None,
+        on_bound_path_wedge: Callable[[Path, float], None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
         # #291: wall-clock when ``_path`` was last bound via an explicit
@@ -327,6 +335,9 @@ class TmuxTranscriptTailer:
         # This makes the tailer correct without dependence on the
         # SessionStart hook firing at all. See ``TmuxSession._discover_transcript_path``.
         self._path_discovery = path_discovery
+        self._on_bound_path_wedge = on_bound_path_wedge
+        self._bound_path_ever_materialized = self._path.exists()
+        self._bound_path_wedge_reported = False
         # Mid-turn usage hook: invoked (sync) with the usage dict every
         # time an assistant entry carries a fresh usage block — i.e. once
         # per API call inside the turn's tool loop, not just at turn end.
@@ -368,6 +379,8 @@ class TmuxTranscriptTailer:
             # #291: count self-heal discoveries we REFUSED because the
             # candidate predated the current bind (the stale-clobber guard).
             "self_heal_stale_skips": 0,
+            # #984: real binds that stayed absent past the bounded grace.
+            "bound_path_wedges": 0,
             # Mid-turn usage callbacks fired (one per assistant entry
             # that carried a fresh usage block).
             "usage_events": 0,
@@ -462,6 +475,8 @@ class TmuxTranscriptTailer:
             # across ``force_restart`` respawns, so a fresh launch rebinds
             # through here and must reset the floor.
             self._path_bound_at = time.time()
+            self._bound_path_ever_materialized = self._path.exists()
+            self._bound_path_wedge_reported = False
             self._swap_generation += 1
             if seek_to_start:
                 self._offset = 0
@@ -602,9 +617,11 @@ class TmuxTranscriptTailer:
         during discovery must never crash the tail loop. The next poll
         tick retries.
         """
-        if self._path_discovery is None:
-            return
         if self._path.exists():
+            self._bound_path_ever_materialized = True
+            return
+        self._report_bound_path_wedge_if_due()
+        if self._path_discovery is None:
             return
         try:
             discovered = self._path_discovery()
@@ -671,6 +688,41 @@ class TmuxTranscriptTailer:
         self.set_transcript_path(Path(discovered), seek_to_start=True)
         self._stats["self_heal_repoints"] += 1
 
+    def _report_bound_path_wedge_if_due(self) -> None:
+        """Report one never-materialized real bind after its grace expires.
+
+        This is deliberately independent of self-heal discovery.  #291 must
+        keep refusing an older transcript, and discovery may return ``None``;
+        neither condition changes the fact that a real bound path has never
+        existed and therefore cannot provide delivery receipts.
+        """
+        if (
+            self._path_bound_at <= 0
+            or self._bound_path_ever_materialized
+            or self._bound_path_wedge_reported
+        ):
+            return
+        bind_age = max(0.0, time.time() - self._path_bound_at)
+        if bind_age < _BOUND_PATH_MATERIALIZE_GRACE_SEC:
+            return
+
+        self._bound_path_wedge_reported = True
+        self._stats["bound_path_wedges"] += 1
+        _log(
+            f"tmux_tailer[{self._agent_name}]: BOUND_PATH_NEVER_MATERIALIZED "
+            f"path={self._path} bind_age_s={bind_age:.1f}; requesting "
+            "transcript-initialization turn (#984)"
+        )
+        if self._on_bound_path_wedge is None:
+            return
+        try:
+            self._on_bound_path_wedge(self._path, bind_age)
+        except Exception as e:
+            _log(
+                f"tmux_tailer[{self._agent_name}]: bound-path wedge callback "
+                f"raised ({type(e).__name__}: {e})"
+            )
+
     async def _read_and_dispatch(self) -> int:
         """Read from ``_offset`` to EOF, feed each JSONL entry, fire
         ``on_turn_complete`` per stop_hook_summary.
@@ -680,6 +732,7 @@ class TmuxTranscriptTailer:
         """
         if not self._path.exists():
             return 0
+        self._bound_path_ever_materialized = True
 
         # Snapshot for the mid-chunk swap check below. The only awaits in
         # this method are the turn callbacks; everything else is sync, so

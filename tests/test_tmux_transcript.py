@@ -1172,6 +1172,71 @@ class TestSelfHealDiscovery:
         assert tailer.stats["self_heal_repoints"] == 0
         assert tailer.stats["self_heal_stale_skips"] == 1
 
+    def test_never_materialized_bind_reports_once_after_grace(
+        self, tmp_path, monkeypatch,
+    ):
+        """#984 deterministic repro: the right bound path stays unborn.
+
+        The older discovery remains blocked by #291 while the distinct wedge
+        callback fires once at the five-minute boundary.
+        """
+        cb = _Captor()
+        old = tmp_path / "previous.jsonl"
+        _write_jsonl(old, [_assistant(text="old"), _stop_hook_summary()])
+        os.utime(old, (900.0, 900.0))
+        fresh = tmp_path / "fresh-bound.jsonl"
+        wedges: list[tuple[Path, float]] = []
+        now = [1000.0]
+        monkeypatch.setattr(
+            "pinky_daemon.tmux_transcript.time.time", lambda: now[0],
+        )
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl",
+            cb,
+            path_discovery=lambda: old,
+            on_bound_path_wedge=lambda path, age: wedges.append((path, age)),
+        )
+        tailer.set_transcript_path(fresh)
+
+        now[0] = 1299.9
+        tailer._try_self_heal_repoint()
+        assert wedges == []
+        assert tailer.transcript_path == fresh
+
+        now[0] = 1300.0
+        tailer._try_self_heal_repoint()
+        tailer._try_self_heal_repoint()
+
+        assert wedges == [(fresh, 300.0)]
+        assert tailer.stats["bound_path_wedges"] == 1
+        assert tailer.stats["self_heal_stale_skips"] == 3
+        assert tailer.transcript_path == fresh
+
+    def test_materialized_bind_never_reports_wedge(self, tmp_path, monkeypatch):
+        cb = _Captor()
+        fresh = tmp_path / "fresh-bound.jsonl"
+        wedges: list[tuple[Path, float]] = []
+        now = [1000.0]
+        monkeypatch.setattr(
+            "pinky_daemon.tmux_transcript.time.time", lambda: now[0],
+        )
+        tailer = TmuxTranscriptTailer(
+            tmp_path / "placeholder.jsonl",
+            cb,
+            on_bound_path_wedge=lambda path, age: wedges.append((path, age)),
+        )
+        tailer.set_transcript_path(fresh)
+        fresh.write_text("", encoding="utf-8")
+        now[0] = 1400.0
+
+        tailer._try_self_heal_repoint()
+        fresh.unlink()
+        now[0] = 1800.0
+        tailer._try_self_heal_repoint()
+
+        assert wedges == []
+        assert tailer.stats["bound_path_wedges"] == 0
+
     @pytest.mark.asyncio
     async def test_stale_discovery_skip_log_is_rate_limited(
         self, tmp_path, monkeypatch, capsys,
