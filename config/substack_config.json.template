@@ -1,6 +1,0 @@
-{
-  "publication_url": "https://aiena.substack.com",
-  "session_cookie": "INSERISCI_QUI_IL_COOKIE_substack.sid",
-  "auto_publish": true,
-  "_note": "Copia questo file in substack_config.json e compila i campi. Il session_cookie si trova in DevTools > Application > Cookies > substack.com > substack.sid"
-}
