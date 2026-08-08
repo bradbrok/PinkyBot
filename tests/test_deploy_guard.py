@@ -80,10 +80,12 @@ class _GuardGitMock:
     """
 
     def __init__(self, *, local_only: list[str] | None = None,
-                 dirty_files: list[str] | None = None):
+                 dirty_files: list[str] | None = None,
+                 rev_list_fails: bool = False):
         self.calls: list[list[str]] = []
         self.local_only = local_only or []
         self.dirty_files = dirty_files or []
+        self.rev_list_fails = rev_list_fails
         self._hash_call = 0
 
     def __call__(self, cmd, **kwargs):
@@ -99,6 +101,8 @@ class _GuardGitMock:
         if cmd[:3] == ["git", "rev-parse", "--abbrev-ref"]:
             return b"main\n"
         if cmd[:2] == ["git", "rev-list"]:
+            if self.rev_list_fails:
+                raise sp.CalledProcessError(128, cmd, output=b"fatal: bad revision")
             joined = "\n".join(self.local_only)
             return (joined + "\n").encode() if joined else b""
         if cmd[:4] == ["git", "diff", "--name-only", "HEAD"]:
@@ -230,6 +234,37 @@ class TestDivergenceLayer:
         assert body.get("dry_run") is True
         assert body.get("blocked_by") == "divergent_head"
         assert body.get("local_only_count") == 1
+        assert not gm.did_deploy_checkout()
+
+    def test_check_failure_blocks_deploy(self):
+        """Fail-closed: if the check itself breaks, refuse rather than proceed.
+
+        #422→#425 were all silent failures. A safety layer that proceeds when
+        it cannot verify reintroduces exactly that pattern — and does so when
+        something is already anomalous, i.e. when the risk is highest.
+        """
+        gm = _GuardGitMock(rev_list_fails=True, dirty_files=["src/pinky_daemon/api.py"])
+        body = _post("branch=main&force=true", gm).json()
+        assert body.get("blocked_by") == "divergence_check_failed"
+        assert not gm.did_force_reset()
+        assert not gm.did_deploy_checkout()
+
+    def test_check_failure_error_names_the_override(self):
+        gm = _GuardGitMock(rev_list_fails=True)
+        body = _post("branch=main", gm).json()
+        assert "override_guard" in body.get("error", "")
+
+    def test_override_guard_bypasses_failed_check(self):
+        gm = _GuardGitMock(rev_list_fails=True)
+        body = _post("branch=main&override_guard=true", gm).json()
+        assert body.get("updated") is True
+        assert gm.did_deploy_checkout()
+
+    def test_dry_run_reports_check_failure(self):
+        gm = _GuardGitMock(rev_list_fails=True)
+        body = _post("branch=main&dry_run=true", gm).json()
+        assert body.get("dry_run") is True
+        assert body.get("blocked_by") == "divergence_check_failed"
         assert not gm.did_deploy_checkout()
 
     def test_divergence_error_names_the_inspect_command(self):
