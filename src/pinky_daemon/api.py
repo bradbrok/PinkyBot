@@ -12844,6 +12844,7 @@ npm run build</pre>
             # than an intention. On an aligned machine `rev-list <ref>..HEAD` is
             # empty and this is a no-op, so legitimate deploys are unaffected.
             local_only: list[str] = []
+            check_error: str | None = None
             if decision.ref and not override_guard:
                 try:
                     revs = sp.check_output(
@@ -12852,11 +12853,25 @@ npm run build</pre>
                     ).decode().strip()
                     local_only = [r for r in revs.splitlines() if r.strip()]
                 except Exception as e:
-                    # Never fail open on a broken check — but never block on it
-                    # either; layer 1 and release verification still apply.
-                    _log(f"admin: divergence check failed ({e}) — not blocking on it")
+                    # Fail CLOSED. #422→#425 all came from silent failures; a
+                    # safety layer that proceeds when it cannot verify repeats
+                    # that pattern exactly when something is already anomalous
+                    # (broken git), i.e. when the risk is highest.
+                    check_error = str(e)[:300]
+                    _log(f"admin: divergence check failed ({e}) — refusing deploy")
             divergence_block: dict | None = None
-            if local_only:
+            if check_error is not None:
+                divergence_block = {
+                    "error": (
+                        "deploy refused: the divergence check could not be run "
+                        f"({check_error}), so it is unknown whether HEAD carries "
+                        f"commits absent from {decision.ref}. Repair the repository, "
+                        "or pass override_guard=true to deploy without the check."
+                    ),
+                    "blocked_by": "divergence_check_failed",
+                    "check_error": check_error,
+                }
+            elif local_only:
                 divergence_block = {
                     "error": (
                         f"deploy refused: HEAD carries {len(local_only)} commit(s) "
