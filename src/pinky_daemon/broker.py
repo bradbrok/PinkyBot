@@ -889,7 +889,7 @@ class MessageBroker:
 
         text = message.content.strip()
         # Match the command prefix case-insensitively, but preserve the RAW case
-        # of the target id — Slack user ids are uppercase (e.g. U774M8XDE) and the
+        # of the target id — Slack user ids are uppercase (e.g. U0EXAMPLE1) and the
         # pending row is keyed under the exact id. Lowercasing the whole token
         # approved a phantom lowercased user, delivered 0 held messages, and left
         # the real user pending (so the channel reply never went out).

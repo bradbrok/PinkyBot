@@ -7917,8 +7917,9 @@ class TestBuildStreamingWakeContextReasonGating:
             assert replayed == ["dymok"]
 
     @pytest.mark.asyncio
-    async def test_scheduler_undelivered_alert_uses_owner_destination(self):
-        """#949 alerting uses the durable #863 owner-notify configuration."""
+    async def test_scheduler_owner_alert_uses_owner_destination(self):
+        """The owner-notify callback (dead-letter alerts: PARKED / stale
+        one-shot drop) routes to the durable #863 owner destination."""
         with tempfile.TemporaryDirectory() as tmpdir:
             app = self._make_app(os.path.join(tmpdir, "test.db"))
             app.state.agents.register("dymok", model="sonnet")
@@ -7937,7 +7938,7 @@ class TestBuildStreamingWakeContextReasonGating:
             app.state.broker._send_callback = send
 
             delivered = await app.state.scheduler._owner_notify_callback(
-                "dymok", "FIRED BUT UNDELIVERED test"
+                "dymok", "scheduler owner-alert test"
             )
 
             assert delivered is True
@@ -7945,7 +7946,7 @@ class TestBuildStreamingWakeContextReasonGating:
                 "dymok",
                 "telegram",
                 "owner-dm",
-                "FIRED BUT UNDELIVERED test",
+                "scheduler owner-alert test",
                 account_id="acct-1",
             )
 
@@ -7980,7 +7981,7 @@ class TestBuildStreamingWakeContextReasonGating:
             monkeypatch.setattr(api_mod, "_log", logs.append)
 
             delivered = await app.state.scheduler._owner_notify_callback(
-                "geordi", "FIRED BUT UNDELIVERED test"
+                "geordi", "scheduler owner-alert test"
             )
 
             assert delivered is True
@@ -7988,7 +7989,7 @@ class TestBuildStreamingWakeContextReasonGating:
                 "local-notifier",
                 "telegram",
                 "owner-dm",
-                "FIRED BUT UNDELIVERED test",
+                "scheduler owner-alert test",
                 account_id="brad-telegram",
             )
             assert any("OWNER_NOTIFY_DELIVERY_FAILURE" in line for line in logs)
@@ -8026,7 +8027,7 @@ class TestBuildStreamingWakeContextReasonGating:
             monkeypatch.setattr(api_mod, "_log", logs.append)
 
             delivered = await app.state.scheduler._owner_notify_callback(
-                "geordi", "FIRED BUT UNDELIVERED test"
+                "geordi", "scheduler owner-alert test"
             )
 
             assert delivered is True
@@ -8034,7 +8035,7 @@ class TestBuildStreamingWakeContextReasonGating:
                 "geordi",
                 "slack",
                 "D_OWNER",
-                "FIRED BUT UNDELIVERED test",
+                "scheduler owner-alert test",
                 account_id="T_PI",
             )
             assert any(

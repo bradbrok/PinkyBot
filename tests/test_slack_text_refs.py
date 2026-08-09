@@ -4,7 +4,7 @@ import asyncio
 
 from pinky_daemon.pollers import resolve_slack_text_refs
 
-_USERS = {"U774M8XDE": "Brett Jones", "U123": "Alice"}
+_USERS = {"U0EXAMPLE1": "Alex Rivera", "U123": "Alice"}
 _CHANNELS = {"C1": "orders-and-equipment"}
 
 
@@ -23,12 +23,12 @@ def _run(text: str) -> str:
 
 
 def test_user_mention_resolved_to_name():
-    assert _run("Hi <@U774M8XDE> there") == "Hi @Brett Jones there"
+    assert _run("Hi <@U0EXAMPLE1> there") == "Hi @Alex Rivera there"
 
 
 def test_user_mention_with_embedded_label_no_lookup():
     # label after | wins; no resolver call needed
-    assert _run("ping <@U999|brett>") == "ping @brett"
+    assert _run("ping <@U999|sam>") == "ping @sam"
 
 
 def test_unknown_user_keeps_raw_id():
@@ -83,11 +83,11 @@ def test_empty_text():
 
 
 def test_multiple_mentions_in_one_message():
-    out = _run("Hi <@U774M8XDE> and <@U123> in <#C1|orders>")
-    assert out == "Hi @Brett Jones and @Alice in #orders"
+    out = _run("Hi <@U0EXAMPLE1> and <@U123> in <#C1|orders>")
+    assert out == "Hi @Alex Rivera and @Alice in #orders"
 
 
 def test_screenshot_case():
     # The exact failure Brad reported: a raw <@U…> in a nudge body.
-    raw = "Hi <@U774M8XDE> Re: Savor Ice Cream — Install 1905 Notre Dame Blvd"
-    assert _run(raw) == "Hi @Brett Jones Re: Savor Ice Cream — Install 1905 Notre Dame Blvd"
+    raw = "Hi <@U0EXAMPLE1> Re: Acme Creamery — Install 100 Main St"
+    assert _run(raw) == "Hi @Alex Rivera Re: Acme Creamery — Install 100 Main St"

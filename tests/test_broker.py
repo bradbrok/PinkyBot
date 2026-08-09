@@ -960,13 +960,13 @@ class TestMessageBrokerRouting:
                 }
             ])
 
-            channel = "C0A8WUU743F"
-            user = "U774M8XDE"
+            channel = "C0EXAMPLE1"
+            user = "U0EXAMPLE1"
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack",
                     chat_id=channel,
-                    sender_name="Alex Ugrin",
+                    sender_name="Alex Rivera",
                     sender_id=user,
                     content="Hi",
                     agent_name="barsik",
@@ -1292,14 +1292,14 @@ class TestMessageBrokerRouting:
             monkeypatch.setattr(broker, "_route_streaming", _fake_route)
             registry.set_primary_user("owner-1", display_name="Brad")
 
-            channel = "C0A8WUU743F"
+            channel = "C0EXAMPLE1"
             # Channel is approved once.
             registry.approve_user("barsik", channel, display_name=channel)
 
             # A brand-new, never-approved member messages in the channel.
             await broker.handle_inbound(
                 BrokerMessage(
-                    platform="slack", chat_id=channel, sender_name="Jake Hredzak",
+                    platform="slack", chat_id=channel, sender_name="Jordan Lee",
                     sender_id="U_NEVER_APPROVED", content="status?",
                     agent_name="barsik", is_group=True,
                 )
@@ -1378,7 +1378,7 @@ class TestMessageBrokerRouting:
     @pytest.mark.asyncio
     async def test_slash_approve_preserves_uppercase_channel_id(self, monkeypatch):
         """Regression: /approve_<id> must preserve the EXACT case of the target
-        id. Slack channel ids are uppercase (C0A8WUU743F); lowercasing the whole
+        id. Slack channel ids are uppercase (C0EXAMPLE1); lowercasing the whole
         command token approved a phantom lowercased id, delivered 0 held
         messages, and left the channel unapproved — so replies never went out.
         Exercises the real owner-notification flow end-to-end at channel scope."""
@@ -1405,12 +1405,12 @@ class TestMessageBrokerRouting:
                 }
             ])
 
-            channel = "C0A8WUU743F"
+            channel = "C0EXAMPLE1"
             # A message in the channel → held pending under the exact channel id.
             await broker.handle_inbound(
                 BrokerMessage(
-                    platform="slack", chat_id=channel, sender_name="Alex Ugrin",
-                    sender_id="U774M8XDE", content="Hi", agent_name="barsik",
+                    platform="slack", chat_id=channel, sender_name="Alex Rivera",
+                    sender_id="U0EXAMPLE1", content="Hi", agent_name="barsik",
                     is_group=True,
                 )
             )

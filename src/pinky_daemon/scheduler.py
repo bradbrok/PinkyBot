@@ -269,8 +269,11 @@ class AgentScheduler:
         # per-agent delivery lock — surfaced by the "extending" log line
         # each timeout period (Murzik review, PR #983).
         self._delivery_inflight_fn = delivery_inflight_fn
-        # async fn(agent_name, text) -> bool. FIRED BUT UNDELIVERED must leave
-        # journald and reach the owner through an out-of-band transport.
+        # async fn(agent_name, text) -> bool. Delivers operator-facing owner
+        # alerts for terminal dead-letter events (PERSISTED_WAKE_PARKED, stale
+        # one-shot drop) through an out-of-band transport. Routine
+        # FIRED-BUT-UNDELIVERED receipt failures are logged only, NOT
+        # owner-notified (#1043).
         self._owner_notify_callback = owner_notify_callback
         self._trigger_store = trigger_store  # TriggerStore | None
         self._activity = activity  # ActivityStore | None
@@ -702,7 +705,11 @@ class AgentScheduler:
     def _record_schedule_undelivered(
         self, schedule, failure_reason: str
     ) -> None:
-        """Persist, alert, and loudly account one unconfirmed fired schedule."""
+        """Persist and loudly log one unconfirmed fired schedule.
+
+        Operator log only — the owner is NOT notified for routine receipt
+        failures (they are frequently false positives; #1043).
+        """
         persisted = False
         alert_this_failure = True
         if not schedule.direct_send:
