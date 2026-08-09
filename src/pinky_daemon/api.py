@@ -7643,7 +7643,7 @@ npm run build</pre>
             material,
             broker,
             agents,
-            _notify_owner_undelivered,
+            _notify_owner_alert,
         )
         _broker_pollers.append(poller)
         task = asyncio.create_task(poller.start())
@@ -10927,7 +10927,7 @@ npm run build</pre>
             return False
         return probe(prompt) is True
 
-    async def _notify_owner_undelivered(
+    async def _notify_owner_alert(
         agent_name: str, message: str
     ) -> bool:
         """Send scheduler failures through canonical and host-local fallbacks."""
@@ -11083,7 +11083,7 @@ npm run build</pre>
         comms_cleanup_fn=comms.cleanup_expired,
         delivery_busy_fn=_scheduler_delivery_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
-        owner_notify_callback=_notify_owner_undelivered,
+        owner_notify_callback=_notify_owner_alert,
         trigger_store=trigger_store,
         activity=activity,
     )
@@ -11531,7 +11531,7 @@ npm run build</pre>
         from pinky_daemon.buzz_runtime import register_buzz_outbound_platforms
 
         app.state.buzz_registration = await register_buzz_outbound_platforms(
-            agents, _notify_owner_undelivered
+            agents, _notify_owner_alert
         )
         if app.state.buzz_registration["refused"]:
             _log(
