@@ -32,7 +32,11 @@ Install step: pin ledger dirs if they aren't under the defaults, for example::
     RC_VOICEMAIL_LEDGER_ACTIVE_JAMF=/absolute/path/to/active_jamf
     RC_VOICEMAIL_LEDGER_INTEGRATION_REQUESTS=/absolute/path/to/integration_requests
 
-Each override may point to a ledger file or a directory containing ledger files.
+Each override may point to a ledger file or a directory; a directory pin resolves
+to exactly ``<name>.json`` and never scans siblings or backups. Without overrides,
+the exact paths below ``RC_VOICEMAIL_LEDGER_ROOT`` are ``rma/active_rmas.json``,
+``rma/label_requests.json``, ``cc_creds/active_cc.json``,
+``jamf/active_jamf.json``, and ``ubereats/integration_requests.json``.
 """
 
 from __future__ import annotations
@@ -47,7 +51,7 @@ import subprocess
 import sys
 import tempfile
 import time
-from collections.abc import Callable, Iterable, Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
@@ -70,15 +74,13 @@ EXIT_RESOLVE = 5
 EXIT_IN_FLIGHT = 6
 EXIT_INTERNAL = 70
 
-LEDGER_ALIASES: dict[str, tuple[str, ...]] = {
-    "active_rmas": ("active_rmas",),
-    "label_requests": ("label_requests",),
-    "active_cc": ("active_cc",),
-    "active_jamf": ("active_jamf",),
-    "integration_requests": ("integration_requests", "ubereats"),
+LEDGER_DEFAULT_PATHS: dict[str, Path] = {
+    "active_rmas": Path("rma/active_rmas.json"),
+    "label_requests": Path("rma/label_requests.json"),
+    "active_cc": Path("cc_creds/active_cc.json"),
+    "active_jamf": Path("jamf/active_jamf.json"),
+    "integration_requests": Path("ubereats/integration_requests.json"),
 }
-LEDGER_SUFFIXES = ("", ".json", ".jsonl", ".csv", ".txt", ".md", ".yaml", ".yml")
-LEDGER_SUBDIRS = ("", "data", "ledgers", "state")
 NO_SPEECH_MARKERS = {
     "no speech",
     "no_speech",
@@ -95,6 +97,11 @@ NO_SPEECH_MARKERS = {
 _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]*\d{4}(?!\d)")
 _DURATION_RE = re.compile(r"\bLength:\s*(\d{1,3}):(\d{2})(?::(\d{2}))?\b", re.I)
 _CITY_HINT_RE = re.compile(r"\bin\s+([A-Za-z][A-Za-z .'-]{1,60})\s*$", re.I)
+_TRANSCRIPT_SEGMENT_RE = re.compile(
+    r"[\r\n.!?;:,]+|\s+\b(?:about|and|because|but|for|regarding|so|with)\b\s+",
+    re.I,
+)
+_DISPLAY_TICKET_NUMBER_RE = re.compile(r"^\d{1,10}$")
 _SAFE_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_GATEWAY_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
@@ -427,10 +434,17 @@ class DeskClient:
             url = f"{url}?{urlencode(params)}"
         return url
 
-    def _request_json(self, path: str, params: Mapping[str, object] | None = None) -> object:
+    def _request_json(
+        self,
+        path: str,
+        params: Mapping[str, object] | None = None,
+        *,
+        base_urls: Sequence[str] | None = None,
+    ) -> object:
         transport_errors: list[str] = []
         body: bytes | None = None
-        for base_url in self.base_urls:
+        request_base_urls = self.base_urls if base_urls is None else base_urls
+        for base_url in request_base_urls:
             url = self._url(base_url, path, params)
             path_without_query = urlparse(url).path
             request = Request(
@@ -483,6 +497,33 @@ class DeskClient:
             raise DeskAPIError("thread detail response is not an object")
         return payload
 
+    def resolve_ticket_id(self, ticket_id: str) -> str:
+        """Resolve a gateway display number while passing internal ids through."""
+
+        if self.mode != "gateway" or not _DISPLAY_TICKET_NUMBER_RE.fullmatch(ticket_id):
+            return ticket_id
+        payload = self._request_json(
+            "tickets/resolve",
+            {"ticket_number": ticket_id},
+        )
+        if not isinstance(payload, dict):
+            raise DeskAPIError("ticket resolve response is not an object")
+        returned_number = payload.get("ticketNumber")
+        if (
+            not isinstance(returned_number, (str, int))
+            or isinstance(returned_number, bool)
+            or str(returned_number).strip() != ticket_id
+        ):
+            raise DeskAPIError("ticket resolve response does not match the requested number")
+        internal_id = payload.get("id")
+        if (
+            not isinstance(internal_id, (str, int))
+            or isinstance(internal_id, bool)
+            or not str(internal_id).strip()
+        ):
+            raise DeskAPIError("ticket resolve response is missing its internal id")
+        return str(internal_id).strip()
+
     def search_contacts(self, query: str) -> list[dict[str, Any]]:
         if self.mode == "gateway":
             params = {"module": "contacts", "q": query}
@@ -495,6 +536,26 @@ class DeskClient:
             params,
         )
         return _collection(payload, context="contact search")
+
+    def search_crm_phone(self, module: str, digits: str) -> list[dict[str, Any]]:
+        """Search a gateway CRM module by normalized phone digits."""
+
+        if self.mode != "gateway" or module not in {"Contacts", "Accounts"}:
+            raise DeskAPIError("CRM phone search requires a supported gateway module")
+        crm_base_urls = tuple(urljoin(base_url, "/crm/") for base_url in self.base_urls)
+        payload = self._request_json(
+            f"{module}/search",
+            {"phone": digits},
+            base_urls=crm_base_urls,
+        )
+        if not isinstance(payload, dict):
+            raise DeskAPIError(f"CRM {module} search response is not an object")
+        rows = payload.get("data", [])
+        if not isinstance(rows, list):
+            raise DeskAPIError(f"CRM {module} search response data is not a list")
+        if any(not isinstance(row, dict) for row in rows):
+            raise DeskAPIError(f"CRM {module} search response contains a non-object record")
+        return rows
 
     def download_attachment(
         self,
@@ -841,34 +902,102 @@ def _site_candidates(
     return candidates
 
 
+def _optional_string(value: object) -> str | None:
+    return str(value) if value is not None else None
+
+
+def _crm_contact_candidates(
+    contacts: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str | bool | None]]:
+    candidates: list[dict[str, str | bool | None]] = []
+    for contact in contacts:
+        account = contact.get("Account_Name")
+        if not isinstance(account, dict):
+            account = {}
+        candidates.append(
+            {
+                "contact_id": _optional_string(contact.get("id")),
+                "account_id": _optional_string(account.get("id")),
+                "account_name": _optional_string(account.get("name")),
+                "match_basis": "phone_exact",
+                "verified": False,
+            }
+        )
+    return candidates
+
+
+def _crm_account_candidates(
+    accounts: Sequence[Mapping[str, Any]],
+) -> list[dict[str, str | bool | None]]:
+    return [
+        {
+            "contact_id": None,
+            "account_id": _optional_string(account.get("id")),
+            "account_name": _optional_string(account.get("name")),
+            "match_basis": "account_phone",
+            "verified": False,
+        }
+        for account in accounts
+    ]
+
+
+def _city_hints(callerid_name: object, transcript: object) -> list[str]:
+    cities: list[str] = []
+    seen: set[str] = set()
+    sources = [callerid_name]
+    if isinstance(transcript, str):
+        sources.extend(_TRANSCRIPT_SEGMENT_RE.split(transcript))
+    for source in sources:
+        city = extract_city_hint(source)
+        if city is None or city.casefold() in seen:
+            continue
+        seen.add(city.casefold())
+        cities.append(city)
+    return cities
+
+
 def resolve_site_candidates(
     desk: DeskClient,
     caller: Mapping[str, str | int | None],
+    transcript: str = "",
 ) -> list[dict[str, str | bool | None]]:
-    """Search digits first, then formatted phone, then an explicit city hint."""
+    """Resolve phone first, then union explicit CNAM and transcript city hints."""
 
     try:
         number = caller.get("number")
         digits = digits_only(number)
         if digits:
-            contacts = desk.search_contacts(digits)
-            if contacts:
-                return _site_candidates(contacts, match_basis="phone_exact")
-            formatted = format_phone(digits)
-            if formatted and formatted != digits:
-                contacts = desk.search_contacts(formatted)
+            if desk.mode == "gateway":
+                contacts = desk.search_crm_phone("Contacts", digits)
+                if contacts:
+                    return _crm_contact_candidates(contacts)
+                accounts = desk.search_crm_phone("Accounts", digits)
+                if accounts:
+                    return _crm_account_candidates(accounts)
+            else:
+                contacts = desk.search_contacts(digits)
                 if contacts:
                     return _site_candidates(contacts, match_basis="phone_exact")
+                formatted = format_phone(digits)
+                if formatted and formatted != digits:
+                    contacts = desk.search_contacts(formatted)
+                    if contacts:
+                        return _site_candidates(contacts, match_basis="phone_exact")
 
-        city = extract_city_hint(caller.get("callerid_name"))
-        if city:
+        candidates: list[dict[str, str | bool | None]] = []
+        seen_candidates: set[tuple[str | bool | None, ...]] = set()
+        for city in _city_hints(caller.get("callerid_name"), transcript):
             contacts = desk.search_contacts(city)
             city_key = city.casefold()
             city_contacts = [
                 contact for contact in contacts if city_key in _contact_city_values(contact)
             ]
-            return _site_candidates(city_contacts, match_basis="city_only")
-        return []
+            for candidate in _site_candidates(city_contacts, match_basis="city_only"):
+                key = tuple(candidate.values())
+                if key not in seen_candidates:
+                    seen_candidates.add(key)
+                    candidates.append(candidate)
+        return candidates
     except DeskAPIError as exc:
         raise TriageError("resolve", str(exc), EXIT_RESOLVE) from exc
 
@@ -876,7 +1005,7 @@ def resolve_site_candidates(
 def _configured_ledger_paths(
     ledger_root: Path,
     env: Mapping[str, str] | None = None,
-) -> dict[str, list[Path]]:
+) -> dict[str, Path]:
     values = os.environ if env is None else env
     if not ledger_root.is_dir():
         raise TriageError(
@@ -884,79 +1013,50 @@ def _configured_ledger_paths(
             f"ledger root is not a directory: {ledger_root}",
             EXIT_IN_FLIGHT,
         )
-    configured: dict[str, list[Path]] = {}
-    for canonical, aliases in LEDGER_ALIASES.items():
+    configured: dict[str, Path] = {}
+    for canonical, relative_path in LEDGER_DEFAULT_PATHS.items():
         env_key = f"RC_VOICEMAIL_LEDGER_{canonical.upper()}"
         explicit = values.get(env_key, "").strip()
         if explicit:
             path = Path(explicit).expanduser()
+            if path.is_dir():
+                path = path / f"{canonical}.json"
             if not path.exists():
                 raise TriageError(
                     "in_flight",
                     f"configured ledger does not exist: {path}",
                     EXIT_IN_FLIGHT,
                 )
-            if not _readable_ledger_source(path):
+            if not _readable_ledger_file(path):
                 raise TriageError(
                     "in_flight",
                     f"configured ledger is not readable: {path}",
                     EXIT_IN_FLIGHT,
                 )
-            configured[canonical] = [path]
+            configured[canonical] = path
             continue
 
-        paths: list[Path] = []
-        for subdir in LEDGER_SUBDIRS:
-            parent = ledger_root / subdir if subdir else ledger_root
-            for alias in aliases:
-                for suffix in LEDGER_SUFFIXES:
-                    path = parent / f"{alias}{suffix}"
-                    if _readable_ledger_source(path) and path not in paths:
-                        paths.append(path)
-        if not paths:
-            aliases_text = " or ".join(aliases)
+        path = ledger_root / relative_path
+        if not _readable_ledger_file(path):
             raise TriageError(
                 "in_flight",
-                f"required ledger is missing or unreadable: {canonical} ({aliases_text})",
+                f"required ledger is missing or unreadable: {canonical} ({path})",
                 EXIT_IN_FLIGHT,
             )
-        configured[canonical] = paths
+        configured[canonical] = path
     return configured
 
 
-def _readable_ledger_source(path: Path) -> bool:
+def _readable_ledger_file(path: Path) -> bool:
     if path.is_symlink():
         return False
     try:
         if path.is_file():
             with path.open("rb"):
                 return True
-        if path.is_dir():
-            with os.scandir(path) as entries:
-                next(entries, None)
-            return True
     except OSError:
         return False
     return False
-
-
-def _ledger_files(paths: Iterable[Path]) -> Iterable[Path]:
-    seen: set[Path] = set()
-    for path in paths:
-        if path.is_symlink():
-            continue
-        if path.is_file():
-            resolved = path.resolve()
-            if resolved not in seen:
-                seen.add(resolved)
-                yield path
-        elif path.is_dir():
-            for child in sorted(path.rglob("*")):
-                if child.is_file() and not child.is_symlink():
-                    resolved = child.resolve()
-                    if resolved not in seen:
-                        seen.add(resolved)
-                        yield child
 
 
 def _search_terms(
@@ -992,29 +1092,28 @@ def scan_in_flight(
         return []
     matches: list[dict[str, str]] = []
     try:
-        for ledger, paths in paths_by_ledger.items():
-            for path in _ledger_files(paths):
-                with path.open(encoding="utf-8", errors="replace") as handle:
-                    for line_number, raw_line in enumerate(handle, start=1):
-                        one_line = raw_line.rstrip("\r\n")
-                        folded = one_line.casefold()
-                        normalized_digits = digits_only(one_line)
-                        if not (
-                            any(term in folded for term in text_terms)
-                            or any(term in normalized_digits for term in digit_terms)
-                        ):
-                            continue
-                        try:
-                            key_path = path.resolve().relative_to(ledger_root.resolve())
-                        except ValueError:
-                            key_path = path
-                        matches.append(
-                            {
-                                "ledger": ledger,
-                                "key": f"{key_path}:{line_number}",
-                                "one_line": one_line,
-                            }
-                        )
+        for ledger, path in paths_by_ledger.items():
+            with path.open(encoding="utf-8", errors="replace") as handle:
+                for line_number, raw_line in enumerate(handle, start=1):
+                    one_line = raw_line.rstrip("\r\n")
+                    folded = one_line.casefold()
+                    normalized_digits = digits_only(one_line)
+                    if not (
+                        any(term in folded for term in text_terms)
+                        or any(term in normalized_digits for term in digit_terms)
+                    ):
+                        continue
+                    try:
+                        key_path = path.resolve().relative_to(ledger_root.resolve())
+                    except ValueError:
+                        key_path = path
+                    matches.append(
+                        {
+                            "ledger": ledger,
+                            "key": f"{key_path}:{line_number}",
+                            "one_line": one_line,
+                        }
+                    )
     except OSError as exc:
         raise TriageError("in_flight", f"cannot read ledger: {exc}", EXIT_IN_FLIGHT) from exc
     return matches
@@ -1080,13 +1179,17 @@ def _triage_in_directory(
     destination_dir: Path,
     transcribe_timeout_s: float,
 ) -> dict[str, object]:
-    audio_path, caller = fetch_voicemail_audio(desk, ticket_id, destination_dir)
+    try:
+        internal_ticket_id = desk.resolve_ticket_id(ticket_id)
+    except DeskAPIError as exc:
+        raise TriageError("fetch", str(exc), EXIT_FETCH) from exc
+    audio_path, caller = fetch_voicemail_audio(desk, internal_ticket_id, destination_dir)
     transcript, no_speech = transcribe_audio(
         audio_path,
         transcriber_path,
         timeout_s=transcribe_timeout_s,
     )
-    site_candidates = resolve_site_candidates(desk, caller)
+    site_candidates = resolve_site_candidates(desk, caller, transcript)
     in_flight = scan_in_flight(ledger_root, caller, site_candidates)
     return build_output(ticket_id, caller, transcript, no_speech, site_candidates, in_flight)
 

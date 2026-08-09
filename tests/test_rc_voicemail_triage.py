@@ -54,6 +54,8 @@ def test_extract_city_hint_requires_explicit_in_phrase():
 
 
 class FakeSearchDesk:
+    mode = "direct"
+
     def __init__(self, responses):
         self.responses = responses
         self.queries = []
@@ -178,6 +180,152 @@ def test_gateway_search_uses_gateway_base_prefix_q_and_path_auth_hook(monkeypatc
     )
 
 
+def test_gateway_phone_resolve_uses_crm_digits_and_maps_nullable_account(monkeypatch):
+    seen = {"requests": [], "headers": []}
+    monkeypatch.setattr(triage.time, "time", lambda: 123)
+
+    def opener(request, **kwargs):
+        seen["requests"].append(request.full_url)
+        seen["headers"].append({key.casefold(): value for key, value in request.header_items()})
+        return FakeHTTPResponse(
+            json.dumps(
+                {
+                    "data": [
+                        {
+                            "id": 123,
+                            "Account_Name": {"id": 456, "name": "Sourdough & Co - Monrovia"},
+                        },
+                        {"id": "contact-without-account", "Account_Name": None},
+                        {},
+                    ]
+                }
+            ).encode()
+        )
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    candidates = triage.resolve_site_candidates(
+        client,
+        {"callerid_name": "Ravjodh Heer", "number": "661-699-3557", "duration_s": 48},
+    )
+
+    assert seen["requests"] == ["http://10.0.0.32:9100/crm/Contacts/search?phone=6616993557"]
+    assert (
+        seen["headers"][0]["x-pinky-signature"]
+        == triage._sign(
+            "shared-secret",
+            "geordi",
+            "GET",
+            "/crm/Contacts/search",
+            123,
+        )["x-pinky-signature"]
+    )
+    assert candidates == [
+        {
+            "contact_id": "123",
+            "account_id": "456",
+            "account_name": "Sourdough & Co - Monrovia",
+            "match_basis": "phone_exact",
+            "verified": False,
+        },
+        {
+            "contact_id": "contact-without-account",
+            "account_id": None,
+            "account_name": None,
+            "match_basis": "phone_exact",
+            "verified": False,
+        },
+        {
+            "contact_id": None,
+            "account_id": None,
+            "account_name": None,
+            "match_basis": "phone_exact",
+            "verified": False,
+        },
+    ]
+
+
+def test_gateway_phone_resolve_empty_objects_are_clean_zero_candidate_miss():
+    seen = []
+
+    def opener(request, **kwargs):
+        seen.append(request.full_url)
+        return FakeHTTPResponse(b"{}")
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    assert (
+        triage.resolve_site_candidates(
+            client,
+            {"callerid_name": "Unknown", "number": "7075731100", "duration_s": 44},
+        )
+        == []
+    )
+    assert seen == [
+        "http://10.0.0.32:9100/crm/Contacts/search?phone=7075731100",
+        "http://10.0.0.32:9100/crm/Accounts/search?phone=7075731100",
+    ]
+
+
+def test_gateway_phone_resolve_falls_back_from_contacts_to_accounts():
+    seen = []
+
+    def opener(request, **kwargs):
+        seen.append(request.full_url)
+        if "/Contacts/" in request.full_url:
+            return FakeHTTPResponse(b"{}")
+        return FakeHTTPResponse(b'{"data":[{"id":"account-1","name":"Main Street"},{}]}')
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    candidates = triage.resolve_site_candidates(
+        client,
+        {"callerid_name": None, "number": "8015550100", "duration_s": 12},
+    )
+
+    assert [triage.urlparse(url).path for url in seen] == [
+        "/crm/Contacts/search",
+        "/crm/Accounts/search",
+    ]
+    assert candidates == [
+        {
+            "contact_id": None,
+            "account_id": "account-1",
+            "account_name": "Main Street",
+            "match_basis": "account_phone",
+            "verified": False,
+        },
+        {
+            "contact_id": None,
+            "account_id": None,
+            "account_name": None,
+            "match_basis": "account_phone",
+            "verified": False,
+        },
+    ]
+
+
 def test_gateway_request_tries_hosts_in_order_and_resigns_each_attempt(monkeypatch):
     seen = {"hosts": [], "timestamps": []}
     timestamps = iter((101, 102))
@@ -229,6 +377,121 @@ def test_gateway_thread_attachments_use_explicit_allowlisted_route(monkeypatch):
     }
     expected_path = "/desk/tickets/ticket%2F1/threads/thread%202/attachments"
     assert seen["requests"] == [f"http://10.0.0.32:9100{expected_path}"]
+
+
+def test_gateway_display_ticket_number_resolves_to_internal_id(monkeypatch):
+    seen = {"requests": [], "headers": []}
+    monkeypatch.setattr(triage.time, "time", lambda: 123)
+
+    def opener(request, **kwargs):
+        seen["requests"].append(request.full_url)
+        seen["headers"].append({key.casefold(): value for key, value in request.header_items()})
+        return FakeHTTPResponse(b'{"id":"637734000000123456","ticketNumber":"88629"}')
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    assert client.resolve_ticket_id("88629") == "637734000000123456"
+    assert seen["requests"] == ["http://10.0.0.32:9100/desk/tickets/resolve?ticket_number=88629"]
+    assert (
+        seen["headers"][0]["x-pinky-signature"]
+        == triage._sign(
+            "shared-secret",
+            "geordi",
+            "GET",
+            "/desk/tickets/resolve",
+            123,
+        )["x-pinky-signature"]
+    )
+
+
+def test_gateway_internal_ticket_id_passes_through_without_resolve_request():
+    def opener(*args, **kwargs):
+        raise AssertionError("internal ticket id must not require a resolve hop")
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    assert client.resolve_ticket_id("637734000000123456") == "637734000000123456"
+
+
+def test_triage_fetch_chain_receives_resolved_internal_ticket_id(tmp_path, monkeypatch):
+    seen = {}
+
+    class FakeDesk:
+        def resolve_ticket_id(self, ticket_id):
+            seen["supplied"] = ticket_id
+            return "637734000000123456"
+
+    def fake_fetch(desk, ticket_id, destination_dir):
+        seen["fetched"] = ticket_id
+        return destination_dir / "voice.mp3", {
+            "callerid_name": None,
+            "number": None,
+            "duration_s": 1,
+        }
+
+    monkeypatch.setattr(triage, "fetch_voicemail_audio", fake_fetch)
+    monkeypatch.setattr(triage, "transcribe_audio", lambda *args, **kwargs: ("", True))
+    monkeypatch.setattr(triage, "resolve_site_candidates", lambda *args, **kwargs: [])
+    monkeypatch.setattr(triage, "scan_in_flight", lambda *args, **kwargs: [])
+
+    result = triage.triage_ticket(
+        "88629",
+        FakeDesk(),
+        transcriber_path=tmp_path / "unused-transcriber.py",
+        ledger_root=tmp_path,
+        destination_dir=tmp_path / "downloads",
+    )
+
+    assert seen == {"supplied": "88629", "fetched": "637734000000123456"}
+    assert result["ticket_id"] == "88629"
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [
+        pytest.param([], id="non-object"),
+        pytest.param({"ticketNumber": "88629"}, id="missing-internal-id"),
+        pytest.param(
+            {"id": "637734000000123456", "ticketNumber": "88630"},
+            id="ticket-number-mismatch",
+        ),
+    ],
+)
+def test_gateway_ticket_resolve_malformed_or_mismatched_response_fails_fetch(tmp_path, payload):
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=lambda *args, **kwargs: FakeHTTPResponse(json.dumps(payload).encode()),
+    )
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.triage_ticket(
+            "88629",
+            client,
+            transcriber_path=tmp_path / "unused-transcriber.py",
+            ledger_root=tmp_path,
+            destination_dir=tmp_path / "downloads",
+        )
+
+    assert caught.value.stage == "fetch"
+    assert caught.value.exit_code == triage.EXIT_FETCH
 
 
 def test_direct_search_keeps_v1_base_query_and_oauth_header():
@@ -307,6 +570,64 @@ def test_explicit_city_fallback_returns_list_without_auto_binding():
     assert [candidate["contact_id"] for candidate in candidates] == ["c1", "c2"]
     assert all(candidate["match_basis"] == "city_only" for candidate in candidates)
     assert all(candidate["verified"] is False for candidate in candidates)
+
+
+def test_transcript_city_hint_is_extracted_mid_sentence_and_unioned_with_cnam():
+    desk = FakeSearchDesk(
+        {
+            "Bakersfield": [{"id": "c1", "city": "Bakersfield"}],
+            "Tooele": [
+                {"id": "c2", "city": "Tooele", "accountId": "a2"},
+                {"id": "c3", "city": "Provo"},
+            ],
+        }
+    )
+
+    candidates = triage.resolve_site_candidates(
+        desk,
+        {"callerid_name": "Main Line in Bakersfield", "number": None, "duration_s": 48},
+        "Hi, this is Subway Cafe in Tooele about my order. Please call me back.",
+    )
+
+    assert desk.queries == ["Bakersfield", "Tooele"]
+    assert [(candidate["contact_id"], candidate["match_basis"]) for candidate in candidates] == [
+        ("c1", "city_only"),
+        ("c2", "city_only"),
+    ]
+
+
+def test_gateway_88632_transcript_city_fallback_runs_after_both_crm_phone_misses():
+    seen = []
+
+    def opener(request, **kwargs):
+        seen.append(triage.urlparse(request.full_url).path)
+        if "/crm/" in request.full_url:
+            return FakeHTTPResponse(b"{}")
+        return FakeHTTPResponse(b'{"data":[{"id":"c1","city":"Tooele"}]}')
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    candidates = triage.resolve_site_candidates(
+        client,
+        {"callerid_name": "HANSEN,DAWSON", "number": "4355550100", "duration_s": 30},
+        "Hi, this is Subway Cafe in Tooele about my order. Please call me back.",
+    )
+
+    assert seen == [
+        "/crm/Contacts/search",
+        "/crm/Accounts/search",
+        "/desk/search",
+    ]
+    assert [(candidate["contact_id"], candidate["match_basis"]) for candidate in candidates] == [
+        ("c1", "city_only")
+    ]
 
 
 def test_multiple_accounts_remain_multiple_unverified_candidates():
@@ -612,13 +933,13 @@ def test_missing_attachment_fails_nonzero_stage():
 
 
 def test_in_flight_scans_all_required_ledgers_and_maps_ubereats(tmp_path):
-    (tmp_path / "active_rmas.jsonl").write_text('{"caller":"Mary Smith"}\n')
-    label_dir = tmp_path / "label_requests"
-    label_dir.mkdir()
-    (label_dir / "open.md").write_text("call (801) 555-0100\n")
-    (tmp_path / "active_cc.csv").write_text("site-1,chargeback\n")
-    (tmp_path / "active_jamf.txt").write_text("Main Street device\n")
-    (tmp_path / "ubereats.json").write_text('{"contact":"contact-1"}\n')
+    for directory in ("rma", "cc_creds", "jamf", "ubereats"):
+        (tmp_path / directory).mkdir()
+    (tmp_path / "rma/active_rmas.json").write_text('{"caller":"Mary Smith"}\n')
+    (tmp_path / "rma/label_requests.json").write_text("call (801) 555-0100\n")
+    (tmp_path / "cc_creds/active_cc.json").write_text("site-1,chargeback\n")
+    (tmp_path / "jamf/active_jamf.json").write_text("Main Street device\n")
+    (tmp_path / "ubereats/integration_requests.json").write_text('{"contact":"contact-1"}\n')
 
     caller = {"callerid_name": "Mary Smith", "number": "8015550100", "duration_s": 12}
     candidates = [
@@ -658,16 +979,47 @@ def test_explicit_missing_ledger_path_fails_loud(tmp_path):
 
 
 def _create_empty_required_ledgers(root, *, missing=None):
-    filenames = {
-        "active_rmas": "active_rmas.jsonl",
-        "label_requests": "label_requests.jsonl",
-        "active_cc": "active_cc.jsonl",
-        "active_jamf": "active_jamf.jsonl",
-        "integration_requests": "ubereats.jsonl",
-    }
-    for canonical, filename in filenames.items():
+    for path in triage.LEDGER_DEFAULT_PATHS.values():
+        (root / path).parent.mkdir(parents=True, exist_ok=True)
+    for canonical, path in triage.LEDGER_DEFAULT_PATHS.items():
         if canonical != missing:
-            (root / filename).write_text("")
+            (root / path).write_text("")
+
+
+def test_ledger_defaults_read_only_exact_files_and_ignore_backup_siblings(tmp_path):
+    _create_empty_required_ledgers(tmp_path)
+    exact = tmp_path / triage.LEDGER_DEFAULT_PATHS["active_cc"]
+    exact.write_text("no active match\n")
+    exact.with_name("active_cc.json.bak.pre-r3").write_text("Mary Smith 8015550100 stale\n")
+
+    assert (
+        triage.scan_in_flight(
+            tmp_path,
+            {"callerid_name": "Mary Smith", "number": "8015550100", "duration_s": 1},
+            [],
+            env={},
+        )
+        == []
+    )
+
+
+def test_directory_ledger_override_resolves_only_canonical_json_file(tmp_path):
+    _create_empty_required_ledgers(tmp_path)
+    pinned = tmp_path / "custom-rma"
+    pinned.mkdir()
+    (pinned / "active_rmas.json").write_text("Mary Smith active\n")
+    (pinned / "active_rmas.json.bak.pre-r3").write_text("Mary Smith stale\n")
+
+    hits = triage.scan_in_flight(
+        tmp_path,
+        {"callerid_name": "Mary Smith", "number": None, "duration_s": 1},
+        [],
+        env={"RC_VOICEMAIL_LEDGER_ACTIVE_RMAS": str(pinned)},
+    )
+
+    assert [(hit["ledger"], hit["one_line"]) for hit in hits] == [
+        ("active_rmas", "Mary Smith active")
+    ]
 
 
 def test_empty_ledger_root_fails_loud(tmp_path):
@@ -742,6 +1094,11 @@ def test_output_contract_has_exact_shape_and_list_candidates():
 
 def test_pipeline_smoke_combines_fetch_transcript_candidates_and_ledgers(tmp_path):
     class FakeDesk:
+        mode = "direct"
+
+        def resolve_ticket_id(self, ticket_id):
+            return ticket_id
+
         def list_threads(self, ticket_id):
             return [{"id": "vm", "fromEmailAddress": "notify@ringcentral.com"}]
 
@@ -769,9 +1126,8 @@ def test_pipeline_smoke_combines_fetch_transcript_candidates_and_ledgers(tmp_pat
     transcriber.write_text('print(\'{"transcript":"Please call me", "no_speech":false}\')\n')
     ledger_root = tmp_path / "ledgers"
     ledger_root.mkdir()
-    (ledger_root / "active_rmas.jsonl").write_text('{"caller":"Mary"}\n')
-    for filename in ("label_requests", "active_cc", "active_jamf", "ubereats"):
-        (ledger_root / f"{filename}.jsonl").write_text("")
+    _create_empty_required_ledgers(ledger_root)
+    (ledger_root / triage.LEDGER_DEFAULT_PATHS["active_rmas"]).write_text('{"caller":"Mary"}\n')
 
     output = triage.triage_ticket(
         "123",
@@ -795,7 +1151,7 @@ def test_pipeline_smoke_combines_fetch_transcript_candidates_and_ledgers(tmp_pat
     assert output["in_flight"] == [
         {
             "ledger": "active_rmas",
-            "key": "active_rmas.jsonl:1",
+            "key": "rma/active_rmas.json:1",
             "one_line": '{"caller":"Mary"}',
         }
     ]
