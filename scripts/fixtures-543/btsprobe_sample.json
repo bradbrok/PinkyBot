@@ -114,13 +114,6 @@
       ]
     }
   },
-    "freebusy": {
-      "aldo@posspecialists.com": "0 busy blocks",
-      "daniel@posspecialists.com": "2 busy blocks",
-      "julie@posspecialists.com": "3 busy blocks",
-      "c_a9f78bede90bb320f7110b1ece4dc19fab768ed7c47a848abaa87e3d1c34a9c0@group.calendar.google.com": "3 busy blocks",
-      "dmartinez@posspecialists.com": "2 busy blocks"
-    },
     "scan": {
       "members": {
         "danielson": {
