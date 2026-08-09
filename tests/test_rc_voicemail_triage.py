@@ -191,6 +191,17 @@ def test_transcriber_false_no_speech_without_text_is_failure():
         triage.parse_transcriber_output('{"transcript":"", "no_speech":false}')
 
 
+@pytest.mark.parametrize("field", ["transcript", "text"])
+def test_transcriber_rejects_text_with_no_speech_true(field):
+    payload = json.dumps({field: "hello", "no_speech": True})
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.parse_transcriber_output(payload)
+
+    assert caught.value.stage == "transcribe"
+    assert caught.value.exit_code == triage.EXIT_TRANSCRIBE
+
+
 def test_transcriber_invocation_is_promptless_and_scrubs_prompt_env(tmp_path, monkeypatch):
     audio = tmp_path / "message.mp3"
     audio.write_bytes(b"audio")
@@ -354,6 +365,61 @@ def test_explicit_missing_ledger_path_fails_loud(tmp_path):
     assert caught.value.stage == "in_flight"
 
 
+def _create_empty_required_ledgers(root, *, missing=None):
+    filenames = {
+        "active_rmas": "active_rmas.jsonl",
+        "label_requests": "label_requests.jsonl",
+        "active_cc": "active_cc.jsonl",
+        "active_jamf": "active_jamf.jsonl",
+        "integration_requests": "ubereats.jsonl",
+    }
+    for canonical, filename in filenames.items():
+        if canonical != missing:
+            (root / filename).write_text("")
+
+
+def test_empty_ledger_root_fails_loud(tmp_path):
+    with pytest.raises(triage.TriageError) as caught:
+        triage.scan_in_flight(
+            tmp_path,
+            {"callerid_name": "Mary", "number": "8015550100", "duration_s": 1},
+            [],
+            env={},
+        )
+
+    assert caught.value.stage == "in_flight"
+    assert "active_rmas" in caught.value.message
+
+
+def test_one_missing_canonical_ledger_fails_loud(tmp_path):
+    _create_empty_required_ledgers(tmp_path, missing="active_jamf")
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.scan_in_flight(
+            tmp_path,
+            {"callerid_name": "Mary", "number": "8015550100", "duration_s": 1},
+            [],
+            env={},
+        )
+
+    assert caught.value.stage == "in_flight"
+    assert "active_jamf" in caught.value.message
+
+
+def test_present_but_empty_ledgers_succeed(tmp_path):
+    _create_empty_required_ledgers(tmp_path)
+
+    assert (
+        triage.scan_in_flight(
+            tmp_path,
+            {"callerid_name": "Mary", "number": "8015550100", "duration_s": 1},
+            [],
+            env={},
+        )
+        == []
+    )
+
+
 def test_output_contract_has_exact_shape_and_list_candidates():
     output = triage.build_output(
         "123",
@@ -412,6 +478,8 @@ def test_pipeline_smoke_combines_fetch_transcript_candidates_and_ledgers(tmp_pat
     ledger_root = tmp_path / "ledgers"
     ledger_root.mkdir()
     (ledger_root / "active_rmas.jsonl").write_text('{"caller":"Mary"}\n')
+    for filename in ("label_requests", "active_cc", "active_jamf", "ubereats"):
+        (ledger_root / f"{filename}.jsonl").write_text("")
 
     output = triage.triage_ticket(
         "123",
@@ -506,3 +574,25 @@ def test_main_failure_is_nonzero_and_self_describing(monkeypatch, capsys, tmp_pa
     assert "stage=transcribe" in captured.err
     assert "ticket_id=123" in captured.err
     assert "helper crashed" in captured.err
+
+
+@pytest.mark.parametrize(
+    ("arguments", "ticket_fragment"),
+    [
+        (["123", "--timeout", "nope"], "ticket_id=123"),
+        (["--timeout", "nope"], "ticket_id=''"),
+    ],
+)
+def test_cli_argparse_failures_are_self_describing(arguments, ticket_fragment):
+    completed = subprocess.run(
+        [sys.executable, str(SCRIPT), *arguments],
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == triage.EXIT_CONFIG
+    assert completed.stdout == ""
+    assert "stage=config" in completed.stderr
+    assert ticket_fragment in completed.stderr
+    assert "usage:" not in completed.stderr

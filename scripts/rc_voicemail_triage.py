@@ -446,7 +446,13 @@ def parse_transcriber_output(stdout: str) -> tuple[str, bool]:
             raise TriageError("transcribe", "transcriber transcript is not text", EXIT_TRANSCRIBE)
         transcript = raw_text.strip()
         if raw_no_speech is True:
-            return transcript, True
+            if transcript:
+                raise TriageError(
+                    "transcribe",
+                    "transcriber returned text with no_speech:true",
+                    EXIT_TRANSCRIBE,
+                )
+            return "", True
         if transcript:
             return transcript, False
         if raw_no_speech is None and has_text_field:
@@ -643,6 +649,12 @@ def _configured_ledger_paths(
                     f"configured ledger does not exist: {path}",
                     EXIT_IN_FLIGHT,
                 )
+            if not _readable_ledger_source(path):
+                raise TriageError(
+                    "in_flight",
+                    f"configured ledger is not readable: {path}",
+                    EXIT_IN_FLIGHT,
+                )
             configured[canonical] = [path]
             continue
 
@@ -652,10 +664,33 @@ def _configured_ledger_paths(
             for alias in aliases:
                 for suffix in LEDGER_SUFFIXES:
                     path = parent / f"{alias}{suffix}"
-                    if path.exists() and path not in paths:
+                    if _readable_ledger_source(path) and path not in paths:
                         paths.append(path)
+        if not paths:
+            aliases_text = " or ".join(aliases)
+            raise TriageError(
+                "in_flight",
+                f"required ledger is missing or unreadable: {canonical} ({aliases_text})",
+                EXIT_IN_FLIGHT,
+            )
         configured[canonical] = paths
     return configured
+
+
+def _readable_ledger_source(path: Path) -> bool:
+    if path.is_symlink():
+        return False
+    try:
+        if path.is_file():
+            with path.open("rb"):
+                return True
+        if path.is_dir():
+            with os.scandir(path) as entries:
+                next(entries, None)
+            return True
+    except OSError:
+        return False
+    return False
 
 
 def _ledger_files(paths: Iterable[Path]) -> Iterable[Path]:
@@ -704,10 +739,10 @@ def scan_in_flight(
     *,
     env: Mapping[str, str] | None = None,
 ) -> list[dict[str, str]]:
+    paths_by_ledger = _configured_ledger_paths(ledger_root, env)
     text_terms, digit_terms = _search_terms(caller, site_candidates)
     if not text_terms and not digit_terms:
         return []
-    paths_by_ledger = _configured_ledger_paths(ledger_root, env)
     matches: list[dict[str, str]] = []
     try:
         for ledger, paths in paths_by_ledger.items():
@@ -816,8 +851,13 @@ def _positive_float(value: str) -> float:
     return parsed
 
 
+class _TriageArgumentParser(argparse.ArgumentParser):
+    def error(self, message: str) -> None:
+        raise TriageError("config", message, EXIT_CONFIG)
+
+
 def _parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(
+    parser = _TriageArgumentParser(
         description="Fetch and triage a RingCentral voicemail from a Zoho Desk ticket"
     )
     parser.add_argument("ticket_id", help="Zoho Desk ticket id")
@@ -864,17 +904,52 @@ def _parser() -> argparse.ArgumentParser:
     return parser
 
 
+_CLI_OPTIONS_WITH_VALUES = {
+    "--desk-base-url",
+    "--desk-org-id",
+    "--dest-dir",
+    "--transcriber",
+    "--ledger-root",
+    "--timeout",
+    "--transcribe-timeout",
+}
+
+
+def _best_effort_ticket_id(argv: Sequence[str]) -> str:
+    index = 0
+    while index < len(argv):
+        token = argv[index]
+        if token == "--":
+            return argv[index + 1] if index + 1 < len(argv) else ""
+        option = token.partition("=")[0]
+        if option in _CLI_OPTIONS_WITH_VALUES:
+            index += 1 if "=" in token else 2
+            continue
+        if token.startswith("-"):
+            index += 1
+            continue
+        return token
+    return ""
+
+
+def _error_ticket_id(ticket_id: str) -> str:
+    if _SAFE_TICKET_RE.fullmatch(ticket_id):
+        return ticket_id
+    return repr(ticket_id)
+
+
 def main(argv: Sequence[str] | None = None) -> int:
-    args = _parser().parse_args(argv)
-    ticket_id = args.ticket_id
-    if not _SAFE_TICKET_RE.fullmatch(ticket_id):
-        error = TriageError("config", "ticket id contains invalid characters", EXIT_CONFIG)
-        print(
-            f"rc_voicemail_triage: stage={error.stage} ticket_id={ticket_id!r} error={error.message}",
-            file=sys.stderr,
-        )
-        return error.exit_code
+    raw_argv = list(sys.argv[1:] if argv is None else argv)
+    ticket_id = _best_effort_ticket_id(raw_argv)
     try:
+        args = _parser().parse_args(raw_argv)
+        ticket_id = args.ticket_id
+        if not _SAFE_TICKET_RE.fullmatch(ticket_id):
+            raise TriageError(
+                "config",
+                "ticket id contains invalid characters",
+                EXIT_CONFIG,
+            )
         token = load_access_token()
         desk = DeskClient(
             token,
@@ -892,13 +967,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         )
     except TriageError as exc:
         print(
-            f"rc_voicemail_triage: stage={exc.stage} ticket_id={ticket_id} error={exc.message}",
+            "rc_voicemail_triage: "
+            f"stage={exc.stage} ticket_id={_error_ticket_id(ticket_id)} error={exc.message}",
             file=sys.stderr,
         )
         return exc.exit_code
     except Exception as exc:  # Defensive CLI boundary; never emit partial success JSON.
         print(
-            f"rc_voicemail_triage: stage=internal ticket_id={ticket_id} error={exc}",
+            "rc_voicemail_triage: "
+            f"stage=internal ticket_id={_error_ticket_id(ticket_id)} error={exc}",
             file=sys.stderr,
         )
         return EXIT_INTERNAL
