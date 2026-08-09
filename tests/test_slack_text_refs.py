@@ -57,16 +57,16 @@ def test_date_token_uses_fallback():
 
 
 def test_link_with_label():
-    assert _run("click <https://posspecialists.com|here>") == "click here"
+    assert _run("click <https://example.com|here>") == "click here"
 
 
 def test_bare_link_keeps_url():
-    assert _run("go <https://posspecialists.com>") == "go https://posspecialists.com"
+    assert _run("go <https://example.com>") == "go https://example.com"
 
 
 def test_mailto_link():
-    assert _run("mail <mailto:brad@posspecialists.com|brad@posspecialists.com>") == (
-        "mail brad@posspecialists.com"
+    assert _run("mail <mailto:user@example.com|user@example.com>") == (
+        "mail user@example.com"
     )
 
 
