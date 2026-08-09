@@ -23,6 +23,16 @@ Common install-time environment:
 Each ledger can also be pinned independently with
 ``RC_VOICEMAIL_LEDGER_<NAME>`` where NAME is ACTIVE_RMAS, LABEL_REQUESTS,
 ACTIVE_CC, ACTIVE_JAMF, or INTEGRATION_REQUESTS.
+
+Install step: pin ledger dirs if they aren't under the defaults, for example::
+
+    RC_VOICEMAIL_LEDGER_ACTIVE_RMAS=/absolute/path/to/active_rmas
+    RC_VOICEMAIL_LEDGER_LABEL_REQUESTS=/absolute/path/to/label_requests
+    RC_VOICEMAIL_LEDGER_ACTIVE_CC=/absolute/path/to/active_cc
+    RC_VOICEMAIL_LEDGER_ACTIVE_JAMF=/absolute/path/to/active_jamf
+    RC_VOICEMAIL_LEDGER_INTEGRATION_REQUESTS=/absolute/path/to/integration_requests
+
+Each override may point to a ledger file or a directory containing ledger files.
 """
 
 from __future__ import annotations
@@ -38,6 +48,7 @@ import sys
 import tempfile
 import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
+from email.utils import parseaddr
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
@@ -556,12 +567,12 @@ def _thread_sender(thread: Mapping[str, Any]) -> str | None:
     for key in ("fromEmailAddress", "from", "replyTo"):
         value = thread.get(key)
         if isinstance(value, str) and "@" in value:
-            return value.strip().casefold()
+            return parseaddr(value)[1].casefold()
     author = thread.get("author")
     if isinstance(author, dict):
         value = author.get("email")
         if isinstance(value, str):
-            return value.strip().casefold()
+            return parseaddr(value)[1].casefold()
     return None
 
 

@@ -469,6 +469,48 @@ def test_fetch_chain_uses_only_notify_thread_mp3(tmp_path):
     assert caller["number"] == "8015550100"
 
 
+@pytest.mark.parametrize(
+    "sender",
+    [
+        pytest.param('"RingCentral"<notify@ringcentral.com>', id="live-wrapped"),
+        pytest.param(
+            '"Voicemail Notification" <notify@ringcentral.com>',
+            id="different-display-name",
+        ),
+        pytest.param(
+            '  "RingCentral" <notify@ringcentral.com>  ',
+            id="surrounding-whitespace",
+        ),
+    ],
+)
+def test_fetch_chain_accepts_display_name_wrapped_notify_sender(tmp_path, sender):
+    class FakeDesk:
+        def __init__(self):
+            self.downloaded = None
+
+        def list_threads(self, ticket_id):
+            return [{"id": "vm", "fromEmailAddress": sender}]
+
+        def get_thread(self, ticket_id, thread_id):
+            return {
+                "id": "vm",
+                "summary": "From: Main Line - Mary (801) 555-0100 Length: 00:12",
+                "attachments": [{"id": "mp3", "name": "voice.mp3", "href": "audio"}],
+            }
+
+        def download_attachment(self, href, destination, **ids):
+            self.downloaded = (href, destination)
+            destination.write_bytes(b"audio")
+
+    desk = FakeDesk()
+
+    path, caller = triage.fetch_voicemail_audio(desk, "ticket-1", tmp_path)
+
+    assert desk.downloaded == ("audio", path)
+    assert path.read_bytes() == b"audio"
+    assert caller["number"] == "8015550100"
+
+
 def _gateway_fetch_client(listed_summary):
     listed_thread = {
         "id": "vm",
