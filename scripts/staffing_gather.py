@@ -35,10 +35,13 @@ from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 DESK_AGENT_IDS = {
-    "danielson": "637734000093213111",
-    "daniel": "637734000000355035",
-    "aldo": "637734000081777021",
-    "julie": "637734000000257004",
+    # Agent-id VALUES below are placeholders — real Zoho Desk IDs are masked for
+    # the public repo. Only the KEYS are consumed (MEMBER_KEYS = tuple(...)); the
+    # desk-count join is keyed by member key, never by agent id.
+    "danielson": "000000000000000001",
+    "daniel": "000000000000000002",
+    "aldo": "000000000000000003",
+    "julie": "000000000000000004",
 }
 MEMBER_KEYS = tuple(DESK_AGENT_IDS)
 SCAN_TYPES = ("appt", "build", "queue", "ooo")
