@@ -763,20 +763,20 @@ class AgentScheduler:
             f"'{schedule.name}' (#{schedule.id}) for agent "
             f"'{schedule.agent_name}': {failure_reason}"
         )
-        if alert_this_failure:
-            recovery = (
-                " The wake was persisted for the agent's next session."
-                if persisted
-                else " WARNING: durable wake persistence did not succeed."
-            )
-            self._queue_owner_alert(
-                schedule.agent_name,
-                (
-                    "🚨 FIRED BUT UNDELIVERED: schedule "
-                    f"'{schedule.name}' (#{schedule.id}) for agent "
-                    f"'{schedule.agent_name}' was not confirmed: "
-                    f"{failure_reason}.{recovery}"
-                ),
+        # Do NOT owner-notify on a scheduler delivery-receipt failure. These
+        # receipts are frequently FALSE positives — the wake persists + replays,
+        # or the receipt times out on work that was in fact delivered (#966/#984)
+        # — so pushing them to the agent's owner spams end-users with infra
+        # internals they cannot act on. The real signal for a genuinely dead job
+        # is artifact staleness, not a receipt timeout. Operators monitor via the
+        # FIRED BUT UNDELIVERED log above + the nightly fleet-health sweep. Only
+        # the rare persistence-FAILED case (no retry possible) gets an extra
+        # operator log line — still never an owner notification.
+        if alert_this_failure and not persisted:
+            _log(
+                "scheduler: WARNING durable wake persistence did NOT succeed "
+                f"for schedule '{schedule.name}' (#{schedule.id}) for agent "
+                f"'{schedule.agent_name}': {failure_reason} — wake may be lost"
             )
 
     async def _wait_for_wake_confirmation(
