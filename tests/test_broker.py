@@ -961,7 +961,7 @@ class TestMessageBrokerRouting:
             ])
 
             channel = "C0A8WUU743F"
-            user = "U774M8XDE"
+            user = "U0EXAMPLE1"
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack",
@@ -1410,7 +1410,7 @@ class TestMessageBrokerRouting:
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack", chat_id=channel, sender_name="Alex Ugrin",
-                    sender_id="U774M8XDE", content="Hi", agent_name="barsik",
+                    sender_id="U0EXAMPLE1", content="Hi", agent_name="barsik",
                     is_group=True,
                 )
             )

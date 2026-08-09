@@ -7917,8 +7917,9 @@ class TestBuildStreamingWakeContextReasonGating:
             assert replayed == ["dymok"]
 
     @pytest.mark.asyncio
-    async def test_scheduler_undelivered_alert_uses_owner_destination(self):
-        """#949 alerting uses the durable #863 owner-notify configuration."""
+    async def test_scheduler_owner_alert_uses_owner_destination(self):
+        """The owner-notify callback (dead-letter alerts: PARKED / stale
+        one-shot drop) routes to the durable #863 owner destination."""
         with tempfile.TemporaryDirectory() as tmpdir:
             app = self._make_app(os.path.join(tmpdir, "test.db"))
             app.state.agents.register("dymok", model="sonnet")

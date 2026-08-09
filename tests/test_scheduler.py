@@ -1765,7 +1765,7 @@ class TestScheduler:
         assert [wake.prompt for wake in pending] == ["probe breaks"]
 
     @pytest.mark.asyncio
-    async def test_undelivered_alerts_owner_and_replays_on_next_boot(
+    async def test_undelivered_does_not_alert_owner_and_replays_on_next_boot(
         self, registry
     ):
         registry.register("oleg")

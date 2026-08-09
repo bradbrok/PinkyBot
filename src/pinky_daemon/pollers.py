@@ -854,7 +854,7 @@ async def _resolve_slack_ref(body: str, user_namer, channel_namer) -> str:
 async def resolve_slack_text_refs(text: str, *, user_namer, channel_namer) -> str:
     """Rewrite Slack mrkdwn ref tokens in inbound text to human-readable form.
 
-    `<@U774M8XDE>` → `@Brett Jones`, `<#C1|orders>` → `#orders`, `<!here>` →
+    `<@U0EXAMPLE1>` → `@Alex Rivera`, `<#C1|orders>` → `#orders`, `<!here>` →
     `@here`, `<https://x|click>` → `click`. ``user_namer``/``channel_namer`` are
     async callables (id → name) returning "" on failure, in which case the raw
     id is kept (no regression). After ref substitution, Slack HTML entities
