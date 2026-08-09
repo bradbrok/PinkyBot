@@ -202,6 +202,42 @@ def test_transcriber_rejects_text_with_no_speech_true(field):
     assert caught.value.exit_code == triage.EXIT_TRANSCRIBE
 
 
+@pytest.mark.parametrize("no_speech", [None, True])
+def test_transcriber_rejects_empty_transcript_masking_nonempty_text(no_speech):
+    payload = {"transcript": "", "text": "hello"}
+    if no_speech is not None:
+        payload["no_speech"] = no_speech
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.parse_transcriber_output(json.dumps(payload))
+
+    assert caught.value.stage == "transcribe"
+    assert caught.value.exit_code == triage.EXIT_TRANSCRIBE
+
+
+def test_transcriber_rejects_disagreeing_nonempty_text_aliases():
+    with pytest.raises(triage.TriageError) as caught:
+        triage.parse_transcriber_output('{"transcript":"hello", "text":"goodbye"}')
+
+    assert caught.value.stage == "transcribe"
+    assert caught.value.exit_code == triage.EXIT_TRANSCRIBE
+
+
+def test_transcriber_validates_every_present_text_alias():
+    with pytest.raises(triage.TriageError) as caught:
+        triage.parse_transcriber_output('{"transcript":"hello", "text":7}')
+
+    assert caught.value.stage == "transcribe"
+    assert caught.value.exit_code == triage.EXIT_TRANSCRIBE
+
+
+def test_transcriber_accepts_matching_text_aliases():
+    assert triage.parse_transcriber_output('{"transcript":"hello", "text":" hello "}') == (
+        "hello",
+        False,
+    )
+
+
 def test_transcriber_invocation_is_promptless_and_scrubs_prompt_env(tmp_path, monkeypatch):
     audio = tmp_path / "message.mp3"
     audio.write_bytes(b"audio")

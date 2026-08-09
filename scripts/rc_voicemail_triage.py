@@ -438,24 +438,40 @@ def parse_transcriber_output(stdout: str) -> tuple[str, bool]:
         raw_no_speech = payload.get("no_speech")
         if raw_no_speech is not None and not isinstance(raw_no_speech, bool):
             raise TriageError("transcribe", "transcriber no_speech is not boolean", EXIT_TRANSCRIBE)
-        has_text_field = "transcript" in payload or "text" in payload
-        raw_text = payload.get("transcript", payload.get("text", ""))
-        if raw_text is None:
-            raw_text = ""
-        if not isinstance(raw_text, str):
-            raise TriageError("transcribe", "transcriber transcript is not text", EXIT_TRANSCRIBE)
-        transcript = raw_text.strip()
-        if raw_no_speech is True:
-            if transcript:
+        text_fields: dict[str, str] = {}
+        for field in ("transcript", "text"):
+            if field not in payload:
+                continue
+            raw_text = payload[field]
+            if raw_text is None:
+                raw_text = ""
+            if not isinstance(raw_text, str):
                 raise TriageError(
                     "transcribe",
-                    "transcriber returned text with no_speech:true",
+                    f"transcriber {field} is not text",
                     EXIT_TRANSCRIBE,
                 )
+            text_fields[field] = raw_text.strip()
+
+        if raw_no_speech is True and any(text_fields.values()):
+            raise TriageError(
+                "transcribe",
+                "transcriber returned text with no_speech:true",
+                EXIT_TRANSCRIBE,
+            )
+        if len(set(text_fields.values())) > 1:
+            raise TriageError(
+                "transcribe",
+                "transcriber transcript and text disagree",
+                EXIT_TRANSCRIBE,
+            )
+
+        transcript = next(iter(text_fields.values()), "")
+        if raw_no_speech is True:
             return "", True
         if transcript:
             return transcript, False
-        if raw_no_speech is None and has_text_field:
+        if raw_no_speech is None and text_fields:
             # A successful machine-readable response with an explicit empty
             # transcript is the JSON equivalent of the helper's empty stdout.
             return "", True
