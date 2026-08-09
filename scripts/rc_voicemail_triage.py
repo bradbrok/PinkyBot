@@ -98,9 +98,12 @@ _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]
 _DURATION_RE = re.compile(r"\bLength:\s*(\d{1,3}):(\d{2})(?::(\d{2}))?\b", re.I)
 _CITY_HINT_RE = re.compile(r"\bin\s+([A-Za-z][A-Za-z .'-]{1,60})\s*$", re.I)
 _TRANSCRIPT_SEGMENT_RE = re.compile(
-    r"[\r\n.!?;:,]+|\s+\b(?:about|and|because|but|for|regarding|so|with)\b\s+",
+    r"(?<=\b[A-Z]\.\b[A-Z]\.)(?=\s+[A-Z])|[\r\n!?;:,]+|"
+    r"(?<!\bSt)(?<!\bMt)(?<!\bFt)(?<!\b[A-Z]\.\b[A-Z])\.(?![A-Z]\.)|"
+    r"\s+\b(?:about|and|because|but|for|regarding|so|with)\b\s+",
     re.I,
 )
+_DOTTED_INITIALISM_RE = re.compile(r"(?:\b[A-Za-z]\.){2,}$")
 _DISPLAY_TICKET_NUMBER_RE = re.compile(r"^\d{1,10}$")
 _SAFE_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
 _SAFE_GATEWAY_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
@@ -200,7 +203,9 @@ def extract_city_hint(callerid_name: object) -> str | None:
     match = _CITY_HINT_RE.search(callerid_name.strip())
     if not match:
         return None
-    city = match.group(1).strip(" ,.-")
+    city = match.group(1).strip(" ,-")
+    if not _DOTTED_INITIALISM_RE.search(city):
+        city = city.rstrip(".")
     return city or None
 
 
@@ -548,9 +553,13 @@ class DeskClient:
             {"phone": digits},
             base_urls=crm_base_urls,
         )
+        if payload == {}:
+            return []
         if not isinstance(payload, dict):
             raise DeskAPIError(f"CRM {module} search response is not an object")
-        rows = payload.get("data", [])
+        if "data" not in payload:
+            raise DeskAPIError(f"CRM {module} search response has no data field")
+        rows = payload["data"]
         if not isinstance(rows, list):
             raise DeskAPIError(f"CRM {module} search response data is not a list")
         if any(not isinstance(row, dict) for row in rows):
@@ -906,6 +915,13 @@ def _optional_string(value: object) -> str | None:
     return str(value) if value is not None else None
 
 
+def _required_crm_id(record: Mapping[str, Any], *, module: str) -> str:
+    value = record.get("id")
+    if value is None or isinstance(value, bool) or not str(value).strip():
+        raise DeskAPIError(f"CRM {module} search result is missing its id")
+    return str(value).strip()
+
+
 def _crm_contact_candidates(
     contacts: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str | bool | None]]:
@@ -916,7 +932,7 @@ def _crm_contact_candidates(
             account = {}
         candidates.append(
             {
-                "contact_id": _optional_string(contact.get("id")),
+                "contact_id": _required_crm_id(contact, module="Contacts"),
                 "account_id": _optional_string(account.get("id")),
                 "account_name": _optional_string(account.get("name")),
                 "match_basis": "phone_exact",
@@ -929,27 +945,34 @@ def _crm_contact_candidates(
 def _crm_account_candidates(
     accounts: Sequence[Mapping[str, Any]],
 ) -> list[dict[str, str | bool | None]]:
-    return [
-        {
-            "contact_id": None,
-            "account_id": _optional_string(account.get("id")),
-            "account_name": _optional_string(account.get("name")),
-            "match_basis": "account_phone",
-            "verified": False,
-        }
-        for account in accounts
-    ]
+    candidates: list[dict[str, str | bool | None]] = []
+    for account in accounts:
+        candidates.append(
+            {
+                "contact_id": None,
+                "account_id": _required_crm_id(account, module="Accounts"),
+                "account_name": _optional_string(account.get("name")),
+                "match_basis": "account_phone",
+                "verified": False,
+            }
+        )
+    return candidates
 
 
 def _city_hints(callerid_name: object, transcript: object) -> list[str]:
     cities: list[str] = []
     seen: set[str] = set()
-    sources = [callerid_name]
+    sources = [(callerid_name, False)]
     if isinstance(transcript, str):
-        sources.extend(_TRANSCRIPT_SEGMENT_RE.split(transcript))
-    for source in sources:
+        sources.extend((segment, True) for segment in _TRANSCRIPT_SEGMENT_RE.split(transcript))
+    for source, from_transcript in sources:
         city = extract_city_hint(source)
-        if city is None or city.casefold() in seen:
+        if city is None:
+            continue
+        first_token = city.split(maxsplit=1)[0]
+        if from_transcript and not first_token[0].isupper():
+            continue
+        if city.casefold() in seen:
             continue
         seen.add(city.casefold())
         cities.append(city)
@@ -1072,6 +1095,8 @@ def _search_terms(
     if number:
         digit_terms.add(number)
     for candidate in site_candidates:
+        if candidate.get("match_basis") not in {"phone_exact", "account_phone"}:
+            continue
         for key in ("account_id", "account_name", "contact_id"):
             value = candidate.get(key)
             if value is not None and len(str(value).strip()) >= 3:

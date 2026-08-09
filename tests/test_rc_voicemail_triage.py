@@ -196,7 +196,6 @@ def test_gateway_phone_resolve_uses_crm_digits_and_maps_nullable_account(monkeyp
                             "Account_Name": {"id": 456, "name": "Sourdough & Co - Monrovia"},
                         },
                         {"id": "contact-without-account", "Account_Name": None},
-                        {},
                     ]
                 }
             ).encode()
@@ -242,13 +241,6 @@ def test_gateway_phone_resolve_uses_crm_digits_and_maps_nullable_account(monkeyp
             "match_basis": "phone_exact",
             "verified": False,
         },
-        {
-            "contact_id": None,
-            "account_id": None,
-            "account_name": None,
-            "match_basis": "phone_exact",
-            "verified": False,
-        },
     ]
 
 
@@ -257,7 +249,9 @@ def test_gateway_phone_resolve_empty_objects_are_clean_zero_candidate_miss():
 
     def opener(request, **kwargs):
         seen.append(request.full_url)
-        return FakeHTTPResponse(b"{}")
+        if "/Contacts/" in request.full_url:
+            return FakeHTTPResponse(b"{}")
+        return FakeHTTPResponse(b'{"data":[]}')
 
     client = triage.DeskClient(
         None,
@@ -281,6 +275,30 @@ def test_gateway_phone_resolve_empty_objects_are_clean_zero_candidate_miss():
     ]
 
 
+def test_gateway_phone_resolve_rejects_nonempty_object_without_data():
+    def opener(request, **kwargs):
+        return FakeHTTPResponse(b'{"error":"gateway auth context missing"}')
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.resolve_site_candidates(
+            client,
+            {"callerid_name": None, "number": "8015550100", "duration_s": 12},
+        )
+
+    assert caught.value.stage == "resolve"
+    assert caught.value.exit_code == triage.EXIT_RESOLVE
+    assert "no data field" in caught.value.message
+
+
 def test_gateway_phone_resolve_falls_back_from_contacts_to_accounts():
     seen = []
 
@@ -288,7 +306,7 @@ def test_gateway_phone_resolve_falls_back_from_contacts_to_accounts():
         seen.append(request.full_url)
         if "/Contacts/" in request.full_url:
             return FakeHTTPResponse(b"{}")
-        return FakeHTTPResponse(b'{"data":[{"id":"account-1","name":"Main Street"},{}]}')
+        return FakeHTTPResponse(b'{"data":[{"id":"account-1","name":"Main Street"}]}')
 
     client = triage.DeskClient(
         None,
@@ -316,14 +334,38 @@ def test_gateway_phone_resolve_falls_back_from_contacts_to_accounts():
             "match_basis": "account_phone",
             "verified": False,
         },
-        {
-            "contact_id": None,
-            "account_id": None,
-            "account_name": None,
-            "match_basis": "account_phone",
-            "verified": False,
-        },
     ]
+
+
+@pytest.mark.parametrize("bad_module", ["Contacts", "Accounts"])
+@pytest.mark.parametrize(
+    "bad_row",
+    [pytest.param({}, id="missing"), pytest.param({"id": ""}, id="empty")],
+)
+def test_gateway_phone_resolve_rejects_idless_crm_rows(bad_module, bad_row):
+    def opener(request, **kwargs):
+        if bad_module == "Accounts" and "/Contacts/" in request.full_url:
+            return FakeHTTPResponse(b"{}")
+        return FakeHTTPResponse(json.dumps({"data": [bad_row]}).encode())
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.resolve_site_candidates(
+            client,
+            {"callerid_name": None, "number": "8015550100", "duration_s": 12},
+        )
+
+    assert caught.value.stage == "resolve"
+    assert caught.value.exit_code == triage.EXIT_RESOLVE
+    assert f"CRM {bad_module} search result is missing its id" == caught.value.message
 
 
 def test_gateway_request_tries_hosts_in_order_and_resigns_each_attempt(monkeypatch):
@@ -594,6 +636,68 @@ def test_transcript_city_hint_is_extracted_mid_sentence_and_unioned_with_cnam():
         ("c1", "city_only"),
         ("c2", "city_only"),
     ]
+
+
+@pytest.mark.parametrize(
+    "city",
+    ["St. George", "St. Louis", "St. Paul", "Mt. Pleasant", "Ft. Worth", "Washington D.C."],
+)
+def test_transcript_city_hints_preserve_dotted_place_names(city):
+    transcript = f"This is our store in {city} about a register issue."
+
+    assert triage._city_hints(None, transcript) == [city]
+
+
+def test_dotted_initialism_city_survives_sentence_boundary():
+    transcript = "This is our store in Washington D.C. Please call me back."
+
+    assert triage._city_hints(None, transcript) == ["Washington D.C."]
+
+
+def test_dotted_transcript_city_survives_exact_membership_filter():
+    desk = FakeSearchDesk(
+        {
+            "St. George": [
+                {"id": "c1", "city": "St. George"},
+                {"id": "c2", "city": "St. George Island"},
+            ]
+        }
+    )
+
+    candidates = triage.resolve_site_candidates(
+        desk,
+        {"callerid_name": None, "number": None, "duration_s": 48},
+        "This is our store in St. George about a register issue.",
+    )
+
+    assert desk.queries == ["St. George"]
+    assert [(candidate["contact_id"], candidate["match_basis"]) for candidate in candidates] == [
+        ("c1", "city_only")
+    ]
+
+
+def test_lowercase_transcript_location_does_not_surface_city_candidate():
+    desk = FakeSearchDesk(
+        {
+            "orange": [
+                {
+                    "id": "orange-contact",
+                    "city": "Orange",
+                    "accountId": "orange-site",
+                    "accountName": "Orange Cafe",
+                }
+            ]
+        }
+    )
+
+    candidates = triage.resolve_site_candidates(
+        desk,
+        {"callerid_name": None, "number": None, "duration_s": 48},
+        "The status indicator is showing in orange.",
+    )
+
+    assert desk.queries == []
+    assert candidates == []
 
 
 def test_gateway_88632_transcript_city_fallback_runs_after_both_crm_phone_misses():
@@ -1001,6 +1105,42 @@ def test_ledger_defaults_read_only_exact_files_and_ignore_backup_siblings(tmp_pa
         )
         == []
     )
+
+
+def test_city_only_candidate_does_not_seed_in_flight_but_caller_phone_does(tmp_path):
+    _create_empty_required_ledgers(tmp_path)
+    active_rmas = tmp_path / triage.LEDGER_DEFAULT_PATHS["active_rmas"]
+    active_rmas.write_text(
+        "Orange Cafe orange-site orange-contact active\nMary Smith 8015550100 active\n"
+    )
+    city_candidate = {
+        "contact_id": "orange-contact",
+        "account_id": "orange-site",
+        "account_name": "Orange Cafe",
+        "match_basis": "city_only",
+        "verified": False,
+    }
+
+    assert (
+        triage.scan_in_flight(
+            tmp_path,
+            {"callerid_name": None, "number": None, "duration_s": 1},
+            [city_candidate],
+            env={},
+        )
+        == []
+    )
+
+    hits = triage.scan_in_flight(
+        tmp_path,
+        {"callerid_name": "Mary Smith", "number": "8015550100", "duration_s": 1},
+        [city_candidate],
+        env={},
+    )
+
+    assert [(hit["ledger"], hit["one_line"]) for hit in hits] == [
+        ("active_rmas", "Mary Smith 8015550100 active")
+    ]
 
 
 def test_directory_ledger_override_resolves_only_canonical_json_file(tmp_path):
