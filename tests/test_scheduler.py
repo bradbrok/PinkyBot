@@ -1796,9 +1796,10 @@ class TestScheduler:
 
         pending = registry.list_pending_schedule_wakes("oleg")
         assert len(pending) == 1
-        assert alerts[0][0] == "oleg"
-        assert "FIRED BUT UNDELIVERED" in alerts[0][1]
-        assert "persisted for the agent's next session" in alerts[0][1]
+        # Delivery-receipt failures are NOT owner-notified: they are frequently
+        # false positives (the wake persists + replays), so the owner sees
+        # nothing — only the FIRED BUT UNDELIVERED operator log line.
+        assert alerts == []
 
         attempts: list[str] = []
 
