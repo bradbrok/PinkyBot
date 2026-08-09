@@ -469,6 +469,66 @@ def test_fetch_chain_uses_only_notify_thread_mp3(tmp_path):
     assert caller["number"] == "8015550100"
 
 
+def _gateway_fetch_client(listed_summary):
+    listed_thread = {
+        "id": "vm",
+        "fromEmailAddress": "notify@ringcentral.com",
+    }
+    if listed_summary is not None:
+        listed_thread["summary"] = listed_summary
+
+    def opener(request, **kwargs):
+        path = triage.urlparse(request.full_url).path
+        if path.endswith("/threads"):
+            return FakeHTTPResponse(json.dumps({"data": [listed_thread]}).encode())
+        if path.endswith("/attachments"):
+            return FakeHTTPResponse(b'{"data":[{"id":"mp3","name":"voice.mp3"}]}')
+        if path.endswith("/content"):
+            return FakeHTTPResponse(b"raw-mp3-bytes")
+        raise AssertionError(f"unexpected gateway request: {path}")
+
+    return triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+
+def test_gateway_fetch_preserves_list_summary_when_detail_only_has_attachments(tmp_path):
+    desk = _gateway_fetch_client("From: Main Line - Mary Smith (801) 555-0100 Length: 00:12")
+
+    path, caller = triage.fetch_voicemail_audio(desk, "ticket-1", tmp_path)
+
+    assert path.read_bytes() == b"raw-mp3-bytes"
+    assert caller == {
+        "callerid_name": "Mary Smith",
+        "number": "8015550100",
+        "duration_s": 12,
+    }
+
+
+@pytest.mark.parametrize(
+    "listed_summary",
+    [
+        pytest.param(None, id="omitted"),
+        pytest.param("", id="empty"),
+        pytest.param("   ", id="whitespace-only"),
+    ],
+)
+def test_gateway_fetch_missing_or_empty_list_summary_fails_fetch(tmp_path, listed_summary):
+    desk = _gateway_fetch_client(listed_summary)
+
+    with pytest.raises(triage.TriageError) as caught:
+        triage.fetch_voicemail_audio(desk, "ticket-1", tmp_path)
+
+    assert caught.value.stage == "fetch"
+    assert caught.value.exit_code == triage.EXIT_FETCH
+    assert "summary" in caught.value.message
+
+
 def test_configured_destination_does_not_overwrite_prior_download(tmp_path):
     class FakeDesk:
         def list_threads(self, ticket_id):

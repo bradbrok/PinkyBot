@@ -601,6 +601,9 @@ def fetch_voicemail_audio(
             raise DeskAPIError("multiple RingCentral thread mp3 attachments found")
 
         thread, attachment = matches[0]
+        summary = thread.get("summary")
+        if not isinstance(summary, str) or not summary.strip():
+            raise DeskAPIError("RingCentral thread summary is missing or empty")
         thread_id_value = thread.get("id")
         attachment_id_value = attachment.get("id")
         if not isinstance(thread_id_value, (str, int)):
@@ -630,7 +633,6 @@ def fetch_voicemail_audio(
             thread_id=thread_id,
             attachment_id=attachment_id,
         )
-        summary = thread.get("summary")
         return destination, parse_summary_line(summary)
     except TriageError:
         raise
