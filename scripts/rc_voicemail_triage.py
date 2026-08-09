@@ -7,9 +7,11 @@ The external ``whisper_transcribe.py`` helper is invoked without a prompt,
 and the result is combined with Desk contact candidates and read-only ledger
 matches into one JSON object on stdout.
 
-Required environment:
+Authentication environment:
 
-* ``ZOHO_DESK_ACCESS_TOKEN`` or ``ZOHO_DESK_TOKEN_FILE``
+* ``RC_VOICEMAIL_AUTH_MODE`` (optional: ``gateway`` or ``direct``)
+* gateway: ``ZOHO_API_HOST``, ``ZOHO_API_SECRET``, and ``ZOHO_AGENT_NAME``
+* direct: ``ZOHO_DESK_ACCESS_TOKEN`` or ``ZOHO_DESK_TOKEN_FILE``
 
 Common install-time environment:
 
@@ -26,12 +28,15 @@ ACTIVE_CC, ACTIVE_JAMF, or INTEGRATION_REQUESTS.
 from __future__ import annotations
 
 import argparse
+import hashlib
+import hmac
 import json
 import os
 import re
 import subprocess
 import sys
 import tempfile
+import time
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from pathlib import Path
 from typing import Any
@@ -43,6 +48,9 @@ NOTIFY_ADDRESS = "notify@ringcentral.com"
 DEFAULT_DESK_BASE_URL = "https://desk.zoho.com/api/v1"
 DEFAULT_TIMEOUT_S = 30.0
 DEFAULT_TRANSCRIBE_TIMEOUT_S = 300.0
+AUTH_MODES = {"direct", "gateway"}
+GATEWAY_ENV_GROUP = ("ZOHO_API_HOST", "ZOHO_API_SECRET", "ZOHO_AGENT_NAME")
+DIRECT_ENV_GROUP = ("ZOHO_DESK_ACCESS_TOKEN", "ZOHO_DESK_TOKEN_FILE")
 
 EXIT_CONFIG = 2
 EXIT_FETCH = 3
@@ -77,6 +85,7 @@ _PHONE_RE = re.compile(r"(?<!\d)(?:\+?1[\s.\-]*)?\(?\d{3}\)?[\s.\-]*\d{3}[\s.\-]
 _DURATION_RE = re.compile(r"\bLength:\s*(\d{1,3}):(\d{2})(?::(\d{2}))?\b", re.I)
 _CITY_HINT_RE = re.compile(r"\bin\s+([A-Za-z][A-Za-z .'-]{1,60})\s*$", re.I)
 _SAFE_TICKET_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+_SAFE_GATEWAY_HOST_RE = re.compile(r"^[A-Za-z0-9.-]+$")
 
 
 class TriageError(Exception):
@@ -91,6 +100,18 @@ class TriageError(Exception):
 
 class DeskAPIError(Exception):
     """A Zoho Desk request or response failure."""
+
+
+def _sign(secret: str, agent: str, method: str, path: str, ts: int) -> dict[str, str]:
+    """Build HMAC-signed headers."""
+    normalized = path.split("?", 1)[0]
+    payload = f"{agent}\n{method.upper()}\n{normalized}\n{ts}".encode("utf-8")
+    sig = hmac.new(secret.encode("utf-8"), payload, hashlib.sha256).hexdigest()
+    return {
+        "x-pinky-agent": agent,
+        "x-pinky-timestamp": str(ts),
+        "x-pinky-signature": sig,
+    }
 
 
 def digits_only(value: object) -> str:
@@ -219,6 +240,79 @@ def load_access_token(env: Mapping[str, str] | None = None) -> str:
     return token.removeprefix("Zoho-oauthtoken ").strip()
 
 
+def _present_env(values: Mapping[str, str], name: str) -> bool:
+    return bool(values.get(name, "").strip())
+
+
+def select_auth_mode(env: Mapping[str, str] | None = None) -> str:
+    """Select an explicitly usable auth mode, or fail with missing credential names."""
+
+    values = os.environ if env is None else env
+    requested = values.get("RC_VOICEMAIL_AUTH_MODE", "").strip().casefold()
+    if requested and requested not in AUTH_MODES:
+        raise TriageError(
+            "config",
+            "RC_VOICEMAIL_AUTH_MODE must be gateway or direct",
+            EXIT_CONFIG,
+        )
+
+    gateway_missing = [name for name in GATEWAY_ENV_GROUP if not _present_env(values, name)]
+    direct_available = any(_present_env(values, name) for name in DIRECT_ENV_GROUP)
+
+    if requested == "gateway":
+        if gateway_missing:
+            raise TriageError(
+                "config",
+                f"gateway auth requires {', '.join(gateway_missing)}",
+                EXIT_CONFIG,
+            )
+        return "gateway"
+    if requested == "direct":
+        if not direct_available:
+            raise TriageError(
+                "config",
+                "direct auth requires ZOHO_DESK_ACCESS_TOKEN or ZOHO_DESK_TOKEN_FILE",
+                EXIT_CONFIG,
+            )
+        return "direct"
+
+    if not gateway_missing:
+        return "gateway"
+    if direct_available:
+        return "direct"
+    raise TriageError(
+        "config",
+        "no usable auth credentials: gateway requires "
+        f"{', '.join(gateway_missing)}; direct requires "
+        "ZOHO_DESK_ACCESS_TOKEN or ZOHO_DESK_TOKEN_FILE",
+        EXIT_CONFIG,
+    )
+
+
+def load_gateway_credentials(
+    env: Mapping[str, str] | None = None,
+) -> tuple[tuple[str, ...], str, str]:
+    """Load the explicit legacy gateway credential group without agent defaults."""
+
+    values = os.environ if env is None else env
+    missing = [name for name in GATEWAY_ENV_GROUP if not _present_env(values, name)]
+    if missing:
+        raise TriageError(
+            "config",
+            f"gateway auth requires {', '.join(missing)}",
+            EXIT_CONFIG,
+        )
+    raw_hosts = values["ZOHO_API_HOST"].strip()
+    hosts = tuple(part.strip() for part in raw_hosts.split(",") if part.strip())
+    if not hosts or any(not _SAFE_GATEWAY_HOST_RE.fullmatch(host) for host in hosts):
+        raise TriageError(
+            "config",
+            "ZOHO_API_HOST must be a comma-separated list of hostnames or IP addresses",
+            EXIT_CONFIG,
+        )
+    return hosts, values["ZOHO_API_SECRET"].strip(), values["ZOHO_AGENT_NAME"].strip()
+
+
 def _collection(payload: object, *, context: str) -> list[dict[str, Any]]:
     """Normalize Desk collection payloads; an empty object is a valid miss."""
 
@@ -226,7 +320,7 @@ def _collection(payload: object, *, context: str) -> list[dict[str, Any]]:
         return []
     records: object = payload
     if isinstance(payload, dict):
-        for key in ("data", "contacts", "results", "threads"):
+        for key in ("data", "contacts", "results", "threads", "attachments"):
             if key in payload:
                 records = payload[key]
                 break
@@ -246,48 +340,108 @@ class DeskClient:
 
     def __init__(
         self,
-        access_token: str,
+        access_token: str | None,
         *,
+        mode: str = "direct",
         org_id: str | None = None,
         base_url: str = DEFAULT_DESK_BASE_URL,
+        gateway_hosts: Sequence[str] = (),
+        gateway_secret: str | None = None,
+        gateway_agent: str | None = None,
         timeout_s: float = DEFAULT_TIMEOUT_S,
         opener: Callable[..., Any] = urlopen,
     ):
-        self.access_token = access_token
+        if mode not in AUTH_MODES:
+            raise TriageError("config", f"unsupported Desk auth mode: {mode}", EXIT_CONFIG)
+        self.mode = mode
+        self.access_token = access_token.strip() if access_token else None
         self.org_id = org_id.strip() if org_id else None
-        self.base_url = base_url.rstrip("/") + "/"
         self.timeout_s = timeout_s
         self._opener = opener
-        parsed = urlparse(self.base_url)
-        if parsed.scheme != "https" or not parsed.netloc:
-            raise TriageError("config", "ZOHO_DESK_BASE_URL must be an https URL", EXIT_CONFIG)
-        self._base_host = parsed.netloc.casefold()
+        self._gateway_secret = gateway_secret.strip() if gateway_secret else None
+        self._gateway_agent = gateway_agent.strip() if gateway_agent else None
 
-    def _headers(self, *, accept: str) -> dict[str, str]:
+        if mode == "direct":
+            if not self.access_token:
+                raise TriageError("config", "direct auth requires a Desk token", EXIT_CONFIG)
+            self.base_urls = (base_url.rstrip("/") + "/",)
+            parsed = urlparse(self.base_urls[0])
+            if parsed.scheme != "https" or not parsed.netloc:
+                raise TriageError("config", "ZOHO_DESK_BASE_URL must be an https URL", EXIT_CONFIG)
+            self._base_host = parsed.netloc.casefold()
+        else:
+            if not gateway_hosts:
+                raise TriageError("config", "gateway auth requires ZOHO_API_HOST", EXIT_CONFIG)
+            if not self._gateway_secret:
+                raise TriageError("config", "gateway auth requires ZOHO_API_SECRET", EXIT_CONFIG)
+            if not self._gateway_agent:
+                raise TriageError("config", "gateway auth requires ZOHO_AGENT_NAME", EXIT_CONFIG)
+            self.base_urls = tuple(f"http://{host}:9100/desk/" for host in gateway_hosts)
+            self._base_host = None
+        self.base_url = self.base_urls[0]
+
+    def _auth_headers(self, method: str, path_without_query: str) -> dict[str, str]:
+        if self.mode == "direct":
+            return {"Authorization": f"Zoho-oauthtoken {self.access_token}"}
+        assert self._gateway_secret is not None
+        assert self._gateway_agent is not None
+        ts = int(time.time())
+        headers = _sign(
+            self._gateway_secret,
+            self._gateway_agent,
+            method,
+            path_without_query,
+            ts,
+        )
+        return headers
+
+    def _headers(self, method: str, path_without_query: str, *, accept: str) -> dict[str, str]:
         headers = {
             "Accept": accept,
-            "Authorization": f"Zoho-oauthtoken {self.access_token}",
             "User-Agent": "pinky-rc-voicemail-triage/1",
         }
-        if self.org_id:
+        headers.update(self._auth_headers(method, path_without_query))
+        if self.mode == "direct" and self.org_id:
             headers["orgId"] = self.org_id
         return headers
 
-    def _url(self, path: str, params: Mapping[str, object] | None = None) -> str:
-        url = urljoin(self.base_url, path.lstrip("/"))
+    @staticmethod
+    def _url(
+        base_url: str,
+        path: str,
+        params: Mapping[str, object] | None = None,
+    ) -> str:
+        url = urljoin(base_url, path.lstrip("/"))
         if params:
             url = f"{url}?{urlencode(params)}"
         return url
 
     def _request_json(self, path: str, params: Mapping[str, object] | None = None) -> object:
-        request = Request(self._url(path, params), headers=self._headers(accept="application/json"))
-        try:
-            with self._opener(request, timeout=self.timeout_s) as response:
-                body = response.read()
-        except HTTPError as exc:
-            raise DeskAPIError(f"Desk HTTP {exc.code} for {path}") from exc
-        except (URLError, TimeoutError, OSError, ValueError) as exc:
-            raise DeskAPIError(f"Desk request failed for {path}: {exc}") from exc
+        transport_errors: list[str] = []
+        body: bytes | None = None
+        for base_url in self.base_urls:
+            url = self._url(base_url, path, params)
+            path_without_query = urlparse(url).path
+            request = Request(
+                url,
+                headers=self._headers("GET", path_without_query, accept="application/json"),
+                method="GET",
+            )
+            try:
+                with self._opener(request, timeout=self.timeout_s) as response:
+                    body = response.read()
+                break
+            except HTTPError as exc:
+                raise DeskAPIError(f"Desk HTTP {exc.code} for {path}") from exc
+            except (URLError, TimeoutError, OSError, ValueError) as exc:
+                transport_errors.append(f"{urlparse(base_url).hostname}: {exc}")
+        if body is None:
+            if self.mode == "gateway":
+                raise DeskAPIError(
+                    f"Desk gateway hosts unreachable for {path}: {'; '.join(transport_errors)}"
+                )
+            detail = transport_errors[0] if transport_errors else "unknown error"
+            raise DeskAPIError(f"Desk request failed for {path}: {detail}")
         try:
             return json.loads(body.decode("utf-8"))
         except (json.JSONDecodeError, UnicodeDecodeError) as exc:
@@ -301,6 +455,15 @@ class DeskClient:
         return _collection(payload, context="ticket threads")
 
     def get_thread(self, ticket_id: str, thread_id: str) -> dict[str, Any]:
+        if self.mode == "gateway":
+            payload = self._request_json(
+                f"tickets/{quote(ticket_id, safe='')}/threads/"
+                f"{quote(thread_id, safe='')}/attachments"
+            )
+            return {
+                "id": thread_id,
+                "attachments": _collection(payload, context="thread attachments"),
+            }
         payload = self._request_json(
             f"tickets/{quote(ticket_id, safe='')}/threads/{quote(thread_id, safe='')}",
             {"include": "plainText"},
@@ -310,35 +473,78 @@ class DeskClient:
         return payload
 
     def search_contacts(self, query: str) -> list[dict[str, Any]]:
+        if self.mode == "gateway":
+            params = {"module": "contacts", "q": query}
+        else:
+            params = {"module": "contacts", "searchStr": query, "from": 0, "limit": 50}
         payload = self._request_json(
             "search",
             # The Desk operation calls this input ``q``; the REST API names
             # the corresponding wire parameter ``searchStr``.
-            {"module": "contacts", "searchStr": query, "from": 0, "limit": 50},
+            params,
         )
         return _collection(payload, context="contact search")
 
-    def download_attachment(self, href: str, destination: Path) -> None:
-        url = urljoin(self.base_url, href)
-        parsed = urlparse(url)
-        if parsed.scheme != "https" or parsed.netloc.casefold() != self._base_host:
-            raise DeskAPIError("attachment href is outside the configured Desk host")
-        request = Request(url, headers=self._headers(accept="audio/mpeg,application/octet-stream"))
+    def download_attachment(
+        self,
+        href: str,
+        destination: Path,
+        *,
+        ticket_id: str,
+        thread_id: str,
+        attachment_id: str,
+    ) -> None:
+        if self.mode == "gateway":
+            path = (
+                f"tickets/{quote(ticket_id, safe='')}/threads/{quote(thread_id, safe='')}"
+                f"/attachments/{quote(attachment_id, safe='')}/content"
+            )
+            urls = [self._url(base_url, path) for base_url in self.base_urls]
+        else:
+            url = urljoin(self.base_url, href)
+            parsed = urlparse(url)
+            if parsed.scheme != "https" or parsed.netloc.casefold() != self._base_host:
+                raise DeskAPIError("attachment href is outside the configured Desk host")
+            urls = [url]
+
         part = destination.with_suffix(destination.suffix + ".part")
+        transport_errors: list[str] = []
         try:
-            with (
-                self._opener(request, timeout=self.timeout_s) as response,
-                part.open("wb") as handle,
-            ):
-                while chunk := response.read(1024 * 1024):
-                    handle.write(chunk)
-            if part.stat().st_size == 0:
-                raise DeskAPIError("Desk returned an empty attachment")
-            part.replace(destination)
-        except HTTPError as exc:
-            raise DeskAPIError(f"Desk HTTP {exc.code} while downloading attachment") from exc
-        except (URLError, TimeoutError, OSError, ValueError) as exc:
-            raise DeskAPIError(f"attachment download failed: {exc}") from exc
+            for url in urls:
+                path_without_query = urlparse(url).path
+                request = Request(
+                    url,
+                    headers=self._headers(
+                        "GET",
+                        path_without_query,
+                        accept="audio/mpeg,application/octet-stream",
+                    ),
+                    method="GET",
+                )
+                try:
+                    with (
+                        self._opener(request, timeout=self.timeout_s) as response,
+                        part.open("wb") as handle,
+                    ):
+                        while chunk := response.read(1024 * 1024):
+                            handle.write(chunk)
+                    if part.stat().st_size == 0:
+                        raise DeskAPIError("Desk returned an empty attachment")
+                    part.replace(destination)
+                    return
+                except HTTPError as exc:
+                    raise DeskAPIError(
+                        f"Desk HTTP {exc.code} while downloading attachment"
+                    ) from exc
+                except (URLError, TimeoutError, OSError, ValueError) as exc:
+                    transport_errors.append(f"{urlparse(url).hostname}: {exc}")
+            if self.mode == "gateway":
+                raise DeskAPIError(
+                    "Desk gateway hosts unreachable while downloading attachment: "
+                    f"{'; '.join(transport_errors)}"
+                )
+            detail = transport_errors[0] if transport_errors else "unknown error"
+            raise DeskAPIError(f"attachment download failed: {detail}")
         finally:
             try:
                 part.unlink(missing_ok=True)
@@ -384,7 +590,7 @@ def fetch_voicemail_audio(
             thread_id = listed.get("id")
             if not isinstance(thread_id, (str, int)):
                 raise DeskAPIError("RingCentral thread is missing its id")
-            detail = desk.get_thread(ticket_id, str(thread_id))
+            detail = {**listed, **desk.get_thread(ticket_id, str(thread_id))}
             for attachment in _attachments(detail):
                 name = attachment.get("name")
                 if isinstance(name, str) and name.casefold().endswith(".mp3"):
@@ -395,8 +601,14 @@ def fetch_voicemail_audio(
             raise DeskAPIError("multiple RingCentral thread mp3 attachments found")
 
         thread, attachment = matches[0]
-        thread_id = str(thread.get("id", "thread"))
-        attachment_id = str(attachment.get("id", "attachment"))
+        thread_id_value = thread.get("id")
+        attachment_id_value = attachment.get("id")
+        if not isinstance(thread_id_value, (str, int)):
+            raise DeskAPIError("RingCentral thread is missing its id")
+        if not isinstance(attachment_id_value, (str, int)):
+            raise DeskAPIError("RingCentral attachment is missing its id")
+        thread_id = str(thread_id_value)
+        attachment_id = str(attachment_id_value)
         href = attachment.get("href")
         if not isinstance(href, str) or not href.strip():
             href = (
@@ -411,7 +623,13 @@ def fetch_voicemail_audio(
                 f"{ticket_id}_{thread_id}_{attachment_id}_{suffix}.mp3"
             )
             suffix += 1
-        desk.download_attachment(href, destination)
+        desk.download_attachment(
+            href,
+            destination,
+            ticket_id=ticket_id,
+            thread_id=thread_id,
+            attachment_id=attachment_id,
+        )
         summary = thread.get("summary")
         return destination, parse_summary_line(summary)
     except TriageError:
@@ -954,6 +1172,31 @@ def _error_ticket_id(ticket_id: str) -> str:
     return repr(ticket_id)
 
 
+def _desk_client_from_env(
+    args: argparse.Namespace,
+    env: Mapping[str, str] | None = None,
+) -> DeskClient:
+    values = os.environ if env is None else env
+    mode = select_auth_mode(values)
+    if mode == "gateway":
+        hosts, secret, agent = load_gateway_credentials(values)
+        return DeskClient(
+            None,
+            mode="gateway",
+            org_id=args.desk_org_id,
+            gateway_hosts=hosts,
+            gateway_secret=secret,
+            gateway_agent=agent,
+            timeout_s=args.timeout,
+        )
+    return DeskClient(
+        load_access_token(values),
+        org_id=args.desk_org_id,
+        base_url=args.desk_base_url,
+        timeout_s=args.timeout,
+    )
+
+
 def main(argv: Sequence[str] | None = None) -> int:
     raw_argv = list(sys.argv[1:] if argv is None else argv)
     ticket_id = _best_effort_ticket_id(raw_argv)
@@ -966,13 +1209,7 @@ def main(argv: Sequence[str] | None = None) -> int:
                 "ticket id contains invalid characters",
                 EXIT_CONFIG,
             )
-        token = load_access_token()
-        desk = DeskClient(
-            token,
-            org_id=args.desk_org_id,
-            base_url=args.desk_base_url,
-            timeout_s=args.timeout,
-        )
+        desk = _desk_client_from_env(args)
         result = triage_ticket(
             ticket_id,
             desk,

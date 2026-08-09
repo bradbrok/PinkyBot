@@ -129,6 +129,160 @@ def test_empty_object_contact_search_is_a_valid_miss(monkeypatch):
     }
 
 
+class FakeHTTPResponse:
+    def __init__(self, body):
+        self.body = body
+        self.offset = 0
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+    def read(self, size=-1):
+        if size is None or size < 0:
+            chunk = self.body[self.offset :]
+            self.offset = len(self.body)
+            return chunk
+        chunk = self.body[self.offset : self.offset + size]
+        self.offset += len(chunk)
+        return chunk
+
+
+def test_gateway_search_uses_gateway_base_prefix_q_and_path_auth_hook(monkeypatch):
+    seen = {"requests": [], "headers": []}
+    monkeypatch.setattr(triage.time, "time", lambda: 123)
+
+    def opener(request, **kwargs):
+        seen["requests"].append(request.full_url)
+        seen["headers"].append({key.casefold(): value for key, value in request.header_items()})
+        return FakeHTTPResponse(b"{}")
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32", "10.0.0.209"),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    assert client.search_contacts("8015550100") == []
+    assert seen["requests"] == ["http://10.0.0.32:9100/desk/search?module=contacts&q=8015550100"]
+    assert seen["headers"][0]["x-pinky-agent"] == "geordi"
+    assert seen["headers"][0]["x-pinky-timestamp"] == "123"
+    assert (
+        seen["headers"][0]["x-pinky-signature"]
+        == triage._sign("shared-secret", "geordi", "GET", "/desk/search", 123)["x-pinky-signature"]
+    )
+
+
+def test_gateway_request_tries_hosts_in_order_and_resigns_each_attempt(monkeypatch):
+    seen = {"hosts": [], "timestamps": []}
+    timestamps = iter((101, 102))
+    monkeypatch.setattr(triage.time, "time", lambda: next(timestamps))
+
+    def opener(request, **kwargs):
+        host = triage.urlparse(request.full_url).hostname
+        seen["hosts"].append(host)
+        headers = {key.casefold(): value for key, value in request.header_items()}
+        seen["timestamps"].append(headers["x-pinky-timestamp"])
+        if host == "10.0.0.32":
+            raise triage.URLError("first host unavailable")
+        return FakeHTTPResponse(b"{}")
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32", "10.0.0.209"),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    assert client.search_contacts("8015550100") == []
+    assert seen["hosts"] == ["10.0.0.32", "10.0.0.209"]
+    assert seen["timestamps"] == ["101", "102"]
+
+
+def test_gateway_thread_attachments_use_explicit_allowlisted_route(monkeypatch):
+    seen = {"requests": []}
+    monkeypatch.setattr(triage.time, "time", lambda: 123)
+
+    def opener(request, **kwargs):
+        seen["requests"].append(request.full_url)
+        return FakeHTTPResponse(b'{"data":[{"id":"attachment-1","name":"voice.mp3"}]}')
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+
+    assert client.get_thread("ticket/1", "thread 2") == {
+        "id": "thread 2",
+        "attachments": [{"id": "attachment-1", "name": "voice.mp3"}],
+    }
+    expected_path = "/desk/tickets/ticket%2F1/threads/thread%202/attachments"
+    assert seen["requests"] == [f"http://10.0.0.32:9100{expected_path}"]
+
+
+def test_direct_search_keeps_v1_base_query_and_oauth_header():
+    seen = {}
+
+    def opener(request, **kwargs):
+        seen["url"] = request.full_url
+        seen["authorization"] = request.get_header("Authorization")
+        return FakeHTTPResponse(b"{}")
+
+    client = triage.DeskClient("direct-token", opener=opener)
+
+    assert client.search_contacts("8015550100") == []
+    assert seen == {
+        "url": (
+            "https://desk.zoho.com/api/v1/search?module=contacts&"
+            "searchStr=8015550100&from=0&limit=50"
+        ),
+        "authorization": "Zoho-oauthtoken direct-token",
+    }
+
+
+def test_gateway_attachment_uses_ids_not_desk_href_and_writes_raw_bytes(tmp_path, monkeypatch):
+    seen = {"requests": []}
+    monkeypatch.setattr(triage.time, "time", lambda: 123)
+
+    def opener(request, **kwargs):
+        seen["requests"].append(request.full_url)
+        return FakeHTTPResponse(b"raw-mp3-bytes")
+
+    client = triage.DeskClient(
+        None,
+        mode="gateway",
+        gateway_hosts=("10.0.0.32",),
+        gateway_secret="shared-secret",
+        gateway_agent="geordi",
+        opener=opener,
+    )
+    destination = tmp_path / "voice.mp3"
+
+    client.download_attachment(
+        "/api/v1/desk-native-wrong-href",
+        destination,
+        ticket_id="ticket 1",
+        thread_id="thread/2",
+        attachment_id="attachment?3",
+    )
+
+    expected_path = "/desk/tickets/ticket%201/threads/thread%2F2/attachments/attachment%3F3/content"
+    assert seen["requests"] == [f"http://10.0.0.32:9100{expected_path}"]
+    assert destination.read_bytes() == b"raw-mp3-bytes"
+    assert not destination.with_suffix(".mp3.part").exists()
+
+
 def test_explicit_city_fallback_returns_list_without_auto_binding():
     desk = FakeSearchDesk(
         {
@@ -302,7 +456,7 @@ def test_fetch_chain_uses_only_notify_thread_mp3(tmp_path):
                 ],
             }
 
-        def download_attachment(self, href, destination):
+        def download_attachment(self, href, destination, **ids):
             self.downloaded = (href, destination)
             destination.write_bytes(b"audio")
 
@@ -327,7 +481,7 @@ def test_configured_destination_does_not_overwrite_prior_download(tmp_path):
                 "attachments": [{"id": "mp3", "name": "voice.mp3", "href": "audio"}],
             }
 
-        def download_attachment(self, href, destination):
+        def download_attachment(self, href, destination, **ids):
             destination.write_bytes(b"new")
 
     original = tmp_path / "ticket-1_vm_mp3.mp3"
@@ -496,7 +650,7 @@ def test_pipeline_smoke_combines_fetch_transcript_candidates_and_ledgers(tmp_pat
                 "attachments": [{"id": "mp3", "name": "voice.mp3", "href": "audio"}],
             }
 
-        def download_attachment(self, href, destination):
+        def download_attachment(self, href, destination, **ids):
             destination.write_bytes(b"audio")
 
         def search_contacts(self, query):
@@ -558,6 +712,102 @@ def test_token_source_accepts_direct_plain_file_and_json_file(tmp_path):
     assert triage.load_access_token({"ZOHO_DESK_TOKEN_FILE": str(json_file)}) == "json-secret"
 
 
+def test_gateway_signing_payload_is_exact_and_uses_hex_digest():
+    assert triage._sign(
+        "shared-secret",
+        "geordi",
+        "get",
+        "/desk/tickets/123/threads?ignored=query",
+        1_700_000_000,
+    ) == {
+        "x-pinky-agent": "geordi",
+        "x-pinky-timestamp": "1700000000",
+        "x-pinky-signature": ("901d1d90a36ad82a3e4aa2f906ae7d168ad46e7d1d168e9623638aacb0bda270"),
+    }
+
+
+def test_auth_mode_auto_defaults_to_gateway_for_complete_gateway_group():
+    assert (
+        triage.select_auth_mode(
+            {
+                "ZOHO_API_HOST": "10.0.0.32,10.0.0.209",
+                "ZOHO_API_SECRET": "shared-secret",
+                "ZOHO_AGENT_NAME": "geordi",
+                "ZOHO_DESK_ACCESS_TOKEN": "direct-token",
+            }
+        )
+        == "gateway"
+    )
+
+
+def test_auth_mode_auto_defaults_to_direct_when_gateway_group_is_incomplete():
+    assert (
+        triage.select_auth_mode(
+            {
+                "ZOHO_API_HOST": "10.0.0.32",
+                "ZOHO_API_SECRET": "shared-secret",
+                "ZOHO_DESK_ACCESS_TOKEN": "direct-token",
+            }
+        )
+        == "direct"
+    )
+
+
+def test_auth_mode_without_usable_group_fails_loud_and_names_missing_groups():
+    with pytest.raises(triage.TriageError) as caught:
+        triage.select_auth_mode({})
+
+    assert caught.value.stage == "config"
+    assert caught.value.exit_code == triage.EXIT_CONFIG
+    assert "ZOHO_API_HOST" in caught.value.message
+    assert "ZOHO_API_SECRET" in caught.value.message
+    assert "ZOHO_AGENT_NAME" in caught.value.message
+    assert "ZOHO_DESK_ACCESS_TOKEN or ZOHO_DESK_TOKEN_FILE" in caught.value.message
+
+
+def test_explicit_gateway_mode_requires_agent_name_without_a_default():
+    with pytest.raises(triage.TriageError) as caught:
+        triage.select_auth_mode(
+            {
+                "RC_VOICEMAIL_AUTH_MODE": "gateway",
+                "ZOHO_API_HOST": "10.0.0.32",
+                "ZOHO_API_SECRET": "shared-secret",
+            }
+        )
+
+    assert caught.value.stage == "config"
+    assert caught.value.exit_code == triage.EXIT_CONFIG
+    assert "ZOHO_AGENT_NAME" in caught.value.message
+    assert "luka" not in caught.value.message
+    assert "sasha" not in caught.value.message
+
+
+def test_cli_client_factory_uses_ordered_gateway_hosts_and_explicit_credentials():
+    args = triage.argparse.Namespace(
+        desk_org_id=None,
+        desk_base_url=triage.DEFAULT_DESK_BASE_URL,
+        timeout=17.0,
+    )
+
+    client = triage._desk_client_from_env(
+        args,
+        {
+            "ZOHO_API_HOST": "10.0.0.32, 10.0.0.209",
+            "ZOHO_API_SECRET": "shared-secret",
+            "ZOHO_AGENT_NAME": "geordi",
+        },
+    )
+
+    assert client.mode == "gateway"
+    assert client.base_urls == (
+        "http://10.0.0.32:9100/desk/",
+        "http://10.0.0.209:9100/desk/",
+    )
+    assert client._gateway_secret == "shared-secret"
+    assert client._gateway_agent == "geordi"
+    assert client.timeout_s == 17.0
+
+
 def test_main_returns_zero_for_valid_no_speech_result(monkeypatch, capsys, tmp_path):
     expected = triage.build_output(
         "123",
@@ -567,7 +817,7 @@ def test_main_returns_zero_for_valid_no_speech_result(monkeypatch, capsys, tmp_p
         [],
         [],
     )
-    monkeypatch.setattr(triage, "load_access_token", lambda: "token")
+    monkeypatch.setattr(triage, "_desk_client_from_env", lambda args: object())
     monkeypatch.setattr(triage, "triage_ticket", lambda *args, **kwargs: expected)
 
     return_code = triage.main(
@@ -587,7 +837,7 @@ def test_main_returns_zero_for_valid_no_speech_result(monkeypatch, capsys, tmp_p
 
 
 def test_main_failure_is_nonzero_and_self_describing(monkeypatch, capsys, tmp_path):
-    monkeypatch.setattr(triage, "load_access_token", lambda: "token")
+    monkeypatch.setattr(triage, "_desk_client_from_env", lambda args: object())
 
     def fail(*args, **kwargs):
         raise triage.TriageError("transcribe", "helper crashed", triage.EXIT_TRANSCRIBE)
