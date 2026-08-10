@@ -3214,6 +3214,38 @@ class TmuxSession:
             return ""
         return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
 
+    def _dedicated_config_dir(self) -> str:
+        """The dedicated CLAUDE_CONFIG_DIR for a LOCAL agent that opted into
+        its own Claude account via ``dedicated_config_dir``, else ``""``.
+
+        Read from the REGISTRY (mirrors ``_container_agent``): isolation-
+        adjacent flags live on the Agent record, not the per-session
+        StreamingSessionConfig. A registry hiccup falls back to the shared
+        ~/.claude (fail-safe: a read-side error must not wedge a session).
+
+        LOCAL-only (#550/Picard): a container agent already runs with its own
+        CLAUDE_CONFIG_DIR (``container_config_dir``), so the flag is a no-op
+        there — we gate on ``isolation_mode`` being local/unset. Requires an
+        absolute working_dir (the path is ``<working_dir>/.claude-local``); a
+        relative/empty cwd can't anchor a stable config dir, so we withhold it
+        and fall back to the shared ~/.claude (current behavior)."""
+        if not self._registry or not self.agent_name:
+            return ""
+        try:
+            agent = self._registry.get(self.agent_name)
+        except Exception:
+            return ""
+        if not agent or not getattr(agent, "dedicated_config_dir", False):
+            return ""
+        if getattr(agent, "isolation_mode", "local") not in ("", "local"):
+            return ""
+        wd = (self._config.working_dir or "").strip()
+        if not wd or not Path(wd).is_absolute():
+            return ""
+        from pinky_daemon.provisioning import local_config_dir
+
+        return local_config_dir(wd)
+
     def _build_repl_env(self) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
@@ -3243,6 +3275,14 @@ class TmuxSession:
         if self._config.provider_key:
             env["ANTHROPIC_API_KEY"] = self._config.provider_key
             env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
+        # Per-agent dedicated Claude account (#550/Picard): a LOCAL agent that
+        # opted into ``dedicated_config_dir`` runs with its OWN CLAUDE_CONFIG_DIR
+        # (<working_dir>/.claude-local) so it holds its own OAuth login instead
+        # of sharing the daemon user's ~/.claude. Empty for every other agent
+        # (shared ~/.claude — unchanged). Guarded LOCAL-only inside the helper.
+        dedicated_config_dir = self._dedicated_config_dir()
+        if dedicated_config_dir:
+            env["CLAUDE_CONFIG_DIR"] = dedicated_config_dir
         # Static OAuth token forwarding (#780): inject a long-lived, never-
         # refreshed CLAUDE_CODE_OAUTH_TOKEN so claude authenticates with it
         # instead of the single-use refresh token in .credentials.json (no
@@ -3251,8 +3291,13 @@ class TmuxSession:
         # without this -e the token never reaches them; local tmux agents get
         # it via tmux-server inheritance, but forwarding makes it explicit and
         # uniform. Flag-gated + provider-guarded inside _static_oauth_token.
+        #
+        # SUPPRESSED for a dedicated_config_dir agent: injecting the SHARED
+        # fleet token would authenticate it as the shared account regardless of
+        # its private config dir, defeating the whole point of the flag. Its own
+        # login lives in .claude-local (populated by a manual `claude /login`).
         oauth_token = self._static_oauth_token()
-        if oauth_token:
+        if oauth_token and not dedicated_config_dir:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
@@ -5560,6 +5605,15 @@ class TmuxSession:
                 from pinky_daemon.provisioning import container_config_dir
 
                 return Path(container_config_dir(wd)) / "projects" / encoded
+        # Dedicated-config-dir LOCAL agent (#550/Picard): claude runs with
+        # CLAUDE_CONFIG_DIR=<working_dir>/.claude-local, so its transcripts live
+        # under that config dir's projects/, not the shared ~/.claude. Without
+        # this branch the tailer watches ~/.claude and never sees the agent's
+        # conversation. Helper returns "" for every non-dedicated/non-local
+        # agent, so the shared path below is unchanged for them.
+        dedicated_config_dir = self._dedicated_config_dir()
+        if dedicated_config_dir:
+            return Path(dedicated_config_dir) / "projects" / encoded
         return Path.home() / ".claude" / "projects" / encoded
 
     def _has_prior_transcript(self) -> bool:

@@ -36,11 +36,13 @@ from pinky_daemon.tmux_session import (
 
 
 class _FakeAgent:
-    def __init__(self, name, isolation_mode="local", working_dir="", isolated=False):
+    def __init__(self, name, isolation_mode="local", working_dir="", isolated=False,
+                 dedicated_config_dir=False):
         self.name = name
         self.isolation_mode = isolation_mode
         self.working_dir = working_dir
         self.isolated = isolated
+        self.dedicated_config_dir = dedicated_config_dir
 
 
 class _RecordingInner:
@@ -714,6 +716,100 @@ class TestStaticOAuthTokenForward:
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")  # no token in env
         ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in ss._build_repl_env()
+
+
+class TestDedicatedConfigDir:
+    """#550/Picard: an opt-in LOCAL agent runs its own Claude subscription
+    account via a dedicated CLAUDE_CONFIG_DIR (<working_dir>/.claude-local) and
+    has the SHARED CLAUDE_CODE_OAUTH_TOKEN withheld. Default False (and every
+    container agent) must behave exactly as before — shared ~/.claude, shared
+    token."""
+
+    def _clear(self, monkeypatch):
+        monkeypatch.delenv("PINKY_FORWARD_OAUTH_TOKEN", raising=False)
+        monkeypatch.delenv("CLAUDE_CODE_OAUTH_TOKEN", raising=False)
+
+    def test_default_agent_no_config_dir_and_keeps_shared_token(self, monkeypatch, tmp_path):
+        # Backward compat: dedicated_config_dir=False → NO CLAUDE_CONFIG_DIR set,
+        # and the shared oauth token is still injected when forwarding is on.
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=False)
+            ),
+            working_dir=wd,
+        )
+        env = ss._build_repl_env()
+        assert "CLAUDE_CONFIG_DIR" not in env
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-shared"
+
+    def test_dedicated_local_agent_sets_config_dir_and_suppresses_token(
+        self, monkeypatch, tmp_path
+    ):
+        # The whole feature: own config dir + shared token SUPPRESSED even when
+        # _static_oauth_token() would otherwise return one (forwarding on).
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=True)
+            ),
+            working_dir=wd,
+        )
+        # Sanity: the token IS available to forward — suppression is the flag's
+        # doing, not an empty env.
+        assert ss._static_oauth_token() == "sk-ant-oat01-shared"
+        env = ss._build_repl_env()
+        assert env["CLAUDE_CONFIG_DIR"] == str(Path(wd) / ".claude-local")
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+
+    def test_container_agent_flag_is_noop(self, monkeypatch, tmp_path):
+        # dedicated_config_dir is a LOCAL concept — a container agent already
+        # gets its own config dir, so the flag must not add CLAUDE_CONFIG_DIR
+        # via the local path nor suppress the (container-essential) token.
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-c")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "container", working_dir=wd, dedicated_config_dir=True)
+            ),
+            working_dir=wd,
+        )
+        assert ss._dedicated_config_dir() == ""
+        env = ss._build_repl_env()
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-c"
+
+    def test_project_dir_routes_to_claude_local(self, monkeypatch, tmp_path):
+        # Transcript discovery must follow the dedicated config dir, else the
+        # tailer watches ~/.claude and never sees the agent's conversation.
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=True)
+            ),
+            working_dir=wd,
+        )
+        expected = Path(wd) / ".claude-local" / "projects" / _claude_slug(wd)
+        assert ss._project_dir() == expected
+
+    def test_project_dir_default_agent_unchanged(self, monkeypatch, tmp_path):
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=False)
+            ),
+            working_dir=wd,
+        )
+        assert ss._project_dir() == Path.home() / ".claude" / "projects" / _claude_slug(wd)
 
 
 @pytest.mark.asyncio

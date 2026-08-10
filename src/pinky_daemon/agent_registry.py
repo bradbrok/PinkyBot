@@ -505,6 +505,14 @@ class Agent:
     # effort drifts from thinking_effort. Default False (warn-only): drift is
     # surfaced to /agents/{name}/effort-drift + heartbeat but does not block.
     strict_effort_enforcement: bool = False
+    # When True AND the agent is LOCAL (isolation_mode local / non-container),
+    # the tmux session runs with its own CLAUDE_CONFIG_DIR
+    # (<working_dir>/.claude-local) and the shared CLAUDE_CODE_OAUTH_TOKEN is
+    # withheld — so the agent holds its OWN Claude subscription account
+    # (populated later by a manual `claude /login`) instead of sharing the
+    # daemon user's ~/.claude. No-op for container agents (they already get
+    # their own config dir). Default False = shared ~/.claude (current behavior).
+    dedicated_config_dir: bool = False
     watchdog_config: dict = field(default_factory=dict)  # Per-agent watchdog overrides (JSON blob)
     # watchdog_config schema: {
     #   "enabled": true,              # Enable/disable watchdog for this agent
@@ -570,6 +578,7 @@ class Agent:
             "provider_ref": self.provider_ref,
             "thinking_effort": self.thinking_effort,
             "strict_effort_enforcement": self.strict_effort_enforcement,
+            "dedicated_config_dir": self.dedicated_config_dir,
             "watchdog_config": self.watchdog_config,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -1757,6 +1766,9 @@ class AgentRegistry:
             # When 1, verify_effort CLI hook blocks tool calls on effort drift
             # (vs. warn-only default of 0). See #429.
             ("strict_effort_enforcement", "INTEGER NOT NULL DEFAULT 0"),
+            # Opt-in per-agent dedicated CLAUDE_CONFIG_DIR (own Claude account
+            # for a LOCAL agent). Default 0 = shared ~/.claude (unchanged).
+            ("dedicated_config_dir", "INTEGER NOT NULL DEFAULT 0"),
             ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("last_seen_at", "REAL NOT NULL DEFAULT 0"),
             ("runtime", "TEXT NOT NULL DEFAULT 'claude_sdk'"),
@@ -2607,7 +2619,8 @@ except Exception as exc:
                     "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                     "librarian_enabled", "librarian_schedule",
                     "runtime", "transport", "provider_url", "provider_model", "provider_ref",
-                    "thinking_effort", "strict_effort_enforcement", "isolated",
+                    "thinking_effort", "strict_effort_enforcement",
+                    "dedicated_config_dir", "isolated",
                     "isolation_mode", "container_image"):
             if key in kwargs:
                 updates[key] = kwargs[key]
@@ -2626,7 +2639,8 @@ except Exception as exc:
 
         for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
                     "plain_text_fallback", "dream_enabled", "dream_notify",
-                    "librarian_enabled", "strict_effort_enforcement", "isolated"):
+                    "librarian_enabled", "strict_effort_enforcement",
+                    "dedicated_config_dir", "isolated"):
             if key in updates:
                 updates[key] = int(updates[key])
         if "voice_config" in updates and isinstance(updates["voice_config"], dict):
@@ -2741,6 +2755,7 @@ except Exception as exc:
                 provider_ref=kwargs.get("provider_ref", ""),
                 thinking_effort=kwargs.get("thinking_effort", "medium"),
                 strict_effort_enforcement=kwargs.get("strict_effort_enforcement", False),
+                dedicated_config_dir=kwargs.get("dedicated_config_dir", False),
                 watchdog_config=kwargs.get("watchdog_config", {}),
                 created_at=now,
                 updated_at=now,
@@ -2757,9 +2772,10 @@ except Exception as exc:
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
-                    thinking_effort, strict_effort_enforcement, watchdog_config,
+                    thinking_effort, strict_effort_enforcement, dedicated_config_dir,
+                    watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -2777,6 +2793,7 @@ except Exception as exc:
                  agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
                  agent.provider_model, agent.provider_ref,
                  agent.thinking_effort, int(agent.strict_effort_enforcement),
+                 int(agent.dedicated_config_dir),
                  json.dumps(agent.watchdog_config),
                  agent.created_at, agent.updated_at),
             )
@@ -2815,7 +2832,7 @@ except Exception as exc:
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
-        "isolation_mode, container_image"
+        "isolation_mode, container_image, dedicated_config_dir"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -6806,6 +6823,7 @@ except Exception as exc:
             isolated=bool(row[51]) if len(row) > 51 else False,
             isolation_mode=row[52] if len(row) > 52 and row[52] else "local",
             container_image=row[53] if len(row) > 53 and row[53] else "",
+            dedicated_config_dir=bool(row[54]) if len(row) > 54 else False,
         )
 
     # ── Cost Tracking ──────────────────────────────────────
