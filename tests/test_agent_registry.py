@@ -462,6 +462,25 @@ class TestAgentCRUD:
         registry.register("plain", isolated=True)
         assert registry.get("plain").isolated is True
 
+    def test_dedicated_config_dir_round_trip(self, registry):
+        """#550/Picard: dedicated_config_dir persists through insert/get/to_dict,
+        defaults off (backward compat), and is settable via the update path."""
+        # Default off — existing agents keep the shared ~/.claude.
+        plain = registry.register("plain", model="opus")
+        assert plain.dedicated_config_dir is False
+        assert registry.get("plain").dedicated_config_dir is False
+        assert registry.get("plain").to_dict()["dedicated_config_dir"] is False
+
+        # Insert with dedicated_config_dir=True.
+        ded = registry.register("solo", model="opus", dedicated_config_dir=True)
+        assert ded.dedicated_config_dir is True
+        assert registry.get("solo").dedicated_config_dir is True
+        assert registry.get("solo").to_dict()["dedicated_config_dir"] is True
+
+        # Update path flips it on for an existing agent.
+        registry.register("plain", dedicated_config_dir=True)
+        assert registry.get("plain").dedicated_config_dir is True
+
     def test_isolation_mode_round_trip(self, registry):
         """#149 phase-3: isolation_mode persists through insert/get/to_dict,
         defaults to 'local', and is settable via the update path."""

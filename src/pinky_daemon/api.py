@@ -6337,6 +6337,7 @@ npm run build</pre>
             provider_ref=req.provider_ref,
             thinking_effort=req.thinking_effort,
             strict_effort_enforcement=req.strict_effort_enforcement,
+            dedicated_config_dir=req.dedicated_config_dir,
             watchdog_config=req.watchdog_config or {},
             isolated=req.isolated,
             isolation_mode=req.isolation_mode,
@@ -6793,6 +6794,23 @@ npm run build</pre>
 
                 allowed_roots.append(
                     (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
+                    .resolve()
+                )
+        # Dedicated-config-dir LOCAL agent (#550/Picard): claude runs with
+        # CLAUDE_CONFIG_DIR=<working_dir>/.claude-local, so its SessionStart hook
+        # legitimately reports transcripts under <working_dir>/.claude-local/
+        # projects/... — without this root the report 403s and the tailer never
+        # repoints off its cold-start guess.
+        if (
+            getattr(agent, "dedicated_config_dir", False)
+            and getattr(agent, "isolation_mode", "local") in ("", "local")
+        ):
+            wd = (agent.working_dir or "").strip()
+            if wd and Path(wd).is_absolute():
+                from pinky_daemon.provisioning import local_config_dir
+
+                allowed_roots.append(
+                    (Path(local_config_dir(str(Path(wd).resolve()))) / "projects")
                     .resolve()
                 )
         try:

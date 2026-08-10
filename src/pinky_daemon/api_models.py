@@ -344,6 +344,10 @@ class RegisterAgentRequest(BaseModel):
     provider_ref: str = ""  # ID of a global provider from the providers table
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool = False  # PR #429 — block tool calls when effort drifts
+    # #550/Picard — opt-in: a LOCAL agent runs its own Claude account via a
+    # dedicated CLAUDE_CONFIG_DIR (<working_dir>/.claude-local). Default False =
+    # shared ~/.claude (unchanged). No-op for container agents.
+    dedicated_config_dir: bool = False
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
     isolated: bool = False  # #149 — hard-isolated tenant (Counterpart); daemon denies cross-agent actions
     # #149 phase-3 — OS-level runtime sandbox for an isolated tenant.
@@ -424,6 +428,9 @@ class UpdateAgentRequest(BaseModel):
     provider_ref: str | None = None  # ID of a global provider from the providers table
     thinking_effort: str | None = None  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
+    # #550/Picard — opt-in dedicated CLAUDE_CONFIG_DIR for a LOCAL agent;
+    # None = leave unchanged. See RegisterAgentRequest for semantics.
+    dedicated_config_dir: bool | None = None
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
     # #149 — hard-isolation flag; None = leave unchanged. Settable so a
     # container→local round trip can explicitly lift the (auto-coerced)
