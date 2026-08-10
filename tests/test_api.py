@@ -5249,6 +5249,49 @@ class TestAgentScheduleEndpoints:
         ).json()["schedules"]
         assert schedules[0]["cron"] == "0 8 * * *"
 
+    def test_create_schedule_rejects_six_field_cron(self):
+        # A 6-field expression parses as "seconds first" elsewhere but the
+        # scheduler only matches 5 fields, so it would be stored and never
+        # fire — or fire at an unintended hour (#446).
+        client = self._make_client()
+        self._register(client, "alice")
+
+        response = self._create_schedule(client, cron="0 21 * * * *")
+
+        assert response.status_code == 400
+        assert "five fields" in response.json()["detail"]
+        assert client.get(
+            "/agents/alice/schedules",
+            params={"enabled_only": False},
+        ).json()["count"] == 0
+
+    def test_patch_schedule_rejects_six_field_cron_without_mutating(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+
+        response = client.patch(
+            f"/agents/alice/schedules/{created['id']}",
+            json={"cron": "30 22 * * * *"},
+        )
+
+        assert response.status_code == 400
+        assert "five fields" in response.json()["detail"]
+        schedules = client.get(
+            "/agents/alice/schedules",
+            params={"enabled_only": False},
+        ).json()["schedules"]
+        assert schedules[0]["cron"] == "0 8 * * *"
+
+    def test_create_schedule_accepts_valid_cron(self):
+        client = self._make_client()
+        self._register(client, "alice")
+
+        response = self._create_schedule(client, cron="*/30 * * * *")
+
+        assert response.status_code == 200
+        assert response.json()["cron"] == "*/30 * * * *"
+
     def test_create_schedule_rejects_enabled_duplicate_name(self):
         client = self._make_client()
         self._register(client, "alice")
