@@ -538,6 +538,27 @@ class _WakeSubmissionLateDetected(Exception):  # noqa: N818
 class _WakeSubmissionRecoveryScheduled(Exception):  # noqa: N818
     """The failed wake scheduled transport recovery; stop the old worker."""
 
+class _SchedulerDeliverySlotTimeout(RuntimeError):  # noqa: N818
+    """The pane never freed a delivery slot within the #445 cap.
+
+    Raised out of ``_wait_for_scheduler_delivery_slot`` so the ordinary
+    ``except Exception`` arm of ``_deliver_scheduler_turn`` resolves the
+    receipt False (wake stays undelivered → replayed on the next
+    scheduler pass) and releases ``_scheduler_delivery_lock``, instead of
+    holding it forever behind an invisible spin.
+    """
+
+
+# #445 — the busy-wait before a scheduler paste used to be unbounded and
+# silent. When ``live_status`` latches on "working" (a wake prompt typed
+# but never submitted) ``_scheduler_pane_busy`` stays True forever, so the
+# wait spun with zero log lines while holding ``_scheduler_delivery_lock``
+# — starving every later wake for the same agent. The cap sits below the
+# scheduler's own 600 s receipt expiry so the receipt resolves False (and
+# the wake is re-queued) before the scheduler gives up on it.
+_SCHEDULER_SLOT_WAIT_TIMEOUT_SEC = 300.0
+_SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC = 30.0
+
 
 @dataclass
 class TmuxCommandResult:
@@ -1433,6 +1454,12 @@ class _QueuedTurn:
     # the only positive evidence and replay work that already entered the pane.
     scheduler_accept: object = None  # Callable() -> bool
     scheduler_serialized: bool = False
+    # #445 — monotonic anchor for the delivery-slot wait budget. Set on the
+    # first wait for this turn and never reset: ``_deliver_turn`` re-enters
+    # the wait every time the under-lock recheck loses the pane, and a
+    # per-call budget would restart from zero each lap (the unbounded spin
+    # this cap exists to stop). Same anchor discipline as #832/#445-bis.
+    scheduler_slot_wait_started_at: float | None = None
     pane_delivery_started: bool = False
     pane_queue_enqueued: bool = False
     transport_accepted: bool = False
@@ -8693,13 +8720,87 @@ class TmuxSession(TransportReplacementMixin):
 
         if self._scheduler_receipt_terminal(turn):
             raise _SchedulerDeliveryCancelled
+
+        if turn.scheduler_slot_wait_started_at is None:
+            turn.scheduler_slot_wait_started_at = time.monotonic()
+        anchor = turn.scheduler_slot_wait_started_at
+        next_log_at = anchor + _SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC
+
         while self._scheduler_pane_busy(turn):
             if self._scheduler_receipt_terminal(turn):
                 raise _SchedulerDeliveryCancelled
-            await asyncio.sleep(0.25)
+            now = time.monotonic()
+            waited = now - anchor
+            if waited >= _SCHEDULER_SLOT_WAIT_TIMEOUT_SEC:
+                raise _SchedulerDeliverySlotTimeout(
+                    f"no scheduler delivery slot after {waited:.0f}s "
+                    f"(cap {_SCHEDULER_SLOT_WAIT_TIMEOUT_SEC:.0f}s, "
+                    f"reason={turn.reason}, "
+                    f"busy={self._scheduler_busy_reason(turn)}) — "
+                    f"leaving the wake undelivered for replay"
+                )
+            if now >= next_log_at:
+                _log(
+                    f"tmux[{self.agent_name}]: SCHEDULER_SLOT_WAIT "
+                    f"reason={turn.reason} waited={waited:.0f}s "
+                    f"cap={_SCHEDULER_SLOT_WAIT_TIMEOUT_SEC:.0f}s "
+                    f"busy={self._scheduler_busy_reason(turn)}"
+                )
+                while next_log_at <= now:
+                    next_log_at += _SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC
+            await asyncio.sleep(
+                min(0.25, _SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC / 2)
+            )
 
         if self._scheduler_receipt_terminal(turn):
             raise _SchedulerDeliveryCancelled
+
+    def _scheduler_busy_reason(
+        self, candidate: _QueuedTurn | None = None
+    ) -> str:
+        """Short diagnostic for why the pane refuses a scheduler paste.
+
+        Logging-only (#445): the historical wait printed nothing, so a
+        latched ``live_status`` was indistinguishable from a genuinely
+        busy pane. Never raises — a broken ``live_status_fn`` must not
+        take down the log line that reports it.
+        """
+        candidate_in_worker = (
+            candidate is not None and self._inflight_turn is candidate
+        )
+        if self._inflight_tool_calls:
+            return f"tool_calls={len(self._inflight_tool_calls)}"
+        if self._inflight_turn is not None and not candidate_in_worker:
+            return "inflight_turn"
+        if not self._message_queue.empty() and not candidate_in_worker:
+            return f"queue={self._message_queue.qsize()}"
+        live_status_fn = getattr(self._config, "live_status_fn", None)
+        if live_status_fn is None:
+            return "no_live_status_fn"
+        try:
+            live = live_status_fn() or {}
+        except Exception as exc:
+            return f"live_status_error={type(exc).__name__}"
+        status = live.get("status")
+        if status != "idle":
+            return f"live_status={status!r}"
+        last_updated = live.get("last_updated")
+        if not (
+            isinstance(last_updated, (int, float))
+            and not isinstance(last_updated, bool)
+            and last_updated > 0
+        ):
+            return "live_status_no_timestamp"
+        for entry in self._inflight_metas:
+            dispatched_at = getattr(entry, "dispatched_at", None)
+            if not (
+                isinstance(dispatched_at, (int, float))
+                and not isinstance(dispatched_at, bool)
+                and dispatched_at > 0
+                and last_updated >= dispatched_at
+            ):
+                return "idle_older_than_inflight_meta"
+        return "free"
 
     def _scheduler_pane_busy(
         self, candidate: _QueuedTurn | None = None

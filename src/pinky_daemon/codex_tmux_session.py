@@ -58,6 +58,8 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
+
+from pinky_daemon import tmux_session
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
@@ -489,10 +491,41 @@ class CodexTmuxSession(TmuxSession):
         """Wait for Codex work, with a literal idle-pane stale-meta exit."""
         if not turn.scheduler_serialized:
             return
+        if turn.scheduler_slot_wait_started_at is None:
+            turn.scheduler_slot_wait_started_at = time.monotonic()
+        anchor = turn.scheduler_slot_wait_started_at
+        next_log_at = anchor + tmux_session._SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC
         while self._scheduler_pane_busy(turn):
             delivery = turn.scheduler_delivery
             if delivery is not None and delivery.cancelled():
                 raise _SchedulerDeliveryCancelled
+            # #445 — same bounded, logged wait as the base class. The codex
+            # gate has extra stale-meta recovery below, but nothing here
+            # guarantees the pane ever frees: without a cap the wait holds
+            # ``_scheduler_delivery_lock`` forever and starves later wakes.
+            now = time.monotonic()
+            waited = now - anchor
+            if waited >= tmux_session._SCHEDULER_SLOT_WAIT_TIMEOUT_SEC:
+                raise tmux_session._SchedulerDeliverySlotTimeout(
+                    f"no codex scheduler delivery slot after {waited:.0f}s "
+                    f"(cap "
+                    f"{tmux_session._SCHEDULER_SLOT_WAIT_TIMEOUT_SEC:.0f}s, "
+                    f"reason={turn.reason}, "
+                    f"busy={self._scheduler_busy_reason(turn)}) — "
+                    f"leaving the wake undelivered for replay"
+                )
+            if now >= next_log_at:
+                _log(
+                    f"tmux[{self.agent_name}]: SCHEDULER_SLOT_WAIT "
+                    f"reason={turn.reason} waited={waited:.0f}s "
+                    f"cap="
+                    f"{tmux_session._SCHEDULER_SLOT_WAIT_TIMEOUT_SEC:.0f}s "
+                    f"busy={self._scheduler_busy_reason(turn)}"
+                )
+                while next_log_at <= now:
+                    next_log_at += (
+                        tmux_session._SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC
+                    )
             if self._codex_gate_blocked_only_by_metas(turn):
                 first_idle = await self._codex_capture_explicit_idle()
                 if first_idle:
@@ -506,7 +539,12 @@ class CodexTmuxSession(TmuxSession):
                             reason="explicit_idle_pane",
                         )
                         continue
-            await asyncio.sleep(0.25)
+            await asyncio.sleep(
+                min(
+                    0.25,
+                    tmux_session._SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC / 2,
+                )
+            )
         delivery = turn.scheduler_delivery
         if delivery is not None and delivery.cancelled():
             raise _SchedulerDeliveryCancelled

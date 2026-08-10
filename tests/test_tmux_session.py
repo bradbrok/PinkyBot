@@ -12581,3 +12581,97 @@ def test_scheduler_drain_busy_unstamped_spawn_keeps_fail_closed() -> None:
     }
 
     assert ss.scheduler_drain_busy() is True
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #445 — scheduler delivery slot: bounded wait + visible progress
+# ──────────────────────────────────────────────────────────────────────────
+
+
+def _scheduler_turn() -> _QueuedTurn:
+    """A serialized scheduler turn with a live delivery receipt."""
+    return _QueuedTurn(
+        prompt="wake",
+        platform="",
+        chat_id="",
+        message_id="",
+        internal=True,
+        reason="wake_scheduled",
+        scheduler_serialized=True,
+        scheduler_delivery=asyncio.get_event_loop().create_future(),
+    )
+
+
+@pytest.fixture
+def _tiny_slot_budget(monkeypatch):
+    """Shrink the #445 cap/log cadence so tests run in milliseconds."""
+    monkeypatch.setattr(
+        tmux_session, "_SCHEDULER_SLOT_WAIT_TIMEOUT_SEC", 0.20
+    )
+    monkeypatch.setattr(
+        tmux_session, "_SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC", 0.05
+    )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_slot_wait_gives_up_after_cap(_tiny_slot_budget) -> None:
+    """A permanently busy pane must not spin the wait forever."""
+    ss, _ = _make_session()
+    turn = _scheduler_turn()
+
+    with pytest.raises(tmux_session._SchedulerDeliverySlotTimeout):
+        await asyncio.wait_for(
+            ss._wait_for_scheduler_delivery_slot(turn), timeout=5
+        )
+
+
+@pytest.mark.asyncio
+async def test_scheduler_slot_wait_logs_progress_while_blocked(
+    _tiny_slot_budget, monkeypatch
+) -> None:
+    """The wait must be visible in the log, not a silent spin."""
+    lines: list[str] = []
+    monkeypatch.setattr(tmux_session, "_log", lines.append)
+    ss, _ = _make_session()
+    turn = _scheduler_turn()
+
+    with pytest.raises(tmux_session._SchedulerDeliverySlotTimeout):
+        await ss._wait_for_scheduler_delivery_slot(turn)
+
+    waiting = [ln for ln in lines if "SCHEDULER_SLOT_WAIT" in ln]
+    assert waiting, f"no progress log emitted; got {lines}"
+    assert any("wake_scheduled" in ln for ln in waiting)
+
+
+@pytest.mark.asyncio
+async def test_scheduler_slot_wait_budget_survives_retry_gate(
+    _tiny_slot_budget,
+) -> None:
+    """The cap is anchored on the turn, so the retry gate can't reset it.
+
+    ``_deliver_turn`` re-enters the wait each time the under-lock recheck
+    loses the pane; a per-call budget would restart from zero every lap
+    and reproduce the unbounded #445 spin.
+    """
+    ss, _ = _make_session()
+    turn = _scheduler_turn()
+    turn.scheduler_slot_wait_started_at = _time.monotonic() - 1000
+
+    started = _time.monotonic()
+    with pytest.raises(tmux_session._SchedulerDeliverySlotTimeout):
+        await ss._wait_for_scheduler_delivery_slot(turn)
+    assert _time.monotonic() - started < 0.15
+
+
+@pytest.mark.asyncio
+async def test_scheduler_slot_timeout_resolves_receipt_false(
+    _tiny_slot_budget,
+) -> None:
+    """A capped-out slot wait must mark the wake undelivered, not vanish."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    turn = _scheduler_turn()
+
+    await ss._deliver_scheduler_turn(turn)
+
+    assert turn.scheduler_delivery.done()
+    assert turn.scheduler_delivery.result() is False
