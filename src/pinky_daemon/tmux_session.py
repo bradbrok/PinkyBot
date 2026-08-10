@@ -3292,12 +3292,22 @@ class TmuxSession:
         # it via tmux-server inheritance, but forwarding makes it explicit and
         # uniform. Flag-gated + provider-guarded inside _static_oauth_token.
         #
-        # SUPPRESSED for a dedicated_config_dir agent: injecting the SHARED
-        # fleet token would authenticate it as the shared account regardless of
-        # its private config dir, defeating the whole point of the flag. Its own
-        # login lives in .claude-local (populated by a manual `claude /login`).
+        # SHADOWED-EMPTY for a dedicated_config_dir agent (#557/Picard, caught in
+        # Murzik review): injecting the SHARED fleet token would authenticate it
+        # as the shared account regardless of its private config dir, defeating
+        # the whole point of the flag. But simply OMITTING the key here is a
+        # NO-OP — tmux ``new-session`` inherits the tmux SERVER's global
+        # environment, which already carries the daemon user's shared
+        # CLAUDE_CODE_OAUTH_TOKEN, so the dedicated session would still see it
+        # via inheritance. We must instead pass ``-e CLAUDE_CODE_OAUTH_TOKEN=``
+        # (EMPTY) to SHADOW the inherited global with an empty value: empty ⇒
+        # claude does not authenticate with it and falls back to the login in
+        # this agent's CLAUDE_CONFIG_DIR (.claude-local, populated by a manual
+        # `claude /login`). Verified end-to-end on CC 2.1.226 + real tmux.
         oauth_token = self._static_oauth_token()
-        if oauth_token and not dedicated_config_dir:
+        if dedicated_config_dir:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+        elif oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name

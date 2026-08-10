@@ -746,11 +746,14 @@ class TestDedicatedConfigDir:
         assert "CLAUDE_CONFIG_DIR" not in env
         assert env["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-shared"
 
-    def test_dedicated_local_agent_sets_config_dir_and_suppresses_token(
+    def test_dedicated_local_agent_sets_config_dir_and_shadows_token_empty(
         self, monkeypatch, tmp_path
     ):
-        # The whole feature: own config dir + shared token SUPPRESSED even when
-        # _static_oauth_token() would otherwise return one (forwarding on).
+        # The whole feature: own config dir + shared token SHADOWED-EMPTY even
+        # when _static_oauth_token() would otherwise return one (forwarding on).
+        # The key must be present with an EMPTY value — NOT omitted. Omitting it
+        # is a no-op: tmux new-session inherits the tmux server's global
+        # CLAUDE_CODE_OAUTH_TOKEN, so only an explicit `-e KEY=` shadows it.
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared")
@@ -761,12 +764,76 @@ class TestDedicatedConfigDir:
             ),
             working_dir=wd,
         )
-        # Sanity: the token IS available to forward — suppression is the flag's
-        # doing, not an empty env.
+        # Sanity: the token IS available to forward — the empty shadow is the
+        # flag's doing, not an empty env.
         assert ss._static_oauth_token() == "sk-ant-oat01-shared"
         env = ss._build_repl_env()
         assert env["CLAUDE_CONFIG_DIR"] == str(Path(wd) / ".claude-local")
-        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
+        # Present-and-empty, not absent. This is the load-bearing assertion:
+        # `in` with `== ""`, never `not in`.
+        assert "CLAUDE_CODE_OAUTH_TOKEN" in env
+        assert env["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+
+    async def test_dedicated_local_agent_emits_empty_oauth_e_flag_in_argv(
+        self, monkeypatch, tmp_path
+    ):
+        # End-to-end at the tmux boundary (the crux the dict-level test misses):
+        # a dedicated agent's env must reach `tmux new-session` as an explicit
+        # `-e CLAUDE_CODE_OAUTH_TOKEN=` (empty value) so it SHADOWS the tmux
+        # server's inherited global token. A regression that reverts to
+        # dict-omission would drop this flag and silently re-leak the shared
+        # token via inheritance — which the dict-level assertion cannot catch.
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=True)
+            ),
+            working_dir=wd,
+        )
+        inner = _RecordingInner()
+        control = _TmuxControl("pinky-dymok-main", command_runner=inner)
+        await control.new_session(
+            cwd=wd, command="claude", env=ss._build_repl_env()
+        )
+        argv = inner.calls[-1]
+        # The pair must appear consecutively; the value is the empty string.
+        assert "-e" in argv
+        pairs = [
+            argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "-e"
+        ]
+        assert "CLAUDE_CODE_OAUTH_TOKEN=" in pairs
+        # And never the shared token itself.
+        assert "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-shared" not in pairs
+
+    async def test_default_agent_emits_populated_oauth_e_flag_in_argv(
+        self, monkeypatch, tmp_path
+    ):
+        # Backward-compat guard: a NON-dedicated agent still forwards the real
+        # shared token as `-e CLAUDE_CODE_OAUTH_TOKEN=<tok>` (never empty).
+        self._clear(monkeypatch)
+        monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared")
+        wd = str(tmp_path / "proj")
+        ss = _session(
+            registry=_FakeRegistry(
+                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=False)
+            ),
+            working_dir=wd,
+        )
+        inner = _RecordingInner()
+        control = _TmuxControl("pinky-dymok-main", command_runner=inner)
+        await control.new_session(
+            cwd=wd, command="claude", env=ss._build_repl_env()
+        )
+        argv = inner.calls[-1]
+        pairs = [
+            argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "-e"
+        ]
+        assert "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-shared" in pairs
+        assert "CLAUDE_CODE_OAUTH_TOKEN=" not in pairs
 
     def test_container_agent_flag_is_noop(self, monkeypatch, tmp_path):
         # dedicated_config_dir is a LOCAL concept — a container agent already
