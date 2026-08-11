@@ -126,6 +126,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
+from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS, resolve_cli_effort
@@ -3474,9 +3475,9 @@ def create_api(
             ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=3.0)
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
-            actual_max = reported_max
-            if is_1m_model(ss._config.model or "", _1M_MODELS) and reported_max <= 200_000:
-                actual_max = 1_000_000
+            actual_max = resolve_context_window(
+                ss._config.model or "", reported_max=reported_max
+            )
             # rawMaxTokens (SDK ≥ 0.1.x) is the raw model cap; maxTokens
             # is effective (autocompact buffer subtracted). Pass both
             # through so the frontend can show either; default to

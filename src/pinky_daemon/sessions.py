@@ -329,10 +329,9 @@ class Session:
     @property
     def max_tokens(self) -> int:
         """Estimated max context tokens for this session's model."""
-        for key, size in MODEL_CONTEXT_SIZES.items():
-            if key in (self.model or "").lower():
-                return size
-        return MODEL_CONTEXT_SIZES["default"]
+        from pinky_daemon.context_window import resolve_context_window
+
+        return resolve_context_window(self.model or "")
 
     @property
     def estimated_tokens(self) -> int:

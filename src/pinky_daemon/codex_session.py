@@ -30,7 +30,7 @@ from pinky_daemon.codex_app_server import (
 )
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.context_estimator import ContextTextEstimator
-from pinky_daemon.sessions import MODEL_CONTEXT_SIZES, SessionUsage
+from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     _is_outreach_tool,
@@ -2010,11 +2010,9 @@ class CodexSession:
     @property
     def max_tokens(self) -> int:
         """Estimated max context tokens for this session's model."""
-        model_name = (self._codex_model or self._config.model or "").lower()
-        for key, size in MODEL_CONTEXT_SIZES.items():
-            if key != "default" and key in model_name:
-                return size
-        return MODEL_CONTEXT_SIZES["default"]
+        from pinky_daemon.context_window import resolve_context_window
+
+        return resolve_context_window(self._codex_model or self._config.model or "")
 
     @property
     def estimated_tokens(self) -> int:
