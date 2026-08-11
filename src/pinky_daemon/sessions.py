@@ -27,11 +27,22 @@ from pinky_daemon.session_store import SessionEventStore, SessionRecord, Session
 # Rough token estimate: ~4 chars per token for English text
 CHARS_PER_TOKEN = 4
 
-# Default context window sizes by model family
+# Default context window sizes by model family.
+# Keys are matched as case-insensitive SUBSTRINGS of the model name
+# (see CodexSession.max_tokens / the tmux context gauge), so a family
+# key like "gpt-5.6-luna" also covers "gpt-5.6-luna-max-fast".
+# NOTE (#531): the Codex gauge has no SDK-reported window (unlike the
+# Claude path's rawMaxTokens), so codex models must be listed here or
+# they fall to the 200k default. gpt-5.6-luna's real window is 272k;
+# absent this entry the gauge over-reports usage and triggers restarts
+# early. Other codex models (e.g. gpt-5.6-terra, gpt-5.6-sol) still fall
+# to the default until their real windows are confirmed — add them here
+# once verified rather than guessing.
 MODEL_CONTEXT_SIZES = {
     "opus": 200_000,
     "sonnet": 200_000,
     "haiku": 200_000,
+    "gpt-5.6-luna": 272_000,
     "default": 200_000,
 }
 

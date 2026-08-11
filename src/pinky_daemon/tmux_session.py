@@ -4273,7 +4273,23 @@ class TmuxSession:
             big = is_1m_model(self._config.model or "")
         except Exception:
             big = False
-        return 1_000_000 if big else 200_000
+        if big:
+            return 1_000_000
+        # #531: non-1M models default to 200k UNLESS listed in
+        # MODEL_CONTEXT_SIZES (single source of truth, shared with the
+        # legacy Session gauge). Codex models have no harness-reported
+        # window here, so e.g. gpt-5.6-luna (real cap 272k) must be in
+        # that table or it under-counts headroom and restarts early.
+        # Substring match mirrors the Session lookup.
+        try:
+            from pinky_daemon.sessions import MODEL_CONTEXT_SIZES
+            model = (self._config.model or "").lower()
+            for key, size in MODEL_CONTEXT_SIZES.items():
+                if key != "default" and key in model:
+                    return size
+        except Exception:
+            pass
+        return 200_000
 
     def _max_tokens_for_model(self) -> int:
         """Return the model's **effective** context-window cap.
