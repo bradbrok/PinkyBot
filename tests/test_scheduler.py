@@ -3383,3 +3383,44 @@ class TestDiscardTombstone:
         tomb = registry.get_schedule_wake_by_fire(schedule.id, fired)
         assert tomb is not None
         assert tomb.parked_at > 0 and tomb.accepted_at == 0  # tombstone intact
+
+
+class TestCohortStalenessGuard:
+    """#567 — a fire that aged past its replay window while its cohort task
+    waited behind the per-agent delivery lock must be dropped, not pasted."""
+
+    @pytest.mark.asyncio
+    async def test_stale_cohort_fire_is_dropped_not_delivered(
+        self, registry, monkeypatch
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="daily", prompt="stale work"
+        )
+        now = 1_800_000_000.0
+        schedule.last_run = now - 3_601.0  # older than the 3600s ceiling
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="daily",
+            prompt="stale work",
+            fired_at=schedule.last_run,
+        )
+        calls: list[str] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            calls.append(prompt)
+            return True
+
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        scheduler = AgentScheduler(
+            registry, wake_callback=wake_cb, pending_wake_max_age_sec=3600.0
+        )
+        await scheduler._deliver_schedule(schedule)
+
+        assert calls == []  # stale fire is not delivered
+        # and its outbox row is dropped
+        assert (
+            registry.get_schedule_wake_by_fire(schedule.id, schedule.last_run)
+            is None
+        )

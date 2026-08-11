@@ -636,6 +636,34 @@ class AgentScheduler:
                     attempt_started.set()
                 return
 
+            # A fire that aged past its replay window while its cohort task
+            # waited behind the per-agent delivery lock must not be pasted: it
+            # would deliver an hours-old prompt, and a busy session queues
+            # several such fires that then drain as duplicate stale wakes. Drop
+            # it, matching the replay path's staleness ceiling. Set the
+            # cohort-start event first so ``_check_schedules`` does not wait out
+            # its timeout on a stale first cohort member.
+            replay_max_age = self._pending_wake_replay_max_age(
+                schedule, schedule.last_run
+            )
+            age = max(0.0, time.time() - schedule.last_run)
+            if age > replay_max_age:
+                dropped = (
+                    self._registry.delete_pending_schedule_wake(row.id)
+                    if row is not None
+                    else False
+                )
+                _log(
+                    f"scheduler: COHORT_STALE_DROPPED pending "
+                    f"#{row.id if row is not None else '?'}, schedule "
+                    f"'{schedule.name}' (#{schedule.id}) for agent "
+                    f"'{schedule.agent_name}': age_s={age:.1f} "
+                    f"max_age_s={replay_max_age:.1f} dropped={dropped}"
+                )
+                if attempt_started is not None:
+                    attempt_started.set()
+                return
+
         if schedule.direct_send:
             if attempt_started is not None:
                 attempt_started.set()
