@@ -259,6 +259,26 @@ def test_switch_already_active_is_noop(store, capsys):
     assert not list(ca.backup_dir().glob(".env.bak.pre-*"))  # no backup churn
 
 
+def test_switch_restart_bypasses_already_active(store, monkeypatch):
+    """--restart must (re)start even when .env already matches: the two-step
+    workflow is `switch` (writes) then `switch --restart` (applies). The second
+    invocation must NOT no-op — the running daemon may still hold the old token."""
+    _seed_account(store, token="sk-ant-oat01-SAME")
+    write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-SAME\nPINKY_FORWARD_OAUTH_TOKEN=1\n")
+    calls = []
+
+    def _restart(env_path, as_agent):
+        calls.append(1)
+        return True, "HTTP 200"
+
+    monkeypatch.setattr(ca, "restart_daemon", _restart)
+    gens = iter(["old-gen", "new-gen"])
+    monkeypatch.setattr(ca, "daemon_generation", lambda: next(gens, "new-gen"))
+    rc = run("switch", "acct", "--restart", "--as-agent", "x")
+    assert rc == 0
+    assert calls == [1]  # restart WAS performed, not skipped as "nothing to do"
+
+
 def test_switch_token_matches_but_flag_off_proceeds(store):
     """Token already in .env but forwarding OFF → switch must set the flag (not no-op)."""
     _seed_account(store, token="sk-ant-oat01-SAME")

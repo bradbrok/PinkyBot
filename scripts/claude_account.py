@@ -776,9 +776,14 @@ def cmd_switch(args: argparse.Namespace) -> int:
     # active_name is flag-aware: this is true only when the token already matches
     # AND forwarding is already on. A token match with the flag OFF falls through
     # so the switch actually sets the flag (the fix for the silent no-op).
-    if active_name(env_path, index) == args.name and not args.force:
+    #
+    # --restart must NOT short-circuit here: ".env already matches" does not mean
+    # "the RUNNING daemon has this token" (the two-step workflow is `switch` to
+    # write, then `switch --restart` to apply). Falling through makes --restart
+    # always perform the restart + generation verification.
+    if active_name(env_path, index) == args.name and not args.force and not args.restart:
         print(f"Already on {args.name!r} with forwarding on; nothing to do "
-              f"(pass --force to rewrite anyway).")
+              f"(pass --restart to (re)start the daemon onto it, or --force to rewrite).")
         return 0
 
     if args.dry_run:
