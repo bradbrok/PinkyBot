@@ -990,9 +990,10 @@ class TestPendingWakeDiscardAuth:
         )
 
         assert response.status_code == 200
-        assert client.app.state.agents.get_schedule_wake_by_fire(
+        tomb = client.app.state.agents.get_schedule_wake_by_fire(
             schedule.id, pending.fired_at
-        ) is None
+        )
+        assert tomb is not None and tomb.parked_at > 0
 
     def test_operator_session_may_delete_cross_agent_row(
         self, monkeypatch, tmp_path
@@ -1009,9 +1010,10 @@ class TestPendingWakeDiscardAuth:
         )
 
         assert response.status_code == 200
-        assert client.app.state.agents.get_schedule_wake_by_fire(
+        tomb = client.app.state.agents.get_schedule_wake_by_fire(
             schedule.id, pending.fired_at
-        ) is None
+        )
+        assert tomb is not None and tomb.parked_at > 0
 
 
 class TestAgentIsolationScoping:

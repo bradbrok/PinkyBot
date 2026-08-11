@@ -5430,9 +5430,12 @@ class TestAgentScheduleEndpoints:
             "pending_id": pending.id,
             "agent": "alice",
         }
-        assert registry.get_schedule_wake_by_fire(
+        # Discard tombstones (parks) the row rather than deleting it, so a
+        # later reconciliation cannot re-create the retired fire.
+        tomb = registry.get_schedule_wake_by_fire(
             created["id"], pending.fired_at
-        ) is None
+        )
+        assert tomb is not None and tomb.parked_at > 0
 
     def test_discard_pending_wake_preserves_terminal_ledger_row(self):
         client = self._make_client()
