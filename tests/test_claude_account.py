@@ -9,6 +9,7 @@ stubbed here.
 
 from __future__ import annotations
 
+import fcntl
 import importlib.util
 import os
 import stat
@@ -304,22 +305,69 @@ def test_switch_restart_reverts_on_unchanged_generation(store, monkeypatch):
     assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
 
 
-def test_switch_restart_unreadable_baseline_does_not_revert(store, monkeypatch):
-    """No pre-restart generation to verify against → don't claim success, but don't
-    revert either (the restart likely proceeded)."""
+def test_switch_restart_unreadable_baseline_aborts_untouched(store, monkeypatch):
+    """No pre-restart generation to verify against → abort BEFORE writing; never
+    persist an unverifiable switch, and never POST the restart."""
     _seed_account(store)
     write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
-    monkeypatch.setattr(ca, "restart_daemon", lambda env_path, as_agent: (True, "HTTP 200"))
     monkeypatch.setattr(ca, "daemon_generation", lambda: None)  # never readable
+
+    def _boom(*a, **k):
+        raise AssertionError("restart must not be POSTed when the baseline is unreadable")
+
+    monkeypatch.setattr(ca, "restart_daemon", _boom)
     rc = run("switch", "acct", "--restart", "--as-agent", "someagent")
     assert rc == 1
-    assert "sk-ant-oat01-NEW" in store["env"].read_text()  # NOT reverted
+    assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"  # untouched
+    assert not list(ca.backup_dir().glob(".env.bak.pre-*"))  # no backup, no write
+
+
+def test_switch_restart_without_identity_aborts_untouched(store, monkeypatch):
+    _seed_account(store)
+    write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
+    monkeypatch.delenv("PINKY_AGENT_NAME", raising=False)
+
+    def _boom(*a, **k):
+        raise AssertionError("must not restart without an identity")
+
+    monkeypatch.setattr(ca, "restart_daemon", _boom)
+    rc = run("switch", "acct", "--restart")  # no --as-agent, no PINKY_AGENT_NAME
+    assert rc == 1
+    assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"  # untouched
+    assert not list(ca.backup_dir().glob(".env.bak.pre-*"))
 
 
 def test_restart_daemon_requires_identity(store):
     ok, detail = ca.restart_daemon(store["env"], "")
     assert ok is False
     assert "identity" in detail.lower()
+
+
+# ── advisory lock / directory-mode fail-closed ───────────────────────────────
+
+
+def test_switch_refuses_when_lock_held(store):
+    _seed_account(store)
+    write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
+    ca.ensure_store()
+    fd = os.open(str(ca.store_dir() / ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)  # hold it (simulates a concurrent op)
+    try:
+        with pytest.raises(SystemExit):
+            run("switch", "acct")
+        assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"  # untouched
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+def test_ensure_store_fails_closed_on_permissive_dir(store, monkeypatch):
+    d = ca.store_dir()
+    d.mkdir(parents=True, exist_ok=True)
+    os.chmod(d, 0o777)
+    monkeypatch.setattr(ca.os, "chmod", lambda *a, **k: None)  # simulate chmod denied
+    with pytest.raises(SystemExit):
+        ca.ensure_store()
 
 
 # ── remove ───────────────────────────────────────────────────────────────────

@@ -29,15 +29,18 @@ are a separate concern and are not managed here.
 from __future__ import annotations
 
 import argparse
+import fcntl
 import getpass
 import hmac
 import json
 import os
 import re
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -140,13 +143,62 @@ def valid_name(name: str) -> bool:
 # ── token store ──────────────────────────────────────────────────────────────
 
 
-def ensure_store() -> None:
-    d = store_dir()
-    d.mkdir(parents=True, exist_ok=True)
+def _assert_private_dir(path: Path) -> None:
+    """Fail closed if ``path`` is group/other-accessible.
+
+    chmod is best-effort — it can be denied on a dir we don't own — so the FINAL
+    mode is what matters, not the chmod call. A credential dir another local user
+    can write to lets them delete/replace stored tokens even though the token
+    files themselves are 0600.
+    """
+    mode = stat.S_IMODE(os.stat(path).st_mode)
+    if mode & 0o077:
+        raise SystemExit(
+            f"claude-account: {path} is not private (mode {oct(mode)}) — another local "
+            f"user could read or replace stored credentials. Fix: chmod 700 {path}"
+        )
+
+
+def _ensure_private_dir(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
     try:
-        os.chmod(d, 0o700)
+        os.chmod(path, 0o700)
     except OSError:
         pass
+    _assert_private_dir(path)
+
+
+def ensure_store() -> None:
+    _ensure_private_dir(store_dir())
+
+
+@contextmanager
+def store_lock():
+    """Advisory exclusive lock held for a whole mutating operation.
+
+    A switch reads → backs up → writes → restarts → verifies → maybe reverts over
+    a window up to RESTART_HEALTH_TIMEOUT_S. Without a lock, a second concurrent
+    switch (process B) can write in the middle, and a delayed revert from process
+    A then restores A's older backup and silently clobbers B. flock is per open
+    file description, so a second claude-account process fails closed here rather
+    than interleaving. Read-only commands do not take the lock.
+    """
+    ensure_store()
+    fd = os.open(str(store_dir() / ".lock"), os.O_CREAT | os.O_RDWR, 0o600)
+    try:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            raise SystemExit(
+                "claude-account: another claude-account operation is in progress "
+                "(lock held) — wait for it to finish and retry."
+            )
+        yield
+    finally:
+        try:
+            fcntl.flock(fd, fcntl.LOCK_UN)
+        finally:
+            os.close(fd)
 
 
 def load_index() -> dict:
@@ -241,11 +293,7 @@ def backup_env(env_path: Path, tag: str) -> Path:
     """
     ensure_store()
     bdir = backup_dir()
-    bdir.mkdir(parents=True, exist_ok=True)
-    try:
-        os.chmod(bdir, 0o700)
-    except OSError:
-        pass
+    _ensure_private_dir(bdir)
     stamp = _utcnow().strftime("%Y%m%d-%H%M%S")
     backup = bdir / f"{env_path.name}.bak.pre-{tag}-{stamp}"
     _atomic_copy(env_path, backup, 0o600)
@@ -348,28 +396,33 @@ def resolve_claude_bin(explicit: str = "") -> str:
 def probe_token(token: str, claude_bin: str = "") -> tuple[bool, str]:
     """Isolation-probe a token BEFORE trusting it (never wall the fleet).
 
-    Runs ``claude --print`` in a minimal env carrying only the candidate token,
-    so a bad token is caught here instead of at fleet startup. The token is
-    passed via env (never argv) and never echoed. ``--print`` does NOT surface
-    the interactive Fable-credit consent, so a pass here means "authenticates",
-    not "no consent prompt at real startup".
+    Runs ``claude --print`` under a THROWAWAY HOME + CLAUDE_CONFIG_DIR and a clean
+    temp cwd, so no user/project settings, hooks, plugins, or MCP servers load with
+    the candidate token in the child env (this repo ships a project Stop hook, and
+    such a hook could spawn further processes that inherit the token). The token is
+    passed via env (never argv) and never echoed. ``--print`` does NOT surface the
+    interactive Fable-credit consent, so a pass here means "authenticates", not
+    "no consent prompt at real startup".
     """
     binary = resolve_claude_bin(claude_bin)
-    env = {
-        "HOME": os.environ.get("HOME", str(Path.home())),
-        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
-        TOKEN_ENV_KEY: token,
-        # keep the probe quiet + non-interactive
-        "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
-    }
     try:
-        proc = subprocess.run(
-            [binary, "--print", "say OK"],
-            env=env,
-            capture_output=True,
-            text=True,
-            timeout=PROBE_TIMEOUT_S,
-        )
+        with tempfile.TemporaryDirectory(prefix="claude-account-probe-") as tmp:
+            env = {
+                "HOME": tmp,               # no ~/.claude settings/hooks/credentials
+                "CLAUDE_CONFIG_DIR": tmp,  # no shared config dir
+                "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+                TOKEN_ENV_KEY: token,
+                # keep the probe quiet + non-interactive
+                "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC": "1",
+            }
+            proc = subprocess.run(
+                [binary, "--print", "say OK"],
+                env=env,
+                cwd=tmp,                   # clean cwd → no project .claude hooks
+                capture_output=True,
+                text=True,
+                timeout=PROBE_TIMEOUT_S,
+            )
     except FileNotFoundError:
         return False, f"claude binary not found at {binary!r}"
     except subprocess.TimeoutExpired:
@@ -747,6 +800,38 @@ def cmd_switch(args: argparse.Namespace) -> int:
             return 1
         print("  probe OK")
 
+    # Preflight for --restart BEFORE any .env mutation: only switch if we can both
+    # authenticate the restart AND establish a generation baseline to verify it.
+    # If either is missing, abort with .env untouched (no backup, no write, no
+    # POST) — never persist an unverifiable switch.
+    as_agent = ""
+    before_gen = None
+    if args.restart:
+        as_agent = (args.as_agent or os.environ.get("PINKY_AGENT_NAME", "")).strip()
+        if not as_agent:
+            print(
+                "claude-account: --restart needs an identity to sign the restart call — "
+                "pass --as-agent <a registered non-isolated agent> or set PINKY_AGENT_NAME. "
+                "Not switching; .env is untouched.",
+                file=sys.stderr,
+            )
+            return 1
+        # retry a few times: the daemon should be up (we're about to restart it),
+        # so a None here is a transient miss rather than "down".
+        for _ in range(3):
+            before_gen = daemon_generation()
+            if before_gen is not None:
+                break
+        if before_gen is None:
+            print(
+                "claude-account: can't read the daemon's current generation (/api "
+                "unreachable), so a --restart switch can't be verified. Not switching; "
+                ".env is untouched. Fix the daemon, or run without --restart to switch the "
+                ".env and restart by hand.",
+                file=sys.stderr,
+            )
+            return 1
+
     lines = read_env_lines(env_path)
     backup = backup_env(env_path, args.name)
     # Fail-closed invariant: token + forward flag land in the SAME atomic write —
@@ -762,38 +847,15 @@ def cmd_switch(args: argparse.Namespace) -> int:
         print("  • then spot-check a few agent panes for a login wall.")
         return 0
 
-    as_agent = (args.as_agent or os.environ.get("PINKY_AGENT_NAME", "")).strip()
-    # Capture the process generation BEFORE the restart. /admin/restart returns
-    # 200 and only SIGTERMs ~1s later, and the OLD process keeps answering /api
-    # until then — so a bare 200 is NOT proof of restart. We require started_at to
-    # ADVANCE (a genuinely new process) before declaring success. (retry a few
-    # times: the daemon is up — /admin/restart is about to 200 — so a None here is
-    # a transient miss, not "down".)
-    before_gen = None
-    for _ in range(3):
-        before_gen = daemon_generation()
-        if before_gen is not None:
-            break
-
     print("Restarting the daemon…")
     ok, detail = restart_daemon(env_path, as_agent)
     if not ok:
         _revert(env_path, backup, f"restart call failed ({detail})")
         return 1
 
-    if before_gen is None:
-        # Restart accepted but no baseline to verify against — do NOT claim success
-        # and do NOT revert (the restart likely proceeded; reverting could undo a
-        # good switch). Hand it to the operator.
-        print(
-            "claude-account: restart accepted but the daemon's pre-restart generation "
-            "was unreadable, so the restart could not be auto-verified. The new token is "
-            "written and NOT reverted — confirm the daemon came back and spot-check panes "
-            "by hand.",
-            file=sys.stderr,
-        )
-        return 1
-
+    # Require the process generation to ADVANCE — /admin/restart returns 200 and
+    # only SIGTERMs ~1s later, and the OLD process keeps answering /api until then,
+    # so a bare 200 is not proof of restart.
     import time
 
     deadline = time.monotonic() + RESTART_HEALTH_TIMEOUT_S
@@ -892,7 +954,7 @@ def build_parser() -> argparse.ArgumentParser:
     a.add_argument("--allow-any", action="store_true", help="accept a non setup-token string")
     a.add_argument("--claude-bin", default="", help="path to the claude binary")
     a.add_argument("--force", action="store_true", help="replace an existing entry")
-    a.set_defaults(func=cmd_add)
+    a.set_defaults(func=cmd_add, mutating=True)
 
     li = sub.add_parser("list", help="stored accounts + active + expiry")
     li.set_defaults(func=cmd_list)
@@ -910,12 +972,12 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--no-probe", action="store_true", help="skip the pre-switch probe (unsafe)")
     s.add_argument("--claude-bin", default="")
     s.add_argument("--force", action="store_true", help="switch even if expired / already active")
-    s.set_defaults(func=cmd_switch)
+    s.set_defaults(func=cmd_switch, mutating=True)
 
     r = sub.add_parser("remove", help="delete a stored token")
     r.add_argument("name")
     r.add_argument("--force", action="store_true", help="remove even the active account")
-    r.set_defaults(func=cmd_remove)
+    r.set_defaults(func=cmd_remove, mutating=True)
 
     e = sub.add_parser("check-expiry", help="nudge (exit 3) if the active token expires soon")
     e.add_argument("--days", type=int, default=EXPIRY_WARN_DAYS)
@@ -928,6 +990,12 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
     # resolve the env path once, after parsing (default is lazy so tests can patch)
     args.env_file = args.env_file or default_env_path()
+    # Mutating commands (add/switch/remove) run under the store lock for the whole
+    # operation — including switch's restart/verify window — so two concurrent runs
+    # can't clobber each other. Read-only commands take no lock.
+    if getattr(args, "mutating", False):
+        with store_lock():
+            return args.func(args)
     return args.func(args)
 
 
