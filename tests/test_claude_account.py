@@ -182,11 +182,6 @@ def test_active_name_none_when_token_absent(store):
     assert ca.active_name(store["env"], ca.load_index()) is None
 
 
-def test_suffix_of():
-    assert ca.suffix_of("sk-ant-oat01-ABCDwxyz") == "wxyz"
-    assert ca.suffix_of("ab") == "?"
-
-
 # ── switch: fail-closed, backup, revert ──────────────────────────────────────
 
 
@@ -478,8 +473,8 @@ def test_add_stores_metadata(store, monkeypatch):
     assert rc == 0
     idx = ca.load_index()["accounts"]["brad"]
     assert idx["billing"] == "subscription"
-    assert idx["token_suffix"] == "DDED"
     assert idx["token_kind"] == "setup_token"
+    assert "token_suffix" not in idx  # no token-derived data stored
     assert ca.read_token("brad") == "sk-ant-oat01-ADDED"
 
 

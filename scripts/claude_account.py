@@ -40,7 +40,7 @@ import stat
 import subprocess
 import sys
 import tempfile
-from contextlib import contextmanager
+from contextlib import contextmanager, suppress
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -161,10 +161,10 @@ def _assert_private_dir(path: Path) -> None:
 
 def _ensure_private_dir(path: Path) -> None:
     path.mkdir(parents=True, exist_ok=True)
-    try:
+    # best-effort — a chmod we can't apply (dir we don't own) is caught by the
+    # final-mode assertion below, which is the real guard.
+    with suppress(OSError):
         os.chmod(path, 0o700)
-    except OSError:
-        pass
     _assert_private_dir(path)
 
 
@@ -569,10 +569,6 @@ def active_name(env_path: Path, index: dict) -> str | None:
     return token_provenance(env_path, index)
 
 
-def suffix_of(token: str) -> str:
-    return token[-4:] if len(token) >= 4 else "?"
-
-
 # ── commands ─────────────────────────────────────────────────────────────────
 
 
@@ -663,11 +659,10 @@ def cmd_add(args: argparse.Namespace) -> int:
         "billing": billing,
         "added_at": _iso(now),
         "expires_at": _iso(exp),
-        "token_suffix": suffix_of(token),
         "probe": probe_meta,
     }
     save_index(index)
-    print(f"Stored {args.name!r} (…{suffix_of(token)}), expires {_iso(exp)}, billing={billing}.")
+    print(f"Stored {args.name!r}, expires {_iso(exp)}, billing={billing}.")
     return 0
 
 
@@ -713,7 +708,7 @@ def cmd_current(args: argparse.Namespace) -> int:
     if not live:
         print(f"{TOKEN_ENV_KEY}: (not set)")
     else:
-        print(f"{TOKEN_ENV_KEY}: set (…{suffix_of(live)})")
+        print(f"{TOKEN_ENV_KEY}: set")
     if prov and flag:
         meta = index["accounts"][prov]
         dl = days_left(meta)
@@ -788,9 +783,8 @@ def cmd_switch(args: argparse.Namespace) -> int:
 
     if args.dry_run:
         flag = "ON" if forwarding_on(env_path) else "OFF"
-        print(f"[dry-run] would set {TOKEN_ENV_KEY}=(…{suffix_of(token)}) and "
-              f"{FORWARD_FLAG_KEY}=1 in {env_path} (forwarding currently {flag}). "
-              f"No write, no backup, no probe.")
+        print(f"[dry-run] would set {TOKEN_ENV_KEY} and {FORWARD_FLAG_KEY}=1 in "
+              f"{env_path} (forwarding currently {flag}). No write, no backup, no probe.")
         return 0
 
     if not args.no_probe:
@@ -844,7 +838,7 @@ def cmd_switch(args: argparse.Namespace) -> int:
     new_lines = set_env_var(lines, TOKEN_ENV_KEY, token)
     new_lines = set_env_var(new_lines, FORWARD_FLAG_KEY, "1")
     write_env_lines(env_path, new_lines)
-    print(f"Wrote {env_path} (backup: {backup}). Active token → {args.name} (…{suffix_of(token)}).")
+    print(f"Wrote {env_path} (backup: {backup}). Active token → {args.name}.")
 
     if not args.restart:
         print("\nNot restarting (the daemon only picks up .env on restart). Next:")
