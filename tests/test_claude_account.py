@@ -84,10 +84,23 @@ def test_set_env_var_leaves_comments_and_appends_live():
     assert ca.read_live_value(out, "TOK") == "new"
 
 
-def test_read_live_value_first_wins_and_strips_quotes():
-    assert ca.read_live_value(['TOK="quoted"', "TOK=second"], "TOK") == "quoted"
+def test_read_live_value_last_wins_and_strips_quotes():
+    # bash `source` is last-wins — the authoritative loader on the Mini
+    assert ca.read_live_value(['TOK="quoted"', "TOK=second"], "TOK") == "second"
     assert ca.read_live_value(["#TOK=commented", "TOK=live"], "TOK") == "live"
     assert ca.read_live_value(["A=1"], "TOK") is None
+
+
+def test_export_assignments_are_live():
+    # bash `source .env` honors `export KEY=…`; the tool must treat it as live
+    assert ca._live_key("export TOK=v") == "TOK"
+    assert ca._live_key("  export   TOK=v") == "TOK"
+    assert ca._live_key("exportTOK=v") == "exportTOK"  # not the `export ` prefix
+    assert ca.read_live_value(["export TOK=fromexport"], "TOK") == "fromexport"
+    # set_env_var collapses a bare + export pair to ONE canonical bare line
+    out = ca.set_env_var(["export TOK=old", "A=1", "TOK=older"], "TOK", "new")
+    assert [line for line in out if ca._live_key(line) == "TOK"] == ["TOK=new"]
+    assert ca.read_live_value(out, "TOK") == "new"
 
 
 # ── valid_name (path-traversal guard) ────────────────────────────────────────
@@ -265,26 +278,42 @@ def test_switch_empty_token_file_refuses(store):
     assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"  # untouched
 
 
-def test_switch_restart_success_not_reverted(store, monkeypatch):
+def test_switch_restart_success_when_generation_advances(store, monkeypatch):
     _seed_account(store)
     write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
     monkeypatch.setattr(ca, "restart_daemon", lambda env_path, as_agent: (True, "HTTP 200"))
-    monkeypatch.setattr(ca, "daemon_healthy", lambda: True)
+    # baseline "old-gen" then a new process "new-gen" → success
+    gens = iter(["old-gen", "new-gen"])
+    monkeypatch.setattr(ca, "daemon_generation", lambda: next(gens, "new-gen"))
     rc = run("switch", "acct", "--restart", "--as-agent", "someagent")
     assert rc == 0
     assert "sk-ant-oat01-NEW" in store["env"].read_text()  # kept, not reverted
 
 
-def test_switch_restart_health_timeout_reverts(store, monkeypatch):
+def test_switch_restart_reverts_on_unchanged_generation(store, monkeypatch):
+    """The false-green case: the OLD process still answers /api (same started_at)
+    but never restarts → must NOT be accepted; revert instead."""
     _seed_account(store)
     write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
     monkeypatch.setattr(ca, "restart_daemon", lambda env_path, as_agent: (True, "HTTP 200"))
-    monkeypatch.setattr(ca, "daemon_healthy", lambda: False)
+    monkeypatch.setattr(ca, "daemon_generation", lambda: "same-gen")  # never advances
     monkeypatch.setattr(ca, "RESTART_HEALTH_TIMEOUT_S", 0)
     rc = run("switch", "acct", "--restart", "--as-agent", "someagent")
     assert rc == 1
     # atomic revert restored the exact original .env
     assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"
+
+
+def test_switch_restart_unreadable_baseline_does_not_revert(store, monkeypatch):
+    """No pre-restart generation to verify against → don't claim success, but don't
+    revert either (the restart likely proceeded)."""
+    _seed_account(store)
+    write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
+    monkeypatch.setattr(ca, "restart_daemon", lambda env_path, as_agent: (True, "HTTP 200"))
+    monkeypatch.setattr(ca, "daemon_generation", lambda: None)  # never readable
+    rc = run("switch", "acct", "--restart", "--as-agent", "someagent")
+    assert rc == 1
+    assert "sk-ant-oat01-NEW" in store["env"].read_text()  # NOT reverted
 
 
 def test_restart_daemon_requires_identity(store):
@@ -415,3 +444,56 @@ def test_add_probe_failure_does_not_store(store, monkeypatch):
     assert rc == 1
     assert "x" not in ca.load_index()["accounts"]
     assert not ca.token_path("x").exists()
+
+
+# ── serialization safety / duplicate / perms / probe hygiene ─────────────────
+
+
+def test_add_rejects_shell_unsafe_token(store, monkeypatch):
+    # the Beaverton-style injection: a newline would write a SECOND live .env line
+    injected = "sk-ant-oat01-GOOD\nCLAUDE_CODE_OAUTH_TOKEN="
+    monkeypatch.setattr(ca.getpass, "getpass", lambda prompt="": injected)
+    assert run("add", "x", "--allow-any") == 2
+    assert "x" not in ca.load_index()["accounts"]
+
+
+def test_switch_rejects_shell_unsafe_token_file(store):
+    _seed_account(store)
+    ca.write_token("acct", "sk-ant-oat01-GOOD\nPINKY_FORWARD_OAUTH_TOKEN=1")  # hand-edited injection
+    write_env(store["env"], "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
+    rc = run("switch", "acct", "--no-probe")
+    assert rc == 1
+    assert store["env"].read_text() == "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n"  # untouched
+
+
+def test_add_rejects_duplicate_token_under_different_name(store, monkeypatch):
+    monkeypatch.setattr(ca.getpass, "getpass", lambda prompt="": "sk-ant-oat01-SHARED")
+    assert run("add", "first") == 0
+    monkeypatch.setattr(ca.getpass, "getpass", lambda prompt="": "sk-ant-oat01-SHARED")
+    assert run("add", "second") == 2  # same token, different name → ambiguous
+    assert "second" not in ca.load_index()["accounts"]
+
+
+def test_switch_clamps_env_to_0600_from_permissive_source(store):
+    _seed_account(store)
+    store["env"].write_text("CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-OLD\n")
+    os.chmod(store["env"], 0o644)  # permissive .env
+    rc = run("switch", "acct")
+    assert rc == 0
+    assert stat.S_IMODE(os.stat(store["env"]).st_mode) == 0o600  # clamped closed
+
+
+def test_probe_token_does_not_leak_the_candidate(monkeypatch):
+    tok = "sk-ant-oat01-SUPERSECRETVALUE"
+
+    class FakeProc:
+        returncode = 1
+        stdout = ""
+        stderr = f"error: invalid token {tok} was rejected"
+
+    monkeypatch.setattr(ca, "resolve_claude_bin", lambda explicit="": "/bin/true")
+    monkeypatch.setattr(ca.subprocess, "run", lambda *a, **k: FakeProc())
+    ok, detail = ca.probe_token(tok)
+    assert ok is False
+    assert tok not in detail
+    assert "SUPERSECRET" not in detail

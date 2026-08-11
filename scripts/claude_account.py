@@ -33,8 +33,8 @@ import getpass
 import hmac
 import json
 import os
+import re
 import shutil
-import stat
 import subprocess
 import sys
 import tempfile
@@ -112,6 +112,19 @@ def default_env_path() -> Path:
 
 
 # ── name validation ──────────────────────────────────────────────────────────
+
+
+# A stored token is interpolated verbatim into .env, which the macOS service
+# loads via bash ``source`` — so it MUST be a single line containing no shell
+# metacharacters (else a value like ``GOOD\nCLAUDE_CODE_OAUTH_TOKEN=`` injects a
+# second assignment, and ``$()``/quotes/spaces would be interpreted by the shell).
+# setup-tokens are base64/base64url + a fixed prefix — all within this charset.
+_TOKEN_SAFE_RE = re.compile(r"\A[A-Za-z0-9_.\-=+/:]+\Z")
+
+
+def token_serialization_safe(token: str) -> bool:
+    """True iff ``token`` is one line safe to write bare into a shell-sourced .env."""
+    return bool(token) and bool(_TOKEN_SAFE_RE.match(token))
 
 
 def valid_name(name: str) -> bool:
@@ -242,36 +255,47 @@ def backup_env(env_path: Path, tag: str) -> Path:
 # ── .env line rewriting ──────────────────────────────────────────────────────
 
 
-def _is_live_assignment(line: str, key: str) -> bool:
-    """True iff ``line`` is a live (non-comment) ``key=…`` assignment.
+def _live_key(line: str) -> str | None:
+    """The KEY assigned on this line, or None if it is not a live assignment.
 
-    Mirrors _load_dotenv's parse: a leading ``#`` is a comment (skipped); the
-    key is everything before the first ``=`` (stripped). ``FOO_BAR`` must not
-    match ``FOO``.
+    The shipped macOS service loads .env via bash ``set -a && source .env`` (see
+    scripts/launchctl/com.pinkybot.daemon.plist), so BOTH a bare ``KEY=…`` and an
+    ``export KEY=…`` are live assignments — and bash is LAST-wins. A leading ``#``
+    is a comment. The key is the text before the first ``=`` (minus an optional
+    ``export`` prefix). ``FOO_BAR`` must not match ``FOO``.
     """
     stripped = line.strip()
     if not stripped or stripped.startswith("#") or "=" not in stripped:
-        return False
-    return stripped.split("=", 1)[0].strip() == key
+        return None
+    lhs = stripped.split("=", 1)[0].strip()
+    if lhs.startswith("export") and (len(lhs) == 6 or lhs[6].isspace()):
+        lhs = lhs[6:].strip()
+    return lhs or None
+
+
+def _is_live_assignment(line: str, key: str) -> bool:
+    return _live_key(line) == key
 
 
 def set_env_var(lines: list[str], key: str, value: str) -> list[str]:
-    """Return ``lines`` with exactly ONE live ``key=value`` assignment.
+    """Return ``lines`` with EXACTLY ONE live ``key=value`` assignment (bare form).
 
-    The daemon's loader takes the FIRST live occurrence and ignores the rest, so
-    a stale duplicate below the one we set would be a latent foot-gun on any
-    later reorder. We replace the first live occurrence in place and drop every
-    later live duplicate; comment lines are left untouched. If no live
-    occurrence exists we append one.
+    Collapses every live form of the key — bare ``KEY=`` AND ``export KEY=`` — to a
+    single canonical bare line, dropping all other live occurrences. This is what
+    makes the result unambiguous across all three loaders the fleet may use (bash
+    ``source`` = last-wins + honors ``export``; systemd EnvironmentFile; the Python
+    parser = first-wins): with exactly one live assignment and no ``export``
+    variants left to shadow it, they all resolve the same value. Comment lines are
+    left untouched. Appends one if the key is absent.
     """
     out: list[str] = []
     seen = False
     for line in lines:
-        if _is_live_assignment(line, key):
+        if _live_key(line) == key:
             if not seen:
                 out.append(f"{key}={value}")
                 seen = True
-            # else: drop the duplicate live assignment
+            # else: drop the duplicate/variant live assignment
             continue
         out.append(line)
     if not seen:
@@ -280,12 +304,18 @@ def set_env_var(lines: list[str], key: str, value: str) -> list[str]:
 
 
 def read_live_value(lines: list[str], key: str) -> str | None:
-    """The value of the FIRST live ``key=…`` line (quotes stripped), else None."""
+    """The value of the LAST live ``key=…`` line (quotes stripped), else None.
+
+    LAST, not first: the authoritative loader is bash ``source`` (last-wins), so
+    this reflects what the daemon actually resolves for a messy pre-rewrite file.
+    (After set_env_var there is exactly one, so first/last coincide.)
+    """
+    found: str | None = None
     for line in lines:
-        if _is_live_assignment(line, key):
+        if _live_key(line) == key:
             raw = line.strip().split("=", 1)[1].strip()
-            return raw.strip("\"'")
-    return None
+            found = raw.strip("\"'")
+    return found
 
 
 def read_env_lines(env_path: Path) -> list[str]:
@@ -296,12 +326,10 @@ def read_env_lines(env_path: Path) -> list[str]:
 
 
 def write_env_lines(env_path: Path, lines: list[str]) -> None:
-    mode = 0o600
-    try:
-        mode = stat.S_IMODE(os.stat(env_path).st_mode)
-    except OSError:
-        pass
-    _atomic_write(env_path, "\n".join(lines) + "\n", mode)
+    # Always 0600 — .env holds live credentials. Preserving a permissive source
+    # mode (e.g. a 0644 .env) would leave the freshly-written OAuth token
+    # group/world-readable; clamp it closed on every write.
+    _atomic_write(env_path, "\n".join(lines) + "\n", 0o600)
 
 
 # ── isolation probe ──────────────────────────────────────────────────────────
@@ -347,9 +375,13 @@ def probe_token(token: str, claude_bin: str = "") -> tuple[bool, str]:
     except subprocess.TimeoutExpired:
         return False, f"probe timed out after {PROBE_TIMEOUT_S}s"
     if proc.returncode != 0:
-        tail = (proc.stderr or proc.stdout or "").strip().splitlines()
-        detail = tail[-1] if tail else f"exit {proc.returncode}"
-        return False, f"probe failed: {detail}"
+        # NEVER surface the child's stdout/stderr — claude may echo the candidate
+        # token in an error line, and this string is printed to the operator. A
+        # generic, category-only reason keeps the secret out of the console/logs.
+        return False, (
+            f"claude rejected the token or errored (exit {proc.returncode}); "
+            f"run the probe by hand to see details"
+        )
     if not (proc.stdout or "").strip():
         return False, "probe returned empty output"
     return True, "ok"
@@ -413,16 +445,27 @@ def restart_daemon(env_path: Path, as_agent: str) -> tuple[bool, str]:
         return False, str(exc)
 
 
-def daemon_healthy() -> bool:
-    # /api is the daemon's unauthenticated health/info route (returns 200);
-    # there is no top-level /health route.
+def daemon_generation() -> str | None:
+    """The running daemon's process-generation marker (``/api`` ``started_at``,
+    a per-boot ``time.time()``), or None when /api is unreachable / not 2xx.
+
+    This is the RESTART signal, not a bare liveness check: /admin/restart returns
+    200 and only SIGTERMs ~1s later, and the OLD process keeps answering /api
+    (same ``started_at``) until then — so a 200 alone is not proof of restart.
+    A changed ``started_at`` means a genuinely new process is serving.
+    """
     try:
+        import json as _json
         import urllib.request
 
         with urllib.request.urlopen(_daemon_base_url() + "/api", timeout=5) as resp:
-            return 200 <= resp.status < 300
+            if not (200 <= resp.status < 300):
+                return None
+            data = _json.loads(resp.read().decode("utf-8"))
     except Exception:  # noqa: BLE001
-        return False
+        return None
+    started = data.get("started_at")
+    return None if started is None else str(started)
 
 
 # ── account metadata helpers ─────────────────────────────────────────────────
@@ -510,6 +553,33 @@ def cmd_add(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 2
+    # Serialization safety is non-negotiable (even with --allow-any): the token is
+    # written bare into a bash-sourced .env, so a newline / shell metachar would
+    # inject a second assignment or be interpreted by the shell.
+    if not token_serialization_safe(token):
+        print(
+            "claude-account: token contains characters unsafe to write into a "
+            "shell-sourced .env (newline or shell metacharacter) — refusing.",
+            file=sys.stderr,
+        )
+        return 2
+    # Reject a token already stored under another name (constant-time): otherwise
+    # provenance is ambiguous — switching to the second name would report success
+    # while list/current still resolve the first.
+    for other, meta in index["accounts"].items():
+        if other == args.name:
+            continue
+        try:
+            if hmac.compare_digest(token, read_token(other)):
+                print(
+                    f"claude-account: that exact token is already stored as {other!r} — "
+                    f"refusing (duplicate token makes the active account ambiguous). "
+                    f"Use {other!r}, or remove it first.",
+                    file=sys.stderr,
+                )
+                return 2
+        except SystemExit:
+            continue
 
     if not args.no_probe:
         print("Isolation-probing the token…")
@@ -639,6 +709,15 @@ def cmd_switch(args: argparse.Namespace) -> int:
             file=sys.stderr,
         )
         return 1
+    # Guard against a hand-edited token file that would inject into the .env the
+    # macOS service sources with bash (newline → second assignment; metachars).
+    if not token_serialization_safe(token):
+        print(
+            f"claude-account: stored token for {args.name!r} is not a single "
+            f"shell-safe line — refusing to write it into .env. Re-add it.",
+            file=sys.stderr,
+        )
+        return 1
 
     env_path = args.env_file
     # active_name is flag-aware: this is true only when the token already matches
@@ -684,24 +763,51 @@ def cmd_switch(args: argparse.Namespace) -> int:
         return 0
 
     as_agent = (args.as_agent or os.environ.get("PINKY_AGENT_NAME", "")).strip()
+    # Capture the process generation BEFORE the restart. /admin/restart returns
+    # 200 and only SIGTERMs ~1s later, and the OLD process keeps answering /api
+    # until then — so a bare 200 is NOT proof of restart. We require started_at to
+    # ADVANCE (a genuinely new process) before declaring success. (retry a few
+    # times: the daemon is up — /admin/restart is about to 200 — so a None here is
+    # a transient miss, not "down".)
+    before_gen = None
+    for _ in range(3):
+        before_gen = daemon_generation()
+        if before_gen is not None:
+            break
+
     print("Restarting the daemon…")
     ok, detail = restart_daemon(env_path, as_agent)
     if not ok:
         _revert(env_path, backup, f"restart call failed ({detail})")
         return 1
-    # Wait for health to come back; revert if it doesn't.
+
+    if before_gen is None:
+        # Restart accepted but no baseline to verify against — do NOT claim success
+        # and do NOT revert (the restart likely proceeded; reverting could undo a
+        # good switch). Hand it to the operator.
+        print(
+            "claude-account: restart accepted but the daemon's pre-restart generation "
+            "was unreadable, so the restart could not be auto-verified. The new token is "
+            "written and NOT reverted — confirm the daemon came back and spot-check panes "
+            "by hand.",
+            file=sys.stderr,
+        )
+        return 1
+
     import time
 
     deadline = time.monotonic() + RESTART_HEALTH_TIMEOUT_S
     while time.monotonic() < deadline:
-        if daemon_healthy():
-            print("Daemon healthy after restart.")
+        cur = daemon_generation()
+        if cur is not None and cur != before_gen:
+            print("Daemon restarted — a new process is serving.")
             print("⚠ Spot-check a few agent panes — --print auth passing does not "
                   "guarantee no Fable-credit consent prompt at real startup.")
             return 0
         time.sleep(3)
     _revert(env_path, backup,
-            f"daemon did not report healthy within {RESTART_HEALTH_TIMEOUT_S}s")
+            f"daemon generation did not advance within {RESTART_HEALTH_TIMEOUT_S}s "
+            f"(restart not confirmed — the new process never came up)")
     return 1
 
 
@@ -709,12 +815,8 @@ def _revert(env_path: Path, backup: Path, why: str) -> None:
     print(f"\nclaude-account: {why} — reverting {env_path} from {backup.name}.",
           file=sys.stderr)
     try:
-        mode = 0o600
-        try:
-            mode = stat.S_IMODE(os.stat(env_path).st_mode)
-        except OSError:
-            pass
-        _atomic_copy(backup, env_path, mode)
+        # 0600 — the restored .env still holds credentials (clamp, don't preserve).
+        _atomic_copy(backup, env_path, 0o600)
         print("Reverted. Restart the daemon to restore the previous token.", file=sys.stderr)
     except OSError as exc:
         print(f"REVERT FAILED ({exc}) — restore {backup} to {env_path} by hand.",
