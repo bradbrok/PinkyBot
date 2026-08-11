@@ -1006,7 +1006,7 @@ class AgentScheduler:
             )
             row_age = max(0.0, replay_now - pending.fired_at)
             if row_age > replay_max_age:
-                discarded = self._registry.discard_pending_schedule_wake(
+                discarded = self._registry.delete_pending_schedule_wake(
                     pending.id
                 )
                 _log(

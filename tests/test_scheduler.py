@@ -3272,3 +3272,84 @@ class TestUrlWatcherOffLoop:
         assert fired == ["ivan"]
         assert store.fires == [1]
         assert store.checks == [(1, "200")]
+
+
+class TestDiscardTombstone:
+    """#566 — discard must tombstone (park), not delete, so a retired fire
+    cannot be re-created and re-fired by a later reconciliation."""
+
+    def _persist(self, registry, *, schedule_id, agent, fired_at):
+        return registry.persist_schedule_wake(
+            schedule_id,
+            agent_name=agent,
+            schedule_name="one-shot",
+            prompt="wake prompt",
+            fired_at=fired_at,
+        )
+
+    def test_discard_tombstones_instead_of_deleting(self, registry):
+        registry.register("oleg")
+        s = registry.add_schedule(
+            "oleg", "0 8 * * *", name="one-shot", prompt="p"
+        )
+        row, created = self._persist(
+            registry, schedule_id=s.id, agent="oleg", fired_at=1000.0
+        )
+        assert created
+        assert any(
+            r.id == row.id
+            for r in registry.list_pending_schedule_wakes("oleg")
+        )
+
+        assert (
+            registry.discard_pending_schedule_wake(row.id, agent_name="oleg")
+            is True
+        )
+
+        # Not deleted: excluded from the active outbox, present as a tombstone.
+        assert all(
+            r.id != row.id
+            for r in registry.list_pending_schedule_wakes("oleg")
+        )
+        parked = registry.list_pending_schedule_wakes(
+            "oleg", include_parked=True
+        )
+        tomb = next(r for r in parked if r.id == row.id)
+        assert tomb.parked_at > 0
+
+    def test_discarded_fire_cannot_be_recreated(self, registry):
+        # The zombie-refire regression: after discard, re-persisting the SAME
+        # (schedule_id, fired_at) must NOT create a new active row — the parked
+        # tombstone still holds the UNIQUE key so INSERT OR IGNORE no-ops.
+        registry.register("oleg")
+        s = registry.add_schedule(
+            "oleg", "0 8 * * *", name="one-shot", prompt="p"
+        )
+        row, _ = self._persist(
+            registry, schedule_id=s.id, agent="oleg", fired_at=1000.0
+        )
+        registry.discard_pending_schedule_wake(row.id, agent_name="oleg")
+
+        _row2, created2 = self._persist(
+            registry, schedule_id=s.id, agent="oleg", fired_at=1000.0
+        )
+        assert created2 is False
+        assert registry.list_pending_schedule_wakes("oleg") == []
+
+    def test_discard_is_noop_on_already_terminal_row(self, registry):
+        registry.register("oleg")
+        s = registry.add_schedule(
+            "oleg", "0 8 * * *", name="one-shot", prompt="p"
+        )
+        row, _ = self._persist(
+            registry, schedule_id=s.id, agent="oleg", fired_at=1000.0
+        )
+        assert (
+            registry.discard_pending_schedule_wake(row.id, agent_name="oleg")
+            is True
+        )
+        # Second discard on the now-parked (terminal) row is a no-op.
+        assert (
+            registry.discard_pending_schedule_wake(row.id, agent_name="oleg")
+            is False
+        )

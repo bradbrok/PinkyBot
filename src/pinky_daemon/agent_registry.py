@@ -4860,20 +4860,52 @@ except Exception as exc:
         *,
         agent_name: str | None = None,
     ) -> bool:
-        """Retire an active pending wake without marking it delivered.
+        """Retire an active pending wake by TOMBSTONING it (not deleting).
 
-        ``agent_name`` scopes self-service callers to their own outbox. Ledger
-        rows that are already accepted or quarantined are terminal evidence and
-        cannot be erased through this cleanup primitive.
+        Sets ``parked_at`` so the row survives as a terminal marker instead of
+        being erased. This is load-bearing: a bare ``DELETE`` left no durable
+        "retired" record, so a later reconciliation — finding the schedule's
+        ``last_run`` advanced but no outbox row and no accepted receipt — would
+        re-create and re-fire an already-handled fire. Keeping the row preserves
+        the ``(schedule_id, fired_at)`` key (a re-persist's ``INSERT OR IGNORE``
+        then no-ops), and the parked row is excluded from the active replay
+        outbox (``list_pending_schedule_wakes`` default), so the fire is neither
+        re-created nor re-delivered.
+
+        ``agent_name`` scopes self-service callers to their own outbox. Rows that
+        are already accepted or parked are terminal evidence and are left as-is.
+
+        Parked tombstones accumulate until a terminal-row reaper prunes them
+        (tracked separately; accepted rows already accumulate the same way).
         """
-        sql = """DELETE FROM pending_schedule_wakes
+        sql = """UPDATE pending_schedule_wakes
+                 SET parked_at=?, last_error=?
                  WHERE id=? AND accepted_at=0 AND parked_at=0"""
-        params: list = [pending_id]
+        params: list = [time.time(), "retired via discard", pending_id]
         if agent_name is not None:
             sql += " AND agent_name=?"
             params.append(agent_name)
         with self._rmw_lock:
             cursor = self._db.execute(sql, params)
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def delete_pending_schedule_wake(self, pending_id: int) -> bool:
+        """Hard-delete an active pending wake (no tombstone).
+
+        Used by the internal replay stale-drop pass, which fires at the cadence
+        of frequently-recurring schedules — tombstoning there would accumulate
+        rows unboundedly without a reaper. Deliberate/manual retirement uses
+        ``discard_pending_schedule_wake`` (which tombstones) so a retired fire
+        cannot be re-created by a later reconciliation. Accepted or already
+        parked rows are terminal and are left as-is.
+        """
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """DELETE FROM pending_schedule_wakes
+                   WHERE id=? AND accepted_at=0 AND parked_at=0""",
+                (pending_id,),
+            )
             self._db.commit()
             return cursor.rowcount > 0
 
