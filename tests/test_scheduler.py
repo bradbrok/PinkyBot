@@ -3353,3 +3353,33 @@ class TestDiscardTombstone:
             registry.discard_pending_schedule_wake(row.id, agent_name="oleg")
             is False
         )
+
+    @pytest.mark.asyncio
+    async def test_discarded_fire_is_not_re_delivered(self, registry):
+        # A fire discarded (parked) while its cohort task waited behind the
+        # per-agent delivery lock must NOT be delivered by the queued live
+        # path — delivering would resurrect the tombstone (confirm clears it).
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="one-shot", prompt="run once"
+        )
+        fired = 1000.0
+        schedule.last_run = fired
+        row, _ = self._persist(
+            registry, schedule_id=schedule.id, agent="oleg", fired_at=fired
+        )
+        registry.discard_pending_schedule_wake(row.id, agent_name="oleg")
+
+        calls: list[str] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            calls.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=wake_cb)
+        await scheduler._deliver_schedule(schedule)
+
+        assert calls == []  # the retired fire is not delivered
+        tomb = registry.get_schedule_wake_by_fire(schedule.id, fired)
+        assert tomb is not None
+        assert tomb.parked_at > 0 and tomb.accepted_at == 0  # tombstone intact

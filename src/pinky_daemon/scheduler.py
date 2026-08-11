@@ -618,13 +618,23 @@ class AgentScheduler:
         # their exact fire represented too; production fires already have this
         # row from the atomic claim transaction above.
         if not schedule.direct_send and schedule.last_run > 0:
-            self._registry.persist_schedule_wake(
+            row, _created = self._registry.persist_schedule_wake(
                 schedule.id,
                 agent_name=schedule.agent_name,
                 schedule_name=schedule.name,
                 prompt=self._wake_prompt(schedule),
                 fired_at=schedule.last_run,
             )
+            # A retired (parked) or already-accepted fire must not be delivered:
+            # an operator may have discarded this fire while its cohort task
+            # waited behind the per-agent delivery lock. Delivering would
+            # resurrect the tombstone (and the delivery-confirm would clear it).
+            # Set the cohort-start event first so ``_check_schedules`` does not
+            # wait out its timeout on a discarded first cohort member.
+            if row is not None and (row.parked_at > 0 or row.accepted_at > 0):
+                if attempt_started is not None:
+                    attempt_started.set()
+                return
 
         if schedule.direct_send:
             if attempt_started is not None:
