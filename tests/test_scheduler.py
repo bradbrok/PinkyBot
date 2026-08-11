@@ -3424,3 +3424,57 @@ class TestCohortStalenessGuard:
             registry.get_schedule_wake_by_fire(schedule.id, schedule.last_run)
             is None
         )
+
+    @pytest.mark.asyncio
+    async def test_stale_one_shot_cohort_drop_alerts_owner(
+        self, registry, monkeypatch
+    ):
+        # A queued one-shot that goes stale is dropped AND owner-alerted (it
+        # was auto-disabled on fire, so the owed work is otherwise lost with no
+        # next occurrence) — mirrors the replay path.
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg",
+            "0 8 * * *",
+            name="one-shot",
+            prompt="owed work",
+            one_shot=True,
+        )
+        now = 1_800_000_000.0
+        schedule.last_run = now - 3_601.0
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name="one-shot",
+            prompt="owed work",
+            fired_at=schedule.last_run,
+        )
+        calls: list[str] = []
+        alerts: list[tuple[str, str]] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            calls.append(prompt)
+            return True
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=3600.0,
+        )
+        await scheduler._deliver_schedule(schedule)
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        assert calls == []  # not delivered
+        assert (
+            registry.get_schedule_wake_by_fire(schedule.id, schedule.last_run)
+            is None
+        )  # dropped
+        assert len(alerts) == 1  # owner alerted about the lost one-shot
+        assert alerts[0][0] == "oleg"
+        assert "STALE ONE-SHOT WAKE DROPPED" in alerts[0][1]

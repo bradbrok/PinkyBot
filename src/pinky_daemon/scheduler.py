@@ -604,6 +604,35 @@ class AgentScheduler:
                 )
             raise
 
+    def _alert_stale_one_shot_drop(
+        self,
+        *,
+        agent_name: str,
+        schedule_id: int,
+        schedule_name: str,
+        pending_id: int,
+        row_age: float,
+        replay_max_age: float,
+    ) -> None:
+        """Owner-alert a stale-dropped one-shot fire.
+
+        A one-shot has no next occurrence (``_check_schedules`` auto-disables
+        it once fired), so a fire dropped for staleness is owed work lost unless
+        re-armed. Fired from both the replay pass and the live cohort path so a
+        queued-then-stale one-shot is never silently lost.
+        """
+        self._queue_owner_alert(
+            agent_name,
+            (
+                "🚨 STALE ONE-SHOT WAKE DROPPED: outbox row "
+                f"#{pending_id} for schedule '{schedule_name}' "
+                f"(#{schedule_id}) on agent '{agent_name}' aged past its "
+                f"replay window ({row_age:.1f}s > {replay_max_age:.1f}s). "
+                "The stale wake was discarded and this one-shot has no next "
+                "occurrence; verify the owed work and re-arm it if needed."
+            ),
+        )
+
     async def _deliver_schedule(
         self,
         schedule,
@@ -660,6 +689,17 @@ class AgentScheduler:
                     f"'{schedule.agent_name}': age_s={age:.1f} "
                     f"max_age_s={replay_max_age:.1f} dropped={dropped}"
                 )
+                if dropped and schedule.one_shot:
+                    # A one-shot was auto-disabled on fire, so a stale drop has
+                    # no next occurrence — mirror the replay path and alert.
+                    self._alert_stale_one_shot_drop(
+                        agent_name=schedule.agent_name,
+                        schedule_id=schedule.id,
+                        schedule_name=schedule.name,
+                        pending_id=row.id if row is not None else 0,
+                        row_age=age,
+                        replay_max_age=replay_max_age,
+                    )
                 if attempt_started is not None:
                     attempt_started.set()
                 return
@@ -1055,20 +1095,13 @@ class AgentScheduler:
                     f"max_age_s={replay_max_age:.1f} discarded={discarded}"
                 )
                 if discarded and current_schedule.one_shot:
-                    self._queue_owner_alert(
-                        pending.agent_name,
-                        (
-                            "🚨 STALE ONE-SHOT WAKE DROPPED: outbox row "
-                            f"#{pending.id} for schedule "
-                            f"'{pending.schedule_name}' "
-                            f"(#{pending.schedule_id}) on agent "
-                            f"'{pending.agent_name}' aged past its replay "
-                            f"window ({row_age:.1f}s > "
-                            f"{replay_max_age:.1f}s). The stale wake was "
-                            "discarded and this one-shot has no next "
-                            "occurrence; verify the owed work and re-arm it "
-                            "if needed."
-                        ),
+                    self._alert_stale_one_shot_drop(
+                        agent_name=pending.agent_name,
+                        schedule_id=pending.schedule_id,
+                        schedule_name=pending.schedule_name,
+                        pending_id=pending.id,
+                        row_age=row_age,
+                        replay_max_age=replay_max_age,
                     )
                 continue
             pending_wakes.append(pending)
