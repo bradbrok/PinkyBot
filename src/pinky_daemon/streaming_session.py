@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
@@ -1180,10 +1181,11 @@ class StreamingSession:
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
 
-            # Fix: SDK reports 200k for 1M models — use actual window
-            max_t = reported_max
-            if is_1m_model(self._config.model or "") and reported_max <= 200_000:
-                max_t = 1_000_000
+            # Single source of truth for the window: trust the harness-reported
+            # cap (reported_max), falling back to the configurable per-model map.
+            max_t = resolve_context_window(
+                self._config.model or "", reported_max=reported_max
+            )
 
             pct = round(total / max_t * 100) if max_t > 0 else 0
 
