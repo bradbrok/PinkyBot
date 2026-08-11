@@ -63,10 +63,56 @@ def test_tier2_env_non_object_ignored(monkeypatch):
 
 
 def test_tier2_env_bad_size_skipped(monkeypatch):
-    # Non-positive / non-int sizes are dropped, not fatal.
+    # Non-positive / non-numeric sizes are dropped, not fatal.
     monkeypatch.setenv(ENV_KEY, '{"gpt-5.6-terra": "huge", "gpt-5.6-sol": -1}')
     assert resolve_context_window("gpt-5.6-terra") == DEFAULT_CONTEXT_WINDOW
     assert resolve_context_window("gpt-5.6-sol") == DEFAULT_CONTEXT_WINDOW
+
+
+def test_env_specific_key_wins_over_builtin_family(monkeypatch):
+    # Regression: an env key that fully names a model must win even though the
+    # built-in map has a broader family substring ("opus") that also matches.
+    monkeypatch.setenv(ENV_KEY, '{"claude-opus-4-8": 1000000}')
+    assert resolve_context_window("claude-opus-4-8") == 1_000_000
+
+
+def test_env_longest_key_wins_over_broader_env_key(monkeypatch):
+    # Within the env override, the most specific (longest) matching key wins,
+    # independent of JSON/dict ordering.
+    monkeypatch.setenv(ENV_KEY, '{"gpt-5.6": 100000, "gpt-5.6-luna-max": 500000}')
+    assert resolve_context_window("gpt-5.6-luna-max") == 500_000
+    # A model that only matches the broader key still resolves to it.
+    assert resolve_context_window("gpt-5.6-plain") == 100_000
+
+
+def test_env_overflow_value_is_skipped_not_fatal(monkeypatch):
+    # Regression: a value that overflows int() (1e309 -> inf) must not crash the
+    # resolver; other good entries in the same object are preserved.
+    monkeypatch.setenv(ENV_KEY, '{"badinf": 1e309, "gpt-5.6-terra": 300000}')
+    assert resolve_context_window("gpt-5.6-terra") == 300_000
+    assert resolve_context_window("badinf-model") == DEFAULT_CONTEXT_WINDOW
+
+
+def test_env_bool_and_float_rejected(monkeypatch):
+    # bool (JSON true -> 1) and float (123.75) are not valid window sizes.
+    monkeypatch.setenv(
+        ENV_KEY, '{"m-bool": true, "m-float": 123.75, "m-ok": 300000}'
+    )
+    assert resolve_context_window("m-bool") == DEFAULT_CONTEXT_WINDOW
+    assert resolve_context_window("m-float") == DEFAULT_CONTEXT_WINDOW
+    assert resolve_context_window("m-ok") == 300_000
+
+
+def test_env_integer_string_accepted(monkeypatch):
+    # A digits-only string is a friendly, valid way to write a size.
+    monkeypatch.setenv(ENV_KEY, '{"gpt-5.6-terra": "300000"}')
+    assert resolve_context_window("gpt-5.6-terra") == 300_000
+
+
+def test_env_out_of_range_value_skipped(monkeypatch):
+    # Absurdly large values are rejected (garbage guard).
+    monkeypatch.setenv(ENV_KEY, '{"gpt-5.6-terra": 999999999999}')
+    assert resolve_context_window("gpt-5.6-terra") == DEFAULT_CONTEXT_WINDOW
 
 
 # --- Tier 3: conservative default -------------------------------------------

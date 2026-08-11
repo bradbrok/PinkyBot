@@ -46,6 +46,33 @@ _ENV_OVERRIDE_KEY = "PINKY_MODEL_CONTEXT_SIZES"
 # env var logs once, not on every gauge tick.
 _warned_bad_env: set[str] = set()
 
+# Sanity ceiling for a configured window — far above any real model window,
+# low enough to reject absurd/garbage values.
+_MAX_REASONABLE_WINDOW = 100_000_000
+
+
+def _coerce_window(value: object) -> int | None:
+    """Coerce a single override value to a positive int, or ``None`` to skip.
+
+    Accepts a JSON integer or an all-digits string; rejects ``bool`` (a JSON
+    ``true``/``false`` would otherwise become ``1``/``0``), ``float`` (e.g.
+    ``123.75`` or ``1e309`` -> ``inf``), ``null``, nested structures,
+    non-numeric strings, and non-positive or out-of-range values. Never raises,
+    so one bad entry is skipped rather than breaking the whole override.
+    """
+    # bool is an int subclass — exclude it before the int check.
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, int):
+        size = value
+    elif isinstance(value, str) and value.strip().lstrip("+").isdigit():
+        size = int(value.strip())
+    else:
+        return None
+    if 0 < size <= _MAX_REASONABLE_WINDOW:
+        return size
+    return None
+
 
 def _env_override_map() -> dict[str, int]:
     """Parse ``PINKY_MODEL_CONTEXT_SIZES`` defensively.
@@ -71,13 +98,10 @@ def _env_override_map() -> dict[str, int]:
     # Valid JSON object: keep the good entries, skip any bad one individually
     # rather than discarding the whole override for one typo.
     out: dict[str, int] = {}
-    for key, size in parsed.items():
-        try:
-            size_int = int(size)
-        except (ValueError, TypeError):
-            continue
-        if size_int > 0:
-            out[str(key).lower()] = size_int
+    for key, value in parsed.items():
+        size = _coerce_window(value)
+        if size is not None:
+            out[str(key).lower()] = size
     return out
 
 
@@ -95,22 +119,40 @@ def _builtin_sizes() -> dict[str, int]:
         return {"default": DEFAULT_CONTEXT_WINDOW}
 
 
+def _longest_substring_match(model: str, mapping: dict[str, int]) -> int:
+    """Return the value whose key is the LONGEST substring of ``model``.
+
+    The ``"default"`` key is never matched as a substring. Longest-match makes
+    a more specific key (e.g. ``gpt-5.6-luna-max``) win over a broader one
+    (``gpt-5.6-luna``) regardless of dict order. Returns ``0`` when nothing
+    matches.
+    """
+    best_len = -1
+    best_size = 0
+    for key, size in mapping.items():
+        if key == "default" or not key:
+            continue
+        if key in model and len(key) > best_len:
+            best_len = len(key)
+            best_size = size
+    return best_size
+
+
 def configured_context_window(model_id: str) -> int:
     """Return the configured window for ``model_id`` by substring match.
 
-    Merges the built-in map with the ``PINKY_MODEL_CONTEXT_SIZES`` env override
-    (env wins). The ``"default"`` key is never matched as a substring. Returns
-    ``0`` when nothing matches, letting the caller decide the fallback.
+    The ``PINKY_MODEL_CONTEXT_SIZES`` env override is consulted first and wins
+    over the built-in seed map; within each tier the longest (most specific)
+    matching key wins. The ``"default"`` key is never matched as a substring.
+    Returns ``0`` when nothing matches, letting the caller decide the fallback.
     """
     model = (model_id or "").lower()
     if not model:
         return 0
-    merged = _builtin_sizes()
-    merged.update(_env_override_map())
-    for key, size in merged.items():
-        if key != "default" and key and key in model:
-            return size
-    return 0
+    env_hit = _longest_substring_match(model, _env_override_map())
+    if env_hit:
+        return env_hit
+    return _longest_substring_match(model, _builtin_sizes())
 
 
 def resolve_context_window(model_id: str, *, reported_max: int = 0) -> int:
