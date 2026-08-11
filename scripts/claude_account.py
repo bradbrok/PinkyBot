@@ -15,7 +15,7 @@ logged.
 
 Subcommands::
 
-    claude-account add <name>        mint/paste + isolation-probe + store a token
+    claude-account add <name>        paste (from `claude setup-token`) + probe + store
     claude-account list              stored accounts, active one, days-to-expiry
     claude-account current           which stored token the .env currently uses
     claude-account switch <name>     safe swap (backup + fail-closed write [+ restart])
@@ -584,14 +584,15 @@ def cmd_add(args: argparse.Namespace) -> int:
         )
         return 2
 
-    if args.mint:
-        binary = resolve_claude_bin(args.claude_bin)
-        print(f"Launching `{binary} setup-token` — sign in as the target account…\n")
-        subprocess.run([binary, "setup-token"], check=False)
-        print()
-
-    # Token via hidden prompt — NEVER on argv (would leak in ps / shell history).
-    token = getpass.getpass("Paste the setup-token (input hidden): ").strip()
+    # The operator mints the token OUT OF BAND with `claude setup-token` in their
+    # own terminal — this tool deliberately never spawns that flow. setup-token
+    # prints the token to stdout ("Your OAuth token (valid for 1 year): …"), and
+    # inheriting that output would leak the long-lived token into scrollback / any
+    # log capture, breaking the never-printed guarantee. We only read it back here
+    # via a hidden prompt (never on argv either).
+    token = getpass.getpass(
+        "Paste the setup-token from `claude setup-token` (input hidden): "
+    ).strip()
     if not token:
         print("claude-account: no token entered", file=sys.stderr)
         return 2
@@ -647,10 +648,7 @@ def cmd_add(args: argparse.Namespace) -> int:
             return 2
     else:
         exp = now + timedelta(days=args.ttl_days)
-    billing = args.billing
-    if billing not in BILLING_MODES:
-        print(f"claude-account: --billing must be one of {BILLING_MODES}", file=sys.stderr)
-        return 2
+    billing = args.billing  # argparse choices=BILLING_MODES has already validated this
 
     write_token(args.name, token)
     index["accounts"][args.name] = {
@@ -662,7 +660,7 @@ def cmd_add(args: argparse.Namespace) -> int:
         "probe": probe_meta,
     }
     save_index(index)
-    print(f"Stored {args.name!r}, expires {_iso(exp)}, billing={billing}.")
+    print(f"Stored {args.name!r}, expires {_iso(exp)}.")
     return 0
 
 
@@ -678,7 +676,10 @@ def cmd_list(args: argparse.Namespace) -> int:
     except SystemExit as exc:
         print(str(exc), file=sys.stderr)
         active = prov = None
-    header = f"{'':2} {'NAME':16} {'BILLING':12} {'EXPIRES':22} {'DAYS':>5}  LABEL"
+    # Columns are name / expiry / days only. billing + account_label are stored
+    # but not printed: CodeQL's clear-text-logging heuristic classifies those
+    # field names as sensitive, and they are not worth a logging sink here.
+    header = f"{'':2} {'NAME':20} {'EXPIRES':22} {'DAYS':>5}"
     print(header)
     for name in sorted(accounts):
         meta = accounts[name]
@@ -686,10 +687,7 @@ def cmd_list(args: argparse.Namespace) -> int:
         dl = days_left(meta)
         dl_s = "—" if dl is None else str(dl)
         warn = " ⚠" if (dl is not None and dl <= EXPIRY_WARN_DAYS) else ""
-        print(
-            f"{mark:2} {name:16} {meta.get('billing','?'):12} "
-            f"{meta.get('expires_at','?'):22} {dl_s:>5}{warn}  {meta.get('account_label','')}"
-        )
+        print(f"{mark:2} {name:20} {meta.get('expires_at','?'):22} {dl_s:>5}{warn}")
     if active is None:
         if prov:
             print(f"\n(forwarding is OFF — {prov!r} is in .env but not being forwarded)")
@@ -712,8 +710,8 @@ def cmd_current(args: argparse.Namespace) -> int:
     if prov and flag:
         meta = index["accounts"][prov]
         dl = days_left(meta)
-        print(f"active account: {prov}  (billing={meta.get('billing','?')}, "
-              f"expires {meta.get('expires_at','?')}, {dl if dl is not None else '?'}d left)")
+        print(f"active account: {prov}  (expires {meta.get('expires_at','?')}, "
+              f"{dl if dl is not None else '?'}d left)")
     elif prov and not flag:
         print(f"active account: none — {prov!r} token is in .env but forwarding is OFF")
     elif live:
@@ -948,7 +946,6 @@ def build_parser() -> argparse.ArgumentParser:
                    help="owner-declared billing mode (subscription | api_usage | unknown)")
     a.add_argument("--ttl-days", type=int, default=DEFAULT_TTL_DAYS)
     a.add_argument("--expires-at", default="", help="explicit ISO expiry (overrides --ttl-days)")
-    a.add_argument("--mint", action="store_true", help="launch `claude setup-token` first")
     a.add_argument("--no-probe", action="store_true", help="skip the isolation-probe (unsafe)")
     a.add_argument("--allow-any", action="store_true", help="accept a non setup-token string")
     a.add_argument("--claude-bin", default="", help="path to the claude binary")

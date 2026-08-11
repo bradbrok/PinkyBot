@@ -509,6 +509,21 @@ def test_add_probe_failure_does_not_store(store, monkeypatch):
     assert not ca.token_path("x").exists()
 
 
+def test_add_never_spawns_a_token_printing_child(store, monkeypatch):
+    """The tool must never spawn `claude setup-token` — that flow prints the
+    long-lived token to stdout, which inherited stdio would leak."""
+    monkeypatch.setattr(ca.getpass, "getpass", lambda prompt="": "sk-ant-oat01-X")
+    calls = []
+    monkeypatch.setattr(ca.subprocess, "run", lambda *a, **k: calls.append(list(a[0]) if a else []))
+    assert run("add", "x") == 0
+    assert all("setup-token" not in part for c in calls for part in c)
+
+
+def test_mint_flag_is_removed():
+    with pytest.raises(SystemExit):  # argparse rejects the unknown flag
+        ca.build_parser().parse_args(["add", "x", "--mint"])
+
+
 # ── serialization safety / duplicate / perms / probe hygiene ─────────────────
 
 
