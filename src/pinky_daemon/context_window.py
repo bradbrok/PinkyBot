@@ -65,8 +65,18 @@ def _coerce_window(value: object) -> int | None:
         return None
     if isinstance(value, int):
         size = value
-    elif isinstance(value, str) and value.strip().lstrip("+").isdigit():
-        size = int(value.strip())
+    elif isinstance(value, str):
+        s = value.strip()
+        # ASCII decimal digits only, bounded length. str.isdigit() also accepts
+        # unicode digit characters (e.g. "²") and arbitrarily long strings
+        # that int() rejects (Python 3.11+ caps integer-string conversion
+        # length), so validate explicitly before converting.
+        if not (s.isascii() and s.isdigit() and len(s) <= 12):
+            return None
+        try:
+            size = int(s)
+        except ValueError:
+            return None
     else:
         return None
     if 0 < size <= _MAX_REASONABLE_WINDOW:

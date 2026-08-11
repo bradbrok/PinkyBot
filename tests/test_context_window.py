@@ -1,5 +1,7 @@
 """Tests for the unified context-window resolver."""
 
+import json
+
 import pytest
 
 from pinky_daemon.context_window import (
@@ -113,6 +115,26 @@ def test_env_out_of_range_value_skipped(monkeypatch):
     # Absurdly large values are rejected (garbage guard).
     monkeypatch.setenv(ENV_KEY, '{"gpt-5.6-terra": 999999999999}')
     assert resolve_context_window("gpt-5.6-terra") == DEFAULT_CONTEXT_WINDOW
+
+
+def test_env_pathological_digit_strings_skipped(monkeypatch):
+    # str.isdigit() accepts inputs int() rejects: an over-long digit string
+    # (Python 3.11+ integer-string conversion cap), a unicode digit, and a
+    # multi-sign string. Each must be skipped non-fatally, preserving good
+    # siblings in the same object.
+    payload = json.dumps(
+        {
+            "bad-long": "9" * 5000,  # exceeds int() digit cap
+            "bad-plus": "++123",  # multi-sign
+            "bad-unicode": "²",  # superscript 2 — isdigit() True, int() raises
+            "gpt-5.6-terra": 300000,  # good sibling must survive
+        }
+    )
+    monkeypatch.setenv(ENV_KEY, payload)
+    assert resolve_context_window("gpt-5.6-terra") == 300_000
+    assert resolve_context_window("bad-long") == DEFAULT_CONTEXT_WINDOW
+    assert resolve_context_window("bad-plus") == DEFAULT_CONTEXT_WINDOW
+    assert resolve_context_window("bad-unicode") == DEFAULT_CONTEXT_WINDOW
 
 
 # --- Tier 3: conservative default -------------------------------------------
