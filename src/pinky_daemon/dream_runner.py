@@ -180,7 +180,7 @@ class DreamRunner:
                 self._db.execute("BEGIN IMMEDIATE")
                 try:
                     self._check_schema_version()
-                    self._db.executescript("""
+                    schema_sql = """
             CREATE TABLE IF NOT EXISTS dream_state (
                 agent_name TEXT PRIMARY KEY,
                 last_dream_at REAL,
@@ -230,7 +230,10 @@ class DreamRunner:
                 surfaced_at REAL,
                 PRIMARY KEY (agent_name, fingerprint)
             );
-                    """)
+                    """
+                    for statement in schema_sql.split(";"):
+                        if statement.strip():
+                            self._db.execute(statement)
                     self._migrate_tables()
                     version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
                     if version < _DREAM_SCHEMA_VERSION:
