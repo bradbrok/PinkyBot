@@ -750,8 +750,20 @@ class DreamRunner:
                     continue
                 if not task.done():
                     task.cancel()
+            if not run_task.done():
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(run_task), timeout=_SDK_DREAM_TEARDOWN_GRACE_S
+                    )
+                except TimeoutError:
+                    _log(
+                        "dream-runner: abandoning orphaned SDK task after bounded "
+                        f"teardown grace (task={run_task!r})"
+                    )
+                except BaseException:
+                    pass
             await asyncio.gather(
-                run_task, renewal_task, *( [deadline_task] if deadline_task else [] ),
+                renewal_task, *( [deadline_task] if deadline_task else [] ),
                 return_exceptions=True,
             )
 
