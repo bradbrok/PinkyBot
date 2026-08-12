@@ -1170,6 +1170,47 @@ class TestDreamReflectionLoudness:
         ).fetchone() == (1, "failed", 0)
 
     @pytest.mark.asyncio
+    async def test_sdk_timeout_discards_late_success_from_cancellation_suppressor(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.setattr(dream_runner_module, "_SDK_DREAM_TIMEOUT_S", 0.02)
+
+        class CancellationSuppressingRunner:
+            def __init__(self, config, agent_name=""):
+                pass
+
+            async def run(self, prompt):
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    await asyncio.sleep(0.06)
+                    from pinky_daemon.claude_runner import RunResult
+                    return RunResult(output="late success", exit_code=0)
+
+        monkeypatch.setattr(dream_runner_module, "SDKRunner", CancellationSuppressingRunner)
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda *args: [{"timestamp": 200.0, "role": "user", "content": "x"}],
+        )
+        summary = await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        assert "TimeoutError" in summary
+        assert runner._db.execute(
+            "SELECT status, terminal FROM dream_reflection_attempts"
+        ).fetchone() == ("failed", 0)
+
+    def test_concurrent_constructors_serialize_migration(self, tmp_path):
+        db_path = str(tmp_path / "dream.db")
+
+        def construct(_):
+            runner = DreamRunner(db_path=db_path)
+            return runner._db.execute("PRAGMA user_version").fetchone()[0]
+
+        with ThreadPoolExecutor(max_workers=12) as pool:
+            versions = list(pool.map(construct, range(12)))
+        assert versions == [1] * 12
+
+    @pytest.mark.asyncio
     async def test_untagged_window_never_proves_completion_and_cap_unblocks_next_night(
         self, tmp_path, monkeypatch
     ):

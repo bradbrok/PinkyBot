@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import fcntl
 import inspect
 import json
 import os
@@ -172,8 +173,11 @@ class DreamRunner:
         return connection
 
     def _init_tables(self) -> None:
-        self._check_schema_version()
-        self._db.executescript("""
+        lock_path = f"{self._db_path}.migration.lock"
+        with open(lock_path, "a+") as migration_lock:
+            fcntl.flock(migration_lock.fileno(), fcntl.LOCK_EX)
+            self._check_schema_version()
+            self._db.executescript("""
             CREATE TABLE IF NOT EXISTS dream_state (
                 agent_name TEXT PRIMARY KEY,
                 last_dream_at REAL,
@@ -224,24 +228,25 @@ class DreamRunner:
                 PRIMARY KEY (agent_name, fingerprint)
             );
         """)
-        # Serialize migration and re-check after acquiring the write lock.
-        for migration_attempt in range(5):
-            self._db.execute("BEGIN IMMEDIATE")
-            try:
-                self._migrate_tables()
-                version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
-                if version < _DREAM_SCHEMA_VERSION:
-                    self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
-                self._db.commit()
-                break
-            except sqlite3.OperationalError:
-                self._db.rollback()
-                if migration_attempt == 4:
+            # Serialize migration and re-check after acquiring the write lock.
+            for migration_attempt in range(5):
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    self._migrate_tables()
+                    version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
+                    if version < _DREAM_SCHEMA_VERSION:
+                        self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
+                    self._db.commit()
+                    break
+                except sqlite3.OperationalError:
+                    self._db.rollback()
+                    if migration_attempt == 4:
+                        raise
+                    time.sleep(0.05 * (migration_attempt + 1))
+                except BaseException:
+                    self._db.rollback()
                     raise
-                time.sleep(0.05 * (migration_attempt + 1))
-            except BaseException:
-                self._db.rollback()
-                raise
+            fcntl.flock(migration_lock.fileno(), fcntl.LOCK_UN)
 
     def _check_schema_version(self) -> None:
         """Fail startup before touching a dream DB created by newer code."""
