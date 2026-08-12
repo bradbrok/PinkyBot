@@ -356,6 +356,23 @@ class TestTmuxDreamRunner:
             assert spawn[idx + 1] == os.path.realpath(mcp_config)
 
     @pytest.mark.asyncio
+    async def test_spawn_prefers_explicit_per_run_mcp_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_config = os.path.join(tmp, ".mcp.json")
+            per_run_config = os.path.join(tmp, "dream-mcp.json")
+            for path in (project_config, per_run_config):
+                with open(path, "w") as file:
+                    file.write("{}")
+            fake = _FakeTmux(new_session_rc=1)
+            runner = _runner(tmp, fake, mcp_config=per_run_config)
+
+            await runner.run("x")
+
+            spawn = fake.named("new-session")[0]
+            idx = spawn.index("--mcp-config")
+            assert spawn[idx + 1] == os.path.realpath(per_run_config)
+
+    @pytest.mark.asyncio
     async def test_spawn_omits_project_mcp_config_when_absent(self):
         with tempfile.TemporaryDirectory() as tmp:
             fake = _FakeTmux(new_session_rc=1)

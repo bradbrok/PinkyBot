@@ -19,6 +19,7 @@ from pinky_daemon.shared_mcp import (
     create_shared_app,
     derive_mcp_bearer,
     get_current_agent,
+    get_current_dream_correlation,
     get_gateway_epoch,
     get_probe_request,
     get_probe_status,
@@ -143,6 +144,25 @@ class TestAgentNameMiddleware:
         }
         await middleware(scope, None, None)
         assert captured_agent == ["barsik"]
+
+    @pytest.mark.asyncio
+    async def test_sets_and_resets_dream_correlation_from_header(self):
+        captured = []
+
+        async def inner_app(scope, receive, send):
+            captured.append(get_current_dream_correlation())
+
+        middleware = AgentNameMiddleware(inner_app)
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"x-agent-name", b"barsik"),
+                (b"x-dream-correlation", b"dream:barsik:night:1:nonce"),
+            ],
+        }
+        await middleware(scope, None, None)
+        assert captured == ["dream:barsik:night:1:nonce"]
+        assert get_current_dream_correlation() == ""
 
     @pytest.mark.asyncio
     async def test_no_header_passes_through(self):

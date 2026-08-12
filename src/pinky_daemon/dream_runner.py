@@ -18,11 +18,14 @@ import inspect
 import json
 import os
 import re
+import socket
 import sqlite3
 import sys
 import threading
 import time
+import uuid
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -80,6 +83,41 @@ _KG_EXTRACTION_MODEL_DEFAULT = "claude-haiku-4-5"
 # significant and should no longer hide behind the report-extraction fallback.
 _ZERO_REFLECTION_NOTICE_THRESHOLD = 3
 
+# Receipt execution policy. The owner renews its lease while the transport is
+# live. SDK runs additionally have a 90-minute wall timeout; tmux has its own
+# one-hour cap. The renewal interval is deliberately far below the lease.
+_REFLECTION_ATTEMPT_CAP = 3
+_REFLECTION_ATTEMPT_LEASE_S = 2 * 3600
+_REFLECTION_ATTEMPT_RENEW_INTERVAL_S = 15 * 60
+_SDK_DREAM_TIMEOUT_S = 90 * 60
+_REFLECTION_RECEIPT_RETENTION_S = 30 * 24 * 3600
+_DREAM_MCP_CONFIG_RETENTION_S = 24 * 3600
+
+# The durable receipt migration removes the old reflection_rowid_floor column,
+# so the dream-state database is intentionally one-way. Schema-aware binaries
+# reject a newer database during daemon construction instead of appearing
+# healthy until the first nightly query.
+_DREAM_SCHEMA_VERSION = 1
+_DREAM_SCHEMA_MIGRATION = "durable-dream-receipts-v1"
+_DREAM_SCHEMA_MIN_CODE_VERSION = "26.08.020"
+
+
+@dataclass(frozen=True)
+class _ReflectionAttempt:
+    """Durable receipt for one history interval handed to a dream session."""
+
+    agent_name: str
+    night_key: str
+    attempt_n: int
+    dream_start: datetime
+    history_start_ts: float
+    history_end_ts: float
+    correlation_id: str
+    summary: str | None
+    runner_completed_at: float | None
+    lease_owner: str
+    lease_expires_at: float
+
 
 class DreamRunner:
     """Runs nightly dream consolidation sessions for agents.
@@ -114,6 +152,11 @@ class DreamRunner:
         # API calls. Isolated agents cannot authenticate with the fleet-wide secret.
         self._signing_key_provider = signing_key_provider
         self._owner_notify_callback = owner_notify_callback
+        self._run_locks: dict[str, asyncio.Lock] = {}
+        self._run_locks_guard = threading.Lock()
+        self._lease_owner = (
+            f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+        )
         self._init_tables()
 
     @property
@@ -128,6 +171,7 @@ class DreamRunner:
         return connection
 
     def _init_tables(self) -> None:
+        self._check_schema_version()
         self._db.executescript("""
             CREATE TABLE IF NOT EXISTS dream_state (
                 agent_name TEXT PRIMARY KEY,
@@ -145,10 +189,33 @@ class DreamRunner:
                 night_key TEXT NOT NULL,
                 embedded_reflections INT NOT NULL,
                 recorded_at REAL NOT NULL,
+                outcome_status TEXT NOT NULL DEFAULT 'completed',
                 alert_attempted_at REAL,
                 alert_delivered_at REAL,
                 PRIMARY KEY (agent_name, night_key)
             );
+            CREATE TABLE IF NOT EXISTS dream_reflection_attempts (
+                agent_name TEXT NOT NULL,
+                night_key TEXT NOT NULL,
+                attempt_n INTEGER NOT NULL,
+                status TEXT NOT NULL CHECK (status IN ('pending', 'completed', 'failed')),
+                dream_started_at TEXT NOT NULL,
+                history_start_ts REAL NOT NULL,
+                history_end_ts REAL NOT NULL,
+                correlation_id TEXT NOT NULL,
+                summary TEXT,
+                runner_completed_at REAL,
+                embedded_reflections INTEGER,
+                completed_at REAL,
+                lease_owner TEXT,
+                lease_expires_at REAL,
+                terminal INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (agent_name, night_key, attempt_n)
+            );
+            CREATE UNIQUE INDEX IF NOT EXISTS
+                idx_dream_reflection_attempts_one_pending
+                ON dream_reflection_attempts(agent_name)
+                WHERE status = 'pending';
             CREATE TABLE IF NOT EXISTS kg_surfaced (
                 agent_name TEXT NOT NULL,
                 fingerprint TEXT NOT NULL,
@@ -158,6 +225,22 @@ class DreamRunner:
         """)
         self._db.commit()
         self._migrate_tables()
+        self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
+        self._db.commit()
+
+    def _check_schema_version(self) -> None:
+        """Fail startup before touching a dream DB created by newer code."""
+        row = self._db.execute("PRAGMA user_version").fetchone()
+        version = int(row[0] or 0) if row else 0
+        if version <= _DREAM_SCHEMA_VERSION:
+            return
+        raise RuntimeError(
+            "Dream state schema is newer than this daemon "
+            f"(database={version}, supported={_DREAM_SCHEMA_VERSION}). "
+            f"Migration {_DREAM_SCHEMA_MIGRATION} requires PinkyBot "
+            f">={_DREAM_SCHEMA_MIN_CODE_VERSION}; refusing startup because "
+            "this rollback cannot safely read the migrated receipt schema."
+        )
 
     def _migrate_tables(self) -> None:
         """Apply incremental schema migrations."""
@@ -227,6 +310,46 @@ class DreamRunner:
             )
             self._db.commit()
 
+        outcome_cols = {
+            row[1]
+            for row in self._db.execute(
+                "PRAGMA table_info(dream_reflection_outcomes)"
+            ).fetchall()
+        }
+        if "outcome_status" not in outcome_cols:
+            self._db.execute(
+                "ALTER TABLE dream_reflection_outcomes "
+                "ADD COLUMN outcome_status TEXT NOT NULL DEFAULT 'completed'"
+            )
+            self._db.commit()
+
+        attempt_cols = {
+            row[1]
+            for row in self._db.execute(
+                "PRAGMA table_info(dream_reflection_attempts)"
+            ).fetchall()
+        }
+        if "reflection_rowid_floor" in attempt_cols:
+            # Round-2 review briefly used this heuristic boundary. Exact
+            # transport correlation supersedes it; drop the column so no
+            # future code can accidentally resurrect heuristic attribution.
+            self._db.execute(
+                "ALTER TABLE dream_reflection_attempts "
+                "DROP COLUMN reflection_rowid_floor"
+            )
+            self._db.commit()
+        for column, declaration in (
+            ("lease_owner", "TEXT"),
+            ("lease_expires_at", "REAL"),
+            ("terminal", "INTEGER NOT NULL DEFAULT 0"),
+        ):
+            if column not in attempt_cols:
+                self._db.execute(
+                    f"ALTER TABLE dream_reflection_attempts "
+                    f"ADD COLUMN {column} {declaration}"
+                )
+                self._db.commit()
+
     def set_owner_notify_callback(
         self, callback: Callable[[str, str], object] | None
     ) -> None:
@@ -290,7 +413,584 @@ class DreamRunner:
         elapsed = time.time() - row[0]
         return elapsed >= _DREAM_COOLDOWN_S
 
+    @staticmethod
+    def _attempt_from_row(row: tuple) -> _ReflectionAttempt:
+        return _ReflectionAttempt(
+            agent_name=row[0],
+            night_key=row[1],
+            attempt_n=int(row[2]),
+            dream_start=datetime.fromisoformat(row[3]),
+            history_start_ts=float(row[4]),
+            history_end_ts=float(row[5]),
+            correlation_id=row[6],
+            summary=row[7],
+            runner_completed_at=row[8],
+            lease_owner=row[9] or "",
+            lease_expires_at=float(row[10] or 0.0),
+        )
+
+    def _get_pending_reflection_attempt(
+        self, agent_name: str
+    ) -> _ReflectionAttempt | None:
+        row = self._db.execute(
+            """SELECT agent_name, night_key, attempt_n, dream_started_at,
+                      history_start_ts, history_end_ts, correlation_id,
+                      summary, runner_completed_at, lease_owner, lease_expires_at
+               FROM dream_reflection_attempts
+               WHERE agent_name=? AND status='pending'
+               ORDER BY dream_started_at, attempt_n LIMIT 1""",
+            (agent_name,),
+        ).fetchone()
+        return self._attempt_from_row(row) if row else None
+
+    def _get_retryable_failed_attempt(
+        self, agent_name: str
+    ) -> _ReflectionAttempt | None:
+        """Return the newest failed interval still ahead of the watermark."""
+        watermark = self._get_last_message_ts(agent_name)
+        row = self._db.execute(
+            """SELECT agent_name, night_key, attempt_n, dream_started_at,
+                      history_start_ts, history_end_ts, correlation_id,
+                      summary, runner_completed_at, lease_owner, lease_expires_at
+               FROM dream_reflection_attempts
+               WHERE agent_name=? AND status='failed' AND terminal=0
+                 AND history_end_ts>?
+               ORDER BY dream_started_at DESC, attempt_n DESC LIMIT 1""",
+            (agent_name, watermark),
+        ).fetchone()
+        return self._attempt_from_row(row) if row else None
+
+    def _night_attempt_count(self, agent_name: str, night_key: str) -> int:
+        row = self._db.execute(
+            """SELECT COUNT(*) FROM dream_reflection_attempts
+               WHERE agent_name=? AND night_key=?""",
+            (agent_name, night_key),
+        ).fetchone()
+        return int(row[0] or 0) if row else 0
+
+    def _night_is_terminal(self, agent_name: str, night_key: str) -> bool:
+        return self._db.execute(
+            """SELECT 1 FROM dream_reflection_outcomes
+               WHERE agent_name=? AND night_key=?
+                 AND outcome_status='failed-terminal'""",
+            (agent_name, night_key),
+        ).fetchone() is not None
+
+    @staticmethod
+    def _memory_db_path(agent_config) -> Path:
+        work_dir = getattr(agent_config, "working_dir", "") or "."
+        return Path(work_dir).resolve() / "data" / "memory.db"
+
+    def _reflection_ids_for_attempt(
+        self,
+        attempt: _ReflectionAttempt,
+        agent_config,
+        *,
+        embedded_only: bool = False,
+    ) -> set[str]:
+        """Return only writes carrying this receipt's enforced correlation tag."""
+        db_path = self._memory_db_path(agent_config)
+        if not db_path.exists():
+            return set()
+
+        connection = sqlite3.connect(str(db_path))
+        try:
+            columns = {
+                row[1]
+                for row in connection.execute("PRAGMA table_info(reflections)").fetchall()
+            }
+            embedded_clause = " AND active=1 AND embedding != '[]'" if embedded_only else ""
+            if "source_session_id" not in columns:
+                return set()
+            rows = connection.execute(
+                "SELECT id FROM reflections WHERE source_session_id=?"
+                + embedded_clause,
+                (attempt.correlation_id,),
+            ).fetchall()
+            return {row[0] for row in rows}
+        except sqlite3.OperationalError:
+            return set()
+        finally:
+            connection.close()
+
+    def _begin_reflection_attempt(
+        self,
+        agent_name: str,
+        night_key: str,
+        *,
+        dream_start: datetime,
+        history_start_ts: float,
+        history_end_ts: float,
+    ) -> _ReflectionAttempt | None:
+        """Persist a run intent before the SDK can call ``reflect``."""
+        lease_expires_at = time.time() + _REFLECTION_ATTEMPT_LEASE_S
+        try:
+            with self._db:
+                existing = self._get_pending_reflection_attempt(agent_name)
+                if existing is not None:
+                    return None
+                row = self._db.execute(
+                    """SELECT COALESCE(MAX(attempt_n), 0)
+                       FROM dream_reflection_attempts
+                       WHERE agent_name=? AND night_key=?""",
+                    (agent_name, night_key),
+                ).fetchone()
+                attempt_n = int(row[0] or 0) + 1
+                if attempt_n > _REFLECTION_ATTEMPT_CAP:
+                    return None
+                correlation_id = (
+                    f"dream:{agent_name}:{night_key}:{attempt_n}:{uuid.uuid4().hex}"
+                )
+                self._db.execute(
+                    """INSERT INTO dream_reflection_attempts
+                            (agent_name, night_key, attempt_n, status,
+                            dream_started_at, history_start_ts, history_end_ts,
+                            correlation_id, lease_owner, lease_expires_at)
+                       VALUES (?, ?, ?, 'pending', ?, ?, ?, ?, ?, ?)""",
+                    (
+                        agent_name,
+                        night_key,
+                        attempt_n,
+                        dream_start.isoformat(),
+                        history_start_ts,
+                        history_end_ts,
+                        correlation_id,
+                        self._lease_owner,
+                        lease_expires_at,
+                    ),
+                )
+        except sqlite3.IntegrityError:
+            # Another process won the unique pending-receipt race.
+            return None
+        return _ReflectionAttempt(
+            agent_name=agent_name,
+            night_key=night_key,
+            attempt_n=attempt_n,
+            dream_start=dream_start,
+            history_start_ts=history_start_ts,
+            history_end_ts=history_end_ts,
+            correlation_id=correlation_id,
+            summary=None,
+            runner_completed_at=None,
+            lease_owner=self._lease_owner,
+            lease_expires_at=lease_expires_at,
+        )
+
+    def _lease_owner_is_dead(self, lease_owner: str) -> bool:
+        """Return True only when a same-host lease owner is provably dead."""
+        try:
+            host, pid_text, _nonce = lease_owner.rsplit(":", 2)
+            pid = int(pid_text)
+        except (AttributeError, TypeError, ValueError):
+            return False
+        if host != socket.gethostname() or pid == os.getpid():
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return True
+        except (OSError, PermissionError):
+            return False
+        return False
+
+    def _claim_pending_reflection_attempt(
+        self, agent_name: str
+    ) -> _ReflectionAttempt | None:
+        """Atomically claim a pending receipt if its prior owner is resumable.
+
+        An unexpired live owner's receipt is never resumed. A receipt owned by
+        this runner is refreshed, while an expired or provably dead same-host
+        owner is taken over with a compare-and-swap update.
+        """
+        attempt = self._get_pending_reflection_attempt(agent_name)
+        if attempt is None:
+            return None
+        now = time.time()
+        claimable = (
+            not attempt.lease_owner
+            or attempt.lease_owner == self._lease_owner
+            or attempt.lease_expires_at <= now
+            or self._lease_owner_is_dead(attempt.lease_owner)
+        )
+        if not claimable:
+            return None
+
+        lease_expires_at = now + _REFLECTION_ATTEMPT_LEASE_S
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE dream_reflection_attempts
+                   SET lease_owner=?, lease_expires_at=?
+                   WHERE agent_name=? AND night_key=? AND attempt_n=?
+                     AND status='pending'
+                     AND COALESCE(lease_owner, '')=?
+                     AND COALESCE(lease_expires_at, 0)=?""",
+                (
+                    self._lease_owner,
+                    lease_expires_at,
+                    attempt.agent_name,
+                    attempt.night_key,
+                    attempt.attempt_n,
+                    attempt.lease_owner,
+                    attempt.lease_expires_at,
+                ),
+            )
+        if cursor.rowcount != 1:
+            return None
+        return self._get_pending_reflection_attempt(agent_name)
+
+    def _renew_reflection_attempt_lease(self, attempt: _ReflectionAttempt) -> bool:
+        """Extend a still-live receipt lease only for its exact current owner."""
+        now = time.time()
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE dream_reflection_attempts
+                   SET lease_expires_at=?
+                   WHERE agent_name=? AND night_key=? AND attempt_n=?
+                     AND status='pending' AND lease_owner=?
+                     AND COALESCE(lease_expires_at, 0)>?""",
+                (
+                    now + _REFLECTION_ATTEMPT_LEASE_S,
+                    attempt.agent_name,
+                    attempt.night_key,
+                    attempt.attempt_n,
+                    self._lease_owner,
+                    now,
+                ),
+            )
+        return cursor.rowcount == 1
+
+    async def _renew_reflection_attempt_lease_until_stopped(
+        self, attempt: _ReflectionAttempt, stopped: asyncio.Event
+    ) -> None:
+        """Renew an owned lease periodically, failing closed if ownership is lost."""
+        while True:
+            try:
+                await asyncio.wait_for(
+                    stopped.wait(), timeout=_REFLECTION_ATTEMPT_RENEW_INTERVAL_S
+                )
+                return
+            except TimeoutError:
+                if not self._renew_reflection_attempt_lease(attempt):
+                    raise RuntimeError(
+                        "dream reflection attempt lost its lease during renewal: "
+                        f"{attempt.correlation_id}"
+                    )
+
+    async def _run_with_reflection_lease(
+        self,
+        runner,
+        prompt: str,
+        attempt: _ReflectionAttempt,
+        *,
+        timeout_s: float | None,
+    ):
+        """Run one transport while renewing its receipt lease.
+
+        The lease monitor participates in the wait: if renewal loses its
+        owner-bound CAS, the live transport is cancelled before another owner
+        can legitimately proceed. SDK transports additionally carry a hard
+        wall-clock timeout.
+        """
+        stopped = asyncio.Event()
+
+        async def invoke_runner():
+            if timeout_s is None:
+                return await runner.run(prompt)
+            try:
+                return await asyncio.wait_for(runner.run(prompt), timeout=timeout_s)
+            except TimeoutError as exc:
+                raise TimeoutError(
+                    f"SDK dream run exceeded its {timeout_s:g}s wall timeout"
+                ) from exc
+
+        run_task = asyncio.create_task(invoke_runner())
+        renewal_task = asyncio.create_task(
+            self._renew_reflection_attempt_lease_until_stopped(attempt, stopped)
+        )
+        try:
+            done, _pending = await asyncio.wait(
+                {run_task, renewal_task}, return_when=asyncio.FIRST_COMPLETED
+            )
+            if renewal_task in done:
+                # A renewal task only completes before ``stopped`` on failure.
+                renewal_task.result()
+                raise RuntimeError(
+                    "dream reflection lease renewal stopped before runner completion"
+                )
+            return run_task.result()
+        finally:
+            stopped.set()
+            for task in (run_task, renewal_task):
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(run_task, renewal_task, return_exceptions=True)
+
+    def _prune_reflection_attempts(self, *, now: float | None = None) -> int:
+        """Prune old completed/terminal receipts; retryable failures survive."""
+        cutoff = (time.time() if now is None else now) - _REFLECTION_RECEIPT_RETENTION_S
+        with self._db:
+            cursor = self._db.execute(
+                """DELETE FROM dream_reflection_attempts
+                   WHERE (status='completed' OR terminal=1)
+                     AND completed_at < ?""",
+                (cutoff,),
+            )
+        return cursor.rowcount
+
+    @staticmethod
+    def _prune_orphaned_dream_mcp_configs(
+        work_dir: str, *, now: float | None = None
+    ) -> int:
+        """Remove per-run MCP copies left by process death more than 24h ago."""
+        dreams_dir = Path(work_dir).resolve() / "dreams"
+        if not dreams_dir.is_dir():
+            return 0
+        cutoff = (time.time() if now is None else now) - _DREAM_MCP_CONFIG_RETENTION_S
+        pruned = 0
+        for path in dreams_dir.glob(".mcp-dream-*.json"):
+            try:
+                if path.lstat().st_mtime >= cutoff:
+                    continue
+                path.unlink()
+                pruned += 1
+            except FileNotFoundError:
+                continue
+            except OSError as exc:
+                _log(f"dream-runner: failed to remove orphan MCP config {path}: {exc}")
+        return pruned
+
+    @staticmethod
+    def _write_dream_mcp_config(
+        work_dir: str, correlation_id: str
+    ) -> Path | None:
+        """Copy the agent MCP config and inject structural dream correlation.
+
+        HTTP/SSE memory transports receive ``X-Dream-Correlation``. A stdio
+        memory subprocess receives the equivalent environment variable. The
+        canonical project config is never modified.
+        """
+        target: Path | None = None
+        raw_fd: int | None = None
+        target_created = False
+        try:
+            work_path = Path(work_dir).resolve()
+            source = work_path / ".mcp.json"
+            if not source.is_file():
+                return None
+            config = json.loads(source.read_text(encoding="utf-8"))
+            servers = config.get("mcpServers")
+            if not isinstance(servers, dict):
+                raise ValueError(".mcp.json has no mcpServers object")
+            memory = servers.get("pinky-memory")
+            if not isinstance(memory, dict):
+                raise ValueError(".mcp.json has no pinky-memory server")
+
+            if memory.get("url") or memory.get("type") in {"sse", "http"}:
+                headers = memory.setdefault("headers", {})
+                if not isinstance(headers, dict):
+                    raise ValueError("pinky-memory MCP headers must be an object")
+                headers["X-Dream-Correlation"] = correlation_id
+            else:
+                env = memory.setdefault("env", {})
+                if not isinstance(env, dict):
+                    raise ValueError("pinky-memory MCP env must be an object")
+                env["PINKY_DREAM_CORRELATION"] = correlation_id
+
+            dreams_dir = work_path / "dreams"
+            dreams_dir.mkdir(parents=True, exist_ok=True)
+            target = dreams_dir / f".mcp-dream-{uuid.uuid4().hex}.json"
+            raw_fd = os.open(
+                target,
+                os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+                0o600,
+            )
+            target_created = True
+            with os.fdopen(raw_fd, "w", encoding="utf-8") as config_file:
+                raw_fd = None  # fdopen owns the descriptor now.
+                json.dump(config, config_file, indent=2)
+            return target
+        except BaseException:
+            if raw_fd is not None:
+                try:
+                    os.close(raw_fd)
+                except OSError:
+                    pass
+            if target_created and target is not None:
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log(
+                        f"dream-runner: failed to clean partial MCP config "
+                        f"{target}: {exc}"
+                    )
+            raise
+
+    def _mark_reflection_attempt_runner_completed(
+        self, attempt: _ReflectionAttempt, summary: str
+    ) -> None:
+        """Persist SDK completion before the cross-database link scan."""
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE dream_reflection_attempts
+                   SET summary=?, runner_completed_at=?
+                   WHERE agent_name=? AND night_key=? AND attempt_n=?
+                     AND status='pending' AND lease_owner=?""",
+                (
+                    summary,
+                    time.time(),
+                    attempt.agent_name,
+                    attempt.night_key,
+                    attempt.attempt_n,
+                    self._lease_owner,
+                ),
+            )
+        if cursor.rowcount != 1:
+            raise RuntimeError(
+                f"dream reflection attempt is no longer pending: {attempt.correlation_id}"
+            )
+
+    def _fail_reflection_attempt(
+        self, attempt: _ReflectionAttempt, summary: str
+    ) -> None:
+        """Close a no-write failed attempt without advancing its watermark."""
+        failed_at = time.time()
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE dream_reflection_attempts
+                   SET status='failed', summary=?, completed_at=?
+                       , lease_owner=NULL, lease_expires_at=NULL
+                   WHERE agent_name=? AND night_key=? AND attempt_n=?
+                     AND status='pending' AND lease_owner=?""",
+                (
+                    summary,
+                    failed_at,
+                    attempt.agent_name,
+                    attempt.night_key,
+                    attempt.attempt_n,
+                    self._lease_owner,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    "dream reflection attempt lost its lease before failure: "
+                    f"{attempt.correlation_id}"
+                )
+            self._write_state(
+                attempt.agent_name,
+                summary,
+                attempt.history_start_ts,
+                saved_at=failed_at,
+            )
+
+    async def _close_failed_reflection_attempt(
+        self, attempt: _ReflectionAttempt, summary: str
+    ) -> None:
+        """Retry a no-write interval at most three times, then unblock it.
+
+        The third failure is finalized atomically as a ``failed-terminal``
+        zero-reflection night. That advances the frozen interval's watermark,
+        preserves the exception context in the receipt and summary, and lets a
+        later night's history proceed instead of wedging forever.
+        """
+        if attempt.attempt_n < _REFLECTION_ATTEMPT_CAP:
+            self._fail_reflection_attempt(attempt, summary)
+            return
+        _log(
+            f"dream-runner: WARNING terminal reflection failure for "
+            f"'{attempt.agent_name}' night={attempt.night_key} after "
+            f"{attempt.attempt_n} attempts: {summary}"
+        )
+        await self._record_reflection_outcome(
+            attempt.agent_name,
+            0,
+            night_key=attempt.night_key,
+            summary=summary,
+            last_message_ts=attempt.history_end_ts,
+            attempt_n=attempt.attempt_n,
+            outcome_status="failed-terminal",
+            terminal_attempt=True,
+        )
+
+    async def _recover_pending_reflection_attempt(
+        self, agent_name: str, agent_config
+    ) -> tuple[_ReflectionAttempt | None, str | None]:
+        """Claim and reconcile a durable receipt before any possible SDK run.
+
+        Exact tagged writes are authoritative. If a crash left any of them,
+        the interval is finalized as positive best-effort consolidation and is
+        never re-run: occasional partial dream coverage is accepted because a
+        retry would risk duplicate durable memories. A claimed no-write receipt
+        may resume its frozen interval; an active lease returns a busy result.
+        """
+        pending = self._get_pending_reflection_attempt(agent_name)
+        if pending is None:
+            return None, None
+        attempt = self._claim_pending_reflection_attempt(agent_name)
+        if attempt is None:
+            summary = (
+                "Dream reflection attempt is already running under an active lease."
+            )
+            _log(
+                f"dream-runner: active receipt lease blocks resume for "
+                f"{pending.correlation_id} owner={pending.lease_owner!r}"
+            )
+            return None, summary
+
+        produced_ids = await asyncio.to_thread(
+            self._reflection_ids_for_attempt, attempt, agent_config
+        )
+        if not produced_ids and attempt.runner_completed_at is None:
+            _log(
+                f"dream-runner: resuming no-write pending attempt "
+                f"{attempt.correlation_id}"
+            )
+            return attempt, None
+
+        await asyncio.to_thread(
+            self._build_memory_links,
+            agent_name,
+            agent_config,
+            since=attempt.dream_start,
+            attempt=attempt,
+        )
+        summary = attempt.summary or (
+            f"Recovered interrupted dream attempt {attempt.correlation_id}."
+        )
+        await self._record_reflection_outcome(
+            agent_name,
+            len(produced_ids),
+            night_key=attempt.night_key,
+            summary=summary,
+            last_message_ts=attempt.history_end_ts,
+            attempt_n=attempt.attempt_n,
+        )
+        _log(
+            f"dream-runner: reconciled pending attempt {attempt.correlation_id} "
+            f"with {len(produced_ids)} attributed reflection(s)"
+        )
+        return None, summary
+
     async def run_dream(self, agent_name: str, agent_config) -> str:
+        """Serialize all in-process dream triggers for one agent."""
+        with self._run_locks_guard:
+            lock = self._run_locks.setdefault(agent_name, asyncio.Lock())
+        async with lock:
+            work_dir = getattr(agent_config, "working_dir", "") or "."
+            orphaned = self._prune_orphaned_dream_mcp_configs(work_dir)
+            if orphaned:
+                _log(
+                    f"dream-runner: pruned {orphaned} orphaned per-run MCP "
+                    f"config(s) on entry"
+                )
+            pruned = self._prune_reflection_attempts()
+            if pruned:
+                _log(
+                    f"dream-runner: pruned {pruned} expired reflection "
+                    f"receipt(s) on entry"
+                )
+            return await self._run_dream_locked(agent_name, agent_config)
+
+    async def _run_dream_locked(self, agent_name: str, agent_config) -> str:
         """Spawn a dream SDK run for the agent and store the summary.
 
         Args:
@@ -302,25 +1002,96 @@ class DreamRunner:
         """
         _log(f"dream-runner: starting dream for '{agent_name}'")
 
-        # Fetch unprocessed conversation history
-        last_message_ts = self._get_last_message_ts(agent_name)
-        history_lines, new_watermark = self._fetch_unprocessed_history(
-            agent_name, after_ts=last_message_ts
+        # Reconcile a receipt left pending by a process death before fetching
+        # the same history again. Observable memory writes are finalized and
+        # never re-run; an intent with no writes and no SDK completion is safe
+        # to resume over its original, frozen history interval.
+        attempt, recovered_summary = await self._recover_pending_reflection_attempt(
+            agent_name, agent_config
         )
+        if recovered_summary is not None:
+            return recovered_summary
+
+        retry_interval: _ReflectionAttempt | None = None
+        if attempt is not None:
+            last_message_ts = attempt.history_start_ts
+            new_watermark = attempt.history_end_ts
+            dream_start = attempt.dream_start
+            night_key = attempt.night_key
+            history_lines, _ = self._fetch_unprocessed_history(
+                agent_name,
+                after_ts=last_message_ts,
+                through_ts=new_watermark,
+            )
+        else:
+            retry_interval = self._get_retryable_failed_attempt(agent_name)
+            if retry_interval is not None:
+                last_message_ts = retry_interval.history_start_ts
+                new_watermark = retry_interval.history_end_ts
+                night_key = retry_interval.night_key
+                history_lines, _ = self._fetch_unprocessed_history(
+                    agent_name,
+                    after_ts=last_message_ts,
+                    through_ts=new_watermark,
+                )
+            else:
+                last_message_ts = self._get_last_message_ts(agent_name)
+                history_lines, new_watermark = self._fetch_unprocessed_history(
+                    agent_name, after_ts=last_message_ts
+                )
         _log(f"dream-runner: fetched {len(history_lines)} messages since ts={last_message_ts}")
 
         if not history_lines:
             summary = "No new conversation history to process."
+            if attempt is not None:
+                await self._close_failed_reflection_attempt(attempt, summary)
+                return summary
+            current_night_key = self._night_key(
+                agent_config, datetime.now(timezone.utc)
+            )
+            completed_night = self._db.execute(
+                """SELECT 1 FROM dream_reflection_outcomes
+                   WHERE agent_name=? AND night_key=?""",
+                (agent_name, current_night_key),
+            ).fetchone()
+            if completed_night:
+                _log(
+                    f"dream-runner: true same-night duplicate rejected before "
+                    f"runner.run for '{agent_name}' night={current_night_key}"
+                )
+                return summary
             # Preserve the existing watermark; saving the default 0.0 would
             # make the next dream re-fetch and re-consolidate all history.
             self._save_state(agent_name, summary, last_message_ts=last_message_ts)
             return summary
 
-        # Bind the run to the agent's scheduled local night once. This key is
-        # carried into the state/outcome transaction so a restart refire (or a
-        # same-night manual trigger) cannot count the outcome twice.
-        dream_start = datetime.now(timezone.utc)
-        night_key = self._night_key(agent_config, dream_start)
+        if attempt is None:
+            # Persist the frozen history interval before runner.run can durably
+            # call reflect(). A failed prior attempt keeps its exact interval;
+            # history that arrived later waits behind it.
+            dream_start = datetime.now(timezone.utc)
+            if retry_interval is None:
+                night_key = self._night_key(agent_config, dream_start)
+            if self._night_is_terminal(agent_name, night_key):
+                return (
+                    f"Dream reflection attempt cap already reached for night "
+                    f"{night_key}."
+                )
+            attempt = self._begin_reflection_attempt(
+                agent_name,
+                night_key,
+                dream_start=dream_start,
+                history_start_ts=last_message_ts,
+                history_end_ts=new_watermark,
+            )
+            if attempt is None:
+                if self._night_attempt_count(agent_name, night_key) >= (
+                    _REFLECTION_ATTEMPT_CAP
+                ):
+                    return (
+                        f"Dream reflection attempt cap reached for night {night_key}."
+                    )
+                return "Dream reflection attempt is already running."
 
         # Build system prompt
         today_str = night_key
@@ -335,6 +1106,11 @@ class DreamRunner:
             today=today_str,
             last_dream_at=last_dream_str,
         )
+        system_prompt += (
+            "\n\n## Durable receipt correlation\n"
+            "For every reflect() call in this run, set source_session_id to "
+            f"{attempt.correlation_id!r}. Do not omit or change this value."
+        )
 
         # Resolve working directory (same as normal streaming session)
         work_dir = "."
@@ -344,33 +1120,6 @@ class DreamRunner:
         # Use dream_model if set, otherwise fall back to agent's main model
         dream_model = getattr(agent_config, "dream_model", "") or ""
         model = dream_model or getattr(agent_config, "model", None) or None
-
-        transport = self._resolve_dream_transport()
-        if transport == "tmux":
-            # #707: interactive tmux session on Max-account billing. The
-            # system prompt travels inside the prompt file, not as an option.
-            runner = TmuxDreamRunner(
-                TmuxDreamConfig(
-                    working_dir=work_dir,
-                    model=model,
-                    system_prompt=system_prompt,
-                    # SDK allowlist + Read/Write for the file-passing protocol
-                    allowed_tools=["Read", "Write", *_DREAM_ALLOWED_TOOLS],
-                ),
-                agent_name=agent_name,
-            )
-            _log(f"dream-runner: transport=tmux for '{agent_name}' "
-                 f"(session pinky-dream-{agent_name})")
-        else:
-            config = SDKRunnerConfig(
-                working_dir=work_dir,
-                model=model,
-                allowed_tools=_DREAM_ALLOWED_TOOLS,
-                permission_mode="bypassPermissions",
-                system_prompt=system_prompt,
-                max_turns=50,
-            )
-            runner = SDKRunner(config, agent_name=agent_name)
 
         # Build the user prompt with conversation history injected
         history_block = "\n".join(history_lines)
@@ -382,29 +1131,84 @@ class DreamRunner:
         prompt = (
             f"Process the following conversation history for agent {agent_name}. "
             f"There are {len(history_lines)} messages to consolidate.\n\n"
+            "RECEIPT REQUIREMENT: Every reflect() call in this run MUST set "
+            f"source_session_id={attempt.correlation_id!r}.\n\n"
             f"<conversation_history>\n{history_block}\n</conversation_history>\n\n"
             "Work through all phases in your system prompt and end with the report."
         )
 
+        dream_mcp_config: Path | None = None
         start = time.time()
-        result = await runner.run(prompt)
-        elapsed = time.time() - start
+        try:
+            dream_mcp_config = self._write_dream_mcp_config(
+                work_dir, attempt.correlation_id
+            )
+            transport = self._resolve_dream_transport()
+            if transport == "tmux":
+                # #707: interactive tmux session on Max-account billing. The
+                # system prompt travels inside the prompt file, not as an option.
+                runner = TmuxDreamRunner(
+                    TmuxDreamConfig(
+                        working_dir=work_dir,
+                        model=model,
+                        system_prompt=system_prompt,
+                        mcp_config=str(dream_mcp_config or ""),
+                        # SDK allowlist + Read/Write for the file-passing protocol
+                        allowed_tools=["Read", "Write", *_DREAM_ALLOWED_TOOLS],
+                    ),
+                    agent_name=agent_name,
+                )
+                timeout_s = None  # TmuxDreamRunner enforces its own one-hour cap.
+                _log(
+                    f"dream-runner: transport=tmux for '{agent_name}' "
+                    f"(session pinky-dream-{agent_name})"
+                )
+            else:
+                config = SDKRunnerConfig(
+                    working_dir=work_dir,
+                    model=model,
+                    allowed_tools=_DREAM_ALLOWED_TOOLS,
+                    permission_mode="bypassPermissions",
+                    system_prompt=system_prompt,
+                    mcp_servers=str(dream_mcp_config or ""),
+                    max_turns=50,
+                )
+                runner = SDKRunner(config, agent_name=agent_name)
+                timeout_s = _SDK_DREAM_TIMEOUT_S
 
-        summary = result.output.strip() if result.output else ""
-        run_failed = not summary or result.exit_code != 0
-        if not summary:
-            summary = f"Dream run failed or produced no output (exit={result.exit_code})"
-            if result.error:
-                summary += f": {result.error}"
+            result = await self._run_with_reflection_lease(
+                runner, prompt, attempt, timeout_s=timeout_s
+            )
+            summary = result.output.strip() if result.output else ""
+            run_failed = not summary or result.exit_code != 0
+            if not summary:
+                summary = (
+                    f"Dream run failed or produced no output "
+                    f"(exit={result.exit_code})"
+                )
+                if result.error:
+                    summary += f": {result.error}"
+        except Exception as exc:  # config/constructor/run failures consume an attempt
+            run_failed = True
+            summary = f"Dream runner raised {type(exc).__name__}: {exc}"
+        finally:
+            if dream_mcp_config is not None:
+                try:
+                    dream_mcp_config.unlink(missing_ok=True)
+                except OSError as exc:
+                    _log(
+                        f"dream-runner: failed to remove per-run MCP config "
+                        f"{dream_mcp_config}: {exc}"
+                    )
+        elapsed = time.time() - start
 
         _log(f"dream-runner: '{agent_name}' dream complete in {elapsed:.1f}s — {summary[:120]}")
 
-        # A failed run has no reflection outcome. Preserve the prior watermark
-        # so the next dream re-fetches this history. Successful state is held
-        # until link accounting is known, then committed atomically with the
-        # durable per-night outcome below.
-        if run_failed:
-            self._save_state(agent_name, summary, last_message_ts=last_message_ts)
+        # SDK completion is itself durable receipt state. If the process dies
+        # during link accounting, recovery can finalize a legitimate zero
+        # without invoking the SDK again.
+        if not run_failed:
+            self._mark_reflection_attempt_runner_completed(attempt, summary)
 
         # The post-dream pipeline below is synchronous (blocking urllib calls
         # with retries, numpy over all embeddings). It runs on the daemon's
@@ -414,16 +1218,31 @@ class DreamRunner:
 
         # Post-dream: build memory graph links for new reflections
         embedded_reflections = await asyncio.to_thread(
-            self._build_memory_links, agent_name, agent_config, since=dream_start
+            self._build_memory_links,
+            agent_name,
+            agent_config,
+            since=dream_start,
+            attempt=attempt,
         )
-        if not run_failed:
+        produced_ids = await asyncio.to_thread(
+            self._reflection_ids_for_attempt, attempt, agent_config
+        )
+        if not run_failed or produced_ids:
+            attributed_reflections = max(
+                len(produced_ids), embedded_reflections
+            )
             await self._record_reflection_outcome(
                 agent_name,
-                embedded_reflections,
+                attributed_reflections,
                 night_key=night_key,
                 summary=summary,
                 last_message_ts=new_watermark,
+                attempt_n=attempt.attempt_n,
             )
+        else:
+            # No durable reflection escaped a failed run, so retrying the same
+            # history later cannot duplicate memory side effects.
+            await self._close_failed_reflection_attempt(attempt, summary)
 
         # Post-dream: extract and store user profiles + relationships from dream output
         profile_count = await asyncio.to_thread(self._extract_user_profiles, summary)
@@ -1250,6 +2069,7 @@ class DreamRunner:
         agent_name: str,
         agent_config,
         since: datetime,
+        attempt: _ReflectionAttempt | None = None,
     ) -> int:
         """Build cosine-similarity links between new and existing reflections.
 
@@ -1267,13 +2087,12 @@ class DreamRunner:
             _log("dream-runner: pinky_memory not installed, skipping link build")
             return 0
 
-        work_dir = getattr(agent_config, "working_dir", "") or "."
-        db_path = str(Path(work_dir).resolve() / "data" / "memory.db")
-        if not Path(db_path).exists():
+        db_path = self._memory_db_path(agent_config)
+        if not db_path.exists():
             _log(f"dream-runner: no memory DB at {db_path}, skipping link build")
             return 0
 
-        store = ReflectionStore(db_path=db_path)
+        store = ReflectionStore(db_path=str(db_path))
 
         # Prune links pointing to inactive/deleted reflections
         pruned = store.prune_orphan_links()
@@ -1282,6 +2101,11 @@ class DreamRunner:
 
         # Fetch new reflections (created during this dream run)
         new_refs = store.get_active_with_embeddings(since=since)
+        if attempt is not None:
+            attributed_ids = self._reflection_ids_for_attempt(
+                attempt, agent_config, embedded_only=True
+            )
+            new_refs = [ref for ref in new_refs if ref.id in attributed_ids]
         if not new_refs:
             _log(f"dream-runner: no new embedded reflections for '{agent_name}', skipping links")
             return 0
@@ -1336,18 +2160,24 @@ class DreamRunner:
         night_key: str,
         summary: str,
         last_message_ts: float,
+        attempt_n: int | None = None,
+        outcome_status: str = "completed",
+        terminal_attempt: bool = False,
     ) -> None:
-        """Atomically persist one night's state/outcome and surface its notice."""
-        created, streak, alert_delivered = self._commit_reflection_outcome(
+        """Atomically finalize an attempt and surface a new zero-night notice."""
+        new_night, streak, alert_delivered = self._commit_reflection_outcome(
             agent_name,
             night_key,
             embedded_reflections,
             summary=summary,
             last_message_ts=last_message_ts,
+            attempt_n=attempt_n,
+            outcome_status=outcome_status,
+            terminal_attempt=terminal_attempt,
         )
-        if not created:
+        if not new_night:
             _log(
-                f"dream-runner: duplicate reflection outcome ignored for "
+                f"dream-runner: same-night reflection outcome updated for "
                 f"'{agent_name}' night={night_key}"
             )
             return
@@ -1405,27 +2235,146 @@ class DreamRunner:
         *,
         summary: str,
         last_message_ts: float,
+        attempt_n: int | None = None,
+        outcome_status: str = "completed",
+        terminal_attempt: bool = False,
     ) -> tuple[bool, int, bool]:
-        """Commit state and one idempotent per-night outcome in one transaction."""
+        """Finalize a receipt, state, and aggregate night outcome atomically.
+
+        ``embedded_reflections`` is the exact correlation-attributed count.
+        A positive partial count is deliberately final for the health signal:
+        best-effort dream consolidation accepts incomplete crash coverage and
+        never re-runs that interval because duplicate memories are worse.
+        """
         recorded_at = time.time()
         with self._db:
-            cursor = self._db.execute(
-                """INSERT OR IGNORE INTO dream_reflection_outcomes
-                       (agent_name, night_key, embedded_reflections, recorded_at)
-                   VALUES (?, ?, ?, ?)""",
-                (agent_name, night_key, embedded_reflections, recorded_at),
+            if attempt_n is not None:
+                attempt_row = self._db.execute(
+                    """SELECT status, lease_owner FROM dream_reflection_attempts
+                       WHERE agent_name=? AND night_key=? AND attempt_n=?""",
+                    (agent_name, night_key, attempt_n),
+                ).fetchone()
+                if (
+                    attempt_row is None
+                    or attempt_row[0] != "pending"
+                    or attempt_row[1] != self._lease_owner
+                ):
+                    raise RuntimeError(
+                        "dream reflection attempt cannot be finalized: "
+                        f"{agent_name}:{night_key}:{attempt_n}"
+                    )
+
+            existing = self._db.execute(
+                """SELECT embedded_reflections, outcome_status
+                   FROM dream_reflection_outcomes
+                   WHERE agent_name=? AND night_key=?""",
+                (agent_name, night_key),
+            ).fetchone()
+            new_night = existing is None
+            prior_reflections = int(existing[0]) if existing else 0
+            aggregate_reflections = prior_reflections + embedded_reflections
+            aggregate_status = (
+                "completed"
+                if aggregate_reflections > 0
+                else outcome_status
+                if new_night or outcome_status == "failed-terminal"
+                else str(existing[1])
             )
-            created = cursor.rowcount > 0
-            if created:
-                self._write_state(
-                    agent_name,
-                    summary,
-                    last_message_ts,
-                    saved_at=recorded_at,
+            if new_night:
+                self._db.execute(
+                    """INSERT INTO dream_reflection_outcomes
+                           (agent_name, night_key, embedded_reflections,
+                            recorded_at, outcome_status)
+                       VALUES (?, ?, ?, ?, ?)""",
+                    (
+                        agent_name,
+                        night_key,
+                        aggregate_reflections,
+                        recorded_at,
+                        aggregate_status,
+                    ),
                 )
+            else:
+                self._db.execute(
+                    """UPDATE dream_reflection_outcomes
+                       SET embedded_reflections=?, recorded_at=?, outcome_status=?
+                       WHERE agent_name=? AND night_key=?""",
+                    (
+                        aggregate_reflections,
+                        recorded_at,
+                        aggregate_status,
+                        agent_name,
+                        night_key,
+                    ),
+                )
+
+            watermark_row = self._db.execute(
+                "SELECT last_message_ts FROM dream_state WHERE agent_name=?",
+                (agent_name,),
+            ).fetchone()
+            durable_watermark = max(
+                float(watermark_row[0] or 0.0) if watermark_row else 0.0,
+                last_message_ts,
+            )
+            self._write_state(
+                agent_name,
+                summary,
+                durable_watermark,
+                saved_at=recorded_at,
+            )
+            if new_night:
                 self._apply_reflection_outcome(
-                    agent_name, night_key, embedded_reflections
+                    agent_name, night_key, aggregate_reflections
                 )
+            elif prior_reflections == 0 and aggregate_reflections > 0:
+                # A later same-night manual attempt produced real work. The
+                # night's aggregate is now positive, so clear its health latch.
+                self._apply_reflection_outcome(
+                    agent_name, night_key, aggregate_reflections
+                )
+
+            if attempt_n is not None:
+                if terminal_attempt:
+                    cursor = self._db.execute(
+                        """UPDATE dream_reflection_attempts
+                           SET status='failed', terminal=1, summary=?,
+                               embedded_reflections=?, completed_at=?,
+                               lease_owner=NULL, lease_expires_at=NULL
+                           WHERE agent_name=? AND night_key=? AND attempt_n=?
+                             AND status='pending' AND lease_owner=?""",
+                        (
+                            summary,
+                            embedded_reflections,
+                            recorded_at,
+                            agent_name,
+                            night_key,
+                            attempt_n,
+                            self._lease_owner,
+                        ),
+                    )
+                else:
+                    cursor = self._db.execute(
+                        """UPDATE dream_reflection_attempts
+                           SET status='completed', summary=?,
+                               embedded_reflections=?, completed_at=?,
+                               lease_owner=NULL, lease_expires_at=NULL
+                           WHERE agent_name=? AND night_key=? AND attempt_n=?
+                             AND status='pending' AND lease_owner=?""",
+                        (
+                            summary,
+                            embedded_reflections,
+                            recorded_at,
+                            agent_name,
+                            night_key,
+                            attempt_n,
+                            self._lease_owner,
+                        ),
+                    )
+                if cursor.rowcount != 1:
+                    raise RuntimeError(
+                        "dream reflection attempt lost pending status during finalize: "
+                        f"{agent_name}:{night_key}:{attempt_n}"
+                    )
 
             row = self._db.execute(
                 """SELECT zero_reflection_streak,
@@ -1438,7 +2387,7 @@ class DreamRunner:
             raise RuntimeError(
                 f"reflection outcome ledger exists without dream state for {agent_name!r}"
             )
-        return created, int(row[0] or 0), row[1] is not None
+        return new_night, int(row[0] or 0), row[1] is not None
 
     def _apply_reflection_outcome(
         self, agent_name: str, night_key: str, embedded_reflections: int
@@ -1543,7 +2492,11 @@ class DreamRunner:
         return (row[0] or 0.0) if row else 0.0
 
     def _fetch_unprocessed_history(
-        self, agent_name: str, after_ts: float = 0.0
+        self,
+        agent_name: str,
+        after_ts: float = 0.0,
+        *,
+        through_ts: float | None = None,
     ) -> tuple[list[str], float]:
         """Fetch all conversation messages since the last watermark.
 
@@ -1562,7 +2515,15 @@ class DreamRunner:
             return [], after_ts
 
         # Filter to messages after the watermark
-        new_msgs = [m for m in messages if (m.get("timestamp") or 0) > after_ts]
+        new_msgs = [
+            m
+            for m in messages
+            if (m.get("timestamp") or 0) > after_ts
+            and (
+                through_ts is None
+                or (m.get("timestamp") or 0) <= through_ts
+            )
+        ]
         if not new_msgs:
             return [], after_ts
 

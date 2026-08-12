@@ -36,11 +36,19 @@ def _log(msg: str) -> None:
 # Set by ASGI middleware in shared mode, read by tool functions.
 # In stdio mode this stays at default ("") and tools use their closure variable.
 _current_agent: ContextVar[str] = ContextVar("current_agent", default="")
+_current_dream_correlation: ContextVar[str] = ContextVar(
+    "current_dream_correlation", default=""
+)
 
 
 def get_current_agent() -> str:
     """Get the current agent name from ContextVar (shared mode)."""
     return _current_agent.get()
+
+
+def get_current_dream_correlation() -> str:
+    """Return the transport-enforced correlation for a dream MCP request."""
+    return _current_dream_correlation.get()
 
 
 def make_agent_name_resolver(closure_agent_name: str):
@@ -442,6 +450,7 @@ class AgentNameMiddleware:
             return
         headers = dict(scope.get("headers", []))
         agent_name = headers.get(b"x-agent-name", b"").decode()
+        dream_correlation = headers.get(b"x-dream-correlation", b"").decode()
         valid_name = bool(agent_name and _AGENT_NAME_RE.match(agent_name))
         auth = headers.get(b"authorization", b"").decode()
         bearer = auth[7:].strip() if auth.lower().startswith("bearer ") else ""
@@ -478,11 +487,13 @@ class AgentNameMiddleware:
             return
 
         if valid_name:
-            token = _current_agent.set(agent_name)
+            agent_token = _current_agent.set(agent_name)
+            correlation_token = _current_dream_correlation.set(dream_correlation)
             try:
                 await self.app(scope, receive, send)
             finally:
-                _current_agent.reset(token)
+                _current_dream_correlation.reset(correlation_token)
+                _current_agent.reset(agent_token)
             return
         await self.app(scope, receive, send)
 

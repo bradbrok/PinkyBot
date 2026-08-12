@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import json
 import os
 import sqlite3
@@ -11,12 +12,14 @@ import time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
-from datetime import datetime
+from datetime import datetime, timezone
+from pathlib import Path
 from urllib.parse import urlsplit
 
 import pytest
 from fastapi.testclient import TestClient
 
+import pinky_daemon.dream_runner as dream_runner_module
 from pinky_daemon.api import create_api
 from pinky_daemon.dream_runner import DreamRunner
 
@@ -679,7 +682,9 @@ class TestDreamReflectionLoudness:
         reopened.close()
 
     @pytest.mark.asyncio
-    async def test_same_night_refire_is_idempotent(self, tmp_path):
+    async def test_same_night_zero_updates_watermark_without_double_counting(
+        self, tmp_path
+    ):
         db_path = str(tmp_path / "dream.db")
         runner = DreamRunner(db_path=db_path)
 
@@ -692,10 +697,983 @@ class TestDreamReflectionLoudness:
         state = runner.get_state("pinky")
         assert state["zero_reflection_streak"] == 1
         assert state["last_summary"] == "night 2026-08-12"
-        assert runner._get_last_message_ts("pinky") == 1.0
+        assert runner._get_last_message_ts("pinky") == 2.0
         assert runner._db.execute(
             "SELECT COUNT(*) FROM dream_reflection_outcomes"
         ).fetchone()[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_cross_db_crash_recovers_reflection_without_rerunning(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+        from pinky_memory.store import ReflectionStore
+        from pinky_memory.types import Reflection
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        memory_dir = tmp_path / "data"
+        memory_dir.mkdir()
+        memory_db = memory_dir / "memory.db"
+        sdk_calls = {"n": 0}
+
+        class ReflectingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+                self.agent_name = agent_name
+
+            async def run(self, prompt):
+                sdk_calls["n"] += 1
+                correlation_id = prompt.split("source_session_id='", 1)[1].split(
+                    "'", 1
+                )[0]
+                store = ReflectionStore(db_path=str(memory_db))
+                store.insert(
+                    Reflection(
+                        content="durable first-attempt reflection",
+                        embedding=[1.0, 0.0],
+                        source_session_id=correlation_id,
+                    )
+                )
+                store.close()
+                return RunResult(output="Consolidated.", exit_code=0)
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", ReflectingSDKRunner
+        )
+        monkeypatch.setattr(
+            DreamRunner,
+            "_night_key",
+            staticmethod(lambda agent_config, dream_start: "2026-08-12"),
+        )
+        messages = [
+            {"timestamp": 200.0, "role": "user", "content": "new context"}
+        ]
+        db_path = str(tmp_path / "dream.db")
+        runner = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
+
+        async def crash_before_finalize(*args, **kwargs):
+            raise RuntimeError("simulated crash after durable reflect")
+
+        monkeypatch.setattr(
+            runner, "_record_reflection_outcome", crash_before_finalize
+        )
+        with pytest.raises(RuntimeError, match="after durable reflect"):
+            await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert runner._get_last_message_ts("pinky") == 100.0
+        assert runner._db.execute(
+            """SELECT status FROM dream_reflection_attempts
+               WHERE agent_name='pinky'"""
+        ).fetchone()[0] == "pending"
+        # A simulated process death must make the old owner's lease stale;
+        # live/unexpired owners are deliberately not recoverable.
+        runner._db.execute(
+            """UPDATE dream_reflection_attempts
+               SET lease_expires_at=0 WHERE agent_name='pinky'"""
+        )
+        runner._db.commit()
+        runner.close()
+
+        reopened = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+        summary = await reopened.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        )
+
+        assert summary == "Consolidated."
+        assert sdk_calls["n"] == 1
+        with sqlite3.connect(memory_db) as memory_connection:
+            assert memory_connection.execute(
+                "SELECT COUNT(*) FROM reflections"
+            ).fetchone()[0] == 1
+        assert reopened._get_last_message_ts("pinky") == 200.0
+        assert reopened.get_state("pinky")["zero_reflection_streak"] == 0
+        assert reopened._db.execute(
+            """SELECT embedded_reflections FROM dream_reflection_outcomes
+               WHERE agent_name='pinky' AND night_key='2026-08-12'"""
+        ).fetchone()[0] == 1
+        assert reopened._db.execute(
+            """SELECT status, embedded_reflections
+               FROM dream_reflection_attempts WHERE agent_name='pinky'"""
+        ).fetchone() == ("completed", 1)
+        reopened.close()
+
+    @pytest.mark.asyncio
+    async def test_same_night_new_history_updates_outcome_and_resets_latch(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr("pinky_daemon.dream_runner.SDKRunner", _StubSDKRunner)
+        _StubSDKRunner.result = RunResult(output="Consolidated.", exit_code=0)
+        monkeypatch.setattr(
+            DreamRunner,
+            "_night_key",
+            staticmethod(lambda agent_config, dream_start: "2026-08-12"),
+        )
+
+        messages = [
+            {"timestamp": 100.0, "role": "user", "content": "first batch"}
+        ]
+        notices: list[str] = []
+
+        async def owner_notify(agent_name: str, message: str) -> bool:
+            notices.append(message)
+            return True
+
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: list(messages),
+            owner_notify_callback=owner_notify,
+        )
+        await self._record_night(runner, "2026-08-10", 0, 1)
+        await self._record_night(runner, "2026-08-11", 0, 2)
+        link_counts = iter((0, 2))
+        monkeypatch.setattr(
+            runner,
+            "_build_memory_links",
+            lambda *args, **kwargs: next(link_counts),
+        )
+
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        latched = runner.get_state("pinky")
+        assert latched["zero_reflection_streak"] == 3
+        assert latched["zero_reflection_alert_delivered_at"] is not None
+
+        messages.append(
+            {"timestamp": 200.0, "role": "user", "content": "manual new batch"}
+        )
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        state = runner.get_state("pinky")
+        assert runner._get_last_message_ts("pinky") == 200.0
+        assert state["zero_reflection_streak"] == 0
+        assert state["zero_reflection_alert_attempted_at"] is None
+        assert state["zero_reflection_alert_delivered_at"] is None
+        assert len(notices) == 1
+        assert runner._db.execute(
+            """SELECT embedded_reflections FROM dream_reflection_outcomes
+               WHERE agent_name='pinky' AND night_key='2026-08-12'"""
+        ).fetchone()[0] == 2
+        assert runner._db.execute(
+            """SELECT status, embedded_reflections
+               FROM dream_reflection_attempts
+               WHERE agent_name='pinky' AND night_key='2026-08-12'
+               ORDER BY attempt_n"""
+        ).fetchall() == [("completed", 0), ("completed", 2)]
+
+    @pytest.mark.asyncio
+    async def test_true_same_night_duplicate_has_no_runner_or_link_side_effects(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr("pinky_daemon.dream_runner.SDKRunner", _StubSDKRunner)
+        _StubSDKRunner.result = RunResult(output="Consolidated.", exit_code=0)
+        monkeypatch.setattr(
+            DreamRunner,
+            "_night_key",
+            staticmethod(lambda agent_config, dream_start: "2026-08-12"),
+        )
+        sdk_calls = {"n": 0}
+        link_calls = {"n": 0}
+
+        async def counted_run(self, prompt):
+            sdk_calls["n"] += 1
+            return type(self).result
+
+        monkeypatch.setattr(_StubSDKRunner, "run", counted_run)
+        messages = [
+            {"timestamp": 100.0, "role": "user", "content": "only batch"}
+        ]
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+
+        def counted_links(*args, **kwargs):
+            link_calls["n"] += 1
+            return 1
+
+        monkeypatch.setattr(runner, "_build_memory_links", counted_links)
+
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        before = runner.get_state("pinky")
+        duplicate_summary = await runner.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        )
+
+        assert duplicate_summary == "No new conversation history to process."
+        assert sdk_calls["n"] == 1
+        assert link_calls["n"] == 1
+        assert runner.get_state("pinky") == before
+        assert runner._db.execute(
+            "SELECT COUNT(*) FROM dream_reflection_attempts"
+        ).fetchone()[0] == 1
+        assert runner._db.execute(
+            "SELECT COUNT(*) FROM dream_reflection_outcomes"
+        ).fetchone()[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_overlapping_triggers_run_sdk_once(self, tmp_path, monkeypatch):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        sdk_calls = {"n": 0}
+
+        class BlockingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                sdk_calls["n"] += 1
+                entered.set()
+                await release.wait()
+                return RunResult(output="Consolidated.", exit_code=0)
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", BlockingSDKRunner
+        )
+        messages = [
+            {"timestamp": 200.0, "role": "user", "content": "one interval"}
+        ]
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+
+        trigger_a = asyncio.create_task(
+            runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        )
+        await entered.wait()
+        trigger_b = asyncio.create_task(
+            runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        )
+        await asyncio.sleep(0)
+        assert sdk_calls["n"] == 1
+
+        release.set()
+        assert await trigger_a == "Consolidated."
+        assert await trigger_b == "No new conversation history to process."
+        assert sdk_calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_pending_lease_takeover_requires_expiry(self, tmp_path, monkeypatch):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        messages = [
+            {"timestamp": 200.0, "role": "user", "content": "leased interval"}
+        ]
+        db_path = str(tmp_path / "dream.db")
+        owner = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+        owner._save_state("pinky", "seed", last_message_ts=100.0)
+        receipt = owner._begin_reflection_attempt(
+            "pinky",
+            "2026-08-12",
+            dream_start=datetime.now(timezone.utc),
+            history_start_ts=100.0,
+            history_end_ts=200.0,
+        )
+        assert receipt is not None
+
+        calls = {"n": 0}
+
+        class CountedSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                calls["n"] += 1
+                return RunResult(output="Consolidated.", exit_code=0)
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", CountedSDKRunner
+        )
+        contender = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+        blocked = await contender.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        )
+        assert "active lease" in blocked
+        assert calls["n"] == 0
+
+        owner._db.execute(
+            "UPDATE dream_reflection_attempts SET lease_expires_at=0"
+        )
+        owner._db.commit()
+        assert await contender.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        ) == "Consolidated."
+        assert calls["n"] == 1
+
+    @pytest.mark.asyncio
+    async def test_live_runner_periodically_extends_lease_and_blocks_contender(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr(dream_runner_module, "_REFLECTION_ATTEMPT_LEASE_S", 5.0)
+        monkeypatch.setattr(
+            dream_runner_module, "_REFLECTION_ATTEMPT_RENEW_INTERVAL_S", 0.02
+        )
+        monkeypatch.setattr(dream_runner_module, "_SDK_DREAM_TIMEOUT_S", 2.0)
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        calls = {"n": 0}
+
+        class BlockingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                calls["n"] += 1
+                entered.set()
+                await release.wait()
+                return RunResult(output="Consolidated.", exit_code=0)
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", BlockingSDKRunner
+        )
+        messages = [
+            {"timestamp": 200.0, "role": "user", "content": "long live interval"}
+        ]
+        db_path = str(tmp_path / "dream.db")
+        owner = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+        contender = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: messages,
+        )
+
+        owner_task = asyncio.create_task(
+            owner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        )
+        await entered.wait()
+        original_expiry = owner._db.execute(
+            "SELECT lease_expires_at FROM dream_reflection_attempts"
+        ).fetchone()[0]
+        renewed_expiry = original_expiry
+        async with asyncio.timeout(2.0):
+            while renewed_expiry <= original_expiry:
+                await asyncio.sleep(0.01)
+                renewed_expiry = owner._db.execute(
+                    "SELECT lease_expires_at FROM dream_reflection_attempts"
+                ).fetchone()[0]
+        assert renewed_expiry > original_expiry
+        assert renewed_expiry > time.time()
+
+        blocked = await contender.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        )
+        assert "active lease" in blocked
+        assert calls["n"] == 1
+
+        release.set()
+        assert await owner_task == "Consolidated."
+        assert calls["n"] == 1
+
+    def test_owner_renewal_prevents_takeover_past_original_expiry(
+        self, tmp_path, monkeypatch
+    ):
+        clock = {"now": 1_000.0}
+        monkeypatch.setattr(dream_runner_module.time, "time", lambda: clock["now"])
+        monkeypatch.setattr(dream_runner_module, "_REFLECTION_ATTEMPT_LEASE_S", 120.0)
+        db_path = str(tmp_path / "dream.db")
+        owner = DreamRunner(db_path=db_path)
+        attempt = owner._begin_reflection_attempt(
+            "pinky",
+            "2026-08-12",
+            dream_start=datetime.now(timezone.utc),
+            history_start_ts=100.0,
+            history_end_ts=200.0,
+        )
+        assert attempt is not None
+        original_expiry = attempt.lease_expires_at
+
+        clock["now"] = original_expiry - 1.0
+        assert owner._renew_reflection_attempt_lease(attempt) is True
+        renewed_expiry = owner._db.execute(
+            "SELECT lease_expires_at FROM dream_reflection_attempts"
+        ).fetchone()[0]
+        assert renewed_expiry > original_expiry
+
+        clock["now"] = original_expiry + 1.0
+        contender = DreamRunner(db_path=db_path)
+        assert contender._claim_pending_reflection_attempt("pinky") is None
+        assert owner._db.execute(
+            "SELECT lease_owner, lease_expires_at FROM dream_reflection_attempts"
+        ).fetchone() == (owner._lease_owner, renewed_expiry)
+
+    @pytest.mark.asyncio
+    async def test_sdk_wall_timeout_is_failed_attempt_and_cancels_run(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr(dream_runner_module, "_SDK_DREAM_TIMEOUT_S", 0.03)
+        cancelled = asyncio.Event()
+
+        class HangingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                try:
+                    await asyncio.Event().wait()
+                finally:
+                    cancelled.set()
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", HangingSDKRunner
+        )
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: [
+                {"timestamp": 200.0, "role": "user", "content": "hung interval"}
+            ],
+        )
+
+        summary = await runner.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        )
+
+        assert "TimeoutError" in summary
+        assert "0.03s wall timeout" in summary
+        assert cancelled.is_set()
+        assert runner._db.execute(
+            "SELECT attempt_n, status, terminal FROM dream_reflection_attempts"
+        ).fetchone() == (1, "failed", 0)
+
+    @pytest.mark.asyncio
+    async def test_untagged_window_never_proves_completion_and_cap_unblocks_next_night(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+        from pinky_memory.store import ReflectionStore
+        from pinky_memory.types import Reflection
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        memory_dir = tmp_path / "data"
+        memory_dir.mkdir()
+        memory_db = memory_dir / "memory.db"
+        messages = [
+            {"timestamp": 200.0, "role": "user", "content": "frozen interval"}
+        ]
+        night_keys = iter(("2026-08-12", "2026-08-13"))
+        monkeypatch.setattr(
+            DreamRunner,
+            "_night_key",
+            staticmethod(lambda agent_config, dream_start: next(night_keys)),
+        )
+
+        class SimulatedProcessDeath(BaseException):
+            pass
+
+        class DyingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                raise SimulatedProcessDeath("pre-write process death")
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", DyingSDKRunner
+        )
+        db_path = str(tmp_path / "dream.db")
+        runner = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: list(messages),
+        )
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
+        with pytest.raises(SimulatedProcessDeath):
+            await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        store = ReflectionStore(db_path=str(memory_db))
+        unrelated = store.insert(
+            Reflection(content="ordinary untagged memory", embedding=[1.0, 0.0])
+        )
+        store.close()
+        runner._db.execute(
+            "UPDATE dream_reflection_attempts SET lease_expires_at=0"
+        )
+        runner._db.commit()
+        runner.close()
+
+        results = iter(
+            (
+                RunResult(output="", exit_code=1, error="boom one"),
+                RunResult(output="", exit_code=1, error="boom two"),
+                RunResult(output="", exit_code=1, error="boom three"),
+                RunResult(output="Consolidated next night.", exit_code=0),
+            )
+        )
+
+        class RetryingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                return next(results)
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", RetryingSDKRunner
+        )
+        reopened = DreamRunner(
+            db_path=db_path,
+            history_provider=lambda agent, after_ts, limit, role: list(messages),
+        )
+        for _ in range(3):
+            await reopened.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert reopened._get_last_message_ts("pinky") == 200.0
+        outcome = reopened._db.execute(
+            """SELECT embedded_reflections, outcome_status
+               FROM dream_reflection_outcomes
+               WHERE agent_name='pinky' AND night_key='2026-08-12'"""
+        ).fetchone()
+        assert outcome == (0, "failed-terminal")
+        assert reopened._db.execute(
+            """SELECT status, terminal FROM dream_reflection_attempts
+               WHERE night_key='2026-08-12' ORDER BY attempt_n"""
+        ).fetchall() == [("failed", 0), ("failed", 0), ("failed", 1)]
+        with sqlite3.connect(memory_db) as connection:
+            assert connection.execute(
+                "SELECT source_session_id FROM reflections WHERE id=?",
+                (unrelated.id,),
+            ).fetchone()[0] is None
+
+        messages.append(
+            {"timestamp": 300.0, "role": "user", "content": "next night interval"}
+        )
+        assert await reopened.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        ) == "Consolidated next night."
+        assert reopened._get_last_message_ts("pinky") == 300.0
+
+    @pytest.mark.asyncio
+    async def test_mixed_tagged_and_untagged_counts_only_exact_tag(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+        from pinky_memory.store import ReflectionStore
+        from pinky_memory.types import Reflection
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        memory_dir = tmp_path / "data"
+        memory_dir.mkdir()
+        memory_db = memory_dir / "memory.db"
+        messages = [
+            {"timestamp": 200.0, "role": "user", "content": "first interval"}
+        ]
+        calls = {"n": 0}
+
+        class MixedSDKRunner:
+            def __init__(self, config, agent_name=""):
+                self.config = config
+
+            async def run(self, prompt):
+                calls["n"] += 1
+                correlation_id = prompt.split("source_session_id='", 1)[1].split(
+                    "'", 1
+                )[0]
+                store = ReflectionStore(db_path=str(memory_db))
+                store.insert(
+                    Reflection(
+                        content=f"tagged {calls['n']}",
+                        embedding=[1.0, 0.0],
+                        source_session_id=correlation_id,
+                    )
+                )
+                store.insert(
+                    Reflection(
+                        content=f"untagged {calls['n']}", embedding=[1.0, 0.0]
+                    )
+                )
+                store.close()
+                return RunResult(
+                    output="partial",
+                    exit_code=1 if calls["n"] == 1 else 0,
+                    error="crash after mixed writes" if calls["n"] == 1 else "",
+                )
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", MixedSDKRunner
+        )
+        monkeypatch.setattr(
+            DreamRunner,
+            "_night_key",
+            staticmethod(lambda agent_config, dream_start: "2026-08-12"),
+        )
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: list(messages),
+        )
+
+        assert await runner.run_dream(
+            "pinky", _DreamAgentConfig(str(tmp_path))
+        ) == "partial"
+        messages.append(
+            {"timestamp": 300.0, "role": "user", "content": "later interval"}
+        )
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert runner._db.execute(
+            """SELECT embedded_reflections FROM dream_reflection_attempts
+               ORDER BY attempt_n"""
+        ).fetchall() == [(1,), (1,)]
+        assert runner._db.execute(
+            """SELECT embedded_reflections FROM dream_reflection_outcomes
+               WHERE agent_name='pinky' AND night_key='2026-08-12'"""
+        ).fetchone()[0] == 2
+        with sqlite3.connect(memory_db) as connection:
+            assert connection.execute(
+                "SELECT COUNT(*) FROM reflections WHERE source_session_id IS NULL"
+            ).fetchone()[0] == 2
+
+    @pytest.mark.asyncio
+    async def test_per_run_mcp_config_injects_header_and_is_removed(
+        self, tmp_path, monkeypatch
+    ):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        canonical = {
+            "mcpServers": {
+                "pinky-memory": {
+                    "type": "sse",
+                    "url": "http://127.0.0.1:8890/mcp/memory/sse",
+                    "headers": {"X-Agent-Name": "pinky"},
+                },
+                "pinky-self": {"command": "unchanged"},
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(canonical))
+        captured = {}
+
+        class ConfigInspectingSDKRunner:
+            def __init__(self, config, agent_name=""):
+                path = Path(config.mcp_servers)
+                captured["path"] = path
+                captured["mode"] = path.stat().st_mode & 0o777
+                captured["config"] = json.loads(path.read_text())
+
+            async def run(self, prompt):
+                return RunResult(output="Consolidated.", exit_code=0)
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", ConfigInspectingSDKRunner
+        )
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: [
+                {"timestamp": 200.0, "role": "user", "content": "context"}
+            ],
+        )
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        header = captured["config"]["mcpServers"]["pinky-memory"]["headers"]
+        assert header["X-Agent-Name"] == "pinky"
+        assert header["X-Dream-Correlation"].startswith("dream:pinky:")
+        assert captured["mode"] == 0o600
+        assert not captured["path"].exists()
+        assert json.loads((tmp_path / ".mcp.json").read_text()) == canonical
+
+    @pytest.mark.asyncio
+    async def test_constructor_failure_cleans_secret_config_and_consumes_attempt(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        bearer = "Bearer constructor-secret"
+        canonical = {
+            "mcpServers": {
+                "pinky-memory": {
+                    "type": "sse",
+                    "url": "http://127.0.0.1:8890/mcp/memory/sse",
+                    "headers": {"Authorization": bearer},
+                }
+            }
+        }
+        (tmp_path / ".mcp.json").write_text(json.dumps(canonical))
+        captured: list[tuple[Path, int, str]] = []
+
+        class FailingConstructorSDKRunner:
+            def __init__(self, config, agent_name=""):
+                path = Path(config.mcp_servers)
+                captured.append(
+                    (path, path.stat().st_mode & 0o777, path.read_text())
+                )
+                raise ImportError("missing claude-agent-sdk")
+
+        monkeypatch.setattr(
+            "pinky_daemon.dream_runner.SDKRunner", FailingConstructorSDKRunner
+        )
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: [
+                {"timestamp": 200.0, "role": "user", "content": "frozen interval"}
+            ],
+        )
+
+        for expected_attempt in (1, 2, 3):
+            summary = await runner.run_dream(
+                "pinky", _DreamAgentConfig(str(tmp_path))
+            )
+            assert "ImportError" in summary
+            assert runner._db.execute(
+                "SELECT MAX(attempt_n) FROM dream_reflection_attempts"
+            ).fetchone()[0] == expected_attempt
+
+        assert len(captured) == 3
+        assert all(mode == 0o600 for _path, mode, _content in captured)
+        assert all(bearer in content for _path, _mode, content in captured)
+        assert all(not path.exists() for path, _mode, _content in captured)
+        assert list((tmp_path / "dreams").glob(".mcp-dream-*.json")) == []
+        assert runner._db.execute(
+            "SELECT attempt_n, status, terminal FROM dream_reflection_attempts "
+            "ORDER BY attempt_n"
+        ).fetchall() == [(1, "failed", 0), (2, "failed", 0), (3, "failed", 1)]
+        assert runner._get_last_message_ts("pinky") == 200.0
+        assert json.loads((tmp_path / ".mcp.json").read_text()) == canonical
+
+    def test_atomic_mcp_config_write_unlinks_partial_on_failure(
+        self, tmp_path, monkeypatch
+    ):
+        bearer = "Bearer partial-secret"
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "pinky-memory": {
+                            "type": "sse",
+                            "url": "http://127.0.0.1/mcp",
+                            "headers": {"Authorization": bearer},
+                        }
+                    }
+                }
+            )
+        )
+        real_open = os.open
+        open_calls: list[tuple[int, int]] = []
+
+        def capture_open(path, flags, mode=0o777):
+            open_calls.append((flags, mode))
+            return real_open(path, flags, mode)
+
+        def fail_after_partial_write(config, config_file, indent=None):
+            config_file.write(f'{{"token": {bearer!r}')
+            config_file.flush()
+            raise OSError("simulated write failure")
+
+        monkeypatch.setattr(dream_runner_module.os, "open", capture_open)
+        monkeypatch.setattr(dream_runner_module.json, "dump", fail_after_partial_write)
+
+        with pytest.raises(OSError, match="simulated write failure"):
+            DreamRunner._write_dream_mcp_config(str(tmp_path), "dream:test")
+
+        assert len(open_calls) == 1
+        flags, mode = open_calls[0]
+        assert flags & os.O_CREAT
+        assert flags & os.O_EXCL
+        assert flags & os.O_WRONLY
+        assert mode == 0o600
+        assert list((tmp_path / "dreams").glob(".mcp-dream-*.json")) == []
+
+    def test_atomic_mcp_config_collision_never_unlinks_existing_file(
+        self, tmp_path, monkeypatch
+    ):
+        (tmp_path / ".mcp.json").write_text(
+            json.dumps(
+                {
+                    "mcpServers": {
+                        "pinky-memory": {
+                            "command": "memory-server",
+                        }
+                    }
+                }
+            )
+        )
+        dreams_dir = tmp_path / "dreams"
+        dreams_dir.mkdir()
+        existing = dreams_dir / ".mcp-dream-collision.json"
+        existing.write_text("belongs to another run")
+
+        class CollisionUUID:
+            hex = "collision"
+
+        monkeypatch.setattr(
+            dream_runner_module.uuid, "uuid4", lambda: CollisionUUID()
+        )
+
+        with pytest.raises(FileExistsError):
+            DreamRunner._write_dream_mcp_config(str(tmp_path), "dream:test")
+
+        assert existing.read_text() == "belongs to another run"
+
+    @pytest.mark.asyncio
+    async def test_nightly_entry_prunes_only_mcp_config_orphans_over_24h(
+        self, tmp_path
+    ):
+        dreams_dir = tmp_path / "dreams"
+        dreams_dir.mkdir()
+        old_config = dreams_dir / ".mcp-dream-old.json"
+        fresh_config = dreams_dir / ".mcp-dream-fresh.json"
+        unrelated = dreams_dir / "notes.json"
+        for path in (old_config, fresh_config, unrelated):
+            path.write_text("secret")
+        now = time.time()
+        os.utime(old_config, (now - 25 * 3600, now - 25 * 3600))
+        os.utime(fresh_config, (now - 23 * 3600, now - 23 * 3600))
+        os.utime(unrelated, (now - 25 * 3600, now - 25 * 3600))
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            history_provider=lambda agent, after_ts, limit, role: [],
+        )
+
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert not old_config.exists()
+        assert fresh_config.exists()
+        assert unrelated.exists()
+
+    def test_receipt_prune_removes_only_expired_closed_rows(self, tmp_path):
+        runner = DreamRunner(db_path=str(tmp_path / "dream.db"))
+        now = time.time()
+
+        for agent in (
+            "old-completed",
+            "old-terminal",
+            "old-retryable",
+            "recent",
+            "pending",
+        ):
+            receipt = runner._begin_reflection_attempt(
+                agent,
+                "2026-08-12",
+                dream_start=datetime.now(timezone.utc),
+                history_start_ts=100.0,
+                history_end_ts=200.0,
+            )
+            assert receipt is not None
+        runner._db.execute(
+            """UPDATE dream_reflection_attempts
+               SET status='completed', completed_at=?
+               WHERE agent_name='old-completed'""",
+            (now - 31 * 24 * 3600,),
+        )
+        runner._db.execute(
+            """UPDATE dream_reflection_attempts
+               SET status='failed', terminal=1, completed_at=?
+               WHERE agent_name='old-terminal'""",
+            (now - 31 * 24 * 3600,),
+        )
+        runner._db.execute(
+            """UPDATE dream_reflection_attempts
+               SET status='failed', terminal=0, completed_at=?
+               WHERE agent_name='old-retryable'""",
+            (now - 31 * 24 * 3600,),
+        )
+        runner._db.execute(
+            """UPDATE dream_reflection_attempts
+               SET status='completed', completed_at=?
+               WHERE agent_name='recent'""",
+            (now - 29 * 24 * 3600,),
+        )
+        runner._db.commit()
+
+        assert runner._get_retryable_failed_attempt("old-retryable") is not None
+        assert runner._prune_reflection_attempts(now=now) == 2
+        assert runner._get_retryable_failed_attempt("old-retryable") is not None
+        assert runner._db.execute(
+            "SELECT agent_name FROM dream_reflection_attempts ORDER BY agent_name"
+        ).fetchall() == [("old-retryable",), ("pending",), ("recent",)]
+
+    def test_dream_schema_rollback_fails_loud_at_startup(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = tmp_path / "dream.db"
+        migrated = DreamRunner(db_path=str(db_path))
+        assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 1
+        migrated.close()
+        monkeypatch.setattr(dream_runner_module, "_DREAM_SCHEMA_VERSION", 0)
+
+        with pytest.raises(RuntimeError) as exc_info:
+            DreamRunner(db_path=str(db_path))
+
+        message = str(exc_info.value)
+        assert "durable-dream-receipts-v1" in message
+        assert "PinkyBot >=26.08.020" in message
+        assert "refusing startup" in message
+        with sqlite3.connect(db_path) as connection:
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+
+    def test_round_two_rowid_boundary_schema_is_dropped_on_migration(self, tmp_path):
+        db_path = tmp_path / "dream.db"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute(
+                """CREATE TABLE dream_reflection_attempts (
+                       agent_name TEXT NOT NULL,
+                       night_key TEXT NOT NULL,
+                       attempt_n INTEGER NOT NULL,
+                       status TEXT NOT NULL,
+                       dream_started_at TEXT NOT NULL,
+                       history_start_ts REAL NOT NULL,
+                       history_end_ts REAL NOT NULL,
+                       correlation_id TEXT NOT NULL,
+                       reflection_rowid_floor INTEGER NOT NULL,
+                       summary TEXT,
+                       runner_completed_at REAL,
+                       embedded_reflections INTEGER,
+                       completed_at REAL,
+                       PRIMARY KEY (agent_name, night_key, attempt_n)
+                   )"""
+            )
+
+        runner = DreamRunner(db_path=str(db_path))
+        columns = {
+            row[1]
+            for row in runner._db.execute(
+                "PRAGMA table_info(dream_reflection_attempts)"
+            ).fetchall()
+        }
+        assert "reflection_rowid_floor" not in columns
+        assert {"lease_owner", "lease_expires_at", "terminal"} <= columns
+        assert runner._db.execute("PRAGMA user_version").fetchone()[0] == 1
+        assert runner._begin_reflection_attempt(
+            "pinky",
+            "2026-08-12",
+            dream_start=datetime.now(timezone.utc),
+            history_start_ts=100.0,
+            history_end_ts=200.0,
+        ) is not None
 
     @pytest.mark.asyncio
     async def test_failed_alert_retries_until_one_positive_receipt(self, tmp_path):
