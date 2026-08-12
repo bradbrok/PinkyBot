@@ -23,8 +23,9 @@ import sys
 import threading
 import time
 from collections.abc import Callable
-from datetime import date, datetime, timezone
+from datetime import datetime, timezone
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 
@@ -134,7 +135,19 @@ class DreamRunner:
                 last_summary TEXT,
                 sessions_processed INT DEFAULT 0,
                 memories_stored INT DEFAULT 0,
-                zero_reflection_streak INT NOT NULL DEFAULT 0
+                zero_reflection_streak INT NOT NULL DEFAULT 0,
+                last_reflection_night_key TEXT,
+                zero_reflection_alert_attempted_at REAL,
+                zero_reflection_alert_delivered_at REAL
+            );
+            CREATE TABLE IF NOT EXISTS dream_reflection_outcomes (
+                agent_name TEXT NOT NULL,
+                night_key TEXT NOT NULL,
+                embedded_reflections INT NOT NULL,
+                recorded_at REAL NOT NULL,
+                alert_attempted_at REAL,
+                alert_delivered_at REAL,
+                PRIMARY KEY (agent_name, night_key)
             );
             CREATE TABLE IF NOT EXISTS kg_surfaced (
                 agent_name TEXT NOT NULL,
@@ -198,6 +211,21 @@ class DreamRunner:
                 "ALTER TABLE dream_state ADD COLUMN zero_reflection_streak INT NOT NULL DEFAULT 0"
             )
             self._db.commit()
+        if "last_reflection_night_key" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN last_reflection_night_key TEXT"
+            )
+            self._db.commit()
+        if "zero_reflection_alert_attempted_at" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN zero_reflection_alert_attempted_at REAL"
+            )
+            self._db.commit()
+        if "zero_reflection_alert_delivered_at" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN zero_reflection_alert_delivered_at REAL"
+            )
+            self._db.commit()
 
     def set_owner_notify_callback(
         self, callback: Callable[[str, str], object] | None
@@ -228,6 +256,16 @@ class DreamRunner:
                 _log(f"dream-runner: unknown PINKY_DREAM_TRANSPORT={val!r} — using sdk")
             return "sdk"
         return val
+
+    @staticmethod
+    def _night_key(agent_config, dream_start: datetime) -> str:
+        """Return the agent-local calendar night that owns one dream outcome."""
+        tz_name = getattr(agent_config, "dream_timezone", "") or "America/Los_Angeles"
+        try:
+            tz = ZoneInfo(tz_name)
+        except (KeyError, ValueError):
+            tz = timezone.utc
+        return dream_start.astimezone(tz).date().isoformat()
 
     # ── Public API ────────────────────────────────────────────
 
@@ -278,8 +316,14 @@ class DreamRunner:
             self._save_state(agent_name, summary, last_message_ts=last_message_ts)
             return summary
 
+        # Bind the run to the agent's scheduled local night once. This key is
+        # carried into the state/outcome transaction so a restart refire (or a
+        # same-night manual trigger) cannot count the outcome twice.
+        dream_start = datetime.now(timezone.utc)
+        night_key = self._night_key(agent_config, dream_start)
+
         # Build system prompt
-        today_str = date.today().isoformat()
+        today_str = night_key
         last_dream_at = self._get_last_dream_at(agent_name)
         last_dream_str = (
             datetime.fromtimestamp(last_dream_at).isoformat()
@@ -342,7 +386,6 @@ class DreamRunner:
             "Work through all phases in your system prompt and end with the report."
         )
 
-        dream_start = datetime.now(timezone.utc)
         start = time.time()
         result = await runner.run(prompt)
         elapsed = time.time() - start
@@ -356,13 +399,12 @@ class DreamRunner:
 
         _log(f"dream-runner: '{agent_name}' dream complete in {elapsed:.1f}s — {summary[:120]}")
 
-        # Only advance the watermark on success: a failed run must leave this
-        # cycle's history unprocessed so the next dream re-fetches it.
-        self._save_state(
-            agent_name,
-            summary,
-            last_message_ts=last_message_ts if run_failed else new_watermark,
-        )
+        # A failed run has no reflection outcome. Preserve the prior watermark
+        # so the next dream re-fetches this history. Successful state is held
+        # until link accounting is known, then committed atomically with the
+        # durable per-night outcome below.
+        if run_failed:
+            self._save_state(agent_name, summary, last_message_ts=last_message_ts)
 
         # The post-dream pipeline below is synchronous (blocking urllib calls
         # with retries, numpy over all embeddings). It runs on the daemon's
@@ -375,7 +417,13 @@ class DreamRunner:
             self._build_memory_links, agent_name, agent_config, since=dream_start
         )
         if not run_failed:
-            await self._record_reflection_outcome(agent_name, embedded_reflections)
+            await self._record_reflection_outcome(
+                agent_name,
+                embedded_reflections,
+                night_key=night_key,
+                summary=summary,
+                last_message_ts=new_watermark,
+            )
 
         # Post-dream: extract and store user profiles + relationships from dream output
         profile_count = await asyncio.to_thread(self._extract_user_profiles, summary)
@@ -614,7 +662,9 @@ class DreamRunner:
         row = self._db.execute(
             """SELECT agent_name, last_dream_at, last_summary,
                       last_sessions_processed, last_memories_stored,
-                      zero_reflection_streak
+                      zero_reflection_streak, last_reflection_night_key,
+                      zero_reflection_alert_attempted_at,
+                      zero_reflection_alert_delivered_at
                FROM dream_state WHERE agent_name=?""",
             (agent_name,),
         ).fetchone()
@@ -627,6 +677,9 @@ class DreamRunner:
                 "last_sessions_processed": 0,
                 "last_memories_stored": 0,
                 "zero_reflection_streak": 0,
+                "last_reflection_night_key": None,
+                "zero_reflection_alert_attempted_at": None,
+                "zero_reflection_alert_delivered_at": None,
             }
 
         return {
@@ -636,6 +689,9 @@ class DreamRunner:
             "last_sessions_processed": row[3] or 0,
             "last_memories_stored": row[4] or 0,
             "zero_reflection_streak": row[5] or 0,
+            "last_reflection_night_key": row[6],
+            "zero_reflection_alert_attempted_at": row[7],
+            "zero_reflection_alert_delivered_at": row[8],
         }
 
     def list_states(self) -> list[dict]:
@@ -643,7 +699,9 @@ class DreamRunner:
         rows = self._db.execute(
             """SELECT agent_name, last_dream_at, last_summary,
                       last_sessions_processed, last_memories_stored,
-                      zero_reflection_streak
+                      zero_reflection_streak, last_reflection_night_key,
+                      zero_reflection_alert_attempted_at,
+                      zero_reflection_alert_delivered_at
                FROM dream_state ORDER BY last_dream_at DESC""",
         ).fetchall()
         return [
@@ -654,6 +712,9 @@ class DreamRunner:
                 "last_sessions_processed": r[3] or 0,
                 "last_memories_stored": r[4] or 0,
                 "zero_reflection_streak": r[5] or 0,
+                "last_reflection_night_key": r[6],
+                "zero_reflection_alert_attempted_at": r[7],
+                "zero_reflection_alert_delivered_at": r[8],
             }
             for r in rows
         ]
@@ -1268,35 +1329,45 @@ class DreamRunner:
         return len(new_refs)
 
     async def _record_reflection_outcome(
-        self, agent_name: str, embedded_reflections: int
+        self,
+        agent_name: str,
+        embedded_reflections: int,
+        *,
+        night_key: str,
+        summary: str,
+        last_message_ts: float,
     ) -> None:
-        """Persist zero-reflection streaks and surface a threshold notice."""
-        if embedded_reflections > 0:
-            self._db.execute(
-                "UPDATE dream_state SET zero_reflection_streak=0 WHERE agent_name=?",
-                (agent_name,),
+        """Atomically persist one night's state/outcome and surface its notice."""
+        created, streak, alert_delivered = self._commit_reflection_outcome(
+            agent_name,
+            night_key,
+            embedded_reflections,
+            summary=summary,
+            last_message_ts=last_message_ts,
+        )
+        if not created:
+            _log(
+                f"dream-runner: duplicate reflection outcome ignored for "
+                f"'{agent_name}' night={night_key}"
             )
-            self._db.commit()
             return
 
-        self._db.execute(
-            """UPDATE dream_state
-               SET zero_reflection_streak=zero_reflection_streak + 1
-               WHERE agent_name=?""",
-            (agent_name,),
-        )
-        row = self._db.execute(
-            "SELECT zero_reflection_streak FROM dream_state WHERE agent_name=?",
-            (agent_name,),
-        ).fetchone()
-        self._db.commit()
-        streak = int(row[0]) if row else 1
+        if embedded_reflections > 0:
+            return
+
         _log(
             f"dream-runner: WARNING '{agent_name}' completed with zero embedded "
             f"reflections ({streak} consecutive night(s))"
         )
 
-        if streak != _ZERO_REFLECTION_NOTICE_THRESHOLD:
+        if streak < _ZERO_REFLECTION_NOTICE_THRESHOLD or alert_delivered:
+            return
+
+        # Persist the attempt before crossing the external callback boundary.
+        # A negative/no receipt leaves delivery unset, so the next distinct
+        # zero-reflection night retries. Same-night refires are stopped by the
+        # durable outcome key above and therefore cannot duplicate an attempt.
+        if not self._mark_reflection_alert_attempted(agent_name, night_key):
             return
 
         if self._owner_notify_callback is None:
@@ -1322,6 +1393,136 @@ class DreamRunner:
                 f"dream-runner: OWNER_NOTIFY_FAILURE for zero-reflection alert "
                 f"agent '{agent_name}': {type(exc).__name__}: {exc}"
             )
+            return
+
+        self._mark_reflection_alert_delivered(agent_name, night_key)
+
+    def _commit_reflection_outcome(
+        self,
+        agent_name: str,
+        night_key: str,
+        embedded_reflections: int,
+        *,
+        summary: str,
+        last_message_ts: float,
+    ) -> tuple[bool, int, bool]:
+        """Commit state and one idempotent per-night outcome in one transaction."""
+        recorded_at = time.time()
+        with self._db:
+            cursor = self._db.execute(
+                """INSERT OR IGNORE INTO dream_reflection_outcomes
+                       (agent_name, night_key, embedded_reflections, recorded_at)
+                   VALUES (?, ?, ?, ?)""",
+                (agent_name, night_key, embedded_reflections, recorded_at),
+            )
+            created = cursor.rowcount > 0
+            if created:
+                self._write_state(
+                    agent_name,
+                    summary,
+                    last_message_ts,
+                    saved_at=recorded_at,
+                )
+                self._apply_reflection_outcome(
+                    agent_name, night_key, embedded_reflections
+                )
+
+            row = self._db.execute(
+                """SELECT zero_reflection_streak,
+                          zero_reflection_alert_delivered_at
+                   FROM dream_state WHERE agent_name=?""",
+                (agent_name,),
+            ).fetchone()
+
+        if row is None:
+            raise RuntimeError(
+                f"reflection outcome ledger exists without dream state for {agent_name!r}"
+            )
+        return created, int(row[0] or 0), row[1] is not None
+
+    def _apply_reflection_outcome(
+        self, agent_name: str, night_key: str, embedded_reflections: int
+    ) -> None:
+        """Apply a newly-ledgered outcome inside the caller's transaction."""
+        if embedded_reflections > 0:
+            self._db.execute(
+                """UPDATE dream_state
+                   SET zero_reflection_streak=0,
+                       last_reflection_night_key=?,
+                       zero_reflection_alert_attempted_at=NULL,
+                       zero_reflection_alert_delivered_at=NULL
+                   WHERE agent_name=?""",
+                (night_key, agent_name),
+            )
+            return
+
+        self._db.execute(
+            """UPDATE dream_state
+               SET zero_reflection_streak=zero_reflection_streak + 1,
+                   last_reflection_night_key=?
+               WHERE agent_name=?""",
+            (night_key, agent_name),
+        )
+
+    def _mark_reflection_alert_attempted(
+        self, agent_name: str, night_key: str
+    ) -> bool:
+        """Persist one alert attempt for the current zero-reflection night."""
+        attempted_at = time.time()
+        with self._db:
+            cursor = self._db.execute(
+                """UPDATE dream_state
+                   SET zero_reflection_alert_attempted_at=?
+                   WHERE agent_name=?
+                     AND last_reflection_night_key=?
+                     AND zero_reflection_streak>=?
+                     AND zero_reflection_alert_delivered_at IS NULL""",
+                (
+                    attempted_at,
+                    agent_name,
+                    night_key,
+                    _ZERO_REFLECTION_NOTICE_THRESHOLD,
+                ),
+            )
+            if cursor.rowcount > 0:
+                self._db.execute(
+                    """UPDATE dream_reflection_outcomes
+                       SET alert_attempted_at=?
+                       WHERE agent_name=? AND night_key=?""",
+                    (attempted_at, agent_name, night_key),
+                )
+        return cursor.rowcount > 0
+
+    def _mark_reflection_alert_delivered(
+        self, agent_name: str, night_key: str
+    ) -> bool:
+        """Persist an exact positive owner-notification receipt."""
+        delivered_at = time.time()
+        with self._db:
+            self._db.execute(
+                """UPDATE dream_reflection_outcomes
+                   SET alert_delivered_at=?
+                   WHERE agent_name=? AND night_key=?
+                     AND alert_attempted_at IS NOT NULL
+                     AND alert_delivered_at IS NULL""",
+                (delivered_at, agent_name, night_key),
+            )
+            cursor = self._db.execute(
+                """UPDATE dream_state
+                   SET zero_reflection_alert_delivered_at=?
+                   WHERE agent_name=?
+                     AND last_reflection_night_key=?
+                     AND zero_reflection_streak>=?
+                     AND zero_reflection_alert_attempted_at IS NOT NULL
+                     AND zero_reflection_alert_delivered_at IS NULL""",
+                (
+                    delivered_at,
+                    agent_name,
+                    night_key,
+                    _ZERO_REFLECTION_NOTICE_THRESHOLD,
+                ),
+            )
+        return cursor.rowcount > 0
 
     # ── Internal ─────────────────────────────────────────────
 
@@ -1384,9 +1585,15 @@ class DreamRunner:
 
         return lines, new_watermark
 
-    def _save_state(self, agent_name: str, summary: str, last_message_ts: float = 0.0) -> None:
-        """Persist dream watermark and free-form summary."""
-        now = time.time()
+    def _write_state(
+        self,
+        agent_name: str,
+        summary: str,
+        last_message_ts: float,
+        *,
+        saved_at: float,
+    ) -> None:
+        """Write dream state without committing the caller's transaction."""
         self._db.execute(
             """INSERT INTO dream_state
                    (agent_name, last_dream_at, last_summary, last_message_ts)
@@ -1395,9 +1602,20 @@ class DreamRunner:
                    last_dream_at=excluded.last_dream_at,
                    last_summary=excluded.last_summary,
                    last_message_ts=excluded.last_message_ts""",
-            (agent_name, now, summary, last_message_ts),
+            (agent_name, saved_at, summary, last_message_ts),
         )
-        self._db.commit()
+
+    def _save_state(
+        self, agent_name: str, summary: str, last_message_ts: float = 0.0
+    ) -> None:
+        """Persist dream watermark and free-form summary."""
+        with self._db:
+            self._write_state(
+                agent_name,
+                summary,
+                last_message_ts,
+                saved_at=time.time(),
+            )
 
     def close(self) -> None:
         """Close the calling thread's connection, if it has opened one.

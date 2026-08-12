@@ -544,6 +544,21 @@ class TestRunDreamWatermark:
 
 
 class TestDreamReflectionLoudness:
+    async def _record_night(
+        self,
+        runner: DreamRunner,
+        night_key: str,
+        embedded_reflections: int,
+        sequence: int,
+    ) -> None:
+        await runner._record_reflection_outcome(
+            "pinky",
+            embedded_reflections,
+            night_key=night_key,
+            summary=f"night {night_key}",
+            last_message_ts=float(sequence),
+        )
+
     @pytest.mark.asyncio
     async def test_zero_streak_warns_persists_notifies_and_resets(
         self, tmp_path, monkeypatch, capsys
@@ -554,6 +569,14 @@ class TestDreamReflectionLoudness:
         monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
         monkeypatch.setattr("pinky_daemon.dream_runner.SDKRunner", _StubSDKRunner)
         _StubSDKRunner.result = RunResult(output="Consolidated.", exit_code=0)
+        night_keys = iter(
+            ("2026-08-09", "2026-08-10", "2026-08-11", "2026-08-12")
+        )
+        monkeypatch.setattr(
+            DreamRunner,
+            "_night_key",
+            staticmethod(lambda agent_config, dream_start: next(night_keys)),
+        )
 
         db_path = str(tmp_path / "dream.db")
 
@@ -604,3 +627,152 @@ class TestDreamReflectionLoudness:
         assert runner.get_state("pinky")["zero_reflection_streak"] == 0
         assert len(notices) == 1
         assert "zero embedded reflections" not in capsys.readouterr().err
+
+    def test_crash_between_state_and_outcome_writes_rolls_back_both(
+        self, tmp_path, monkeypatch
+    ):
+        db_path = str(tmp_path / "dream.db")
+        runner = DreamRunner(db_path=db_path)
+        runner._save_state("pinky", "seed", last_message_ts=100.0)
+        runner._db.execute(
+            "UPDATE dream_state SET zero_reflection_streak=2 WHERE agent_name=?",
+            ("pinky",),
+        )
+        runner._db.commit()
+
+        def simulated_crash(*args, **kwargs):
+            raise RuntimeError("simulated crash after state write")
+
+        monkeypatch.setattr(runner, "_apply_reflection_outcome", simulated_crash)
+        with pytest.raises(RuntimeError, match="simulated crash"):
+            runner._commit_reflection_outcome(
+                "pinky",
+                "2026-08-12",
+                0,
+                summary="completed dream",
+                last_message_ts=200.0,
+            )
+        runner.close()
+
+        reopened = DreamRunner(db_path=db_path)
+        state = reopened.get_state("pinky")
+        assert state["last_summary"] == "seed"
+        assert state["zero_reflection_streak"] == 2
+        assert reopened._get_last_message_ts("pinky") == 100.0
+        assert reopened._db.execute(
+            "SELECT COUNT(*) FROM dream_reflection_outcomes"
+        ).fetchone()[0] == 0
+
+        created, streak, delivered = reopened._commit_reflection_outcome(
+            "pinky",
+            "2026-08-12",
+            0,
+            summary="completed dream",
+            last_message_ts=200.0,
+        )
+        assert (created, streak, delivered) == (True, 3, False)
+        assert reopened.get_state("pinky")["last_summary"] == "completed dream"
+        assert reopened._get_last_message_ts("pinky") == 200.0
+        assert reopened._db.execute(
+            "SELECT COUNT(*) FROM dream_reflection_outcomes"
+        ).fetchone()[0] == 1
+        reopened.close()
+
+    @pytest.mark.asyncio
+    async def test_same_night_refire_is_idempotent(self, tmp_path):
+        db_path = str(tmp_path / "dream.db")
+        runner = DreamRunner(db_path=db_path)
+
+        await self._record_night(runner, "2026-08-12", 0, 1)
+        runner.close()
+
+        runner = DreamRunner(db_path=db_path)
+        await self._record_night(runner, "2026-08-12", 0, 2)
+
+        state = runner.get_state("pinky")
+        assert state["zero_reflection_streak"] == 1
+        assert state["last_summary"] == "night 2026-08-12"
+        assert runner._get_last_message_ts("pinky") == 1.0
+        assert runner._db.execute(
+            "SELECT COUNT(*) FROM dream_reflection_outcomes"
+        ).fetchone()[0] == 1
+
+    @pytest.mark.asyncio
+    async def test_failed_alert_retries_until_one_positive_receipt(self, tmp_path):
+        attempts: list[str] = []
+        receipts = iter((False, True))
+
+        async def owner_notify(agent_name: str, message: str) -> bool:
+            attempts.append(message)
+            return next(receipts)
+
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            owner_notify_callback=owner_notify,
+        )
+        for sequence, night_key in enumerate(
+            (
+                "2026-08-08",
+                "2026-08-09",
+                "2026-08-10",
+                "2026-08-11",
+                "2026-08-12",
+            ),
+            start=1,
+        ):
+            await self._record_night(runner, night_key, 0, sequence)
+
+        state = runner.get_state("pinky")
+        assert state["zero_reflection_streak"] == 5
+        assert state["zero_reflection_alert_attempted_at"] is not None
+        assert state["zero_reflection_alert_delivered_at"] is not None
+        assert len(attempts) == 2
+        assert "3 consecutive nights" in attempts[0]
+        assert "4 consecutive nights" in attempts[1]
+
+        alert_rows = runner._db.execute(
+            """SELECT night_key, alert_attempted_at, alert_delivered_at
+               FROM dream_reflection_outcomes
+               WHERE alert_attempted_at IS NOT NULL
+               ORDER BY night_key"""
+        ).fetchall()
+        assert len(alert_rows) == 2
+        assert alert_rows[0][2] is None
+        assert alert_rows[1][2] is not None
+
+    @pytest.mark.asyncio
+    async def test_positive_night_resets_streak_and_delivery_latch(self, tmp_path):
+        notices: list[str] = []
+
+        async def owner_notify(agent_name: str, message: str) -> bool:
+            notices.append(message)
+            return True
+
+        runner = DreamRunner(
+            db_path=str(tmp_path / "dream.db"),
+            owner_notify_callback=owner_notify,
+        )
+        for sequence, night_key in enumerate(
+            ("2026-08-06", "2026-08-07", "2026-08-08"), start=1
+        ):
+            await self._record_night(runner, night_key, 0, sequence)
+
+        delivered = runner.get_state("pinky")
+        assert delivered["zero_reflection_streak"] == 3
+        assert delivered["zero_reflection_alert_attempted_at"] is not None
+        assert delivered["zero_reflection_alert_delivered_at"] is not None
+        assert len(notices) == 1
+
+        await self._record_night(runner, "2026-08-09", 2, 4)
+        reset = runner.get_state("pinky")
+        assert reset["zero_reflection_streak"] == 0
+        assert reset["zero_reflection_alert_attempted_at"] is None
+        assert reset["zero_reflection_alert_delivered_at"] is None
+
+        for sequence, night_key in enumerate(
+            ("2026-08-10", "2026-08-11", "2026-08-12"), start=5
+        ):
+            await self._record_night(runner, night_key, 0, sequence)
+
+        assert runner.get_state("pinky")["zero_reflection_streak"] == 3
+        assert len(notices) == 2
