@@ -9839,6 +9839,8 @@ class TestWakeSubmissionVerification:
         target, instruction = injector.await_args.args
         assert target == ss.agent_name
         assert instruction.startswith("CONTEXT-RELOAD:")
+        assert "already oriented" in instruction
+        assert "take no other action" in instruction
         assert "load_my_context" in instruction
         assert turn.prompt not in instruction
         assert await receipt is False
@@ -9897,7 +9899,7 @@ class TestWakeSubmissionVerification:
         assert "WAKE SUBMISSION ESCALATION TERMINAL" in capsys.readouterr().err
 
     @pytest.mark.asyncio
-    async def test_broker_observes_original_receipt_frozen_false(
+    async def test_late_original_before_enqueue_aborts_context_reload(
         self, monkeypatch,
     ) -> None:
         monkeypatch.setattr(
@@ -9919,9 +9921,10 @@ class TestWakeSubmissionVerification:
             reason="wake_context_restart",
             submission_receipt=receipt,
         )
-        broker_receipts: list[bool] = []
+        events: list[dict] = []
 
         async def stream_event(event: dict) -> None:
+            events.append(event)
             if event["type"] != "wake_prompt_submission_unverified":
                 return
             assert receipt.done() and receipt.result() is False
@@ -9936,19 +9939,134 @@ class TestWakeSubmissionVerification:
             )
             await asyncio.sleep(0)
 
-        async def injector(*_args) -> bool:
-            broker_receipts.append(receipt.result())
-            return True
-
         ss._stream_event_callback = stream_event
+        injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
 
-        with pytest.raises(tmux_session._WakeSubmissionFallbackQueued):
+        with pytest.raises(tmux_session._WakeSubmissionLateDetected):
             await ss._deliver_turn(turn)
 
-        assert broker_receipts == [False]
+        injector.assert_not_awaited()
         assert turn.transport_accepted is False
+        assert await receipt is False
         assert tmux.paste_text.await_count == 1
+        assert ss._wake_context_reload_guard is None
+        assert any(
+            event.get("rung") == "broker_context_reload_enqueue"
+            and event.get("outcome") == "LATE_SUBMISSION_DETECTED"
+            and event.get("detail") == "fallback_aborted_before_enqueue"
+            for event in events
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("late_after_enqueue", [True, False])
+    async def test_worker_fences_or_drains_conditional_context_reload(
+        self, monkeypatch, late_after_enqueue: bool,
+    ) -> None:
+        """Exercise production-shaped broker enqueue through worker drain."""
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        pasted: list[str] = []
+
+        async def paste_text(prompt: str, *, enter: bool = True):
+            assert enter is True
+            pasted.append(prompt)
+            return _ok()
+
+        tmux.paste_text = AsyncMock(side_effect=paste_text)
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        events: list[dict] = []
+
+        async def stream_event(event: dict) -> None:
+            events.append(event)
+
+        ss._stream_event_callback = stream_event
+        receipt = asyncio.get_running_loop().create_future()
+        original = _QueuedTurn(
+            prompt="worker-level original orientation wake",
+            internal=True,
+            reason="wake_context_restart",
+            submission_receipt=receipt,
+        )
+
+        async def injector(_target: str, instruction: str) -> bool:
+            wrapped = (
+                "[agent | transport-recovery | internal | test UTC]\n"
+                f"{instruction}"
+            )
+            assert await ss.send(wrapped) is True
+            if late_after_enqueue:
+                # This lands after the enqueue-time fence but before the same
+                # worker can drain the broker turn.
+                ss._on_transcript_entry(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": original.prompt,
+                        },
+                    }
+                )
+            return True
+
+        ss._config.wake_submission_recovery_injector = injector
+        ss.force_restart = AsyncMock(return_value=True)
+        ss._message_queue.put_nowait(original)
+
+        worker = asyncio.create_task(ss._message_worker())
+        try:
+            expected_outcome = (
+                "LATE_SUBMISSION_DETECTED" if late_after_enqueue else "succeeded"
+            )
+            for _ in range(500):
+                if any(
+                    event.get("rung") == "broker_context_reload_drain"
+                    and event.get("outcome") == expected_outcome
+                    for event in events
+                ):
+                    break
+                await asyncio.sleep(0.001)
+        finally:
+            worker.cancel()
+            await worker
+
+        assert await receipt is False
+        assert original.transport_accepted is False
+        assert pasted[0] == original.prompt
+        if late_after_enqueue:
+            assert pasted == [original.prompt]
+            assert any(
+                event.get("rung") == "broker_context_reload_drain"
+                and event.get("outcome") == "LATE_SUBMISSION_DETECTED"
+                and event.get("detail") == "fallback_aborted_before_paste"
+                for event in events
+            )
+        else:
+            assert len(pasted) == 2
+            assert pasted[1].startswith(
+                "[agent | transport-recovery | internal | test UTC]\n"
+                "CONTEXT-RELOAD:"
+            )
+            assert "already oriented" in pasted[1]
+            assert "take no other action" in pasted[1]
+            assert "load_my_context" in pasted[1]
+            assert any(
+                event.get("rung") == "broker_context_reload_drain"
+                and event.get("outcome") == "succeeded"
+                and event.get("detail") == "conditional_context_reload_pasted"
+                for event in events
+            )
+        assert ss._wake_context_reload_guard is None
+        ss.force_restart.assert_not_awaited()
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize(

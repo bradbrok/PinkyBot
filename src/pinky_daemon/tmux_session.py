@@ -446,15 +446,21 @@ _PASTE_ENTER_MAX_DELAY_MS = 2_000
 _WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC = 5.0
 _WAKE_SUBMISSION_ENTER_RETRY_LIMIT = 2
 # A context-restart wake that exhausts the ordinary verifier gets one final
-# receipt-only grace window.  The original prompt is never pasted again: an
-# empty composer can mean Claude already accepted it while transcript/tailer
-# evidence still lags, so pane state cannot safely authorize a replay.
+# receipt-only grace window.  The mechanical exactly-once contract is narrow:
+# the original wake text is never pasted a second time.  A distinct broker
+# continuation is protected by enqueue/drain late-row fences, with the
+# instruction's semantic guard covering the residual post-drain-check window.
+# An empty composer can mean Claude already accepted the original while
+# transcript/tailer evidence still lags, so pane state cannot authorize replay.
 _WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC = 5.0
 _WAKE_SUBMISSION_BROKER_TIMEOUT_SEC = 5.0
 _WAKE_CONTEXT_RELOAD_INSTRUCTION = (
-    "CONTEXT-RELOAD: Reload the saved continuation state now with "
-    "load_my_context, then resume from that durable artifact. Do not replay "
-    "the failed orientation wake verbatim or treat it as delivered."
+    "CONTEXT-RELOAD: If an orientation wake for this session already appears "
+    "above and you have begun acting on it, reply exactly 'already oriented' "
+    "and take no other action. Otherwise, reload the saved continuation state "
+    "now with load_my_context, then resume from that durable artifact. This is "
+    "a distinct recovery instruction; never replay the failed orientation "
+    "wake text."
 )
 
 
@@ -518,6 +524,10 @@ class _SchedulerDeliveryCancelled(Exception):  # noqa: N818
 
 class _WakeSubmissionFallbackQueued(Exception):  # noqa: N818
     """The failed wake was replaced by a broker context-reload handoff."""
+
+
+class _WakeSubmissionLateDetected(Exception):  # noqa: N818
+    """A late original wake started, so remaining escalation was aborted."""
 
 
 class _WakeSubmissionRecoveryScheduled(Exception):  # noqa: N818
@@ -926,6 +936,15 @@ class _QueuedTurn:
     # scheduler receipt because wake prompts remain ordinary worker-queued
     # internal turns rather than scheduler-serialized external turns.
     submission_receipt: asyncio.Future[bool] | None = None
+
+
+@dataclass
+class _WakeContextReloadGuard:
+    """Short-lived fence joining one failed wake to its broker fallback."""
+
+    original_turn: _QueuedTurn
+    instruction: str
+    original_seen: bool = False
 
 
 _TRANSCRIPT_MATERIALIZE_PROMPT = (
@@ -1593,6 +1612,7 @@ class TmuxSession:
         # recurse through force_restart forever.
         self._wake_submission_transport_recovery_used: bool = False
         self._wake_submission_recovery_task: asyncio.Task[None] | None = None
+        self._wake_context_reload_guard: _WakeContextReloadGuard | None = None
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -3550,6 +3570,7 @@ class TmuxSession:
         self._scheduler_pending_turns.clear()
         self._pane_queue_operations.clear()
         self._pane_dequeued_turns.clear()
+        self._wake_context_reload_guard = None
 
         # Cancel worker.
         if self._worker_task and not self._worker_task.done():
@@ -5858,10 +5879,34 @@ class TmuxSession:
                     self._inflight_turn = await self._message_queue.get()
                     delivery_timeouts = 0
                 turn = self._inflight_turn
+                reload_guard = self._wake_context_reload_guard_for(turn)
+                if reload_guard is not None and reload_guard.original_seen:
+                    await self._emit_wake_submission_escalation(
+                        reload_guard.original_turn,
+                        rung="broker_context_reload_drain",
+                        outcome="LATE_SUBMISSION_DETECTED",
+                        detail="fallback_aborted_before_paste",
+                    )
+                    self._clear_wake_context_reload_guard(reload_guard)
+                    self._inflight_turn = None
+                    continue
                 try:
                     self._processing = True
                     await self._deliver_turn(turn)
                     self._stats["turns"] += 1
+                    if reload_guard is not None:
+                        detail = (
+                            "conditional_guard_covers_post_check_late_original"
+                            if reload_guard.original_seen
+                            else "conditional_context_reload_pasted"
+                        )
+                        await self._emit_wake_submission_escalation(
+                            reload_guard.original_turn,
+                            rung="broker_context_reload_drain",
+                            outcome="succeeded",
+                            detail=detail,
+                        )
+                        self._clear_wake_context_reload_guard(reload_guard)
                     # Success — paste landed, meta appended to the
                     # deque. ``_has_completed_turn`` advances when the
                     # first stop_hook_summary pops anything (see
@@ -5895,6 +5940,13 @@ class TmuxSession:
                     # CONTEXT-RELOAD instruction now sits in the broker queue.
                     # Do not count the failed wake as a turn or an error; clear
                     # it so the worker advances to the fallback handoff.
+                    self._inflight_turn = None
+                    continue
+                except _WakeSubmissionLateDetected:
+                    # A transcript row proved the original wake started after
+                    # its receipt froze False.  Accounting remains negative,
+                    # but recovery must stop instead of adding a second
+                    # semantically equivalent continuation.
                     self._inflight_turn = None
                     continue
                 except _WakeSubmissionRecoveryScheduled:
@@ -5966,6 +6018,22 @@ class TmuxSession:
                                 e = finish_e
                             else:
                                 self._stats["turns"] += 1
+                                if reload_guard is not None:
+                                    detail = (
+                                        "conditional_guard_covers_post_check_"
+                                        "late_original"
+                                        if reload_guard.original_seen
+                                        else "conditional_context_reload_pasted"
+                                    )
+                                    await self._emit_wake_submission_escalation(
+                                        reload_guard.original_turn,
+                                        rung="broker_context_reload_drain",
+                                        outcome="succeeded",
+                                        detail=detail,
+                                    )
+                                    self._clear_wake_context_reload_guard(
+                                        reload_guard
+                                    )
                                 self._inflight_turn = None
                                 continue
                         else:
@@ -5981,6 +6049,14 @@ class TmuxSession:
                     # dead-pane, tailer-state corruption, etc.). Drop
                     # the inflight turn so we don't redeliver into a
                     # broken pane on the next iteration.
+                    if reload_guard is not None:
+                        await self._emit_wake_submission_escalation(
+                            reload_guard.original_turn,
+                            rung="broker_context_reload_drain",
+                            outcome="failed",
+                            detail=f"fallback_delivery_raised_{type(e).__name__}",
+                        )
+                        self._clear_wake_context_reload_guard(reload_guard)
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
                     # _deliver_turn already re-armed _turn_done and
@@ -7291,6 +7367,22 @@ class TmuxSession:
             if receipt is not None and not receipt.done():
                 receipt.set_result(True)
 
+    def _wake_context_reload_guard_for(
+        self, turn: _QueuedTurn
+    ) -> _WakeContextReloadGuard | None:
+        """Return the active guard when ``turn`` is its wrapped fallback."""
+        guard = self._wake_context_reload_guard
+        if guard is None or not turn.prompt.endswith(guard.instruction):
+            return None
+        return guard
+
+    def _clear_wake_context_reload_guard(
+        self, guard: _WakeContextReloadGuard
+    ) -> None:
+        """Clear ``guard`` only if it is still the active escalation epoch."""
+        if self._wake_context_reload_guard is guard:
+            self._wake_context_reload_guard = None
+
     def _on_transcript_entry(self, entry: dict) -> None:
         """Consume transcript evidence strong enough for exact-turn receipts."""
         entry_type = entry.get("type")
@@ -7315,6 +7407,18 @@ class TmuxSession:
         if entry_type == "user":
             prompt = self._transcript_user_text(entry)
             if prompt is not None:
+                guard = self._wake_context_reload_guard
+                if (
+                    guard is not None
+                    and prompt == guard.original_turn.prompt
+                    and not guard.original_seen
+                ):
+                    guard.original_seen = True
+                    _log(
+                        f"tmux[{self.agent_name}]: LATE_SUBMISSION_DETECTED "
+                        "for original orientation wake; remaining broker "
+                        "escalation will be fenced"
+                    )
                 if self._pane_dequeued_turns:
                     dequeued = self._pane_dequeued_turns[0]
                     if dequeued is None or dequeued.prompt == prompt:
@@ -7482,8 +7586,24 @@ class TmuxSession:
         )
         return True
 
-    async def _inject_wake_context_reload(self, turn: _QueuedTurn) -> bool:
-        """Run the broker-injection rung with a non-replayed instruction."""
+    async def _inject_wake_context_reload(self, turn: _QueuedTurn) -> str:
+        """Run the guarded broker-injection rung without replaying the wake."""
+        guard = self._wake_context_reload_guard
+        if guard is None or guard.original_turn is not turn:
+            guard = _WakeContextReloadGuard(
+                original_turn=turn,
+                instruction=_WAKE_CONTEXT_RELOAD_INSTRUCTION,
+            )
+            self._wake_context_reload_guard = guard
+        if guard.original_seen:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="broker_context_reload_enqueue",
+                outcome="LATE_SUBMISSION_DETECTED",
+                detail="fallback_aborted_before_enqueue",
+            )
+            self._clear_wake_context_reload_guard(guard)
+            return "late_submission_detected"
         injector = self._config.wake_submission_recovery_injector
         if injector is None:
             await self._emit_wake_submission_escalation(
@@ -7492,7 +7612,8 @@ class TmuxSession:
                 outcome="failed",
                 detail="injector_unavailable",
             )
-            return False
+            self._clear_wake_context_reload_guard(guard)
+            return "failed"
         try:
             result = injector(
                 self.agent_name,
@@ -7511,14 +7632,18 @@ class TmuxSession:
                 outcome="failed",
                 detail=f"injector_raised_{type(exc).__name__}",
             )
-            return False
+            self._clear_wake_context_reload_guard(guard)
+            return "failed"
         await self._emit_wake_submission_escalation(
             turn,
             rung="broker_context_reload",
             outcome="succeeded" if delivered else "failed",
             detail="context_reload_handoff" if delivered else "handoff_rejected",
         )
-        return delivered
+        if not delivered:
+            self._clear_wake_context_reload_guard(guard)
+            return "failed"
+        return "queued"
 
     async def _run_wake_submission_transport_recovery(
         self, turn: _QueuedTurn
@@ -7707,6 +7832,13 @@ class TmuxSession:
         }
         if escalation_applies:
             unverified_event["escalating"] = True
+            # Arm before the first escalation callback can yield. A late exact
+            # original-wake row remains terminal-False for receipt/accounting,
+            # but marks this epoch so the distinct fallback is fenced.
+            self._wake_context_reload_guard = _WakeContextReloadGuard(
+                original_turn=turn,
+                instruction=_WAKE_CONTEXT_RELOAD_INSTRUCTION,
+            )
         await self._emit_stream_event(unverified_event)
         if not escalation_applies:
             return "unverified"
@@ -7717,8 +7849,11 @@ class TmuxSession:
             outcome="expired",
             detail="late_receipt_not_observed",
         )
-        if await self._inject_wake_context_reload(turn):
+        injection = await self._inject_wake_context_reload(turn)
+        if injection == "queued":
             return "fallback_queued"
+        if injection == "late_submission_detected":
+            return "late_submission_detected"
         return "recovery_required"
 
     async def _finish_submitted_turn(self, turn: _QueuedTurn) -> None:
@@ -7743,6 +7878,10 @@ class TmuxSession:
         if verdict == "fallback_queued":
             raise _WakeSubmissionFallbackQueued(
                 "failed orientation wake replaced by broker context reload"
+            )
+        if verdict == "late_submission_detected":
+            raise _WakeSubmissionLateDetected(
+                "late original orientation wake stopped broker escalation"
             )
         if verdict == "recovery_required":
             if await self._schedule_wake_submission_transport_recovery(turn):
