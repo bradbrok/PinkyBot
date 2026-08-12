@@ -8461,14 +8461,15 @@ class TestInflightDequeConcurrentDispatch:
         await ss.disconnect()
 
     @pytest.mark.asyncio
-    async def test_watchdog_vetoes_frozen_pre_session_live_status(
+    async def test_watchdog_vetoes_frozen_pre_session_live_status_within_grace(
         self, monkeypatch, capsys,
     ):
-        """#943: frozen live_last_updated + a static/idle pane is unknown
-        evidence and must never trigger force_restart."""
+        """#984 negative: the never-started shape still vetoes within grace."""
         from pinky_daemon import tmux_session as _ts
         monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
         monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "60")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "60")
 
         ss, _ = _make_session()
         await ss.connect()
@@ -8497,6 +8498,242 @@ class TestInflightDequeConcurrentDispatch:
         assert ss._head_started_at is not None and ss._head_started_at > 0
         assert ss._pane_is_animating.await_count == 0
         assert "WATCHDOG_STALE_LIVE_STATUS_VETO" in capsys.readouterr().err
+        await ss.disconnect()
+
+    def test_advancing_fossil_resets_frozen_tracker(self, monkeypatch):
+        """#943 negative: a pre-session value that advances is not frozen."""
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "0")
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._current_session_started_at = 100.0
+
+        assert ss._observe_frozen_live_status(
+            400.0, {"status": "working", "last_updated": 80.0}
+        ) == (80.0, 400.0, 1)
+        advanced = {"status": "working", "last_updated": 90.0}
+        assert ss._observe_frozen_live_status(401.0, advanced) == (
+            90.0, 401.0, 1
+        )
+        assert ss._frozen_liveness_restart_reason(401.0, advanced) is None
+
+        # Only a subsequent identical observation may become actionable.
+        assert ss._observe_frozen_live_status(402.0, advanced) == (
+            90.0, 401.0, 2
+        )
+        assert (
+            ss._frozen_liveness_restart_reason(402.0, advanced)
+            == "never_started_signature"
+        )
+
+    def test_frozen_liveness_trigger_defaults_on_with_live_kill_switch(
+        self, monkeypatch,
+    ):
+        """#984's kill switch follows the existing pane-liveness pattern."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.delenv(
+            "PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", raising=False
+        )
+        assert _ts._watchdog_frozen_liveness_trigger_enabled() is True
+        for off in ("0", "false", "NO", " off "):
+            monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", off)
+            assert _ts._watchdog_frozen_liveness_trigger_enabled() is False
+        monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", "1")
+        assert _ts._watchdog_frozen_liveness_trigger_enabled() is True
+
+    def test_frozen_liveness_threshold_defaults_and_overrides(self, monkeypatch):
+        """Grace, cap, and pacing remain bounded and independently tunable."""
+        from pinky_daemon import tmux_session as _ts
+
+        names = (
+            "PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC",
+            "PINKY_WATCHDOG_STALE_VETO_CAP_SEC",
+            "PINKY_WATCHDOG_FROZEN_RESTART_INTERVAL_SEC",
+        )
+        for name in names:
+            monkeypatch.delenv(name, raising=False)
+        assert _ts._watchdog_never_started_grace_sec() == 300.0
+        assert _ts._watchdog_stale_veto_cap_sec() == 1800.0
+        assert _ts._watchdog_frozen_restart_interval_sec() == 600.0
+
+        for name, value in zip(names, ("7", "8", "9"), strict=True):
+            monkeypatch.setenv(name, value)
+        assert _ts._watchdog_never_started_grace_sec() == 7.0
+        assert _ts._watchdog_stale_veto_cap_sec() == 8.0
+        assert _ts._watchdog_frozen_restart_interval_sec() == 9.0
+
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "-1")
+        assert _ts._watchdog_never_started_grace_sec() == 0.0
+
+    @pytest.mark.asyncio
+    async def test_watchdog_never_started_signature_restarts_once_then_paces(
+        self, monkeypatch, capsys,
+    ):
+        """Frozen-at-launch past grace restarts once; a repeat cannot storm."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.02)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.01)
+        monkeypatch.delenv(
+            "PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", raising=False
+        )
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "60")
+        monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_RESTART_INTERVAL_SEC", "60")
+        decisions = MagicMock()
+        monkeypatch.setattr(_ts, "log_watchdog_decision", decisions)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        # Equality is intentionally part of the signature: a launch-time
+        # value that never advances proves no turn moved status past launch.
+        frozen_at = ss._current_session_started_at
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": frozen_at,
+        }
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+        ss._pane_is_animating = AsyncMock(return_value=False)
+
+        force_called = asyncio.Event()
+        force_calls: list[bool] = []
+
+        async def _stub_force_restart(*, bypass_guard: bool = False):
+            force_calls.append(bypass_guard)
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub_force_restart
+        _seed_inflight(ss, prompt="never-started wake")
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        await asyncio.sleep(0)
+
+        assert force_calls == [True]
+        assert not ss._inflight_metas
+        assert ss._watchdog_last_frozen_restart_at is not None
+        first_logs = capsys.readouterr().err
+        assert "WATCHDOG_NEVER_STARTED_RESTART" in first_logs
+        assert f"live_last_updated={frozen_at}" in first_logs
+        assert f"session_started_at={ss._current_session_started_at}" in first_logs
+        assert any(
+            call.kwargs.get("decision") == "restart"
+            and call.kwargs.get("reason") == "never_started_signature"
+            for call in decisions.call_args_list
+        )
+
+        # Simulate another stuck head on the retained session object.  The
+        # frozen signature remains true, but the 60s attempt interval must
+        # leave the head intact and avoid a second force_restart.
+        _seed_inflight(ss, prompt="repeat wake")
+        ss._watchdog_task = asyncio.create_task(ss._inflight_watchdog())
+        await asyncio.sleep(0.12)
+
+        assert force_calls == [True]
+        assert len(ss._inflight_metas) == 1
+        assert "WATCHDOG_FROZEN_LIVENESS_RESTART_PACED" in capsys.readouterr().err
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_new_tmux_process_resets_frozen_window_but_preserves_pacing(self):
+        """Every respawn compares evidence only with its current launch."""
+        ss, _ = _make_session()
+        ss._watchdog_frozen_live_status = (10.0, 20.0, 30)
+        ss._watchdog_last_frozen_restart_at = 40.0
+
+        await ss.connect()
+
+        assert ss._current_session_started_at > 0
+        assert ss._watchdog_frozen_live_status is None
+        assert ss._watchdog_last_frozen_restart_at == 40.0
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_stale_veto_age_cap_restarts_frozen_after_start(
+        self, monkeypatch,
+    ):
+        """The general cap recovers a frozen value newer than launch."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.02)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.01)
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "60")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "0.03")
+        decisions = MagicMock()
+        monkeypatch.setattr(_ts, "log_watchdog_decision", decisions)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        ss._current_session_started_at = _time.time() - 1.0
+        frozen_after_start = ss._current_session_started_at + 0.1
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": frozen_after_start,
+        }
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+
+        force_called = asyncio.Event()
+
+        async def _stub_force_restart(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub_force_restart
+        _seed_inflight(ss, prompt="stale-after-launch wake")
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        assert any(
+            call.kwargs.get("decision") == "restart"
+            and call.kwargs.get("reason") == "stale_live_status_age_cap"
+            for call in decisions.call_args_list
+        )
+        await ss.disconnect()
+
+    @pytest.mark.parametrize("last_updated_offset", (-1.0, 0.1))
+    @pytest.mark.asyncio
+    async def test_frozen_liveness_kill_switch_disables_both_trigger_paths(
+        self, monkeypatch, last_updated_offset,
+    ):
+        """The default-on feature flag can restore indefinite #943 vetoes."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.02)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.01)
+        monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "0")
+
+        ss, _ = _make_session()
+        await ss.connect()
+        ss._current_session_started_at = _time.time() - 1.0
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": (
+                ss._current_session_started_at + last_updated_offset
+            ),
+        }
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+
+        force_called = asyncio.Event()
+
+        async def _must_not_restart(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _must_not_restart
+        _seed_inflight(ss, prompt="kill-switch wake")
+        await asyncio.sleep(0.12)
+
+        assert not force_called.is_set()
+        assert len(ss._inflight_metas) == 1
+        assert ss._watchdog_frozen_live_status is None
         await ss.disconnect()
 
     @pytest.mark.asyncio
