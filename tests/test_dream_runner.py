@@ -1209,6 +1209,7 @@ class TestDreamReflectionLoudness:
     ):
         monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
         monkeypatch.setattr(dream_runner_module, "_SDK_DREAM_TIMEOUT_S", 0.02)
+        late_returned = asyncio.Event()
 
         class CancellationSuppressingRunner:
             def __init__(self, config, agent_name=""):
@@ -1220,6 +1221,7 @@ class TestDreamReflectionLoudness:
                 except asyncio.CancelledError:
                     await asyncio.sleep(0.06)
                     from pinky_daemon.claude_runner import RunResult
+                    late_returned.set()
                     return RunResult(output="late success", exit_code=0)
 
         monkeypatch.setattr(dream_runner_module, "SDKRunner", CancellationSuppressingRunner)
@@ -1232,6 +1234,19 @@ class TestDreamReflectionLoudness:
         assert runner._db.execute(
             "SELECT status, terminal FROM dream_reflection_attempts"
         ).fetchone() == ("failed", 0)
+        assert runner._db.execute(
+            "SELECT runner_completed_at FROM dream_reflection_attempts"
+        ).fetchone() == (None,)
+        assert runner._db.execute(
+            "SELECT last_message_ts FROM dream_state WHERE agent_name='pinky'"
+        ).fetchone()[0] == 0
+        await late_returned.wait()
+        assert runner._db.execute(
+            "SELECT status, runner_completed_at FROM dream_reflection_attempts"
+        ).fetchone() == ("failed", None)
+        assert runner._db.execute(
+            "SELECT last_message_ts FROM dream_state WHERE agent_name='pinky'"
+        ).fetchone()[0] == 0
 
     def test_concurrent_constructors_serialize_migration(self, tmp_path):
         db_path = str(tmp_path / "dream.db")

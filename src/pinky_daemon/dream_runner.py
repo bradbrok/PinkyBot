@@ -176,8 +176,11 @@ class DreamRunner:
         lock_path = f"{self._db_path}.migration.lock"
         with open(lock_path, "a+") as migration_lock:
             fcntl.flock(migration_lock.fileno(), fcntl.LOCK_EX)
-            self._check_schema_version()
-            self._db.executescript("""
+            for migration_attempt in range(5):
+                self._db.execute("BEGIN IMMEDIATE")
+                try:
+                    self._check_schema_version()
+                    self._db.executescript("""
             CREATE TABLE IF NOT EXISTS dream_state (
                 agent_name TEXT PRIMARY KEY,
                 last_dream_at REAL,
@@ -227,11 +230,7 @@ class DreamRunner:
                 surfaced_at REAL,
                 PRIMARY KEY (agent_name, fingerprint)
             );
-        """)
-            # Serialize migration and re-check after acquiring the write lock.
-            for migration_attempt in range(5):
-                self._db.execute("BEGIN IMMEDIATE")
-                try:
+                    """)
                     self._migrate_tables()
                     version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
                     if version < _DREAM_SCHEMA_VERSION:
@@ -714,6 +713,9 @@ class DreamRunner:
         """
         stopped = asyncio.Event()
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
+        teardown_deadline = (
+            deadline + _SDK_DREAM_TEARDOWN_GRACE_S if deadline is not None else None
+        )
 
         run_task = asyncio.create_task(runner.run(prompt))
         renewal_task = asyncio.create_task(
@@ -734,12 +736,6 @@ class DreamRunner:
                 # the runner, and never accept a result from a late/zombie task.
                 stopped.set()
                 run_task.cancel()
-                try:
-                    await asyncio.wait_for(
-                        asyncio.shield(run_task), timeout=_SDK_DREAM_TEARDOWN_GRACE_S
-                    )
-                except BaseException:
-                    pass
                 raise TimeoutError(
                     f"SDK dream run exceeded its {timeout_s:g}s wall timeout"
                 )
@@ -759,8 +755,13 @@ class DreamRunner:
                     task.cancel()
             if not run_task.done():
                 try:
+                    remaining = (
+                        max(0.0, teardown_deadline - time.monotonic())
+                        if teardown_deadline is not None
+                        else _SDK_DREAM_TEARDOWN_GRACE_S
+                    )
                     await asyncio.wait_for(
-                        asyncio.shield(run_task), timeout=_SDK_DREAM_TEARDOWN_GRACE_S
+                        asyncio.shield(run_task), timeout=remaining
                     )
                 except TimeoutError:
                     _log(
