@@ -3736,6 +3736,18 @@ def create_api(
         except Exception as e:
             _log(f"streaming-start: ensure_workspace_hooks({agent_name}) — {e}")
 
+        async def _inject_wake_context_reload(
+            target_agent: str, instruction: str
+        ) -> bool:
+            """Route one wake-recovery instruction through the live broker."""
+            outcome = await broker.inject_agent_message(
+                "transport-recovery",
+                target_agent,
+                instruction,
+                route_reply=False,
+            )
+            return outcome.delivered
+
         config = StreamingSessionConfig(
             agent_name=agent_name,
             label=label,
@@ -3755,6 +3767,7 @@ def create_api(
             wake_context=_build_streaming_wake_context(agent_name, commit=False),
             wake_context_builder=_build_streaming_wake_context,
             on_wake_delivered=_log_agent_wake_event,
+            wake_submission_recovery_injector=_inject_wake_context_reload,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             # #943: verdict-time fresh read of the persisted field that the
             # working/idle hooks update.  The in-memory map is non-authoritative
