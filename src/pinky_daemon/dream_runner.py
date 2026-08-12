@@ -100,6 +100,7 @@ _DREAM_MCP_CONFIG_RETENTION_S = 24 * 3600
 _DREAM_SCHEMA_VERSION = 1
 _DREAM_SCHEMA_MIGRATION = "durable-dream-receipts-v1"
 _DREAM_SCHEMA_MIN_CODE_VERSION = "26.08.020"
+_SDK_DREAM_TEARDOWN_GRACE_S = 10.0
 
 
 @dataclass(frozen=True)
@@ -223,10 +224,17 @@ class DreamRunner:
                 PRIMARY KEY (agent_name, fingerprint)
             );
         """)
-        self._db.commit()
-        self._migrate_tables()
-        self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
-        self._db.commit()
+        # Serialize migration and re-check after acquiring the write lock.
+        self._db.execute("BEGIN IMMEDIATE")
+        try:
+            self._migrate_tables()
+            version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
+            if version < _DREAM_SCHEMA_VERSION:
+                self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
+            self._db.commit()
+        except BaseException:
+            self._db.rollback()
+            raise
 
     def _check_schema_version(self) -> None:
         """Fail startup before touching a dream DB created by newer code."""
@@ -693,24 +701,34 @@ class DreamRunner:
         """
         stopped = asyncio.Event()
 
-        async def invoke_runner():
-            if timeout_s is None:
-                return await runner.run(prompt)
-            try:
-                return await asyncio.wait_for(runner.run(prompt), timeout=timeout_s)
-            except TimeoutError as exc:
-                raise TimeoutError(
-                    f"SDK dream run exceeded its {timeout_s:g}s wall timeout"
-                ) from exc
-
-        run_task = asyncio.create_task(invoke_runner())
+        run_task = asyncio.create_task(runner.run(prompt))
         renewal_task = asyncio.create_task(
             self._renew_reflection_attempt_lease_until_stopped(attempt, stopped)
         )
+        deadline_task = (
+            asyncio.create_task(asyncio.sleep(timeout_s)) if timeout_s is not None else None
+        )
         try:
+            watched = {run_task, renewal_task}
+            if deadline_task is not None:
+                watched.add(deadline_task)
             done, _pending = await asyncio.wait(
-                {run_task, renewal_task}, return_when=asyncio.FIRST_COMPLETED
+                watched, return_when=asyncio.FIRST_COMPLETED
             )
+            if deadline_task is not None and deadline_task in done:
+                # The deadline decision is final. Stop renewal before touching
+                # the runner, and never accept a result from a late/zombie task.
+                stopped.set()
+                run_task.cancel()
+                try:
+                    await asyncio.wait_for(
+                        asyncio.shield(run_task), timeout=_SDK_DREAM_TEARDOWN_GRACE_S
+                    )
+                except BaseException:
+                    pass
+                raise TimeoutError(
+                    f"SDK dream run exceeded its {timeout_s:g}s wall timeout"
+                )
             if renewal_task in done:
                 # A renewal task only completes before ``stopped`` on failure.
                 renewal_task.result()
@@ -720,10 +738,15 @@ class DreamRunner:
             return run_task.result()
         finally:
             stopped.set()
-            for task in (run_task, renewal_task):
+            for task in (run_task, renewal_task, deadline_task):
+                if task is None:
+                    continue
                 if not task.done():
                     task.cancel()
-            await asyncio.gather(run_task, renewal_task, return_exceptions=True)
+            await asyncio.gather(
+                run_task, renewal_task, *( [deadline_task] if deadline_task else [] ),
+                return_exceptions=True,
+            )
 
     def _prune_reflection_attempts(self, *, now: float | None = None) -> int:
         """Prune old completed/terminal receipts; retryable failures survive."""
