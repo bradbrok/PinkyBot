@@ -273,7 +273,7 @@ class DreamRunner:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN last_notified_at REAL"
             )
-            self._db.commit()
+            pass
         # Migration: rename sessions_processed -> last_sessions_processed
         if "last_sessions_processed" not in cols:
             self._db.execute(
@@ -282,7 +282,7 @@ class DreamRunner:
             self._db.execute(
                 "UPDATE dream_state SET last_sessions_processed = sessions_processed"
             )
-            self._db.commit()
+            pass
         # Migration: rename memories_stored -> last_memories_stored
         if "last_memories_stored" not in cols:
             self._db.execute(
@@ -291,44 +291,44 @@ class DreamRunner:
             self._db.execute(
                 "UPDATE dream_state SET last_memories_stored = memories_stored"
             )
-            self._db.commit()
+            pass
         # Migration: add last_message_ts watermark for tracking processed history
         if "last_message_ts" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN last_message_ts REAL DEFAULT 0"
             )
-            self._db.commit()
+            pass
         # Migration: add KG proactive-surfacing columns (#682 PR2)
         if "kg_insights" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN kg_insights TEXT"
             )
-            self._db.commit()
+            pass
         if "kg_insights_notified_at" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN kg_insights_notified_at REAL"
             )
-            self._db.commit()
+            pass
         if "zero_reflection_streak" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN zero_reflection_streak INT NOT NULL DEFAULT 0"
             )
-            self._db.commit()
+            pass
         if "last_reflection_night_key" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN last_reflection_night_key TEXT"
             )
-            self._db.commit()
+            pass
         if "zero_reflection_alert_attempted_at" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN zero_reflection_alert_attempted_at REAL"
             )
-            self._db.commit()
+            pass
         if "zero_reflection_alert_delivered_at" not in cols:
             self._db.execute(
                 "ALTER TABLE dream_state ADD COLUMN zero_reflection_alert_delivered_at REAL"
             )
-            self._db.commit()
+            pass
 
         outcome_cols = {
             row[1]
@@ -341,7 +341,6 @@ class DreamRunner:
                 "ALTER TABLE dream_reflection_outcomes "
                 "ADD COLUMN outcome_status TEXT NOT NULL DEFAULT 'completed'"
             )
-            self._db.commit()
 
         attempt_cols = {
             row[1]
@@ -357,7 +356,6 @@ class DreamRunner:
                 "ALTER TABLE dream_reflection_attempts "
                 "DROP COLUMN reflection_rowid_floor"
             )
-            self._db.commit()
         for column, declaration in (
             ("lease_owner", "TEXT"),
             ("lease_expires_at", "REAL"),
@@ -368,7 +366,7 @@ class DreamRunner:
                     f"ALTER TABLE dream_reflection_attempts "
                     f"ADD COLUMN {column} {declaration}"
                 )
-                self._db.commit()
+                pass
 
     def set_owner_notify_callback(
         self, callback: Callable[[str, str], object] | None
@@ -680,7 +678,8 @@ class DreamRunner:
         return cursor.rowcount == 1
 
     async def _renew_reflection_attempt_lease_until_stopped(
-        self, attempt: _ReflectionAttempt, stopped: asyncio.Event
+        self, attempt: _ReflectionAttempt, stopped: asyncio.Event,
+        deadline: float | None = None,
     ) -> None:
         """Renew an owned lease periodically, failing closed if ownership is lost."""
         while True:
@@ -690,6 +689,8 @@ class DreamRunner:
                 )
                 return
             except TimeoutError:
+                if deadline is not None and time.monotonic() >= deadline:
+                    return
                 if not self._renew_reflection_attempt_lease(attempt):
                     raise RuntimeError(
                         "dream reflection attempt lost its lease during renewal: "
@@ -712,10 +713,11 @@ class DreamRunner:
         wall-clock timeout.
         """
         stopped = asyncio.Event()
+        deadline = time.monotonic() + timeout_s if timeout_s is not None else None
 
         run_task = asyncio.create_task(runner.run(prompt))
         renewal_task = asyncio.create_task(
-            self._renew_reflection_attempt_lease_until_stopped(attempt, stopped)
+            self._renew_reflection_attempt_lease_until_stopped(attempt, stopped, deadline)
         )
         deadline_task = (
             asyncio.create_task(asyncio.sleep(timeout_s)) if timeout_s is not None else None

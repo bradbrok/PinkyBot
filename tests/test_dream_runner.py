@@ -1130,6 +1130,27 @@ class TestDreamReflectionLoudness:
         ).fetchone() == (owner._lease_owner, renewed_expiry)
 
     @pytest.mark.asyncio
+    async def test_renewal_refuses_at_sdk_deadline(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(dream_runner_module, "_REFLECTION_ATTEMPT_RENEW_INTERVAL_S", 0.02)
+        runner = DreamRunner(db_path=str(tmp_path / "dream.db"))
+        attempt = runner._begin_reflection_attempt(
+            "pinky", "2026-08-12", dream_start=datetime.now(timezone.utc),
+            history_start_ts=0, history_end_ts=1,
+        )
+        assert attempt is not None
+        renewals = []
+        monkeypatch.setattr(runner, "_renew_reflection_attempt_lease", lambda a: renewals.append(a) or True)
+        stopped = asyncio.Event()
+        deadline = asyncio.get_running_loop().time() + 0.02
+        task = asyncio.create_task(
+            runner._renew_reflection_attempt_lease_until_stopped(attempt, stopped, deadline)
+        )
+        await asyncio.sleep(0.05)
+        stopped.set()
+        await task
+        assert renewals == []
+
+    @pytest.mark.asyncio
     async def test_sdk_wall_timeout_is_failed_attempt_and_cancels_run(
         self, tmp_path, monkeypatch
     ):
@@ -1168,6 +1189,19 @@ class TestDreamReflectionLoudness:
         assert runner._db.execute(
             "SELECT attempt_n, status, terminal FROM dream_reflection_attempts"
         ).fetchone() == (1, "failed", 0)
+        assert runner._db.execute(
+            "SELECT runner_completed_at FROM dream_reflection_attempts"
+        ).fetchone() == (None,)
+        assert runner._db.execute(
+            "SELECT last_message_ts FROM dream_state WHERE agent_name='pinky'"
+        ).fetchone()[0] == 0
+        await asyncio.sleep(0.08)
+        assert runner._db.execute(
+            "SELECT status, runner_completed_at FROM dream_reflection_attempts"
+        ).fetchone() == ("failed", None)
+        assert runner._db.execute(
+            "SELECT last_message_ts FROM dream_state WHERE agent_name='pinky'"
+        ).fetchone()[0] == 0
 
     @pytest.mark.asyncio
     async def test_sdk_timeout_discards_late_success_from_cancellation_suppressor(
@@ -1657,14 +1691,11 @@ class TestDreamReflectionLoudness:
             "SELECT agent_name FROM dream_reflection_attempts ORDER BY agent_name"
         ).fetchall() == [("old-retryable",), ("pending",), ("recent",)]
 
-    def test_dream_schema_rollback_fails_loud_at_startup(
-        self, tmp_path, monkeypatch
-    ):
+    def test_dream_schema_future_version_refuses_startup(self, tmp_path):
         db_path = tmp_path / "dream.db"
-        migrated = DreamRunner(db_path=str(db_path))
-        assert migrated._db.execute("PRAGMA user_version").fetchone()[0] == 1
-        migrated.close()
-        monkeypatch.setattr(dream_runner_module, "_DREAM_SCHEMA_VERSION", 0)
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("PRAGMA user_version=2")
+            connection.commit()
 
         with pytest.raises(RuntimeError) as exc_info:
             DreamRunner(db_path=str(db_path))
@@ -1674,7 +1705,7 @@ class TestDreamReflectionLoudness:
         assert "PinkyBot >=26.08.020" in message
         assert "refusing startup" in message
         with sqlite3.connect(db_path) as connection:
-            assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
     def test_round_two_rowid_boundary_schema_is_dropped_on_migration(self, tmp_path):
         db_path = tmp_path / "dream.db"
