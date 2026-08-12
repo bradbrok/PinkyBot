@@ -2017,6 +2017,9 @@ class TestAPI:
                 assert session.__class__.__name__ == "TmuxSession"
                 assert session._config.model == "sonnet"
                 assert session.resume_handle == "pinky-tmux-agent"
+                assert callable(
+                    session._config.wake_submission_recovery_injector
+                )
 
     def test_wake_uses_codex_tmux_session_for_codex_tmux_transport(self):
         # #215 PR2: codex_cli + transport=tmux is now a VALID combo (it was

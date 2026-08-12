@@ -445,6 +445,28 @@ _PASTE_ENTER_MAX_DELAY_MS = 2_000
 # used by the dashboard terminal transport.
 _WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC = 5.0
 _WAKE_SUBMISSION_ENTER_RETRY_LIMIT = 2
+# A failed context-restart wake gets one additional full paste cycle, and only
+# after a pane capture proves the composer is blank.  Each paste cycle retains
+# the bounded Enter-only verifier above.
+_WAKE_SUBMISSION_REPASTE_RETRY_LIMIT = 1
+_WAKE_SUBMISSION_BROKER_TIMEOUT_SEC = 5.0
+_WAKE_CONTEXT_RELOAD_INSTRUCTION = (
+    "CONTEXT-RELOAD: Reload the saved continuation state now with "
+    "load_my_context, then resume from that durable artifact. Do not replay "
+    "the failed orientation wake verbatim or treat it as delivered."
+)
+
+
+def _wake_submission_escalation_enabled() -> bool:
+    """Whether verified-failed context-restart wakes run the #984 ladder.
+
+    Default ON.  Read at verdict time so an operator can disable the ladder
+    without restarting the daemon while retaining the existing loud
+    UNVERIFIED terminal outcome.
+    """
+    return os.environ.get(
+        "PINKY_WAKE_SUBMISSION_ESCALATION", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _adaptive_paste_enter_delay_ms(text: str) -> int:
@@ -491,6 +513,14 @@ class _ContextLockDeferral(Exception):  # noqa: N818
 
 class _SchedulerDeliveryCancelled(Exception):  # noqa: N818
     """A timed-out scheduler receipt cancelled this turn before paste."""
+
+
+class _WakeSubmissionFallbackQueued(Exception):  # noqa: N818
+    """The failed wake was replaced by a broker context-reload handoff."""
+
+
+class _WakeSubmissionRecoveryScheduled(Exception):  # noqa: N818
+    """The failed wake scheduled transport recovery; stop the old worker."""
 
 
 @dataclass
@@ -1555,6 +1585,13 @@ class TmuxSession:
         # Dedicated wake-prompt tests leave this False and provide the
         # tailer simulation explicitly.
         self._skip_wake_prompt_for_tests: bool = False
+
+        # #984 Defect 1 — one transport-recovery budget survives the retained
+        # session object's respawn.  A verified replacement wake re-arms it;
+        # without this latch, a pane that rejects every orientation wake could
+        # recurse through force_restart forever.
+        self._wake_submission_transport_recovery_used: bool = False
+        self._wake_submission_recovery_task: asyncio.Task[None] | None = None
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -3481,6 +3518,21 @@ class TmuxSession:
         intent (idle_sleep / force_restart / explicit DEAD) by driving
         the state machine BEFORE calling disconnect.
         """
+        # A wake-escalation recovery task may be between scheduling and its
+        # force_restart call.  An independent disconnect owns shutdown and
+        # must cancel that task so it cannot revive a deliberately stopped
+        # session.  When force_restart itself reaches this method, the
+        # recovery task is the current task and must not cancel/await itself.
+        recovery_task = self._wake_submission_recovery_task
+        if (
+            recovery_task is not None
+            and recovery_task is not asyncio.current_task()
+        ):
+            if not recovery_task.done():
+                recovery_task.cancel()
+                await asyncio.gather(recovery_task, return_exceptions=True)
+            self._wake_submission_recovery_task = None
+
         # Fail and cancel scheduler-only delivery tasks before tearing down the
         # ordinary worker/pane. A pane shutdown is a terminal non-receipt.
         for turn in list(self._scheduler_pending_turns):
@@ -5837,6 +5889,18 @@ class TmuxSession:
                     )
                     await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
                     continue
+                except _WakeSubmissionFallbackQueued:
+                    # The original wake is terminal-False and its distinct
+                    # CONTEXT-RELOAD instruction now sits in the broker queue.
+                    # Do not count the failed wake as a turn or an error; clear
+                    # it so the worker advances to the fallback handoff.
+                    self._inflight_turn = None
+                    continue
+                except _WakeSubmissionRecoveryScheduled:
+                    # The recovery task owns teardown/re-spawn.  Exit this old
+                    # worker immediately so no backlog can overtake recovery.
+                    self._inflight_turn = None
+                    return
                 except Exception as e:
                     # For an ordinary turn, a tmux command timeout (``_run``'s
                     # 5s subprocess ceiling) is transient: keep the turn in
@@ -7321,6 +7385,10 @@ class TmuxSession:
         submit_attempts: int,
     ) -> bool:
         """Emit one positive wake submission verdict."""
+        # A positive wake proves the replacement transport can accept turns,
+        # so a future independent context restart receives a fresh one-shot
+        # transport-recovery budget.
+        self._wake_submission_transport_recovery_used = False
         latency_ms = int((time.monotonic() - started) * 1000)
         _log(
             f"tmux[{self.agent_name}]: wake prompt submission VERIFIED "
@@ -7338,11 +7406,277 @@ class TmuxSession:
         )
         return True
 
-    async def _verify_wake_submission(self, turn: _QueuedTurn) -> bool:
+    async def _emit_wake_submission_escalation(
+        self,
+        turn: _QueuedTurn,
+        *,
+        rung: str,
+        outcome: str,
+        detail: str = "",
+    ) -> None:
+        """Emit one bounded-ladder decision without logging prompt content."""
+        suffix = f", detail={detail}" if detail else ""
+        _log(
+            f"tmux[{self.agent_name}]: WAKE SUBMISSION ESCALATION "
+            f"rung={rung}, outcome={outcome}, reason={turn.reason}{suffix}"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_submission_escalation",
+                "agent_name": self.agent_name,
+                "reason": turn.reason,
+                "rung": rung,
+                "outcome": outcome,
+                "detail": detail,
+            }
+        )
+
+    async def _report_wake_submission_escalation_terminal(
+        self, turn: _QueuedTurn, *, detail: str
+    ) -> None:
+        """Surface exhaustion as a terminal operator-visible outcome."""
+        _log(
+            f"tmux[{self.agent_name}]: WAKE SUBMISSION ESCALATION TERMINAL "
+            f"— all bounded recovery rungs failed (reason={turn.reason}, "
+            f"detail={detail})"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_submission_escalation_terminal",
+                "agent_name": self.agent_name,
+                "reason": turn.reason,
+                "detail": detail,
+            }
+        )
+
+    @staticmethod
+    def _pane_snapshot_has_blank_prompt(snapshot: str) -> bool:
+        """Fail-closed test for a visibly empty composer.
+
+        Only a standalone prompt glyph on the final non-empty pane line is
+        accepted.  Placeholder copy, typed text, dialogs, spinners, capture
+        failures, and ambiguous layouts all skip re-paste and advance to the
+        broker rung.
+        """
+        nonempty = [
+            line.strip()
+            for line in (snapshot or "").splitlines()
+            if line.strip()
+        ]
+        return bool(nonempty and nonempty[-1] in {">", "❯"})
+
+    async def _repaste_unverified_context_restart_wake(
+        self,
+        turn: _QueuedTurn,
+        *,
+        started: float,
+        submit_attempts: int,
+        prompt_visible: bool | None,
+    ) -> bool:
+        """Run the single blank-composer re-paste rung."""
+        receipt = turn.submission_receipt
+        if receipt is None:
+            return False
+        if prompt_visible:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="repaste",
+                outcome="skipped",
+                detail="original_prompt_visible",
+            )
+            return False
+
+        for retry_index in range(_WAKE_SUBMISSION_REPASTE_RETRY_LIMIT):
+            async with self._repl_control_lock:
+                if self._receipt_accepted(receipt):
+                    return await self._report_verified_wake_submission(
+                        turn,
+                        started=started,
+                        submit_attempts=submit_attempts,
+                    )
+                try:
+                    pane = await self._tmux.capture_pane()
+                except Exception as exc:
+                    await self._emit_wake_submission_escalation(
+                        turn,
+                        rung="repaste",
+                        outcome="skipped",
+                        detail=f"pane_capture_raised_{type(exc).__name__}",
+                    )
+                    return False
+                if not pane.ok or not self._pane_snapshot_has_blank_prompt(
+                    pane.stdout or ""
+                ):
+                    await self._emit_wake_submission_escalation(
+                        turn,
+                        rung="repaste",
+                        outcome="skipped",
+                        detail=(
+                            "pane_capture_failed"
+                            if not pane.ok
+                            else "composer_not_proven_blank"
+                        ),
+                    )
+                    return False
+                # An exact row can land while capture-pane yields.  Receipt
+                # evidence always wins the boundary and forbids re-paste.
+                if self._receipt_accepted(receipt):
+                    return await self._report_verified_wake_submission(
+                        turn,
+                        started=started,
+                        submit_attempts=submit_attempts,
+                    )
+                try:
+                    result = await self._tmux.paste_text(turn.prompt, enter=True)
+                except Exception as exc:
+                    await self._emit_wake_submission_escalation(
+                        turn,
+                        rung="repaste",
+                        outcome="failed",
+                        detail=f"paste_raised_{type(exc).__name__}",
+                    )
+                    return False
+            if not result.ok:
+                await self._emit_wake_submission_escalation(
+                    turn,
+                    rung="repaste",
+                    outcome="failed",
+                    detail=f"paste_rc_{result.returncode}",
+                )
+                return False
+
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="repaste",
+                outcome="attempted",
+                detail=f"attempt_{retry_index + 1}",
+            )
+            if (
+                await self._verify_wake_submission(
+                    turn, allow_escalation=False
+                )
+                == "verified"
+            ):
+                await self._emit_wake_submission_escalation(
+                    turn,
+                    rung="repaste",
+                    outcome="succeeded",
+                    detail=f"attempt_{retry_index + 1}",
+                )
+                return True
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="repaste",
+                outcome="failed",
+                detail=f"attempt_{retry_index + 1}_unverified",
+            )
+            return False
+        return False
+
+    async def _inject_wake_context_reload(self, turn: _QueuedTurn) -> bool:
+        """Run the broker-injection rung with a non-replayed instruction."""
+        injector = self._config.wake_submission_recovery_injector
+        if injector is None:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="broker_context_reload",
+                outcome="failed",
+                detail="injector_unavailable",
+            )
+            return False
+        try:
+            result = injector(
+                self.agent_name,
+                _WAKE_CONTEXT_RELOAD_INSTRUCTION,
+            )
+            if asyncio.iscoroutine(result):
+                result = await asyncio.wait_for(
+                    result,
+                    timeout=_WAKE_SUBMISSION_BROKER_TIMEOUT_SEC,
+                )
+            delivered = result is True
+        except Exception as exc:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="broker_context_reload",
+                outcome="failed",
+                detail=f"injector_raised_{type(exc).__name__}",
+            )
+            return False
+        await self._emit_wake_submission_escalation(
+            turn,
+            rung="broker_context_reload",
+            outcome="succeeded" if delivered else "failed",
+            detail="context_reload_handoff" if delivered else "handoff_rejected",
+        )
+        return delivered
+
+    async def _run_wake_submission_transport_recovery(
+        self, turn: _QueuedTurn
+    ) -> None:
+        """Own the one-shot fresh force-restart rung outside the worker."""
+        # Let the old worker observe _WakeSubmissionRecoveryScheduled and exit
+        # before force_restart disconnects it.
+        await asyncio.sleep(0)
+        self._config.force_fresh_context_once = True
+        try:
+            restarted = await self.force_restart(bypass_guard=True)
+        except asyncio.CancelledError:
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="force_restart_cancelled"
+            )
+            raise
+        except Exception as exc:
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail=f"force_restart_raised_{type(exc).__name__}"
+            )
+            return
+        if restarted:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="force_restart",
+                outcome="succeeded",
+                detail="fresh_transport_started",
+            )
+            return
+        await self._report_wake_submission_escalation_terminal(
+            turn, detail="force_restart_rejected_or_failed"
+        )
+
+    async def _schedule_wake_submission_transport_recovery(
+        self, turn: _QueuedTurn
+    ) -> bool:
+        """Schedule at most one force-restart until a wake verifies."""
+        task = self._wake_submission_recovery_task
+        if task is not None and not task.done():
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="force_restart_already_in_flight"
+            )
+            return False
+        if self._wake_submission_transport_recovery_used:
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="force_restart_budget_exhausted"
+            )
+            return False
+        self._wake_submission_transport_recovery_used = True
+        self._wake_submission_recovery_task = asyncio.create_task(
+            self._run_wake_submission_transport_recovery(turn)
+        )
+        await self._emit_wake_submission_escalation(
+            turn,
+            rung="force_restart",
+            outcome="scheduled",
+            detail="fresh_context_preserved",
+        )
+        return True
+
+    async def _verify_wake_submission(
+        self, turn: _QueuedTurn, *, allow_escalation: bool = True
+    ) -> str:
         """Require exact turn-start evidence, retrying only a parked Enter."""
         receipt = turn.submission_receipt
         if receipt is None:
-            return True
+            return "verified"
 
         started = time.monotonic()
         prompt_visible: bool | None = None
@@ -7365,11 +7699,12 @@ class TmuxSession:
                 accepted = self._receipt_accepted(receipt)
 
             if accepted:
-                return await self._report_verified_wake_submission(
+                await self._report_verified_wake_submission(
                     turn,
                     started=started,
                     submit_attempts=submit_attempts,
                 )
+                return "verified"
 
             # A terminal/cancelled False receipt cannot become True later.
             if receipt.done():
@@ -7381,11 +7716,12 @@ class TmuxSession:
             # Re-pasting here could duplicate a side-effecting wake turn.
             prompt_visible = await self._timed_out_turn_landed(turn)
             if self._receipt_accepted(receipt):
-                return await self._report_verified_wake_submission(
+                await self._report_verified_wake_submission(
                     turn,
                     started=started,
                     submit_attempts=submit_attempts,
                 )
+                return "verified"
             if not prompt_visible:
                 break
             try:
@@ -7416,18 +7752,24 @@ class TmuxSession:
         # The exact row can land while the final best-effort pane probe yields.
         # Positive transcript evidence wins that timeout boundary.
         if self._receipt_accepted(receipt):
-            return await self._report_verified_wake_submission(
+            await self._report_verified_wake_submission(
                 turn,
                 started=started,
                 submit_attempts=submit_attempts,
             )
+            return "verified"
         latency_ms = int((time.monotonic() - started) * 1000)
-        self._resolve_submission_receipt(turn, False)
+        escalation_applies = bool(
+            allow_escalation
+            and turn.reason == f"wake_{WakeReason.CONTEXT_RESTART.value}"
+            and _wake_submission_escalation_enabled()
+        )
         _log(
             f"tmux[{self.agent_name}]: wake prompt submission UNVERIFIED "
             f"after bounded Enter retries (reason={turn.reason}, "
             f"submit_attempts={submit_attempts}, latency_ms={latency_ms}, "
             f"prompt_visible={prompt_visible}); not claiming delivery"
+            + ("; starting bounded escalation" if escalation_applies else "")
         )
         await self._emit_stream_event(
             {
@@ -7437,9 +7779,28 @@ class TmuxSession:
                 "submit_attempts": submit_attempts,
                 "latency_ms": latency_ms,
                 "prompt_visible": prompt_visible,
+                "escalating": escalation_applies,
             }
         )
-        return False
+        if not escalation_applies:
+            self._resolve_submission_receipt(turn, False)
+            return "unverified"
+
+        if await self._repaste_unverified_context_restart_wake(
+            turn,
+            started=started,
+            submit_attempts=submit_attempts,
+            prompt_visible=prompt_visible,
+        ):
+            return "verified"
+
+        # Freeze the original wake's verdict before the distinct broker path.
+        # Any later exact row for it is ignored, preventing both the original
+        # wake and the context-reload fallback from being credited.
+        self._resolve_submission_receipt(turn, False)
+        if await self._inject_wake_context_reload(turn):
+            return "fallback_queued"
+        return "recovery_required"
 
     async def _finish_submitted_turn(self, turn: _QueuedTurn) -> None:
         """Record pane delivery and enforce any exact wake receipt."""
@@ -7453,12 +7814,22 @@ class TmuxSession:
         )
         if not verify_submission:
             return
-        if await self._verify_wake_submission(turn):
+        verdict = await self._verify_wake_submission(turn)
+        if verdict == "verified":
             self._fire_on_delivered(turn)
             return
 
         self._discard_unverified_turn_delivery(turn)
         self._turn_done.set()
+        if verdict == "fallback_queued":
+            raise _WakeSubmissionFallbackQueued(
+                "failed orientation wake replaced by broker context reload"
+            )
+        if verdict == "recovery_required":
+            if await self._schedule_wake_submission_transport_recovery(turn):
+                raise _WakeSubmissionRecoveryScheduled(
+                    "failed orientation wake scheduled transport recovery"
+                )
         raise RuntimeError(
             "wake prompt paste/Enter was not confirmed by an exact "
             "transcript receipt after bounded Enter retries"
