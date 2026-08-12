@@ -67,7 +67,7 @@ class TmuxDreamConfig:
     # instructions, so file-level delivery is equivalent in practice).
     system_prompt: str = ""
 
-    # PRIMARY tool boundary (Murzik, #708 review): the dream prompt embeds raw
+    # PRIMARY tool boundary (#708 review): the dream prompt embeds raw
     # conversation history, so an injection there must not reach a broad
     # interactive tool surface. Mirror the SDK path's allowlist semantics
     # (--allowedTools + bypassPermissions), widened only by Read (prompt file)
