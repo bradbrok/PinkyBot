@@ -1707,6 +1707,19 @@ class TestDreamReflectionLoudness:
         with sqlite3.connect(db_path) as connection:
             assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
 
+    def test_schema_bump_before_constructor_is_refused_without_mutation(self, tmp_path):
+        db_path = tmp_path / "dream.db"
+        with sqlite3.connect(db_path) as connection:
+            connection.execute("CREATE TABLE sentinel (value TEXT)")
+            connection.execute("INSERT INTO sentinel VALUES ('before')")
+            connection.execute("PRAGMA user_version=2")
+            connection.commit()
+        with pytest.raises(RuntimeError, match="schema is newer"):
+            DreamRunner(db_path=str(db_path))
+        with sqlite3.connect(db_path) as connection:
+            assert connection.execute("SELECT * FROM sentinel").fetchone() == ("before",)
+            assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+
     def test_round_two_rowid_boundary_schema_is_dropped_on_migration(self, tmp_path):
         db_path = tmp_path / "dream.db"
         with sqlite3.connect(db_path) as connection:
