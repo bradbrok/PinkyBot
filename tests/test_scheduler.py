@@ -1345,7 +1345,12 @@ class TestScheduler:
         scheduler = AgentScheduler(registry, wake_callback=confirmed)
         await scheduler._replay_pending_locked("oleg")
 
-        assert attempts == ["boundary frozen prompt", "fresh frozen prompt"]
+        assert len(attempts) == 2
+        assert "Note: 1 fire of recurring schedule 'minutely'" in attempts[0]
+        assert "The work that fire would have done was NOT performed." in attempts[0]
+        assert attempts[0].endswith("\n\nboundary frozen prompt")
+        assert attempts[1] == "fresh frozen prompt"
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
         assert registry.get_schedule_wake_by_fire(
             schedule.id, stale.fired_at
         ) is None
@@ -1468,6 +1473,7 @@ class TestScheduler:
         assert "STALE ONE-SHOT WAKE DROPPED" in alerts[0][1]
         assert f"outbox row #{pending.id}" in alerts[0][1]
         assert "has no next occurrence" in alerts[0][1]
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
 
     @pytest.mark.asyncio
     async def test_kill_after_durable_accept_before_future_resolve_never_replays(
@@ -3424,6 +3430,10 @@ class TestCohortStalenessGuard:
             registry.get_schedule_wake_by_fire(schedule.id, schedule.last_run)
             is None
         )
+        notices = registry.list_recurring_schedule_stale_drops("oleg")
+        assert len(notices) == 1
+        assert notices[0].schedule_id == schedule.id
+        assert notices[0].drop_count == 1
 
     @pytest.mark.asyncio
     async def test_stale_one_shot_cohort_drop_alerts_owner(
@@ -3478,3 +3488,220 @@ class TestCohortStalenessGuard:
         assert len(alerts) == 1  # owner alerted about the lost one-shot
         assert alerts[0][0] == "oleg"
         assert "STALE ONE-SHOT WAKE DROPPED" in alerts[0][1]
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
+
+
+class TestRecurringStaleDropSurfacing:
+    """#1053 — recurring stale drops surface to the agent, never the owner."""
+
+    def test_no_subsequent_wake_stays_bounded_and_cascades(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="hourly-ish", prompt="work"
+        )
+
+        for offset in range(100):
+            registry.record_recurring_schedule_stale_drop(
+                schedule.id,
+                agent_name="oleg",
+                schedule_name=schedule.name,
+                dropped_at=1_800_000_000.0 + offset,
+                row_age_s=61.0 + offset,
+            )
+
+        notices = registry.list_recurring_schedule_stale_drops("oleg")
+        assert len(notices) == 1
+        assert notices[0].drop_count == 100
+        assert notices[0].generation == 100
+        assert notices[0].first_dropped_at == pytest.approx(1_800_000_000.0)
+        assert notices[0].last_dropped_at == pytest.approx(1_800_000_099.0)
+        assert notices[0].max_row_age_s == pytest.approx(160.0)
+        assert registry.list_pending_schedule_wakes("oleg") == []
+
+        assert registry.remove_schedule(schedule.id) is True
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
+
+    def test_surface_ack_does_not_erase_concurrent_new_drop(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="concurrent", prompt="work"
+        )
+        registry.record_recurring_schedule_stale_drop(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            dropped_at=1_800_000_000.0,
+            row_age_s=61.0,
+        )
+        surfaced_snapshot = registry.list_recurring_schedule_stale_drops("oleg")
+
+        registry.record_recurring_schedule_stale_drop(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            dropped_at=1_800_000_001.0,
+            row_age_s=62.0,
+        )
+
+        assert (
+            registry.acknowledge_recurring_schedule_stale_drops(
+                "oleg", surfaced_snapshot
+            )
+            == 0
+        )
+        retained = registry.list_recurring_schedule_stale_drops("oleg")
+        assert len(retained) == 1
+        assert retained[0].drop_count == 2
+        assert retained[0].generation == 2
+
+    @pytest.mark.asyncio
+    async def test_both_drop_sites_aggregate_surface_and_clear_once(
+        self, registry, monkeypatch
+    ):
+        registry.register("oleg")
+        lost = registry.add_schedule(
+            "oleg", "* * * * *", name="hourly sweep", prompt="lost work"
+        )
+        next_wake = registry.add_schedule(
+            "oleg", "* * * * *", name="next wake", prompt="new work"
+        )
+        now = 1_800_000_000.0
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        attempts: list[str] = []
+        owner_alerts: list[tuple[str, str]] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        async def owner_notify(agent_name, message):
+            owner_alerts.append((agent_name, message))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=3_600.0,
+        )
+
+        # Replay-path stale drop.
+        replay_fire = now - 62.0
+        registry.persist_schedule_wake(
+            lost.id,
+            agent_name="oleg",
+            schedule_name=lost.name,
+            prompt=lost.prompt,
+            fired_at=replay_fire,
+        )
+        await scheduler._replay_pending_locked("oleg")
+
+        # Live-cohort stale drop for the same schedule.
+        lost.last_run = now - 61.0
+        registry.persist_schedule_wake(
+            lost.id,
+            agent_name="oleg",
+            schedule_name=lost.name,
+            prompt=lost.prompt,
+            fired_at=lost.last_run,
+        )
+        await scheduler._deliver_schedule(lost)
+
+        notices = registry.list_recurring_schedule_stale_drops("oleg")
+        assert len(notices) == 1
+        assert notices[0].schedule_id == lost.id
+        assert notices[0].drop_count == 2
+        assert attempts == []
+        assert owner_alerts == []
+        assert registry.list_pending_schedule_wakes("oleg") == []
+
+        # The notice registry alone never triggers or resurrects a wake.
+        await scheduler._replay_pending_locked("oleg")
+        assert attempts == []
+        assert len(registry.list_recurring_schedule_stale_drops("oleg")) == 1
+
+        # The next genuinely delivered wake carries one aggregate and clears it.
+        next_wake.last_run = now - 1.0
+        await scheduler._deliver_schedule(next_wake)
+        assert len(attempts) == 1
+        assert "Note: 2 fires of recurring schedule 'hourly sweep'" in attempts[0]
+        assert "The work those fires would have done was NOT performed." in attempts[0]
+        assert attempts[0].endswith("\n\nnew work")
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
+
+        # A later wake sees neither a duplicate note nor any owner delivery.
+        next_wake.last_run = now
+        await scheduler._deliver_schedule(next_wake)
+        assert attempts[1] == "new work"
+        assert owner_alerts == []
+
+    @pytest.mark.asyncio
+    async def test_unconfirmed_wake_keeps_note_for_next_success(
+        self, registry, monkeypatch
+    ):
+        registry.register("oleg")
+        dropped = registry.add_schedule(
+            "oleg", "* * * * *", name="dropped", prompt="lost work"
+        )
+        delivery = registry.add_schedule(
+            "oleg", "* * * * *", name="delivery", prompt="new work"
+        )
+        now = 1_800_000_000.0
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        registry.record_recurring_schedule_stale_drop(
+            dropped.id,
+            agent_name="oleg",
+            schedule_name=dropped.name,
+            dropped_at=now - 1.0,
+            row_age_s=61.0,
+        )
+        delivery.last_run = now - 1.0
+        attempts: list[str] = []
+
+        async def first_fails(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return False
+
+        scheduler = AgentScheduler(registry, wake_callback=first_fails)
+        await scheduler._deliver_schedule(delivery)
+
+        assert "Note: 1 fire of recurring schedule 'dropped'" in attempts[0]
+        assert len(registry.list_recurring_schedule_stale_drops("oleg")) == 1
+
+        async def then_succeeds(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler._wake_callback = then_succeeds
+        await scheduler._replay_pending_locked("oleg")
+
+        assert "Note: 1 fire of recurring schedule 'dropped'" in attempts[1]
+        assert attempts[1].endswith("\n\nnew work")
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
+
+    @pytest.mark.asyncio
+    async def test_no_drops_leaves_wake_prompt_unchanged(
+        self, registry, monkeypatch
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="ordinary", prompt="ordinary work"
+        )
+        now = 1_800_000_000.0
+        schedule.last_run = now
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        await scheduler._deliver_schedule(schedule)
+
+        assert attempts == ["ordinary work"]
+        assert registry.list_recurring_schedule_stale_drops("oleg") == []
