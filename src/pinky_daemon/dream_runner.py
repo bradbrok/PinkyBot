@@ -225,16 +225,23 @@ class DreamRunner:
             );
         """)
         # Serialize migration and re-check after acquiring the write lock.
-        self._db.execute("BEGIN IMMEDIATE")
-        try:
-            self._migrate_tables()
-            version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
-            if version < _DREAM_SCHEMA_VERSION:
-                self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
-            self._db.commit()
-        except BaseException:
-            self._db.rollback()
-            raise
+        for migration_attempt in range(5):
+            self._db.execute("BEGIN IMMEDIATE")
+            try:
+                self._migrate_tables()
+                version = int(self._db.execute("PRAGMA user_version").fetchone()[0] or 0)
+                if version < _DREAM_SCHEMA_VERSION:
+                    self._db.execute(f"PRAGMA user_version={_DREAM_SCHEMA_VERSION}")
+                self._db.commit()
+                break
+            except sqlite3.OperationalError:
+                self._db.rollback()
+                if migration_attempt == 4:
+                    raise
+                time.sleep(0.05 * (migration_attempt + 1))
+            except BaseException:
+                self._db.rollback()
+                raise
 
     def _check_schema_version(self) -> None:
         """Fail startup before touching a dream DB created by newer code."""
