@@ -1087,6 +1087,47 @@ _PANE_LIVENESS_CAPTURE_LINES = 40
 _PANE_LIVENESS_SAMPLE_GAP_SEC = 1.5
 
 
+def _watchdog_frozen_liveness_trigger_enabled() -> bool:
+    """Whether frozen live-status vetoes may escalate to recovery (#984).
+
+    Default ON.  Read per watchdog tick so operators can disable both the
+    never-started signature and the general stale-veto age cap without a
+    daemon restart.
+    """
+    return os.environ.get(
+        "PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _watchdog_seconds_env(name: str, default: float) -> float:
+    """Read a non-negative watchdog duration, falling back safely."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except (TypeError, ValueError):
+        value = default
+    return max(0.0, value)
+
+
+def _watchdog_never_started_grace_sec() -> float:
+    """Grace before a frozen at-or-before-launch status becomes actionable."""
+    return _watchdog_seconds_env(
+        "PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", 300.0
+    )
+
+
+def _watchdog_stale_veto_cap_sec() -> float:
+    """Maximum continuous age of one frozen stale-veto timestamp."""
+    return _watchdog_seconds_env("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", 1800.0)
+
+
+def _watchdog_frozen_restart_interval_sec() -> float:
+    """Minimum spacing between frozen-liveness restart attempts per session."""
+    return _watchdog_seconds_env(
+        "PINKY_WATCHDOG_FROZEN_RESTART_INTERVAL_SEC", 600.0
+    )
+
+
 def _pane_liveness_enabled() -> bool:
     """Whether the inflight watchdog credits an animating tmux pane as liveness
     (#832). Default ON; ``PINKY_WATCHDOG_PANE_LIVENESS=0`` is the kill switch
@@ -1400,6 +1441,16 @@ class TmuxSession:
         # genuinely new head (deque advanced) auto-starts a fresh ceiling budget
         # without having to touch the out-of-loop head-start sites.
         self._inflight_pane_ext_anchor: tuple[object, float] | None = None
+        # #984 Defect 2 — continuous frozen-live-status observation.  One
+        # bounded tuple per TmuxSession: (last_updated value, first-seen wall
+        # clock, consecutive observations).  Any changed value starts a new
+        # observation window, so a fossilized reader that still ADVANCES can
+        # never match the never-started signature or stale-veto age cap.
+        self._watchdog_frozen_live_status: tuple[float, float, int] | None = None
+        # Pacing survives force_restart's retained-instance respawn.  If a
+        # restart does not cure the frozen signal, this prevents the new
+        # watchdog from immediately tearing the replacement pane down again.
+        self._watchdog_last_frozen_restart_at: float | None = None
         # Back-compat advisory signal. Pre-#560 this was the worker's
         # per-iteration gate (the bottleneck that broke steering).
         # Post-#560 the worker no longer awaits it between dispatches;
@@ -2867,6 +2918,11 @@ class TmuxSession:
                     f"stderr={result.stderr.strip()!r}"
                 )
             self._current_session_started_at = session_started_at
+            # The frozen-value tracker is scoped to the CURRENT tmux process.
+            # Keep restart pacing on the retained TmuxSession instance, but
+            # never compare the replacement process against the old process's
+            # observation window.
+            self._watchdog_frozen_live_status = None
 
         try:
             await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
@@ -6181,7 +6237,79 @@ class TmuxSession:
             }
         return {"active": False, "reason": "quiet", "age_s": None}
 
-    def _inflight_stall_verdict(self, now: float) -> str:
+    def _read_live_status(self) -> dict | None:
+        """Read the process-local live-status signal once, fail-closed."""
+        fn = getattr(self._config, "live_status_fn", None)
+        if fn is None:
+            return None
+        try:
+            live = fn()
+        except Exception:
+            return None
+        return live if isinstance(live, dict) else None
+
+    def _observe_frozen_live_status(
+        self, now: float, live: dict | None
+    ) -> tuple[float, float, int] | None:
+        """Track one unchanged numeric ``last_updated`` value (#984).
+
+        A changed value — including one that still predates the current tmux
+        process — starts a fresh window with a single observation.  Missing or
+        malformed evidence breaks continuity entirely.
+        """
+        last_updated = live.get("last_updated") if live else None
+        if (
+            not isinstance(last_updated, (int, float))
+            or isinstance(last_updated, bool)
+        ):
+            self._watchdog_frozen_live_status = None
+            return None
+        value = float(last_updated)
+        observed = self._watchdog_frozen_live_status
+        if observed is None or observed[0] != value:
+            observed = (value, now, 1)
+        else:
+            observed = (value, observed[1], observed[2] + 1)
+        self._watchdog_frozen_live_status = observed
+        return observed
+
+    def _frozen_liveness_restart_reason(
+        self, now: float, live: dict | None
+    ) -> str | None:
+        """Return the bounded recovery reason for a stale-veto sample."""
+        if not _watchdog_frozen_liveness_trigger_enabled():
+            return None
+        observed = self._watchdog_frozen_live_status
+        last_updated = live.get("last_updated") if live else None
+        if (
+            observed is None
+            or observed[2] < 2
+            or not isinstance(last_updated, (int, float))
+            or isinstance(last_updated, bool)
+            or observed[0] != float(last_updated)
+        ):
+            return None
+        session_started_at = self._current_session_started_at
+        if (
+            session_started_at > 0
+            and float(last_updated) <= session_started_at
+            and (now - session_started_at) > _watchdog_never_started_grace_sec()
+        ):
+            return "never_started_signature"
+        if (now - observed[1]) > _watchdog_stale_veto_cap_sec():
+            return "stale_live_status_age_cap"
+        return None
+
+    def _frozen_liveness_restart_is_paced(self, now: float) -> bool:
+        last_attempt = self._watchdog_last_frozen_restart_at
+        return (
+            last_attempt is not None
+            and (now - last_attempt) < _watchdog_frozen_restart_interval_sec()
+        )
+
+    def _inflight_stall_verdict(
+        self, now: float, live_status_sample: dict | None = None
+    ) -> str:
         """Classify a possibly-stalled inflight head for the watchdog (#118).
 
         Returns one of:
@@ -6199,8 +6327,10 @@ class TmuxSession:
                             input, so the lingering meta(s) are phantom (a
                             paste with no matching stop_hook). Reconcile, don't
                             restart.
-          - ``"unknown"`` — live_status predates this tmux process and cannot
-                            prove either idle or wedged; veto restart.
+          - ``"unknown"`` — live_status predates this tmux process or the
+                            current head and cannot yet prove either idle or
+                            wedged; veto restart pending bounded frozen-signal
+                            recovery.
           - ``"wedged"``  — aged out, transcript quiet, REPL not idle →
                             genuinely stuck; force_restart.
 
@@ -6242,21 +6372,11 @@ class TmuxSession:
         # REPL has nothing in flight. Require the idle to be at-least-as-recent
         # as when the CURRENT head was pasted — otherwise a turn was pasted
         # that the REPL never came alive for (hang-on-paste), which IS a wedge.
-        live = None
-        fn = getattr(self._config, "live_status_fn", None)
-        if fn is not None:
-            try:
-                live = fn()
-            except Exception:
-                live = None
+        live = live_status_sample
+        if live is None:
+            live = self._read_live_status()
         live_last_updated = live.get("last_updated") if live else None
-        if (
-            self._current_session_started_at > 0
-            and isinstance(live_last_updated, (int, float))
-            and not isinstance(live_last_updated, bool)
-            and live_last_updated < self._current_session_started_at
-        ):
-            return "unknown"
+        head = self._inflight_metas[0]
         if live and live.get("status") == "idle":
             last_updated = live.get("last_updated") or 0.0
             # Floor the idle-freshness check at when the current head was
@@ -6273,7 +6393,6 @@ class TmuxSession:
             # window: both timestamps come from the same daemon clock (no
             # skew), and a turn's own idle always postdates its own paste, so
             # an idle that predates the paste cannot belong to this turn.
-            head = self._inflight_metas[0]
             idle_floor = min(self._head_started_at, head.dispatched_at)
             if last_updated >= idle_floor:
                 return "idle"
@@ -6304,6 +6423,21 @@ class TmuxSession:
                             return "idle"
                     except OSError:
                         pass
+        # Positive idle evidence above is authoritative (#118/#592), even if
+        # the numeric live-status timestamp itself predates this head. Only a
+        # sample that failed both idle proofs may become an unknown/stale veto
+        # and accrue toward #984's bounded frozen-signal recovery.
+        live_floor = min(self._head_started_at, head.dispatched_at)
+        if (
+            self._current_session_started_at > 0
+            and isinstance(live_last_updated, (int, float))
+            and not isinstance(live_last_updated, bool)
+            and (
+                live_last_updated <= self._current_session_started_at
+                or live_last_updated < live_floor
+            )
+        ):
+            return "unknown"
         self._log_wedged_inputs(now, live)
         return "wedged"
 
@@ -6447,9 +6581,18 @@ class TmuxSession:
                 # takes effect live (no respawn). Checked at the TOP so nothing
                 # below (verdict, pane-liveness sampling, force_restart) runs.
                 if not self._watchdog_enabled():
+                    self._watchdog_frozen_live_status = None
                     continue
                 now = time.time()
-                verdict = self._inflight_stall_verdict(now)
+                live = self._read_live_status()
+                if _watchdog_frozen_liveness_trigger_enabled():
+                    self._observe_frozen_live_status(now, live)
+                else:
+                    # A live kill-switch flip starts a fresh continuity window
+                    # when re-enabled; time spent disabled never counts toward
+                    # either recovery threshold.
+                    self._watchdog_frozen_live_status = None
+                verdict = self._inflight_stall_verdict(now, live)
                 if verdict == "ok":
                     continue
                 age = now - (self._head_started_at or now)
@@ -6462,6 +6605,7 @@ class TmuxSession:
                 # (capture-pane + sample gap), during which a stop hook can pop or
                 # advance the head out from under us.
                 head_meta = self._inflight_metas[0]
+                restart_reason: str | None = None
                 if verdict == "growing":
                     # #118: head aged out BUT the transcript is still being
                     # written — a long/streaming turn, NOT a wedge. Extend
@@ -6515,37 +6659,93 @@ class TmuxSession:
                     )
                     continue
                 if verdict == "unknown":
-                    # #943: a process-local live-status reader can fossilize
-                    # across session recreation.  A value predating THIS tmux
-                    # process is not evidence that an idle/static pane is
-                    # wedged. Fail toward no-restart, extend the decision
-                    # window, and emit a distinctive release receipt once per
-                    # timeout window.
-                    self._head_started_at = now
+                    # #943 prevents one stale sample from proving a wedge.
+                    # #984 bounds that veto: an unchanged value at-or-before
+                    # launch becomes the never-started signature after grace;
+                    # any other unchanged stale value gets the general age
+                    # cap.  Both reuse the established replay-safe recovery
+                    # below and are paced across retained-instance respawns.
                     self._inflight_pane_ext_anchor = None
-                    live = None
-                    live_status_fn = getattr(self._config, "live_status_fn", None)
-                    if live_status_fn is not None:
-                        try:
-                            live = live_status_fn()
-                        except Exception:
-                            live = None
-                    _log(
-                        f"tmux[{self.agent_name}]: "
-                        f"WATCHDOG_STALE_LIVE_STATUS_VETO "
-                        f"live_last_updated="
-                        f"{live.get('last_updated') if live else None} "
-                        f"session_started_at={self._current_session_started_at} "
-                        f"— input unknown; NOT restarting "
-                        f"(deque depth={depth})"
-                    )
-                    log_watchdog_decision(
-                        watchdog="inflight", agent=self.agent_name,
-                        decision="skip", reason="stale_live_status_veto",
-                        state=self.state.value, progress_stale_s=age,
-                        inflight_turns=depth, inflight_active=False,
-                    )
-                    continue
+                    restart_reason = self._frozen_liveness_restart_reason(now, live)
+                    live_last_updated = live.get("last_updated") if live else None
+                    observed = self._watchdog_frozen_live_status
+                    frozen_for = (now - observed[1]) if observed else 0.0
+                    if restart_reason and self._frozen_liveness_restart_is_paced(now):
+                        last_attempt = self._watchdog_last_frozen_restart_at
+                        since_attempt = (
+                            now - last_attempt if last_attempt is not None else 0.0
+                        )
+                        self._head_started_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_FROZEN_LIVENESS_RESTART_PACED "
+                            f"reason={restart_reason} "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"since_attempt_s={since_attempt:.1f} — NOT restarting "
+                            f"(deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="skip", reason="frozen_liveness_restart_paced",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                        continue
+                    if restart_reason == "never_started_signature":
+                        self._watchdog_last_frozen_restart_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_NEVER_STARTED_RESTART "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"session_age_s="
+                            f"{now - self._current_session_started_at:.1f} "
+                            f"frozen_for_s={frozen_for:.1f} "
+                            f"— scheduling force_restart (deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="restart", reason="never_started_signature",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                    elif restart_reason == "stale_live_status_age_cap":
+                        self._watchdog_last_frozen_restart_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_STALE_LIVE_STATUS_CAP_RESTART "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"frozen_for_s={frozen_for:.1f} "
+                            f"— scheduling force_restart (deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="restart", reason="stale_live_status_age_cap",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                    else:
+                        # A changed/freshly-observed fossil is still unknown,
+                        # never restart proof. Preserve #943's veto while its
+                        # bounded continuity evidence accumulates.
+                        self._head_started_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_STALE_LIVE_STATUS_VETO "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"— input unknown; NOT restarting "
+                            f"(deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="skip", reason="stale_live_status_veto",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                        continue
                 # (#832) Last-chance liveness before tearing down a "wedged"
                 # head: a long pure-reasoning / slow-generation turn (common at
                 # ultracode/xhigh) writes nothing to the transcript and has no
@@ -6555,7 +6755,7 @@ class TmuxSession:
                 # like the "growing" branch. Bounded by an absolute ceiling so an
                 # animating-but-genuinely-stuck REPL is still recovered, and
                 # flag-gated (PINKY_WATCHDOG_PANE_LIVENESS=0) for a kill switch.
-                if _pane_liveness_enabled():
+                if restart_reason is None and _pane_liveness_enabled():
                     # Anchor the absolute ceiling to when THIS head FIRST reached
                     # the pane-liveness rescue, NOT to ``_head_started_at`` — the
                     # extend branch below resets ``_head_started_at = now`` on every
@@ -6606,20 +6806,21 @@ class TmuxSession:
                         f"restarting (#832; deque depth={len(self._inflight_metas)})"
                     )
                     continue
-                # verdict == "wedged": no output + REPL not idle → genuinely
-                # stuck. Fall through to the force_restart recovery path.
-                _log(
-                    f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
-                    f"> {_TURN_DONE_TIMEOUT_SEC}s, transcript quiet + REPL not "
-                    f"idle — REPL stuck; scheduling force_restart "
-                    f"(deque depth={depth})"
-                )
-                log_watchdog_decision(
-                    watchdog="inflight", agent=self.agent_name,
-                    decision="restart", reason="wedged", state=self.state.value,
-                    progress_stale_s=age, inflight_turns=depth,
-                    inflight_active=False,
-                )
+                if restart_reason is None:
+                    # verdict == "wedged": no output + REPL not idle → genuinely
+                    # stuck. Fall through to the force_restart recovery path.
+                    _log(
+                        f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                        f"> {_TURN_DONE_TIMEOUT_SEC}s, transcript quiet + REPL not "
+                        f"idle — REPL stuck; scheduling force_restart "
+                        f"(deque depth={depth})"
+                    )
+                    log_watchdog_decision(
+                        watchdog="inflight", agent=self.agent_name,
+                        decision="restart", reason="wedged", state=self.state.value,
+                        progress_stale_s=age, inflight_turns=depth,
+                        inflight_active=False,
+                    )
                 # Snapshot deque state before mutation so this critical
                 # section is atomic from the outside (no awaits between
                 # snapshot and mutation).
