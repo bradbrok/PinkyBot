@@ -750,6 +750,20 @@ class PendingScheduleWake:
         }
 
 
+@dataclass(frozen=True)
+class RecurringScheduleStaleDrop:
+    """Bounded aggregate of recurring fires dropped before delivery."""
+
+    schedule_id: int = 0
+    agent_name: str = ""
+    schedule_name: str = ""
+    drop_count: int = 0
+    first_dropped_at: float = 0.0
+    last_dropped_at: float = 0.0
+    max_row_age_s: float = 0.0
+    generation: int = 0
+
+
 class ScheduleNameConflictError(ValueError):
     """An enabled schedule already uses the requested agent/name pair."""
 
@@ -1374,6 +1388,20 @@ class AgentRegistry:
                 UNIQUE(schedule_id, fired_at)
             );
 
+            CREATE TABLE IF NOT EXISTS recurring_schedule_stale_drops (
+                schedule_id INTEGER PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                schedule_name TEXT NOT NULL DEFAULT '',
+                drop_count INTEGER NOT NULL DEFAULT 1,
+                first_dropped_at REAL NOT NULL,
+                last_dropped_at REAL NOT NULL,
+                max_row_age_s REAL NOT NULL DEFAULT 0,
+                generation INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (schedule_id) REFERENCES agent_schedules(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+            );
+
             CREATE TABLE IF NOT EXISTS agent_heartbeats (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
@@ -1532,6 +1560,8 @@ class AgentRegistry:
                 ON agent_schedules(agent_name);
             CREATE INDEX IF NOT EXISTS idx_pending_schedule_wakes_agent
                 ON pending_schedule_wakes(agent_name, fired_at, id);
+            CREATE INDEX IF NOT EXISTS idx_recurring_stale_drops_agent
+                ON recurring_schedule_stale_drops(agent_name, schedule_id);
             CREATE INDEX IF NOT EXISTS idx_pending_messages_agent_chat
                 ON pending_messages(agent_name, chat_id, delivered);
             CREATE INDEX IF NOT EXISTS idx_approval_requests_retry
@@ -4494,6 +4524,110 @@ except Exception as exc:
             (ts, schedule_id),
         )
         self._db.commit()
+
+    def record_recurring_schedule_stale_drop(
+        self,
+        schedule_id: int,
+        *,
+        agent_name: str,
+        schedule_name: str,
+        dropped_at: float,
+        row_age_s: float,
+    ) -> RecurringScheduleStaleDrop:
+        """Aggregate one stale recurring fire into one bounded schedule row.
+
+        The table has exactly one row per live schedule and cascades on
+        schedule deletion. ``generation`` lets delivery acknowledge only the
+        snapshot it actually surfaced; a concurrent newer drop stays pending.
+        """
+        if schedule_id <= 0:
+            raise ValueError("schedule_id must be positive")
+        if not agent_name:
+            raise ValueError("agent_name must not be empty")
+        if dropped_at <= 0:
+            raise ValueError("dropped_at must be positive")
+        bounded_name = str(schedule_name or "")[:256]
+        bounded_age = max(0.0, float(row_age_s))
+        with self._rmw_lock:
+            self._db.execute(
+                """INSERT INTO recurring_schedule_stale_drops (
+                       schedule_id, agent_name, schedule_name, drop_count,
+                       first_dropped_at, last_dropped_at, max_row_age_s,
+                       generation
+                   ) VALUES (?, ?, ?, 1, ?, ?, ?, 1)
+                   ON CONFLICT(schedule_id) DO UPDATE SET
+                       agent_name=excluded.agent_name,
+                       schedule_name=excluded.schedule_name,
+                       drop_count=recurring_schedule_stale_drops.drop_count + 1,
+                       first_dropped_at=MIN(
+                           recurring_schedule_stale_drops.first_dropped_at,
+                           excluded.first_dropped_at
+                       ),
+                       last_dropped_at=MAX(
+                           recurring_schedule_stale_drops.last_dropped_at,
+                           excluded.last_dropped_at
+                       ),
+                       max_row_age_s=MAX(
+                           recurring_schedule_stale_drops.max_row_age_s,
+                           excluded.max_row_age_s
+                       ),
+                       generation=recurring_schedule_stale_drops.generation + 1""",
+                (
+                    schedule_id,
+                    agent_name,
+                    bounded_name,
+                    dropped_at,
+                    dropped_at,
+                    bounded_age,
+                ),
+            )
+            row = self._db.execute(
+                """SELECT schedule_id, agent_name, schedule_name, drop_count,
+                          first_dropped_at, last_dropped_at, max_row_age_s,
+                          generation
+                   FROM recurring_schedule_stale_drops
+                   WHERE schedule_id=?""",
+                (schedule_id,),
+            ).fetchone()
+            self._db.commit()
+        return RecurringScheduleStaleDrop(*row)
+
+    def list_recurring_schedule_stale_drops(
+        self, agent_name: str
+    ) -> list[RecurringScheduleStaleDrop]:
+        """Return unsurfaced recurring-drop aggregates in stable order."""
+        rows = self._db.execute(
+            """SELECT schedule_id, agent_name, schedule_name, drop_count,
+                      first_dropped_at, last_dropped_at, max_row_age_s,
+                      generation
+               FROM recurring_schedule_stale_drops
+               WHERE agent_name=?
+               ORDER BY schedule_id ASC""",
+            (agent_name,),
+        ).fetchall()
+        return [RecurringScheduleStaleDrop(*row) for row in rows]
+
+    def acknowledge_recurring_schedule_stale_drops(
+        self,
+        agent_name: str,
+        notices: list[RecurringScheduleStaleDrop],
+    ) -> int:
+        """Clear only versioned aggregates included in a confirmed delivery."""
+        if not notices:
+            return 0
+        cleared = 0
+        with self._rmw_lock:
+            for notice in notices:
+                if notice.agent_name != agent_name:
+                    continue
+                cursor = self._db.execute(
+                    """DELETE FROM recurring_schedule_stale_drops
+                       WHERE agent_name=? AND schedule_id=? AND generation=?""",
+                    (agent_name, notice.schedule_id, notice.generation),
+                )
+                cleared += cursor.rowcount
+            self._db.commit()
+        return cleared
 
     def claim_schedule_fire(
         self,

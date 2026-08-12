@@ -21,7 +21,7 @@ import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.agent_registry import AgentRegistry, RecurringScheduleStaleDrop
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
@@ -633,6 +633,39 @@ class AgentScheduler:
             ),
         )
 
+    def _record_recurring_stale_drop(
+        self,
+        *,
+        agent_name: str,
+        schedule_id: int,
+        schedule_name: str,
+        dropped_at: float,
+        row_age: float,
+    ) -> None:
+        """Persist one recurring drop without creating owner-facing delivery."""
+        try:
+            notice = self._registry.record_recurring_schedule_stale_drop(
+                schedule_id,
+                agent_name=agent_name,
+                schedule_name=schedule_name,
+                dropped_at=dropped_at,
+                row_age_s=row_age,
+            )
+        except Exception as exc:
+            # Surfacing bookkeeping must never turn a terminal stale drop back
+            # into a replay candidate or fail the scheduler cohort.
+            _log(
+                "scheduler: recurring stale-drop surfacing record failed for "
+                f"schedule '{schedule_name}' (#{schedule_id}) on agent "
+                f"'{agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return
+        _log(
+            "scheduler: recurring stale-drop notice aggregated for schedule "
+            f"'{schedule_name}' (#{schedule_id}) on agent '{agent_name}': "
+            f"count={notice.drop_count}"
+        )
+
     async def _deliver_schedule(
         self,
         schedule,
@@ -675,7 +708,8 @@ class AgentScheduler:
             replay_max_age = self._pending_wake_replay_max_age(
                 schedule, schedule.last_run
             )
-            age = max(0.0, time.time() - schedule.last_run)
+            drop_checked_at = time.time()
+            age = max(0.0, drop_checked_at - schedule.last_run)
             if age > replay_max_age:
                 dropped = (
                     self._registry.delete_pending_schedule_wake(row.id)
@@ -699,6 +733,14 @@ class AgentScheduler:
                         pending_id=row.id if row is not None else 0,
                         row_age=age,
                         replay_max_age=replay_max_age,
+                    )
+                elif dropped:
+                    self._record_recurring_stale_drop(
+                        agent_name=schedule.agent_name,
+                        schedule_id=schedule.id,
+                        schedule_name=schedule.name,
+                        dropped_at=drop_checked_at,
+                        row_age=age,
                     )
                 if attempt_started is not None:
                     attempt_started.set()
@@ -871,18 +913,28 @@ class AgentScheduler:
         attempt_started: asyncio.Event | None = None,
     ) -> bool:
         """Wait for one exact receipt, extending while positive liveness holds."""
+        delivery_prompt, stale_drop_notices = (
+            self._wake_prompt_with_recurring_stale_drops(schedule)
+        )
         delivery = asyncio.create_task(
             self._wake_and_confirm(
-                schedule, attempt_started=attempt_started
+                schedule,
+                prompt=delivery_prompt,
+                attempt_started=attempt_started,
             )
         )
         try:
             while True:
                 try:
-                    return await asyncio.wait_for(
+                    confirmed = await asyncio.wait_for(
                         asyncio.shield(delivery),
                         timeout=self._schedule_delivery_timeout,
                     )
+                    if confirmed and stale_drop_notices:
+                        self._acknowledge_recurring_stale_drops(
+                            schedule.agent_name, stale_drop_notices
+                        )
+                    return confirmed
                 except asyncio.TimeoutError:
                     if self._agent_busy_not_wedged(schedule.agent_name):
                         _log(
@@ -892,7 +944,9 @@ class AgentScheduler:
                             "reports busy-not-wedged; extending delivery timeout"
                         )
                         continue
-                    if self._wake_prompt_inflight(schedule):
+                    if self._wake_prompt_inflight(
+                        schedule, prompt=delivery_prompt
+                    ):
                         _log(
                             f"scheduler: receipt still pending for schedule "
                             f"'{schedule.name}' (#{schedule.id}) for agent "
@@ -1103,6 +1157,14 @@ class AgentScheduler:
                         row_age=row_age,
                         replay_max_age=replay_max_age,
                     )
+                elif discarded:
+                    self._record_recurring_stale_drop(
+                        agent_name=pending.agent_name,
+                        schedule_id=pending.schedule_id,
+                        schedule_name=pending.schedule_name,
+                        dropped_at=replay_now,
+                        row_age=row_age,
+                    )
                 continue
             pending_wakes.append(pending)
 
@@ -1196,7 +1258,73 @@ class AgentScheduler:
         """The exact prompt text a schedule's wake delivers to the transport."""
         return schedule.prompt or f"Scheduled wake: {schedule.name}"
 
-    def _wake_prompt_inflight(self, schedule) -> bool:
+    @staticmethod
+    def _stale_drop_timestamp(timestamp: float) -> str:
+        """Render an unambiguous compact UTC timestamp for the agent note."""
+        return datetime.fromtimestamp(timestamp, tz=ZoneInfo("UTC")).strftime(
+            "%Y-%m-%d %H:%M:%SZ"
+        )
+
+    def _wake_prompt_with_recurring_stale_drops(
+        self, schedule
+    ) -> tuple[str, list[RecurringScheduleStaleDrop]]:
+        """Prepend bounded unsurfaced drop aggregates to one exact wake prompt."""
+        prompt = self._wake_prompt(schedule)
+        try:
+            notices = self._registry.list_recurring_schedule_stale_drops(
+                schedule.agent_name
+            )
+        except Exception as exc:
+            # Operational-awareness storage must not block real scheduled work.
+            _log(
+                "scheduler: recurring stale-drop surfacing read failed for "
+                f"agent '{schedule.agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return prompt, []
+        if not notices:
+            return prompt, []
+
+        lines = []
+        for notice in notices:
+            schedule_name = " ".join(notice.schedule_name.split()) or "unnamed"
+            if len(schedule_name) > 120:
+                schedule_name = f"{schedule_name[:117]}..."
+            fire_word = "fire" if notice.drop_count == 1 else "fires"
+            drop_verb = "was" if notice.drop_count == 1 else "were"
+            work_subject = "that fire" if notice.drop_count == 1 else "those fires"
+            lines.append(
+                f"Note: {notice.drop_count} {fire_word} of recurring schedule "
+                f"'{schedule_name}' (#{notice.schedule_id}) {drop_verb} dropped as stale "
+                f"between {self._stale_drop_timestamp(notice.first_dropped_at)} "
+                f"and {self._stale_drop_timestamp(notice.last_dropped_at)} "
+                "(session busy past the replay window). The work "
+                f"{work_subject} would have done was NOT performed."
+            )
+        notes_text = "\n".join(lines)
+        return f"{notes_text}\n\n{prompt}", notices
+
+    def _acknowledge_recurring_stale_drops(
+        self, agent_name: str, notices: list[RecurringScheduleStaleDrop]
+    ) -> None:
+        """Best-effort clear only snapshots included in a confirmed wake."""
+        try:
+            cleared = self._registry.acknowledge_recurring_schedule_stale_drops(
+                agent_name, notices
+            )
+        except Exception as exc:
+            # The wake already has a positive receipt. Never convert it to an
+            # undelivered/replayable wake because notice cleanup failed.
+            _log(
+                "scheduler: recurring stale-drop surfacing acknowledge failed "
+                f"for agent '{agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return
+        _log(
+            "scheduler: recurring stale-drop notice surfaced for agent "
+            f"'{agent_name}': snapshots={len(notices)} cleared={cleared}"
+        )
+
+    def _wake_prompt_inflight(self, schedule, *, prompt: str | None = None) -> bool:
         """True when this wake's prompt is pasted with its receipt unresolved.
 
         Reads the transport's per-turn execution state via
@@ -1209,7 +1337,8 @@ class AgentScheduler:
         try:
             return (
                 self._delivery_inflight_fn(
-                    schedule.agent_name, self._wake_prompt(schedule)
+                    schedule.agent_name,
+                    self._wake_prompt(schedule) if prompt is None else prompt,
                 )
                 is True
             )
@@ -1224,6 +1353,7 @@ class AgentScheduler:
         self,
         schedule,
         *,
+        prompt: str | None = None,
         attempt_started: asyncio.Event | None = None,
     ) -> bool:
         """Invoke the wake callback and await its exact per-prompt receipt."""
@@ -1249,7 +1379,7 @@ class AgentScheduler:
         result = await self._wake_callback(
             schedule.agent_name,
             main_session_id,
-            self._wake_prompt(schedule),
+            self._wake_prompt(schedule) if prompt is None else prompt,
             **callback_kwargs,
         )
         if inspect.isawaitable(result):
