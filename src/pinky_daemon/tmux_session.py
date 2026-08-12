@@ -445,10 +445,11 @@ _PASTE_ENTER_MAX_DELAY_MS = 2_000
 # used by the dashboard terminal transport.
 _WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC = 5.0
 _WAKE_SUBMISSION_ENTER_RETRY_LIMIT = 2
-# A failed context-restart wake gets one additional full paste cycle, and only
-# after a pane capture proves the composer is blank.  Each paste cycle retains
-# the bounded Enter-only verifier above.
-_WAKE_SUBMISSION_REPASTE_RETRY_LIMIT = 1
+# A context-restart wake that exhausts the ordinary verifier gets one final
+# receipt-only grace window.  The original prompt is never pasted again: an
+# empty composer can mean Claude already accepted it while transcript/tailer
+# evidence still lags, so pane state cannot safely authorize a replay.
+_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC = 5.0
 _WAKE_SUBMISSION_BROKER_TIMEOUT_SEC = 5.0
 _WAKE_CONTEXT_RELOAD_INSTRUCTION = (
     "CONTEXT-RELOAD: Reload the saved continuation state now with "
@@ -7449,129 +7450,37 @@ class TmuxSession:
             }
         )
 
-    @staticmethod
-    def _pane_snapshot_has_blank_prompt(snapshot: str) -> bool:
-        """Fail-closed test for a visibly empty composer.
-
-        Only a standalone prompt glyph on the final non-empty pane line is
-        accepted.  Placeholder copy, typed text, dialogs, spinners, capture
-        failures, and ambiguous layouts all skip re-paste and advance to the
-        broker rung.
-        """
-        nonempty = [
-            line.strip()
-            for line in (snapshot or "").splitlines()
-            if line.strip()
-        ]
-        return bool(nonempty and nonempty[-1] in {">", "❯"})
-
-    async def _repaste_unverified_context_restart_wake(
+    async def _wait_for_wake_submission_receipt_quiescence(
         self,
         turn: _QueuedTurn,
         *,
         started: float,
         submit_attempts: int,
-        prompt_visible: bool | None,
     ) -> bool:
-        """Run the single blank-composer re-paste rung."""
+        """Wait once for lagging exact evidence without replaying the wake."""
         receipt = turn.submission_receipt
         if receipt is None:
             return False
-        if prompt_visible:
-            await self._emit_wake_submission_escalation(
-                turn,
-                rung="repaste",
-                outcome="skipped",
-                detail="original_prompt_visible",
+        try:
+            accepted = bool(
+                await asyncio.wait_for(
+                    asyncio.shield(receipt),
+                    timeout=_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC,
+                )
             )
+        except asyncio.TimeoutError:
+            # Prefer an exact row that resolves on the timeout boundary.
+            accepted = self._receipt_accepted(receipt)
+        except Exception:
+            accepted = self._receipt_accepted(receipt)
+        if not accepted:
             return False
-
-        for retry_index in range(_WAKE_SUBMISSION_REPASTE_RETRY_LIMIT):
-            async with self._repl_control_lock:
-                if self._receipt_accepted(receipt):
-                    return await self._report_verified_wake_submission(
-                        turn,
-                        started=started,
-                        submit_attempts=submit_attempts,
-                    )
-                try:
-                    pane = await self._tmux.capture_pane()
-                except Exception as exc:
-                    await self._emit_wake_submission_escalation(
-                        turn,
-                        rung="repaste",
-                        outcome="skipped",
-                        detail=f"pane_capture_raised_{type(exc).__name__}",
-                    )
-                    return False
-                if not pane.ok or not self._pane_snapshot_has_blank_prompt(
-                    pane.stdout or ""
-                ):
-                    await self._emit_wake_submission_escalation(
-                        turn,
-                        rung="repaste",
-                        outcome="skipped",
-                        detail=(
-                            "pane_capture_failed"
-                            if not pane.ok
-                            else "composer_not_proven_blank"
-                        ),
-                    )
-                    return False
-                # An exact row can land while capture-pane yields.  Receipt
-                # evidence always wins the boundary and forbids re-paste.
-                if self._receipt_accepted(receipt):
-                    return await self._report_verified_wake_submission(
-                        turn,
-                        started=started,
-                        submit_attempts=submit_attempts,
-                    )
-                try:
-                    result = await self._tmux.paste_text(turn.prompt, enter=True)
-                except Exception as exc:
-                    await self._emit_wake_submission_escalation(
-                        turn,
-                        rung="repaste",
-                        outcome="failed",
-                        detail=f"paste_raised_{type(exc).__name__}",
-                    )
-                    return False
-            if not result.ok:
-                await self._emit_wake_submission_escalation(
-                    turn,
-                    rung="repaste",
-                    outcome="failed",
-                    detail=f"paste_rc_{result.returncode}",
-                )
-                return False
-
-            await self._emit_wake_submission_escalation(
-                turn,
-                rung="repaste",
-                outcome="attempted",
-                detail=f"attempt_{retry_index + 1}",
-            )
-            if (
-                await self._verify_wake_submission(
-                    turn, allow_escalation=False
-                )
-                == "verified"
-            ):
-                await self._emit_wake_submission_escalation(
-                    turn,
-                    rung="repaste",
-                    outcome="succeeded",
-                    detail=f"attempt_{retry_index + 1}",
-                )
-                return True
-            await self._emit_wake_submission_escalation(
-                turn,
-                rung="repaste",
-                outcome="failed",
-                detail=f"attempt_{retry_index + 1}_unverified",
-            )
-            return False
-        return False
+        await self._report_verified_wake_submission(
+            turn,
+            started=started,
+            submit_attempts=submit_attempts,
+        )
+        return True
 
     async def _inject_wake_context_reload(self, turn: _QueuedTurn) -> bool:
         """Run the broker-injection rung with a non-replayed instruction."""
@@ -7622,11 +7531,13 @@ class TmuxSession:
         try:
             restarted = await self.force_restart(bypass_guard=True)
         except asyncio.CancelledError:
+            self._config.force_fresh_context_once = False
             await self._report_wake_submission_escalation_terminal(
                 turn, detail="force_restart_cancelled"
             )
             raise
         except Exception as exc:
+            self._config.force_fresh_context_once = False
             await self._report_wake_submission_escalation_terminal(
                 turn, detail=f"force_restart_raised_{type(exc).__name__}"
             )
@@ -7639,6 +7550,7 @@ class TmuxSession:
                 detail="fresh_transport_started",
             )
             return
+        self._config.force_fresh_context_once = False
         await self._report_wake_submission_escalation_terminal(
             turn, detail="force_restart_rejected_or_failed"
         )
@@ -7764,6 +7676,20 @@ class TmuxSession:
             and turn.reason == f"wake_{WakeReason.CONTEXT_RESTART.value}"
             and _wake_submission_escalation_enabled()
         )
+        if (
+            escalation_applies
+            and await self._wait_for_wake_submission_receipt_quiescence(
+                turn,
+                started=started,
+                submit_attempts=submit_attempts,
+            )
+        ):
+            return "verified"
+
+        # Freeze the original wake before any diagnostic callback or fallback
+        # can yield.  A late exact row must not turn the terminal verdict True
+        # while a distinct broker CONTEXT-RELOAD handoff is already underway.
+        self._resolve_submission_receipt(turn, False)
         _log(
             f"tmux[{self.agent_name}]: wake prompt submission UNVERIFIED "
             f"after bounded Enter retries (reason={turn.reason}, "
@@ -7771,33 +7697,26 @@ class TmuxSession:
             f"prompt_visible={prompt_visible}); not claiming delivery"
             + ("; starting bounded escalation" if escalation_applies else "")
         )
-        await self._emit_stream_event(
-            {
-                "type": "wake_prompt_submission_unverified",
-                "agent_name": self.agent_name,
-                "reason": turn.reason,
-                "submit_attempts": submit_attempts,
-                "latency_ms": latency_ms,
-                "prompt_visible": prompt_visible,
-                "escalating": escalation_applies,
-            }
-        )
+        unverified_event = {
+            "type": "wake_prompt_submission_unverified",
+            "agent_name": self.agent_name,
+            "reason": turn.reason,
+            "submit_attempts": submit_attempts,
+            "latency_ms": latency_ms,
+            "prompt_visible": prompt_visible,
+        }
+        if escalation_applies:
+            unverified_event["escalating"] = True
+        await self._emit_stream_event(unverified_event)
         if not escalation_applies:
-            self._resolve_submission_receipt(turn, False)
             return "unverified"
 
-        if await self._repaste_unverified_context_restart_wake(
+        await self._emit_wake_submission_escalation(
             turn,
-            started=started,
-            submit_attempts=submit_attempts,
-            prompt_visible=prompt_visible,
-        ):
-            return "verified"
-
-        # Freeze the original wake's verdict before the distinct broker path.
-        # Any later exact row for it is ignored, preventing both the original
-        # wake and the context-reload fallback from being credited.
-        self._resolve_submission_receipt(turn, False)
+            rung="receipt_quiescence",
+            outcome="expired",
+            detail="late_receipt_not_observed",
+        )
         if await self._inject_wake_context_reload(turn):
             return "fallback_queued"
         return "recovery_required"
@@ -8282,17 +8201,19 @@ class TmuxSession:
             )
             return False
 
-        await self.disconnect()
-
-        # disconnect's default → DEAD path triggers ONLY from CONNECTED;
-        # we pre-set RECONNECTING above so it stays put. Now spawn fresh.
+        transition_open = True
         try:
+            await self.disconnect()
+
+            # disconnect's default → DEAD path triggers ONLY from CONNECTED;
+            # we pre-set RECONNECTING above so it stays put. Now spawn fresh.
             await self._spawn_tmux_repl()
             await self._state_machine.transition_complete(
                 token,
                 SessionState.CONNECTED,
                 trigger=Trigger.INTERNAL,
             )
+            transition_open = False
             # Re-prime the agent with an orientation wake prompt BEFORE the
             # worker can start draining. Without this, force_restart
             # respawned the REPL but — unlike connect() — left the agent on
@@ -8333,17 +8254,33 @@ class TmuxSession:
                 f"(wake_reason={wake_reason.value})"
             )
             return True
+        except asyncio.CancelledError:
+            # The transition owner must close its StateMachine lease even when
+            # an independent disconnect cancels this restart before spawn.  A
+            # fresh-context latch belongs to this abandoned recovery attempt;
+            # never leak it into a later unrelated lifecycle.
+            self._config.force_fresh_context_once = False
+            _log(f"tmux[{self.agent_name}]: force_restart cancelled")
+            raise
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: force_restart spawn failed: {e}")
-            try:
-                await self._state_machine.transition_complete(
-                    token,
-                    SessionState.DEAD,
-                    trigger=Trigger.INTERNAL,
-                )
-            except Exception:
-                pass
             return False
+        finally:
+            # Every owner exit before CONNECTED completion closes the lease.
+            # This covers exceptions and BaseException cancellation alike, so
+            # subscribers cannot remain stranded behind RECONNECTING.
+            if transition_open:
+                try:
+                    await self._state_machine.transition_complete(
+                        token,
+                        SessionState.DEAD,
+                        trigger=Trigger.INTERNAL,
+                    )
+                except Exception as cleanup_exc:
+                    _log(
+                        f"tmux[{self.agent_name}]: force_restart transition "
+                        f"cleanup failed: {cleanup_exc}"
+                    )
 
     async def idle_sleep(self) -> bool:
         """Disconnect but keep the tmux session name pinned for cheap

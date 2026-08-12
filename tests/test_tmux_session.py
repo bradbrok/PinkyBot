@@ -9747,7 +9747,7 @@ class TestWakeSubmissionVerification:
         ss.force_restart.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_blank_prompt_repaste_success_stops_before_broker(
+    async def test_late_receipt_during_quiescence_stops_before_broker(
         self, monkeypatch,
     ) -> None:
         monkeypatch.setattr(
@@ -9756,13 +9756,17 @@ class TestWakeSubmissionVerification:
         monkeypatch.setattr(
             tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
         )
-        tmux = _make_mock_tmux()
-        tmux.capture_pane = AsyncMock(
-            side_effect=[
-                TmuxCommandResult(0, "previous output\n>", ""),
-                TmuxCommandResult(0, "previous output\n>", ""),
-            ]
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.2
         )
+        tmux = _make_mock_tmux()
+        final_probe_done = asyncio.Event()
+
+        async def final_probe(*_args, **_kwargs):
+            final_probe_done.set()
+            return TmuxCommandResult(0, "previous output\n>", "")
+
+        tmux.capture_pane = AsyncMock(side_effect=final_probe)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
         injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
@@ -9777,35 +9781,28 @@ class TestWakeSubmissionVerification:
             on_delivered=lambda: fires.append("delivered"),
             submission_receipt=receipt,
         )
-        paste_calls = 0
+        delivery = asyncio.create_task(ss._deliver_turn(turn))
+        await final_probe_done.wait()
+        await asyncio.sleep(0)
+        ss._on_transcript_entry(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "exact context restart wake",
+                },
+            }
+        )
+        await delivery
 
-        async def accept_second_paste(*_args, **_kwargs):
-            nonlocal paste_calls
-            paste_calls += 1
-            if paste_calls == 2:
-                ss._on_transcript_entry(
-                    {
-                        "type": "user",
-                        "message": {
-                            "role": "user",
-                            "content": "exact context restart wake",
-                        },
-                    }
-                )
-            return _ok()
-
-        tmux.paste_text = AsyncMock(side_effect=accept_second_paste)
-
-        await ss._deliver_turn(turn)
-
-        assert tmux.paste_text.await_count == 2
+        assert tmux.paste_text.await_count == 1
         assert await receipt is True
         assert fires == ["delivered"]
         injector.assert_not_awaited()
         ss.force_restart.assert_not_awaited()
 
     @pytest.mark.asyncio
-    async def test_nonblank_prompt_skips_repaste_and_queues_context_reload(
+    async def test_quiescence_expiry_queues_context_reload_without_repaste(
         self, monkeypatch,
     ) -> None:
         monkeypatch.setattr(
@@ -9813,6 +9810,9 @@ class TestWakeSubmissionVerification:
         )
         monkeypatch.setattr(
             tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
         )
         tmux = _make_mock_tmux()
         tmux.capture_pane = AsyncMock(
@@ -9856,6 +9856,9 @@ class TestWakeSubmissionVerification:
             tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
         )
         monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        monkeypatch.setattr(
             tmux_session, "_WAKE_SUBMISSION_BROKER_TIMEOUT_SEC", 0.001
         )
         tmux = _make_mock_tmux()
@@ -9888,26 +9891,145 @@ class TestWakeSubmissionVerification:
         assert tmux.paste_text.await_count == 1
         injector.assert_awaited_once()
         ss.force_restart.assert_awaited_once_with(bypass_guard=True)
-        assert ss._config.force_fresh_context_once is True
+        assert ss._config.force_fresh_context_once is False
         assert await receipt is False
         assert len(ss._inflight_metas) == 0
         assert "WAKE SUBMISSION ESCALATION TERMINAL" in capsys.readouterr().err
 
     @pytest.mark.asyncio
-    async def test_external_disconnect_cancels_pending_transport_recovery(
+    async def test_broker_observes_original_receipt_frozen_false(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt="original receipt must stay false",
+            internal=True,
+            reason="wake_context_restart",
+            submission_receipt=receipt,
+        )
+        broker_receipts: list[bool] = []
+
+        async def stream_event(event: dict) -> None:
+            if event["type"] != "wake_prompt_submission_unverified":
+                return
+            assert receipt.done() and receipt.result() is False
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "original receipt must stay false",
+                    },
+                }
+            )
+            await asyncio.sleep(0)
+
+        async def injector(*_args) -> bool:
+            broker_receipts.append(receipt.result())
+            return True
+
+        ss._stream_event_callback = stream_event
+        ss._config.wake_submission_recovery_injector = injector
+
+        with pytest.raises(tmux_session._WakeSubmissionFallbackQueued):
+            await ss._deliver_turn(turn)
+
+        assert broker_receipts == [False]
+        assert turn.transport_accepted is False
+        assert tmux.paste_text.await_count == 1
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("reason", "disable_escalation"),
+        [
+            ("wake_context_restart", True),
+            ("wake_resume", False),
+        ],
+    )
+    async def test_non_escalating_receipt_is_frozen_before_legacy_event(
+        self, monkeypatch, reason: str, disable_escalation: bool,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        if disable_escalation:
+            monkeypatch.setenv("PINKY_WAKE_SUBMISSION_ESCALATION", "0")
+        else:
+            monkeypatch.delenv("PINKY_WAKE_SUBMISSION_ESCALATION", raising=False)
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt="legacy unverified event contract",
+            internal=True,
+            reason=reason,
+            submission_receipt=receipt,
+        )
+        events: list[dict] = []
+
+        async def stream_event(event: dict) -> None:
+            if event["type"] != "wake_prompt_submission_unverified":
+                return
+            assert receipt.done() and receipt.result() is False
+            events.append(event)
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "legacy unverified event contract",
+                    },
+                }
+            )
+            await asyncio.sleep(0)
+
+        ss._stream_event_callback = stream_event
+
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            await ss._deliver_turn(turn)
+
+        assert receipt.result() is False
+        assert turn.transport_accepted is False
+        assert len(events) == 1
+        assert set(events[0]) == {
+            "type",
+            "agent_name",
+            "reason",
+            "submit_attempts",
+            "latency_ms",
+            "prompt_visible",
+        }
+
+    @pytest.mark.asyncio
+    async def test_external_disconnect_releases_real_restart_owner_and_latch(
         self,
     ) -> None:
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
-        force_restart_entered = asyncio.Event()
+        recovery_disconnect_entered = asyncio.Event()
 
-        async def stalled_force_restart(*, bypass_guard: bool = False) -> bool:
-            assert bypass_guard is True
-            force_restart_entered.set()
-            await asyncio.Event().wait()
-            return True
+        async def stalled_recovery_stop_tailer() -> None:
+            if asyncio.current_task() is ss._wake_submission_recovery_task:
+                recovery_disconnect_entered.set()
+                await asyncio.Event().wait()
 
-        ss.force_restart = AsyncMock(side_effect=stalled_force_restart)
+        ss._stop_tailer = AsyncMock(side_effect=stalled_recovery_stop_tailer)
         turn = _QueuedTurn(
             prompt="unaccepted context restart wake",
             internal=True,
@@ -9917,13 +10039,19 @@ class TestWakeSubmissionVerification:
             ss._run_wake_submission_transport_recovery(turn)
         )
         ss._wake_submission_recovery_task = recovery
-        await force_restart_entered.wait()
+        await recovery_disconnect_entered.wait()
+
+        assert ss.state == SessionState.RECONNECTING
+        assert ss._state_machine._in_flight is not None
+        assert ss._config.force_fresh_context_once is True
 
         await ss.disconnect()
 
         assert recovery.cancelled()
         assert ss._wake_submission_recovery_task is None
         assert ss.state == SessionState.DEAD
+        assert ss._state_machine._in_flight is None
+        assert ss._config.force_fresh_context_once is False
 
     @pytest.mark.asyncio
     async def test_queue_dequeue_is_an_exact_submission_receipt(
