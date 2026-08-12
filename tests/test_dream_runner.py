@@ -541,3 +541,66 @@ class TestRunDreamWatermark:
 
         assert summary == "Consolidated."
         assert runner._get_last_message_ts("pinky") == 200.0
+
+
+class TestDreamReflectionLoudness:
+    @pytest.mark.asyncio
+    async def test_zero_streak_warns_persists_notifies_and_resets(
+        self, tmp_path, monkeypatch, capsys
+    ):
+        from pinky_daemon.claude_runner import RunResult
+
+        monkeypatch.delenv("PINKY_DREAM_TRANSPORT", raising=False)
+        monkeypatch.delenv("PINKY_KG_PROACTIVE", raising=False)
+        monkeypatch.setattr("pinky_daemon.dream_runner.SDKRunner", _StubSDKRunner)
+        _StubSDKRunner.result = RunResult(output="Consolidated.", exit_code=0)
+
+        db_path = str(tmp_path / "dream.db")
+
+        def messages(agent, after_ts, limit, role):
+            return [
+                {
+                    "timestamp": after_ts + 1.0,
+                    "role": "user",
+                    "content": "new nightly context",
+                }
+            ]
+
+        notices: list[tuple[str, str]] = []
+
+        async def owner_notify(agent_name: str, message: str) -> bool:
+            notices.append((agent_name, message))
+            return True
+
+        runner = DreamRunner(
+            db_path=db_path,
+            history_provider=messages,
+            owner_notify_callback=owner_notify,
+        )
+        monkeypatch.setattr(runner, "_build_memory_links", lambda *args, **kwargs: 0)
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        assert runner.get_state("pinky")["zero_reflection_streak"] == 1
+        runner.close()
+
+        runner = DreamRunner(
+            db_path=db_path,
+            history_provider=messages,
+            owner_notify_callback=owner_notify,
+        )
+        monkeypatch.setattr(runner, "_build_memory_links", lambda *args, **kwargs: 0)
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert runner.get_state("pinky")["zero_reflection_streak"] == 3
+        assert len(notices) == 1
+        assert notices[0][0] == "pinky"
+        assert "3 consecutive nights" in notices[0][1]
+        warnings = capsys.readouterr().err
+        assert warnings.count("WARNING 'pinky' completed with zero embedded reflections") == 3
+
+        monkeypatch.setattr(runner, "_build_memory_links", lambda *args, **kwargs: 2)
+        await runner.run_dream("pinky", _DreamAgentConfig(str(tmp_path)))
+
+        assert runner.get_state("pinky")["zero_reflection_streak"] == 0
+        assert len(notices) == 1
+        assert "zero embedded reflections" not in capsys.readouterr().err

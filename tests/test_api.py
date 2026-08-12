@@ -7928,6 +7928,10 @@ class TestBuildStreamingWakeContextReasonGating:
         one-shot drop) routes to the durable #863 owner destination."""
         with tempfile.TemporaryDirectory() as tmpdir:
             app = self._make_app(os.path.join(tmpdir, "test.db"))
+            assert (
+                app.state.dream_runner._owner_notify_callback
+                is app.state.scheduler._owner_notify_callback
+            )
             app.state.agents.register("dymok", model="sonnet")
             app.state.agents.set_token(
                 "dymok", "telegram", "token", settings={"account_id": "acct-1"},

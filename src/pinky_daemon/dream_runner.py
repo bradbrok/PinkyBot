@@ -14,6 +14,7 @@ Usage:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
 import os
 import re
@@ -74,6 +75,10 @@ _MAX_HISTORY_CHARS = 200_000
 # Bare alias only: dated Haiku 4.5 snapshots return 404 from Anthropic.
 _KG_EXTRACTION_MODEL_DEFAULT = "claude-haiku-4-5"
 
+# A single empty night can be legitimate. Three in a row is operationally
+# significant and should no longer hide behind the report-extraction fallback.
+_ZERO_REFLECTION_NOTICE_THRESHOLD = 3
+
 
 class DreamRunner:
     """Runs nightly dream consolidation sessions for agents.
@@ -91,6 +96,7 @@ class DreamRunner:
         owner_provider: Callable[[], dict] | None = None,
         setting_provider: Callable[[str], str] | None = None,
         signing_key_provider: Callable[[str], str | None] | None = None,
+        owner_notify_callback: Callable[[str, str], object] | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
@@ -106,6 +112,7 @@ class DreamRunner:
         # Optional agent_name -> per-agent signing key resolver for daemon-internal
         # API calls. Isolated agents cannot authenticate with the fleet-wide secret.
         self._signing_key_provider = signing_key_provider
+        self._owner_notify_callback = owner_notify_callback
         self._init_tables()
 
     @property
@@ -126,7 +133,8 @@ class DreamRunner:
                 last_dream_at REAL,
                 last_summary TEXT,
                 sessions_processed INT DEFAULT 0,
-                memories_stored INT DEFAULT 0
+                memories_stored INT DEFAULT 0,
+                zero_reflection_streak INT NOT NULL DEFAULT 0
             );
             CREATE TABLE IF NOT EXISTS kg_surfaced (
                 agent_name TEXT NOT NULL,
@@ -185,6 +193,17 @@ class DreamRunner:
                 "ALTER TABLE dream_state ADD COLUMN kg_insights_notified_at REAL"
             )
             self._db.commit()
+        if "zero_reflection_streak" not in cols:
+            self._db.execute(
+                "ALTER TABLE dream_state ADD COLUMN zero_reflection_streak INT NOT NULL DEFAULT 0"
+            )
+            self._db.commit()
+
+    def set_owner_notify_callback(
+        self, callback: Callable[[str, str], object] | None
+    ) -> None:
+        """Set the callback used for owner-visible dream health notices."""
+        self._owner_notify_callback = callback
 
     def _resolve_dream_transport(self) -> str:
         """Which transport runs the dream: ``sdk`` (default) or ``tmux`` (#707).
@@ -352,9 +371,11 @@ class DreamRunner:
         # freezes for the duration of the pipeline.
 
         # Post-dream: build memory graph links for new reflections
-        await asyncio.to_thread(
+        embedded_reflections = await asyncio.to_thread(
             self._build_memory_links, agent_name, agent_config, since=dream_start
         )
+        if not run_failed:
+            await self._record_reflection_outcome(agent_name, embedded_reflections)
 
         # Post-dream: extract and store user profiles + relationships from dream output
         profile_count = await asyncio.to_thread(self._extract_user_profiles, summary)
@@ -592,7 +613,8 @@ class DreamRunner:
         """Return the full dream_state row for an agent as a dict."""
         row = self._db.execute(
             """SELECT agent_name, last_dream_at, last_summary,
-                      last_sessions_processed, last_memories_stored
+                      last_sessions_processed, last_memories_stored,
+                      zero_reflection_streak
                FROM dream_state WHERE agent_name=?""",
             (agent_name,),
         ).fetchone()
@@ -604,6 +626,7 @@ class DreamRunner:
                 "last_summary": None,
                 "last_sessions_processed": 0,
                 "last_memories_stored": 0,
+                "zero_reflection_streak": 0,
             }
 
         return {
@@ -612,13 +635,15 @@ class DreamRunner:
             "last_summary": row[2],
             "last_sessions_processed": row[3] or 0,
             "last_memories_stored": row[4] or 0,
+            "zero_reflection_streak": row[5] or 0,
         }
 
     def list_states(self) -> list[dict]:
         """Return dream_state rows for all agents that have ever dreamed."""
         rows = self._db.execute(
             """SELECT agent_name, last_dream_at, last_summary,
-                      last_sessions_processed, last_memories_stored
+                      last_sessions_processed, last_memories_stored,
+                      zero_reflection_streak
                FROM dream_state ORDER BY last_dream_at DESC""",
         ).fetchall()
         return [
@@ -628,6 +653,7 @@ class DreamRunner:
                 "last_summary": r[2],
                 "last_sessions_processed": r[3] or 0,
                 "last_memories_stored": r[4] or 0,
+                "zero_reflection_streak": r[5] or 0,
             }
             for r in rows
         ]
@@ -1163,7 +1189,7 @@ class DreamRunner:
         agent_name: str,
         agent_config,
         since: datetime,
-    ) -> None:
+    ) -> int:
         """Build cosine-similarity links between new and existing reflections.
 
         Runs after the dream SDK session. Compares reflections created during
@@ -1178,13 +1204,13 @@ class DreamRunner:
             )
         except ImportError:
             _log("dream-runner: pinky_memory not installed, skipping link build")
-            return
+            return 0
 
         work_dir = getattr(agent_config, "working_dir", "") or "."
         db_path = str(Path(work_dir).resolve() / "data" / "memory.db")
         if not Path(db_path).exists():
             _log(f"dream-runner: no memory DB at {db_path}, skipping link build")
-            return
+            return 0
 
         store = ReflectionStore(db_path=db_path)
 
@@ -1197,12 +1223,12 @@ class DreamRunner:
         new_refs = store.get_active_with_embeddings(since=since)
         if not new_refs:
             _log(f"dream-runner: no new embedded reflections for '{agent_name}', skipping links")
-            return
+            return 0
 
         # Fetch all active reflections with embeddings
         all_refs = store.get_active_with_embeddings()
         if len(all_refs) < 2:
-            return
+            return len(new_refs)
 
         # Build ID -> embedding index for all reflections
         all_ids = [r.id for r in all_refs]
@@ -1239,6 +1265,63 @@ class DreamRunner:
 
         _log(f"dream-runner: built {links_created} links for '{agent_name}' "
              f"({len(new_refs)} new reflections)")
+        return len(new_refs)
+
+    async def _record_reflection_outcome(
+        self, agent_name: str, embedded_reflections: int
+    ) -> None:
+        """Persist zero-reflection streaks and surface a threshold notice."""
+        if embedded_reflections > 0:
+            self._db.execute(
+                "UPDATE dream_state SET zero_reflection_streak=0 WHERE agent_name=?",
+                (agent_name,),
+            )
+            self._db.commit()
+            return
+
+        self._db.execute(
+            """UPDATE dream_state
+               SET zero_reflection_streak=zero_reflection_streak + 1
+               WHERE agent_name=?""",
+            (agent_name,),
+        )
+        row = self._db.execute(
+            "SELECT zero_reflection_streak FROM dream_state WHERE agent_name=?",
+            (agent_name,),
+        ).fetchone()
+        self._db.commit()
+        streak = int(row[0]) if row else 1
+        _log(
+            f"dream-runner: WARNING '{agent_name}' completed with zero embedded "
+            f"reflections ({streak} consecutive night(s))"
+        )
+
+        if streak != _ZERO_REFLECTION_NOTICE_THRESHOLD:
+            return
+
+        if self._owner_notify_callback is None:
+            _log(
+                f"dream-runner: OWNER_NOTIFY_UNAVAILABLE for zero-reflection "
+                f"alert agent '{agent_name}'"
+            )
+            return
+
+        message = (
+            f"Dream memory warning: {agent_name} completed {streak} consecutive "
+            "nights with zero embedded reflections. Verify that the dream session "
+            "can access the configured memory tools."
+        )
+        try:
+            result = self._owner_notify_callback(agent_name, message)
+            if inspect.isawaitable(result):
+                result = await result
+            if result is not True:
+                raise RuntimeError("owner notify returned no positive receipt")
+        except Exception as exc:  # noqa: BLE001 - a notice failure must not fail the dream
+            _log(
+                f"dream-runner: OWNER_NOTIFY_FAILURE for zero-reflection alert "
+                f"agent '{agent_name}': {type(exc).__name__}: {exc}"
+            )
 
     # ── Internal ─────────────────────────────────────────────
 

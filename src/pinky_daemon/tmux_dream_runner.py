@@ -187,6 +187,9 @@ class TmuxDreamRunner:
         cmd = [self._resolve_binary()]
         if self._config.model:
             cmd += ["--model", self._config.model]
+        mcp_config = work_dir / ".mcp.json"
+        if mcp_config.is_file():
+            cmd += ["--mcp-config", str(mcp_config)]
         cmd += ["--permission-mode", "bypassPermissions"]
         if self._config.allowed_tools:
             cmd += ["--allowedTools", ",".join(self._config.allowed_tools)]
