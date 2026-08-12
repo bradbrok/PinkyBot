@@ -32,8 +32,8 @@ class SDKRunnerConfig:
     # Model selection
     model: str | None = None
 
-    # MCP servers (dict of name -> config)
-    mcp_servers: dict = field(default_factory=dict)
+    # MCP servers (dict of name -> config, or an explicit --mcp-config path)
+    mcp_servers: dict | str = field(default_factory=dict)
 
     # Tool permissions (outreach removed — broker handles messaging)
     allowed_tools: list[str] = field(default_factory=lambda: [

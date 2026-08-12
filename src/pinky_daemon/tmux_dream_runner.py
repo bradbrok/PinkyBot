@@ -67,7 +67,11 @@ class TmuxDreamConfig:
     # instructions, so file-level delivery is equivalent in practice).
     system_prompt: str = ""
 
-    # PRIMARY tool boundary (Murzik, #708 review): the dream prompt embeds raw
+    # Explicit per-run MCP config. DreamRunner uses this to inject the durable
+    # correlation header without mutating the agent's canonical .mcp.json.
+    mcp_config: str = ""
+
+    # PRIMARY tool boundary (#708 review): the dream prompt embeds raw
     # conversation history, so an injection there must not reach a broad
     # interactive tool surface. Mirror the SDK path's allowlist semantics
     # (--allowedTools + bypassPermissions), widened only by Read (prompt file)
@@ -187,6 +191,13 @@ class TmuxDreamRunner:
         cmd = [self._resolve_binary()]
         if self._config.model:
             cmd += ["--model", self._config.model]
+        mcp_config = (
+            Path(self._config.mcp_config).resolve()
+            if self._config.mcp_config
+            else work_dir / ".mcp.json"
+        )
+        if mcp_config.is_file():
+            cmd += ["--mcp-config", str(mcp_config)]
         cmd += ["--permission-mode", "bypassPermissions"]
         if self._config.allowed_tools:
             cmd += ["--allowedTools", ",".join(self._config.allowed_tools)]

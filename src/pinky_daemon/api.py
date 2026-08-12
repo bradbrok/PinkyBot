@@ -11103,6 +11103,8 @@ npm run build</pre>
         )
         return False
 
+    dream_runner.set_owner_notify_callback(_notify_owner_alert)
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
