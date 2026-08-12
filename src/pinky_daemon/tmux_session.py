@@ -6377,17 +6377,6 @@ class TmuxSession:
             live = self._read_live_status()
         live_last_updated = live.get("last_updated") if live else None
         head = self._inflight_metas[0]
-        live_floor = min(self._head_started_at, head.dispatched_at)
-        if (
-            self._current_session_started_at > 0
-            and isinstance(live_last_updated, (int, float))
-            and not isinstance(live_last_updated, bool)
-            and (
-                live_last_updated <= self._current_session_started_at
-                or live_last_updated < live_floor
-            )
-        ):
-            return "unknown"
         if live and live.get("status") == "idle":
             last_updated = live.get("last_updated") or 0.0
             # Floor the idle-freshness check at when the current head was
@@ -6434,6 +6423,21 @@ class TmuxSession:
                             return "idle"
                     except OSError:
                         pass
+        # Positive idle evidence above is authoritative (#118/#592), even if
+        # the numeric live-status timestamp itself predates this head. Only a
+        # sample that failed both idle proofs may become an unknown/stale veto
+        # and accrue toward #984's bounded frozen-signal recovery.
+        live_floor = min(self._head_started_at, head.dispatched_at)
+        if (
+            self._current_session_started_at > 0
+            and isinstance(live_last_updated, (int, float))
+            and not isinstance(live_last_updated, bool)
+            and (
+                live_last_updated <= self._current_session_started_at
+                or live_last_updated < live_floor
+            )
+        ):
+            return "unknown"
         self._log_wedged_inputs(now, live)
         return "wedged"
 

@@ -4681,6 +4681,46 @@ def test_inflight_verdict_idle_via_transcript_mtime(tmp_path) -> None:
     assert ss._inflight_stall_verdict(_time.time()) == "idle"
 
 
+def test_inflight_verdict_real_session_keeps_transcript_proven_idle(tmp_path) -> None:
+    """#118/#592/#984: positive transcript evidence wins before stale veto.
+
+    Production shape: the current tmux process started at S; this aged head was
+    pasted at H > S; live status is idle but fossilized at S < L < H; and the
+    transcript contains a real response at H+30, safely past paste slack. Base
+    classifies this phantom head as idle, so #984 must not turn it unknown and
+    eventually force-restart the healthy session.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    session_started_at = head_t - 100.0
+    live_updated_at = head_t - 50.0
+    assert session_started_at < live_updated_at < head_t
+
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    meta.transcript_mtime_at_paste = head_t
+    meta.paste_succeeded_at = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._current_session_started_at = session_started_at
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": live_updated_at,
+    }
+
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    import os
+
+    mtime_with_response = head_t + 30.0
+    os.utime(f, (mtime_with_response, mtime_with_response))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    assert ss._inflight_stall_verdict(_time.time()) == "idle"
+
+
 def test_inflight_verdict_wedged_when_transcript_only_paste_echo(tmp_path) -> None:
     """#592: stale live_status, transcript mtime is only the paste echo (< slack) → wedged."""
     ss, _ = _make_session(state=SessionState.CONNECTED)
