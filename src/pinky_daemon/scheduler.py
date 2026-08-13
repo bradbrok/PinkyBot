@@ -16,12 +16,18 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
+import os
 import sys
 import time
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
-from pinky_daemon.agent_registry import AgentRegistry, RecurringScheduleStaleDrop
+from pinky_daemon.agent_registry import (
+    AgentRegistry,
+    PendingScheduleWake,
+    RecurringScheduleStaleDrop,
+)
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
@@ -52,6 +58,14 @@ _SCHEDULE_PROMPT_WARN_INTERVAL_SEC = 15 * 60
 # so a daemon restart can never deliver hours-old frozen prompts. Constructor
 # injection below keeps fleet policy configurable and tests deterministic.
 _PERSISTED_WAKE_MAX_AGE_SEC = 60 * 60
+_RECEIPT_EXTENSION_MAX_AGE_ENV = "PINKY_SCHEDULE_RECEIPT_EXTENSION_MAX_AGE_SEC"
+_RECEIPT_EXTENSION_MAX_AGE_SEC = 60 * 60
+_ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC = 1.0
+_PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC = 60
+
+
+class _ReceiptAbandonedError(RuntimeError):
+    """An already-pasted wake exceeded its original-fire receipt deadline."""
 
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
@@ -222,6 +236,7 @@ class AgentScheduler:
         tick_interval: int = 30,
         schedule_delivery_timeout: float = 600.0,
         pending_wake_max_age_sec: float = _PERSISTED_WAKE_MAX_AGE_SEC,
+        receipt_extension_max_age_sec: float | None = None,
     ) -> None:
         self._registry = registry
         # async fn(agent_name, session_id, prompt, *, schedule_receipt=None)
@@ -258,16 +273,11 @@ class AgentScheduler:
         # liveness (can blip false between turns at the timeout boundary);
         # this reads the turn's own transport execution state.
         #
-        # The extension is DELIBERATELY unbounded while the probe keeps
-        # reporting pasted-unresolved: in that state any timeout action
-        # either drops the wake or duplicates it, so the scheduler holds.
-        # The hold ends when the receipt resolves (acceptance observed),
-        # the session leaves CONNECTED (receipt resolves False), or a
-        # force_restart resets the turn's pasted flag (probe reads False
-        # and the durable cancel+persist path resumes). Operational cost
-        # while held: same-agent schedule cohorts queue behind the
-        # per-agent delivery lock — surfaced by the "extending" log line
-        # each timeout period (Murzik review, PR #983).
+        # A pasted-unresolved prompt cannot be safely cancelled and replayed,
+        # but it also cannot hold the per-agent lock forever. Receipt waiting
+        # is therefore capped against the wake's durable original fired_at.
+        # At the ceiling the waiter detaches, the exact row is quarantined as
+        # RECEIPT_ABANDONED, and a later positive receipt can still win.
         self._delivery_inflight_fn = delivery_inflight_fn
         # async fn(agent_name, text) -> bool. Delivers operator-facing owner
         # alerts for terminal dead-letter events (PERSISTED_WAKE_PARKED, stale
@@ -282,6 +292,35 @@ class AgentScheduler:
         if pending_wake_max_age_sec <= 0:
             raise ValueError("pending_wake_max_age_sec must be positive")
         self._pending_wake_max_age_sec = float(pending_wake_max_age_sec)
+        if receipt_extension_max_age_sec is None:
+            raw_extension_max_age = os.environ.get(
+                _RECEIPT_EXTENSION_MAX_AGE_ENV,
+                str(_RECEIPT_EXTENSION_MAX_AGE_SEC),
+            )
+            try:
+                receipt_extension_max_age_sec = float(raw_extension_max_age)
+                if (
+                    not math.isfinite(receipt_extension_max_age_sec)
+                    or receipt_extension_max_age_sec <= 0
+                ):
+                    raise ValueError("ceiling must be finite and positive")
+            except (TypeError, ValueError):
+                receipt_extension_max_age_sec = _RECEIPT_EXTENSION_MAX_AGE_SEC
+                _log(
+                    "scheduler: invalid receipt-extension ceiling "
+                    f"{raw_extension_max_age!r}; using "
+                    f"{_RECEIPT_EXTENSION_MAX_AGE_SEC:g}s"
+                )
+        if (
+            not math.isfinite(receipt_extension_max_age_sec)
+            or receipt_extension_max_age_sec <= 0
+        ):
+            raise ValueError(
+                "receipt_extension_max_age_sec must be finite and positive"
+            )
+        self._receipt_extension_max_age_sec = float(
+            receipt_extension_max_age_sec
+        )
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
@@ -306,9 +345,12 @@ class AgentScheduler:
         # cohorts while allowing unrelated agents to progress independently.
         self._schedule_delivery_tasks: set[asyncio.Task] = set()
         self._schedule_delivery_locks: dict[str, asyncio.Lock] = {}
+        self._detached_receipt_tasks: set[asyncio.Task] = set()
         self._pending_replay_tasks: dict[str, asyncio.Task] = {}
+        self._pending_replay_again: set[str] = set()
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
+        self._last_pending_wake_liveness_drain_at: float | None = None
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -356,6 +398,14 @@ class AgentScheduler:
         if delivery_tasks:
             await asyncio.gather(*delivery_tasks, return_exceptions=True)
         self._schedule_delivery_tasks.clear()
+        detached_receipts = list(self._detached_receipt_tasks)
+        for task in detached_receipts:
+            if not task.done():
+                task.cancel()
+        if detached_receipts:
+            await asyncio.gather(*detached_receipts, return_exceptions=True)
+        self._detached_receipt_tasks.clear()
+        self._pending_replay_again.clear()
         replay_tasks = list(self._pending_replay_tasks.values())
         for task in replay_tasks:
             if not task.done():
@@ -389,6 +439,11 @@ class AgentScheduler:
 
         # Check clock-aligned wakes
         await self._check_clock_aligned_wakes(now)
+
+        # Idle notifications are the primary low-latency outbox drain.  This
+        # bounded fallback prevents a lost edge from stranding a busy-deferred
+        # fire forever, including agents that keep the default heartbeat=0.
+        self._check_pending_wake_liveness(now)
 
         # Check heartbeat health
         await self._check_heartbeats(now)
@@ -577,6 +632,29 @@ class AgentScheduler:
                         f"live cohort for '{agent_name}': "
                         f"{type(exc).__name__}: {exc}"
                     )
+            if self._agent_busy_not_wedged(agent_name) or lock.locked():
+                direct_sends = [
+                    schedule for schedule in schedules if schedule.direct_send
+                ]
+                deferred = [
+                    schedule for schedule in schedules if not schedule.direct_send
+                ]
+                for index, schedule in enumerate(direct_sends):
+                    await self._deliver_schedule(
+                        schedule,
+                        attempt_started=(
+                            attempt_started if index == 0 else None
+                        ),
+                    )
+                if deferred:
+                    if attempt_started is not None:
+                        attempt_started.set()
+                    _log(
+                        f"scheduler: deferring {len(deferred)} fired "
+                        f"schedule(s) for agent '{agent_name}' until the next "
+                        "turn-idle boundary"
+                    )
+                return
             async with lock:
                 for next_index, schedule in enumerate(schedules):
                     try:
@@ -603,6 +681,13 @@ class AgentScheduler:
                     schedule, "delivery canceled before attempt"
                 )
             raise
+
+    def notify_agent_idle(self, agent_name: str) -> None:
+        """Drain durable scheduler work after a transport turn goes idle."""
+        _log(
+            f"scheduler: turn-idle delivery trigger for agent '{agent_name}'"
+        )
+        self.replay_pending_for_agent(agent_name)
 
     def _alert_stale_one_shot_drop(
         self,
@@ -775,8 +860,10 @@ class AgentScheduler:
                 )
                 if not confirmed:
                     failure_reason = "wake callback returned no positive receipt"
-            except asyncio.TimeoutError:
-                failure_reason = (
+            except _ReceiptAbandonedError:
+                return
+            except asyncio.TimeoutError as exc:
+                failure_reason = str(exc) or (
                     "delivery receipt timed out after "
                     f"{self._schedule_delivery_timeout:g}s"
                 )
@@ -911,8 +998,9 @@ class AgentScheduler:
         schedule,
         *,
         attempt_started: asyncio.Event | None = None,
+        fresh_receipt_budget: bool = False,
     ) -> bool:
-        """Wait for one exact receipt, extending while positive liveness holds."""
+        """Wait for one exact receipt within its applicable delivery budget."""
         delivery_prompt, stale_drop_notices = (
             self._wake_prompt_with_recurring_stale_drops(schedule)
         )
@@ -926,9 +1014,25 @@ class AgentScheduler:
         try:
             while True:
                 try:
+                    remaining = max(
+                        0.0,
+                        self._receipt_extension_max_age_sec
+                        - self._receipt_age(schedule),
+                    )
+                    if fresh_receipt_budget:
+                        # Replay already proved this old prompt was never
+                        # pasted. Give the owed first transport attempt one
+                        # real acceptance window instead of cancelling its
+                        # task at timeout=0 from the historical fired_at.
+                        remaining = max(
+                            remaining, self._schedule_delivery_timeout
+                        )
+                        fresh_receipt_budget = False
                     confirmed = await asyncio.wait_for(
                         asyncio.shield(delivery),
-                        timeout=self._schedule_delivery_timeout,
+                        timeout=min(
+                            self._schedule_delivery_timeout, remaining
+                        ),
                     )
                     if confirmed and stale_drop_notices:
                         self._acknowledge_recurring_stale_drops(
@@ -936,10 +1040,32 @@ class AgentScheduler:
                         )
                     return confirmed
                 except asyncio.TimeoutError:
+                    age = self._receipt_age(schedule)
+                    if age >= self._receipt_extension_max_age_sec:
+                        inflight = self._wake_prompt_inflight(
+                            schedule, prompt=delivery_prompt
+                        )
+                        if inflight:
+                            self._abandon_receipt_wait(
+                                schedule,
+                                delivery,
+                                age=age,
+                                stale_drop_notices=stale_drop_notices,
+                            )
+                            raise _ReceiptAbandonedError
+                        delivery.cancel()
+                        await asyncio.gather(
+                            delivery, return_exceptions=True
+                        )
+                        raise asyncio.TimeoutError(
+                            "delivery receipt ceiling reached from original "
+                            f"fired_at after {age:.1f}s"
+                        )
                     if self._agent_busy_not_wedged(schedule.agent_name):
                         _log(
                             f"scheduler: receipt still pending for schedule "
-                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.name}' "
+                            f"(#{self._schedule_id(schedule)}) for agent "
                             f"'{schedule.agent_name}', but inflight watchdog "
                             "reports busy-not-wedged; extending delivery timeout"
                         )
@@ -949,7 +1075,8 @@ class AgentScheduler:
                     ):
                         _log(
                             f"scheduler: receipt still pending for schedule "
-                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.name}' "
+                            f"(#{self._schedule_id(schedule)}) for agent "
                             f"'{schedule.agent_name}', but its prompt is "
                             "already pasted to the transport — a cancel "
                             "cannot recall it, and declaring undelivered "
@@ -964,6 +1091,206 @@ class AgentScheduler:
             delivery.cancel()
             await asyncio.gather(delivery, return_exceptions=True)
             raise
+
+    def _abandon_receipt_wait(
+        self,
+        schedule,
+        delivery: asyncio.Task,
+        *,
+        age: float,
+        stale_drop_notices: list[RecurringScheduleStaleDrop],
+    ) -> None:
+        """Release the delivery lock while retaining late-receipt authority."""
+        schedule_id, fired_at, _ = self._quarantine_abandoned_receipt(
+            schedule, age=age
+        )
+
+        async def _observe_late_receipt() -> None:
+            try:
+                confirmed = await delivery
+                if not confirmed:
+                    return
+                self._registry.confirm_pending_schedule_wake_by_fire(
+                    schedule_id,
+                    fired_at,
+                    delivered_at=time.time(),
+                )
+                if stale_drop_notices:
+                    self._acknowledge_recurring_stale_drops(
+                        schedule.agent_name, stale_drop_notices
+                    )
+                self._log_late_abandoned_receipt(
+                    schedule, schedule_id=schedule_id, fired_at=fired_at
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log(
+                    f"scheduler: abandoned receipt observer failed for "
+                    f"schedule '{schedule.name}' (#{schedule_id}) for agent "
+                    f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+                )
+
+        self._track_detached_receipt_task(_observe_late_receipt())
+
+    def _quarantine_abandoned_receipt(
+        self, schedule, *, age: float
+    ) -> tuple[int, float, bool]:
+        """Quarantine one unrecallable fire without submitting new work."""
+        reason = (
+            "RECEIPT_ABANDONED: original fired_at exceeded receipt-extension "
+            f"ceiling ({age:.1f}s >= {self._receipt_extension_max_age_sec:.1f}s)"
+        )
+        schedule_id = self._schedule_id(schedule)
+        fired_at = self._schedule_fired_at(schedule)
+        row = self._registry.get_schedule_wake_by_fire(
+            schedule_id, fired_at
+        )
+        parked = bool(
+            row is not None
+            and self._registry.park_pending_schedule_wake(
+                row.id,
+                reason=reason,
+            )
+        )
+        _log(
+            f"scheduler: RECEIPT_ABANDONED schedule '{schedule.name}' "
+            f"(#{schedule_id}) for agent '{schedule.agent_name}' "
+            f"fired_at={fired_at} age_s={age:.1f} "
+            f"ceiling_s={self._receipt_extension_max_age_sec:.1f} "
+            f"quarantined={parked}"
+        )
+        if self._activity:
+            try:
+                self._activity.log(
+                    schedule.agent_name,
+                    "schedule_receipt_abandoned",
+                    f"Schedule '{schedule.name}' receipt wait exceeded its "
+                    "original-fire ceiling",
+                )
+            except Exception:
+                pass
+        return schedule_id, fired_at, parked
+
+    def _abandon_inflight_replay(
+        self,
+        schedule: PendingScheduleWake,
+        *,
+        prompt: str,
+        age: float,
+        stale_drop_notices: list[RecurringScheduleStaleDrop],
+    ) -> bool:
+        """Abandon a pasted replay in place, never invoking the wake callback.
+
+        The physical turn already owns the durable ``ScheduleWakeReceipt``
+        callback.  Polling only observes that existing authority; it never
+        creates another transport turn.
+        """
+        schedule_id, fired_at, parked = self._quarantine_abandoned_receipt(
+            schedule, age=age
+        )
+        row = self._registry.get_schedule_wake_by_fire(schedule_id, fired_at)
+        retained = bool(
+            parked
+            or (
+                row is not None
+                and row.accepted_at == 0
+                and row.parked_at > 0
+                and row.last_error.startswith("RECEIPT_ABANDONED")
+            )
+        )
+        if not retained:
+            return False
+
+        async def _observe_existing_receipt() -> None:
+            try:
+                while True:
+                    row = self._registry.get_schedule_wake_by_fire(
+                        schedule_id, fired_at
+                    )
+                    if row is None:
+                        return
+                    if row.accepted_at > 0:
+                        if stale_drop_notices:
+                            self._acknowledge_recurring_stale_drops(
+                                schedule.agent_name, stale_drop_notices
+                            )
+                        self._log_late_abandoned_receipt(
+                            schedule,
+                            schedule_id=schedule_id,
+                            fired_at=fired_at,
+                        )
+                        return
+                    if not self._wake_prompt_inflight(
+                        schedule, prompt=prompt
+                    ):
+                        # Durable acceptance precedes the transport receipt
+                        # resolving. Re-read once across that ordering edge.
+                        row = self._registry.get_schedule_wake_by_fire(
+                            schedule_id, fired_at
+                        )
+                        if row is not None and row.accepted_at > 0:
+                            if stale_drop_notices:
+                                self._acknowledge_recurring_stale_drops(
+                                    schedule.agent_name, stale_drop_notices
+                                )
+                            self._log_late_abandoned_receipt(
+                                schedule,
+                                schedule_id=schedule_id,
+                                fired_at=fired_at,
+                            )
+                        return
+                    await asyncio.sleep(
+                        _ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC
+                    )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                _log(
+                    f"scheduler: abandoned receipt observer failed for "
+                    f"schedule '{schedule.name}' (#{schedule_id}) for agent "
+                    f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+                )
+
+        self._track_detached_receipt_task(_observe_existing_receipt())
+        return True
+
+    def _track_detached_receipt_task(self, observer) -> None:
+        """Run one late-receipt observer outside the per-agent delivery lock."""
+        task = asyncio.create_task(observer)
+        self._detached_receipt_tasks.add(task)
+        task.add_done_callback(self._detached_receipt_tasks.discard)
+
+    @staticmethod
+    def _log_late_abandoned_receipt(
+        schedule, *, schedule_id: int, fired_at: float
+    ) -> None:
+        _log(
+            f"scheduler: late positive receipt retired abandoned "
+            f"schedule '{schedule.name}' (#{schedule_id}) for agent "
+            f"'{schedule.agent_name}' fired_at={fired_at}"
+        )
+
+    @staticmethod
+    def _schedule_id(schedule) -> int:
+        """Return the schedule identity, never a replay outbox-row identity."""
+        if hasattr(schedule, "schedule_id"):
+            return int(schedule.schedule_id)
+        return int(schedule.id)
+
+    @staticmethod
+    def _schedule_fired_at(schedule) -> float:
+        """Return the immutable exact-fire timestamp for either row shape."""
+        if hasattr(schedule, "fired_at"):
+            return float(schedule.fired_at)
+        return float(schedule.last_run)
+
+    def _receipt_age(self, schedule) -> float:
+        """Age one durable fire; direct legacy callers with no stamp start now."""
+        fired_at = self._schedule_fired_at(schedule)
+        if fired_at <= 0:
+            return 0.0
+        return max(0.0, time.time() - fired_at)
 
     def _agent_busy_not_wedged(self, agent_name: str) -> bool:
         """Read the transport's live positive-liveness signal, failing closed."""
@@ -1014,9 +1341,10 @@ class AgentScheduler:
         task.add_done_callback(self._owner_alert_tasks.discard)
 
     def replay_pending_for_agent(self, agent_name: str) -> None:
-        """Replay the durable wake outbox after the agent's next session boot."""
+        """Coalesce triggers while guaranteeing one replay after the active pass."""
         existing = self._pending_replay_tasks.get(agent_name)
         if existing is not None and not existing.done():
+            self._pending_replay_again.add(agent_name)
             return
         try:
             loop = asyncio.get_running_loop()
@@ -1038,11 +1366,15 @@ class AgentScheduler:
                     f"scheduler: PERSISTED_WAKE_REPLAY_FAILURE for "
                     f"'{agent_name}': {type(error).__name__}: {error}"
                 )
+            rerun = agent_name in self._pending_replay_again
+            self._pending_replay_again.discard(agent_name)
+            if rerun and not done.cancelled() and done.exception() is None:
+                self.replay_pending_for_agent(agent_name)
 
         task.add_done_callback(_done)
 
     async def _replay_pending_for_agent(self, agent_name: str) -> None:
-        """Deliver one agent's persisted wakes FIFO and receipt exact successes."""
+        """Deliver one agent's current owed wakes with exact receipts."""
         lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
         async with lock:
             await self._replay_pending_locked(agent_name)
@@ -1083,7 +1415,7 @@ class AgentScheduler:
         return True
 
     async def _replay_pending_locked(self, agent_name: str) -> None:
-        """Reap all zombies, then replay active wakes FIFO under the agent lock."""
+        """Reap zombies, collapse recurrences, then replay under the agent lock."""
         replay_now = time.time()
         health = self._registry.get_pending_schedule_wake_health(
             agent_name, now=replay_now
@@ -1096,10 +1428,33 @@ class AgentScheduler:
                 f"oldest_age_s={summary['oldest_age_seconds']:.1f} "
                 f"oldest_fired_at={summary['oldest_fired_at']}"
             )
+            if self._agent_busy_not_wedged(agent_name):
+                _log(
+                    f"scheduler: persisted wake replay deferred for "
+                    f"'{agent_name}' until the next turn-idle boundary"
+                )
+                return
         all_pending_wakes = self._registry.list_pending_schedule_wakes(
             agent_name, include_parked=True
         )
+        abandoned_schedule_ids = set()
+        for pending in all_pending_wakes:
+            if (
+                pending.parked_at > 0
+                and pending.last_error.startswith("RECEIPT_ABANDONED")
+                and self._wake_prompt_inflight(
+                    pending,
+                    prompt=self._wake_prompt_with_recurring_stale_drops(
+                        pending
+                    )[0],
+                )
+            ):
+                # A persisted abandonment blocks only while the old physical
+                # prompt can still execute. After a restart or failed receipt,
+                # a no-longer-inflight tombstone must not starve newer work.
+                abandoned_schedule_ids.add(pending.schedule_id)
         pending_wakes = []
+        fresh_receipt_budget_ids: set[int] = set()
         for pending in all_pending_wakes:
             current_schedule = self._registry.get_schedule(pending.schedule_id)
             zombie_reason = ""
@@ -1133,10 +1488,47 @@ class AgentScheduler:
                 continue
             if pending.parked_at != 0:
                 continue
+            if pending.schedule_id in abandoned_schedule_ids:
+                _log(
+                    f"scheduler: persisted wake #{pending.id}, schedule "
+                    f"#{pending.schedule_id} for agent '{pending.agent_name}' "
+                    "remains pending behind an older abandoned pasted fire"
+                )
+                continue
             replay_max_age = self._pending_wake_replay_max_age(
                 current_schedule, pending.fired_at
             )
             row_age = max(0.0, replay_now - pending.fired_at)
+            delivery_prompt, stale_drop_notices = (
+                self._wake_prompt_with_recurring_stale_drops(pending)
+            )
+            # Invariant: abandonment precedes both stale deletion and
+            # recurrence collapse. Once a prompt is physically pasted it
+            # cannot be recalled, so replay must quarantine that exact fire
+            # in place and retain its existing durable acceptance authority.
+            # Calling _wait_for_wake_confirmation here would paste a duplicate.
+            past_receipt_ceiling = (
+                row_age >= self._receipt_extension_max_age_sec
+            )
+            inflight_past_receipt_ceiling = (
+                past_receipt_ceiling
+                and self._wake_prompt_inflight(pending, prompt=delivery_prompt)
+            )
+            if inflight_past_receipt_ceiling:
+                retained = self._abandon_inflight_replay(
+                    pending,
+                    prompt=delivery_prompt,
+                    age=row_age,
+                    stale_drop_notices=stale_drop_notices,
+                )
+                if retained:
+                    abandoned_schedule_ids.add(pending.schedule_id)
+                _log(
+                    f"scheduler: pasted pending wake #{pending.id} crossed "
+                    "its receipt ceiling; receipt abandonment takes "
+                    "precedence over stale deletion and recurrence collapse"
+                )
+                continue
             if row_age > replay_max_age:
                 discarded = self._registry.delete_pending_schedule_wake(
                     pending.id
@@ -1166,7 +1558,57 @@ class AgentScheduler:
                         row_age=row_age,
                     )
                 continue
+            if past_receipt_ceiling:
+                # The inflight probe above proved this old row was never
+                # pasted. It remains owed work inside its replay window.
+                fresh_receipt_budget_ids.add(pending.id)
             pending_wakes.append(pending)
+
+        # A recurring schedule describes current work, not a FIFO event log.
+        # When several occurrences accumulated during one busy turn, keep the
+        # newest relevant fire and quarantine older recurrences as explicit
+        # ledger evidence. One-shots remain independent owed work.
+        newest_recurring: dict[int, PendingScheduleWake] = {}
+        for pending in pending_wakes:
+            current_schedule = self._registry.get_schedule(
+                pending.schedule_id
+            )
+            if current_schedule is not None and not current_schedule.one_shot:
+                newest_recurring[pending.schedule_id] = pending
+        collapsed_ids: set[int] = set()
+        for pending in pending_wakes:
+            newest = newest_recurring.get(pending.schedule_id)
+            if newest is None or newest.id == pending.id:
+                continue
+            if self._registry.collapse_pending_schedule_wake(
+                pending.id,
+                superseded_by_fired_at=newest.fired_at,
+                collapsed_at=replay_now,
+            ):
+                collapsed_ids.add(pending.id)
+                _log(
+                    f"scheduler: RECURRENCE_COLLAPSED pending #{pending.id}, "
+                    f"schedule '{pending.schedule_name}' "
+                    f"(#{pending.schedule_id}) for agent "
+                    f"'{pending.agent_name}': fired_at={pending.fired_at} "
+                    f"superseded_by_fired_at={newest.fired_at}"
+                )
+                if self._activity:
+                    try:
+                        self._activity.log(
+                            pending.agent_name,
+                            "schedule_recurrence_collapsed",
+                            f"Schedule '{pending.schedule_name}' recurrence "
+                            "collapsed into its newest pending fire",
+                        )
+                    except Exception:
+                        pass
+        if collapsed_ids:
+            pending_wakes = [
+                pending
+                for pending in pending_wakes
+                if pending.id not in collapsed_ids
+            ]
 
         for pending in pending_wakes:
             if pending.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP:
@@ -1178,9 +1620,19 @@ class AgentScheduler:
             if attempts is None:
                 continue
             try:
-                confirmed = await self._wait_for_wake_confirmation(pending)
+                confirmed = await self._wait_for_wake_confirmation(
+                    pending,
+                    # Any over-ceiling row that reached this point is not
+                    # currently pasted and survived the replay-age policy.
+                    # Its first legitimate transport acceptance is still owed.
+                    fresh_receipt_budget=(
+                        pending.id in fresh_receipt_budget_ids
+                    ),
+                )
             except asyncio.CancelledError:
                 raise
+            except _ReceiptAbandonedError:
+                break
             except Exception as exc:
                 _log(
                     f"scheduler: persisted wake #{pending.id} for "
@@ -1366,7 +1818,7 @@ class AgentScheduler:
             else schedule.last_run
         )
         receipt = ScheduleWakeReceipt(
-            self._registry, schedule.id, fired_at
+            self._registry, self._schedule_id(schedule), fired_at
         )
         callback_kwargs = {}
         try:
@@ -1498,6 +1950,44 @@ class AgentScheduler:
             "outbox; triggering durable replay"
         )
         self.replay_pending_for_agent(agent_name)
+
+    def _check_pending_wake_liveness(self, now: float) -> None:
+        """Periodically drain live-daemon outboxes without heartbeat opt-in.
+
+        Turn-idle remains the primary path.  This once-per-minute scan is the
+        bounded fallback for a lost idle callback; the positive busy gate is
+        checked both here and again under the per-agent replay lock.
+        """
+        last_drain = self._last_pending_wake_liveness_drain_at
+        if last_drain is None:
+            self._last_pending_wake_liveness_drain_at = now
+            return
+        if now - last_drain < _PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC:
+            return
+        self._last_pending_wake_liveness_drain_at = now
+        try:
+            agent_names = {
+                pending.agent_name
+                for pending in self._registry.list_pending_schedule_wakes()
+            }
+        except Exception as exc:
+            _log(
+                "scheduler: periodic outbox drain scan failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        for agent_name in sorted(agent_names):
+            if self._agent_busy_not_wedged(agent_name):
+                _log(
+                    f"scheduler: periodic outbox drain deferred for "
+                    f"'{agent_name}': transport remains busy-not-wedged"
+                )
+                continue
+            _log(
+                f"scheduler: periodic liveness drain found pending wakes "
+                f"for '{agent_name}'"
+            )
+            self.replay_pending_for_agent(agent_name)
 
     # Resurrection cap: at most this many attempts per RESURRECTION_WINDOW_SECONDS
     # per agent. Prevents thrashing on a persistently-broken session while still

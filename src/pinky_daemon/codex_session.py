@@ -35,6 +35,7 @@ from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     _is_outreach_tool,
     _log,
+    _notify_turn_idle,
 )
 from pinky_daemon.transport_state import (
     OwnerToken,
@@ -724,6 +725,11 @@ class CodexSession:
                         scheduler_delivery, False
                     )
                     self._processing = False
+                    if (
+                        self.state == SessionState.CONNECTED
+                        and self._message_queue.empty()
+                    ):
+                        _notify_turn_idle(self._config, self.agent_name)
 
         except asyncio.CancelledError:
             _log(f"codex[{self.agent_name}]: worker cancelled")

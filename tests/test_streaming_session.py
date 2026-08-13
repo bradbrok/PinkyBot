@@ -968,6 +968,77 @@ async def test_send_enqueues_routing_entry_even_without_chat_id() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("is_error", [False, True])
+async def test_send_books_turn_before_fast_result_can_emit_idle(
+    is_error: bool,
+) -> None:
+    """A result visible before query() returns still consumes a booked turn."""
+    ss = _make_session()
+    write_visible = asyncio.Event()
+    release_query = asyncio.Event()
+    result_consumed = asyncio.Event()
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
+
+    async def held_query(prompt: str) -> None:
+        del prompt
+        write_visible.set()
+        await release_query.wait()
+
+    async def receive_messages():
+        await write_visible.wait()
+        yield _make_result_message(
+            is_error=is_error,
+            api_error_status=429 if is_error else None,
+        )
+        result_consumed.set()
+
+    ss._client.query = held_query
+    ss._client.receive_messages = receive_messages
+
+    send_task = asyncio.create_task(
+        ss.send(
+            "fast turn",
+            platform="telegram",
+            chat_id="123",
+            message_id="9",
+        )
+    )
+    reader_task = asyncio.create_task(ss._reader_loop())
+
+    await result_consumed.wait()
+    assert not send_task.done()
+    assert idle_agents == [ss.agent_name]
+    assert ss._pending_chats == []
+
+    release_query.set()
+    assert await send_task is True
+    await reader_task
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
+async def test_send_query_failure_rolls_back_only_its_reservation() -> None:
+    ss = _make_session()
+    existing = ("telegram", "same", "same")
+    ss._pending_chats.append(existing)
+    ss._client.query = AsyncMock(side_effect=RuntimeError("write failed"))
+    ss.attempt_reconnect = AsyncMock(return_value=False)
+
+    assert (
+        await ss.send(
+            "fails",
+            platform="telegram",
+            chat_id="same",
+            message_id="same",
+        )
+        is False
+    )
+    assert len(ss._pending_chats) == 1
+    assert ss._pending_chats[0] is existing
+
+
+@pytest.mark.asyncio
 async def test_context_warn_enqueues_unrouted_sentinel() -> None:
     """The [SYSTEM] context warning triggers an agent turn whose ResultMessage
     pops a routing tuple -- a sentinel must be enqueued for it."""
@@ -1097,6 +1168,8 @@ async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
     """Sentinel turns with no content stay silent -- no routing target."""
     ss = _make_session()
     routed: list[str] = []
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
 
     async def capture(turn_result):
         routed.append(turn_result.chat_id)
@@ -1107,6 +1180,7 @@ async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
     await _run_reader_against_stream(ss, [_make_result_message()])
 
     assert routed == []
+    assert idle_agents == [ss.agent_name]
 
 
 # -- idle_sleep must let the memory-save turn finish before teardown ----------

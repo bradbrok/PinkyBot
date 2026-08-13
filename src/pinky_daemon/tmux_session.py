@@ -82,6 +82,7 @@ from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     _is_outreach_tool,
     _log,
+    _notify_turn_idle,
 )
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
@@ -5069,6 +5070,7 @@ class TmuxSession:
                     "autonomous": True,
                 }
             )
+            self._notify_scheduler_idle_if_ready()
             return
 
         entry = self._inflight_metas.popleft()
@@ -5261,6 +5263,19 @@ class TmuxSession:
         # sleeps between sends, and this callback runs on the tailer's
         # read loop, which must not stall.
         self._schedule_pending_effort_if_idle()
+        self._notify_scheduler_idle_if_ready()
+
+    def _notify_scheduler_idle_if_ready(self) -> None:
+        """Report an idle pane after transport-specific reconciliation."""
+        if getattr(self, "_defer_scheduler_idle_notify", False):
+            return
+        if (
+            self.state == SessionState.CONNECTED
+            and not self._inflight_metas
+            and self._inflight_turn is None
+            and self._message_queue.empty()
+        ):
+            _notify_turn_idle(self._config, self.agent_name)
 
     async def handle_stop_failure(
         self,
