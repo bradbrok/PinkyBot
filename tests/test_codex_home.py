@@ -170,9 +170,119 @@ def test_prepare_replaces_linked_soul_without_writing_its_shared_target(
     assert agents_md.read_text(encoding="utf-8") == "compiled soul"
     assert shared_soul.read_text(encoding="utf-8") == "shared operator soul"
     assert soul_store.calls == [
-        ("test-agent", "shared operator soul", "agent"),
         ("test-agent", "compiled soul", "spawn"),
     ]
+
+
+def test_prepare_replaces_dangling_soul_symlink_without_creating_target(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    agent_home.mkdir()
+    _auth(shared_home)
+    missing_target = shared_home / "missing-operator-soul.md"
+    agents_md = agent_home / "AGENTS.md"
+    agents_md.symlink_to(missing_target)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    soul_store = _SoulStore()
+
+    prepare_agent_codex_home(
+        _scope(working_dir, system_prompt="compiled soul"),
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+
+    assert not agents_md.is_symlink()
+    assert agents_md.read_text(encoding="utf-8") == "compiled soul"
+    assert not missing_target.exists()
+    assert soul_store.calls == [("test-agent", "compiled soul", "spawn")]
+
+
+def test_prepare_publishes_soul_mode_0600_under_restrictive_umask(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+
+    previous_umask = os.umask(0o777)
+    try:
+        prepare_agent_codex_home(
+            _scope(working_dir, system_prompt="compiled soul"),
+            log=lambda _message: None,
+            soul_version_store=_SoulStore(),
+        )
+    finally:
+        os.umask(previous_umask)
+
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    assert stat.S_IMODE(agents_md.stat().st_mode) == 0o600
+    assert agents_md.read_text(encoding="utf-8") == "compiled soul"
+
+
+def test_shared_home_equality_refuses_before_every_writer_and_preserves_bytes(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    (shared_home / "AGENTS.md").write_text("shared operator soul", encoding="utf-8")
+    (shared_home / "config.toml").write_text("shared operator config", encoding="utf-8")
+    before = {
+        path.name: path.read_bytes()
+        for path in shared_home.iterdir()
+        if path.is_file()
+    }
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    writer_calls: list[str] = []
+
+    def _writer_spy(name):
+        def _record(*_args, **_kwargs):
+            writer_calls.append(name)
+
+        return _record
+
+    monkeypatch.setattr(codex_home_mod, "_write_managed_config", _writer_spy("config"))
+    monkeypatch.setattr(codex_home_mod, "_ensure_auth_link", _writer_spy("auth"))
+    monkeypatch.setattr(codex_home_mod, "_write_agent_soul", _writer_spy("soul"))
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_run_initial_rollout_migration",
+        _writer_spy("migration"),
+    )
+    soul_store = _SoulStore()
+
+    with pytest.raises(RuntimeError, match="resolves to the shared home"):
+        prepare_agent_codex_home(
+            _scope(
+                working_dir,
+                codex_home=str(shared_home),
+                system_prompt="compiled soul",
+            ),
+            log=lambda _message: None,
+            soul_version_store=soul_store,
+        )
+
+    after = {
+        path.name: path.read_bytes()
+        for path in shared_home.iterdir()
+        if path.is_file()
+    }
+    assert writer_calls == []
+    assert soul_store.calls == []
+    assert after == before
 
 
 def test_subprocess_transport_flag_off_has_zero_env_delta_and_zero_soul_writes(
@@ -2027,6 +2137,45 @@ def test_tmux_transport_preflight_writes_soul_only_to_agent_home(
     assert not (shared_home / "AGENTS.md").exists()
 
 
+@pytest.mark.asyncio
+async def test_tmux_replacement_publishes_and_snapshots_soul_once(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+    )
+    soul_store = _SoulStore()
+    session = CodexTmuxSession(config, registry=soul_store)
+
+    async def _noop():
+        return None
+
+    async def _base_spawn(_session):
+        return None
+
+    monkeypatch.setattr(session, "disconnect", _noop)
+    monkeypatch.setattr(session, "_seed_codex_trust", lambda _cwd: None)
+    monkeypatch.setattr(session, "_codex_dismiss_nux_and_ready", _noop)
+    monkeypatch.setattr(
+        "pinky_daemon.codex_tmux_session.TmuxSession._spawn_tmux_repl",
+        _base_spawn,
+    )
+
+    await session.restart_transport(bring_up=session._spawn_tmux_repl)
+
+    assert soul_store.calls == [("test-agent", "compiled tmux soul", "spawn")]
+
+
 def test_tmux_app_server_boundary_uses_the_shared_soul_writer(
     tmp_path,
     monkeypatch,
@@ -2061,6 +2210,83 @@ def test_tmux_app_server_boundary_uses_the_shared_soul_writer(
         ("test-agent", "compiled app-server soul", "spawn")
     ]
     assert not (shared_home / "AGENTS.md").exists()
+
+
+@pytest.mark.asyncio
+async def test_tmux_app_server_replacement_publishes_and_snapshots_soul_once(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+    monkeypatch.setenv("PINKY_CODEX_TMUX_APP_SERVER", "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    session = CodexSession(config, registry=soul_store)
+    assert session._app_supervisor is not None
+    supervisor = session._app_supervisor
+
+    class _Client:
+        def __init__(self) -> None:
+            self.is_closed = False
+            self.initialized = False
+
+        async def close(self) -> None:
+            self.is_closed = True
+
+        def set_transport_closed_handler(self, _handler) -> None:
+            return None
+
+        async def initialize(self, *, name: str, version: str) -> None:
+            assert (name, version) == ("pinkybot", "1")
+            self.initialized = True
+
+    class _Proc:
+        def __init__(self, returncode) -> None:
+            self.pid = 4321
+            self.returncode = returncode
+
+        def kill(self) -> None:
+            self.returncode = -9
+
+        async def wait(self) -> int:
+            return self.returncode
+
+    stale_client = _Client()
+    session._app_client = stale_client
+    session._app_proc = _Proc(1)
+
+    async def _noop_teardown() -> None:
+        return None
+
+    async def _start(**kwargs):
+        prepared_home = kwargs.get("prepared_codex_home")
+        if prepared_home is None:
+            env = supervisor._build_env()
+        else:
+            env = supervisor._build_env(prepared_codex_home=prepared_home)
+        assert env["CODEX_HOME"] == str(working_dir / ".codex")
+        return _Client(), _Proc(None)
+
+    monkeypatch.setattr(supervisor, "teardown", _noop_teardown)
+    monkeypatch.setattr(supervisor, "start", _start)
+
+    assert await session._ensure_app_server() is True
+
+    assert stale_client.is_closed is True
+    assert soul_store.calls == [
+        ("test-agent", "compiled app-server soul", "spawn")
+    ]
 
 
 def test_reverse_migration_moves_only_matching_rollouts(tmp_path):

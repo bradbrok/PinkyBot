@@ -167,7 +167,11 @@ def _write_agent_soul(
         )
 
     agents_path = codex_home / "AGENTS.md"
-    if _path_entry_exists(agents_path):
+    try:
+        agents_stat = agents_path.lstat()
+    except FileNotFoundError:
+        agents_stat = None
+    if agents_stat is not None and not stat.S_ISLNK(agents_stat.st_mode):
         try:
             existing = agents_path.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
@@ -183,6 +187,7 @@ def _write_agent_soul(
     )
     temp_path = Path(temp_name)
     try:
+        os.fchmod(fd, 0o600)
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
             fd = -1
             handle.write(content)

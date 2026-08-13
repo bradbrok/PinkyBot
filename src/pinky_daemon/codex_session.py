@@ -1236,8 +1236,9 @@ class CodexSession(TransportReplacementMixin):
         # closed/cleared (and a tmux supervisor must not be started) before the
         # replacement spawn proves its Codex home can be prepared safely.
         direct_env: dict[str, str] | None = None
+        prepared_tmux_home: str | None = None
         if self._use_tmux_app_server:
-            self._preflight_agent_codex_home()
+            prepared_tmux_home = self._preflight_agent_codex_home()
         else:
             direct_env = self._build_codex_env()
 
@@ -1254,9 +1255,14 @@ class CodexSession(TransportReplacementMixin):
                 # hands back an UN-initialized client. The initialize below is
                 # the single end-to-end gate for that child.
                 assert self._app_supervisor is not None
+                start_kwargs = {
+                    "notification_handler": self._on_appserver_notification,
+                    "server_request_handler": self._on_appserver_request,
+                }
+                if prepared_tmux_home is not None:
+                    start_kwargs["prepared_codex_home"] = prepared_tmux_home
                 self._app_client, self._app_proc = await self._app_supervisor.start(
-                    notification_handler=self._on_appserver_notification,
-                    server_request_handler=self._on_appserver_request,
+                    **start_kwargs
                 )
             else:
                 assert direct_env is not None

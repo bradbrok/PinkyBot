@@ -165,6 +165,7 @@ class CodexTmuxSession(TmuxSession):
         self._reasoning_effort = config.thinking_effort or "medium"
         self._codex_mcp_servers = config.mcp_servers or {}
         self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
+        self._preflighted_codex_home: Path | None = None
 
     # ── seam: session name ──────────────────────────────────────────────────
     def _build_session_name(self) -> str:
@@ -567,7 +568,7 @@ class CodexTmuxSession(TmuxSession):
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     def _preflight_transport_replacement(self) -> None:
         """Prove the isolated Codex home before an inherited tmux teardown."""
-        prepare_agent_codex_home(
+        self._preflighted_codex_home = prepare_agent_codex_home(
             self._config,
             log=_log,
             soul_version_store=self._registry,
@@ -575,11 +576,14 @@ class CodexTmuxSession(TmuxSession):
 
     async def _spawn_tmux_repl(self) -> None:
         cwd = str(Path(self._config.working_dir or ".").resolve())
-        prepare_agent_codex_home(
-            self._config,
-            log=_log,
-            soul_version_store=self._registry,
-        )
+        prepared_home = self._preflighted_codex_home
+        self._preflighted_codex_home = None
+        if prepared_home is None:
+            prepare_agent_codex_home(
+                self._config,
+                log=_log,
+                soul_version_store=self._registry,
+            )
         self._seed_codex_trust(cwd)
         await super()._spawn_tmux_repl()
         await self._codex_dismiss_nux_and_ready()
