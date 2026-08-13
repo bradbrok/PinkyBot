@@ -8,6 +8,7 @@ import hashlib
 import json
 import math
 import os
+import shutil
 import stat
 import subprocess
 import tempfile
@@ -17,6 +18,7 @@ from collections.abc import Callable, Iterator
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from functools import cache
 from pathlib import Path
 from typing import BinaryIO
 
@@ -34,6 +36,7 @@ _MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
 _PRESERVATION_RESERVATION_SUFFIX = ".reserve"
 _PRESERVATION_RESERVATION_STALE_SECONDS = 60 * 60
 _CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS = 2.0
+_LSOF_FALLBACK_PATHS = ("/usr/sbin/lsof", "/usr/bin/lsof")
 _CRASH_FROZEN_CLAIM_MODE = stat.S_IRUSR | stat.S_IWUSR
 _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 10.0
 _MIGRATION_LOCK_RETRY_SECONDS = 0.05
@@ -514,6 +517,19 @@ def _sweep_stale_reservations(root: Path, log: LogFn) -> None:
             os.close(reservation_fd)
 
 
+@cache
+def _resolve_lsof_binary() -> str | None:
+    """Resolve lsof across daemon and login-shell PATH differences."""
+    resolved = shutil.which("lsof")
+    if resolved is not None:
+        return resolved
+    for fallback in _LSOF_FALLBACK_PATHS:
+        resolved = shutil.which(fallback)
+        if resolved is not None:
+            return resolved
+    return None
+
+
 def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
     """Return whether any descriptor holds a claim path.
 
@@ -521,9 +537,16 @@ def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
     live retirement. It deliberately includes this process: another retirer in
     the same process is still a live holder and must keep the freeze intact.
     """
+    lsof_binary = _resolve_lsof_binary()
+    if lsof_binary is None:
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            "descriptor scan unavailable: lsof executable not found"
+        )
+        return None
     try:
         scan = subprocess.run(
-            ["lsof", "-Fn", "--", os.fspath(claim)],
+            [lsof_binary, "-Fn", "--", os.fspath(claim)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -570,9 +593,17 @@ def _inode_has_open_descriptors(
     log: LogFn,
 ) -> bool | None:
     """Scan a frozen claim by device and inode, excluding only this handle."""
+    lsof_binary = _resolve_lsof_binary()
+    if lsof_binary is None:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            "descriptor scan unavailable for frozen inode: "
+            "lsof executable not found"
+        )
+        return None
     try:
         scan = subprocess.run(
-            ["lsof", "-F", "pfDi"],
+            [lsof_binary, "-F", "pfDi"],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,

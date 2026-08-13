@@ -735,6 +735,88 @@ def test_frozen_inode_half_parse_is_loud_uncertainty(
     )
 
 
+def test_lsof_resolver_finds_macos_binary_outside_daemon_path(monkeypatch):
+    """R8: the production daemon PATH still reaches macOS' system lsof."""
+    daemon_path = "/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin"
+    lookups: list[tuple[str, str]] = []
+
+    def resolve(command: str) -> str | None:
+        lookups.append((command, os.environ["PATH"]))
+        if command == "lsof":
+            return None
+        if command == "/usr/sbin/lsof":
+            return command
+        raise AssertionError(f"unexpected lsof candidate: {command}")
+
+    monkeypatch.setenv("PATH", daemon_path)
+    monkeypatch.setattr(codex_home_mod.shutil, "which", resolve)
+    codex_home_mod._resolve_lsof_binary.cache_clear()
+    try:
+        assert codex_home_mod._resolve_lsof_binary() == "/usr/sbin/lsof"
+        assert codex_home_mod._resolve_lsof_binary() == "/usr/sbin/lsof"
+    finally:
+        codex_home_mod._resolve_lsof_binary.cache_clear()
+
+    assert lookups == [
+        ("lsof", daemon_path),
+        ("/usr/sbin/lsof", daemon_path),
+    ]
+
+
+def test_both_descriptor_scans_invoke_resolved_lsof_binary(tmp_path, monkeypatch):
+    """R8: neither descriptor scan falls back to subprocess PATH lookup."""
+    claim = tmp_path / "claim"
+    claim.write_bytes(b"bytes")
+    resolved_lsof = "/resolved/system/lsof"
+    commands: list[list[str]] = []
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_resolve_lsof_binary",
+        lambda: resolved_lsof,
+    )
+
+    with claim.open("rb", buffering=0) as claim_handle:
+        claim_stat = os.fstat(claim_handle.fileno())
+        inode_output = "\n".join(
+            [
+                f"p{os.getpid()}",
+                f"f{claim_handle.fileno()}r",
+                f"D{claim_stat.st_dev}",
+                f"i{claim_stat.st_ino}",
+                "",
+            ]
+        )
+
+        def scan(command, **_kwargs):
+            commands.append(command)
+            if command[1:] == ["-Fn", "--", os.fspath(claim)]:
+                return SimpleNamespace(returncode=1, stdout="", stderr="")
+            if command[1:] == ["-F", "pfDi"]:
+                return SimpleNamespace(
+                    returncode=0,
+                    stdout=inode_output,
+                    stderr="",
+                )
+            raise AssertionError(f"unexpected lsof command: {command}")
+
+        monkeypatch.setattr(codex_home_mod.subprocess, "run", scan)
+
+        assert codex_home_mod._claim_has_open_descriptors(
+            claim,
+            log=lambda _message: None,
+        ) is False
+        assert codex_home_mod._inode_has_open_descriptors(
+            claim_handle,
+            claim,
+            log=lambda _message: None,
+        ) is False
+
+    assert commands == [
+        [resolved_lsof, "-Fn", "--", os.fspath(claim)],
+        [resolved_lsof, "-F", "pfDi"],
+    ]
+
+
 def test_live_mode_freeze_is_transiently_retained_without_thaw(tmp_path):
     """R7 R5: a concurrent retirer cannot repair another live freeze."""
     working_dir = tmp_path / "agent"
@@ -972,10 +1054,11 @@ def test_descriptor_scan_unavailable_keeps_claim(tmp_path, monkeypatch):
     )
     logs: list[str] = []
 
-    def unavailable(*_args, **_kwargs):
-        raise FileNotFoundError("lsof")
+    def unexpected_subprocess(*_args, **_kwargs):
+        raise AssertionError("subprocess must not run without a resolved lsof")
 
-    monkeypatch.setattr(codex_home_mod.subprocess, "run", unavailable)
+    monkeypatch.setattr(codex_home_mod, "_resolve_lsof_binary", lambda: None)
+    monkeypatch.setattr(codex_home_mod.subprocess, "run", unexpected_subprocess)
 
     retired = codex_home_mod._retire_rollout_claim(
         claim,
@@ -987,6 +1070,7 @@ def test_descriptor_scan_unavailable_keeps_claim(tmp_path, monkeypatch):
     assert retired is False
     assert claim.exists()
     assert any("descriptor scan unavailable" in message for message in logs)
+    assert any("lsof executable not found" in message for message in logs)
 
 
 def test_claim_link_collision_retries_without_replacing_interleaved_claim(
