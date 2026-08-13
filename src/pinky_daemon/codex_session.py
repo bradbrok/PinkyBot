@@ -1117,7 +1117,21 @@ class CodexSession:
         if self._app_client is not None and self._app_proc is not None:
             if self._app_proc.returncode is None:
                 return  # still running
-            # Process died under us — drop the stale client and respawn.
+
+        # Refuse an unsafe/missing per-agent auth setup before mutating any
+        # cached transport. In particular, a dead cached app-server must not be
+        # closed/cleared (and a tmux supervisor must not be started) before the
+        # replacement spawn proves its Codex home can be prepared safely.
+        direct_env: dict[str, str] | None = None
+        if self._use_tmux_app_server:
+            if per_agent_codex_home_enabled():
+                prepare_agent_codex_home(self._config, log=_log)
+        else:
+            direct_env = self._build_codex_env()
+
+        if self._app_client is not None or self._app_proc is not None:
+            # Process died under us — drop the stale client and respawn only
+            # after the replacement environment passed preparation above.
             await self._teardown_app_server()
 
         if self._use_tmux_app_server:
@@ -1132,11 +1146,10 @@ class CodexSession:
                 server_request_handler=self._on_appserver_request,
             )
         else:
-            env = self._build_codex_env()
-
+            assert direct_env is not None
             self._app_client, self._app_proc = await spawn_app_server(
                 cwd=self._working_dir,
-                env=env,
+                env=direct_env,
                 notification_handler=self._on_appserver_notification,
                 server_request_handler=self._on_appserver_request,
                 log=_log,

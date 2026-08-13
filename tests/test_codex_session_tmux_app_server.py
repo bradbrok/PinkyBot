@@ -11,6 +11,7 @@ from __future__ import annotations
 import pytest
 
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
+from pinky_daemon.codex_home import PER_AGENT_CODEX_HOME_ENV
 from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
 
@@ -20,7 +21,7 @@ def _make_session(**overrides) -> CodexSession:
         agent_name="test-agent",
         label="main",
         model="",
-        working_dir="/tmp",
+        working_dir=overrides.pop("working_dir", "/tmp"),
         provider_url="codex_cli",
         provider_key="test-key",
         **overrides,
@@ -57,6 +58,7 @@ def test_tmux_flag_on_creates_supervisor(monkeypatch):
 class _FakeClient:
     def __init__(self) -> None:
         self.initialized = False
+        self.closed = False
 
     def start(self) -> None:  # pragma: no cover - not called on this path
         pass
@@ -66,7 +68,7 @@ class _FakeClient:
         return {"userAgent": "fake/1"}
 
     async def close(self) -> None:
-        pass
+        self.closed = True
 
 
 class _FakeProc:
@@ -115,6 +117,33 @@ async def test_ensure_app_server_uses_supervisor_in_tmux_mode(monkeypatch):
     assert stats["tmux_session"] == "pinky-codex-as-test-agent"
     assert stats["sock_path"] == fake.sock_path
     assert stats["child_pid"] == 4321
+
+
+@pytest.mark.asyncio
+async def test_tmux_auth_refusal_precedes_stale_transport_teardown(tmp_path, monkeypatch):
+    """Review P2: validate auth before stale close and supervisor.start."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    shared_home.mkdir()
+    working_dir.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+    monkeypatch.setenv("PINKY_CODEX_TMUX_APP_SERVER", "1")
+    s = _make_session(working_dir=str(working_dir))
+    fake = _FakeSupervisor()
+    fake.proc.returncode = 1
+    s._app_supervisor = fake
+    s._app_client = fake.client
+    s._app_proc = fake.proc
+
+    with pytest.raises(RuntimeError, match="shared auth file is absent or unreadable"):
+        await s._ensure_app_server()
+
+    assert fake.started == 0
+    assert fake.client.closed is False
+    assert s._app_client is fake.client
+    assert s._app_proc is fake.proc
 
 
 def test_stats_mode_subprocess_when_tmux_off(monkeypatch):
