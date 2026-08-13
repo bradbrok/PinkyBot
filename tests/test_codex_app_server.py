@@ -267,6 +267,29 @@ class TestFramingAndLifecycle:
         assert len(closed) == 1
 
     @pytest.mark.asyncio
+    async def test_eof_latches_closed_before_any_later_request_is_registered(self):
+        closed: list[CodexAppServerError] = []
+        client, reader, writer = make_client()
+        client.set_transport_closed_handler(closed.append)
+
+        reader.feed_eof()
+        await _settle()
+
+        frames_before = writer.frames()
+        assert client.is_closed is True
+        next_id_before = client._next_id
+        for method in ("after-eof-1", "after-eof-2"):
+            with pytest.raises(CodexAppServerError, match="connection closed"):
+                await asyncio.wait_for(client.request(method), timeout=0.05)
+
+        assert client._pending == {}
+        assert client._next_id == next_id_before
+        assert writer.frames() == frames_before
+        assert len(closed) == 1
+        await client.close()
+        assert len(closed) == 1
+
+    @pytest.mark.asyncio
     async def test_deliberate_close_does_not_signal_transport_failure(self):
         closed: list[CodexAppServerError] = []
         client, _reader, _writer = make_client()

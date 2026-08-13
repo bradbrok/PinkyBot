@@ -1607,6 +1607,123 @@ class TestCodexAppServerTurn:
         )
 
     @pytest.mark.asyncio
+    async def test_terminal_stream_delivery_is_serialized_across_respawn(self):
+        s = _appserver_session()
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        both_delivered = asyncio.Event()
+        delivery_order: list[str] = []
+        callback_count = 0
+
+        async def terminal_callback(event: dict) -> None:
+            nonlocal callback_count
+            if event["type"] != "turn_completed":
+                return
+            callback_count += 1
+            generation = "old" if callback_count == 1 else "new"
+            if generation == "old":
+                old_started.set()
+                await release_old.wait()
+            delivery_order.append(generation)
+            if len(delivery_order) == 2:
+                both_delivered.set()
+
+        s._stream_event_callback = terminal_callback
+        clients = [
+            _FakeAppClient(
+                s, [("turn/completed", {"turn": {"status": "completed"}})]
+            ),
+            _FakeAppClient(
+                s, [("turn/completed", {"turn": {"status": "completed"}})]
+            ),
+        ]
+        ensure_calls = 0
+
+        async def replace_client() -> bool:
+            nonlocal ensure_calls
+            s._app_client = clients[ensure_calls]
+            ensure_calls += 1
+            return True
+
+        s._ensure_app_server = replace_client  # type: ignore[assignment]
+
+        first = await asyncio.wait_for(
+            s._exec_codex_app_server("old generation"), timeout=0.25
+        )
+        assert first.failed is False
+        await asyncio.wait_for(old_started.wait(), timeout=0.25)
+
+        second = await asyncio.wait_for(
+            s._exec_codex_app_server("new generation"), timeout=0.25
+        )
+        assert second.failed is False
+        await asyncio.sleep(0)
+        assert delivery_order != ["new"]
+
+        release_old.set()
+        await asyncio.wait_for(both_delivered.wait(), timeout=0.25)
+        assert delivery_order == ["old", "new"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_resistant_terminal_callback_remains_retained(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        cancellation_seen = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        callback_finished = asyncio.Event()
+
+        async def cancellation_resistant_callback(_event: dict) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_cleanup.wait()
+            finally:
+                callback_finished.set()
+
+        s._stream_event_callback = cancellation_resistant_callback
+        fake = _FakeAppClient(
+            s, [("turn/completed", {"turn": {"status": "completed"}})]
+        )
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("do not gate on cleanup"), timeout=0.25
+        )
+        assert result.failed is False
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=0.25)
+        assert any(
+            not task.done() for task in s._appserver_terminal_stream_tasks
+        )
+
+        await asyncio.wait_for(s._teardown_app_server(), timeout=0.05)
+        assert any(
+            "app_server_terminal_stream_survivors "
+            "agent=test-agent phase=teardown" in line
+            for line in logs
+        )
+        assert any(
+            "app_server_terminal_stream_abandoned "
+            "agent=test-agent type=turn_completed timeout_s=0.01" in line
+            for line in logs
+        )
+
+        release_cleanup.set()
+        await asyncio.wait_for(callback_finished.wait(), timeout=0.25)
+        for _ in range(10):
+            if not s._appserver_terminal_stream_tasks:
+                break
+            await asyncio.sleep(0)
+        assert s._appserver_terminal_stream_tasks == set()
+
+    @pytest.mark.asyncio
     async def test_connect_failure_returns_failed_result(self):
         s = _appserver_session()
 

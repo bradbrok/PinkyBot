@@ -10,6 +10,7 @@ from pathlib import Path
 
 import pytest
 
+from pinky_daemon.codex_app_server import CodexAppServerError
 from pinky_daemon.codex_session import CodexSession, CodexTurnResult
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.transport_state import SessionState
@@ -260,6 +261,94 @@ async def test_child_eof_after_acceptance_fails_promptly_and_respawns(
     assert session.stats["app_server_counters"] == {
         "turns_ok": 1,
         "turns_failed": 1,
+        "respawns": 1,
+    }
+    await session._teardown_app_server()
+
+
+@pytest.mark.asyncio
+async def test_stdout_eof_between_turns_with_live_process_respawns(
+    monkeypatch, tmp_path
+):
+    logs: list[str] = []
+    monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+    session = _session(monkeypatch, tmp_path, mode="eof-between-turns")
+
+    assert await session._ensure_app_server() is True
+    old_client = session._app_client
+    old_proc = session._app_proc
+    assert old_client is not None
+    assert old_proc is not None
+    for _ in range(100):
+        if old_client.is_closed:
+            break
+        await asyncio.sleep(0.005)
+
+    assert old_client.is_closed is True
+    assert old_proc.returncode is None
+    with pytest.raises(CodexAppServerError, match="connection closed"):
+        await asyncio.wait_for(old_client.request("thread/start"), timeout=0.05)
+    assert old_client._pending == {}
+    assert sum("app_server_transport_closed" in line for line in logs) == 1
+    assert any("active_turn=false" in line for line in logs)
+
+    session._app_server_command = (
+        sys.executable,
+        str(_FAKE),
+        "--mode",
+        "happy",
+    )
+    result = await asyncio.wait_for(
+        session._exec_codex_app_server("replacement succeeds"), timeout=1
+    )
+    assert result.failed is False
+    assert result.text_parts == ["fake app-server reply"]
+    assert session._app_client is not old_client
+    assert session.stats["app_server_counters"]["respawns"] == 1
+    await session._teardown_app_server()
+
+
+@pytest.mark.asyncio
+async def test_stdout_eof_after_terminal_notification_respawns(
+    monkeypatch, tmp_path
+):
+    logs: list[str] = []
+    monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+    session = _session(monkeypatch, tmp_path, mode="eof-after-terminal")
+
+    first = await asyncio.wait_for(
+        session._exec_codex_app_server("complete then eof"), timeout=1
+    )
+    assert first.failed is False
+    old_client = session._app_client
+    old_proc = session._app_proc
+    assert old_client is not None
+    assert old_proc is not None
+    for _ in range(100):
+        if old_client.is_closed:
+            break
+        await asyncio.sleep(0.005)
+
+    assert old_client.is_closed is True
+    assert old_proc.returncode is None
+    assert sum("app_server_transport_closed" in line for line in logs) == 1
+    assert any("active_turn=false" in line for line in logs)
+
+    session._app_server_command = (
+        sys.executable,
+        str(_FAKE),
+        "--mode",
+        "happy",
+    )
+    second = await asyncio.wait_for(
+        session._exec_codex_app_server("fresh after terminal eof"), timeout=1
+    )
+    assert second.failed is False
+    assert second.text_parts == ["fake app-server reply"]
+    assert session._app_client is not old_client
+    assert session.stats["app_server_counters"] == {
+        "turns_ok": 2,
+        "turns_failed": 0,
         "respawns": 1,
     }
     await session._teardown_app_server()

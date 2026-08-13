@@ -9,7 +9,8 @@ end-to-end with no real ``codex`` binary.
     request echoes params (including frames >64 KiB)
   * phase-1 modes exercise the 0.144 lifecycle used by CodexSession: happy
     turns, init hang/error/death, terminal error notification, and exit after
-    a completed turn
+    a completed turn; EOF-only modes close stdout while the process and stdin
+    remain alive
   * notifications (no id)  -> ignored
 
 Env knobs:
@@ -29,6 +30,7 @@ _PHASE1_MODES = {
     "happy",
     "error-notification",
     "eof-after-acceptance",
+    "eof-after-terminal",
     "exit-after-turn",
 }
 
@@ -36,6 +38,12 @@ _PHASE1_MODES = {
 def _send(frame: dict) -> None:
     sys.stdout.write(json.dumps(frame) + "\n")
     sys.stdout.flush()
+
+
+def _close_stdout() -> None:
+    """Emit EOF to the parent while keeping this process and stdin alive."""
+    sys.stdout.flush()
+    os.close(sys.stdout.fileno())
 
 
 def _thread(thread_id: str) -> dict:
@@ -84,7 +92,9 @@ def main(argv: list[str] | None = None) -> int:
             "error-init",
             "die-pre-init",
             "error-notification",
+            "eof-between-turns",
             "eof-after-acceptance",
+            "eof-after-terminal",
             "exit-after-turn",
         ),
         default="echo",
@@ -122,6 +132,8 @@ def main(argv: list[str] | None = None) -> int:
                     "platformOs": "fake",
                 },
             })
+            if mode == "eof-between-turns":
+                _close_stdout()
             if exit_after_init:
                 return 0
             continue
@@ -175,6 +187,8 @@ def main(argv: list[str] | None = None) -> int:
                     "turn": _turn(turn_id, "completed"),
                 },
             })
+            if mode == "eof-after-terminal":
+                _close_stdout()
             if mode == "exit-after-turn":
                 return 0
             continue
