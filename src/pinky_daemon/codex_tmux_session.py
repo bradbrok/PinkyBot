@@ -567,11 +567,19 @@ class CodexTmuxSession(TmuxSession):
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     def _preflight_transport_replacement(self) -> None:
         """Prove the isolated Codex home before an inherited tmux teardown."""
-        prepare_agent_codex_home(self._config, log=_log)
+        prepare_agent_codex_home(
+            self._config,
+            log=_log,
+            soul_version_store=self._registry,
+        )
 
     async def _spawn_tmux_repl(self) -> None:
         cwd = str(Path(self._config.working_dir or ".").resolve())
-        prepare_agent_codex_home(self._config, log=_log)
+        prepare_agent_codex_home(
+            self._config,
+            log=_log,
+            soul_version_store=self._registry,
+        )
         self._seed_codex_trust(cwd)
         await super()._spawn_tmux_repl()
         await self._codex_dismiss_nux_and_ready()

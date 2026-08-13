@@ -268,6 +268,7 @@ class CodexSession(TransportReplacementMixin):
                 working_dir=self._working_dir,
                 openai_api_key=self._openai_api_key,
                 agent_config=config,
+                soul_version_store=registry,
                 log=_log,
             )
         self._app_client: CodexAppServerClient | None = None
@@ -1024,7 +1025,13 @@ class CodexSession(TransportReplacementMixin):
         """Validate and prepare replacement-home state before teardown/spawn."""
         if not per_agent_codex_home_enabled():
             return None
-        return str(prepare_agent_codex_home(self._config, log=_log))
+        return str(
+            prepare_agent_codex_home(
+                self._config,
+                log=_log,
+                soul_version_store=self._registry,
+            )
+        )
 
     def _preflight_transport_replacement(self) -> None:
         """Keep retained-session replacement refusal ahead of teardown."""

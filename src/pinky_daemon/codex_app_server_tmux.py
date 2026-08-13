@@ -107,12 +107,14 @@ class CodexAppServerSupervisor:
         working_dir: str,
         openai_api_key: str = "",
         agent_config: object | None = None,
+        soul_version_store: object | None = None,
         log: Callable[[str], None] = _log,
     ) -> None:
         self.agent_name = agent_name
         self._log = log
         self._openai_api_key = openai_api_key
         self._agent_config = agent_config
+        self._soul_version_store = soul_version_store
         self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
         self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
@@ -232,7 +234,11 @@ class CodexAppServerSupervisor:
                     "per-agent Codex home requires app-server agent config"
                 )
             env["CODEX_HOME"] = str(
-                prepare_agent_codex_home(self._agent_config, log=self._log)
+                prepare_agent_codex_home(
+                    self._agent_config,
+                    log=self._log,
+                    soul_version_store=self._soul_version_store,
+                )
             )
         return env
 

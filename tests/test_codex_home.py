@@ -16,6 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from pinky_daemon import codex_home as codex_home_mod
+from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     PER_AGENT_CODEX_HOME_ENV,
@@ -31,12 +32,32 @@ from pinky_daemon.codex_tmux_transcript import _discover_codex_rollout
 from pinky_daemon.streaming_session import StreamingSessionConfig
 
 
-def _scope(working_dir: Path, *, codex_home: str = "") -> SimpleNamespace:
+def _scope(
+    working_dir: Path,
+    *,
+    codex_home: str = "",
+    system_prompt: str = "",
+) -> SimpleNamespace:
     return SimpleNamespace(
         agent_name="test-agent",
         working_dir=str(working_dir),
         codex_home=codex_home,
+        system_prompt=system_prompt,
     )
+
+
+class _SoulStore:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, str]] = []
+
+    def save_soul_version(
+        self,
+        agent_name: str,
+        content: str,
+        source: str = "unknown",
+    ) -> int:
+        self.calls.append((agent_name, content, source))
+        return len(self.calls)
 
 
 def _auth(shared_home: Path) -> Path:
@@ -70,13 +91,113 @@ def test_flag_off_preserves_shared_path_and_performs_no_bootstrap(tmp_path, monk
     monkeypatch.setenv("CODEX_HOME", str(shared_home))
     monkeypatch.delenv(PER_AGENT_CODEX_HOME_ENV, raising=False)
     monkeypatch.setenv(codex_home_mod.MIGRATION_LOCK_TIMEOUT_ENV, "invalid")
-    scope = _scope(working_dir, codex_home=str(override))
+    scope = _scope(
+        working_dir,
+        codex_home=str(override),
+        system_prompt="compiled soul",
+    )
+    soul_store = _SoulStore()
 
     assert codex_home_for(scope) == shared_home
-    assert prepare_agent_codex_home(scope, log=lambda _message: None) == shared_home
+    assert prepare_agent_codex_home(
+        scope,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    ) == shared_home
     assert not working_dir.exists()
     assert not override.exists()
     assert not shared_home.exists()
+    assert soul_store.calls == []
+
+
+def test_prepare_writes_agent_soul_and_snapshots_self_edit_before_overwrite(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    agent_home.mkdir()
+    _auth(shared_home)
+    agents_md = agent_home / "AGENTS.md"
+    agents_md.write_text("agent-authored edit", encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    soul_store = _SoulStore()
+
+    prepared = prepare_agent_codex_home(
+        _scope(working_dir, system_prompt="compiled soul"),
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+
+    assert prepared == agent_home
+    assert agents_md.read_text(encoding="utf-8") == "compiled soul"
+    assert stat.S_IMODE(agents_md.stat().st_mode) == 0o600
+    assert soul_store.calls == [
+        ("test-agent", "agent-authored edit", "agent"),
+        ("test-agent", "compiled soul", "spawn"),
+    ]
+    assert not (shared_home / "AGENTS.md").exists()
+
+
+def test_prepare_replaces_linked_soul_without_writing_its_shared_target(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    agent_home.mkdir()
+    _auth(shared_home)
+    shared_soul = shared_home / "AGENTS.md"
+    shared_soul.write_text("shared operator soul", encoding="utf-8")
+    agents_md = agent_home / "AGENTS.md"
+    agents_md.symlink_to(shared_soul)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    soul_store = _SoulStore()
+
+    prepare_agent_codex_home(
+        _scope(working_dir, system_prompt="compiled soul"),
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+
+    assert not agents_md.is_symlink()
+    assert agents_md.read_text(encoding="utf-8") == "compiled soul"
+    assert shared_soul.read_text(encoding="utf-8") == "shared operator soul"
+    assert soul_store.calls == [
+        ("test-agent", "shared operator soul", "agent"),
+        ("test-agent", "compiled soul", "spawn"),
+    ]
+
+
+def test_subprocess_transport_flag_off_has_zero_env_delta_and_zero_soul_writes(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.delenv(PER_AGENT_CODEX_HOME_ENV, raising=False)
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled soul",
+    )
+    soul_store = _SoulStore()
+    before = dict(os.environ)
+
+    env = CodexSession(config, registry=soul_store)._build_codex_env()
+
+    assert env == before
+    assert soul_store.calls == []
+    assert not (shared_home / "AGENTS.md").exists()
+    assert not (working_dir / ".codex" / "AGENTS.md").exists()
 
 
 def test_flag_off_home_fallback_is_test_controlled(tmp_path, monkeypatch):
@@ -1861,12 +1982,85 @@ def test_subprocess_transport_overlays_prepared_home(tmp_path, monkeypatch):
         agent_name="test-agent",
         working_dir=str(working_dir),
         provider_url="codex_cli",
+        system_prompt="compiled subprocess soul",
     )
+    soul_store = _SoulStore()
 
-    env = CodexSession(config)._build_codex_env()
+    env = CodexSession(config, registry=soul_store)._build_codex_env()
 
     assert env["CODEX_HOME"] == str(working_dir / ".codex")
     assert (working_dir / ".codex" / "auth.json").is_symlink()
+    assert (working_dir / ".codex" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    ) == "compiled subprocess soul"
+    assert soul_store.calls == [
+        ("test-agent", "compiled subprocess soul", "spawn")
+    ]
+    assert not (shared_home / "AGENTS.md").exists()
+
+
+def test_tmux_transport_preflight_writes_soul_only_to_agent_home(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+    )
+    soul_store = _SoulStore()
+    session = CodexTmuxSession(config, registry=soul_store)
+
+    session._preflight_transport_replacement()
+
+    assert (working_dir / ".codex" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    ) == "compiled tmux soul"
+    assert soul_store.calls == [("test-agent", "compiled tmux soul", "spawn")]
+    assert not (shared_home / "AGENTS.md").exists()
+
+
+def test_tmux_app_server_boundary_uses_the_shared_soul_writer(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    supervisor = CodexAppServerSupervisor(
+        "test-agent",
+        working_dir=str(working_dir),
+        agent_config=config,
+        soul_version_store=soul_store,
+    )
+
+    env = supervisor._build_env()
+
+    assert env["CODEX_HOME"] == str(working_dir / ".codex")
+    assert (working_dir / ".codex" / "AGENTS.md").read_text(
+        encoding="utf-8"
+    ) == "compiled app-server soul"
+    assert soul_store.calls == [
+        ("test-agent", "compiled app-server soul", "spawn")
+    ]
+    assert not (shared_home / "AGENTS.md").exists()
 
 
 def test_reverse_migration_moves_only_matching_rollouts(tmp_path):
