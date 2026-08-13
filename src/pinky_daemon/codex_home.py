@@ -35,6 +35,7 @@ _MIGRATION_LOCK_NAME = ".pinkybot-rollout-migration.lock"
 _MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
 _PRESERVATION_RESERVATION_SUFFIX = ".reserve"
 _PRESERVATION_RESERVATION_STALE_SECONDS = 60 * 60
+_RESERVATION_ACQUIRE_MAX_ATTEMPTS = 8
 _CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS = 2.0
 _LSOF_FALLBACK_PATHS = ("/usr/sbin/lsof", "/usr/bin/lsof")
 _CRASH_FROZEN_CLAIM_MODE = stat.S_IRUSR | stat.S_IWUSR
@@ -276,6 +277,8 @@ def _migration_lock_entry_kind(entry_stat: os.stat_result) -> str:
 @contextmanager
 def _reserve_exclusive_destination(
     destination_for_uuid: Callable[[str], Path],
+    *,
+    log: LogFn,
 ) -> Iterator[Path]:
     """Reserve a collision-free private name without replacing data.
 
@@ -288,43 +291,87 @@ def _reserve_exclusive_destination(
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec
-    while True:
+    last_reservation: Path | None = None
+    for _attempt in range(_RESERVATION_ACQUIRE_MAX_ATTEMPTS):
         destination = destination_for_uuid(uuid.uuid4().hex)
         reservation = destination.with_name(
             f".{destination.name}{_PRESERVATION_RESERVATION_SUFFIX}"
         )
+        last_reservation = reservation
         try:
             reservation_fd = os.open(reservation, flags, 0o600)
         except FileExistsError:
             continue
+        locked = False
         try:
-            fcntl.flock(reservation_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            try:
+                fcntl.flock(reservation_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise
+            locked = True
+            if not _path_matches_descriptor(reservation, reservation_fd):
+                continue
             if _path_entry_exists(destination):
-                reservation.unlink()
+                _unlink_locked_reservation(reservation, reservation_fd)
                 continue
             try:
                 yield destination
             finally:
-                try:
-                    reservation.unlink()
-                except FileNotFoundError:
-                    pass
+                _unlink_locked_reservation(reservation, reservation_fd)
         finally:
-            fcntl.flock(reservation_fd, fcntl.LOCK_UN)
+            if locked:
+                fcntl.flock(reservation_fd, fcntl.LOCK_UN)
             os.close(reservation_fd)
         return
+
+    message = (
+        "codex-home: exclusive migration reservation did not converge after "
+        f"{_RESERVATION_ACQUIRE_MAX_ATTEMPTS} attempts near {last_reservation}; "
+        "refusing non-replacing publication"
+    )
+    log(message)
+    raise RuntimeError(message)
+
+
+def _path_matches_descriptor(path: Path, descriptor: int) -> bool:
+    """Return whether a descriptor still owns a named directory entry."""
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = path.lstat()
+    except OSError:
+        return False
+    return (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+        path_stat.st_dev,
+        path_stat.st_ino,
+    )
+
+
+def _unlink_locked_reservation(reservation: Path, reservation_fd: int) -> bool:
+    """Unlink a reservation only while its locked descriptor owns the name."""
+    if not _path_matches_descriptor(reservation, reservation_fd):
+        return False
+    try:
+        reservation.unlink()
+    except FileNotFoundError:
+        return False
+    return True
 
 
 @contextmanager
 def _reserve_preservation_destination(
     source: Path,
     name_prefix: str,
+    *,
+    log: LogFn,
 ) -> Iterator[Path]:
     """Reserve a collision-free preservation name without replacing data."""
     with _reserve_exclusive_destination(
         lambda reservation_id: source.with_name(
             f"{name_prefix}{source.name}-{reservation_id}"
         ),
+        log=log,
     ) as destination:
         yield destination
 
@@ -348,6 +395,7 @@ def _rename_migration_lock_aside(
     with _reserve_preservation_destination(
         lock_path,
         _MIGRATION_LOCK_ASIDE_PREFIX,
+        log=log,
     ) as aside:
         os.rename(lock_path, aside)
     _fsync_directory(lock_path.parent)
@@ -501,9 +549,7 @@ def _sweep_stale_reservations(root: Path, log: LogFn) -> None:
                 if exc.errno in (errno.EACCES, errno.EAGAIN):
                     continue
                 raise
-            try:
-                reservation.unlink()
-            except FileNotFoundError:
+            if not _unlink_locked_reservation(reservation, reservation_fd):
                 continue
             kind = (
                 "stale"
@@ -825,6 +871,7 @@ def _publish_frozen_rollout_recovery(
                 lambda recovery_id: claim.with_name(
                     f"{_MIGRATION_CLAIM_PREFIX}{recovery_id}-{canonical.name}"
                 ),
+                log=log,
             ) as candidate:
                 try:
                     os.link(temp_path, candidate, follow_symlinks=False)
@@ -1024,6 +1071,7 @@ def _quarantine_rollout(destination: Path, log: LogFn) -> Path:
     with _reserve_preservation_destination(
         destination,
         _MIGRATION_QUARANTINE_PREFIX,
+        log=log,
     ) as quarantine:
         os.rename(destination, quarantine)
     _fsync_directory(destination.parent)
@@ -1165,7 +1213,7 @@ def _claim_original_path(claim: Path) -> Path | None:
     return claim.with_name(original_name)
 
 
-def _claim_rollout(source: Path) -> Path | None:
+def _claim_rollout(source: Path, *, log: LogFn) -> Path | None:
     """Claim a rollout without any replacing rename operation.
 
     The hard link is a non-replacing atomic publication: EEXIST loses the UUID
@@ -1178,6 +1226,7 @@ def _claim_rollout(source: Path) -> Path | None:
             lambda claim_id: source.with_name(
                 f"{_MIGRATION_CLAIM_PREFIX}{claim_id}-{source.name}"
             ),
+            log=log,
         ) as claim:
             try:
                 os.link(source, claim, follow_symlinks=False)
@@ -1321,7 +1370,7 @@ def _move_rollout_candidates(
             continue
         if os.path.realpath(rollout_cwd) != target_cwd:
             continue
-        claim = candidate.claim or _claim_rollout(source)
+        claim = candidate.claim or _claim_rollout(source, log=log)
         if claim is None:
             if _rollout_is_valid(destination, target_cwd):
                 log(

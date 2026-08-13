@@ -505,7 +505,7 @@ def test_frozen_claim_with_held_writer_retains_every_append_in_named_claim(
         working_dir,
     )
     original = source.read_bytes()
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
     assert claim is not None
     destination = _rollout(
         destination_home,
@@ -620,7 +620,7 @@ def test_recovery_publication_failure_restores_named_claim_without_litter(
         working_dir,
     )
     original = source.read_bytes()
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
     assert claim is not None
     original_mode = stat.S_IMODE(claim.stat().st_mode)
     appended = b'{"type":"event_msg","payload":{"message":"new bytes"}}\n'
@@ -828,7 +828,7 @@ def test_live_mode_freeze_is_transiently_retained_without_thaw(tmp_path):
         "rollout-live-concurrent-freeze.jsonl",
         working_dir,
     )
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
     assert claim is not None
     destination = _rollout(
         destination_home,
@@ -868,7 +868,7 @@ def test_crashed_mode_freeze_repairs_without_an_open_holder(tmp_path):
         "rollout-crashed-freeze.jsonl",
         working_dir,
     )
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
     assert claim is not None
     claim.chmod(0)
     logs: list[str] = []
@@ -891,7 +891,7 @@ def test_install_open_eacces_race_is_a_loud_retryable_retain(tmp_path, monkeypat
         "rollout-install-eacces-race.jsonl",
         working_dir,
     )
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
     assert claim is not None
     destination = _rollout(
         destination_home,
@@ -941,7 +941,7 @@ def test_hard_exit_freeze_seams_keep_discoverable_complete_bytes(
         working_dir,
     )
     original = source.read_bytes()
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
     assert claim is not None
     appended = b'{"type":"event_msg","payload":{"message":"latest"}}\n'
     current = original + appended
@@ -1104,7 +1104,7 @@ def test_claim_link_collision_retries_without_replacing_interleaved_claim(
 
     monkeypatch.setattr(codex_home_mod.os, "link", collide_before_link)
 
-    claim = codex_home_mod._claim_rollout(source)
+    claim = codex_home_mod._claim_rollout(source, log=lambda _message: None)
 
     assert injected is True
     assert claim is not None
@@ -1173,7 +1173,8 @@ def test_active_reservation_lock_prevents_crash_sweeper_race(tmp_path):
     logs: list[str] = []
 
     with codex_home_mod._reserve_exclusive_destination(
-        lambda _reservation_id: destination
+        lambda _reservation_id: destination,
+        log=logs.append,
     ) as reserved:
         assert reserved == destination
         assert reservation.exists()
@@ -1184,6 +1185,292 @@ def test_active_reservation_lock_prevents_crash_sweeper_race(tmp_path):
         assert not logs
 
     assert not reservation.exists()
+
+
+def test_reservation_swept_between_create_and_flock_retries_without_double_grant(
+    tmp_path, monkeypatch
+):
+    """R8 R1: the exact swept-before-flock interleaving cannot double-grant."""
+    destination = tmp_path / ".pinkybot-rollout-claim-race-rollout-test.jsonl"
+    reservation = destination.with_name(
+        f".{destination.name}{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    real_open = codex_home_mod.os.open
+    real_flock = codex_home_mod.fcntl.flock
+    creator_a_before_flock = threading.Event()
+    allow_creator_a_flock = threading.Event()
+    creator_a_retry_blocked = threading.Event()
+    creator_a_granted = threading.Event()
+    release_creator_a = threading.Event()
+    creator_b_granted = threading.Event()
+    release_creator_b = threading.Event()
+    creator_b_exited = threading.Event()
+    state_lock = threading.Lock()
+    creator_a_attempts = 0
+    active_grants = 0
+    maximum_active_grants = 0
+    grant_order: list[tuple[str, Path]] = []
+    errors: list[BaseException] = []
+    sweep_logs: list[str] = []
+
+    def interleaved_open(path, flags, *args, **kwargs):
+        nonlocal creator_a_attempts
+        if (
+            threading.current_thread().name == "reservation-creator-a"
+            and flags & os.O_EXCL
+            and Path(path) == reservation
+        ):
+            creator_a_attempts += 1
+            if creator_a_attempts == 2:
+                creator_a_retry_blocked.set()
+                if not creator_b_exited.wait(timeout=5):
+                    raise AssertionError("creator B did not release its reservation")
+        return real_open(path, flags, *args, **kwargs)
+
+    def pause_creator_a_before_flock(descriptor: int, operation: int) -> None:
+        if (
+            threading.current_thread().name == "reservation-creator-a"
+            and operation & fcntl.LOCK_EX
+            and not creator_a_before_flock.is_set()
+        ):
+            creator_a_before_flock.set()
+            if not allow_creator_a_flock.wait(timeout=5):
+                raise AssertionError("creator A was not released to flock")
+        real_flock(descriptor, operation)
+
+    def reserve(name: str, granted: threading.Event, release: threading.Event) -> None:
+        nonlocal active_grants, maximum_active_grants
+        try:
+            with codex_home_mod._reserve_exclusive_destination(
+                lambda _reservation_id: destination,
+                log=lambda _message: None,
+            ) as reserved:
+                with state_lock:
+                    active_grants += 1
+                    maximum_active_grants = max(
+                        maximum_active_grants,
+                        active_grants,
+                    )
+                    grant_order.append((name, reserved))
+                granted.set()
+                if not release.wait(timeout=5):
+                    raise AssertionError(f"creator {name} was not released")
+                with state_lock:
+                    active_grants -= 1
+        except BaseException as exc:
+            errors.append(exc)
+            granted.set()
+        finally:
+            if name == "b":
+                creator_b_exited.set()
+
+    monkeypatch.setattr(codex_home_mod.os, "open", interleaved_open)
+    monkeypatch.setattr(
+        codex_home_mod.fcntl,
+        "flock",
+        pause_creator_a_before_flock,
+    )
+    creator_a = threading.Thread(
+        target=reserve,
+        args=("a", creator_a_granted, release_creator_a),
+        name="reservation-creator-a",
+    )
+    creator_b = threading.Thread(
+        target=reserve,
+        args=("b", creator_b_granted, release_creator_b),
+        name="reservation-creator-b",
+    )
+    try:
+        creator_a.start()
+        assert creator_a_before_flock.wait(timeout=5)
+
+        codex_home_mod._sweep_stale_reservations(tmp_path, sweep_logs.append)
+        assert not reservation.exists()
+
+        creator_b.start()
+        assert creator_b_granted.wait(timeout=5)
+        assert not errors
+        assert reservation.exists()
+
+        allow_creator_a_flock.set()
+        assert creator_a_retry_blocked.wait(timeout=5)
+        assert not creator_a_granted.is_set()
+        assert maximum_active_grants == 1
+        assert list(tmp_path.glob("*.reserve")) == [reservation]
+
+        release_creator_b.set()
+        assert creator_b_exited.wait(timeout=5)
+        assert creator_a_granted.wait(timeout=5)
+        assert not errors
+        assert list(tmp_path.glob("*.reserve")) == [reservation]
+        assert maximum_active_grants == 1
+    finally:
+        allow_creator_a_flock.set()
+        release_creator_b.set()
+        release_creator_a.set()
+        if creator_a.ident is not None:
+            creator_a.join(timeout=5)
+        if creator_b.ident is not None:
+            creator_b.join(timeout=5)
+
+    assert not creator_a.is_alive()
+    assert not creator_b.is_alive()
+    assert errors == []
+    assert creator_a_attempts == 2
+    assert grant_order == [("b", destination), ("a", destination)]
+    assert maximum_active_grants == 1
+    assert not reservation.exists()
+    assert len(sweep_logs) == 1
+    assert "removed orphaned migration reservation" in sweep_logs[0]
+
+
+def test_creator_cleanup_does_not_unlink_replacement_live_reservation(tmp_path):
+    """R8 R2: an old creator cannot unlink a new holder's sidecar name."""
+    destination = tmp_path / ".pinkybot-rollout-claim-cleanup-rollout-test.jsonl"
+    reservation = destination.with_name(
+        f".{destination.name}{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    replacement_fd = -1
+    try:
+        with codex_home_mod._reserve_exclusive_destination(
+            lambda _reservation_id: destination,
+            log=lambda _message: None,
+        ):
+            original_stat = reservation.lstat()
+            reservation.unlink()
+            replacement_fd = os.open(
+                reservation,
+                os.O_RDWR | os.O_CREAT | os.O_EXCL,
+                0o600,
+            )
+            fcntl.flock(replacement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            replacement_stat = os.fstat(replacement_fd)
+            assert (replacement_stat.st_dev, replacement_stat.st_ino) != (
+                original_stat.st_dev,
+                original_stat.st_ino,
+            )
+
+        current_stat = reservation.lstat()
+        assert (current_stat.st_dev, current_stat.st_ino) == (
+            replacement_stat.st_dev,
+            replacement_stat.st_ino,
+        )
+    finally:
+        if replacement_fd >= 0:
+            fcntl.flock(replacement_fd, fcntl.LOCK_UN)
+            os.close(replacement_fd)
+        reservation.unlink(missing_ok=True)
+
+
+def test_sweeper_cleanup_does_not_unlink_replacement_live_reservation(
+    tmp_path, monkeypatch
+):
+    """R8 R2: a sweeper cannot unlink a new holder after locking the old inode."""
+    destination = tmp_path / ".pinkybot-rollout-claim-sweeper-rollout-test.jsonl"
+    reservation = destination.with_name(
+        f".{destination.name}{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    reservation.touch()
+    real_unlink_locked = codex_home_mod._unlink_locked_reservation
+    replacement_fd = -1
+    replacement_stat = None
+
+    def replace_before_sweeper_cleanup(path: Path, locked_fd: int) -> bool:
+        nonlocal replacement_fd, replacement_stat
+        original_stat = os.fstat(locked_fd)
+        path.unlink()
+        replacement_fd = os.open(
+            path,
+            os.O_RDWR | os.O_CREAT | os.O_EXCL,
+            0o600,
+        )
+        fcntl.flock(replacement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        replacement_stat = os.fstat(replacement_fd)
+        assert (replacement_stat.st_dev, replacement_stat.st_ino) != (
+            original_stat.st_dev,
+            original_stat.st_ino,
+        )
+        return real_unlink_locked(path, locked_fd)
+
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_unlink_locked_reservation",
+        replace_before_sweeper_cleanup,
+    )
+    logs: list[str] = []
+    try:
+        codex_home_mod._sweep_stale_reservations(tmp_path, logs.append)
+
+        assert replacement_stat is not None
+        current_stat = reservation.lstat()
+        assert (current_stat.st_dev, current_stat.st_ino) == (
+            replacement_stat.st_dev,
+            replacement_stat.st_ino,
+        )
+        assert not logs
+    finally:
+        if replacement_fd >= 0:
+            fcntl.flock(replacement_fd, fcntl.LOCK_UN)
+            os.close(replacement_fd)
+        reservation.unlink(missing_ok=True)
+
+
+def test_reservation_retry_exhaustion_is_loud_and_retains_source(
+    tmp_path, monkeypatch
+):
+    """R8 R3: repeated pre-lock sweeps stop loudly without claiming bytes."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    source = _rollout(
+        tmp_path / "source",
+        "rollout-reservation-exhaustion.jsonl",
+        working_dir,
+    )
+    source_bytes = source.read_bytes()
+    real_open = codex_home_mod.os.open
+    real_flock = codex_home_mod.fcntl.flock
+    reservation_paths: dict[int, Path] = {}
+    swept_reservations: list[Path] = []
+    logs: list[str] = []
+
+    def track_reservation_open(path, flags, *args, **kwargs):
+        descriptor = real_open(path, flags, *args, **kwargs)
+        if flags & os.O_EXCL and os.fspath(path).endswith(
+            codex_home_mod._PRESERVATION_RESERVATION_SUFFIX
+        ):
+            reservation_paths[descriptor] = Path(path)
+        return descriptor
+
+    def sweep_every_reservation_before_flock(
+        descriptor: int,
+        operation: int,
+    ) -> None:
+        reservation = reservation_paths.get(descriptor)
+        if operation & fcntl.LOCK_EX and reservation is not None:
+            reservation.unlink()
+            swept_reservations.append(reservation)
+        real_flock(descriptor, operation)
+
+    monkeypatch.setattr(codex_home_mod, "_RESERVATION_ACQUIRE_MAX_ATTEMPTS", 3)
+    monkeypatch.setattr(codex_home_mod.os, "open", track_reservation_open)
+    monkeypatch.setattr(
+        codex_home_mod.fcntl,
+        "flock",
+        sweep_every_reservation_before_flock,
+    )
+
+    with pytest.raises(
+        RuntimeError,
+        match="exclusive migration reservation did not converge after 3 attempts",
+    ):
+        codex_home_mod._claim_rollout(source, log=logs.append)
+
+    assert len(swept_reservations) == 3
+    assert source.read_bytes() == source_bytes
+    assert not list(source.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*"))
+    assert not list(source.parent.glob("*.reserve"))
+    assert len(logs) == 1
+    assert "refusing non-replacing publication" in logs[0]
 
 
 @pytest.mark.parametrize("write_phase", ["during_copy", "post_install"])
