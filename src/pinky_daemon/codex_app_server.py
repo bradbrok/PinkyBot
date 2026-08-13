@@ -48,8 +48,6 @@ _STREAM_LIMIT = 10 * 1024 * 1024
 NotificationHandler = Callable[[str, dict], Awaitable[None]]
 # async fn(method: str, params: dict) -> dict (the result payload)
 ServerRequestHandler = Callable[[str, dict], Awaitable[dict | None]]
-
-
 class CodexAppServerError(Exception):
     """A JSON-RPC error frame, or a transport failure (EOF / closed)."""
 
@@ -67,6 +65,11 @@ class CodexAppServerError(Exception):
                 data=err.get("data"),
             )
         return cls(str(err))
+
+
+# Synchronous by design: EOF must be able to wake a higher-layer turn future
+# without making the transport read loop await teardown (or itself).
+TransportClosedHandler = Callable[[CodexAppServerError], None]
 
 
 class CodexAppServerClient:
@@ -93,6 +96,7 @@ class CodexAppServerClient:
         self._stderr = stderr
         self._notification_handler = notification_handler
         self._server_request_handler = server_request_handler
+        self._transport_closed_handler: TransportClosedHandler | None = None
         self._log = log
         self._next_id = 0
         self._pending: dict[int, asyncio.Future] = {}
@@ -108,6 +112,17 @@ class CodexAppServerClient:
         # blocks the child once the OS buffer (~64KiB) fills, wedging every turn.
         if self._stderr is not None and self._stderr_task is None:
             self._stderr_task = asyncio.create_task(self._drain_stderr())
+
+    def set_transport_closed_handler(
+        self, handler: TransportClosedHandler | None
+    ) -> None:
+        """Register a synchronous callback for unexpected read-side closure.
+
+        Deliberate :meth:`close` does not invoke it. Higher layers use this
+        edge to fail work that was accepted after its request future resolved;
+        at that point ``_pending`` alone no longer represents active work.
+        """
+        self._transport_closed_handler = handler
 
     async def request(
         self,
@@ -175,7 +190,13 @@ class CodexAppServerClient:
         except Exception as exc:  # noqa: BLE001 — read loop must not die silently
             self._log(f"codex-app-server: read loop error: {exc}")
         finally:
-            self._fail_pending(CodexAppServerError("connection closed"))
+            close_error = CodexAppServerError("connection closed")
+            self._fail_pending(close_error)
+            if not self._closed and self._transport_closed_handler is not None:
+                try:
+                    self._transport_closed_handler(close_error)
+                except Exception as exc:  # noqa: BLE001 — closure stays terminal
+                    self._log(f"codex-app-server: transport-close handler error: {exc}")
 
     async def _dispatch(self, msg: dict) -> None:
         mid = msg.get("id")

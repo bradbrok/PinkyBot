@@ -54,6 +54,7 @@ from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import WakeReason
 
 APP_SERVER_INIT_TIMEOUT = 20.0
+APP_SERVER_TERMINAL_STREAM_TIMEOUT = 5.0
 _APP_SERVER_INIT_TIMEOUT_ENV = "PINKY_CODEX_APP_SERVER_INIT_TIMEOUT"
 _APP_SERVER_AGENTS_ENV = "PINKY_CODEX_APP_SERVER_AGENTS"
 _APP_SERVER_COMMAND_ENV = "PINKY_CODEX_APP_SERVER_CMD"
@@ -278,6 +279,7 @@ class CodexSession(TransportReplacementMixin):
         # so a single in-flight result + completion future is sufficient.
         self._active_turn_result: CodexTurnResult | None = None
         self._turn_done: asyncio.Future | None = None
+        self._appserver_terminal_stream_tasks: set[asyncio.Task[None]] = set()
         # Latest per-turn token breakdown from thread/tokenUsage/updated —
         # app-server reports usage out-of-band, not inside turn/completed.
         self._appserver_last_usage: dict = {}
@@ -1247,6 +1249,15 @@ class CodexSession(TransportReplacementMixin):
                     log=_log,
                 )
 
+            # RPC futures only cover requests awaiting responses. Once
+            # turn/start is accepted, the independently awaited _turn_done must
+            # also be failed on EOF/read-loop death or the turn sits for 600s.
+            set_closed_handler = getattr(
+                self._app_client, "set_transport_closed_handler", None
+            )
+            if set_closed_handler is not None:
+                set_closed_handler(self._on_appserver_transport_closed)
+
             self._appserver_spawn_count += 1
             pid = self._app_proc.pid
             mode = "tmux" if self._use_tmux_app_server else "subprocess"
@@ -1374,7 +1385,7 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append(f"app-server connect failed: {e}")
             _log(f"codex[{self.agent_name}]: app-server connect failed: {e}")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
@@ -1463,7 +1474,7 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append("codex app-server turn timed out after 600s")
             _log(f"codex[{self.agent_name}]: app-server turn timed out")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": "codex app-server turn timed out after 600s",
             })
@@ -1476,7 +1487,7 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append(str(e))
             _log(f"codex[{self.agent_name}]: app-server error: {e}")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
@@ -1489,7 +1500,7 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append(str(e))
             _log(f"codex[{self.agent_name}]: app-server turn exception: {e}")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
@@ -1511,9 +1522,32 @@ class CodexSession(TransportReplacementMixin):
                 )
             self._resolve_scheduler_delivery(scheduler_delivery, False)
             self._active_turn_result = None
+            if (
+                self._turn_done is not None
+                and self._turn_done.done()
+                and not self._turn_done.cancelled()
+            ):
+                # If closure raced a still-pending thread/start or turn/start,
+                # that RPC exception wins the catch path. Retrieve the closure
+                # future's exception too so the independently signalled edge
+                # cannot become an unobserved-future warning.
+                self._turn_done.exception()
             self._turn_done = None
 
         return result
+
+    def _on_appserver_transport_closed(self, error: CodexAppServerError) -> None:
+        """Wake an accepted turn immediately when the transport disappears."""
+        active_turn = self._turn_done is not None and not self._turn_done.done()
+        _log(
+            f"app_server_transport_closed agent={self.agent_name} "
+            f"active_turn={str(active_turn).lower()} error={str(error)[:200]!r}"
+        )
+        if active_turn:
+            assert self._turn_done is not None
+            self._turn_done.set_exception(
+                CodexAppServerError(f"app-server transport closed: {error}")
+            )
 
     async def _on_appserver_notification(self, method: str, params: dict) -> None:
         """Translate an app-server notification onto the legacy event path."""
@@ -1538,10 +1572,6 @@ class CodexSession(TransportReplacementMixin):
         event = self._appserver_to_event(method, params)
         if event is not None and self._active_turn_result is not None:
             await self._handle_event(event, self._active_turn_result)
-
-        if method in ("turn/completed", "error") and self._turn_done is not None:
-            if not self._turn_done.done():
-                self._turn_done.set_result(None)
 
     async def _on_appserver_request(self, method: str, params: dict) -> dict:
         """Auto-approve server->client requests (full-auto).
@@ -1680,6 +1710,59 @@ class CodexSession(TransportReplacementMixin):
             await self._stream_event_callback(event)
         except Exception as e:
             _log(f"codex[{self.agent_name}]: stream event callback error: {e}")
+
+    def _resolve_appserver_turn(self) -> None:
+        """Release the app-server turn waiter after terminal result mutation."""
+        if self._turn_done is not None and not self._turn_done.done():
+            self._turn_done.set_result(None)
+
+    async def _deliver_bounded_appserver_terminal_stream_event(
+        self, event: dict
+    ) -> None:
+        callback_task = asyncio.create_task(self._emit_stream_event(event))
+        done, _pending = await asyncio.wait(
+            {callback_task}, timeout=APP_SERVER_TERMINAL_STREAM_TIMEOUT
+        )
+        if done:
+            await callback_task
+            return
+
+        _log(
+            f"app_server_terminal_stream_abandoned agent={self.agent_name} "
+            f"type={event.get('type', '')} "
+            f"timeout_s={APP_SERVER_TERMINAL_STREAM_TIMEOUT}"
+        )
+        # Do not await cancellation: a hostile callback can suppress it. The
+        # turn and read loop are already independent, and the done callback
+        # consumes any later exception if the abandoned task eventually exits.
+        callback_task.cancel()
+        callback_task.add_done_callback(self._consume_background_task)
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    def _schedule_appserver_terminal_stream_event(self, event: dict) -> None:
+        """Deliver terminal UI output without holding the turn/read loop."""
+        if self._stream_event_callback is None:
+            return
+        task = asyncio.create_task(
+            self._deliver_bounded_appserver_terminal_stream_event(event)
+        )
+        self._appserver_terminal_stream_tasks.add(task)
+        task.add_done_callback(self._appserver_terminal_stream_tasks.discard)
+
+    async def _emit_terminal_stream_event(self, event: dict) -> None:
+        """Keep legacy ordering; detach only for an active app-server turn."""
+        if self._turn_done is None:
+            await self._emit_stream_event(event)
+            return
+        self._schedule_appserver_terminal_stream_event(event)
 
     async def _handle_event(self, event: dict, result: CodexTurnResult) -> None:
         """Parse a single JSONL event and update result + activity tracking."""
@@ -1935,7 +2018,10 @@ class CodexSession(TransportReplacementMixin):
                 },
             )
             self._stamp_last_seen()
-            await self._emit_stream_event({
+            # Result + analytics state is now complete. Release the turn before
+            # any external callback; terminal delivery is separately bounded.
+            self._resolve_appserver_turn()
+            await self._emit_terminal_stream_event({
                 "type": "turn_completed",
                 "agent": self.agent_name,
                 "session_id": self.id,
@@ -1955,7 +2041,8 @@ class CodexSession(TransportReplacementMixin):
             result.errors.append(err_msg)
             self._analytics_log_activity("turn_failed", metadata={"error": err_msg})
             self._stamp_last_seen()
-            await self._emit_stream_event({
+            self._resolve_appserver_turn()
+            await self._emit_terminal_stream_event({
                 "type": "turn_failed",
                 "agent": self.agent_name,
                 "session_id": self.id,
@@ -1968,7 +2055,8 @@ class CodexSession(TransportReplacementMixin):
             result.errors.append("turn interrupted")
             self._analytics_log_activity("turn_interrupted")
             self._stamp_last_seen()
-            await self._emit_stream_event({
+            self._resolve_appserver_turn()
+            await self._emit_terminal_stream_event({
                 "type": "turn_interrupted",
                 "agent": self.agent_name,
                 "session_id": self.id,
