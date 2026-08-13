@@ -19,7 +19,9 @@ from __future__ import annotations
 
 import asyncio
 import json
+import math
 import os
+import shlex
 import time
 from dataclasses import dataclass, field
 
@@ -51,6 +53,48 @@ from pinky_daemon.transport_state import (
 from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import WakeReason
 
+APP_SERVER_INIT_TIMEOUT = 20.0
+APP_SERVER_TERMINAL_STREAM_TIMEOUT = 5.0
+# Permit one cancellation-resistant survivor while the newest generation runs.
+# Further deliveries are dropped loudly until a retained callback truly exits;
+# otherwise repeated cancellation suppression can grow retained work forever.
+APP_SERVER_TERMINAL_STREAM_MAX_LIVE_CALLBACKS = 2
+_APP_SERVER_INIT_TIMEOUT_ENV = "PINKY_CODEX_APP_SERVER_INIT_TIMEOUT"
+_APP_SERVER_AGENTS_ENV = "PINKY_CODEX_APP_SERVER_AGENTS"
+_APP_SERVER_COMMAND_ENV = "PINKY_CODEX_APP_SERVER_CMD"
+
+
+def _select_app_server(agent_name: str) -> tuple[bool, str]:
+    """Return the construction-time app-server decision and its source."""
+    allowlist = {
+        entry.strip()
+        for entry in os.environ.get(_APP_SERVER_AGENTS_ENV, "").split(",")
+        if entry.strip()
+    }
+    if agent_name in allowlist:
+        return True, "allowlist"
+    if os.environ.get("PINKY_CODEX_APP_SERVER") == "1":
+        return True, "global"
+    return False, "off"
+
+
+def _app_server_init_timeout() -> float:
+    """Read the positive finite initialize bound, falling back safely."""
+    raw = os.environ.get(_APP_SERVER_INIT_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return APP_SERVER_INIT_TIMEOUT
+    try:
+        timeout = float(raw)
+    except ValueError:
+        timeout = 0.0
+    if not math.isfinite(timeout) or timeout <= 0:
+        _log(
+            f"app_server_init_timeout_invalid value={raw!r} "
+            f"default={APP_SERVER_INIT_TIMEOUT}"
+        )
+        return APP_SERVER_INIT_TIMEOUT
+    return timeout
+
 
 @dataclass
 class CodexTurnResult:
@@ -68,6 +112,9 @@ class CodexTurnResult:
     reasoning_output_tokens: int = 0
     errors: list[str] = field(default_factory=list)
     failed: bool = False
+    # codex-cli 0.144 reports interruption as a distinct terminal status. It
+    # is an unsuccessful turn, but not a failed app-server substrate.
+    interrupted: bool = False
 
     @property
     def uncached_input_tokens(self) -> int:
@@ -180,13 +227,32 @@ class CodexSession(TransportReplacementMixin):
         # Uses the shared MCP server's streamable HTTP transport
         self._mcp_servers = config.mcp_servers or {}
 
-        # Tier 2 (#98): when PINKY_CODEX_APP_SERVER=1, route turns through a
-        # long-lived ``codex app-server`` JSON-RPC connection instead of
-        # spawning ``codex exec`` per message. Legacy exec stays the default
-        # and the fallback until the soak proves the app-server path. One
-        # app-server process + one thread per session here (chunk 2); a shared
-        # supervisor lands in chunk 3.
-        self._use_app_server = os.environ.get("PINKY_CODEX_APP_SERVER") == "1"
+        # Tier 2 (#98/#582): route only explicitly selected agents through a
+        # long-lived ``codex app-server`` connection. The exact-name allowlist
+        # is the candidate-zero mechanism; the global flag remains a backwards-
+        # compatible fallback. Both default off.
+        self._app_server_requested, self._app_server_source = _select_app_server(
+            self.agent_name
+        )
+        self._use_app_server = self._app_server_requested
+        self._app_server_degraded = False
+        self._app_server_init_timeout = (
+            _app_server_init_timeout()
+            if self._app_server_requested
+            else APP_SERVER_INIT_TIMEOUT
+        )
+        command_override = (
+            os.environ.get(_APP_SERVER_COMMAND_ENV, "").strip()
+            if self._app_server_requested
+            else ""
+        )
+        self._app_server_command = (
+            tuple(shlex.split(command_override)) if command_override else None
+        )
+        _log(
+            f"app_server_mode={'on' if self._use_app_server else 'off'} "
+            f"source={self._app_server_source} agent={self.agent_name}"
+        )
         # #791: when additionally PINKY_CODEX_TMUX_APP_SERVER=1, front the
         # app-server with a tmux-hosted UDS shim (Design A) instead of a daemon
         # child subprocess. Same JSON-RPC client + initialize/thread-resume flow
@@ -206,11 +272,21 @@ class CodexSession(TransportReplacementMixin):
             )
         self._app_client: CodexAppServerClient | None = None
         self._app_proc: asyncio.subprocess.Process | None = None
+        self._appserver_spawn_count = 0
+        self._appserver_counters = {
+            "turns_ok": 0,
+            "turns_failed": 0,
+            "respawns": 0,
+        }
         # Active turn correlation: the read loop dispatches notifications onto
         # a single handler, but turns are processed sequentially by the worker,
         # so a single in-flight result + completion future is sufficient.
         self._active_turn_result: CodexTurnResult | None = None
         self._turn_done: asyncio.Future | None = None
+        self._appserver_terminal_stream_tasks: set[asyncio.Task[None]] = set()
+        self._appserver_terminal_stream_tail: asyncio.Task[None] | None = None
+        self._appserver_terminal_stream_pending: tuple[int, dict] | None = None
+        self._appserver_terminal_stream_generation = 0
         # Latest per-turn token breakdown from thread/tokenUsage/updated —
         # app-server reports usage out-of-band, not inside turn/completed.
         self._appserver_last_usage: dict = {}
@@ -303,6 +379,9 @@ class CodexSession(TransportReplacementMixin):
             )
             return
 
+        if warm_wake_token is not None:
+            self._begin_app_server_reconnect_cycle()
+
         # Bring up the substrate (app-server spawn+initialize for app-server
         # mode; nothing persistent for exec mode). A failure here is structural
         # — terminalize the in-flight transition to DEAD so the broker
@@ -341,13 +420,24 @@ class CodexSession(TransportReplacementMixin):
         """Bring up the structural substrate for a turn-capable session.
 
         App-server mode: spawn + initialize the long-lived ``codex app-server``
-        connection (the persistent transport). Exec mode: nothing persistent —
-        each turn spawns its own ``codex exec``, so there's no substrate to fail
-        on boot. Raises on failure; the caller terminalizes the in-flight
-        transition to DEAD.
+        connection (the persistent transport). An init timeout/error degrades
+        this session instance to exec mode, so it is still turn-capable. Exec
+        mode itself has no persistent substrate. Preflight failures still raise
+        because the same unsafe auth/home would affect both transports.
         """
         if self._use_app_server:
             await self._ensure_app_server()
+
+    def _begin_app_server_reconnect_cycle(self) -> None:
+        """Retry a construction-selected app-server after sticky degradation."""
+        if not self._app_server_requested or not self._app_server_degraded:
+            return
+        self._use_app_server = True
+        self._app_server_degraded = False
+        _log(
+            f"app_server_mode=on source={self._app_server_source} "
+            f"agent={self.agent_name} reconnect_retry=true"
+        )
 
     def _start_worker(self) -> None:
         """Spawn the message-drainer worker if not already running.
@@ -1122,11 +1212,17 @@ class CodexSession(TransportReplacementMixin):
     _APPROVAL_POLICY = "never"  # AskForApproval — full-auto, never prompt
     _SANDBOX_MODE = "danger-full-access"  # SandboxMode — parity with the exec yolo flag
 
-    async def _ensure_app_server(self) -> None:
-        """Spawn + initialise the app-server connection if not already live."""
+    async def _ensure_app_server(self) -> bool:
+        """Spawn + initialise the app-server, or degrade this cycle to exec."""
         if self._app_client is not None and self._app_proc is not None:
-            if self._app_proc.returncode is None:
-                return  # still running
+            client_closed = bool(getattr(self._app_client, "is_closed", False))
+            if self._app_proc.returncode is None and not client_closed:
+                return True  # still running
+            if self._app_proc.returncode is None and client_closed:
+                _log(
+                    f"app_server_cached_transport_unusable agent={self.agent_name} "
+                    "reason=read_closed process_alive=true"
+                )
 
         # Refuse an unsafe/missing per-agent auth setup before mutating any
         # cached transport. In particular, a dead cached app-server must not be
@@ -1143,42 +1239,94 @@ class CodexSession(TransportReplacementMixin):
             # after the replacement environment passed preparation above.
             await self._teardown_app_server()
 
-        if self._use_tmux_app_server:
-            # #791 Design A: the supervisor spawns the shim under tmux and hands
-            # back an UN-initialized client (accept-readiness only — no probe
-            # initialize, which would burn the child's single-use one). The
-            # single initialize below stays the real end-to-end gate, and its
-            # half-initialized guard covers a dead tmux child (item F).
-            assert self._app_supervisor is not None
-            self._app_client, self._app_proc = await self._app_supervisor.start(
-                notification_handler=self._on_appserver_notification,
-                server_request_handler=self._on_appserver_request,
+        started_at = time.monotonic()
+
+        async def _spawn_and_initialize() -> None:
+            if self._use_tmux_app_server:
+                # #791 Design A: the supervisor spawns the shim under tmux and
+                # hands back an UN-initialized client. The initialize below is
+                # the single end-to-end gate for that child.
+                assert self._app_supervisor is not None
+                self._app_client, self._app_proc = await self._app_supervisor.start(
+                    notification_handler=self._on_appserver_notification,
+                    server_request_handler=self._on_appserver_request,
+                )
+            else:
+                assert direct_env is not None
+                self._app_client, self._app_proc = await spawn_app_server(
+                    command=self._app_server_command,
+                    cwd=self._working_dir,
+                    env=direct_env,
+                    notification_handler=self._on_appserver_notification,
+                    server_request_handler=self._on_appserver_request,
+                    log=_log,
+                )
+
+            # RPC futures only cover requests awaiting responses. Once
+            # turn/start is accepted, the independently awaited _turn_done must
+            # also be failed on EOF/read-loop death or the turn sits for 600s.
+            set_closed_handler = getattr(
+                self._app_client, "set_transport_closed_handler", None
             )
-        else:
-            assert direct_env is not None
-            self._app_client, self._app_proc = await spawn_app_server(
-                cwd=self._working_dir,
-                env=direct_env,
-                notification_handler=self._on_appserver_notification,
-                server_request_handler=self._on_appserver_request,
-                log=_log,
+            if set_closed_handler is not None:
+                set_closed_handler(self._on_appserver_transport_closed)
+
+            self._appserver_spawn_count += 1
+            pid = self._app_proc.pid
+            mode = "tmux" if self._use_tmux_app_server else "subprocess"
+            _log(
+                f"app_server_spawned agent={self.agent_name} mode={mode} pid={pid}"
             )
-        try:
+            if self._appserver_spawn_count > 1:
+                self._appserver_counters["respawns"] += 1
+                _log(
+                    f"app_server_respawn agent={self.agent_name} "
+                    f"count={self._appserver_counters['respawns']} pid={pid}"
+                )
+
             await self._app_client.initialize(name="pinkybot", version="1")
-        except BaseException:
-            # Spawn succeeded but initialize() failed: never leave a
-            # half-initialized client/proc cached. The early-return guard above
-            # checks only (client is not None and proc still alive), so a
-            # cached-but-uninitialized substrate would make the NEXT reconnect
-            # skip initialization entirely and flip the state machine to
-            # CONNECTED on a dead app-server. Tear down before re-raising so
-            # the next _ensure_app_server() respawns from scratch.
+
+        try:
+            # One bound covers process/supervisor spawn plus initialize. A child
+            # that starts but never answers cannot hold BOOTING for the client's
+            # blanket 600-second request timeout.
+            await asyncio.wait_for(
+                _spawn_and_initialize(), timeout=self._app_server_init_timeout
+            )
+        except asyncio.CancelledError:
             await self._teardown_app_server()
             raise
-        _log(f"codex[{self.agent_name}]: app-server connected (pid={self._app_proc.pid})")
+        except asyncio.TimeoutError:
+            await self._teardown_app_server()
+            self._degrade_app_server(reason="timeout")
+            return False
+        except Exception as exc:  # noqa: BLE001 — any init failure degrades
+            await self._teardown_app_server()
+            self._degrade_app_server(reason="error", error=exc)
+            return False
+
+        elapsed_ms = round((time.monotonic() - started_at) * 1000)
+        _log(
+            f"app_server_initialized agent={self.agent_name} "
+            f"elapsed_ms={elapsed_ms} pid={self._app_proc.pid}"
+        )
+        return True
+
+    def _degrade_app_server(self, *, reason: str, error: Exception | None = None) -> None:
+        """Stick to exec mode until a later reconnect cycle retries."""
+        detail = f" error={str(error)[:200]!r}" if error is not None else ""
+        _log(
+            f"app_server_init_failed reason={reason} agent={self.agent_name}{detail}"
+        )
+        self._use_app_server = False
+        self._app_server_degraded = True
+        _log(
+            f"app_server_degraded_to_exec agent={self.agent_name} reason={reason}"
+        )
 
     async def _teardown_app_server(self) -> None:
         """Close the client and kill the process. Idempotent."""
+        self._report_appserver_terminal_stream_survivors(phase="teardown")
         if self._app_client is not None:
             try:
                 await self._app_client.close()
@@ -1193,6 +1341,14 @@ class CodexSession(TransportReplacementMixin):
             except Exception:
                 pass
             self._app_proc = None
+        # A tmux supervisor may have started its shim but timed out/cancelled
+        # before returning a client/proc adapter. Always run its idempotent
+        # teardown so that partial spawn cannot leak a session or socket.
+        if self._use_tmux_app_server and self._app_supervisor is not None:
+            try:
+                await self._app_supervisor.teardown()
+            except Exception:
+                pass
 
     def _appserver_config(self) -> dict:
         """Build the per-thread ``config`` override for MCP servers.
@@ -1233,7 +1389,7 @@ class CodexSession(TransportReplacementMixin):
         """Run a single turn over the long-lived app-server connection."""
         result = CodexTurnResult()
         try:
-            await self._ensure_app_server()
+            app_server_live = await self._ensure_app_server()
         except Exception as e:  # noqa: BLE001
             # Structural (#206): the persistent app-server substrate failed to
             # come back up mid-life — the session can't process. Terminalize to
@@ -1243,13 +1399,23 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append(f"app-server connect failed: {e}")
             _log(f"codex[{self.agent_name}]: app-server connect failed: {e}")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
             await self._terminalize_dead("app-server connect failed")
             self._resolve_scheduler_delivery(scheduler_delivery, False)
             return result
+
+        if app_server_live is False:
+            # Initialize failure is a transport selection failure, not an agent
+            # failure. _ensure_app_server made exec mode sticky for this cycle;
+            # immediately deliver the same prompt over the legacy path.
+            return await self._exec_codex(
+                prompt,
+                scheduler_delivery=scheduler_delivery,
+                scheduler_accept=scheduler_accept,
+            )
 
         client = self._app_client
         assert client is not None
@@ -1259,10 +1425,10 @@ class CodexSession(TransportReplacementMixin):
         self._appserver_last_usage = {}
 
         config = self._appserver_config()
+        turn_started_at = time.monotonic()
         _log(
-            f"codex[{self.agent_name}]: app-server turn "
-            f"{'resume ' + self.codex_session_id[:12] + ' ' if self.codex_session_id else 'new '}"
-            f"(prompt: {len(prompt)} chars)"
+            f"app_server_turn_start agent={self.agent_name} "
+            f"thread={'resume' if self.codex_session_id else 'new'}"
         )
 
         try:
@@ -1322,7 +1488,7 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append("codex app-server turn timed out after 600s")
             _log(f"codex[{self.agent_name}]: app-server turn timed out")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": "codex app-server turn timed out after 600s",
             })
@@ -1335,7 +1501,7 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append(str(e))
             _log(f"codex[{self.agent_name}]: app-server error: {e}")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
@@ -1348,18 +1514,54 @@ class CodexSession(TransportReplacementMixin):
             result.failed = True
             result.errors.append(str(e))
             _log(f"codex[{self.agent_name}]: app-server turn exception: {e}")
-            await self._emit_stream_event({
+            self._schedule_appserver_terminal_stream_event({
                 "type": "turn_failed", "agent": self.agent_name,
                 "session_id": self.id, "error": str(e),
             })
             await self._teardown_app_server()
             await self._terminalize_dead("app-server turn exception")
         finally:
+            elapsed_ms = round((time.monotonic() - turn_started_at) * 1000)
+            if result.failed:
+                self._appserver_counters["turns_failed"] += 1
+                reason = "interrupted" if result.interrupted else "failed"
+                _log(
+                    f"app_server_turn_failed agent={self.agent_name} "
+                    f"reason={reason} elapsed_ms={elapsed_ms}"
+                )
+            else:
+                self._appserver_counters["turns_ok"] += 1
+                _log(
+                    f"app_server_turn_ok agent={self.agent_name} elapsed_ms={elapsed_ms}"
+                )
             self._resolve_scheduler_delivery(scheduler_delivery, False)
             self._active_turn_result = None
+            if (
+                self._turn_done is not None
+                and self._turn_done.done()
+                and not self._turn_done.cancelled()
+            ):
+                # If closure raced a still-pending thread/start or turn/start,
+                # that RPC exception wins the catch path. Retrieve the closure
+                # future's exception too so the independently signalled edge
+                # cannot become an unobserved-future warning.
+                self._turn_done.exception()
             self._turn_done = None
 
         return result
+
+    def _on_appserver_transport_closed(self, error: CodexAppServerError) -> None:
+        """Wake an accepted turn immediately when the transport disappears."""
+        active_turn = self._turn_done is not None and not self._turn_done.done()
+        _log(
+            f"app_server_transport_closed agent={self.agent_name} "
+            f"active_turn={str(active_turn).lower()} error={str(error)[:200]!r}"
+        )
+        if active_turn:
+            assert self._turn_done is not None
+            self._turn_done.set_exception(
+                CodexAppServerError(f"app-server transport closed: {error}")
+            )
 
     async def _on_appserver_notification(self, method: str, params: dict) -> None:
         """Translate an app-server notification onto the legacy event path."""
@@ -1385,10 +1587,6 @@ class CodexSession(TransportReplacementMixin):
         if event is not None and self._active_turn_result is not None:
             await self._handle_event(event, self._active_turn_result)
 
-        if method == "turn/completed" and self._turn_done is not None:
-            if not self._turn_done.done():
-                self._turn_done.set_result(None)
-
     async def _on_appserver_request(self, method: str, params: dict) -> dict:
         """Auto-approve server->client requests (full-auto).
 
@@ -1405,8 +1603,19 @@ class CodexSession(TransportReplacementMixin):
             return {"decision": "accept"}
         if method == "item/permissions/requestApproval":
             return {"permissions": {}, "scope": "session"}
-        # Elicitations / tool-call / user-input requests: nothing useful to add
-        # under full-auto; an empty result lets the server proceed.
+        # codex-cli 0.144 requires shaped, non-empty result objects for each of
+        # these server requests. Decline or fail safely where this unattended
+        # client cannot supply a real answer/token/tool implementation.
+        if method == "account/chatgptAuthTokens/refresh":
+            return {"accessToken": "", "chatgptAccountId": ""}
+        if method == "item/tool/requestUserInput":
+            return {"answers": {}}
+        if method == "mcpServer/elicitation/request":
+            return {"action": "decline"}
+        if method == "item/tool/call":
+            return {"contentItems": [], "success": False}
+        if method == "attestation/generate":
+            return {"token": ""}
         return {}
 
     def _appserver_to_event(self, method: str, params: dict) -> dict | None:
@@ -1430,13 +1639,26 @@ class CodexSession(TransportReplacementMixin):
             }
         if method == "turn/completed":
             turn = params.get("turn") or {}
-            if turn.get("status") == "failed":
+            status = turn.get("status")
+            if status == "completed":
+                return {"type": "turn.completed", "usage": self._appserver_usage_to_legacy()}
+            if status == "failed":
                 return {"type": "turn.failed", "error": turn.get("error") or {}}
-            return {"type": "turn.completed", "usage": self._appserver_usage_to_legacy()}
+            if status == "interrupted":
+                return {"type": "turn.interrupted"}
+            if status == "inProgress":
+                return {
+                    "type": "turn.failed",
+                    "error": {"message": "turn/completed reported inProgress"},
+                }
+            return {
+                "type": "turn.failed",
+                "error": {"message": f"turn/completed reported unknown status {status!r}"},
+            }
         if method == "error":
             err = params.get("error")
             msg = err.get("message", "unknown error") if isinstance(err, dict) else str(err)
-            return {"type": "error", "message": msg}
+            return {"type": "turn.failed", "error": {"message": msg}}
         return None
 
     def _appserver_usage_to_legacy(self) -> dict:
@@ -1502,6 +1724,146 @@ class CodexSession(TransportReplacementMixin):
             await self._stream_event_callback(event)
         except Exception as e:
             _log(f"codex[{self.agent_name}]: stream event callback error: {e}")
+
+    def _resolve_appserver_turn(self) -> None:
+        """Release the app-server turn waiter after terminal result mutation."""
+        if self._turn_done is not None and not self._turn_done.done():
+            self._turn_done.set_result(None)
+
+    async def _deliver_bounded_appserver_terminal_stream_event(
+        self, event: dict
+    ) -> None:
+        callback_task = asyncio.create_task(self._emit_stream_event(event))
+        self._retain_appserver_terminal_stream_task(callback_task)
+        done, _pending = await asyncio.wait(
+            {callback_task}, timeout=APP_SERVER_TERMINAL_STREAM_TIMEOUT
+        )
+        if done:
+            try:
+                await callback_task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                # A callback that cancels itself is a completed best-effort
+                # delivery, not cancellation of the session dispatcher.
+            return
+
+        _log(
+            f"app_server_terminal_stream_abandoned agent={self.agent_name} "
+            f"type={event.get('type', '')} "
+            f"timeout_s={APP_SERVER_TERMINAL_STREAM_TIMEOUT}"
+        )
+        # Keep cancellation-resistant work strongly retained for truthful
+        # teardown reporting, but do not await the corpse: the dispatcher must
+        # advance to the latest pending generation within this same bound.
+        callback_task.cancel()
+
+    @staticmethod
+    def _consume_background_task(task: asyncio.Task) -> None:
+        if task.cancelled():
+            return
+        try:
+            task.exception()
+        except asyncio.CancelledError:
+            pass
+
+    def _retain_appserver_terminal_stream_task(
+        self, task: asyncio.Task[None]
+    ) -> None:
+        """Retain detached delivery work until the underlying task is done."""
+        self._appserver_terminal_stream_tasks.add(task)
+        task.add_done_callback(self._appserver_terminal_stream_tasks.discard)
+        task.add_done_callback(self._consume_background_task)
+
+    def _report_appserver_terminal_stream_survivors(self, *, phase: str) -> None:
+        survivors = [
+            task
+            for task in self._appserver_terminal_stream_tasks
+            if not task.done()
+        ]
+        if survivors:
+            _log(
+                f"app_server_terminal_stream_survivors agent={self.agent_name} "
+                f"phase={phase} count={len(survivors)}"
+            )
+
+    def _schedule_appserver_terminal_stream_event(self, event: dict) -> None:
+        """Deliver only the latest not-yet-started terminal generation.
+
+        One dispatcher serializes ordinary callbacks. A callback that exceeds
+        its bound is cancelled and retained, while the dispatcher immediately
+        advances. Intermediate pending generations are coalesced loudly so a
+        resistant callback cannot create an unbounded wrapper-task convoy.
+        """
+        if self._stream_event_callback is None:
+            return
+        self._appserver_terminal_stream_generation += 1
+        generation = self._appserver_terminal_stream_generation
+        previous_pending = self._appserver_terminal_stream_pending
+        if previous_pending is not None:
+            stale_generation, stale_event = previous_pending
+            _log(
+                f"app_server_stale_terminal_dropped agent={self.agent_name} "
+                f"type={stale_event.get('type', '')} "
+                f"generation={stale_generation} superseded_by={generation}"
+            )
+        self._appserver_terminal_stream_pending = (generation, event)
+
+        if (
+            self._appserver_terminal_stream_tail is not None
+            and not self._appserver_terminal_stream_tail.done()
+        ):
+            return
+
+        async def _deliver_latest() -> None:
+            while self._appserver_terminal_stream_pending is not None:
+                pending_generation, pending_event = (
+                    self._appserver_terminal_stream_pending
+                )
+                self._appserver_terminal_stream_pending = None
+                high_water = self._appserver_terminal_stream_generation
+                if pending_generation != high_water:
+                    _log(
+                        f"app_server_stale_terminal_dropped agent={self.agent_name} "
+                        f"type={pending_event.get('type', '')} "
+                        f"generation={pending_generation} superseded_by={high_water}"
+                    )
+                    continue
+
+                live_callbacks = sum(
+                    not retained.done()
+                    for retained in self._appserver_terminal_stream_tasks
+                )
+                if live_callbacks >= APP_SERVER_TERMINAL_STREAM_MAX_LIVE_CALLBACKS:
+                    _log(
+                        f"app_server_stale_terminal_dropped agent={self.agent_name} "
+                        f"type={pending_event.get('type', '')} "
+                        f"generation={pending_generation} reason=survivor_limit "
+                        f"live_callbacks={live_callbacks}"
+                    )
+                    continue
+
+                await self._deliver_bounded_appserver_terminal_stream_event(
+                    pending_event
+                )
+
+        task = asyncio.create_task(_deliver_latest())
+        self._appserver_terminal_stream_tail = task
+        task.add_done_callback(self._consume_background_task)
+
+        def _clear_tail(done: asyncio.Task[None]) -> None:
+            if self._appserver_terminal_stream_tail is done:
+                self._appserver_terminal_stream_tail = None
+
+        task.add_done_callback(_clear_tail)
+
+    async def _emit_terminal_stream_event(self, event: dict) -> None:
+        """Keep legacy ordering; detach only for an active app-server turn."""
+        if self._turn_done is None:
+            await self._emit_stream_event(event)
+            return
+        self._schedule_appserver_terminal_stream_event(event)
 
     async def _handle_event(self, event: dict, result: CodexTurnResult) -> None:
         """Parse a single JSONL event and update result + activity tracking."""
@@ -1757,7 +2119,10 @@ class CodexSession(TransportReplacementMixin):
                 },
             )
             self._stamp_last_seen()
-            await self._emit_stream_event({
+            # Result + analytics state is now complete. Release the turn before
+            # any external callback; terminal delivery is separately bounded.
+            self._resolve_appserver_turn()
+            await self._emit_terminal_stream_event({
                 "type": "turn_completed",
                 "agent": self.agent_name,
                 "session_id": self.id,
@@ -1777,11 +2142,25 @@ class CodexSession(TransportReplacementMixin):
             result.errors.append(err_msg)
             self._analytics_log_activity("turn_failed", metadata={"error": err_msg})
             self._stamp_last_seen()
-            await self._emit_stream_event({
+            self._resolve_appserver_turn()
+            await self._emit_terminal_stream_event({
                 "type": "turn_failed",
                 "agent": self.agent_name,
                 "session_id": self.id,
                 "error": err_msg,
+            })
+
+        elif event_type == "turn.interrupted":
+            result.failed = True
+            result.interrupted = True
+            result.errors.append("turn interrupted")
+            self._analytics_log_activity("turn_interrupted")
+            self._stamp_last_seen()
+            self._resolve_appserver_turn()
+            await self._emit_terminal_stream_event({
+                "type": "turn_interrupted",
+                "agent": self.agent_name,
+                "session_id": self.id,
             })
 
         elif event_type == "error":
@@ -1833,6 +2212,7 @@ class CodexSession(TransportReplacementMixin):
             )
             return False
         token = res.owner_token
+        self._begin_app_server_reconnect_cycle()
 
         try:
             # Clear the resume handle (fresh start).
@@ -1960,6 +2340,7 @@ class CodexSession(TransportReplacementMixin):
                 )
             return
         token = res.owner_token
+        self._begin_app_server_reconnect_cycle()
 
         last_error: Exception | None = None
         for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
@@ -2100,8 +2481,15 @@ class CodexSession(TransportReplacementMixin):
     def stats(self) -> dict:
         state = self.state
         app_server: dict = {}
-        if self._use_app_server:
-            app_server["app_server_mode"] = "tmux" if self._use_tmux_app_server else "subprocess"
+        if self._app_server_requested:
+            if self._app_server_degraded:
+                app_server["app_server_mode"] = "degraded_exec"
+            else:
+                app_server["app_server_mode"] = (
+                    "tmux" if self._use_tmux_app_server else "subprocess"
+                )
+            app_server["app_server_source"] = self._app_server_source
+            app_server["app_server_counters"] = dict(self._appserver_counters)
             if self._app_proc is not None:
                 app_server["child_pid"] = self._app_proc.pid
             if self._app_supervisor is not None:

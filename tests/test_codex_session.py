@@ -1111,6 +1111,7 @@ def _patch_ensure(session, fake):
 class TestCodexAppServerFlag:
     def test_flag_off_by_default(self, monkeypatch):
         monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER_AGENTS", raising=False)
         config = StreamingSessionConfig(
             agent_name="a", working_dir="/tmp", provider_url="codex_cli",
         )
@@ -1122,6 +1123,42 @@ class TestCodexAppServerFlag:
             agent_name="a", working_dir="/tmp", provider_url="codex_cli",
         )
         assert CodexSession(config)._use_app_server is True
+
+    def test_allowlist_member_is_on(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", " other, a ")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        assert session._use_app_server is True
+        assert session._app_server_source == "allowlist"
+
+    def test_allowlist_nonmember_is_off(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", "other")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        assert CodexSession(config)._use_app_server is False
+
+    def test_allowlist_match_is_case_sensitive(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", "A")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        assert CodexSession(config)._use_app_server is False
+
+    def test_global_fallback_still_enables_nonmember(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", "other")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        assert session._use_app_server is True
+        assert session._app_server_source == "global"
 
     @pytest.mark.asyncio
     async def test_exec_dispatches_to_app_server_when_flagged(self):
@@ -1203,9 +1240,24 @@ class TestCodexAppServerTranslation:
         )
         assert ev == {"type": "turn.failed", "error": {"message": "boom"}}
 
-    def test_error_notification(self):
+    def test_error_notification_maps_to_terminal_failure(self):
         ev = self._s()._appserver_to_event("error", {"error": {"message": "rate limited"}})
-        assert ev == {"type": "error", "message": "rate limited"}
+        assert ev == {"type": "turn.failed", "error": {"message": "rate limited"}}
+
+    def test_turn_completed_interrupted_is_distinct(self):
+        ev = self._s()._appserver_to_event(
+            "turn/completed", {"turn": {"status": "interrupted"}}
+        )
+        assert ev == {"type": "turn.interrupted"}
+
+    def test_turn_completed_in_progress_is_not_success(self):
+        ev = self._s()._appserver_to_event(
+            "turn/completed", {"turn": {"status": "inProgress"}}
+        )
+        assert ev == {
+            "type": "turn.failed",
+            "error": {"message": "turn/completed reported inProgress"},
+        }
 
     def test_unknown_method_returns_none(self):
         assert self._s()._appserver_to_event("thread/status/changed", {}) is None
@@ -1241,9 +1293,28 @@ class TestCodexAppServerApprovals:
         out = await self._s()._on_appserver_request("item/permissions/requestApproval", {})
         assert out == {"permissions": {}, "scope": "session"}
 
+    @pytest.mark.parametrize(
+        ("method", "expected"),
+        [
+            (
+                "account/chatgptAuthTokens/refresh",
+                {"accessToken": "", "chatgptAccountId": ""},
+            ),
+            ("item/tool/requestUserInput", {"answers": {}}),
+            ("mcpServer/elicitation/request", {"action": "decline"}),
+            ("item/tool/call", {"contentItems": [], "success": False}),
+            ("attestation/generate", {"token": ""}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_0144_server_requests_return_schema_shaped_results(
+        self, method, expected
+    ):
+        assert await self._s()._on_appserver_request(method, {}) == expected
+
     @pytest.mark.asyncio
     async def test_unknown_request_returns_empty(self):
-        assert await self._s()._on_appserver_request("mcpServer/elicitation/request", {}) == {}
+        assert await self._s()._on_appserver_request("future/method", {}) == {}
 
 
 class TestCodexAppServerEffortAndConfig:
@@ -1396,6 +1467,412 @@ class TestCodexAppServerTurn:
         result = await s._exec_codex_app_server("boom")
         assert result.failed
         assert "rate limited" in result.errors[0]
+
+    @pytest.mark.asyncio
+    async def test_interrupted_turn_is_distinct_and_keeps_substrate(self):
+        s = _appserver_session()
+        notifications = [
+            ("thread/started", {"thread": {"id": "thr-1"}}),
+            ("turn/completed", {"turn": {"status": "interrupted"}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("stop")
+        assert result.failed is True
+        assert result.interrupted is True
+        assert result.errors == ["turn interrupted"]
+        assert s._app_client is fake
+
+    @pytest.mark.asyncio
+    async def test_in_progress_completion_resolves_as_failure(self):
+        s = _appserver_session()
+        fake = _FakeAppClient(
+            s, [("turn/completed", {"turn": {"status": "inProgress"}})]
+        )
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("do not hang"), timeout=1
+        )
+        assert result.failed is True
+        assert result.interrupted is False
+        assert result.errors == ["turn/completed reported inProgress"]
+
+    @pytest.mark.parametrize(
+        ("notifications", "expected_failed", "expected_errors", "expected_tokens"),
+        [
+            (
+                [("error", {
+                    "threadId": "thr-1",
+                    "turnId": "t1",
+                    "willRetry": False,
+                    "error": {"message": "scripted terminal error"},
+                })],
+                True,
+                ["scripted terminal error"],
+                0,
+            ),
+            (
+                [
+                    ("thread/tokenUsage/updated", {"tokenUsage": {"last": {
+                        "inputTokens": 7,
+                        "outputTokens": 3,
+                        "cachedInputTokens": 2,
+                        "reasoningOutputTokens": 1,
+                    }}}),
+                    ("turn/completed", {
+                        "threadId": "thr-1",
+                        "turn": {"id": "t1", "status": "completed"},
+                    }),
+                ],
+                False,
+                [],
+                3,
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_terminal_turn_does_not_wait_for_blocked_stream_callback(
+        self,
+        notifications,
+        expected_failed,
+        expected_errors,
+        expected_tokens,
+    ):
+        s = _appserver_session()
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+        callback_completed = asyncio.Event()
+
+        async def blocked_terminal_callback(event: dict) -> None:
+            if event["type"] not in {"turn_failed", "turn_completed"}:
+                return
+            callback_started.set()
+            await release_callback.wait()
+            callback_completed.set()
+
+        s._stream_event_callback = blocked_terminal_callback
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("terminal callback must not gate"),
+            timeout=0.25,
+        )
+
+        assert result.failed is expected_failed
+        assert result.errors == expected_errors
+        assert result.output_tokens == expected_tokens
+        await asyncio.wait_for(callback_started.wait(), timeout=0.25)
+        assert callback_completed.is_set() is False
+
+        release_callback.set()
+        await asyncio.wait_for(callback_completed.wait(), timeout=0.25)
+
+    @pytest.mark.asyncio
+    async def test_stuck_terminal_stream_callback_is_loudly_abandoned(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        callback_cancelled = asyncio.Event()
+
+        async def stuck_callback(_event: dict) -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                callback_cancelled.set()
+
+        s._stream_event_callback = stuck_callback
+        fake = _FakeAppClient(
+            s, [("turn/completed", {"turn": {"status": "completed"}})]
+        )
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("abandon stuck callback"), timeout=0.25
+        )
+        assert result.failed is False
+        await asyncio.wait_for(callback_cancelled.wait(), timeout=0.25)
+        assert any(
+            "app_server_terminal_stream_abandoned "
+            "agent=test-agent type=turn_completed timeout_s=0.01" in line
+            for line in logs
+        )
+
+    @pytest.mark.asyncio
+    async def test_terminal_stream_delivery_is_serialized_across_respawn(self):
+        s = _appserver_session()
+        old_started = asyncio.Event()
+        release_old = asyncio.Event()
+        both_delivered = asyncio.Event()
+        delivery_order: list[str] = []
+        callback_count = 0
+
+        async def terminal_callback(event: dict) -> None:
+            nonlocal callback_count
+            if event["type"] != "turn_completed":
+                return
+            callback_count += 1
+            generation = "old" if callback_count == 1 else "new"
+            if generation == "old":
+                old_started.set()
+                await release_old.wait()
+            delivery_order.append(generation)
+            if len(delivery_order) == 2:
+                both_delivered.set()
+
+        s._stream_event_callback = terminal_callback
+        clients = [
+            _FakeAppClient(
+                s, [("turn/completed", {"turn": {"status": "completed"}})]
+            ),
+            _FakeAppClient(
+                s, [("turn/completed", {"turn": {"status": "completed"}})]
+            ),
+        ]
+        ensure_calls = 0
+
+        async def replace_client() -> bool:
+            nonlocal ensure_calls
+            s._app_client = clients[ensure_calls]
+            ensure_calls += 1
+            return True
+
+        s._ensure_app_server = replace_client  # type: ignore[assignment]
+
+        first = await asyncio.wait_for(
+            s._exec_codex_app_server("old generation"), timeout=0.25
+        )
+        assert first.failed is False
+        await asyncio.wait_for(old_started.wait(), timeout=0.25)
+
+        second = await asyncio.wait_for(
+            s._exec_codex_app_server("new generation"), timeout=0.25
+        )
+        assert second.failed is False
+        await asyncio.sleep(0)
+        assert delivery_order != ["new"]
+
+        release_old.set()
+        await asyncio.wait_for(both_delivered.wait(), timeout=0.25)
+        assert delivery_order == ["old", "new"]
+
+    @pytest.mark.asyncio
+    async def test_cancellation_resistant_terminal_callback_remains_retained(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        cancellation_seen = asyncio.Event()
+        release_cleanup = asyncio.Event()
+        callback_finished = asyncio.Event()
+
+        async def cancellation_resistant_callback(_event: dict) -> None:
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancellation_seen.set()
+                await release_cleanup.wait()
+            finally:
+                callback_finished.set()
+
+        s._stream_event_callback = cancellation_resistant_callback
+        fake = _FakeAppClient(
+            s, [("turn/completed", {"turn": {"status": "completed"}})]
+        )
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("do not gate on cleanup"), timeout=0.25
+        )
+        assert result.failed is False
+        await asyncio.wait_for(cancellation_seen.wait(), timeout=0.25)
+        assert any(
+            not task.done() for task in s._appserver_terminal_stream_tasks
+        )
+
+        await asyncio.wait_for(s._teardown_app_server(), timeout=0.05)
+        assert any(
+            "app_server_terminal_stream_survivors "
+            "agent=test-agent phase=teardown" in line
+            for line in logs
+        )
+        assert any(
+            "app_server_terminal_stream_abandoned "
+            "agent=test-agent type=turn_completed timeout_s=0.01" in line
+            for line in logs
+        )
+
+        release_cleanup.set()
+        await asyncio.wait_for(callback_finished.wait(), timeout=0.25)
+        for _ in range(10):
+            if not s._appserver_terminal_stream_tasks:
+                break
+            await asyncio.sleep(0)
+        assert s._appserver_terminal_stream_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_terminal_generation_churn_drops_stale_without_waiting_for_survivor(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        old_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_old = asyncio.Event()
+        old_finished = asyncio.Event()
+        newest_started = asyncio.Event()
+        repeated_newest_started = asyncio.Event()
+        starts: list[int] = []
+
+        async def terminal_callback(event: dict) -> None:
+            sequence = event["sequence"]
+            starts.append(sequence)
+            if sequence == 0:
+                old_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+                    await release_old.wait()
+                finally:
+                    old_finished.set()
+            elif sequence == 5:
+                newest_started.set()
+            elif sequence == 12:
+                repeated_newest_started.set()
+
+        s._stream_event_callback = terminal_callback
+        s._schedule_appserver_terminal_stream_event(
+            {"type": "turn_completed", "sequence": 0}
+        )
+        await asyncio.wait_for(old_started.wait(), timeout=0.25)
+        try:
+            for sequence in range(1, 6):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+
+            # One dispatcher/current callback plus one resistant survivor is the
+            # ceiling; queued wrapper chains must not grow with event churn.
+            assert len(s._appserver_terminal_stream_tasks) <= 2
+            await asyncio.wait_for(cancellation_seen.wait(), timeout=0.25)
+            await asyncio.wait_for(newest_started.wait(), timeout=0.05)
+            assert starts == [0, 5]
+
+            for sequence in range(6, 13):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+
+            assert len(s._appserver_terminal_stream_tasks) <= 2
+            await asyncio.wait_for(repeated_newest_started.wait(), timeout=0.05)
+            assert starts == [0, 5, 12]
+            assert sum("app_server_stale_terminal_dropped" in line for line in logs) >= 10
+
+            s._report_appserver_terminal_stream_survivors(phase="generation-test")
+            assert any(
+                "app_server_terminal_stream_survivors "
+                "agent=test-agent phase=generation-test count=1" in line
+                for line in logs
+            )
+        finally:
+            release_old.set()
+            await asyncio.wait_for(old_finished.wait(), timeout=0.25)
+            for _ in range(20):
+                if not s._appserver_terminal_stream_tasks:
+                    break
+                await asyncio.sleep(0)
+
+        assert s._appserver_terminal_stream_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_terminal_survivor_limit_caps_resistant_callback_churn(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        release_all = asyncio.Event()
+        two_cancelled = asyncio.Event()
+        starts: list[int] = []
+        cancelled: list[int] = []
+
+        async def resistant_callback(event: dict) -> None:
+            sequence = event["sequence"]
+            starts.append(sequence)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(sequence)
+                if len(cancelled) == 2:
+                    two_cancelled.set()
+                await release_all.wait()
+
+        s._stream_event_callback = resistant_callback
+        try:
+            s._schedule_appserver_terminal_stream_event(
+                {"type": "turn_completed", "sequence": 0}
+            )
+            for _ in range(20):
+                if starts:
+                    break
+                await asyncio.sleep(0)
+
+            for sequence in range(1, 6):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+
+            await asyncio.wait_for(two_cancelled.wait(), timeout=0.1)
+            assert starts == [0, 5]
+            assert len(s._appserver_terminal_stream_tasks) == 2
+
+            for sequence in range(6, 13):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            # Two truthfully retained survivors are the hard ceiling. The next
+            # high-water generation is dropped immediately and loudly.
+            assert starts == [0, 5]
+            assert len(s._appserver_terminal_stream_tasks) == 2
+            assert any(
+                "app_server_stale_terminal_dropped " in line
+                and "generation=13 reason=survivor_limit live_callbacks=2" in line
+                for line in logs
+            )
+        finally:
+            release_all.set()
+            for _ in range(20):
+                if not s._appserver_terminal_stream_tasks:
+                    break
+                await asyncio.sleep(0)
+
+        assert s._appserver_terminal_stream_tasks == set()
 
     @pytest.mark.asyncio
     async def test_connect_failure_returns_failed_result(self):
@@ -1593,31 +2070,24 @@ class TestCodexStateMachine:
         assert s.state == SessionState.CONNECTED
 
     @pytest.mark.asyncio
-    async def test_cold_connect_appserver_init_failure_dies_no_leak(self):
-        # App-server initialize failure during BOOT → BOOTING completes to DEAD,
-        # and the owner token is NOT leaked (a later resurrection can proceed).
+    async def test_cold_connect_appserver_init_failure_degrades_without_dead(self):
+        # An app-server initialize failure is bounded and degrades this session
+        # to legacy exec; it must not terminalize the agent.
         s = _appserver_session()
 
         async def failing_ensure():
-            raise RuntimeError("app-server init boom")
+            s._degrade_app_server(reason="error", error=RuntimeError("init boom"))
+            return False
 
         s._ensure_app_server = failing_ensure  # type: ignore[assignment]
-
-        with pytest.raises(RuntimeError):
-            await s.connect()
-        assert s.state == SessionState.DEAD
-        assert s._state_machine._in_flight is None, "owner token leaked on BOOT failure"
-
-        # No leak → resurrection works: DEAD → RECONNECTING → CONNECTED.
-        async def ok_ensure():
-            s._app_client = object()
-
-        s._ensure_app_server = ok_ensure  # type: ignore[assignment]
         s._start_worker = lambda: None  # type: ignore[assignment]
         s._enqueue_wake = _noop  # type: ignore[assignment]
         s._analytics_session_started = lambda: None  # type: ignore[assignment]
         await s.connect()
         assert s.state == SessionState.CONNECTED
+        assert s._use_app_server is False
+        assert s._app_server_degraded is True
+        assert s._state_machine._in_flight is None
 
     @pytest.mark.asyncio
     async def test_ensure_app_server_init_failure_is_atomic(self, monkeypatch):
@@ -1646,6 +2116,9 @@ class TestCodexStateMachine:
             def __init__(self):
                 self.closed = False
 
+            def set_transport_closed_handler(self, handler):
+                self.transport_closed_handler = handler
+
             async def initialize(self, **kw):
                 raise RuntimeError("initialize boom")
 
@@ -1665,20 +2138,24 @@ class TestCodexStateMachine:
             "pinky_daemon.codex_session.spawn_app_server", fake_spawn_boom
         )
 
-        with pytest.raises(RuntimeError, match="initialize boom"):
-            await s._ensure_app_server()
+        assert await s._ensure_app_server() is False
 
         # Half-initialized substrate must be torn down, not cached.
         assert s._app_client is None
         assert s._app_proc is None
+        assert s._use_app_server is False
+        assert s._app_server_degraded is True
         assert boom_clients[0].closed is True, "client not closed on init failure"
         assert boom_procs[0].killed is True, "proc not killed on init failure"
 
-        # A later attempt must respawn AND re-run initialize — the guard must
-        # not short-circuit on the cleared (None) fields.
+        # A later reconnect cycle must re-enable, respawn, and re-run initialize.
+        s._begin_app_server_reconnect_cycle()
         init_calls: list = []
 
         class _OkClient:
+            def set_transport_closed_handler(self, handler):
+                self.transport_closed_handler = handler
+
             async def initialize(self, **kw):
                 init_calls.append(True)
 
@@ -1691,7 +2168,7 @@ class TestCodexStateMachine:
         monkeypatch.setattr(
             "pinky_daemon.codex_session.spawn_app_server", fake_spawn_ok
         )
-        await s._ensure_app_server()
+        assert await s._ensure_app_server() is True
         assert init_calls == [True], "initialization was skipped on reconnect"
         assert s._app_client is not None
         assert s._app_proc is not None

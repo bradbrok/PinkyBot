@@ -35,6 +35,19 @@ class FakeWriter:
         return [json.loads(ln) for ln in self.buffer.split(b"\n") if ln.strip()]
 
 
+class BackpressuredWriter(FakeWriter):
+    """Writer whose drain never completes until the test releases it."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.drain_started = asyncio.Event()
+        self.release_drain = asyncio.Event()
+
+    async def drain(self) -> None:
+        self.drain_started.set()
+        await self.release_drain.wait()
+
+
 def make_client(**kwargs) -> tuple[CodexAppServerClient, asyncio.StreamReader, FakeWriter]:
     reader = asyncio.StreamReader()
     writer = FakeWriter()
@@ -105,10 +118,85 @@ class TestRequestResponse:
 
     @pytest.mark.asyncio
     async def test_request_timeout(self):
-        client, _reader, _writer = make_client()
+        client, _reader, writer = make_client()
         with pytest.raises(CodexAppServerError, match="timed out"):
             await client.request("slow", timeout=0.05)
+        assert client.is_closed is False
+        assert writer.closed is False
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_request_timeout_covers_backpressured_send_closed_by_eof(self):
+        reader = asyncio.StreamReader()
+        writer = BackpressuredWriter()
+        client = CodexAppServerClient(reader, writer)
+        client.start()
+        timeout = 0.05
+        task = asyncio.create_task(
+            client.request(
+                "backpressured",
+                {"payload": "x" * (16 * 1024 * 1024)},
+                timeout=timeout,
+            )
+        )
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=1)
+
+        # stdout closes while the peer process and stdin can remain live. The
+        # pending Future is failed by EOF, but request() must also escape drain.
+        reader.feed_eof()
+        try:
+            with pytest.raises(CodexAppServerError, match="connection closed"):
+                await asyncio.wait_for(task, timeout=timeout * 4)
+            assert client._pending == {}
+        finally:
+            writer.release_drain.set()
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_request_timeout_covers_backpressured_send_without_eof(self):
+        reader = asyncio.StreamReader()
+        writer = BackpressuredWriter()
+        client = CodexAppServerClient(reader, writer)
+        client.start()
+        timeout = 0.02
+        task = asyncio.create_task(client.request("send-timeout", timeout=timeout))
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=1)
+
+        try:
+            with pytest.raises(CodexAppServerError, match="timed out"):
+                await asyncio.wait_for(task, timeout=timeout * 4)
+            assert client._pending == {}
+            assert client.is_closed is True
+            assert writer.closed is True
+        finally:
+            writer.release_drain.set()
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_eof_at_write_edge_interrupts_backpressured_send(self):
+        reader = asyncio.StreamReader()
+
+        class EofAtWriteWriter(BackpressuredWriter):
+            def write(self, data: bytes) -> None:
+                # Exact close edge: request's closed-latch check passed, then
+                # EOF lands as the write begins. Do not accept a partial frame.
+                reader.feed_eof()
+
+        writer = EofAtWriteWriter()
+        client = CodexAppServerClient(reader, writer)
+        client.start()
+        timeout = 0.05
+        task = asyncio.create_task(client.request("write-edge", timeout=timeout))
+        await asyncio.wait_for(writer.drain_started.wait(), timeout=1)
+
+        try:
+            with pytest.raises(CodexAppServerError, match="connection closed"):
+                await asyncio.wait_for(task, timeout=timeout * 4)
+            assert client._pending == {}
+            assert writer.buffer == b""
+        finally:
+            writer.release_drain.set()
+            await client.close()
 
     @pytest.mark.asyncio
     async def test_request_on_closed_client_raises(self):
@@ -124,7 +212,10 @@ class TestRequestResponse:
         await _settle()
         frame = writer.frames()[0]
         assert frame["method"] == "initialize"
-        assert frame["params"] == {"clientInfo": {"name": "pinkybot", "version": "9"}}
+        assert frame["params"] == {
+            "clientInfo": {"name": "pinkybot", "version": "9"},
+            "capabilities": {},
+        }
 
         _feed(reader, {"id": frame["id"], "result": {"codexHome": "/x"}})
         assert await asyncio.wait_for(task, timeout=1) == {"codexHome": "/x"}
@@ -248,6 +339,53 @@ class TestFramingAndLifecycle:
         with pytest.raises(CodexAppServerError, match="connection closed"):
             await asyncio.wait_for(task, timeout=1)
         await client.close()
+
+    @pytest.mark.asyncio
+    async def test_eof_signals_transport_closed_after_requests_are_empty(self):
+        closed: list[CodexAppServerError] = []
+        client, reader, _writer = make_client()
+        client.set_transport_closed_handler(closed.append)
+
+        reader.feed_eof()
+        await _settle()
+
+        assert len(closed) == 1
+        assert str(closed[0]) == "connection closed"
+        await client.close()
+        assert len(closed) == 1
+
+    @pytest.mark.asyncio
+    async def test_eof_latches_closed_before_any_later_request_is_registered(self):
+        closed: list[CodexAppServerError] = []
+        client, reader, writer = make_client()
+        client.set_transport_closed_handler(closed.append)
+
+        reader.feed_eof()
+        await _settle()
+
+        frames_before = writer.frames()
+        assert client.is_closed is True
+        next_id_before = client._next_id
+        for method in ("after-eof-1", "after-eof-2"):
+            with pytest.raises(CodexAppServerError, match="connection closed"):
+                await asyncio.wait_for(client.request(method), timeout=0.05)
+
+        assert client._pending == {}
+        assert client._next_id == next_id_before
+        assert writer.frames() == frames_before
+        assert len(closed) == 1
+        await client.close()
+        assert len(closed) == 1
+
+    @pytest.mark.asyncio
+    async def test_deliberate_close_does_not_signal_transport_failure(self):
+        closed: list[CodexAppServerError] = []
+        client, _reader, _writer = make_client()
+        client.set_transport_closed_handler(closed.append)
+
+        await client.close()
+
+        assert closed == []
 
     @pytest.mark.asyncio
     async def test_close_is_idempotent(self):
