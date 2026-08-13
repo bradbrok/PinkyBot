@@ -92,6 +92,7 @@ def main(argv: list[str] | None = None) -> int:
             "error-init",
             "die-pre-init",
             "error-notification",
+            "backpressure-eof",
             "eof-between-turns",
             "eof-after-acceptance",
             "eof-after-terminal",
@@ -132,6 +133,16 @@ def main(argv: list[str] | None = None) -> int:
                     "platformOs": "fake",
                 },
             })
+            if mode == "backpressure-eof":
+                # Wait for the first byte of the next request, then stop
+                # reading stdin so the parent's 16 MiB write backpressures.
+                # Close only stdout: the process and stdin stay live until the
+                # test explicitly tears the child down.
+                os.read(sys.stdin.fileno(), 1)
+                time.sleep(0.05)
+                _close_stdout()
+                while True:
+                    time.sleep(3600)
             if mode == "eof-between-turns":
                 _close_stdout()
             if exit_after_init:

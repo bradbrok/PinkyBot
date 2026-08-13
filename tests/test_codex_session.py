@@ -1724,6 +1724,157 @@ class TestCodexAppServerTurn:
         assert s._appserver_terminal_stream_tasks == set()
 
     @pytest.mark.asyncio
+    async def test_terminal_generation_churn_drops_stale_without_waiting_for_survivor(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        old_started = asyncio.Event()
+        cancellation_seen = asyncio.Event()
+        release_old = asyncio.Event()
+        old_finished = asyncio.Event()
+        newest_started = asyncio.Event()
+        repeated_newest_started = asyncio.Event()
+        starts: list[int] = []
+
+        async def terminal_callback(event: dict) -> None:
+            sequence = event["sequence"]
+            starts.append(sequence)
+            if sequence == 0:
+                old_started.set()
+                try:
+                    await asyncio.Event().wait()
+                except asyncio.CancelledError:
+                    cancellation_seen.set()
+                    await release_old.wait()
+                finally:
+                    old_finished.set()
+            elif sequence == 5:
+                newest_started.set()
+            elif sequence == 12:
+                repeated_newest_started.set()
+
+        s._stream_event_callback = terminal_callback
+        s._schedule_appserver_terminal_stream_event(
+            {"type": "turn_completed", "sequence": 0}
+        )
+        await asyncio.wait_for(old_started.wait(), timeout=0.25)
+        try:
+            for sequence in range(1, 6):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+
+            # One dispatcher/current callback plus one resistant survivor is the
+            # ceiling; queued wrapper chains must not grow with event churn.
+            assert len(s._appserver_terminal_stream_tasks) <= 2
+            await asyncio.wait_for(cancellation_seen.wait(), timeout=0.25)
+            await asyncio.wait_for(newest_started.wait(), timeout=0.05)
+            assert starts == [0, 5]
+
+            for sequence in range(6, 13):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+
+            assert len(s._appserver_terminal_stream_tasks) <= 2
+            await asyncio.wait_for(repeated_newest_started.wait(), timeout=0.05)
+            assert starts == [0, 5, 12]
+            assert sum("app_server_stale_terminal_dropped" in line for line in logs) >= 10
+
+            s._report_appserver_terminal_stream_survivors(phase="generation-test")
+            assert any(
+                "app_server_terminal_stream_survivors "
+                "agent=test-agent phase=generation-test count=1" in line
+                for line in logs
+            )
+        finally:
+            release_old.set()
+            await asyncio.wait_for(old_finished.wait(), timeout=0.25)
+            for _ in range(20):
+                if not s._appserver_terminal_stream_tasks:
+                    break
+                await asyncio.sleep(0)
+
+        assert s._appserver_terminal_stream_tasks == set()
+
+    @pytest.mark.asyncio
+    async def test_terminal_survivor_limit_caps_resistant_callback_churn(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        release_all = asyncio.Event()
+        two_cancelled = asyncio.Event()
+        starts: list[int] = []
+        cancelled: list[int] = []
+
+        async def resistant_callback(event: dict) -> None:
+            sequence = event["sequence"]
+            starts.append(sequence)
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelled.append(sequence)
+                if len(cancelled) == 2:
+                    two_cancelled.set()
+                await release_all.wait()
+
+        s._stream_event_callback = resistant_callback
+        try:
+            s._schedule_appserver_terminal_stream_event(
+                {"type": "turn_completed", "sequence": 0}
+            )
+            for _ in range(20):
+                if starts:
+                    break
+                await asyncio.sleep(0)
+
+            for sequence in range(1, 6):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+
+            await asyncio.wait_for(two_cancelled.wait(), timeout=0.1)
+            assert starts == [0, 5]
+            assert len(s._appserver_terminal_stream_tasks) == 2
+
+            for sequence in range(6, 13):
+                s._schedule_appserver_terminal_stream_event(
+                    {"type": "turn_completed", "sequence": sequence}
+                )
+            for _ in range(20):
+                await asyncio.sleep(0)
+
+            # Two truthfully retained survivors are the hard ceiling. The next
+            # high-water generation is dropped immediately and loudly.
+            assert starts == [0, 5]
+            assert len(s._appserver_terminal_stream_tasks) == 2
+            assert any(
+                "app_server_stale_terminal_dropped " in line
+                and "generation=13 reason=survivor_limit live_callbacks=2" in line
+                for line in logs
+            )
+        finally:
+            release_all.set()
+            for _ in range(20):
+                if not s._appserver_terminal_stream_tasks:
+                    break
+                await asyncio.sleep(0)
+
+        assert s._appserver_terminal_stream_tasks == set()
+
+    @pytest.mark.asyncio
     async def test_connect_failure_returns_failed_result(self):
         s = _appserver_session()
 

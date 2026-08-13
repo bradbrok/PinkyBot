@@ -309,6 +309,40 @@ async def test_stdout_eof_between_turns_with_live_process_respawns(
 
 
 @pytest.mark.asyncio
+async def test_backpressured_16mib_request_fails_on_eof_while_child_stays_live(
+    monkeypatch, tmp_path
+):
+    session = _session(monkeypatch, tmp_path, mode="backpressure-eof")
+    assert await session._ensure_app_server() is True
+    client = session._app_client
+    proc = session._app_proc
+    assert client is not None
+    assert proc is not None
+    # Leave headroom for serializing the 16 MiB JSON frame; the close still
+    # has to win well before this documented end-to-end deadline.
+    timeout = 0.5
+    started = time.monotonic()
+
+    try:
+        with pytest.raises(CodexAppServerError, match="connection closed"):
+            await asyncio.wait_for(
+                client.request(
+                    "backpressured",
+                    {"payload": "x" * (16 * 1024 * 1024)},
+                    timeout=timeout,
+                ),
+                timeout=timeout * 2,
+            )
+        elapsed = time.monotonic() - started
+
+        assert elapsed < timeout
+        assert proc.returncode is None
+        assert client._pending == {}
+    finally:
+        await session._teardown_app_server()
+
+
+@pytest.mark.asyncio
 async def test_stdout_eof_after_terminal_notification_respawns(
     monkeypatch, tmp_path
 ):
