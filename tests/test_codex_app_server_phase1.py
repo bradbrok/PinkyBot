@@ -208,6 +208,64 @@ async def test_error_notification_terminally_resolves_turn(monkeypatch, tmp_path
 
 
 @pytest.mark.asyncio
+async def test_child_eof_after_acceptance_fails_promptly_and_respawns(
+    monkeypatch, tmp_path
+):
+    logs: list[str] = []
+    monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+    session = _session(monkeypatch, tmp_path, mode="eof-after-acceptance")
+    receipt = asyncio.get_running_loop().create_future()
+    acceptance_order: list[bool] = []
+
+    def persist_exact_fire() -> bool:
+        acceptance_order.append(receipt.done())
+        return True
+
+    started = time.monotonic()
+    first = await asyncio.wait_for(
+        session._exec_codex_app_server(
+            "accepted then eof",
+            scheduler_delivery=receipt,
+            scheduler_accept=persist_exact_fire,
+        ),
+        timeout=1,
+    )
+    elapsed = time.monotonic() - started
+
+    assert elapsed < 1
+    assert first.failed is True
+    assert first.errors == ["app-server transport closed: connection closed"]
+    assert acceptance_order == [False]
+    assert await receipt is True
+    assert session._app_client is None
+    assert session._app_proc is None
+    assert any(
+        "app_server_transport_closed agent=phase1-agent active_turn=true" in line
+        for line in logs
+    )
+
+    # The failed transport was fully cleared. A later turn gets a fresh child
+    # and retains the existing respawn-on-next-turn behavior.
+    session._app_server_command = (
+        sys.executable,
+        str(_FAKE),
+        "--mode",
+        "happy",
+    )
+    second = await asyncio.wait_for(
+        session._exec_codex_app_server("fresh child"), timeout=1
+    )
+    assert second.failed is False
+    assert second.text_parts == ["fake app-server reply"]
+    assert session.stats["app_server_counters"] == {
+        "turns_ok": 1,
+        "turns_failed": 1,
+        "respawns": 1,
+    }
+    await session._teardown_app_server()
+
+
+@pytest.mark.asyncio
 async def test_child_exit_after_turn_respawns_on_next_turn(monkeypatch, tmp_path):
     session = _session(monkeypatch, tmp_path, mode="exit-after-turn")
     try:

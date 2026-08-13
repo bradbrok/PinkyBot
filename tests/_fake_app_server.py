@@ -25,7 +25,12 @@ import os
 import sys
 import time
 
-_PHASE1_MODES = {"happy", "error-notification", "exit-after-turn"}
+_PHASE1_MODES = {
+    "happy",
+    "error-notification",
+    "eof-after-acceptance",
+    "exit-after-turn",
+}
 
 
 def _send(frame: dict) -> None:
@@ -79,6 +84,7 @@ def main(argv: list[str] | None = None) -> int:
             "error-init",
             "die-pre-init",
             "error-notification",
+            "eof-after-acceptance",
             "exit-after-turn",
         ),
         default="echo",
@@ -135,6 +141,10 @@ def main(argv: list[str] | None = None) -> int:
             turn_count += 1
             turn_id = f"fake-turn-{turn_count}"
             _send({"id": mid, "result": {"turn": _turn(turn_id, "inProgress")}})
+            if mode == "eof-after-acceptance":
+                # Exact May-wedge shape: prompt acceptance is positive, then
+                # the child exits cleanly without any terminal notification.
+                return 0
             if mode == "error-notification":
                 _send({
                     "method": "error",

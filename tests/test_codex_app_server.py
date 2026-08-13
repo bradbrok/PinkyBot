@@ -253,6 +253,30 @@ class TestFramingAndLifecycle:
         await client.close()
 
     @pytest.mark.asyncio
+    async def test_eof_signals_transport_closed_after_requests_are_empty(self):
+        closed: list[CodexAppServerError] = []
+        client, reader, _writer = make_client()
+        client.set_transport_closed_handler(closed.append)
+
+        reader.feed_eof()
+        await _settle()
+
+        assert len(closed) == 1
+        assert str(closed[0]) == "connection closed"
+        await client.close()
+        assert len(closed) == 1
+
+    @pytest.mark.asyncio
+    async def test_deliberate_close_does_not_signal_transport_failure(self):
+        closed: list[CodexAppServerError] = []
+        client, _reader, _writer = make_client()
+        client.set_transport_closed_handler(closed.append)
+
+        await client.close()
+
+        assert closed == []
+
+    @pytest.mark.asyncio
     async def test_close_is_idempotent(self):
         client, _reader, writer = make_client()
         await client.close()

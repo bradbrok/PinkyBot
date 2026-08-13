@@ -1499,6 +1499,113 @@ class TestCodexAppServerTurn:
         assert result.interrupted is False
         assert result.errors == ["turn/completed reported inProgress"]
 
+    @pytest.mark.parametrize(
+        ("notifications", "expected_failed", "expected_errors", "expected_tokens"),
+        [
+            (
+                [("error", {
+                    "threadId": "thr-1",
+                    "turnId": "t1",
+                    "willRetry": False,
+                    "error": {"message": "scripted terminal error"},
+                })],
+                True,
+                ["scripted terminal error"],
+                0,
+            ),
+            (
+                [
+                    ("thread/tokenUsage/updated", {"tokenUsage": {"last": {
+                        "inputTokens": 7,
+                        "outputTokens": 3,
+                        "cachedInputTokens": 2,
+                        "reasoningOutputTokens": 1,
+                    }}}),
+                    ("turn/completed", {
+                        "threadId": "thr-1",
+                        "turn": {"id": "t1", "status": "completed"},
+                    }),
+                ],
+                False,
+                [],
+                3,
+            ),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_terminal_turn_does_not_wait_for_blocked_stream_callback(
+        self,
+        notifications,
+        expected_failed,
+        expected_errors,
+        expected_tokens,
+    ):
+        s = _appserver_session()
+        callback_started = asyncio.Event()
+        release_callback = asyncio.Event()
+        callback_completed = asyncio.Event()
+
+        async def blocked_terminal_callback(event: dict) -> None:
+            if event["type"] not in {"turn_failed", "turn_completed"}:
+                return
+            callback_started.set()
+            await release_callback.wait()
+            callback_completed.set()
+
+        s._stream_event_callback = blocked_terminal_callback
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("terminal callback must not gate"),
+            timeout=0.25,
+        )
+
+        assert result.failed is expected_failed
+        assert result.errors == expected_errors
+        assert result.output_tokens == expected_tokens
+        await asyncio.wait_for(callback_started.wait(), timeout=0.25)
+        assert callback_completed.is_set() is False
+
+        release_callback.set()
+        await asyncio.wait_for(callback_completed.wait(), timeout=0.25)
+
+    @pytest.mark.asyncio
+    async def test_stuck_terminal_stream_callback_is_loudly_abandoned(
+        self, monkeypatch
+    ):
+        logs: list[str] = []
+        monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
+        monkeypatch.setattr(
+            "pinky_daemon.codex_session.APP_SERVER_TERMINAL_STREAM_TIMEOUT",
+            0.01,
+        )
+        s = _appserver_session()
+        callback_cancelled = asyncio.Event()
+
+        async def stuck_callback(_event: dict) -> None:
+            try:
+                await asyncio.Event().wait()
+            finally:
+                callback_cancelled.set()
+
+        s._stream_event_callback = stuck_callback
+        fake = _FakeAppClient(
+            s, [("turn/completed", {"turn": {"status": "completed"}})]
+        )
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("abandon stuck callback"), timeout=0.25
+        )
+        assert result.failed is False
+        await asyncio.wait_for(callback_cancelled.wait(), timeout=0.25)
+        assert any(
+            "app_server_terminal_stream_abandoned "
+            "agent=test-agent type=turn_completed timeout_s=0.01" in line
+            for line in logs
+        )
+
     @pytest.mark.asyncio
     async def test_connect_failure_returns_failed_result(self):
         s = _appserver_session()
@@ -1741,6 +1848,9 @@ class TestCodexStateMachine:
             def __init__(self):
                 self.closed = False
 
+            def set_transport_closed_handler(self, handler):
+                self.transport_closed_handler = handler
+
             async def initialize(self, **kw):
                 raise RuntimeError("initialize boom")
 
@@ -1775,6 +1885,9 @@ class TestCodexStateMachine:
         init_calls: list = []
 
         class _OkClient:
+            def set_transport_closed_handler(self, handler):
+                self.transport_closed_handler = handler
+
             async def initialize(self, **kw):
                 init_calls.append(True)
 
