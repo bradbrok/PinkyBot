@@ -2,9 +2,12 @@
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
+import stat
 import threading
+import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -66,6 +69,7 @@ def test_flag_off_preserves_shared_path_and_performs_no_bootstrap(tmp_path, monk
     override = tmp_path / "override"
     monkeypatch.setenv("CODEX_HOME", str(shared_home))
     monkeypatch.delenv(PER_AGENT_CODEX_HOME_ENV, raising=False)
+    monkeypatch.setenv(codex_home_mod.MIGRATION_LOCK_TIMEOUT_ENV, "invalid")
     scope = _scope(working_dir, codex_home=str(override))
 
     assert codex_home_for(scope) == shared_home
@@ -273,6 +277,218 @@ def test_partial_migration_final_is_quarantined_and_retry_converges(tmp_path, mo
     assert quarantines[0].read_bytes() == partial_bytes
     assert any("removed abandoned rollout migration temp" in message for message in logs)
     assert any("quarantined invalid rollout migration final" in message for message in logs)
+
+
+def test_initial_migration_lock_deadline_preserves_source_and_markerless_state(
+    tmp_path, monkeypatch
+):
+    """R2 P1-1: a held destination lock cannot block prepare indefinitely."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    _auth(shared_home)
+    source = _rollout(shared_home, "rollout-held-lock.jsonl", working_dir)
+    source_bytes = source.read_bytes()
+    destination_sessions = agent_home / "sessions"
+    destination_sessions.mkdir(parents=True)
+    lock_path = destination_sessions / codex_home_mod._MIGRATION_LOCK_NAME
+    logs: list[str] = []
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    monkeypatch.setenv(codex_home_mod.MIGRATION_LOCK_TIMEOUT_ENV, "0.05")
+
+    with lock_path.open("a+b") as held_lock:
+        fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        started = time.monotonic()
+        with pytest.raises(RuntimeError, match="migration lock deadline exceeded"):
+            prepare_agent_codex_home(_scope(working_dir), log=logs.append)
+        elapsed = time.monotonic() - started
+
+    assert elapsed < 0.5
+    assert source.read_bytes() == source_bytes
+    assert not (agent_home / ROLLOUT_MIGRATION_MARKER).exists()
+    assert any("migration lock deadline exceeded" in message for message in logs)
+
+
+def test_reverse_migration_uses_same_bounded_lock_acquisition(tmp_path, monkeypatch):
+    """R2 P1-1: the public reverse-migration entry point shares the deadline."""
+    source_home = tmp_path / "agent-home"
+    destination_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    source = _rollout(source_home, "rollout-reverse-held-lock.jsonl", working_dir)
+    source_bytes = source.read_bytes()
+    destination_sessions = destination_home / "sessions"
+    destination_sessions.mkdir(parents=True)
+    lock_path = destination_sessions / codex_home_mod._MIGRATION_LOCK_NAME
+    monkeypatch.setenv(codex_home_mod.MIGRATION_LOCK_TIMEOUT_ENV, "0.05")
+
+    with lock_path.open("a+b") as held_lock:
+        fcntl.flock(held_lock.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        with pytest.raises(RuntimeError, match="migration lock deadline exceeded"):
+            move_matching_rollouts(
+                source_home,
+                destination_home,
+                working_dir,
+                log=lambda _message: None,
+            )
+
+    assert source.read_bytes() == source_bytes
+
+
+def test_source_change_after_final_validation_remains_authoritative_and_retryable(
+    tmp_path, monkeypatch
+):
+    """R2 P1-2: recheck the source immediately before removing it."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    _auth(shared_home)
+    source = _rollout(shared_home, "rollout-late-append.jsonl", working_dir)
+    original = source.read_bytes()
+    appended = b'{"type":"event_msg","payload":{"message":"late append"}}\n'
+    relative = source.relative_to(shared_home / "sessions")
+    destination = agent_home / "sessions" / relative
+    real_rollout_is_valid = codex_home_mod._rollout_is_valid
+    injected = False
+
+    def append_after_final_validation(path, target_cwd, *, expected_signature=None):
+        nonlocal injected
+        valid = real_rollout_is_valid(
+            path,
+            target_cwd,
+            expected_signature=expected_signature,
+        )
+        if path == destination and expected_signature is not None and valid and not injected:
+            with source.open("ab") as handle:
+                handle.write(appended)
+                handle.flush()
+                os.fsync(handle.fileno())
+            injected = True
+        return valid
+
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_rollout_is_valid",
+        append_after_final_validation,
+    )
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+
+    with pytest.raises(RuntimeError, match="changed before source removal"):
+        prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
+
+    assert source.read_bytes() == original + appended
+    assert destination.read_bytes() == original
+    assert not (agent_home / ROLLOUT_MIGRATION_MARKER).exists()
+
+    prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
+
+    assert not source.exists()
+    assert destination.read_bytes() == original + appended
+    assert (agent_home / ROLLOUT_MIGRATION_MARKER).exists()
+
+
+def test_linked_lock_entry_is_preserved_aside_without_touching_target(
+    tmp_path, monkeypatch
+):
+    """R2 P2-4: classify and preserve a linked lock before opening it."""
+    shared_home = tmp_path / "shared"
+    destination_home = tmp_path / "agent-home"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    destination_sessions = destination_home / "sessions"
+    destination_sessions.mkdir(parents=True)
+    unintended_target = tmp_path / "must-not-be-created.lock"
+    lock_path = destination_sessions / codex_home_mod._MIGRATION_LOCK_NAME
+    lock_path.symlink_to(unintended_target)
+    logs: list[str] = []
+
+    moved = move_matching_rollouts(
+        shared_home,
+        destination_home,
+        working_dir,
+        log=logs.append,
+    )
+
+    assert moved == 0
+    assert not unintended_target.exists()
+    assert lock_path.is_file()
+    assert not lock_path.is_symlink()
+    asides = list(
+        destination_sessions.glob(f"{codex_home_mod._MIGRATION_LOCK_ASIDE_PREFIX}*")
+    )
+    assert len(asides) == 1
+    assert asides[0].is_symlink()
+    assert os.readlink(asides[0]) == str(unintended_target)
+    assert any("renamed linked migration lock entry" in message for message in logs)
+
+
+def test_hard_linked_lock_entry_is_preserved_aside_without_mutating_peer(tmp_path):
+    """A multiply-linked regular entry follows the same preserve-aside rule."""
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    destination_sessions = destination_home / "sessions"
+    destination_sessions.mkdir(parents=True)
+    peer = tmp_path / "operator-lock"
+    peer.write_bytes(b"operator bytes")
+    peer.chmod(0o640)
+    lock_path = destination_sessions / codex_home_mod._MIGRATION_LOCK_NAME
+    os.link(peer, lock_path)
+    original_mode = peer.stat().st_mode
+    logs: list[str] = []
+
+    moved = move_matching_rollouts(
+        source_home,
+        destination_home,
+        working_dir,
+        log=logs.append,
+    )
+
+    assert moved == 0
+    assert peer.read_bytes() == b"operator bytes"
+    assert peer.stat().st_mode == original_mode
+    assert lock_path.is_file()
+    assert lock_path.stat().st_ino != peer.stat().st_ino
+    asides = list(
+        destination_sessions.glob(f"{codex_home_mod._MIGRATION_LOCK_ASIDE_PREFIX}*")
+    )
+    assert len(asides) == 1
+    assert asides[0].stat().st_ino == peer.stat().st_ino
+    assert any("renamed linked migration lock entry" in message for message in logs)
+
+
+def test_nonregular_lock_entry_is_preserved_aside_without_blocking(tmp_path):
+    """A FIFO lock entry is classified before open and cannot stall prepare."""
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    destination_sessions = destination_home / "sessions"
+    destination_sessions.mkdir(parents=True)
+    lock_path = destination_sessions / codex_home_mod._MIGRATION_LOCK_NAME
+    os.mkfifo(lock_path)
+    logs: list[str] = []
+
+    moved = move_matching_rollouts(
+        source_home,
+        destination_home,
+        working_dir,
+        log=logs.append,
+    )
+
+    assert moved == 0
+    assert lock_path.is_file()
+    asides = list(
+        destination_sessions.glob(f"{codex_home_mod._MIGRATION_LOCK_ASIDE_PREFIX}*")
+    )
+    assert len(asides) == 1
+    assert stat.S_ISFIFO(asides[0].lstat().st_mode)
+    assert any("renamed non-regular migration lock entry" in message for message in logs)
 
 
 def test_same_source_migration_loser_converges_and_counts_result(tmp_path, monkeypatch):

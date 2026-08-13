@@ -2,25 +2,34 @@
 
 from __future__ import annotations
 
+import errno
 import fcntl
 import hashlib
 import json
+import math
 import os
 import stat
 import tempfile
+import time
 import uuid
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import BinaryIO
 
 PER_AGENT_CODEX_HOME_ENV = "PINKY_CODEX_PER_AGENT_HOME"
 MANAGED_CONFIG_SENTINEL = "# pinkybot-managed-codex-home-v1"
 ROLLOUT_MIGRATION_MARKER = ".pinkybot-rollout-migration-v1.json"
+MIGRATION_LOCK_TIMEOUT_ENV = "PINKY_CODEX_HOME_LOCK_TIMEOUT_SECONDS"
 
 _MIGRATION_TEMP_PREFIX = ".pinkybot-rollout-migration-"
 _MIGRATION_TEMP_SUFFIX = ".tmp"
 _MIGRATION_QUARANTINE_PREFIX = ".pinkybot-rollout-quarantine-"
 _MIGRATION_LOCK_NAME = ".pinkybot-rollout-migration.lock"
+_MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
+_DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 10.0
+_MIGRATION_LOCK_RETRY_SECONDS = 0.05
 
 LogFn = Callable[[str], None]
 
@@ -207,6 +216,139 @@ def _fsync_directory(path: Path) -> None:
         os.close(fd)
 
 
+def _migration_lock_timeout_seconds() -> float:
+    """Return the bounded destination-lock acquisition window."""
+    raw = os.environ.get(MIGRATION_LOCK_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {MIGRATION_LOCK_TIMEOUT_ENV}: {raw!r}") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise RuntimeError(f"invalid {MIGRATION_LOCK_TIMEOUT_ENV}: {raw!r}")
+    return timeout
+
+
+def _migration_lock_entry_kind(entry_stat: os.stat_result) -> str:
+    if stat.S_ISLNK(entry_stat.st_mode) or entry_stat.st_nlink > 1:
+        return "linked"
+    if not stat.S_ISREG(entry_stat.st_mode):
+        return "non-regular"
+    return ""
+
+
+def _rename_migration_lock_aside(
+    lock_path: Path,
+    entry_stat: os.stat_result,
+    kind: str,
+    log: LogFn,
+) -> bool:
+    """Preserve a rejected lock entry without following it."""
+    try:
+        current_stat = lock_path.lstat()
+    except FileNotFoundError:
+        return False
+    if (current_stat.st_dev, current_stat.st_ino) != (
+        entry_stat.st_dev,
+        entry_stat.st_ino,
+    ):
+        return False
+    aside = lock_path.with_name(
+        f"{_MIGRATION_LOCK_ASIDE_PREFIX}{lock_path.name}-{uuid.uuid4().hex}"
+    )
+    os.replace(lock_path, aside)
+    _fsync_directory(lock_path.parent)
+    log(f"codex-home: renamed {kind} migration lock entry {lock_path} aside as {aside}")
+    return True
+
+
+def _open_migration_lock(lock_path: Path, log: LogFn) -> BinaryIO:
+    """Open a stable regular lock entry without following links."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("migration lock path resolution requires O_NOFOLLOW")
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | nofollow
+    flags |= getattr(os, "O_CLOEXEC", 0)
+
+    for _attempt in range(8):
+        try:
+            entry_stat = lock_path.lstat()
+        except FileNotFoundError:
+            entry_stat = None
+        if entry_stat is not None:
+            kind = _migration_lock_entry_kind(entry_stat)
+            if kind:
+                _rename_migration_lock_aside(lock_path, entry_stat, kind, log)
+                continue
+
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+                continue
+            raise
+
+        try:
+            opened_stat = os.fstat(fd)
+            current_stat = lock_path.lstat()
+            kind = _migration_lock_entry_kind(opened_stat)
+            same_entry = (opened_stat.st_dev, opened_stat.st_ino) == (
+                current_stat.st_dev,
+                current_stat.st_ino,
+            )
+            if not kind and same_entry:
+                return os.fdopen(fd, "a+b")
+        except FileNotFoundError:
+            kind = ""
+            current_stat = None
+            same_entry = False
+        except BaseException:
+            os.close(fd)
+            raise
+
+        os.close(fd)
+        if kind and current_stat is not None and same_entry:
+            _rename_migration_lock_aside(lock_path, current_stat, kind, log)
+
+    raise RuntimeError(f"migration lock path resolution did not converge: {lock_path}")
+
+
+@contextmanager
+def _acquire_migration_lock(lock_path: Path, log: LogFn) -> Iterator[BinaryIO]:
+    """Acquire the destination writer lock within a fixed wall-clock bound."""
+    timeout = _migration_lock_timeout_seconds()
+    deadline = time.monotonic() + timeout
+    lock_handle = _open_migration_lock(lock_path, log)
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    message = (
+                        "codex-home: migration lock deadline exceeded after "
+                        f"{timeout:g}s at {lock_path}; refusing rollout migration"
+                    )
+                    log(message)
+                    raise RuntimeError(message)
+                time.sleep(min(_MIGRATION_LOCK_RETRY_SECONDS, remaining))
+        yield lock_handle
+    finally:
+        if acquired:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
 def _sweep_migration_temps(destination_sessions: Path, log: LogFn) -> None:
     """Remove private copy temps abandoned before an atomic install."""
     if not destination_sessions.exists():
@@ -263,6 +405,8 @@ def _install_rollout(
             expected_signature=source_signature,
         ):
             try:
+                if _file_signature(source) != source_signature:
+                    raise RuntimeError(f"rollout changed before source removal: {source}")
                 source.unlink()
                 _fsync_directory(source.parent)
             except FileNotFoundError:
@@ -312,6 +456,8 @@ def _install_rollout(
             raise RuntimeError(f"rollout migration final failed validation: {destination}")
 
         try:
+            if _file_signature(source) != copied_signature:
+                raise RuntimeError(f"rollout changed before source removal: {source}")
             source.unlink()
             _fsync_directory(source.parent)
         except FileNotFoundError:
@@ -363,22 +509,18 @@ def move_matching_rollouts(
     candidates = list(source_sessions.glob("**/rollout-*.jsonl"))
     destination_sessions.mkdir(parents=True, exist_ok=True)
     lock_path = destination_sessions / _MIGRATION_LOCK_NAME
-    with lock_path.open("a+b") as lock_handle:
+    with _acquire_migration_lock(lock_path, log):
         # Serializing destination writers makes temp cleanup race-free and
         # works across daemon processes. The kernel releases flock on crash,
         # after which the successor sweeps the abandoned private temp.
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            _sweep_migration_temps(destination_sessions, log)
-            return _move_rollout_candidates(
-                candidates,
-                source_sessions,
-                destination_sessions,
-                target_cwd,
-                log=log,
-            )
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        _sweep_migration_temps(destination_sessions, log)
+        return _move_rollout_candidates(
+            candidates,
+            source_sessions,
+            destination_sessions,
+            target_cwd,
+            log=log,
+        )
 
 
 def _move_rollout_candidates(
@@ -467,34 +609,30 @@ def _run_initial_rollout_migration(
     candidates = list(source_sessions.glob("**/rollout-*.jsonl"))
     target_cwd = os.path.realpath(str(working_dir))
     lock_path = destination_sessions / _MIGRATION_LOCK_NAME
-    with lock_path.open("a+b") as lock_handle:
-        fcntl.flock(lock_handle.fileno(), fcntl.LOCK_EX)
-        try:
-            if _path_entry_exists(marker):
-                converged = sum(
-                    _rollout_is_valid(
-                        destination_sessions / source.relative_to(source_sessions),
-                        target_cwd,
-                    )
-                    for source in candidates
+    with _acquire_migration_lock(lock_path, log):
+        if _path_entry_exists(marker):
+            converged = sum(
+                _rollout_is_valid(
+                    destination_sessions / source.relative_to(source_sessions),
+                    target_cwd,
                 )
-                log(
-                    f"codex-home: concurrent rollout migration converged on "
-                    f"{converged} installed rollout(s); marker already committed"
-                )
-                return converged
-            _sweep_migration_temps(destination_sessions, log)
-            moved = _move_rollout_candidates(
-                candidates,
-                source_sessions,
-                destination_sessions,
-                target_cwd,
-                log=log,
+                for source in candidates
             )
-            _write_migration_marker(resolved_home, moved)
-            return moved
-        finally:
-            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+            log(
+                f"codex-home: concurrent rollout migration converged on "
+                f"{converged} installed rollout(s); marker already committed"
+            )
+            return converged
+        _sweep_migration_temps(destination_sessions, log)
+        moved = _move_rollout_candidates(
+            candidates,
+            source_sessions,
+            destination_sessions,
+            target_cwd,
+            log=log,
+        )
+        _write_migration_marker(resolved_home, moved)
+        return moved
 
 
 def prepare_agent_codex_home(agent: object, *, log: LogFn) -> Path:

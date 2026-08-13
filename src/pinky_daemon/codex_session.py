@@ -924,11 +924,16 @@ class CodexSession:
         env = {**os.environ}
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
-        if per_agent_codex_home_enabled():
-            env["CODEX_HOME"] = str(
-                prepare_agent_codex_home(self._config, log=_log)
-            )
+        prepared_home = self._preflight_agent_codex_home()
+        if prepared_home is not None:
+            env["CODEX_HOME"] = prepared_home
         return env
+
+    def _preflight_agent_codex_home(self) -> str | None:
+        """Validate and prepare replacement-home state before teardown/spawn."""
+        if not per_agent_codex_home_enabled():
+            return None
+        return str(prepare_agent_codex_home(self._config, log=_log))
 
     async def _exec_codex(
         self,
@@ -1124,8 +1129,7 @@ class CodexSession:
         # replacement spawn proves its Codex home can be prepared safely.
         direct_env: dict[str, str] | None = None
         if self._use_tmux_app_server:
-            if per_agent_codex_home_enabled():
-                prepare_agent_codex_home(self._config, log=_log)
+            self._preflight_agent_codex_home()
         else:
             direct_env = self._build_codex_env()
 
@@ -1798,6 +1802,15 @@ class CodexSession:
                 _log(f"codex[{self.agent_name}]: restart blocked")
                 return False
 
+        # Prove the replacement home before taking transition ownership or
+        # touching the current process/client. A refusal leaves the live
+        # transport and its CONNECTED state intact in both app-server modes.
+        try:
+            self._preflight_agent_codex_home()
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: force restart preflight failed: {e}")
+            return False
+
         _log(f"codex[{self.agent_name}]: force restarting")
 
         # Own the CONNECTED → RECONNECTING transition (USER_AGENT = the agent's
@@ -1919,6 +1932,15 @@ class CodexSession:
         / IDLE_SLEEPING / DEAD via WATCHDOG (the default; the heartbeat-resurrect
         + watchdog-recovery callers).
         """
+        # Like force_restart, this path tears down with the intent to replace.
+        # Refuse before touching an existing transport when the replacement
+        # home cannot be prepared.
+        try:
+            self._preflight_agent_codex_home()
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: reconnect preflight failed: {e}")
+            return
+
         res = await self._state_machine.request_transition(
             SessionState.RECONNECTING, trigger, reason="attempt_reconnect"
         )
