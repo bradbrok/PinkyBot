@@ -491,6 +491,98 @@ def test_zero_holder_identical_claim_retires(tmp_path, monkeypatch):
     assert not claim.exists()
 
 
+def test_claim_retirement_timing_window_keeps_appended_bytes_recoverable(
+    tmp_path, monkeypatch
+):
+    """R6 boundary-condition check: pathname-appended bytes stay recoverable."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    source = _rollout(
+        claim_home,
+        "rollout-retirement-timing-window.jsonl",
+        working_dir,
+    )
+    original = source.read_bytes()
+    claim = codex_home_mod._claim_rollout(source)
+    assert claim is not None
+    destination = _rollout(
+        destination_home,
+        "rollout-retirement-timing-window.jsonl",
+        working_dir,
+    )
+    appended = b'{"type":"event_msg","payload":{"message":"timing window"}}\n'
+    real_rollout_is_valid = codex_home_mod._rollout_is_valid
+    late_writer = None
+    injected = False
+    logs: list[str] = []
+
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_claim_has_open_descriptors",
+        lambda _claim, _log: False,
+    )
+
+    def append_during_destination_verification(
+        path: Path,
+        target_cwd: str,
+        *,
+        expected_signature=None,
+    ) -> bool:
+        nonlocal injected, late_writer
+        valid = real_rollout_is_valid(
+            path,
+            target_cwd,
+            expected_signature=expected_signature,
+        )
+        if path == destination and expected_signature is not None and not injected:
+            late_writer = claim.open("ab", buffering=0)
+            late_writer.write(appended)
+            os.fsync(late_writer.fileno())
+            injected = True
+        return valid
+
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_rollout_is_valid",
+        append_during_destination_verification,
+    )
+    try:
+        retired = codex_home_mod._retire_rollout_claim(
+            claim,
+            destination,
+            os.path.realpath(working_dir),
+            log=logs.append,
+        )
+
+        recovery_claims = list(
+            claim.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*")
+        )
+        assert injected is True
+        assert retired is False
+        assert not claim.exists()
+        assert len(recovery_claims) == 1
+        assert recovery_claims[0].name != claim.name
+        assert recovery_claims[0].read_bytes() == original + appended
+        assert destination.read_bytes() == original
+        assert any(
+            "retirement boundary-condition check" in message
+            and "recovery claim" in message
+            for message in logs
+        )
+        assert not list(
+            claim.parent.glob(
+                f"{codex_home_mod._MIGRATION_TEMP_PREFIX}recovery-*"
+                f"{codex_home_mod._MIGRATION_TEMP_SUFFIX}"
+            )
+        )
+        assert not list(claim.parent.glob("*.reserve"))
+    finally:
+        if late_writer is not None:
+            late_writer.close()
+
+
 def test_descriptor_scan_unavailable_keeps_claim(tmp_path, monkeypatch):
     """R4 P1-1: lsof absence fails toward claim retention, never deletion."""
     working_dir = tmp_path / "agent"

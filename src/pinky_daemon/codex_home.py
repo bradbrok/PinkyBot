@@ -210,6 +210,17 @@ def _file_signature(path: Path) -> tuple[int, str]:
     return size, digest.hexdigest()
 
 
+def _file_signature_from_handle(handle: BinaryIO) -> tuple[int, str]:
+    """Return an exact size+digest signature through an already-open file."""
+    handle.seek(0)
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+    return size, digest.hexdigest()
+
+
 def _rollout_is_valid(
     path: Path,
     target_cwd: str,
@@ -465,7 +476,15 @@ def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
     """Return holder state from lsof, retaining the claim on scan uncertainty."""
     try:
         scan = subprocess.run(
-            ["lsof", "-Fn", "--", os.fspath(claim)],
+            [
+                "lsof",
+                "-Fn",
+                "-a",
+                "-p",
+                f"^{os.getpid()}",
+                "--",
+                os.fspath(claim),
+            ],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -498,6 +517,170 @@ def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
     return None
 
 
+def _parse_lsof_integer(raw: str) -> int | None:
+    """Parse a decimal or hexadecimal lsof identity field."""
+    try:
+        return int(raw, 16 if raw.lower().startswith("0x") else 10)
+    except ValueError:
+        return None
+
+
+def _inode_has_open_descriptors(
+    claim_handle: BinaryIO,
+    claim: Path,
+    log: LogFn,
+) -> bool | None:
+    """Re-scan an unlinked claim by device and inode.
+
+    A full field scan avoids depending on a pathname after unlink. The exact
+    descriptor owned by this retirement is excluded; any other descriptor,
+    including one in this process, retains the bytes through a recovery claim.
+    """
+    try:
+        scan = subprocess.run(
+            ["lsof", "-F", "pfDi"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            f"could not re-scan the inode: {exc}"
+        )
+        return None
+
+    stderr = scan.stderr.strip()
+    stdout = scan.stdout.strip()
+    if stderr:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            f"could not re-scan the inode: {stderr}"
+        )
+        return None
+    if scan.returncode != 0 or not stdout:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            f"received unexpected re-scan status {scan.returncode}"
+        )
+        return None
+
+    records: list[tuple[int | None, str, int | None, int | None]] = []
+    current_pid: int | None = None
+    current_fd = ""
+    current_device: int | None = None
+    current_inode: int | None = None
+
+    def finish_record() -> None:
+        if current_fd:
+            records.append(
+                (current_pid, current_fd, current_device, current_inode)
+            )
+
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        field, value = line[0], line[1:]
+        if field == "p":
+            finish_record()
+            current_pid = _parse_lsof_integer(value)
+            current_fd = ""
+            current_device = None
+            current_inode = None
+        elif field == "f":
+            finish_record()
+            current_fd = value
+            current_device = None
+            current_inode = None
+        elif field == "D" and current_fd:
+            current_device = _parse_lsof_integer(value)
+        elif field == "i" and current_fd:
+            current_inode = _parse_lsof_integer(value)
+    finish_record()
+
+    claim_stat = os.fstat(claim_handle.fileno())
+    target_identity = (claim_stat.st_dev, claim_stat.st_ino)
+    own_identity = (os.getpid(), claim_handle.fileno())
+    found_own_descriptor = False
+    for process_id, descriptor, device, inode in records:
+        if (device, inode) != target_identity:
+            continue
+        descriptor_number = ""
+        for character in descriptor:
+            if not character.isdigit():
+                break
+            descriptor_number += character
+        parsed_descriptor = (
+            int(descriptor_number) if descriptor_number else None
+        )
+        if (process_id, parsed_descriptor) == own_identity:
+            found_own_descriptor = True
+            continue
+        return True
+
+    if found_own_descriptor:
+        return False
+    log(
+        f"codex-home: claim retirement boundary-condition check for {claim} "
+        "did not find its own descriptor in the inode re-scan"
+    )
+    return None
+
+
+def _recover_unlinked_rollout_claim(
+    claim: Path,
+    claim_handle: BinaryIO,
+    log: LogFn,
+) -> Path:
+    """Copy current unlinked bytes into a complete, discoverable claim."""
+    canonical = _claim_original_path(claim)
+    if canonical is None:
+        raise RuntimeError(f"cannot recover malformed rollout claim name: {claim}")
+
+    temp_fd, temp_name = tempfile.mkstemp(
+        dir=claim.parent,
+        prefix=f"{_MIGRATION_TEMP_PREFIX}recovery-",
+        suffix=_MIGRATION_TEMP_SUFFIX,
+    )
+    temp_path = Path(temp_name)
+    try:
+        claim_handle.seek(0)
+        with os.fdopen(temp_fd, "wb") as temp_handle:
+            temp_fd = -1
+            while chunk := claim_handle.read(1024 * 1024):
+                temp_handle.write(chunk)
+            temp_handle.flush()
+            os.fsync(temp_handle.fileno())
+
+        while True:
+            with _reserve_exclusive_destination(
+                lambda recovery_id: claim.with_name(
+                    f"{_MIGRATION_CLAIM_PREFIX}{recovery_id}-{canonical.name}"
+                ),
+            ) as recovery:
+                try:
+                    os.link(temp_path, recovery, follow_symlinks=False)
+                except FileExistsError:
+                    continue
+            break
+        temp_path.unlink()
+        _fsync_directory(claim.parent)
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+    log(
+        "codex-home: WARNING claim retirement boundary-condition check "
+        f"preserved current bytes as recovery claim {recovery}"
+    )
+    return recovery
+
+
 def _retire_rollout_claim(
     claim: Path,
     destination: Path,
@@ -505,41 +688,89 @@ def _retire_rollout_claim(
     *,
     log: LogFn,
 ) -> bool:
-    """Retire a verified tombstone only after its descriptor set reaches zero.
-
-    A claim has a private, unguessable name: after the canonical link is
-    removed, path-based writers can only create a fresh canonical rollout.
-    Therefore no new descriptor can target the claim and its holder set only
-    shrinks.  Once lsof observes zero holders, a final byte-identity check is a
-    stable retirement boundary.
-    """
-    holders = _claim_has_open_descriptors(claim, log)
-    if holders is not False:
-        if holders:
+    """Retire a verified tombstone with post-unlink recovery verification."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("rollout claim path resolution requires O_NOFOLLOW")
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        claim_fd = os.open(claim, flags)
+    except FileNotFoundError:
+        return True
+    with os.fdopen(claim_fd, "rb", buffering=0) as claim_handle:
+        opened_stat = os.fstat(claim_handle.fileno())
+        try:
+            current_stat = claim.lstat()
+        except FileNotFoundError:
+            current_stat = None
+        if (
+            current_stat is None
+            or not stat.S_ISREG(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (current_stat.st_dev, current_stat.st_ino)
+        ):
             log(
                 f"codex-home: retained rollout claim {claim}; "
-                "open descriptor holder(s) remain"
+                "claim identity changed during verification"
             )
-        return False
-    try:
-        claim_signature = _file_signature(claim)
-    except FileNotFoundError:
-        return True
-    if not _rollout_is_valid(
-        destination,
-        target_cwd,
-        expected_signature=claim_signature,
-    ):
-        log(
-            f"codex-home: retained rollout claim {claim}; "
-            "installed destination is not byte-identical at retirement"
+            return False
+
+        holders = _claim_has_open_descriptors(claim, log)
+        if holders is not False:
+            if holders:
+                log(
+                    f"codex-home: retained rollout claim {claim}; "
+                    "open descriptor holder(s) remain"
+                )
+            return False
+
+        claim_signature = _file_signature_from_handle(claim_handle)
+        if not _rollout_is_valid(
+            destination,
+            target_cwd,
+            expected_signature=claim_signature,
+        ):
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                "installed destination is not byte-identical at retirement"
+            )
+            return False
+
+        try:
+            current_stat = claim.lstat()
+        except FileNotFoundError:
+            current_stat = None
+        if current_stat is not None and (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+        ) != (current_stat.st_dev, current_stat.st_ino):
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                "claim identity changed before unlink"
+            )
+            return False
+        if current_stat is not None:
+            try:
+                claim.unlink()
+            except FileNotFoundError:
+                pass
+            _fsync_directory(claim.parent)
+
+        post_unlink_holders = _inode_has_open_descriptors(
+            claim_handle,
+            claim,
+            log,
         )
-        return False
-    try:
-        claim.unlink()
-        _fsync_directory(claim.parent)
-    except FileNotFoundError:
-        return True
+        current_signature = _file_signature_from_handle(claim_handle)
+        current_destination_matches = _rollout_is_valid(
+            destination,
+            target_cwd,
+            expected_signature=current_signature,
+        )
+        if post_unlink_holders is not False or not current_destination_matches:
+            _recover_unlinked_rollout_claim(claim, claim_handle, log)
+            return False
+
     log(f"codex-home: retired verified rollout claim {claim}")
     return True
 
