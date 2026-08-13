@@ -9,6 +9,7 @@ import json
 import math
 import os
 import stat
+import subprocess
 import tempfile
 import time
 import uuid
@@ -31,6 +32,8 @@ _MIGRATION_QUARANTINE_PREFIX = ".pinkybot-rollout-quarantine-"
 _MIGRATION_LOCK_NAME = ".pinkybot-rollout-migration.lock"
 _MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
 _PRESERVATION_RESERVATION_SUFFIX = ".reserve"
+_PRESERVATION_RESERVATION_STALE_SECONDS = 60 * 60
+_CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS = 2.0
 _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 10.0
 _MIGRATION_LOCK_RETRY_SECONDS = 0.05
 
@@ -256,25 +259,22 @@ def _migration_lock_entry_kind(entry_stat: os.stat_result) -> str:
 
 
 @contextmanager
-def _reserve_preservation_destination(
-    source: Path,
-    name_prefix: str,
+def _reserve_exclusive_destination(
+    destination_for_uuid: Callable[[str], Path],
 ) -> Iterator[Path]:
-    """Reserve a collision-free preservation name without replacing data.
+    """Reserve a collision-free private name without replacing data.
 
     Every attempt gets a fresh UUID and an adjacent O_EXCL reservation.  A
-    pre-existing preservation artifact or reservation loses that attempt and
-    forces a new name.  The reservation serializes cooperating preservers while
-    ``os.rename`` moves the entry to a path proven unused; unlike ``os.replace``,
-    the move can never intentionally overwrite a retained artifact.
+    pre-existing artifact or reservation loses that attempt and forces a new
+    name.  The caller must still use a non-replacing operation when materializing
+    the reserved destination because an uncooperating process can create the
+    destination after the reservation's absence check.
     """
     nofollow = getattr(os, "O_NOFOLLOW", 0)
     cloexec = getattr(os, "O_CLOEXEC", 0)
     flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec
     while True:
-        destination = source.with_name(
-            f"{name_prefix}{source.name}-{uuid.uuid4().hex}"
-        )
+        destination = destination_for_uuid(uuid.uuid4().hex)
         reservation = destination.with_name(
             f".{destination.name}{_PRESERVATION_RESERVATION_SUFFIX}"
         )
@@ -294,6 +294,20 @@ def _reserve_preservation_destination(
             except FileNotFoundError:
                 pass
         return
+
+
+@contextmanager
+def _reserve_preservation_destination(
+    source: Path,
+    name_prefix: str,
+) -> Iterator[Path]:
+    """Reserve a collision-free preservation name without replacing data."""
+    with _reserve_exclusive_destination(
+        lambda reservation_id: source.with_name(
+            f"{name_prefix}{source.name}-{reservation_id}"
+        ),
+    ) as destination:
+        yield destination
 
 
 def _rename_migration_lock_aside(
@@ -421,6 +435,115 @@ def _sweep_migration_temps(destination_sessions: Path, log: LogFn) -> None:
             continue
 
 
+def _sweep_stale_reservations(root: Path, log: LogFn) -> None:
+    """Remove only old, empty, singly-linked migration reservation sidecars."""
+    if not root.exists():
+        return
+    stale_before = time.time() - _PRESERVATION_RESERVATION_STALE_SECONDS
+    for reservation in root.glob(
+        f"**/..pinkybot-rollout-*{_PRESERVATION_RESERVATION_SUFFIX}"
+    ):
+        try:
+            reservation_stat = reservation.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(reservation_stat.st_mode)
+            or reservation_stat.st_nlink != 1
+            or reservation_stat.st_size != 0
+            or reservation_stat.st_mtime > stale_before
+        ):
+            continue
+        try:
+            reservation.unlink()
+            log(f"codex-home: removed stale migration reservation {reservation}")
+        except FileNotFoundError:
+            continue
+
+
+def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
+    """Return holder state from lsof, retaining the claim on scan uncertainty."""
+    try:
+        scan = subprocess.run(
+            ["lsof", "-Fn", "--", os.fspath(claim)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            f"descriptor scan unavailable: {exc}"
+        )
+        return None
+
+    stderr = scan.stderr.strip()
+    stdout = scan.stdout.strip()
+    if stderr:
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            f"descriptor scan failed: {stderr}"
+        )
+        return None
+    if scan.returncode == 0 and stdout:
+        return True
+    if scan.returncode == 1 and not stdout:
+        return False
+    log(
+        f"codex-home: retained rollout claim {claim}; descriptor scan returned "
+        f"unexpected status {scan.returncode}"
+    )
+    return None
+
+
+def _retire_rollout_claim(
+    claim: Path,
+    destination: Path,
+    target_cwd: str,
+    *,
+    log: LogFn,
+) -> bool:
+    """Retire a verified tombstone only after its descriptor set reaches zero.
+
+    A claim has a private, unguessable name: after the canonical link is
+    removed, path-based writers can only create a fresh canonical rollout.
+    Therefore no new descriptor can target the claim and its holder set only
+    shrinks.  Once lsof observes zero holders, a final byte-identity check is a
+    stable retirement boundary.
+    """
+    holders = _claim_has_open_descriptors(claim, log)
+    if holders is not False:
+        if holders:
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                "open descriptor holder(s) remain"
+            )
+        return False
+    try:
+        claim_signature = _file_signature(claim)
+    except FileNotFoundError:
+        return True
+    if not _rollout_is_valid(
+        destination,
+        target_cwd,
+        expected_signature=claim_signature,
+    ):
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            "installed destination is not byte-identical at retirement"
+        )
+        return False
+    try:
+        claim.unlink()
+        _fsync_directory(claim.parent)
+    except FileNotFoundError:
+        return True
+    log(f"codex-home: retired verified rollout claim {claim}")
+    return True
+
+
 def _quarantine_rollout(destination: Path, log: LogFn) -> Path:
     """Atomically move an invalid final aside so it cannot shadow discovery."""
     with _reserve_preservation_destination(
@@ -442,11 +565,11 @@ def _install_rollout(
 ) -> bool:
     """Install one rollout with crash recovery and concurrent convergence.
 
-    ``claim`` is a private name established by atomically renaming the canonical
-    source before this function is entered.  All reads, verification, and
-    cleanup stay on that private name.  A writer arriving after the rename must
-    create a fresh canonical file, which this migration never removes and a
-    later prepare can migrate independently.
+    ``claim`` is a private hard-link name established before the canonical name
+    is unlinked.  All reads, verification, and
+    cleanup stay on that private name.  A path-based writer arriving after the
+    canonical unlink must create a fresh canonical file, which this migration
+    never removes and a later prepare can migrate independently.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
 
@@ -466,11 +589,7 @@ def _install_rollout(
             target_cwd,
             expected_signature=claim_signature,
         ):
-            try:
-                claim.unlink()
-                _fsync_directory(claim.parent)
-            except FileNotFoundError:
-                pass
+            _retire_rollout_claim(claim, destination, target_cwd, log=log)
             log(f"codex-home: rollout migration converged at {destination}")
             return True
         _quarantine_rollout(destination, log)
@@ -494,7 +613,7 @@ def _install_rollout(
             os.fsync(temp_handle.fileno())
         copied_signature = (copied_size, copied_digest.hexdigest())
 
-        # A descriptor opened before the claim rename can still change the
+        # A descriptor opened before the canonical unlink can still change the
         # claimed inode.  Detect that shape before install and leave the claim
         # intact for retry; name-based late writers use the fresh canonical path.
         if _file_signature(claim) != copied_signature:
@@ -516,10 +635,10 @@ def _install_rollout(
             _quarantine_rollout(destination, log)
             raise RuntimeError(f"rollout migration final failed validation: {destination}")
 
-        # Removal targets only the private claim.  There is deliberately no
-        # check-then-remove pair on the canonical writer path.
-        claim.unlink()
-        _fsync_directory(claim.parent)
+        # Installation does not consume the private claim. Retirement is a
+        # separate verified-tombstone boundary: zero descriptor holders first,
+        # then a stable byte-identity check against the installed destination.
+        _retire_rollout_claim(claim, destination, target_cwd, log=log)
         return True
     except FileNotFoundError:
         # A crash-recovery claim may already have been consumed by a concurrent
@@ -558,17 +677,31 @@ def _claim_original_path(claim: Path) -> Path | None:
 
 
 def _claim_rollout(source: Path) -> Path | None:
-    """Atomically remove the canonical writer target before migration reads."""
+    """Claim a rollout without any replacing rename operation.
+
+    The hard link is a non-replacing atomic publication: EEXIST loses the UUID
+    attempt without touching the interleaved claim.  Only after the claim link
+    exists do we unlink the canonical writer name.  Descriptors opened before
+    that unlink remain attached to the claimed inode for verified retirement.
+    """
     while True:
-        claim = source.with_name(
-            f"{_MIGRATION_CLAIM_PREFIX}{uuid.uuid4().hex}-{source.name}"
-        )
-        if _path_entry_exists(claim):
-            continue
-        try:
-            os.rename(source, claim)
-        except FileNotFoundError:
-            return None
+        with _reserve_exclusive_destination(
+            lambda claim_id: source.with_name(
+                f"{_MIGRATION_CLAIM_PREFIX}{claim_id}-{source.name}"
+            ),
+        ) as claim:
+            try:
+                os.link(source, claim, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                return None
+            try:
+                source.unlink()
+            except FileNotFoundError:
+                # A concurrent claimant may already have removed the canonical
+                # name. This private hard link still owns the original inode.
+                pass
         _fsync_directory(source.parent)
         return claim
 
@@ -642,6 +775,8 @@ def move_matching_rollouts(
         # works across daemon processes. The kernel releases flock on crash,
         # after which the successor sweeps the abandoned private temp.
         _sweep_migration_temps(destination_sessions, log)
+        _sweep_stale_reservations(source_sessions, log)
+        _sweep_stale_reservations(destination_sessions, log)
         return _move_rollout_candidates(
             candidates,
             source_sessions,
@@ -770,6 +905,12 @@ def _run_initial_rollout_migration(
     closing the scan-to-marker race between concurrent spawns.
     """
     marker = resolved_home / ROLLOUT_MIGRATION_MARKER
+    source_sessions = shared_home / "sessions"
+    destination_sessions = resolved_home / "sessions"
+    # Reservations are private zero-byte coordination artifacts. Sweep old
+    # crash residue even when the durable marker lets migration return early.
+    _sweep_stale_reservations(source_sessions, log)
+    _sweep_stale_reservations(destination_sessions, log)
     if _path_entry_exists(marker):
         retry_sources = _read_marker_retry_sources(marker)
         if not retry_sources:
@@ -778,8 +919,6 @@ def _run_initial_rollout_migration(
                 "shared rollout store not scanned"
             )
             return 0
-        source_sessions = shared_home / "sessions"
-        destination_sessions = resolved_home / "sessions"
         candidates = _retry_rollout_candidates(source_sessions, retry_sources)
         if not candidates:
             log(
@@ -804,8 +943,6 @@ def _run_initial_rollout_migration(
         )
         return result.moved
 
-    source_sessions = shared_home / "sessions"
-    destination_sessions = resolved_home / "sessions"
     candidates = _snapshot_rollout_candidates(source_sessions)
     target_cwd = os.path.realpath(str(working_dir))
     lock_path = destination_sessions / _MIGRATION_LOCK_NAME

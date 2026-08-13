@@ -406,6 +406,212 @@ def test_claim_boundary_never_removes_fresh_canonical_writer_bytes(tmp_path, mon
     assert str(relative) in marker_payload["retry_sources"]
 
 
+def test_descriptor_held_writer_retains_claim_then_remigrates_bytes(
+    tmp_path, monkeypatch
+):
+    """R4 P1-1: a pre-claim descriptor write survives the retirement boundary."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    _auth(shared_home)
+    source = _rollout(shared_home, "rollout-held-descriptor.jsonl", working_dir)
+    original = source.read_bytes()
+    appended = b'{"type":"event_msg","payload":{"message":"late append"}}\n'
+    assert len(appended) == 57
+    relative = source.relative_to(shared_home / "sessions")
+    destination = agent_home / "sessions" / relative
+    real_file_signature = codex_home_mod._file_signature
+    injected = False
+
+    with source.open("ab", buffering=0) as held_writer:
+
+        def append_after_claim_signature(path: Path):
+            nonlocal injected
+            signature = real_file_signature(path)
+            if (
+                path.parent == source.parent
+                and path.name.startswith(codex_home_mod._MIGRATION_CLAIM_PREFIX)
+                and not injected
+            ):
+                held_writer.write(appended)
+                os.fsync(held_writer.fileno())
+                injected = True
+            return signature
+
+        monkeypatch.setattr(
+            codex_home_mod,
+            "_file_signature",
+            append_after_claim_signature,
+        )
+        monkeypatch.setenv("CODEX_HOME", str(shared_home))
+        monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+
+        prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
+
+        claims = list(
+            source.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*")
+        )
+        assert injected is True
+        assert len(claims) == 1
+        assert claims[0].read_bytes() == original + appended
+        assert destination.read_bytes() == original
+
+    prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
+
+    assert destination.read_bytes() == original + appended
+
+
+def test_zero_holder_identical_claim_retires(tmp_path, monkeypatch):
+    """R4 P1-1: zero holders plus reverified identity retires the tombstone."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    claim = _rollout(claim_home, "rollout-zero-holder.jsonl", working_dir)
+    destination = _rollout(
+        destination_home,
+        "rollout-zero-holder.jsonl",
+        working_dir,
+    )
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_claim_has_open_descriptors",
+        lambda _claim, _log: False,
+    )
+
+    retired = codex_home_mod._retire_rollout_claim(
+        claim,
+        destination,
+        os.path.realpath(working_dir),
+        log=lambda _message: None,
+    )
+
+    assert retired is True
+    assert not claim.exists()
+
+
+def test_descriptor_scan_unavailable_keeps_claim(tmp_path, monkeypatch):
+    """R4 P1-1: lsof absence fails toward claim retention, never deletion."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    claim = _rollout(claim_home, "rollout-scan-unavailable.jsonl", working_dir)
+    destination = _rollout(
+        destination_home,
+        "rollout-scan-unavailable.jsonl",
+        working_dir,
+    )
+    logs: list[str] = []
+
+    def unavailable(*_args, **_kwargs):
+        raise FileNotFoundError("lsof")
+
+    monkeypatch.setattr(codex_home_mod.subprocess, "run", unavailable)
+
+    retired = codex_home_mod._retire_rollout_claim(
+        claim,
+        destination,
+        os.path.realpath(working_dir),
+        log=logs.append,
+    )
+
+    assert retired is False
+    assert claim.exists()
+    assert any("descriptor scan unavailable" in message for message in logs)
+
+
+def test_claim_link_collision_retries_without_replacing_interleaved_claim(
+    tmp_path, monkeypatch
+):
+    """R4 P2-3: link EEXIST preserves the winner and retries a fresh UUID."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    source_home = tmp_path / "shared"
+    source = _rollout(source_home, "rollout-link-collision.jsonl", working_dir)
+    source_bytes = source.read_bytes()
+    collision_hex = "e" * 32
+    fresh_hex = "f" * 32
+    prior = source.with_name(
+        f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}"
+        f"{collision_hex}-{source.name}"
+    )
+    generated = iter(
+        [SimpleNamespace(hex=collision_hex), SimpleNamespace(hex=fresh_hex)]
+    )
+    monkeypatch.setattr(codex_home_mod.uuid, "uuid4", lambda: next(generated))
+    real_link = os.link
+    injected = False
+
+    def collide_before_link(source_path, claim_path, *args, **kwargs):
+        nonlocal injected
+        if not injected:
+            Path(claim_path).write_bytes(b"interleaved prior claim")
+            injected = True
+        return real_link(source_path, claim_path, *args, **kwargs)
+
+    monkeypatch.setattr(codex_home_mod.os, "link", collide_before_link)
+
+    claim = codex_home_mod._claim_rollout(source)
+
+    assert injected is True
+    assert claim is not None
+    assert claim.name == (
+        f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}{fresh_hex}-{source.name}"
+    )
+    assert prior.read_bytes() == b"interleaved prior claim"
+    assert claim.read_bytes() == source_bytes
+    assert not source.exists()
+    assert not list(source.parent.glob("*.reserve"))
+
+
+def test_stale_empty_reservations_are_swept_data_safely(tmp_path, monkeypatch):
+    """R4 debt: marker fast paths sweep only stale empty private sidecars."""
+    source_home = tmp_path / "source"
+    destination_home = tmp_path / "destination"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(source_home)
+    monkeypatch.setenv("CODEX_HOME", str(source_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    scope = _scope(working_dir, codex_home=str(destination_home))
+    prepare_agent_codex_home(scope, log=lambda _message: None)
+    source_sessions = source_home / "sessions"
+    destination_sessions = destination_home / "sessions"
+    source_sessions.mkdir(parents=True)
+    destination_sessions.mkdir(parents=True, exist_ok=True)
+    stale = source_sessions / (
+        f".{codex_home_mod._MIGRATION_CLAIM_PREFIX}"
+        f"{'a' * 32}-rollout-stale.jsonl"
+        f"{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    recent = destination_sessions / (
+        f".{codex_home_mod._MIGRATION_QUARANTINE_PREFIX}"
+        f"rollout-recent.jsonl-{'b' * 32}"
+        f"{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    nonempty = destination_sessions / (
+        f".{codex_home_mod._MIGRATION_LOCK_ASIDE_PREFIX}"
+        f"lock-{'c' * 32}{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    stale.touch()
+    recent.touch()
+    nonempty.write_text("operator bytes", encoding="utf-8")
+    old = time.time() - codex_home_mod._PRESERVATION_RESERVATION_STALE_SECONDS - 1
+    os.utime(stale, (old, old))
+    os.utime(nonempty, (old, old))
+    logs: list[str] = []
+
+    prepared = prepare_agent_codex_home(scope, log=logs.append)
+
+    assert prepared == destination_home
+    assert not stale.exists()
+    assert recent.exists()
+    assert nonempty.read_text(encoding="utf-8") == "operator bytes"
+    assert any("removed stale migration reservation" in message for message in logs)
+
+
 @pytest.mark.parametrize("write_phase", ["during_copy", "post_install"])
 def test_fresh_canonical_writer_path_remigrates_on_next_prepare(
     tmp_path, monkeypatch, write_phase

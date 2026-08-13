@@ -8322,6 +8322,7 @@ class TmuxSession(TransportReplacementMixin):
         had to cancel the old worker to prevent the race window
         Murzik flagged on commit 2).
         """
+        self._preflight_transport_replacement()
         if (
             not bypass_guard
             and self._has_completed_turn
@@ -8551,6 +8552,7 @@ class TmuxSession(TransportReplacementMixin):
                 ``SCHEDULER`` from cron-driven resurrect, ``API_ADMIN`` from
                 explicit operator action.
         """
+        self._preflight_transport_replacement()
         # Drive into RECONNECTING. If we're already there (e.g. force_restart
         # is mid-flight), let that owner finish.
         if self.state == SessionState.RECONNECTING:

@@ -35,7 +35,7 @@ from pinky_daemon.tmux_session import (
     _TmuxControl,
 )
 from pinky_daemon.tmux_transcript import TurnResponse
-from pinky_daemon.transport_state import SessionState
+from pinky_daemon.transport_state import SessionState, Trigger
 
 
 def _ok(stdout: str = "") -> TmuxCommandResult:
@@ -68,6 +68,52 @@ def _session(*, model="gpt-5.5", effort="medium", mcp=None, working_dir="/tmp/co
         mcp_servers=mcp or {},
     )
     return CodexTmuxSession(cfg, tmux_control=tmux or _mock_tmux())
+
+
+async def _to_connected(session: CodexTmuxSession) -> None:
+    boot = await session._state_machine.request_transition(
+        SessionState.BOOTING,
+        Trigger.BOOT,
+    )
+    await session._state_machine.transition_complete(
+        boot.owner_token,
+        SessionState.CONNECTED,
+        trigger=Trigger.BOOT_COMPLETE,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("entry_point", ["force_restart", "attempt_reconnect"])
+async def test_inherited_replacement_preflight_refuses_before_tmux_teardown(
+    tmp_path, monkeypatch, entry_point
+):
+    """R4 P1-2: inherited recovery cannot own transition state before refusal."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    shared_home.mkdir()
+    working_dir.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    tmux = _mock_tmux()
+    session = _session(working_dir=str(working_dir), tmux=tmux)
+    await _to_connected(session)
+    cached_tailer = object()
+    session._tailer = cached_tailer
+    session._processing = True
+
+    with pytest.raises(RuntimeError, match="shared auth file is absent"):
+        if entry_point == "force_restart":
+            await session.force_restart(bypass_guard=True)
+        else:
+            await session.attempt_reconnect(trigger=Trigger.WATCHDOG)
+
+    assert session.state == SessionState.CONNECTED
+    assert session.state != SessionState.DEAD
+    assert session._tailer is cached_tailer
+    assert session._processing is True
+    assert session.stats["reconnects"] == 0
+    tmux.kill_session.assert_not_awaited()
+    tmux.new_session.assert_not_awaited()
 
 
 # ── session name ────────────────────────────────────────────────────────────
