@@ -17,6 +17,7 @@ from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
 from pinky_daemon.scheduler import (
     _SCHEDULE_PROMPT_WARN_INTERVAL_SEC,
     AgentScheduler,
+    ScheduleWakeReceipt,
     cron_matches,
     next_cron_description,
 )
@@ -1738,6 +1739,11 @@ class TestScheduler:
     async def test_receipt_ceiling_uses_persisted_fired_at_across_restart(
         self, registry, monkeypatch, capsys
     ):
+        """A restart must quarantine an old pasted row without resubmitting it.
+
+        This catches the buggy replay path that called the wake callback for a
+        prompt the transport had already pasted and could no longer recall.
+        """
         registry.register("worker")
         schedule = registry.add_schedule(
             "worker", "0 * * * *", name="aged", prompt="already pasted"
@@ -1756,16 +1762,26 @@ class TestScheduler:
         monkeypatch.setattr(
             "pinky_daemon.scheduler.time.time", lambda: fired_at + 91.0
         )
-        receipt = asyncio.get_running_loop().create_future()
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler._ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC",
+            0.01,
+        )
+        submissions: list[str] = []
+        pasted_inflight = True
 
         async def pasted(agent_name, session_id, prompt, **kwargs):
-            del agent_name, session_id, prompt, kwargs
-            return receipt
+            del agent_name, session_id, kwargs
+            submissions.append(prompt)
+            return False
+
+        def inflight(agent_name, prompt):
+            del agent_name, prompt
+            return pasted_inflight
 
         restarted = AgentScheduler(
             restarted_registry,
             wake_callback=pasted,
-            delivery_inflight_fn=lambda agent_name, prompt: True,
+            delivery_inflight_fn=inflight,
             schedule_delivery_timeout=10.0,
             receipt_extension_max_age_sec=90.0,
         )
@@ -1777,9 +1793,13 @@ class TestScheduler:
         )
         assert ledger.ledger_state == "quarantined"
         assert "RECEIPT_ABANDONED" in ledger.last_error
+        assert submissions == []
         assert not restarted._schedule_delivery_locks["worker"].locked()
         assert "age_s=91.0 ceiling_s=90.0" in capsys.readouterr().err
-        receipt.set_result(True)
+        assert ScheduleWakeReceipt(
+            restarted_registry, schedule.id, fired_at
+        ).accept() is True
+        pasted_inflight = False
         await asyncio.gather(*list(restarted._detached_receipt_tasks))
         assert restarted_registry.get_schedule_wake_by_fire(
             schedule.id, fired_at
@@ -1790,12 +1810,27 @@ class TestScheduler:
     async def test_production_ceiling_abandons_pasted_replay_before_stale_drop(
         self, registry, monkeypatch, capsys
     ):
-        """At 3601s with both defaults, abandonment wins over stale deletion."""
+        """An id-mismatched pasted row is abandoned without a duplicate paste.
+
+        A prior receipted row forces ``pending.id != pending.schedule_id``.
+        This catches both the wrong-key lookup that left the active row pending
+        and the callback attempt that submitted the same physical prompt twice.
+        """
         registry.register("worker")
         schedule = registry.add_schedule(
             "worker", "0 8 * * *", name="production-edge", prompt="pasted"
         )
         fired_at = 1_800_000_000.0
+        prior, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at - 1.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            prior.id, delivered_at=fired_at - 0.5
+        )
         pending, _ = registry.persist_schedule_wake(
             schedule.id,
             agent_name="worker",
@@ -1806,18 +1841,22 @@ class TestScheduler:
         monkeypatch.setattr(
             "pinky_daemon.scheduler.time.time", lambda: fired_at + 3_601.0
         )
-        receipt = asyncio.get_running_loop().create_future()
-        attempts: list[str] = []
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler._ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC",
+            0.01,
+        )
+        submissions: list[str] = []
         probes: list[tuple[str, str]] = []
+        pasted_inflight = True
 
         async def pasted(agent_name, session_id, prompt, **kwargs):
             del agent_name, session_id, kwargs
-            attempts.append(prompt)
-            return receipt
+            submissions.append(prompt)
+            return False
 
         def inflight(agent_name, prompt):
             probes.append((agent_name, prompt))
-            return True
+            return pasted_inflight
 
         scheduler = AgentScheduler(
             registry,
@@ -1827,24 +1866,250 @@ class TestScheduler:
         )
 
         await scheduler._replay_pending_locked("worker")
-        await asyncio.sleep(0)
 
         ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
         assert ledger is not None
         assert ledger.id == pending.id
+        assert ledger.id != ledger.schedule_id
         assert ledger.ledger_state == "quarantined"
         assert "RECEIPT_ABANDONED" in ledger.last_error
-        assert attempts == ["pasted"]
+        assert submissions == []
         assert probes and set(probes) == {("worker", "pasted")}
         assert len(scheduler._detached_receipt_tasks) == 1
         logs = capsys.readouterr().err
         assert "receipt abandonment takes precedence over stale deletion" in logs
         assert "age_s=3601.0 ceiling_s=3600.0" in logs
 
-        receipt.set_result(True)
+        assert ScheduleWakeReceipt(
+            registry, schedule.id, fired_at
+        ).accept() is True
+        pasted_inflight = False
         await asyncio.gather(*list(scheduler._detached_receipt_tasks))
         assert registry.get_schedule_wake_by_fire(
             schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
+    async def test_replay_receipt_capability_uses_schedule_id_not_pending_id(
+        self, registry
+    ):
+        """Durable acceptance must target the schedule when outbox IDs differ.
+
+        This catches ``ScheduleWakeReceipt(..., pending.id, ...)``: the buggy
+        capability cannot commit acceptance at the transport edge and leaves
+        the exact replay row vulnerable across a process-local Future loss.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="identity", prompt="accept exactly"
+        )
+        fired_at = time.time()
+        prior, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at - 1.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            prior.id, delivered_at=fired_at - 0.5
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        assert pending.id != pending.schedule_id
+        accepted_at_transport = asyncio.Event()
+        process_local_receipt = asyncio.get_running_loop().create_future()
+
+        async def accept_then_stall(
+            agent_name,
+            session_id,
+            prompt,
+            *,
+            schedule_receipt,
+        ):
+            del agent_name, session_id, prompt
+            assert schedule_receipt.schedule_id == schedule.id
+            assert schedule_receipt.accept() is True
+            accepted_at_transport.set()
+            return process_local_receipt
+
+        scheduler = AgentScheduler(registry, wake_callback=accept_then_stall)
+        replay = asyncio.create_task(
+            scheduler._replay_pending_locked("worker")
+        )
+        await asyncio.wait_for(accepted_at_transport.wait(), timeout=1)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.ledger_state == "receipted-ran-once"
+        replay.cancel()
+        await asyncio.gather(replay, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    async def test_replay_abandonment_and_late_receipt_use_schedule_id(
+        self, registry, monkeypatch, capsys
+    ):
+        """A replay crossing the ceiling mid-attempt keeps exact authority.
+
+        The active outbox row is deliberately #2 for schedule #1. This catches
+        both wrong-key quarantine and wrong-key late confirmation after a
+        legitimate replay submission becomes pasted while its receipt waits.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="late-identity", prompt="wait exactly"
+        )
+        fired_at = 1_800_000_000.0
+        prior, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at - 1.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            prior.id, delivered_at=fired_at - 0.5
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        assert pending.id != pending.schedule_id
+        now = [fired_at + 89.0]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: now[0]
+        )
+        process_local_receipt = asyncio.get_running_loop().create_future()
+        durable_receipt = None
+
+        async def paste_then_cross_ceiling(
+            agent_name,
+            session_id,
+            prompt,
+            *,
+            schedule_receipt,
+        ):
+            nonlocal durable_receipt
+            del agent_name, session_id, prompt
+            durable_receipt = schedule_receipt
+            now[0] = fired_at + 91.0
+            return process_local_receipt
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=paste_then_cross_ceiling,
+            delivery_inflight_fn=lambda agent_name, prompt: True,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=90.0,
+        )
+        await scheduler._replay_pending_locked("worker")
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.ledger_state == "quarantined"
+        assert "RECEIPT_ABANDONED" in ledger.last_error
+        assert durable_receipt is not None
+        assert durable_receipt.schedule_id == schedule.id
+        logs = capsys.readouterr().err
+        assert "schedule 'late-identity' (#1)" in logs
+        assert "quarantined=True" in logs
+
+        assert durable_receipt.accept() is True
+        process_local_receipt.set_result(True)
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
+    async def test_abandonment_blocks_newer_recurrence_until_late_receipt(
+        self, registry, monkeypatch, capsys
+    ):
+        """An old pasted fire retains authority ahead of recurrence collapse.
+
+        The two-row fixture catches the buggy newest-fire collapse that marked
+        the unrecallable old row RECURRENCE_COLLAPSED and submitted the newer
+        equal prompt, allowing both physical turns to execute.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 8 * * *", name="daily", prompt="same prompt"
+        )
+        older_fired_at = 1_800_000_000.0
+        newer_fired_at = older_fired_at + 100.0
+        older, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=older_fired_at,
+        )
+        newer, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=newer_fired_at,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time",
+            lambda: older_fired_at + 3_601.0,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler._ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC",
+            0.01,
+        )
+        pasted_inflight = True
+        submissions: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            submissions.append(prompt)
+            return True
+
+        def inflight(agent_name, prompt):
+            del agent_name, prompt
+            return pasted_inflight
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_inflight_fn=inflight,
+        )
+        await scheduler._replay_pending_locked("worker")
+
+        by_id = {
+            row.id: row for row in registry.list_schedule_wake_ledger("worker")
+        }
+        assert submissions == []
+        assert by_id[older.id].ledger_state == "quarantined"
+        assert "RECEIPT_ABANDONED" in by_id[older.id].last_error
+        assert by_id[newer.id].ledger_state == "pending"
+        assert by_id[newer.id].attempts == 0
+        logs = capsys.readouterr().err
+        assert "recurrence collapse" in logs
+        assert "RECURRENCE_COLLAPSED" not in logs
+
+        assert ScheduleWakeReceipt(
+            registry, schedule.id, older_fired_at
+        ).accept() is True
+        pasted_inflight = False
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        await scheduler._replay_pending_locked("worker")
+
+        assert submissions == ["same prompt"]
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, newer_fired_at
         ).ledger_state == "receipted-ran-once"
 
     @pytest.mark.asyncio
