@@ -103,9 +103,20 @@ class CodexAppServerClient:
         self._read_task: asyncio.Task | None = None
         self._stderr_task: asyncio.Task | None = None
         self._closed = False
+        self._close_reason: str | None = None
+
+    @property
+    def is_closed(self) -> bool:
+        """Whether either side deliberately closed or the read side died."""
+        return self._closed
+
+    def _raise_if_closed(self) -> None:
+        if self._closed:
+            raise CodexAppServerError(self._close_reason or "client is closed")
 
     def start(self) -> None:
         """Begin consuming the read stream. Idempotent."""
+        self._raise_if_closed()
         if self._read_task is None:
             self._read_task = asyncio.create_task(self._read_loop())
         # Drain stderr continuously: an undrained PIPE on a long-lived process
@@ -133,8 +144,7 @@ class CodexAppServerClient:
     ) -> object:
         """Send a request and await its result. Raises CodexAppServerError on
         an error frame, transport close, or timeout."""
-        if self._closed:
-            raise CodexAppServerError("client is closed")
+        self._raise_if_closed()
         self._next_id += 1
         rid = self._next_id
         fut: asyncio.Future = asyncio.get_running_loop().create_future()
@@ -165,8 +175,7 @@ class CodexAppServerClient:
         )
 
     async def _send(self, msg: dict) -> None:
-        if self._closed:
-            raise CodexAppServerError("client is closed")
+        self._raise_if_closed()
         self._writer.write((json.dumps(msg) + "\n").encode())
         await self._writer.drain()
 
@@ -190,9 +199,16 @@ class CodexAppServerClient:
         except Exception as exc:  # noqa: BLE001 — read loop must not die silently
             self._log(f"codex-app-server: read loop error: {exc}")
         finally:
+            unexpected_close = not self._closed
             close_error = CodexAppServerError("connection closed")
+            if unexpected_close:
+                # Latch read-side death before failing futures or notifying the
+                # session. A live child may retain stdin after closing stdout;
+                # no later request may be registered against that dead reader.
+                self._closed = True
+                self._close_reason = str(close_error)
             self._fail_pending(close_error)
-            if not self._closed and self._transport_closed_handler is not None:
+            if unexpected_close and self._transport_closed_handler is not None:
                 try:
                     self._transport_closed_handler(close_error)
                 except Exception as exc:  # noqa: BLE001 — closure stays terminal
@@ -257,6 +273,8 @@ class CodexAppServerClient:
     async def close(self) -> None:
         """Stop reading and close the write side. Idempotent."""
         self._closed = True
+        if self._close_reason is None:
+            self._close_reason = "client is closed"
         if self._read_task is not None:
             self._read_task.cancel()
             try:

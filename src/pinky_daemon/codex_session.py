@@ -280,6 +280,7 @@ class CodexSession(TransportReplacementMixin):
         self._active_turn_result: CodexTurnResult | None = None
         self._turn_done: asyncio.Future | None = None
         self._appserver_terminal_stream_tasks: set[asyncio.Task[None]] = set()
+        self._appserver_terminal_stream_tail: asyncio.Task[None] | None = None
         # Latest per-turn token breakdown from thread/tokenUsage/updated —
         # app-server reports usage out-of-band, not inside turn/completed.
         self._appserver_last_usage: dict = {}
@@ -1208,8 +1209,14 @@ class CodexSession(TransportReplacementMixin):
     async def _ensure_app_server(self) -> bool:
         """Spawn + initialise the app-server, or degrade this cycle to exec."""
         if self._app_client is not None and self._app_proc is not None:
-            if self._app_proc.returncode is None:
+            client_closed = bool(getattr(self._app_client, "is_closed", False))
+            if self._app_proc.returncode is None and not client_closed:
                 return True  # still running
+            if self._app_proc.returncode is None and client_closed:
+                _log(
+                    f"app_server_cached_transport_unusable agent={self.agent_name} "
+                    "reason=read_closed process_alive=true"
+                )
 
         # Refuse an unsafe/missing per-agent auth setup before mutating any
         # cached transport. In particular, a dead cached app-server must not be
@@ -1313,6 +1320,7 @@ class CodexSession(TransportReplacementMixin):
 
     async def _teardown_app_server(self) -> None:
         """Close the client and kill the process. Idempotent."""
+        self._report_appserver_terminal_stream_survivors(phase="teardown")
         if self._app_client is not None:
             try:
                 await self._app_client.close()
@@ -1720,6 +1728,7 @@ class CodexSession(TransportReplacementMixin):
         self, event: dict
     ) -> None:
         callback_task = asyncio.create_task(self._emit_stream_event(event))
+        self._retain_appserver_terminal_stream_task(callback_task)
         done, _pending = await asyncio.wait(
             {callback_task}, timeout=APP_SERVER_TERMINAL_STREAM_TIMEOUT
         )
@@ -1732,11 +1741,15 @@ class CodexSession(TransportReplacementMixin):
             f"type={event.get('type', '')} "
             f"timeout_s={APP_SERVER_TERMINAL_STREAM_TIMEOUT}"
         )
-        # Do not await cancellation: a hostile callback can suppress it. The
-        # turn and read loop are already independent, and the done callback
-        # consumes any later exception if the abandoned task eventually exits.
+        # The turn and read loop are already independent, so retaining and
+        # awaiting a cancellation-resistant callback here cannot gate turn
+        # completion. Keeping this detached delivery task alive until the
+        # callback truly exits also keeps later terminal deliveries serialized.
         callback_task.cancel()
-        callback_task.add_done_callback(self._consume_background_task)
+        try:
+            await callback_task
+        except asyncio.CancelledError:
+            pass
 
     @staticmethod
     def _consume_background_task(task: asyncio.Task) -> None:
@@ -1747,15 +1760,56 @@ class CodexSession(TransportReplacementMixin):
         except asyncio.CancelledError:
             pass
 
-    def _schedule_appserver_terminal_stream_event(self, event: dict) -> None:
-        """Deliver terminal UI output without holding the turn/read loop."""
-        if self._stream_event_callback is None:
-            return
-        task = asyncio.create_task(
-            self._deliver_bounded_appserver_terminal_stream_event(event)
-        )
+    def _retain_appserver_terminal_stream_task(
+        self, task: asyncio.Task[None]
+    ) -> None:
+        """Retain detached delivery work until the underlying task is done."""
         self._appserver_terminal_stream_tasks.add(task)
         task.add_done_callback(self._appserver_terminal_stream_tasks.discard)
+        task.add_done_callback(self._consume_background_task)
+
+    def _report_appserver_terminal_stream_survivors(self, *, phase: str) -> None:
+        survivors = [
+            task
+            for task in self._appserver_terminal_stream_tasks
+            if not task.done()
+        ]
+        if survivors:
+            _log(
+                f"app_server_terminal_stream_survivors agent={self.agent_name} "
+                f"phase={phase} count={len(survivors)}"
+            )
+
+    def _schedule_appserver_terminal_stream_event(self, event: dict) -> None:
+        """Deliver terminal UI output in session order, outside the turn."""
+        if self._stream_event_callback is None:
+            return
+        previous = self._appserver_terminal_stream_tail
+
+        async def _deliver_after_previous() -> None:
+            if previous is not None:
+                try:
+                    await asyncio.shield(previous)
+                except asyncio.CancelledError:
+                    # A cancelled predecessor is complete ordering-wise. If
+                    # this task itself was cancelled, preserve that request.
+                    if not previous.done():
+                        raise
+                except Exception:
+                    # Delivery is best effort; ordering survives an earlier
+                    # callback failure and the done callback consumes it.
+                    pass
+            await self._deliver_bounded_appserver_terminal_stream_event(event)
+
+        task = asyncio.create_task(_deliver_after_previous())
+        self._appserver_terminal_stream_tail = task
+        self._retain_appserver_terminal_stream_task(task)
+
+        def _clear_tail(done: asyncio.Task[None]) -> None:
+            if self._appserver_terminal_stream_tail is done:
+                self._appserver_terminal_stream_tail = None
+
+        task.add_done_callback(_clear_tail)
 
     async def _emit_terminal_stream_event(self, event: dict) -> None:
         """Keep legacy ordering; detach only for an active app-server turn."""
