@@ -3195,12 +3195,6 @@ def create_api(
     async def _make_streaming_response_callback():
         """Create a response callback that routes through the broker."""
         async def _on_response(turn_result):
-            # #279: agent-to-agent reply auto-routing. If this completed turn was
-            # an injected agent message (platform == "agent"), deliver its text to
-            # the requesting agent via a one-way live inject and stop. Must run
-            # BEFORE the empty-chat_id early-return.
-            if await broker.route_agent_reply(comms, turn_result):
-                return
             if not turn_result.chat_id:
                 return
             agent = agents.get(turn_result.agent_name)
@@ -3759,7 +3753,6 @@ def create_api(
                 "transport-recovery",
                 target_agent,
                 instruction,
-                route_reply=False,
             )
             return outcome.delivered
 
