@@ -6,7 +6,7 @@ on this to host long-lived *Threads* instead of spawning ``codex exec`` once
 per user message — avoiding per-turn cold-start cost and gaining native
 reconnect (Tier 2 of the Codex modernisation, task #98).
 
-Wire protocol (observed against codex-cli 0.125, ``--listen stdio://``):
+Wire protocol (re-verified against codex-cli 0.144, ``--listen stdio://``):
 
   * One JSON object per line (NDJSON). No ``Content-Length`` framing and no
     ``"jsonrpc"`` version field — the server neither emits nor requires it.
@@ -138,7 +138,16 @@ class CodexAppServerClient:
 
     async def initialize(self, *, name: str = "pinkybot", version: str = "1") -> object:
         """Perform the required ``initialize`` handshake."""
-        return await self.request("initialize", {"clientInfo": {"name": name, "version": version}})
+        return await self.request(
+            "initialize",
+            {
+                "clientInfo": {"name": name, "version": version},
+                # 0.144 added capability negotiation. An empty declaration is
+                # the minimal stable set: do not opt into experimentalApi,
+                # attestation requests, or extended elicitation semantics.
+                "capabilities": {},
+            },
+        )
 
     async def _send(self, msg: dict) -> None:
         if self._closed:

@@ -1111,6 +1111,7 @@ def _patch_ensure(session, fake):
 class TestCodexAppServerFlag:
     def test_flag_off_by_default(self, monkeypatch):
         monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER_AGENTS", raising=False)
         config = StreamingSessionConfig(
             agent_name="a", working_dir="/tmp", provider_url="codex_cli",
         )
@@ -1122,6 +1123,42 @@ class TestCodexAppServerFlag:
             agent_name="a", working_dir="/tmp", provider_url="codex_cli",
         )
         assert CodexSession(config)._use_app_server is True
+
+    def test_allowlist_member_is_on(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", " other, a ")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        assert session._use_app_server is True
+        assert session._app_server_source == "allowlist"
+
+    def test_allowlist_nonmember_is_off(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", "other")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        assert CodexSession(config)._use_app_server is False
+
+    def test_allowlist_match_is_case_sensitive(self, monkeypatch):
+        monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", "A")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        assert CodexSession(config)._use_app_server is False
+
+    def test_global_fallback_still_enables_nonmember(self, monkeypatch):
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+        monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", "other")
+        config = StreamingSessionConfig(
+            agent_name="a", working_dir="/tmp", provider_url="codex_cli",
+        )
+        session = CodexSession(config)
+        assert session._use_app_server is True
+        assert session._app_server_source == "global"
 
     @pytest.mark.asyncio
     async def test_exec_dispatches_to_app_server_when_flagged(self):
@@ -1203,9 +1240,24 @@ class TestCodexAppServerTranslation:
         )
         assert ev == {"type": "turn.failed", "error": {"message": "boom"}}
 
-    def test_error_notification(self):
+    def test_error_notification_maps_to_terminal_failure(self):
         ev = self._s()._appserver_to_event("error", {"error": {"message": "rate limited"}})
-        assert ev == {"type": "error", "message": "rate limited"}
+        assert ev == {"type": "turn.failed", "error": {"message": "rate limited"}}
+
+    def test_turn_completed_interrupted_is_distinct(self):
+        ev = self._s()._appserver_to_event(
+            "turn/completed", {"turn": {"status": "interrupted"}}
+        )
+        assert ev == {"type": "turn.interrupted"}
+
+    def test_turn_completed_in_progress_is_not_success(self):
+        ev = self._s()._appserver_to_event(
+            "turn/completed", {"turn": {"status": "inProgress"}}
+        )
+        assert ev == {
+            "type": "turn.failed",
+            "error": {"message": "turn/completed reported inProgress"},
+        }
 
     def test_unknown_method_returns_none(self):
         assert self._s()._appserver_to_event("thread/status/changed", {}) is None
@@ -1241,9 +1293,28 @@ class TestCodexAppServerApprovals:
         out = await self._s()._on_appserver_request("item/permissions/requestApproval", {})
         assert out == {"permissions": {}, "scope": "session"}
 
+    @pytest.mark.parametrize(
+        ("method", "expected"),
+        [
+            (
+                "account/chatgptAuthTokens/refresh",
+                {"accessToken": "", "chatgptAccountId": ""},
+            ),
+            ("item/tool/requestUserInput", {"answers": {}}),
+            ("mcpServer/elicitation/request", {"action": "decline"}),
+            ("item/tool/call", {"contentItems": [], "success": False}),
+            ("attestation/generate", {"token": ""}),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_0144_server_requests_return_schema_shaped_results(
+        self, method, expected
+    ):
+        assert await self._s()._on_appserver_request(method, {}) == expected
+
     @pytest.mark.asyncio
     async def test_unknown_request_returns_empty(self):
-        assert await self._s()._on_appserver_request("mcpServer/elicitation/request", {}) == {}
+        assert await self._s()._on_appserver_request("future/method", {}) == {}
 
 
 class TestCodexAppServerEffortAndConfig:
@@ -1396,6 +1467,37 @@ class TestCodexAppServerTurn:
         result = await s._exec_codex_app_server("boom")
         assert result.failed
         assert "rate limited" in result.errors[0]
+
+    @pytest.mark.asyncio
+    async def test_interrupted_turn_is_distinct_and_keeps_substrate(self):
+        s = _appserver_session()
+        notifications = [
+            ("thread/started", {"thread": {"id": "thr-1"}}),
+            ("turn/completed", {"turn": {"status": "interrupted"}}),
+        ]
+        fake = _FakeAppClient(s, notifications)
+        _patch_ensure(s, fake)
+
+        result = await s._exec_codex_app_server("stop")
+        assert result.failed is True
+        assert result.interrupted is True
+        assert result.errors == ["turn interrupted"]
+        assert s._app_client is fake
+
+    @pytest.mark.asyncio
+    async def test_in_progress_completion_resolves_as_failure(self):
+        s = _appserver_session()
+        fake = _FakeAppClient(
+            s, [("turn/completed", {"turn": {"status": "inProgress"}})]
+        )
+        _patch_ensure(s, fake)
+
+        result = await asyncio.wait_for(
+            s._exec_codex_app_server("do not hang"), timeout=1
+        )
+        assert result.failed is True
+        assert result.interrupted is False
+        assert result.errors == ["turn/completed reported inProgress"]
 
     @pytest.mark.asyncio
     async def test_connect_failure_returns_failed_result(self):
@@ -1593,31 +1695,24 @@ class TestCodexStateMachine:
         assert s.state == SessionState.CONNECTED
 
     @pytest.mark.asyncio
-    async def test_cold_connect_appserver_init_failure_dies_no_leak(self):
-        # App-server initialize failure during BOOT → BOOTING completes to DEAD,
-        # and the owner token is NOT leaked (a later resurrection can proceed).
+    async def test_cold_connect_appserver_init_failure_degrades_without_dead(self):
+        # An app-server initialize failure is bounded and degrades this session
+        # to legacy exec; it must not terminalize the agent.
         s = _appserver_session()
 
         async def failing_ensure():
-            raise RuntimeError("app-server init boom")
+            s._degrade_app_server(reason="error", error=RuntimeError("init boom"))
+            return False
 
         s._ensure_app_server = failing_ensure  # type: ignore[assignment]
-
-        with pytest.raises(RuntimeError):
-            await s.connect()
-        assert s.state == SessionState.DEAD
-        assert s._state_machine._in_flight is None, "owner token leaked on BOOT failure"
-
-        # No leak → resurrection works: DEAD → RECONNECTING → CONNECTED.
-        async def ok_ensure():
-            s._app_client = object()
-
-        s._ensure_app_server = ok_ensure  # type: ignore[assignment]
         s._start_worker = lambda: None  # type: ignore[assignment]
         s._enqueue_wake = _noop  # type: ignore[assignment]
         s._analytics_session_started = lambda: None  # type: ignore[assignment]
         await s.connect()
         assert s.state == SessionState.CONNECTED
+        assert s._use_app_server is False
+        assert s._app_server_degraded is True
+        assert s._state_machine._in_flight is None
 
     @pytest.mark.asyncio
     async def test_ensure_app_server_init_failure_is_atomic(self, monkeypatch):
@@ -1665,17 +1760,18 @@ class TestCodexStateMachine:
             "pinky_daemon.codex_session.spawn_app_server", fake_spawn_boom
         )
 
-        with pytest.raises(RuntimeError, match="initialize boom"):
-            await s._ensure_app_server()
+        assert await s._ensure_app_server() is False
 
         # Half-initialized substrate must be torn down, not cached.
         assert s._app_client is None
         assert s._app_proc is None
+        assert s._use_app_server is False
+        assert s._app_server_degraded is True
         assert boom_clients[0].closed is True, "client not closed on init failure"
         assert boom_procs[0].killed is True, "proc not killed on init failure"
 
-        # A later attempt must respawn AND re-run initialize — the guard must
-        # not short-circuit on the cleared (None) fields.
+        # A later reconnect cycle must re-enable, respawn, and re-run initialize.
+        s._begin_app_server_reconnect_cycle()
         init_calls: list = []
 
         class _OkClient:
@@ -1691,7 +1787,7 @@ class TestCodexStateMachine:
         monkeypatch.setattr(
             "pinky_daemon.codex_session.spawn_app_server", fake_spawn_ok
         )
-        await s._ensure_app_server()
+        assert await s._ensure_app_server() is True
         assert init_calls == [True], "initialization was skipped on reconnect"
         assert s._app_client is not None
         assert s._app_proc is not None

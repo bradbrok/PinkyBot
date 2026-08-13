@@ -5,9 +5,11 @@ codex_app_server.py): one JSON object per line, requests carry ``id`` +
 ``method``, responses carry ``id`` + ``result``. Lets the bridge be exercised
 end-to-end with no real ``codex`` binary.
 
-  * ``initialize``         -> {"id", "result": {"userAgent": "fake/1", ...}}
-  * any other request      -> {"id", "result": {"echo": <params>}}  (round-trips
-                              arbitrary payloads, incl. frames >64 KiB)
+  * default mode: ``initialize`` returns a small success and every other
+    request echoes params (including frames >64 KiB)
+  * phase-1 modes exercise the 0.144 lifecycle used by CodexSession: happy
+    turns, init hang/error/death, terminal error notification, and exit after
+    a completed turn
   * notifications (no id)  -> ignored
 
 Env knobs:
@@ -17,13 +19,74 @@ Env knobs:
 
 from __future__ import annotations
 
+import argparse
 import json
 import os
 import sys
+import time
+
+_PHASE1_MODES = {"happy", "error-notification", "exit-after-turn"}
 
 
-def main() -> int:
+def _send(frame: dict) -> None:
+    sys.stdout.write(json.dumps(frame) + "\n")
+    sys.stdout.flush()
+
+
+def _thread(thread_id: str) -> dict:
+    """Minimal 0.144-shaped Thread object for scripted responses."""
+    now = int(time.time())
+    return {
+        "id": thread_id,
+        "preview": "",
+        "ephemeral": False,
+        "modelProvider": "openai",
+        "createdAt": now,
+        "updatedAt": now,
+        "status": {"type": "idle"},
+        "cwd": os.getcwd(),
+        "cliVersion": "0.144.0-fake",
+        "source": "appServer",
+        "sessionId": thread_id,
+        "turns": [],
+    }
+
+
+def _thread_response(thread_id: str) -> dict:
+    return {
+        "thread": _thread(thread_id),
+        "model": "gpt-5",
+        "modelProvider": "openai",
+        "cwd": os.getcwd(),
+        "approvalPolicy": "never",
+        "approvalsReviewer": "user",
+        "sandbox": {"type": "dangerFullAccess"},
+    }
+
+
+def _turn(turn_id: str, status: str) -> dict:
+    return {"id": turn_id, "items": [], "status": status, "error": None}
+
+
+def main(argv: list[str] | None = None) -> int:
+    parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--mode",
+        choices=(
+            "echo",
+            "happy",
+            "hang-init",
+            "error-init",
+            "die-pre-init",
+            "error-notification",
+            "exit-after-turn",
+        ),
+        default="echo",
+    )
+    mode = parser.parse_args(argv).mode
     exit_after_init = os.environ.get("FAKE_AS_EXIT_AFTER_INIT") == "1"
+    thread_id = f"fake-thread-{os.getpid()}"
+    turn_count = 0
     for raw in sys.stdin.buffer:
         line = raw.strip()
         if not line:
@@ -37,13 +100,76 @@ def main() -> int:
         if mid is None:
             continue  # notification — ignore
         if method == "initialize":
-            resp = {"id": mid, "result": {"userAgent": "fake/1", "ok": True}}
-        else:
-            resp = {"id": mid, "result": {"echo": msg.get("params")}}
-        sys.stdout.write(json.dumps(resp) + "\n")
-        sys.stdout.flush()
-        if method == "initialize" and exit_after_init:
-            return 0
+            if mode == "hang-init":
+                continue
+            if mode == "error-init":
+                _send({"id": mid, "error": {"code": -32000, "message": "init refused"}})
+                continue
+            if mode == "die-pre-init":
+                return 7
+            _send({
+                "id": mid,
+                "result": {
+                    "userAgent": "fake/1",
+                    "codexHome": os.getcwd(),
+                    "platformFamily": "unix",
+                    "platformOs": "fake",
+                },
+            })
+            if exit_after_init:
+                return 0
+            continue
+
+        if mode not in _PHASE1_MODES:
+            _send({"id": mid, "result": {"echo": msg.get("params")}})
+            continue
+
+        if method == "thread/start":
+            _send({"id": mid, "result": _thread_response(thread_id)})
+            continue
+        if method == "thread/resume":
+            thread_id = (msg.get("params") or {}).get("threadId", thread_id)
+            _send({"id": mid, "result": _thread_response(thread_id)})
+            continue
+        if method == "turn/start":
+            turn_count += 1
+            turn_id = f"fake-turn-{turn_count}"
+            _send({"id": mid, "result": {"turn": _turn(turn_id, "inProgress")}})
+            if mode == "error-notification":
+                _send({
+                    "method": "error",
+                    "params": {
+                        "threadId": thread_id,
+                        "turnId": turn_id,
+                        "willRetry": False,
+                        "error": {"message": "scripted terminal error"},
+                    },
+                })
+                continue
+            _send({
+                "method": "item/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turnId": turn_id,
+                    "item": {
+                        "id": "item-1",
+                        "type": "agentMessage",
+                        "text": "fake app-server reply",
+                    },
+                },
+            })
+            _send({
+                "method": "turn/completed",
+                "params": {
+                    "threadId": thread_id,
+                    "turn": _turn(turn_id, "completed"),
+                },
+            })
+            if mode == "exit-after-turn":
+                return 0
+            continue
+
+        _send({"id": mid, "result": {}})
     return 0
 
 

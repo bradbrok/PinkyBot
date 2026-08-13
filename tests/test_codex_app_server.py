@@ -124,7 +124,10 @@ class TestRequestResponse:
         await _settle()
         frame = writer.frames()[0]
         assert frame["method"] == "initialize"
-        assert frame["params"] == {"clientInfo": {"name": "pinkybot", "version": "9"}}
+        assert frame["params"] == {
+            "clientInfo": {"name": "pinkybot", "version": "9"},
+            "capabilities": {},
+        }
 
         _feed(reader, {"id": frame["id"], "result": {"codexHome": "/x"}})
         assert await asyncio.wait_for(task, timeout=1) == {"codexHome": "/x"}
