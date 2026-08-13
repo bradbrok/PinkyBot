@@ -491,10 +491,10 @@ def test_zero_holder_identical_claim_retires(tmp_path, monkeypatch):
     assert not claim.exists()
 
 
-def test_claim_retirement_timing_window_keeps_appended_bytes_recoverable(
+def test_frozen_claim_with_held_writer_retains_every_append_in_named_claim(
     tmp_path, monkeypatch
 ):
-    """R6 boundary-condition check: pathname-appended bytes stay recoverable."""
+    """R7 R1: a holder may keep writing, so retirement retains its pathname."""
     working_dir = tmp_path / "agent"
     working_dir.mkdir()
     claim_home = tmp_path / "claims"
@@ -512,17 +512,13 @@ def test_claim_retirement_timing_window_keeps_appended_bytes_recoverable(
         "rollout-retirement-timing-window.jsonl",
         working_dir,
     )
-    appended = b'{"type":"event_msg","payload":{"message":"timing window"}}\n'
+    before_freeze = b'{"type":"event_msg","payload":{"message":"before freeze"}}\n'
+    after_scan = b'{"type":"event_msg","payload":{"message":"after scan"}}\n'
     real_rollout_is_valid = codex_home_mod._rollout_is_valid
+    real_inode_scan = codex_home_mod._inode_has_open_descriptors
     late_writer = None
     injected = False
     logs: list[str] = []
-
-    monkeypatch.setattr(
-        codex_home_mod,
-        "_claim_has_open_descriptors",
-        lambda _claim, _log: False,
-    )
 
     def append_during_destination_verification(
         path: Path,
@@ -538,7 +534,7 @@ def test_claim_retirement_timing_window_keeps_appended_bytes_recoverable(
         )
         if path == destination and expected_signature is not None and not injected:
             late_writer = claim.open("ab", buffering=0)
-            late_writer.write(appended)
+            late_writer.write(before_freeze)
             os.fsync(late_writer.fileno())
             injected = True
         return valid
@@ -548,7 +544,26 @@ def test_claim_retirement_timing_window_keeps_appended_bytes_recoverable(
         "_rollout_is_valid",
         append_during_destination_verification,
     )
+
+    def append_after_frozen_scan_decision(claim_handle, claim_path, log):
+        holders = real_inode_scan(claim_handle, claim_path, log)
+        assert late_writer is not None
+        late_writer.write(after_scan)
+        os.fsync(late_writer.fileno())
+        return holders
+
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_inode_has_open_descriptors",
+        append_after_frozen_scan_decision,
+    )
     try:
+        claim_signature = codex_home_mod._file_signature(claim)
+        assert codex_home_mod._rollout_is_valid(
+            destination,
+            os.path.realpath(working_dir),
+            expected_signature=claim_signature,
+        )
         retired = codex_home_mod._retire_rollout_claim(
             claim,
             destination,
@@ -556,31 +571,391 @@ def test_claim_retirement_timing_window_keeps_appended_bytes_recoverable(
             log=logs.append,
         )
 
-        recovery_claims = list(
-            claim.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*")
-        )
         assert injected is True
         assert retired is False
-        assert not claim.exists()
-        assert len(recovery_claims) == 1
-        assert recovery_claims[0].name != claim.name
-        assert recovery_claims[0].read_bytes() == original + appended
+        assert claim.read_bytes() == original + before_freeze + after_scan
         assert destination.read_bytes() == original
         assert any(
-            "retirement boundary-condition check" in message
-            and "recovery claim" in message
+            "open descriptor holder(s) remain at the frozen boundary" in message
             for message in logs
         )
-        assert not list(
-            claim.parent.glob(
-                f"{codex_home_mod._MIGRATION_TEMP_PREFIX}recovery-*"
-                f"{codex_home_mod._MIGRATION_TEMP_SUFFIX}"
-            )
-        )
-        assert not list(claim.parent.glob("*.reserve"))
+        assert stat.S_IMODE(claim.stat().st_mode) != 0
     finally:
         if late_writer is not None:
             late_writer.close()
+
+
+def test_file_mode_freeze_blocks_new_open_but_preserves_descriptor_rights(tmp_path):
+    """R7 boundary semantics: file mode freeze is portable for a non-root owner."""
+    claim = tmp_path / "claim"
+    claim.write_bytes(b"stable bytes")
+    claim.chmod(0o640)
+    claim_fd = os.open(claim, os.O_RDONLY)
+    try:
+        os.fchmod(claim_fd, 0)
+
+        with pytest.raises(PermissionError):
+            os.open(claim, os.O_RDONLY)
+
+        os.lseek(claim_fd, 0, os.SEEK_SET)
+        assert os.read(claim_fd, 64) == b"stable bytes"
+        os.chmod(claim, 0o640, follow_symlinks=False)
+        assert stat.S_IMODE(claim.stat().st_mode) == 0o640
+    finally:
+        os.fchmod(claim_fd, 0o640)
+        os.close(claim_fd)
+
+
+def test_recovery_publication_failure_restores_named_claim_without_litter(
+    tmp_path, monkeypatch
+):
+    """R7 R2a: publication failure occurs while the complete old name remains."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    source = _rollout(
+        claim_home,
+        "rollout-recovery-publication-failure.jsonl",
+        working_dir,
+    )
+    original = source.read_bytes()
+    claim = codex_home_mod._claim_rollout(source)
+    assert claim is not None
+    original_mode = stat.S_IMODE(claim.stat().st_mode)
+    appended = b'{"type":"event_msg","payload":{"message":"new bytes"}}\n'
+    current = original + appended
+    claim.write_bytes(current)
+    destination = _rollout(
+        destination_home,
+        "rollout-recovery-publication-failure.jsonl",
+        working_dir,
+    )
+    real_link = codex_home_mod.os.link
+    logs: list[str] = []
+
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_inode_has_open_descriptors",
+        lambda _handle, _claim, _log: False,
+    )
+
+    def fail_recovery_link(source_path, destination_path, *args, **kwargs):
+        if Path(source_path).name.startswith(
+            f"{codex_home_mod._MIGRATION_TEMP_PREFIX}recovery-"
+        ):
+            raise OSError(5, "forced recovery publication failure")
+        return real_link(source_path, destination_path, *args, **kwargs)
+
+    monkeypatch.setattr(codex_home_mod.os, "link", fail_recovery_link)
+
+    retired = codex_home_mod._retire_rollout_claim(
+        claim,
+        destination,
+        os.path.realpath(working_dir),
+        log=logs.append,
+    )
+
+    assert retired is False
+    assert claim.read_bytes() == current
+    assert stat.S_IMODE(claim.stat().st_mode) == original_mode
+    assert destination.read_bytes() == original
+    assert not list(
+        claim.parent.glob(
+            f"{codex_home_mod._MIGRATION_TEMP_PREFIX}recovery-*"
+            f"{codex_home_mod._MIGRATION_TEMP_SUFFIX}"
+        )
+    )
+    assert not list(claim.parent.glob("*.reserve"))
+    assert any(
+        "recovery publication failed before unlink" in message for message in logs
+    )
+
+
+@pytest.mark.parametrize(
+    ("device_field", "inode_field"),
+    [
+        ("unparseable-device", "matching"),
+        ("matching", "unparseable-inode"),
+    ],
+)
+def test_frozen_inode_half_parse_is_loud_uncertainty(
+    tmp_path, monkeypatch, device_field, inode_field
+):
+    """R7 R4: a matching identity half never becomes verified absence."""
+    claim = tmp_path / "claim"
+    claim.write_bytes(b"bytes")
+    logs: list[str] = []
+
+    with claim.open("rb", buffering=0) as claim_handle:
+        claim_stat = os.fstat(claim_handle.fileno())
+        device = (
+            str(claim_stat.st_dev)
+            if device_field == "matching"
+            else device_field
+        )
+        inode = (
+            str(claim_stat.st_ino)
+            if inode_field == "matching"
+            else inode_field
+        )
+        output = "\n".join(
+            [
+                f"p{os.getpid()}",
+                f"f{claim_handle.fileno()}r",
+                f"D{claim_stat.st_dev}",
+                f"i{claim_stat.st_ino}",
+                "p987654",
+                "f9w",
+                f"D{device}",
+                f"i{inode}",
+                "",
+            ]
+        )
+        monkeypatch.setattr(
+            codex_home_mod.subprocess,
+            "run",
+            lambda *_args, **_kwargs: SimpleNamespace(
+                returncode=0,
+                stdout=output,
+                stderr="",
+            ),
+        )
+
+        holders = codex_home_mod._inode_has_open_descriptors(
+            claim_handle,
+            claim,
+            logs.append,
+        )
+
+    assert holders is None
+    assert any(
+        "could not parse a device or inode field for a potential holder" in message
+        for message in logs
+    )
+
+
+def test_live_mode_freeze_is_transiently_retained_without_thaw(tmp_path):
+    """R7 R5: a concurrent retirer cannot repair another live freeze."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    source = _rollout(
+        claim_home,
+        "rollout-live-concurrent-freeze.jsonl",
+        working_dir,
+    )
+    claim = codex_home_mod._claim_rollout(source)
+    assert claim is not None
+    destination = _rollout(
+        destination_home,
+        "rollout-live-concurrent-freeze.jsonl",
+        working_dir,
+    )
+    logs: list[str] = []
+    live_retirement_fd = os.open(claim, os.O_RDONLY)
+    try:
+        os.fchmod(live_retirement_fd, 0)
+
+        retired = codex_home_mod._retire_rollout_claim(
+            claim,
+            destination,
+            os.path.realpath(working_dir),
+            log=logs.append,
+        )
+
+        assert retired is False
+        assert stat.S_IMODE(claim.stat().st_mode) == 0
+        assert any(
+            "another retirement still holds the frozen claim" in message
+            for message in logs
+        )
+    finally:
+        os.fchmod(live_retirement_fd, 0o600)
+        os.close(live_retirement_fd)
+
+
+def test_crashed_mode_freeze_repairs_without_an_open_holder(tmp_path):
+    """R7 R3: an owner can thaw a crashed mode-000 claim by pathname."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    source = _rollout(
+        claim_home,
+        "rollout-crashed-freeze.jsonl",
+        working_dir,
+    )
+    claim = codex_home_mod._claim_rollout(source)
+    assert claim is not None
+    claim.chmod(0)
+    logs: list[str] = []
+
+    repaired = codex_home_mod._repair_frozen_rollout_claim(claim, logs.append)
+
+    assert repaired is True
+    assert stat.S_IMODE(claim.stat().st_mode) == 0o600
+    assert any("repaired crashed mode-000 rollout claim" in message for message in logs)
+
+
+def test_install_open_eacces_race_is_a_loud_retryable_retain(tmp_path, monkeypatch):
+    """R7 R5: a claim reader racing the freeze does not fail the migration."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    source = _rollout(
+        claim_home,
+        "rollout-install-eacces-race.jsonl",
+        working_dir,
+    )
+    claim = codex_home_mod._claim_rollout(source)
+    assert claim is not None
+    destination = _rollout(
+        destination_home,
+        "rollout-install-eacces-race.jsonl",
+        working_dir,
+    )
+    claim.chmod(0)
+    logs: list[str] = []
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_repair_frozen_rollout_claim",
+        lambda _claim, _log: True,
+    )
+
+    installed = codex_home_mod._install_rollout(
+        claim,
+        destination,
+        os.path.realpath(working_dir),
+        log=logs.append,
+    )
+
+    assert installed is False
+    assert destination.exists()
+    assert stat.S_IMODE(claim.stat().st_mode) == 0
+    assert any(
+        "claim pathname access was denied during a concurrent freeze" in message
+        for message in logs
+    )
+    claim.chmod(0o600)
+
+
+@pytest.mark.parametrize(
+    "seam",
+    ["after_freeze", "after_scan", "mid_publication", "before_unlink"],
+)
+def test_hard_exit_freeze_seams_keep_discoverable_complete_bytes(
+    tmp_path, monkeypatch, seam
+):
+    """R7 R2b/R3: every hard-exit seam leaves a complete discoverable claim."""
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    claim_home = tmp_path / "claims"
+    destination_home = tmp_path / "destination"
+    source = _rollout(
+        claim_home,
+        f"rollout-hard-exit-{seam}.jsonl",
+        working_dir,
+    )
+    original = source.read_bytes()
+    claim = codex_home_mod._claim_rollout(source)
+    assert claim is not None
+    appended = b'{"type":"event_msg","payload":{"message":"latest"}}\n'
+    current = original + appended
+    claim.write_bytes(current)
+    destination = _rollout(
+        destination_home,
+        f"rollout-hard-exit-{seam}.jsonl",
+        working_dir,
+    )
+    hard_exit_code = 73
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_claim_has_open_descriptors",
+        lambda _claim, _log: False,
+    )
+    monkeypatch.setattr(
+        codex_home_mod,
+        "_inode_has_open_descriptors",
+        lambda _handle, _claim, _log: False,
+    )
+
+    child_pid = os.fork()
+    if child_pid == 0:
+        if seam == "after_freeze":
+            codex_home_mod._inode_has_open_descriptors = (
+                lambda *_args, **_kwargs: os._exit(hard_exit_code)
+            )
+        elif seam == "after_scan":
+            codex_home_mod._file_signature_from_handle = (
+                lambda *_args, **_kwargs: os._exit(hard_exit_code)
+            )
+        elif seam == "mid_publication":
+            real_link = codex_home_mod.os.link
+
+            def exit_during_publication(source_path, destination_path, *args, **kwargs):
+                if Path(source_path).name.startswith(
+                    f"{codex_home_mod._MIGRATION_TEMP_PREFIX}recovery-"
+                ):
+                    os._exit(hard_exit_code)
+                return real_link(source_path, destination_path, *args, **kwargs)
+
+            codex_home_mod.os.link = exit_during_publication
+        else:
+            real_unlink = Path.unlink
+
+            def exit_before_claim_unlink(path, *args, **kwargs):
+                if path == claim:
+                    os._exit(hard_exit_code)
+                return real_unlink(path, *args, **kwargs)
+
+            Path.unlink = exit_before_claim_unlink
+
+        codex_home_mod._retire_rollout_claim(
+            claim,
+            destination,
+            os.path.realpath(working_dir),
+            log=lambda _message: None,
+        )
+        os._exit(74)
+
+    waited_pid, wait_status = os.waitpid(child_pid, 0)
+    assert waited_pid == child_pid
+    assert os.WIFEXITED(wait_status)
+    assert os.WEXITSTATUS(wait_status) == hard_exit_code
+
+    surviving_claims = list(
+        claim.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*")
+    )
+    assert surviving_claims
+    repair_logs: list[str] = []
+    for surviving_claim in surviving_claims:
+        assert codex_home_mod._repair_frozen_rollout_claim(
+            surviving_claim,
+            repair_logs.append,
+        )
+    assert any(path.read_bytes() == current for path in surviving_claims)
+
+    moved = move_matching_rollouts(
+        claim_home,
+        destination_home,
+        working_dir,
+        log=repair_logs.append,
+    )
+
+    assert moved >= 1
+    assert destination.read_bytes() == current
+    assert not list(
+        claim.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*")
+    )
+    assert not list(
+        claim.parent.glob(
+            f"{codex_home_mod._MIGRATION_TEMP_PREFIX}recovery-*"
+            f"{codex_home_mod._MIGRATION_TEMP_SUFFIX}"
+        )
+    )
+    assert not list(claim.parent.glob("*.reserve"))
 
 
 def test_descriptor_scan_unavailable_keeps_claim(tmp_path, monkeypatch):
@@ -659,7 +1034,7 @@ def test_claim_link_collision_retries_without_replacing_interleaved_claim(
 
 
 def test_stale_empty_reservations_are_swept_data_safely(tmp_path, monkeypatch):
-    """R4 debt: marker fast paths sweep only stale empty private sidecars."""
+    """R7: marker fast paths sweep unlocked crash or stale empty sidecars."""
     source_home = tmp_path / "source"
     destination_home = tmp_path / "destination"
     working_dir = tmp_path / "agent"
@@ -699,9 +1074,32 @@ def test_stale_empty_reservations_are_swept_data_safely(tmp_path, monkeypatch):
 
     assert prepared == destination_home
     assert not stale.exists()
-    assert recent.exists()
+    assert not recent.exists()
     assert nonempty.read_text(encoding="utf-8") == "operator bytes"
     assert any("removed stale migration reservation" in message for message in logs)
+    assert any("removed orphaned migration reservation" in message for message in logs)
+
+
+def test_active_reservation_lock_prevents_crash_sweeper_race(tmp_path):
+    """R7 R3: immediate orphan cleanup never removes a live publisher's name."""
+    destination = tmp_path / ".pinkybot-rollout-claim-live-rollout-test.jsonl"
+    reservation = destination.with_name(
+        f".{destination.name}{codex_home_mod._PRESERVATION_RESERVATION_SUFFIX}"
+    )
+    logs: list[str] = []
+
+    with codex_home_mod._reserve_exclusive_destination(
+        lambda _reservation_id: destination
+    ) as reserved:
+        assert reserved == destination
+        assert reservation.exists()
+
+        codex_home_mod._sweep_stale_reservations(tmp_path, logs.append)
+
+        assert reservation.exists()
+        assert not logs
+
+    assert not reservation.exists()
 
 
 @pytest.mark.parametrize("write_phase", ["during_copy", "post_install"])

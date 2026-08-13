@@ -34,6 +34,7 @@ _MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
 _PRESERVATION_RESERVATION_SUFFIX = ".reserve"
 _PRESERVATION_RESERVATION_STALE_SECONDS = 60 * 60
 _CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS = 2.0
+_CRASH_FROZEN_CLAIM_MODE = stat.S_IRUSR | stat.S_IWUSR
 _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 10.0
 _MIGRATION_LOCK_RETRY_SECONDS = 0.05
 
@@ -293,17 +294,21 @@ def _reserve_exclusive_destination(
             reservation_fd = os.open(reservation, flags, 0o600)
         except FileExistsError:
             continue
-        os.close(reservation_fd)
-        if _path_entry_exists(destination):
-            reservation.unlink()
-            continue
         try:
-            yield destination
-        finally:
-            try:
+            fcntl.flock(reservation_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            if _path_entry_exists(destination):
                 reservation.unlink()
-            except FileNotFoundError:
-                pass
+                continue
+            try:
+                yield destination
+            finally:
+                try:
+                    reservation.unlink()
+                except FileNotFoundError:
+                    pass
+        finally:
+            fcntl.flock(reservation_fd, fcntl.LOCK_UN)
+            os.close(reservation_fd)
         return
 
 
@@ -447,7 +452,7 @@ def _sweep_migration_temps(destination_sessions: Path, log: LogFn) -> None:
 
 
 def _sweep_stale_reservations(root: Path, log: LogFn) -> None:
-    """Remove only old, empty, singly-linked migration reservation sidecars."""
+    """Remove unlocked crash or stale migration reservation sidecars."""
     if not root.exists():
         return
     stale_before = time.time() - _PRESERVATION_RESERVATION_STALE_SECONDS
@@ -462,29 +467,63 @@ def _sweep_stale_reservations(root: Path, log: LogFn) -> None:
             not stat.S_ISREG(reservation_stat.st_mode)
             or reservation_stat.st_nlink != 1
             or reservation_stat.st_size != 0
-            or reservation_stat.st_mtime > stale_before
         ):
             continue
-        try:
-            reservation.unlink()
-            log(f"codex-home: removed stale migration reservation {reservation}")
-        except FileNotFoundError:
+        destination = reservation.with_name(
+            reservation.name[1 : -len(_PRESERVATION_RESERVATION_SUFFIX)]
+        )
+        if _path_entry_exists(destination) and reservation_stat.st_mtime > stale_before:
             continue
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            reservation_fd = os.open(
+                reservation,
+                os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError:
+            continue
+        try:
+            opened_stat = os.fstat(reservation_fd)
+            if (opened_stat.st_dev, opened_stat.st_ino) != (
+                reservation_stat.st_dev,
+                reservation_stat.st_ino,
+            ):
+                continue
+            try:
+                fcntl.flock(
+                    reservation_fd,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise
+            try:
+                reservation.unlink()
+            except FileNotFoundError:
+                continue
+            kind = (
+                "stale"
+                if reservation_stat.st_mtime <= stale_before
+                else "orphaned"
+            )
+            log(
+                f"codex-home: removed {kind} migration reservation {reservation}"
+            )
+        finally:
+            os.close(reservation_fd)
 
 
 def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
-    """Return holder state from lsof, retaining the claim on scan uncertainty."""
+    """Return whether any descriptor holds a claim path.
+
+    This path scan is used only to distinguish a crashed mode-000 freeze from a
+    live retirement. It deliberately includes this process: another retirer in
+    the same process is still a live holder and must keep the freeze intact.
+    """
     try:
         scan = subprocess.run(
-            [
-                "lsof",
-                "-Fn",
-                "-a",
-                "-p",
-                f"^{os.getpid()}",
-                "--",
-                os.fspath(claim),
-            ],
+            ["lsof", "-Fn", "--", os.fspath(claim)],
             stdin=subprocess.DEVNULL,
             capture_output=True,
             text=True,
@@ -530,12 +569,7 @@ def _inode_has_open_descriptors(
     claim: Path,
     log: LogFn,
 ) -> bool | None:
-    """Re-scan an unlinked claim by device and inode.
-
-    A full field scan avoids depending on a pathname after unlink. The exact
-    descriptor owned by this retirement is excluded; any other descriptor,
-    including one in this process, retains the bytes through a recovery claim.
-    """
+    """Scan a frozen claim by device and inode, excluding only this handle."""
     try:
         scan = subprocess.run(
             ["lsof", "-F", "pfDi"],
@@ -548,7 +582,7 @@ def _inode_has_open_descriptors(
     except (OSError, subprocess.SubprocessError) as exc:
         log(
             f"codex-home: claim retirement boundary-condition check for {claim} "
-            f"could not re-scan the inode: {exc}"
+            f"descriptor scan unavailable for frozen inode: {exc}"
         )
         return None
 
@@ -557,13 +591,13 @@ def _inode_has_open_descriptors(
     if stderr:
         log(
             f"codex-home: claim retirement boundary-condition check for {claim} "
-            f"could not re-scan the inode: {stderr}"
+            f"descriptor scan failed for frozen inode: {stderr}"
         )
         return None
     if scan.returncode != 0 or not stdout:
         log(
             f"codex-home: claim retirement boundary-condition check for {claim} "
-            f"received unexpected re-scan status {scan.returncode}"
+            f"received unexpected inode-scan status {scan.returncode}"
         )
         return None
 
@@ -604,8 +638,16 @@ def _inode_has_open_descriptors(
     target_identity = (claim_stat.st_dev, claim_stat.st_ino)
     own_identity = (os.getpid(), claim_handle.fileno())
     found_own_descriptor = False
+    uncertain_target_record = False
     for process_id, descriptor, device, inode in records:
-        if (device, inode) != target_identity:
+        exact_target = (device, inode) == target_identity
+        partial_target = (
+            (inode == target_identity[1] and device is None)
+            or (device == target_identity[0] and inode is None)
+        )
+        if partial_target:
+            uncertain_target_record = True
+        if not exact_target:
             continue
         descriptor_number = ""
         for character in descriptor:
@@ -620,6 +662,12 @@ def _inode_has_open_descriptors(
             continue
         return True
 
+    if uncertain_target_record:
+        log(
+            f"codex-home: retained rollout claim {claim}; frozen inode scan "
+            "could not parse a device or inode field for a potential holder"
+        )
+        return None
     if found_own_descriptor:
         return False
     log(
@@ -629,12 +677,98 @@ def _inode_has_open_descriptors(
     return None
 
 
-def _recover_unlinked_rollout_claim(
+def _restore_rollout_claim_mode(
     claim: Path,
     claim_handle: BinaryIO,
+    original_mode: int,
+    log: LogFn,
+) -> bool:
+    """Restore a frozen named claim through its already-open descriptor."""
+    try:
+        os.fchmod(claim_handle.fileno(), original_mode)
+        os.fsync(claim_handle.fileno())
+    except OSError as exc:
+        log(
+            f"codex-home: retained rollout claim {claim}; could not restore "
+            f"mode after retirement freeze: {exc}"
+        )
+        return False
+    return True
+
+
+def _repair_frozen_rollout_claim(claim: Path, log: LogFn) -> bool:
+    """Repair a mode-000 claim left by a crashed retirement.
+
+    A live retirement always holds an open descriptor. Seeing any holder, or
+    being unable to prove holder absence, is therefore a transient retain and
+    must never thaw another retireer's stable boundary.
+    """
+    try:
+        frozen_stat = claim.lstat()
+    except FileNotFoundError:
+        return True
+    if (
+        not stat.S_ISREG(frozen_stat.st_mode)
+        or stat.S_IMODE(frozen_stat.st_mode) != 0
+    ):
+        return True
+
+    holders = _claim_has_open_descriptors(claim, log)
+    if holders is not False:
+        detail = (
+            "another retirement still holds the frozen claim"
+            if holders
+            else "live-retirement status could not be verified"
+        )
+        log(
+            f"codex-home: transiently retained mode-000 rollout claim {claim}; "
+            f"{detail}"
+        )
+        return False
+
+    try:
+        os.chmod(
+            claim,
+            _CRASH_FROZEN_CLAIM_MODE,
+            follow_symlinks=False,
+        )
+        repaired_stat = claim.lstat()
+    except (OSError, NotImplementedError) as exc:
+        log(
+            f"codex-home: retained crashed mode-000 rollout claim {claim}; "
+            f"pathname mode repair failed: {exc}"
+        )
+        return False
+    if (
+        not stat.S_ISREG(repaired_stat.st_mode)
+        or (repaired_stat.st_dev, repaired_stat.st_ino)
+        != (frozen_stat.st_dev, frozen_stat.st_ino)
+    ):
+        log(
+            f"codex-home: retained rollout claim {claim}; identity changed "
+            "during crashed-freeze repair"
+        )
+        return False
+    try:
+        _fsync_directory(claim.parent)
+    except OSError as exc:
+        log(
+            f"codex-home: repaired crashed mode-000 rollout claim {claim}, "
+            f"but its directory sync failed: {exc}"
+        )
+        return False
+    log(f"codex-home: repaired crashed mode-000 rollout claim {claim}")
+    return True
+
+
+def _publish_frozen_rollout_recovery(
+    claim: Path,
+    claim_handle: BinaryIO,
+    target_cwd: str,
+    expected_signature: tuple[int, str],
     log: LogFn,
 ) -> Path:
-    """Copy current unlinked bytes into a complete, discoverable claim."""
+    """Publish and verify a durable recovery claim before unlinking the old one."""
     canonical = _claim_original_path(claim)
     if canonical is None:
         raise RuntimeError(f"cannot recover malformed rollout claim name: {claim}")
@@ -645,6 +779,7 @@ def _recover_unlinked_rollout_claim(
         suffix=_MIGRATION_TEMP_SUFFIX,
     )
     temp_path = Path(temp_name)
+    recovery: Path | None = None
     try:
         claim_handle.seek(0)
         with os.fdopen(temp_fd, "wb") as temp_handle:
@@ -659,14 +794,31 @@ def _recover_unlinked_rollout_claim(
                 lambda recovery_id: claim.with_name(
                     f"{_MIGRATION_CLAIM_PREFIX}{recovery_id}-{canonical.name}"
                 ),
-            ) as recovery:
+            ) as candidate:
                 try:
-                    os.link(temp_path, recovery, follow_symlinks=False)
+                    os.link(temp_path, candidate, follow_symlinks=False)
                 except FileExistsError:
                     continue
+                recovery = candidate
             break
         temp_path.unlink()
         _fsync_directory(claim.parent)
+        if recovery is None or not _rollout_is_valid(
+            recovery,
+            target_cwd,
+            expected_signature=expected_signature,
+        ):
+            raise RuntimeError(
+                f"published rollout recovery claim failed verification: {recovery}"
+            )
+    except Exception:
+        if recovery is not None:
+            try:
+                recovery.unlink()
+                _fsync_directory(claim.parent)
+            except FileNotFoundError:
+                pass
+        raise
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
@@ -674,10 +826,8 @@ def _recover_unlinked_rollout_claim(
             temp_path.unlink()
         except FileNotFoundError:
             pass
-    log(
-        "codex-home: WARNING claim retirement boundary-condition check "
-        f"preserved current bytes as recovery claim {recovery}"
-    )
+    assert recovery is not None
+    log(f"codex-home: published verified rollout recovery claim {recovery}")
     return recovery
 
 
@@ -688,15 +838,23 @@ def _retire_rollout_claim(
     *,
     log: LogFn,
 ) -> bool:
-    """Retire a verified tombstone with post-unlink recovery verification."""
+    """Retire a claim only after reaching a stable, recoverable byte boundary."""
     nofollow = getattr(os, "O_NOFOLLOW", None)
     if nofollow is None:
         raise RuntimeError("rollout claim path resolution requires O_NOFOLLOW")
+    if not _repair_frozen_rollout_claim(claim, log):
+        return False
     flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
     try:
         claim_fd = os.open(claim, flags)
     except FileNotFoundError:
         return True
+    except PermissionError as exc:
+        log(
+            f"codex-home: transiently retained rollout claim {claim}; "
+            f"pathname open was denied during a concurrent freeze: {exc}"
+        )
+        return False
     with os.fdopen(claim_fd, "rb", buffering=0) as claim_handle:
         opened_stat = os.fstat(claim_handle.fileno())
         try:
@@ -715,26 +873,66 @@ def _retire_rollout_claim(
             )
             return False
 
-        holders = _claim_has_open_descriptors(claim, log)
+        original_mode = stat.S_IMODE(opened_stat.st_mode)
+        try:
+            os.fchmod(claim_handle.fileno(), 0)
+            os.fsync(claim_handle.fileno())
+        except OSError as exc:
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                f"could not establish retirement freeze: {exc}"
+            )
+            _restore_rollout_claim_mode(
+                claim,
+                claim_handle,
+                original_mode,
+                log,
+            )
+            return False
+
+        holders = _inode_has_open_descriptors(claim_handle, claim, log)
         if holders is not False:
             if holders:
                 log(
                     f"codex-home: retained rollout claim {claim}; "
-                    "open descriptor holder(s) remain"
+                    "open descriptor holder(s) remain at the frozen boundary"
                 )
+            _restore_rollout_claim_mode(
+                claim,
+                claim_handle,
+                original_mode,
+                log,
+            )
             return False
 
         claim_signature = _file_signature_from_handle(claim_handle)
-        if not _rollout_is_valid(
+        destination_matches = _rollout_is_valid(
             destination,
             target_cwd,
             expected_signature=claim_signature,
-        ):
-            log(
-                f"codex-home: retained rollout claim {claim}; "
-                "installed destination is not byte-identical at retirement"
-            )
-            return False
+        )
+        recovery: Path | None = None
+        if not destination_matches:
+            try:
+                recovery = _publish_frozen_rollout_recovery(
+                    claim,
+                    claim_handle,
+                    target_cwd,
+                    claim_signature,
+                    log,
+                )
+            except Exception as exc:
+                log(
+                    f"codex-home: retained rollout claim {claim}; recovery "
+                    f"publication failed before unlink: {exc}"
+                )
+                _restore_rollout_claim_mode(
+                    claim,
+                    claim_handle,
+                    original_mode,
+                    log,
+                )
+                return False
 
         try:
             current_stat = claim.lstat()
@@ -748,29 +946,44 @@ def _retire_rollout_claim(
                 f"codex-home: retained rollout claim {claim}; "
                 "claim identity changed before unlink"
             )
+            _restore_rollout_claim_mode(
+                claim,
+                claim_handle,
+                original_mode,
+                log,
+            )
             return False
         if current_stat is not None:
             try:
                 claim.unlink()
             except FileNotFoundError:
                 pass
+            except OSError as exc:
+                log(
+                    f"codex-home: retained rollout claim {claim}; "
+                    f"unlink failed at the stable boundary: {exc}"
+                )
+                _restore_rollout_claim_mode(
+                    claim,
+                    claim_handle,
+                    original_mode,
+                    log,
+                )
+                return False
+        try:
             _fsync_directory(claim.parent)
-
-        post_unlink_holders = _inode_has_open_descriptors(
-            claim_handle,
-            claim,
-            log,
-        )
-        current_signature = _file_signature_from_handle(claim_handle)
-        current_destination_matches = _rollout_is_valid(
-            destination,
-            target_cwd,
-            expected_signature=current_signature,
-        )
-        if post_unlink_holders is not False or not current_destination_matches:
-            _recover_unlinked_rollout_claim(claim, claim_handle, log)
+        except OSError as exc:
+            log(
+                f"codex-home: claim retirement directory sync failed for "
+                f"{claim}: {exc}"
+            )
             return False
 
+    if recovery is not None:
+        log(
+            f"codex-home: retained differing bytes as recovery claim {recovery}"
+        )
+        return False
     log(f"codex-home: retired verified rollout claim {claim}")
     return True
 
@@ -803,6 +1016,8 @@ def _install_rollout(
     never removes and a later prepare can migrate independently.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
+    if not _repair_frozen_rollout_claim(claim, log):
+        return False
 
     if _path_entry_exists(destination):
         try:
@@ -815,6 +1030,12 @@ def _install_rollout(
                 )
                 return True
             raise
+        except PermissionError as exc:
+            log(
+                f"codex-home: transiently retained rollout claim {claim}; "
+                f"claim pathname access was denied during a concurrent freeze: {exc}"
+            )
+            return False
         if _rollout_is_valid(
             destination,
             target_cwd,
@@ -881,6 +1102,12 @@ def _install_rollout(
             )
             return True
         raise
+    except PermissionError as exc:
+        log(
+            f"codex-home: transiently retained rollout claim {claim}; "
+            f"claim pathname access was denied during a concurrent freeze: {exc}"
+        )
+        return False
     finally:
         if temp_fd >= 0:
             os.close(temp_fd)
@@ -1006,6 +1233,7 @@ def move_matching_rollouts(
         # works across daemon processes. The kernel releases flock on crash,
         # after which the successor sweeps the abandoned private temp.
         _sweep_migration_temps(destination_sessions, log)
+        _sweep_migration_temps(source_sessions, log)
         _sweep_stale_reservations(source_sessions, log)
         _sweep_stale_reservations(destination_sessions, log)
         return _move_rollout_candidates(
@@ -1033,8 +1261,24 @@ def _move_rollout_candidates(
         relative = source.relative_to(source_sessions)
         destination = destination_sessions / relative
         inspection_path = candidate.claim or source
+        if candidate.claim is not None and not _repair_frozen_rollout_claim(
+            candidate.claim,
+            log,
+        ):
+            continue
         rollout_cwd = _rollout_cwd(inspection_path)
         if not rollout_cwd:
+            if candidate.claim is not None:
+                try:
+                    claim_mode = stat.S_IMODE(candidate.claim.lstat().st_mode)
+                except FileNotFoundError:
+                    claim_mode = None
+                if claim_mode == 0:
+                    log(
+                        "codex-home: transiently retained rollout claim "
+                        f"{candidate.claim}; claim pathname is frozen by a "
+                        "concurrent retirement"
+                    )
             if not _path_entry_exists(inspection_path) and _rollout_is_valid(
                 destination, target_cwd
             ):
