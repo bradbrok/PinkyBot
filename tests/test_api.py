@@ -4636,7 +4636,11 @@ class TestAPI:
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.dream_runner.SDKRunner._ensure_sdk", return_value=None), \
-                patch("pinky_daemon.dream_runner.SDKRunner.run", new=fake_run):
+                patch("pinky_daemon.dream_runner.SDKRunner.run", new=fake_run), \
+                patch(
+                    "pinky_daemon.dream_runner.TmuxDreamRunner",
+                    side_effect=AssertionError("real dream transport selected"),
+                ) as tmux_runner:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
@@ -4648,6 +4652,7 @@ class TestAPI:
                 assert resp.status_code == 200
                 assert resp.json()["summary"] == "Dreamed successfully"
 
+        assert not tmux_runner.called
         assert captured_prompts
         assert "<conversation_history>" in captured_prompts[0]
         assert long_message in captured_prompts[0]

@@ -34,13 +34,58 @@ from fastapi.testclient import TestClient
 # ``monkeypatch.setenv`` for the duration of their test.
 TEST_SESSION_SECRET = "test-session-secret-do-not-use-in-prod-32bytes-min"
 
+# Repository tests must not inherit live daemon behavior from their invoking
+# shell.  The source tree contains many PINKY_* switches that can select real
+# transports, containers, shared services, auth policy, or process launchers.
+# Scrub the whole namespace so newly-added switches are isolated by default,
+# then pin only the deterministic values the suite relies on.
+_PINNED_TEST_ENV = {
+    "PINKY_AUTH_DENY_DEFAULT": "shadow",
+    "PINKY_DREAM_TRANSPORT": "sdk",
+    "PINKY_SESSION_SECRET": TEST_SESSION_SECRET,
+}
+_REAL_TRANSPORT_OPT_IN_ENV = "PINKY_TEST_REAL_TRANSPORT"
+_REAL_TRANSPORT_OPTED_IN = os.environ.get(
+    _REAL_TRANSPORT_OPT_IN_ENV, ""
+).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _scrub_pinky_env() -> None:
+    """Replace ambient PINKY_* configuration with deterministic test values."""
+    for key in tuple(os.environ):
+        if key.startswith("PINKY_"):
+            os.environ.pop(key, None)
+    os.environ.update(_PINNED_TEST_ENV)
+
+
+# Run during conftest import, before pytest imports test modules that may import
+# source modules with environment-derived module constants.
+_scrub_pinky_env()
+
 
 def pytest_configure(config: pytest.Config) -> None:
-    """Register the `real_auth` marker so it doesn't warn."""
+    """Register suite-specific opt-in markers."""
     config.addinivalue_line(
         "markers",
         "real_auth: test exercises real auth flow — skip conftest auto-cookie patch",
     )
+    config.addinivalue_line(
+        "markers",
+        "real_transport: test intentionally uses a real external transport",
+    )
+
+
+def pytest_runtest_setup(item: pytest.Item) -> None:
+    """Require both a marker and a process-level flag for real transports.
+
+    Even an opted-in run starts from the scrubbed environment.  A marked test
+    must still set the exact transport configuration it intends to exercise.
+    """
+    if item.get_closest_marker("real_transport") and not _REAL_TRANSPORT_OPTED_IN:
+        pytest.skip(
+            f"real transport disabled; set {_REAL_TRANSPORT_OPT_IN_ENV}=1 "
+            "for this explicitly marked test"
+        )
 
 
 @pytest.fixture(autouse=True, scope="session")
@@ -64,7 +109,27 @@ def _ensure_test_session_secret():
 
 
 @pytest.fixture(autouse=True)
-def _auto_cookie_test_client(request, monkeypatch):
+def _isolate_pinky_env(monkeypatch):
+    """Re-apply the ambient guard before every test.
+
+    Tests remain free to override a value explicitly with ``monkeypatch`` in
+    their own setup or body.  Re-applying the guard also contains accidental
+    environment leakage from a prior test that mutated ``os.environ`` directly.
+    """
+    for key in tuple(os.environ):
+        if key.startswith("PINKY_"):
+            monkeypatch.delenv(key, raising=False)
+    for key, value in _PINNED_TEST_ENV.items():
+        monkeypatch.setenv(key, value)
+    try:
+        yield
+    finally:
+        # Also contain direct os.environ writes that bypassed monkeypatch.
+        _scrub_pinky_env()
+
+
+@pytest.fixture(autouse=True)
+def _auto_cookie_test_client(request, monkeypatch, _isolate_pinky_env):
     """Auto-inject a valid session cookie into every TestClient.
 
     Skipped for tests marked ``real_auth`` — those construct their own
