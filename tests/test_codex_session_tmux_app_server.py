@@ -159,7 +159,10 @@ async def test_tmux_auth_refusal_precedes_stale_transport_teardown(tmp_path, mon
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("entry_point", ["force_restart", "attempt_reconnect"])
+@pytest.mark.parametrize(
+    "entry_point",
+    ["force_restart", "attempt_reconnect", "restart_transport"],
+)
 async def test_tmux_replacement_preflight_preserves_cached_transport(
     tmp_path, monkeypatch, entry_point
 ):
@@ -179,7 +182,12 @@ async def test_tmux_replacement_preflight_preserves_cached_transport(
     s._app_client = fake.client
     s._app_proc = fake.proc
 
-    result = await getattr(s, entry_point)()
+    if entry_point == "restart_transport":
+        with pytest.raises(RuntimeError, match="shared auth file is absent"):
+            await s.restart_transport()
+        result = None
+    else:
+        result = await getattr(s, entry_point)()
 
     if entry_point == "force_restart":
         assert result is False

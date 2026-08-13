@@ -279,6 +279,33 @@ def test_partial_migration_final_is_quarantined_and_retry_converges(tmp_path, mo
     assert any("quarantined invalid rollout migration final" in message for message in logs)
 
 
+def test_quarantine_uuid_collision_retains_both_artifacts(tmp_path, monkeypatch):
+    """R3 P2-3: quarantine reservation retries instead of replacing history."""
+    destination = tmp_path / "rollout-collision.jsonl"
+    destination.write_bytes(b"new invalid bytes")
+    collision_hex = "a" * 32
+    fresh_hex = "b" * 32
+    prior = destination.with_name(
+        f"{codex_home_mod._MIGRATION_QUARANTINE_PREFIX}"
+        f"{destination.name}-{collision_hex}"
+    )
+    prior.write_bytes(b"prior invalid bytes")
+    generated = iter(
+        [SimpleNamespace(hex=collision_hex), SimpleNamespace(hex=fresh_hex)]
+    )
+    monkeypatch.setattr(codex_home_mod.uuid, "uuid4", lambda: next(generated))
+
+    retained = codex_home_mod._quarantine_rollout(
+        destination,
+        log=lambda _message: None,
+    )
+
+    assert prior.read_bytes() == b"prior invalid bytes"
+    assert retained.read_bytes() == b"new invalid bytes"
+    assert retained != prior
+    assert not destination.exists()
+
+
 def test_initial_migration_lock_deadline_preserves_source_and_markerless_state(
     tmp_path, monkeypatch
 ):
@@ -337,10 +364,8 @@ def test_reverse_migration_uses_same_bounded_lock_acquisition(tmp_path, monkeypa
     assert source.read_bytes() == source_bytes
 
 
-def test_source_change_after_final_validation_remains_authoritative_and_retryable(
-    tmp_path, monkeypatch
-):
-    """R2 P1-2: recheck the source immediately before removing it."""
+def test_claim_boundary_never_removes_fresh_canonical_writer_bytes(tmp_path, monkeypatch):
+    """R3 P1-1: a write inside the former check/unlink interval survives."""
     shared_home = tmp_path / "shared"
     working_dir = tmp_path / "agent"
     agent_home = working_dir / ".codex"
@@ -351,43 +376,104 @@ def test_source_change_after_final_validation_remains_authoritative_and_retryabl
     appended = b'{"type":"event_msg","payload":{"message":"late append"}}\n'
     relative = source.relative_to(shared_home / "sessions")
     destination = agent_home / "sessions" / relative
-    real_rollout_is_valid = codex_home_mod._rollout_is_valid
+    real_unlink = Path.unlink
     injected = False
 
-    def append_after_final_validation(path, target_cwd, *, expected_signature=None):
+    def write_at_claim_removal(path: Path, *args, **kwargs):
         nonlocal injected
-        valid = real_rollout_is_valid(
-            path,
-            target_cwd,
-            expected_signature=expected_signature,
-        )
-        if path == destination and expected_signature is not None and valid and not injected:
-            with source.open("ab") as handle:
-                handle.write(appended)
-                handle.flush()
-                os.fsync(handle.fileno())
+        if (
+            path.parent == source.parent
+            and path.name.startswith(codex_home_mod._MIGRATION_CLAIM_PREFIX)
+            and not injected
+        ):
+            source.write_bytes(appended)
             injected = True
-        return valid
+        return real_unlink(path, *args, **kwargs)
 
-    monkeypatch.setattr(
-        codex_home_mod,
-        "_rollout_is_valid",
-        append_after_final_validation,
-    )
+    monkeypatch.setattr(Path, "unlink", write_at_claim_removal)
     monkeypatch.setenv("CODEX_HOME", str(shared_home))
     monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
 
-    with pytest.raises(RuntimeError, match="changed before source removal"):
-        prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
+    prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
 
-    assert source.read_bytes() == original + appended
+    assert injected is True
+    assert source.read_bytes() == appended
     assert destination.read_bytes() == original
-    assert not (agent_home / ROLLOUT_MIGRATION_MARKER).exists()
+    assert not list(source.parent.glob(f"{codex_home_mod._MIGRATION_CLAIM_PREFIX}*"))
+    marker_payload = json.loads(
+        (agent_home / ROLLOUT_MIGRATION_MARKER).read_text(encoding="utf-8")
+    )
+    assert str(relative) in marker_payload["retry_sources"]
+
+
+@pytest.mark.parametrize("write_phase", ["during_copy", "post_install"])
+def test_fresh_canonical_writer_path_remigrates_on_next_prepare(
+    tmp_path, monkeypatch, write_phase
+):
+    """R3 P1-1: writes after claim become the next prepare's authority."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    working_dir.mkdir()
+    _auth(shared_home)
+    source = _rollout(shared_home, f"rollout-{write_phase}.jsonl", working_dir)
+    original = source.read_bytes()
+    appended = b'{"type":"event_msg","payload":{"message":"fresh path"}}\n'
+    fresh_bytes = original + appended
+    relative = source.relative_to(shared_home / "sessions")
+    destination = agent_home / "sessions" / relative
+    injected = False
+
+    if write_phase == "during_copy":
+        real_file_signature = codex_home_mod._file_signature
+
+        def write_after_claim_copy(path: Path):
+            nonlocal injected
+            signature = real_file_signature(path)
+            if (
+                path.parent == source.parent
+                and path.name.startswith(codex_home_mod._MIGRATION_CLAIM_PREFIX)
+                and not injected
+            ):
+                source.write_bytes(fresh_bytes)
+                injected = True
+            return signature
+
+        monkeypatch.setattr(codex_home_mod, "_file_signature", write_after_claim_copy)
+    else:
+        real_rollout_is_valid = codex_home_mod._rollout_is_valid
+
+        def write_after_final_install(path, target_cwd, *, expected_signature=None):
+            nonlocal injected
+            valid = real_rollout_is_valid(
+                path,
+                target_cwd,
+                expected_signature=expected_signature,
+            )
+            if path == destination and expected_signature is not None and valid and not injected:
+                source.write_bytes(fresh_bytes)
+                injected = True
+            return valid
+
+        monkeypatch.setattr(
+            codex_home_mod,
+            "_rollout_is_valid",
+            write_after_final_install,
+        )
+
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+
+    prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
+
+    assert injected is True
+    assert source.read_bytes() == fresh_bytes
+    assert destination.read_bytes() == original
 
     prepare_agent_codex_home(_scope(working_dir), log=lambda _message: None)
 
     assert not source.exists()
-    assert destination.read_bytes() == original + appended
+    assert destination.read_bytes() == fresh_bytes
     assert (agent_home / ROLLOUT_MIGRATION_MARKER).exists()
 
 
@@ -424,6 +510,48 @@ def test_linked_lock_entry_is_preserved_aside_without_touching_target(
     assert asides[0].is_symlink()
     assert os.readlink(asides[0]) == str(unintended_target)
     assert any("renamed linked migration lock entry" in message for message in logs)
+
+
+def test_lock_aside_uuid_collision_retains_both_artifacts(tmp_path, monkeypatch):
+    """R3 P2-3: lock-aside reservation retries instead of replacing history."""
+    source_home = tmp_path / "source-home"
+    destination_home = tmp_path / "destination-home"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    destination_sessions = destination_home / "sessions"
+    destination_sessions.mkdir(parents=True)
+    lock_path = destination_sessions / codex_home_mod._MIGRATION_LOCK_NAME
+    lock_path.write_bytes(b"new linked bytes")
+    peer = tmp_path / "peer.lock"
+    os.link(lock_path, peer)
+    collision_hex = "c" * 32
+    fresh_hex = "d" * 32
+    prior = destination_sessions / (
+        f"{codex_home_mod._MIGRATION_LOCK_ASIDE_PREFIX}"
+        f"{lock_path.name}-{collision_hex}"
+    )
+    prior.write_bytes(b"prior retained bytes")
+    generated = iter(
+        [SimpleNamespace(hex=collision_hex), SimpleNamespace(hex=fresh_hex)]
+    )
+    monkeypatch.setattr(codex_home_mod.uuid, "uuid4", lambda: next(generated))
+
+    moved = move_matching_rollouts(
+        source_home,
+        destination_home,
+        working_dir,
+        log=lambda _message: None,
+    )
+
+    retained = destination_sessions / (
+        f"{codex_home_mod._MIGRATION_LOCK_ASIDE_PREFIX}"
+        f"{lock_path.name}-{fresh_hex}"
+    )
+    assert moved == 0
+    assert prior.read_bytes() == b"prior retained bytes"
+    assert retained.read_bytes() == b"new linked bytes"
+    assert peer.read_bytes() == b"new linked bytes"
+    assert lock_path.is_file()
 
 
 def test_hard_linked_lock_entry_is_preserved_aside_without_mutating_peer(tmp_path):

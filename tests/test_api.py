@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -958,6 +960,7 @@ class TestAPI:
             self.sent: list[tuple[str, str, str]] = []
             self.disconnect_calls = 0
             self.connect_calls = 0
+            self.restart_transport_calls = 0
 
         @property
         def state(self):
@@ -983,6 +986,66 @@ class TestAPI:
         async def connect(self):
             self.connect_calls += 1
             self._state = self._TS.CONNECTED
+
+        async def restart_transport(
+            self,
+            *,
+            configure=None,
+            bring_up=None,
+            connect_wrapper=None,
+            suppress_teardown_errors=False,
+        ):
+            self.restart_transport_calls += 1
+            if configure is not None:
+                result = configure()
+                if inspect.isawaitable(result):
+                    await result
+            try:
+                await self.disconnect()
+            except Exception:
+                if not suppress_teardown_errors:
+                    raise
+            if bring_up is not None:
+                result = bring_up()
+                if inspect.isawaitable(result):
+                    await result
+            elif connect_wrapper is not None:
+                await connect_wrapper(self.connect)
+            else:
+                await self.connect()
+
+    def test_replacement_routes_use_one_transport_chokepoint(self):
+        """R3 P1-2: API replacement routes cannot recompose raw teardown/start."""
+        api_path = Path(__file__).parents[1] / "src" / "pinky_daemon" / "api.py"
+        module = ast.parse(api_path.read_text(encoding="utf-8"))
+        replacement_routes = {
+            "_restart_streaming_session_after_response",
+            "set_streaming_model",
+            "archive_streaming_session",
+            "_watchdog_recover",
+            "_watchdog_mcp_recover",
+            "admin_force_restart_agent",
+        }
+        functions = {
+            node.name: node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and node.name in replacement_routes
+        }
+
+        assert functions.keys() == replacement_routes
+        for name, function in functions.items():
+            session_calls = [
+                node.func.attr
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "ss"
+            ]
+            assert "restart_transport" in session_calls, name
+            assert "disconnect" not in session_calls, name
+            assert "connect" not in session_calls, name
 
     def test_root(self):
         client = self._make_client()

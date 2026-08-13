@@ -309,6 +309,28 @@ def test_flag_on_trust_seed_preserves_unmanaged_agent_config(
     assert not (shared_home / "config.toml").exists()
 
 
+@pytest.mark.asyncio
+async def test_restart_transport_preflight_refusal_preserves_tmux_transport(
+    monkeypatch, tmp_path
+):
+    """R3 P1-2: the common API chokepoint protects Codex tmux too."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    shared_home.mkdir()
+    working_dir.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    ss = _session(working_dir=str(working_dir))
+    ss.disconnect = AsyncMock()
+    ss.connect = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="shared auth file is absent"):
+        await ss.restart_transport()
+
+    ss.disconnect.assert_not_awaited()
+    ss.connect.assert_not_awaited()
+
+
 # ── tailer class ────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_start_tailer_uses_codex_tailer(monkeypatch):

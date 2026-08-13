@@ -41,6 +41,7 @@ from pinky_daemon.streaming_session import (
     _log,
     _notify_turn_idle,
 )
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
     OwnerToken,
     SessionState,
@@ -84,7 +85,7 @@ class CodexTurnResult:
         return max(0, self.input_tokens - self.cached_input_tokens)
 
 
-class CodexSession:
+class CodexSession(TransportReplacementMixin):
     """Agent session backed by Codex CLI.
 
     Drop-in replacement for StreamingSession — exposes the same public
@@ -934,6 +935,10 @@ class CodexSession:
         if not per_agent_codex_home_enabled():
             return None
         return str(prepare_agent_codex_home(self._config, log=_log))
+
+    def _preflight_transport_replacement(self) -> None:
+        """Keep retained-session replacement refusal ahead of teardown."""
+        self._preflight_agent_codex_home()
 
     async def _exec_codex(
         self,

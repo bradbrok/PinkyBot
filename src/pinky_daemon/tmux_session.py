@@ -88,6 +88,7 @@ from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
 )
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
     SessionState,
     StateMachine,
@@ -1285,7 +1286,7 @@ _MODEL_DIALOG_NEEDLES = ("change model", "switch model?")
 _MODEL_ERROR_NEEDLES = ("unknown model", "invalid model", "not a valid model")
 
 
-class TmuxSession:
+class TmuxSession(TransportReplacementMixin):
     """Agent session backed by an interactive ``claude`` REPL in tmux.
 
     Implements the ``Transport`` protocol (see ``transport.py``). Drop-in

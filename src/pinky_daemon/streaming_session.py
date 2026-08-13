@@ -21,6 +21,7 @@ from pathlib import Path
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import (
@@ -264,7 +265,7 @@ def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
     return name
 
 
-class StreamingSession:
+class StreamingSession(TransportReplacementMixin):
     """Persistent bidirectional Claude Code session via SDK client.
 
     Unlike Session which blocks on each send(), StreamingSession:

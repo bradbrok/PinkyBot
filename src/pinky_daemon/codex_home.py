@@ -14,6 +14,7 @@ import time
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import BinaryIO
@@ -25,13 +26,29 @@ MIGRATION_LOCK_TIMEOUT_ENV = "PINKY_CODEX_HOME_LOCK_TIMEOUT_SECONDS"
 
 _MIGRATION_TEMP_PREFIX = ".pinkybot-rollout-migration-"
 _MIGRATION_TEMP_SUFFIX = ".tmp"
+_MIGRATION_CLAIM_PREFIX = ".pinkybot-rollout-claim-"
 _MIGRATION_QUARANTINE_PREFIX = ".pinkybot-rollout-quarantine-"
 _MIGRATION_LOCK_NAME = ".pinkybot-rollout-migration.lock"
 _MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
+_PRESERVATION_RESERVATION_SUFFIX = ".reserve"
 _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 10.0
 _MIGRATION_LOCK_RETRY_SECONDS = 0.05
 
 LogFn = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class _RolloutCandidate:
+    """A canonical rollout path and an optional crash-recovery claim."""
+
+    canonical: Path
+    claim: Path | None = None
+
+
+@dataclass(frozen=True)
+class _MoveResult:
+    moved: int
+    claimed_sources: frozenset[Path]
 
 
 def per_agent_codex_home_enabled() -> bool:
@@ -238,6 +255,47 @@ def _migration_lock_entry_kind(entry_stat: os.stat_result) -> str:
     return ""
 
 
+@contextmanager
+def _reserve_preservation_destination(
+    source: Path,
+    name_prefix: str,
+) -> Iterator[Path]:
+    """Reserve a collision-free preservation name without replacing data.
+
+    Every attempt gets a fresh UUID and an adjacent O_EXCL reservation.  A
+    pre-existing preservation artifact or reservation loses that attempt and
+    forces a new name.  The reservation serializes cooperating preservers while
+    ``os.rename`` moves the entry to a path proven unused; unlike ``os.replace``,
+    the move can never intentionally overwrite a retained artifact.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec
+    while True:
+        destination = source.with_name(
+            f"{name_prefix}{source.name}-{uuid.uuid4().hex}"
+        )
+        reservation = destination.with_name(
+            f".{destination.name}{_PRESERVATION_RESERVATION_SUFFIX}"
+        )
+        try:
+            reservation_fd = os.open(reservation, flags, 0o600)
+        except FileExistsError:
+            continue
+        os.close(reservation_fd)
+        if _path_entry_exists(destination):
+            reservation.unlink()
+            continue
+        try:
+            yield destination
+        finally:
+            try:
+                reservation.unlink()
+            except FileNotFoundError:
+                pass
+        return
+
+
 def _rename_migration_lock_aside(
     lock_path: Path,
     entry_stat: os.stat_result,
@@ -254,10 +312,11 @@ def _rename_migration_lock_aside(
         entry_stat.st_ino,
     ):
         return False
-    aside = lock_path.with_name(
-        f"{_MIGRATION_LOCK_ASIDE_PREFIX}{lock_path.name}-{uuid.uuid4().hex}"
-    )
-    os.replace(lock_path, aside)
+    with _reserve_preservation_destination(
+        lock_path,
+        _MIGRATION_LOCK_ASIDE_PREFIX,
+    ) as aside:
+        os.rename(lock_path, aside)
     _fsync_directory(lock_path.parent)
     log(f"codex-home: renamed {kind} migration lock entry {lock_path} aside as {aside}")
     return True
@@ -364,17 +423,18 @@ def _sweep_migration_temps(destination_sessions: Path, log: LogFn) -> None:
 
 def _quarantine_rollout(destination: Path, log: LogFn) -> Path:
     """Atomically move an invalid final aside so it cannot shadow discovery."""
-    quarantine = destination.with_name(
-        f"{_MIGRATION_QUARANTINE_PREFIX}{destination.name}-{uuid.uuid4().hex}"
-    )
-    os.replace(destination, quarantine)
+    with _reserve_preservation_destination(
+        destination,
+        _MIGRATION_QUARANTINE_PREFIX,
+    ) as quarantine:
+        os.rename(destination, quarantine)
     _fsync_directory(destination.parent)
     log(f"codex-home: quarantined invalid rollout migration final {destination} as {quarantine}")
     return quarantine
 
 
 def _install_rollout(
-    source: Path,
+    claim: Path,
     destination: Path,
     target_cwd: str,
     *,
@@ -382,33 +442,33 @@ def _install_rollout(
 ) -> bool:
     """Install one rollout with crash recovery and concurrent convergence.
 
-    The source remains authoritative until an exact copy is fsynced, atomically
-    installed, and revalidated at the final path. ``True`` means this caller
-    either completed the move or observed another migrator's valid result.
+    ``claim`` is a private name established by atomically renaming the canonical
+    source before this function is entered.  All reads, verification, and
+    cleanup stay on that private name.  A writer arriving after the rename must
+    create a fresh canonical file, which this migration never removes and a
+    later prepare can migrate independently.
     """
     destination.parent.mkdir(parents=True, exist_ok=True)
 
     if _path_entry_exists(destination):
         try:
-            source_signature = _file_signature(source)
+            claim_signature = _file_signature(claim)
         except FileNotFoundError:
             if _rollout_is_valid(destination, target_cwd):
                 log(
                     f"codex-home: rollout migration converged at {destination}; "
-                    "source was already claimed"
+                    "private claim was already consumed"
                 )
                 return True
             raise
         if _rollout_is_valid(
             destination,
             target_cwd,
-            expected_signature=source_signature,
+            expected_signature=claim_signature,
         ):
             try:
-                if _file_signature(source) != source_signature:
-                    raise RuntimeError(f"rollout changed before source removal: {source}")
-                source.unlink()
-                _fsync_directory(source.parent)
+                claim.unlink()
+                _fsync_directory(claim.parent)
             except FileNotFoundError:
                 pass
             log(f"codex-home: rollout migration converged at {destination}")
@@ -424,7 +484,7 @@ def _install_rollout(
     try:
         copied_digest = hashlib.sha256()
         copied_size = 0
-        with source.open("rb") as source_handle, os.fdopen(temp_fd, "wb") as temp_handle:
+        with claim.open("rb") as source_handle, os.fdopen(temp_fd, "wb") as temp_handle:
             temp_fd = -1
             while chunk := source_handle.read(1024 * 1024):
                 temp_handle.write(chunk)
@@ -434,10 +494,11 @@ def _install_rollout(
             os.fsync(temp_handle.fileno())
         copied_signature = (copied_size, copied_digest.hexdigest())
 
-        # Detect an append/change racing the copy; never unlink a newer source
-        # than the snapshot we actually installed.
-        if _file_signature(source) != copied_signature:
-            raise RuntimeError(f"rollout changed during migration: {source}")
+        # A descriptor opened before the claim rename can still change the
+        # claimed inode.  Detect that shape before install and leave the claim
+        # intact for retry; name-based late writers use the fresh canonical path.
+        if _file_signature(claim) != copied_signature:
+            raise RuntimeError(f"rollout claim changed during migration: {claim}")
         if not _rollout_is_valid(
             temp_path,
             target_cwd,
@@ -455,32 +516,18 @@ def _install_rollout(
             _quarantine_rollout(destination, log)
             raise RuntimeError(f"rollout migration final failed validation: {destination}")
 
-        try:
-            if _file_signature(source) != copied_signature:
-                raise RuntimeError(f"rollout changed before source removal: {source}")
-            source.unlink()
-            _fsync_directory(source.parent)
-        except FileNotFoundError:
-            # A same-source migrator won the unlink race. Its destination is
-            # the same relative final; our validated atomic install converged.
-            if not _rollout_is_valid(
-                destination,
-                target_cwd,
-                expected_signature=copied_signature,
-            ):
-                raise
-            log(
-                f"codex-home: rollout migration converged at {destination}; "
-                "source was already claimed"
-            )
+        # Removal targets only the private claim.  There is deliberately no
+        # check-then-remove pair on the canonical writer path.
+        claim.unlink()
+        _fsync_directory(claim.parent)
         return True
     except FileNotFoundError:
-        # The source may disappear after glob/read when a concurrent migrator
-        # claims it. Count the valid final as convergence instead of raising.
+        # A crash-recovery claim may already have been consumed by a concurrent
+        # process. Count a valid final as convergence instead of raising.
         if _rollout_is_valid(destination, target_cwd):
             log(
                 f"codex-home: rollout migration converged at {destination}; "
-                "source was already claimed"
+                "private claim was already consumed"
             )
             return True
         raise
@@ -491,6 +538,86 @@ def _install_rollout(
             temp_path.unlink()
         except FileNotFoundError:
             pass
+
+
+def _claim_original_path(claim: Path) -> Path | None:
+    """Decode the canonical source path represented by a private claim."""
+    if not claim.name.startswith(_MIGRATION_CLAIM_PREFIX):
+        return None
+    encoded = claim.name[len(_MIGRATION_CLAIM_PREFIX) :]
+    claim_id, separator, original_name = encoded.partition("-")
+    if (
+        not separator
+        or len(claim_id) != 32
+        or any(character not in "0123456789abcdef" for character in claim_id)
+        or not original_name.startswith("rollout-")
+        or not original_name.endswith(".jsonl")
+    ):
+        return None
+    return claim.with_name(original_name)
+
+
+def _claim_rollout(source: Path) -> Path | None:
+    """Atomically remove the canonical writer target before migration reads."""
+    while True:
+        claim = source.with_name(
+            f"{_MIGRATION_CLAIM_PREFIX}{uuid.uuid4().hex}-{source.name}"
+        )
+        if _path_entry_exists(claim):
+            continue
+        try:
+            os.rename(source, claim)
+        except FileNotFoundError:
+            return None
+        _fsync_directory(source.parent)
+        return claim
+
+
+def _snapshot_rollout_candidates(source_sessions: Path) -> list[_RolloutCandidate]:
+    """Return recoverable claims first, then live canonical rollout names."""
+    claims: list[_RolloutCandidate] = []
+    claim_pattern = f"**/{_MIGRATION_CLAIM_PREFIX}*-rollout-*.jsonl"
+    for claim in sorted(source_sessions.glob(claim_pattern)):
+        canonical = _claim_original_path(claim)
+        if canonical is not None:
+            claims.append(_RolloutCandidate(canonical=canonical, claim=claim))
+    canonical = [
+        _RolloutCandidate(path)
+        for path in sorted(source_sessions.glob("**/rollout-*.jsonl"))
+    ]
+    return [*claims, *canonical]
+
+
+def _retry_rollout_candidates(
+    source_sessions: Path,
+    relative_sources: list[str],
+) -> list[_RolloutCandidate]:
+    """Resolve marker-pinned canonical paths and their private crash claims."""
+    candidates: list[_RolloutCandidate] = []
+    seen: set[tuple[Path, Path | None]] = set()
+    for raw_relative in relative_sources:
+        relative = Path(raw_relative)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.name.startswith("rollout-")
+            or not relative.name.endswith(".jsonl")
+        ):
+            continue
+        canonical = source_sessions / relative
+        claim_pattern = f"{_MIGRATION_CLAIM_PREFIX}*-{canonical.name}"
+        for claim in sorted(canonical.parent.glob(claim_pattern)):
+            if _claim_original_path(claim) == canonical:
+                key = (canonical, claim)
+                if key not in seen:
+                    candidates.append(_RolloutCandidate(canonical, claim))
+                    seen.add(key)
+        if _path_entry_exists(canonical):
+            key = (canonical, None)
+            if key not in seen:
+                candidates.append(_RolloutCandidate(canonical))
+                seen.add(key)
+    return candidates
 
 
 def move_matching_rollouts(
@@ -505,8 +632,9 @@ def move_matching_rollouts(
     destination_sessions = destination_home / "sessions"
     target_cwd = os.path.realpath(str(working_dir))
     # Snapshot before locking so a contender that saw the same source before
-    # the winner claimed it can still converge on the installed final.
-    candidates = list(source_sessions.glob("**/rollout-*.jsonl"))
+    # the winner claimed it can still converge on the installed final. Private
+    # crash claims lead the list so a newer canonical recreation wins last.
+    candidates = _snapshot_rollout_candidates(source_sessions)
     destination_sessions.mkdir(parents=True, exist_ok=True)
     lock_path = destination_sessions / _MIGRATION_LOCK_NAME
     with _acquire_migration_lock(lock_path, log):
@@ -520,25 +648,30 @@ def move_matching_rollouts(
             destination_sessions,
             target_cwd,
             log=log,
-        )
+        ).moved
 
 
 def _move_rollout_candidates(
-    candidates: list[Path],
+    candidates: list[_RolloutCandidate],
     source_sessions: Path,
     destination_sessions: Path,
     target_cwd: str,
     *,
     log: LogFn,
-) -> int:
+) -> _MoveResult:
     """Move a pre-lock snapshot while holding the destination writer lock."""
     moved = 0
-    for source in candidates:
+    claimed_sources: set[Path] = set()
+    for candidate in candidates:
+        source = candidate.canonical
         relative = source.relative_to(source_sessions)
         destination = destination_sessions / relative
-        rollout_cwd = _rollout_cwd(source)
+        inspection_path = candidate.claim or source
+        rollout_cwd = _rollout_cwd(inspection_path)
         if not rollout_cwd:
-            if not _path_entry_exists(source) and _rollout_is_valid(destination, target_cwd):
+            if not _path_entry_exists(inspection_path) and _rollout_is_valid(
+                destination, target_cwd
+            ):
                 log(
                     f"codex-home: rollout migration converged at {destination}; "
                     "source was already claimed"
@@ -547,17 +680,37 @@ def _move_rollout_candidates(
             continue
         if os.path.realpath(rollout_cwd) != target_cwd:
             continue
-        if _install_rollout(source, destination, target_cwd, log=log):
+        claim = candidate.claim or _claim_rollout(source)
+        if claim is None:
+            if _rollout_is_valid(destination, target_cwd):
+                log(
+                    f"codex-home: rollout migration converged at {destination}; "
+                    "source was already claimed"
+                )
+                moved += 1
+            continue
+        claimed_sources.add(source)
+        if _install_rollout(claim, destination, target_cwd, log=log):
             moved += 1
-    return moved
+    return _MoveResult(moved=moved, claimed_sources=frozenset(claimed_sources))
 
 
-def _write_migration_marker(codex_home: Path, moved: int) -> None:
+def _write_migration_marker(
+    codex_home: Path,
+    moved: int,
+    *,
+    retry_sources: list[str],
+) -> None:
     """Durably commit the one-time migration gate after a successful scan."""
     marker = codex_home / ROLLOUT_MIGRATION_MARKER
     payload = {
         "completed_at": datetime.now(timezone.utc).isoformat(),
         "moved_count": moved,
+        # Exact paths claimed during the one-time bridge remain eligible for a
+        # bounded retry. A writer recreating one of those canonical names after
+        # the atomic claim is therefore migrated on the next prepare without
+        # reopening the shared store to arbitrary late rollouts.
+        "retry_sources": retry_sources,
     }
     fd, temp_name = tempfile.mkstemp(
         dir=codex_home,
@@ -583,6 +736,23 @@ def _write_migration_marker(codex_home: Path, moved: int) -> None:
             pass
 
 
+def _read_marker_retry_sources(marker: Path) -> list[str]:
+    """Read retry paths from a managed marker; malformed markers fail closed."""
+    try:
+        marker_stat = marker.lstat()
+        if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_nlink > 1:
+            return []
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw_sources = payload.get("retry_sources")
+    if not isinstance(raw_sources, list):
+        return []
+    return [source for source in raw_sources if isinstance(source, str)]
+
+
 def _run_initial_rollout_migration(
     shared_home: Path,
     resolved_home: Path,
@@ -601,22 +771,53 @@ def _run_initial_rollout_migration(
     """
     marker = resolved_home / ROLLOUT_MIGRATION_MARKER
     if _path_entry_exists(marker):
-        log(f"codex-home: migration marker present at {marker}; shared rollout store not scanned")
-        return 0
+        retry_sources = _read_marker_retry_sources(marker)
+        if not retry_sources:
+            log(
+                f"codex-home: migration marker present at {marker}; "
+                "shared rollout store not scanned"
+            )
+            return 0
+        source_sessions = shared_home / "sessions"
+        destination_sessions = resolved_home / "sessions"
+        candidates = _retry_rollout_candidates(source_sessions, retry_sources)
+        if not candidates:
+            log(
+                f"codex-home: migration marker present at {marker}; "
+                "no claimed source path requires retry"
+            )
+            return 0
+        target_cwd = os.path.realpath(str(working_dir))
+        lock_path = destination_sessions / _MIGRATION_LOCK_NAME
+        with _acquire_migration_lock(lock_path, log):
+            _sweep_migration_temps(destination_sessions, log)
+            result = _move_rollout_candidates(
+                candidates,
+                source_sessions,
+                destination_sessions,
+                target_cwd,
+                log=log,
+            )
+        log(
+            f"codex-home: migration marker retry converged on "
+            f"{result.moved} rollout(s)"
+        )
+        return result.moved
 
     source_sessions = shared_home / "sessions"
     destination_sessions = resolved_home / "sessions"
-    candidates = list(source_sessions.glob("**/rollout-*.jsonl"))
+    candidates = _snapshot_rollout_candidates(source_sessions)
     target_cwd = os.path.realpath(str(working_dir))
     lock_path = destination_sessions / _MIGRATION_LOCK_NAME
     with _acquire_migration_lock(lock_path, log):
         if _path_entry_exists(marker):
             converged = sum(
                 _rollout_is_valid(
-                    destination_sessions / source.relative_to(source_sessions),
+                    destination_sessions
+                    / candidate.canonical.relative_to(source_sessions),
                     target_cwd,
                 )
-                for source in candidates
+                for candidate in candidates
             )
             log(
                 f"codex-home: concurrent rollout migration converged on "
@@ -624,15 +825,23 @@ def _run_initial_rollout_migration(
             )
             return converged
         _sweep_migration_temps(destination_sessions, log)
-        moved = _move_rollout_candidates(
+        result = _move_rollout_candidates(
             candidates,
             source_sessions,
             destination_sessions,
             target_cwd,
             log=log,
         )
-        _write_migration_marker(resolved_home, moved)
-        return moved
+        retry_sources = sorted(
+            str(source.relative_to(source_sessions))
+            for source in result.claimed_sources
+        )
+        _write_migration_marker(
+            resolved_home,
+            result.moved,
+            retry_sources=retry_sources,
+        )
+        return result.moved
 
 
 def prepare_agent_codex_home(agent: object, *, log: LogFn) -> Path:
