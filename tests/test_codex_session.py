@@ -971,6 +971,8 @@ class TestCodexPendingWakeCallback:
         await _to_connected(s)
 
         fires: list[str] = []
+        idle_agents: list[str] = []
+        s._config.on_turn_idle = idle_agents.append
         s._pending_wake_callback = lambda: fires.append("delivered")
 
         async def fake_exec(prompt: str) -> CodexTurnResult:
@@ -994,6 +996,7 @@ class TestCodexPendingWakeCallback:
         assert fires == ["delivered"], (
             "pending_wake_callback must fire exactly once on exec-success"
         )
+        assert idle_agents == [s.agent_name]
         # And cleared so it doesn't re-fire on a subsequent non-wake turn.
         assert s._pending_wake_callback is None
 

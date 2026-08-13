@@ -3159,6 +3159,20 @@ def create_api(
                 f"{agent_name} (reason={reason.value}): {e}"
             )
 
+    def _notify_scheduler_turn_idle(agent_name: str) -> None:
+        """Drain deferred scheduler work at a confirmed idle boundary."""
+        try:
+            scheduler_instance = _scheduler_holder.get("scheduler")
+            if scheduler_instance is not None:
+                scheduler_instance.notify_agent_idle(agent_name)
+        except Exception as e:
+            _log(
+                "api: SCHEDULER_IDLE_TRIGGER_FAILURE for "
+                f"{agent_name}: {type(e).__name__}: {e}"
+            )
+
+    app.state._notify_scheduler_turn_idle = _notify_scheduler_turn_idle
+
     # Exposed for unit-test reach-in (verifying centralized wake logging
     # advances the cycle-gate boundary). Not part of the public API.
     app.state._log_agent_wake_event = _log_agent_wake_event
@@ -3767,6 +3781,7 @@ def create_api(
             wake_context=_build_streaming_wake_context(agent_name, commit=False),
             wake_context_builder=_build_streaming_wake_context,
             on_wake_delivered=_log_agent_wake_event,
+            on_turn_idle=_notify_scheduler_turn_idle,
             wake_submission_recovery_injector=_inject_wake_context_reload,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             # #943: verdict-time fresh read of the persisted field that the

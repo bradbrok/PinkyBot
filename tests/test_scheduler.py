@@ -1345,24 +1345,25 @@ class TestScheduler:
         scheduler = AgentScheduler(registry, wake_callback=confirmed)
         await scheduler._replay_pending_locked("oleg")
 
-        assert len(attempts) == 2
+        assert len(attempts) == 1
         assert "Note: 1 fire of recurring schedule 'minutely'" in attempts[0]
         assert "The work that fire would have done was NOT performed." in attempts[0]
-        assert attempts[0].endswith("\n\nboundary frozen prompt")
-        assert attempts[1] == "fresh frozen prompt"
+        assert attempts[0].endswith("\n\nfresh frozen prompt")
         assert registry.list_recurring_schedule_stale_drops("oleg") == []
         assert registry.get_schedule_wake_by_fire(
             schedule.id, stale.fired_at
         ) is None
-        assert registry.get_schedule_wake_by_fire(
+        collapsed = registry.get_schedule_wake_by_fire(
             schedule.id, boundary.fired_at
-        ).accepted_at == pytest.approx(now)
+        )
+        assert collapsed.parked_at == pytest.approx(now)
+        assert collapsed.last_error.startswith("recurrence collapsed")
         assert registry.get_schedule_wake_by_fire(
             schedule.id, fresh.fired_at
         ).accepted_at == pytest.approx(now)
         logs = capsys.readouterr().err
         assert f"PERSISTED_WAKE_STALE_DROPPED pending #{stale.id}" in logs
-        assert "count=3" in logs
+        assert "RECURRENCE_COLLAPSED" in logs
         assert "oldest_age_s=61.0" in logs
 
     @pytest.mark.asyncio
@@ -1629,7 +1630,7 @@ class TestScheduler:
             asyncio.gather(*delivery_tasks, return_exceptions=True), timeout=1
         )
 
-        assert attempts == ["same schedule", "same schedule"]
+        assert attempts == ["same schedule"]
         assert [
             pending.fired_at
             for pending in registry.list_pending_schedule_wakes("oleg")
@@ -1714,6 +1715,186 @@ class TestScheduler:
         assert registry.get_schedules("oleg")[0].last_delivered > 0
         assert registry.list_pending_schedule_wakes("oleg") == []
         assert "already pasted to the transport" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_receipt_ceiling_uses_persisted_fired_at_across_restart(
+        self, registry, monkeypatch, capsys
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="aged", prompt="already pasted"
+        )
+        fired_at = 1_800_000_000.0
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        db_path = registry._db_path
+        registry.close()
+        restarted_registry = AgentRegistry(db_path=db_path)
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: fired_at + 91.0
+        )
+        receipt = asyncio.get_running_loop().create_future()
+
+        async def pasted(agent_name, session_id, prompt, **kwargs):
+            del agent_name, session_id, prompt, kwargs
+            return receipt
+
+        restarted = AgentScheduler(
+            restarted_registry,
+            wake_callback=pasted,
+            delivery_inflight_fn=lambda agent_name, prompt: True,
+            schedule_delivery_timeout=10.0,
+            receipt_extension_max_age_sec=90.0,
+        )
+        restarted.replay_pending_for_agent("worker")
+        await restarted._pending_replay_tasks["worker"]
+
+        ledger = restarted_registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        )
+        assert ledger.ledger_state == "quarantined"
+        assert "RECEIPT_ABANDONED" in ledger.last_error
+        assert not restarted._schedule_delivery_locks["worker"].locked()
+        assert "age_s=91.0 ceiling_s=90.0" in capsys.readouterr().err
+        receipt.set_result(True)
+        await asyncio.gather(*list(restarted._detached_receipt_tasks))
+        assert restarted_registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
+        restarted_registry.close()
+
+    @pytest.mark.asyncio
+    async def test_pending_recurrences_collapse_to_newest_with_trace(
+        self, registry, capsys
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="hourly", prompt="run once"
+        )
+        now = time.time()
+        rows = [
+            registry.persist_schedule_wake(
+                schedule.id,
+                agent_name="worker",
+                schedule_name=schedule.name,
+                prompt=schedule.prompt,
+                fired_at=now + offset,
+            )[0]
+            for offset in (1.0, 2.0, 3.0)
+        ]
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        await scheduler._replay_pending_locked("worker")
+
+        assert attempts == ["run once"]
+        ledger = registry.list_schedule_wake_ledger("worker")
+        by_id = {row.id: row for row in ledger}
+        assert by_id[rows[2].id].ledger_state == "receipted-ran-once"
+        assert all(
+            by_id[row.id].ledger_state == "quarantined"
+            and by_id[row.id].last_error.startswith("recurrence collapsed")
+            for row in rows[:2]
+        )
+        assert capsys.readouterr().err.count("RECURRENCE_COLLAPSED") == 2
+
+    @pytest.mark.asyncio
+    async def test_busy_fire_waits_for_idle_trigger_then_delivers(
+        self, registry
+    ):
+        registry.register("worker")
+        registry.add_schedule(
+            "worker", "* * * * *", name="idle-driven", prompt="deliver on idle"
+        )
+        attempts: list[str] = []
+        busy = True
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_busy_fn=lambda agent_name: busy,
+        )
+        await scheduler._check_schedules(time.time())
+        await asyncio.gather(
+            *list(scheduler._schedule_delivery_tasks),
+            return_exceptions=True,
+        )
+        assert attempts == []
+        assert len(registry.list_pending_schedule_wakes("worker")) == 1
+
+        busy = False
+        scheduler.notify_agent_idle("worker")
+        await scheduler._pending_replay_tasks["worker"]
+
+        assert attempts == ["deliver on idle"]
+        assert registry.list_pending_schedule_wakes("worker") == []
+
+    @pytest.mark.asyncio
+    async def test_idle_trigger_during_replay_guarantees_follow_up_pass(
+        self, registry
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="follow-up", prompt="deliver later"
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=time.time(),
+        )
+        attempts: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        first_started = asyncio.Event()
+        release_first = asyncio.Event()
+        original_replay = scheduler._replay_pending_locked
+        passes = 0
+
+        async def controlled_replay(agent_name):
+            nonlocal passes
+            passes += 1
+            if passes == 1:
+                first_started.set()
+                await release_first.wait()
+                return
+            await original_replay(agent_name)
+
+        scheduler._replay_pending_locked = controlled_replay
+        scheduler.replay_pending_for_agent("worker")
+        await first_started.wait()
+        scheduler.notify_agent_idle("worker")
+        release_first.set()
+
+        for _ in range(100):
+            if not registry.list_pending_schedule_wakes("worker"):
+                break
+            await asyncio.sleep(0)
+
+        assert passes == 2
+        assert attempts == ["deliver later"]
+        assert registry.list_pending_schedule_wakes("worker") == []
 
     @pytest.mark.asyncio
     async def test_unpasted_wake_still_persists_on_timeout(self, registry):
@@ -2011,6 +2192,12 @@ class TestScheduler:
         schedule = registry.add_schedule(
             "oleg", "* * * * *", name="fifo", prompt="unused"
         )
+        newer_schedule = registry.add_schedule(
+            schedule.agent_name,
+            "* * * * *",
+            name="fifo-newer",
+            prompt="unused",
+        )
         now = time.time()
         registry.persist_schedule_wake(
             schedule.id,
@@ -2020,9 +2207,9 @@ class TestScheduler:
             fired_at=now - 2.0,
         )
         registry.persist_schedule_wake(
-            schedule.id,
+            newer_schedule.id,
             agent_name="oleg",
-            schedule_name="fifo",
+            schedule_name="fifo-newer",
             prompt="newer",
             fired_at=now - 1.0,
         )
@@ -2291,6 +2478,12 @@ class TestScheduler:
         live = registry.add_schedule(
             "oleg", "* * * * *", name="live", prompt="unused"
         )
+        live_two = registry.add_schedule(
+            live.agent_name,
+            "* * * * *",
+            name="live-two",
+            prompt="unused",
+        )
         now = time.time()
         registry.persist_schedule_wake(
             zombie.id,
@@ -2307,9 +2500,9 @@ class TestScheduler:
             fired_at=now - 2.0,
         )
         registry.persist_schedule_wake(
-            live.id,
+            live_two.id,
             agent_name="oleg",
-            schedule_name="live",
+            schedule_name="live-two",
             prompt="live two",
             fired_at=now - 1.0,
         )
@@ -2592,6 +2785,35 @@ class TestScheduler:
         assert wake_calls == []
         assert stored.last_delivered == 0.0
         assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_busy_agent_does_not_defer_independent_direct_send(
+        self, registry
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker",
+            "* * * * *",
+            name="direct",
+            prompt="send now",
+            target_channel="test-channel",
+            direct_send=True,
+        )
+        sent: list[tuple[str, str, str, str]] = []
+
+        async def direct_send(agent_name, platform, chat_id, message):
+            sent.append((agent_name, platform, chat_id, message))
+
+        scheduler = AgentScheduler(
+            registry,
+            direct_send_callback=direct_send,
+            delivery_busy_fn=lambda agent_name: True,
+        )
+        await scheduler._deliver_schedule_group("worker", [schedule])
+
+        assert sent == [
+            ("worker", "telegram", "test-channel", "send now")
+        ]
 
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────

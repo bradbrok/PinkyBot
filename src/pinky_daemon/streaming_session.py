@@ -81,6 +81,20 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _notify_turn_idle(config: "StreamingSessionConfig", agent_name: str) -> None:
+    """Report a real turn boundary without letting callback failures escape."""
+    callback = config.on_turn_idle
+    if callback is None:
+        return
+    try:
+        callback(agent_name)
+    except Exception as exc:
+        _log(
+            f"streaming[{agent_name}]: on_turn_idle callback failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 @dataclass
 class StreamingSessionConfig:
     """Configuration for a streaming session."""
@@ -105,6 +119,9 @@ class StreamingSessionConfig:
     # the boundary advances against a wake that never reached the model
     # → the directive would be eaten by a wedged paste.
     on_wake_delivered: object = None  # Callable(agent_name, WakeReason) -> None
+    # Fires when a completed turn leaves no queued transport work. Scheduler
+    # delivery uses this edge to drain durable wakes without timer polling.
+    on_turn_idle: object = None  # Callable(agent_name) -> None
     # Tmux-only #984 recovery seam.  A verified-failed context-restart wake
     # uses this to route a CONTEXT-RELOAD instruction through the broker's
     # agent-message path.  The callback returns a positive handoff bool; the
@@ -999,6 +1016,11 @@ class StreamingSession:
                         self._turn_done.set()
                         # Reset per-turn auth dedupe — turn boundary
                         auth_reported_this_turn = False
+                        if (
+                            self.state == SessionState.CONNECTED
+                            and not self._pending_chats
+                        ):
+                            _notify_turn_idle(self._config, self.agent_name)
                         continue
 
                     # Turn complete — fire response callback
@@ -1166,6 +1188,11 @@ class StreamingSession:
 
                     # Check context usage for auto-restart
                     await self._check_context()
+                    if (
+                        self.state == SessionState.CONNECTED
+                        and not self._pending_chats
+                    ):
+                        _notify_turn_idle(self._config, self.agent_name)
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")

@@ -1097,6 +1097,8 @@ async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
     """Sentinel turns with no content stay silent -- no routing target."""
     ss = _make_session()
     routed: list[str] = []
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
 
     async def capture(turn_result):
         routed.append(turn_result.chat_id)
@@ -1107,6 +1109,7 @@ async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
     await _run_reader_against_stream(ss, [_make_result_message()])
 
     assert routed == []
+    assert idle_agents == [ss.agent_name]
 
 
 # -- idle_sleep must let the memory-save turn finish before teardown ----------

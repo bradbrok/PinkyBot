@@ -361,6 +361,8 @@ async def test_codex_acceptance_reserves_meta_before_same_read_completion():
     """A user_message + task_complete pair can beat paste_text's return."""
     ss = _session()
     ss._state_machine._state = SessionState.CONNECTED
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
     receipt = asyncio.get_running_loop().create_future()
     turn = _QueuedTurn(
         prompt="fast scheduled wake",
@@ -386,6 +388,7 @@ async def test_codex_acceptance_reserves_meta_before_same_read_completion():
         TurnResponse(text="done", stop_reason="task_complete")
     )
     assert len(ss._inflight_metas) == 0
+    assert idle_agents == [ss.agent_name]
 
 
 @pytest.mark.asyncio

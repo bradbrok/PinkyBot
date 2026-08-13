@@ -769,6 +769,20 @@ async def test_turn_complete_consumes_pending_live_effort(fast_settle) -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_complete_notifies_scheduler_at_idle_boundary() -> None:
+    ss, _ = _make_session(agent_name="test-agent", state=SessionState.CONNECTED)
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
+    _seed_inflight(ss)
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="done", stop_reason="stop_hook_summary")
+    )
+
+    assert idle_agents == [ss.agent_name]
+
+
+@pytest.mark.asyncio
 async def test_apply_model_live_idle_types_command(fast_settle) -> None:
     ss, tmux = _make_session(state=SessionState.CONNECTED)
     tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))

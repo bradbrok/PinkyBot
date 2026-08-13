@@ -4915,6 +4915,31 @@ except Exception as exc:
             self._db.commit()
         return cursor.rowcount > 0
 
+    def collapse_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        superseded_by_fired_at: float,
+        collapsed_at: float = 0.0,
+    ) -> bool:
+        """Quarantine one recurrence superseded by a newer pending fire."""
+        timestamp = collapsed_at or time.time()
+        reason = (
+            "recurrence collapsed into newer pending fire "
+            f"fired_at={superseded_by_fired_at}"
+        )
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET parked_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND parked_at=0 AND accepted_at=0""",
+                (timestamp, timestamp, reason, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
     def confirm_pending_schedule_wake(
         self, pending_id: int, *, delivered_at: float = 0.0
     ) -> bool:

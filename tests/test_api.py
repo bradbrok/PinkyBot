@@ -7922,6 +7922,17 @@ class TestBuildStreamingWakeContextReasonGating:
 
             assert replayed == ["dymok"]
 
+    def test_turn_idle_triggers_scheduler_outbox_drain(self):
+        """A transport turn boundary is the scheduler's dequeue signal."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            idle_agents: list[str] = []
+            app.state.scheduler.notify_agent_idle = idle_agents.append
+
+            app.state._notify_scheduler_turn_idle("test-agent")
+
+            assert idle_agents == ["test-agent"]
+
     @pytest.mark.asyncio
     async def test_scheduler_owner_alert_uses_owner_destination(self):
         """The owner-notify callback (dead-letter alerts: PARKED / stale

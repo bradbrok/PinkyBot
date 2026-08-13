@@ -505,7 +505,11 @@ class CodexTmuxSession(TmuxSession):
 
     async def _handle_turn_complete(self, response) -> None:
         """Retire Codex metas coalesced into the just-closed rollout turn."""
-        await super()._handle_turn_complete(response)
+        self._defer_scheduler_idle_notify = True
+        try:
+            await super()._handle_turn_complete(response)
+        finally:
+            self._defer_scheduler_idle_notify = False
         # ``on_entry`` runs before the tailer feeds the following task_complete.
         # Therefore any remaining turn already transport-accepted at this exact
         # callback boundary was accepted inside the turn that just closed. It
@@ -518,6 +522,7 @@ class CodexTmuxSession(TmuxSession):
         self._reconcile_codex_phantom_metas(
             coalesced, reason="accepted_before_task_close"
         )
+        self._notify_scheduler_idle_if_ready()
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Map Codex rollout acceptance onto the shared exact-receipt path."""
