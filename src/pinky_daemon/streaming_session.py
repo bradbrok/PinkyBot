@@ -655,10 +655,7 @@ class StreamingSession(TransportReplacementMixin):
 
         async def _send_wake_prompt() -> None:
             try:
-                await self._client.query(wake_prompt)
-                # Keep ResultMessage pops 1:1 with queries: the wake turn
-                # has no routing target, so enqueue an unrouted sentinel.
-                self._pending_chats.append(("", "", ""))
+                await self._query_unrouted(wake_prompt)
                 _log(
                     f"streaming[{self.agent_name}]: sent wake prompt "
                     f"(reason={wake_reason.value})"
@@ -762,6 +759,28 @@ class StreamingSession(TransportReplacementMixin):
             # Try to reconnect
             await self.attempt_reconnect()
             return False
+
+    async def _query_unrouted(self, prompt: str) -> None:
+        """Submit an internal prompt with boundary-safe bookkeeping.
+
+        The reservation must exist before ``query()`` makes its write visible
+        to the reader; otherwise a fast ResultMessage can complete first and
+        the subsequently appended sentinel becomes stale state for the next
+        turn. Failure removes only this exact reservation because concurrent
+        internal prompts have identical tuple values.
+        """
+        if not self._client:
+            raise RuntimeError("streaming client is unavailable")
+        reservation = ("", "", "")
+        self._pending_chats.append(reservation)
+        try:
+            await self._client.query(prompt)
+        except Exception:
+            for index, pending in enumerate(self._pending_chats):
+                if pending is reservation:
+                    self._pending_chats.pop(index)
+                    break
+            raise
 
     async def _reader_loop(self) -> None:
         """Background loop that reads responses and fires callbacks."""
@@ -919,11 +938,36 @@ class StreamingSession(TransportReplacementMixin):
                     if msg.num_turns and msg.num_turns > 0:
                         _log(f"streaming[{self.agent_name}]: result — turns={msg.num_turns}, cost=${msg.total_cost_usd or 0:.4f}, model_usage={msg.model_usage}")
 
-                    # Get the routing info for this response
-                    if self._pending_chats:
-                        resp_platform, resp_chat_id, resp_message_id = self._pending_chats.pop(0)
+                    # Snapshot and drain every reservation visible when this
+                    # turn boundary starts. The SDK may coalesce several
+                    # queued prompts into one turn/ResultMessage; pop-one left
+                    # the surplus route at the head for an unrelated later
+                    # turn (#1074). There is no await between the high-water
+                    # capture and deletion, so a reservation submitted after
+                    # boundary processing begins survives for the next turn.
+                    boundary_high_water = len(self._pending_chats)
+                    boundary_routes = self._pending_chats[:boundary_high_water]
+                    del self._pending_chats[:boundary_high_water]
+                    routed_boundary_routes = [
+                        route for route in boundary_routes if route[1]
+                    ]
+                    stale_route_count = max(0, boundary_high_water - 1)
+                    if stale_route_count:
+                        _log(
+                            f"streaming[{self.agent_name}]: "
+                            "TURN_BOUNDARY_STALE_ROUTE_DRAIN "
+                            f"stale_entries={stale_route_count} "
+                            f"total_entries={boundary_high_water} "
+                            f"routed_entries={len(routed_boundary_routes)}"
+                        )
+
+                    # A single reservation is unambiguous conversation-source
+                    # metadata. A coalesced turn is not; persist it without a
+                    # platform/chat attribution rather than choosing a lie.
+                    if boundary_high_water == 1:
+                        resp_platform, resp_chat_id, _ = boundary_routes[0]
                     else:
-                        resp_platform, resp_chat_id, resp_message_id = ("", "", "")
+                        resp_platform, resp_chat_id = ("", "")
 
                     # If the SDK reports an error result, discard _last_response — it may
                     # contain raw API error JSON (e.g. content filter, rate limit) that must
@@ -999,25 +1043,30 @@ class StreamingSession(TransportReplacementMixin):
                         # stop in broker.route_response) still runs. The
                         # suppressed content is never forwarded -- route_response
                         # no-ops on empty text.
-                        if self._response_callback and resp_chat_id:
-                            try:
-                                await self._response_callback(TurnResponse(
-                                    agent_name=self.agent_name,
-                                    session_id=self.id,
-                                    platform=resp_platform,
-                                    chat_id=resp_chat_id,
-                                    message_id=resp_message_id,
-                                    text="",
-                                    tool_uses=list(turn_tool_uses),
-                                    used_outreach_tools=any(
-                                        _is_outreach_tool(tool_use.get("tool", ""))
-                                        for tool_use in turn_tool_uses
-                                    ),
-                                    usage=msg.usage or {},
-                                    num_turns=msg.num_turns or 0,
-                                ))
-                            except Exception as e:
-                                _log(f"streaming[{self.agent_name}]: callback error: {e}")
+                        if self._response_callback:
+                            for (
+                                callback_platform,
+                                callback_chat_id,
+                                callback_message_id,
+                            ) in routed_boundary_routes:
+                                try:
+                                    await self._response_callback(TurnResponse(
+                                        agent_name=self.agent_name,
+                                        session_id=self.id,
+                                        platform=callback_platform,
+                                        chat_id=callback_chat_id,
+                                        message_id=callback_message_id,
+                                        text="",
+                                        tool_uses=list(turn_tool_uses),
+                                        used_outreach_tools=any(
+                                            _is_outreach_tool(tool_use.get("tool", ""))
+                                            for tool_use in turn_tool_uses
+                                        ),
+                                        usage=msg.usage or {},
+                                        num_turns=msg.num_turns or 0,
+                                    ))
+                                except Exception as e:
+                                    _log(f"streaming[{self.agent_name}]: callback error: {e}")
                         self._last_response = ""
                         self._current_activity = ""
                         self._activity_log = []
@@ -1036,35 +1085,44 @@ class StreamingSession(TransportReplacementMixin):
                             _notify_turn_idle(self._config, self.agent_name)
                         continue
 
-                    # Turn complete — fire response callback
-                    turn_result = TurnResponse(
-                        agent_name=self.agent_name,
-                        session_id=self.id,
-                        platform=resp_platform,
-                        chat_id=resp_chat_id,
-                        message_id=resp_message_id,
-                        text=self._last_response,
-                        tool_uses=list(turn_tool_uses),
-                        used_outreach_tools=any(
-                            _is_outreach_tool(tool_use.get("tool", ""))
-                            for tool_use in turn_tool_uses
-                        ),
-                        usage=msg.usage or {},
-                        total_cost_usd=msg.total_cost_usd or 0.0,
-                        num_turns=msg.num_turns or 0,
-                        model_usage=msg.model_usage or {},
-                    )
-
-                    # Fire whenever there's content OR a routing target: a
-                    # routed turn with no text/tools must still reach
-                    # broker.route_response so the typing indicator stops.
-                    if self._response_callback and (
-                        turn_result.response_text or turn_result.tool_uses or resp_chat_id
-                    ):
-                        try:
-                            await self._response_callback(turn_result)
-                        except Exception as e:
-                            _log(f"streaming[{self.agent_name}]: callback error: {e}")
+                    # Fire once per routed reservation so every typing/voice
+                    # marker is retired. With no route, fire one web-only
+                    # result when the turn has content/tools. route_response is
+                    # delivery-suppressed; explicit outreach tools have already
+                    # performed any authorized delivery.
+                    callback_routes = routed_boundary_routes or [("", "", "")]
+                    if self._response_callback:
+                        for (
+                            callback_platform,
+                            callback_chat_id,
+                            callback_message_id,
+                        ) in callback_routes:
+                            turn_result = TurnResponse(
+                                agent_name=self.agent_name,
+                                session_id=self.id,
+                                platform=callback_platform,
+                                chat_id=callback_chat_id,
+                                message_id=callback_message_id,
+                                text=self._last_response,
+                                tool_uses=list(turn_tool_uses),
+                                used_outreach_tools=any(
+                                    _is_outreach_tool(tool_use.get("tool", ""))
+                                    for tool_use in turn_tool_uses
+                                ),
+                                usage=msg.usage or {},
+                                total_cost_usd=msg.total_cost_usd or 0.0,
+                                num_turns=msg.num_turns or 0,
+                                model_usage=msg.model_usage or {},
+                            )
+                            if (
+                                turn_result.response_text
+                                or turn_result.tool_uses
+                                or callback_chat_id
+                            ):
+                                try:
+                                    await self._response_callback(turn_result)
+                                except Exception as e:
+                                    _log(f"streaming[{self.agent_name}]: callback error: {e}")
 
                     # A successful (non-errored) turn proves Claude auth is
                     # working again — clear any auth-fail tracking for this
@@ -1247,9 +1305,7 @@ class StreamingSession(TransportReplacementMixin):
                     f"or call context_restart when ready."
                 )
                 try:
-                    await self._client.query(warn_msg)
-                    # Unrouted system turn -- keep ResultMessage pops 1:1
-                    self._pending_chats.append(("", "", ""))
+                    await self._query_unrouted(warn_msg)
                     self._context_warned = True
                     _log(f"streaming[{self.agent_name}]: warned agent at {pct}% context")
                 except Exception as e:
@@ -1289,9 +1345,7 @@ class StreamingSession(TransportReplacementMixin):
             f"{detail} Use save_my_context() now, then retry once you've saved your latest work."
         )
         try:
-            await self._client.query(warn_msg)
-            # Unrouted system turn -- keep ResultMessage pops 1:1
-            self._pending_chats.append(("", "", ""))
+            await self._query_unrouted(warn_msg)
         except Exception:
             pass
 
@@ -1384,9 +1438,7 @@ class StreamingSession(TransportReplacementMixin):
         sends_before = self._stats["messages_sent"]
         try:
             self._turn_done.clear()
-            await self._client.query(build_idle_sleep_prompt())
-            # Unrouted system turn -- keep ResultMessage pops 1:1
-            self._pending_chats.append(("", "", ""))
+            await self._query_unrouted(build_idle_sleep_prompt())
             _log(f"streaming[{self.agent_name}]: memory save prompt sent before idle sleep")
             # query() returns as soon as the prompt hits the transport; it
             # does NOT wait for the turn. Give the save turn a bounded
