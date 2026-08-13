@@ -55,6 +55,10 @@ from pinky_daemon.wake_prompt import WakeReason
 
 APP_SERVER_INIT_TIMEOUT = 20.0
 APP_SERVER_TERMINAL_STREAM_TIMEOUT = 5.0
+# Permit one cancellation-resistant survivor while the newest generation runs.
+# Further deliveries are dropped loudly until a retained callback truly exits;
+# otherwise repeated cancellation suppression can grow retained work forever.
+APP_SERVER_TERMINAL_STREAM_MAX_LIVE_CALLBACKS = 2
 _APP_SERVER_INIT_TIMEOUT_ENV = "PINKY_CODEX_APP_SERVER_INIT_TIMEOUT"
 _APP_SERVER_AGENTS_ENV = "PINKY_CODEX_APP_SERVER_AGENTS"
 _APP_SERVER_COMMAND_ENV = "PINKY_CODEX_APP_SERVER_CMD"
@@ -281,6 +285,8 @@ class CodexSession(TransportReplacementMixin):
         self._turn_done: asyncio.Future | None = None
         self._appserver_terminal_stream_tasks: set[asyncio.Task[None]] = set()
         self._appserver_terminal_stream_tail: asyncio.Task[None] | None = None
+        self._appserver_terminal_stream_pending: tuple[int, dict] | None = None
+        self._appserver_terminal_stream_generation = 0
         # Latest per-turn token breakdown from thread/tokenUsage/updated —
         # app-server reports usage out-of-band, not inside turn/completed.
         self._appserver_last_usage: dict = {}
@@ -1733,7 +1739,14 @@ class CodexSession(TransportReplacementMixin):
             {callback_task}, timeout=APP_SERVER_TERMINAL_STREAM_TIMEOUT
         )
         if done:
-            await callback_task
+            try:
+                await callback_task
+            except asyncio.CancelledError:
+                current = asyncio.current_task()
+                if current is not None and current.cancelling():
+                    raise
+                # A callback that cancels itself is a completed best-effort
+                # delivery, not cancellation of the session dispatcher.
             return
 
         _log(
@@ -1741,15 +1754,10 @@ class CodexSession(TransportReplacementMixin):
             f"type={event.get('type', '')} "
             f"timeout_s={APP_SERVER_TERMINAL_STREAM_TIMEOUT}"
         )
-        # The turn and read loop are already independent, so retaining and
-        # awaiting a cancellation-resistant callback here cannot gate turn
-        # completion. Keeping this detached delivery task alive until the
-        # callback truly exits also keeps later terminal deliveries serialized.
+        # Keep cancellation-resistant work strongly retained for truthful
+        # teardown reporting, but do not await the corpse: the dispatcher must
+        # advance to the latest pending generation within this same bound.
         callback_task.cancel()
-        try:
-            await callback_task
-        except asyncio.CancelledError:
-            pass
 
     @staticmethod
     def _consume_background_task(task: asyncio.Task) -> None:
@@ -1781,29 +1789,68 @@ class CodexSession(TransportReplacementMixin):
             )
 
     def _schedule_appserver_terminal_stream_event(self, event: dict) -> None:
-        """Deliver terminal UI output in session order, outside the turn."""
+        """Deliver only the latest not-yet-started terminal generation.
+
+        One dispatcher serializes ordinary callbacks. A callback that exceeds
+        its bound is cancelled and retained, while the dispatcher immediately
+        advances. Intermediate pending generations are coalesced loudly so a
+        resistant callback cannot create an unbounded wrapper-task convoy.
+        """
         if self._stream_event_callback is None:
             return
-        previous = self._appserver_terminal_stream_tail
+        self._appserver_terminal_stream_generation += 1
+        generation = self._appserver_terminal_stream_generation
+        previous_pending = self._appserver_terminal_stream_pending
+        if previous_pending is not None:
+            stale_generation, stale_event = previous_pending
+            _log(
+                f"app_server_stale_terminal_dropped agent={self.agent_name} "
+                f"type={stale_event.get('type', '')} "
+                f"generation={stale_generation} superseded_by={generation}"
+            )
+        self._appserver_terminal_stream_pending = (generation, event)
 
-        async def _deliver_after_previous() -> None:
-            if previous is not None:
-                try:
-                    await asyncio.shield(previous)
-                except asyncio.CancelledError:
-                    # A cancelled predecessor is complete ordering-wise. If
-                    # this task itself was cancelled, preserve that request.
-                    if not previous.done():
-                        raise
-                except Exception:
-                    # Delivery is best effort; ordering survives an earlier
-                    # callback failure and the done callback consumes it.
-                    pass
-            await self._deliver_bounded_appserver_terminal_stream_event(event)
+        if (
+            self._appserver_terminal_stream_tail is not None
+            and not self._appserver_terminal_stream_tail.done()
+        ):
+            return
 
-        task = asyncio.create_task(_deliver_after_previous())
+        async def _deliver_latest() -> None:
+            while self._appserver_terminal_stream_pending is not None:
+                pending_generation, pending_event = (
+                    self._appserver_terminal_stream_pending
+                )
+                self._appserver_terminal_stream_pending = None
+                high_water = self._appserver_terminal_stream_generation
+                if pending_generation != high_water:
+                    _log(
+                        f"app_server_stale_terminal_dropped agent={self.agent_name} "
+                        f"type={pending_event.get('type', '')} "
+                        f"generation={pending_generation} superseded_by={high_water}"
+                    )
+                    continue
+
+                live_callbacks = sum(
+                    not retained.done()
+                    for retained in self._appserver_terminal_stream_tasks
+                )
+                if live_callbacks >= APP_SERVER_TERMINAL_STREAM_MAX_LIVE_CALLBACKS:
+                    _log(
+                        f"app_server_stale_terminal_dropped agent={self.agent_name} "
+                        f"type={pending_event.get('type', '')} "
+                        f"generation={pending_generation} reason=survivor_limit "
+                        f"live_callbacks={live_callbacks}"
+                    )
+                    continue
+
+                await self._deliver_bounded_appserver_terminal_stream_event(
+                    pending_event
+                )
+
+        task = asyncio.create_task(_deliver_latest())
         self._appserver_terminal_stream_tail = task
-        self._retain_appserver_terminal_stream_task(task)
+        task.add_done_callback(self._consume_background_task)
 
         def _clear_tail(done: asyncio.Task[None]) -> None:
             if self._appserver_terminal_stream_tail is done:
