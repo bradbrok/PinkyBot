@@ -46,6 +46,10 @@ from pinky_daemon.codex_app_server import (
     NotificationHandler,
     ServerRequestHandler,
 )
+from pinky_daemon.codex_home import (
+    per_agent_codex_home_enabled,
+    prepare_agent_codex_home,
+)
 from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.streaming_session import _log
 from pinky_daemon.tmux_session import _TmuxControl
@@ -102,11 +106,13 @@ class CodexAppServerSupervisor:
         *,
         working_dir: str,
         openai_api_key: str = "",
+        agent_config: object | None = None,
         log: Callable[[str], None] = _log,
     ) -> None:
         self.agent_name = agent_name
         self._log = log
         self._openai_api_key = openai_api_key
+        self._agent_config = agent_config
         self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
         self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
@@ -149,6 +155,7 @@ class CodexAppServerSupervisor:
         client plus its process adapter. Raises on tmux failure or readiness
         timeout. The caller (CodexSession) performs the single ``initialize``."""
         self._kill_requested = False
+        env = self._build_env()
 
         # Idempotent pre-start cleanup: a crashed predecessor can leave a live
         # tmux session and/or a stale socket; either would wedge a fresh start.
@@ -162,7 +169,7 @@ class CodexAppServerSupervisor:
             for p in [sys.executable, "-m", "pinky_daemon.codex_app_server_shim", self.sock_path]
         )
         result = await self._tmux.new_session(
-            cwd=self._sock_dir, command=command, env=self._build_env()
+            cwd=self._sock_dir, command=command, env=env
         )
         if not result.ok:
             raise RuntimeError(
@@ -219,6 +226,14 @@ class CodexAppServerSupervisor:
             env[key] = value
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
+        if per_agent_codex_home_enabled():
+            if self._agent_config is None:
+                raise RuntimeError(
+                    "per-agent Codex home requires app-server agent config"
+                )
+            env["CODEX_HOME"] = str(
+                prepare_agent_codex_home(self._agent_config, log=self._log)
+            )
         return env
 
     async def _await_accept(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:

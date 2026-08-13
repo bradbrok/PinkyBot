@@ -52,6 +52,12 @@ import time
 from collections import deque
 from pathlib import Path
 
+from pinky_daemon.codex_home import (
+    MANAGED_CONFIG_SENTINEL,
+    codex_home_for,
+    per_agent_codex_home_enabled,
+    prepare_agent_codex_home,
+)
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
@@ -290,6 +296,8 @@ class CodexTmuxSession(TmuxSession):
             env["OPENAI_API_KEY"] = self._openai_api_key
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
+        if per_agent_codex_home_enabled():
+            env["CODEX_HOME"] = str(codex_home_for(self._config))
         return env
 
     # ── seam: transcript discovery (codex rollout store) ────────────────────
@@ -298,18 +306,26 @@ class CodexTmuxSession(TmuxSession):
         ``~/.codex/sessions``). Codex does NOT slug the cwd into the path the way
         claude does — discovery is by ``session_meta.cwd`` match, not directory
         name — so this is just the scan root."""
-        codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
-        return codex_home / "sessions"
+        return codex_home_for(self._config) / "sessions"
 
     def _has_prior_transcript(self) -> bool:
         """True iff a codex rollout for this agent's cwd already exists (gates
         ``codex resume --last``)."""
-        return _discover_codex_rollout(self._config.working_dir or ".") is not None
+        return (
+            _discover_codex_rollout(
+                self._config.working_dir or ".",
+                agent=self._config,
+            )
+            is not None
+        )
 
     def _discover_transcript_path(self) -> Path | None:
         """Newest rollout whose ``session_meta.cwd`` == this agent's cwd, or None
         (cold start before the first turn writes a rollout)."""
-        return _discover_codex_rollout(self._config.working_dir or ".")
+        return _discover_codex_rollout(
+            self._config.working_dir or ".",
+            agent=self._config,
+        )
 
     # ── seam: tailer class ──────────────────────────────────────────────────
     async def _start_tailer(self) -> None:
@@ -549,8 +565,13 @@ class CodexTmuxSession(TmuxSession):
         super()._on_transcript_entry(entry)
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
+    def _preflight_transport_replacement(self) -> None:
+        """Prove the isolated Codex home before an inherited tmux teardown."""
+        prepare_agent_codex_home(self._config, log=_log)
+
     async def _spawn_tmux_repl(self) -> None:
         cwd = str(Path(self._config.working_dir or ".").resolve())
+        prepare_agent_codex_home(self._config, log=_log)
         self._seed_codex_trust(cwd)
         await super()._spawn_tmux_repl()
         await self._codex_dismiss_nux_and_ready()
@@ -595,11 +616,19 @@ class CodexTmuxSession(TmuxSession):
         from a trusted parent dir. Best-effort; a failure here at worst leaves
         the trust NUX for ``_codex_dismiss_nux_and_ready`` to handle."""
         try:
-            codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+            codex_home = codex_home_for(self._config)
             cfg = codex_home / "config.toml"
             real = os.path.realpath(cwd)
             header = f'[projects."{real}"]'
             existing = cfg.read_text(encoding="utf-8") if cfg.exists() else ""
+            if per_agent_codex_home_enabled() and not existing.startswith(
+                MANAGED_CONFIG_SENTINEL
+            ):
+                _log(
+                    f"tmux[{self.agent_name}]: managed codex config unavailable "
+                    f"at {cfg}; trust seed skipped"
+                )
+                return
             if header in existing:
                 return
             codex_home.mkdir(parents=True, exist_ok=True)

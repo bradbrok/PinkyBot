@@ -126,6 +126,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
+from pinky_daemon.codex_home import codex_home_for
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
@@ -3803,6 +3804,7 @@ def create_api(
             subagents=subagents,
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
+            codex_home=getattr(agent, "codex_home", "") or "",
             thinking_effort=agent.thinking_effort or "medium",
             strict_effort_enforcement=bool(
                 getattr(agent, "strict_effort_enforcement", False)
@@ -6364,6 +6366,7 @@ npm run build</pre>
             provider_key=req.provider_key,
             provider_model=req.provider_model,
             provider_ref=req.provider_ref,
+            codex_home=req.codex_home,
             thinking_effort=req.thinking_effort,
             strict_effort_enforcement=req.strict_effort_enforcement,
             dedicated_config_dir=req.dedicated_config_dir,
@@ -6810,12 +6813,7 @@ npm run build</pre>
         allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
         # #215: codex tmux agents tail rollouts under the codex session store
         # (``$CODEX_HOME/sessions`` or ``~/.codex/sessions``), not ~/.claude.
-        _codex_home = os.environ.get("CODEX_HOME", "").strip()
-        allowed_roots.append(
-            (Path(_codex_home) / "sessions").resolve()
-            if _codex_home
-            else (Path.home() / ".codex" / "sessions").resolve()
-        )
+        allowed_roots.append((codex_home_for(agent) / "sessions").resolve())
         if getattr(agent, "isolation_mode", "local") == "container":
             wd = (agent.working_dir or "").strip()
             if wd and Path(wd).is_absolute():
@@ -9341,32 +9339,29 @@ npm run build</pre>
                 pass
 
             try:
-                # Arm fresh-launch intent BEFORE disconnect.  If a
-                # broker/watchdog wake races the teardown's transient DEAD
-                # state, its launch must inherit the force-fresh contract
-                # rather than resume the old transcript.
-                _refresh_streaming_launch_config(name, ss)
-                ss._config.wake_context = _build_streaming_wake_context(
-                    name, commit=False
-                )
-                ss._config.resume_handle = ""
-                ss._config.restart_reason = "context_restart"
-                # PR for #543: explicit launch-behavior contract — the next
-                # transport spawn must NOT resume the prior conversation.
-                ss._config.force_fresh_context_once = True
-                ss.resume_handle = ""
-                # Codex sessions track thread_id separately on the session.
-                if hasattr(ss, "codex_session_id"):
-                    if ss.codex_session_id:
-                        _log(
-                            f"api: clearing stale codex thread "
-                            f"{ss.codex_session_id[:12]} for {name}"
-                        )
-                    ss.codex_session_id = ""
+                def _configure_context_restart() -> None:
+                    # This callback runs inside restart_transport only after its
+                    # replacement preflight succeeds, but before teardown. A
+                    # racing wake therefore inherits force-fresh intent without
+                    # a refusal corrupting the still-live transport.
+                    _refresh_streaming_launch_config(name, ss)
+                    ss._config.wake_context = _build_streaming_wake_context(
+                        name, commit=False
+                    )
+                    ss._config.resume_handle = ""
+                    ss._config.restart_reason = "context_restart"
+                    ss._config.force_fresh_context_once = True
+                    ss.resume_handle = ""
+                    if hasattr(ss, "codex_session_id"):
+                        if ss.codex_session_id:
+                            _log(
+                                f"api: clearing stale codex thread "
+                                f"{ss.codex_session_id[:12]} for {name}"
+                            )
+                        ss.codex_session_id = ""
+                    agents.set_streaming_session_id(name, "", label="main")
 
-                await ss.disconnect()
-                agents.set_streaming_session_id(name, "", label="main")
-                await ss.connect()
+                await ss.restart_transport(configure=_configure_context_restart)
                 _log(f"api: streaming session restarted for {name}")
                 activity.log(
                     name, "context_restart", f"{name} context restarted"
@@ -9516,10 +9511,6 @@ npm run build</pre>
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
 
-            # Persist only once the restart is actually going ahead, so a 409
-            # above leaves the DB matching the still-running session.
-            agents.register(name, model=req.model)
-
             # Ask agent to save state
             try:
                 await ss._client.query(
@@ -9532,21 +9523,27 @@ npm run build</pre>
             # Restart streaming session
             old_resume_handle = ss.resume_handle
             old_turns = ss._stats["turns"]
-            await ss.disconnect()
-            agents.set_streaming_session_id(name, "", label="main")
-            ss._config.resume_handle = ""
-            ss.resume_handle = ""
-            if hasattr(ss, "codex_session_id"):
-                if ss.codex_session_id:
-                    _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
-                ss.codex_session_id = ""
-            # This is a retained-object rebuild, so refresh every durable
-            # launch setting (not just the newly-persisted model). Provider,
-            # effort, and Codex's transport-level caches may have changed in
-            # the registry since the object was constructed.
-            _refresh_streaming_launch_config(name, ss)
+
+            def _configure_model_restart() -> None:
+                # Persist and mutate the retained object only after the common
+                # replacement preflight has protected the live transport.
+                agents.register(name, model=req.model)
+                agents.set_streaming_session_id(name, "", label="main")
+                ss._config.resume_handle = ""
+                ss.resume_handle = ""
+                if hasattr(ss, "codex_session_id"):
+                    if ss.codex_session_id:
+                        _log(
+                            f"api: clearing stale codex thread "
+                            f"{ss.codex_session_id[:12]} for {name}"
+                        )
+                    ss.codex_session_id = ""
+                # Refresh every durable launch setting, including provider,
+                # effort, and backend-specific transport caches.
+                _refresh_streaming_launch_config(name, ss)
+
             try:
-                await ss.connect()
+                await ss.restart_transport(configure=_configure_model_restart)
                 _log(f"api: restarted {name} with model {req.model}")
             except Exception as e:
                 broker.unregister_streaming(name)
@@ -9623,19 +9620,24 @@ npm run build</pre>
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
-        await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
+        def _configure_archive_restart() -> None:
+            agents.set_streaming_session_id(name, "", label="main")
+            ss._config.wake_context = _build_streaming_wake_context(
+                name, commit=False
+            )
+            _refresh_streaming_launch_config(name, ss)
+            ss._config.resume_handle = ""
+            ss.resume_handle = ""
+            if hasattr(ss, "codex_session_id"):
+                if ss.codex_session_id:
+                    _log(
+                        f"api: clearing stale codex thread "
+                        f"{ss.codex_session_id[:12]} for {name}"
+                    )
+                ss.codex_session_id = ""
 
-        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
-        _refresh_streaming_launch_config(name, ss)
-        ss._config.resume_handle = ""
-        ss.resume_handle = ""
-        if hasattr(ss, "codex_session_id"):
-            if ss.codex_session_id:
-                _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
-            ss.codex_session_id = ""
         try:
-            await ss.connect()
+            await ss.restart_transport(configure=_configure_archive_restart)
             _log(f"api: archived and restarted session for {name}")
         except Exception as e:
             broker.unregister_streaming(name)
@@ -11168,14 +11170,19 @@ npm run build</pre>
             sessions = broker._streaming.get(agent_name, {})
             ss = sessions.get(label)
             if ss:
-                try:
-                    await ss.disconnect()
-                except Exception:
-                    pass
-                agents.set_streaming_session_id(agent_name, "", label=label)
-                broker.unregister_streaming(agent_name, label=label)
-            await asyncio.sleep(2)
-            await _ensure_streaming_session(agent_name, label=label)
+                async def _rebuild_watchdog_transport() -> None:
+                    agents.set_streaming_session_id(agent_name, "", label=label)
+                    broker.unregister_streaming(agent_name, label=label)
+                    await asyncio.sleep(2)
+                    await _ensure_streaming_session(agent_name, label=label)
+
+                await ss.restart_transport(
+                    bring_up=_rebuild_watchdog_transport,
+                    suppress_teardown_errors=True,
+                )
+            else:
+                await asyncio.sleep(2)
+                await _ensure_streaming_session(agent_name, label=label)
             _log(f"watchdog: {agent_name}/{label} recovered successfully")
         except Exception as exc:
             _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
@@ -11443,32 +11450,38 @@ npm run build</pre>
             title=f"Watchdog MCP-recover ({label}): {reason}",
             metadata=audit_meta,
         )
-        try:
-            await ss.disconnect()
-        except Exception:
-            pass
-        agents.set_streaming_session_id(agent_name, "", label=label)
-        # The agent couldn't refresh save_my_context (its MCP was dead) — bump
-        # so any context-staleness gate is satisfied; preserve saved state.
-        try:
-            agents.bump_context_updated_at(agent_name)
-        except Exception:
-            pass
-        ss._config.wake_context = _build_streaming_wake_context(agent_name, commit=False)
-        _refresh_streaming_launch_config(agent_name, ss)
-        ss._config.resume_handle = ""
-        ss._config.restart_reason = "mcp_epoch_unbound"
-        ss._config.force_fresh_context_once = True
-        ss.resume_handle = ""
-        if hasattr(ss, "codex_session_id"):
-            ss.codex_session_id = ""
-        try:
+
+        def _configure_mcp_recovery() -> None:
+            agents.set_streaming_session_id(agent_name, "", label=label)
+            # The agent couldn't refresh save_my_context (its MCP was dead) —
+            # bump so any context-staleness gate is satisfied; preserve state.
+            try:
+                agents.bump_context_updated_at(agent_name)
+            except Exception:
+                pass
+            ss._config.wake_context = _build_streaming_wake_context(
+                agent_name, commit=False
+            )
+            _refresh_streaming_launch_config(agent_name, ss)
+            ss._config.resume_handle = ""
+            ss._config.restart_reason = "mcp_epoch_unbound"
+            ss._config.force_fresh_context_once = True
+            ss.resume_handle = ""
+            if hasattr(ss, "codex_session_id"):
+                ss.codex_session_id = ""
+
+        async def _connect_mcp_recovery(connect) -> None:
             # #202: a force-fresh MCP recovery boots a brand-new `claude`, so
-            # serialize it behind the cold-start gate too — it's globally
-            # rate-limited, but can still overlap a daemon cold boot / manual
-            # cold start and race the shared single-use OAuth refresh token.
+            # serialize it behind the cold-start gate too.
             async with _coldstart_gate(agent_name, label):
-                await ss.connect()
+                await connect()
+
+        try:
+            await ss.restart_transport(
+                configure=_configure_mcp_recovery,
+                connect_wrapper=_connect_mcp_recovery,
+                suppress_teardown_errors=True,
+            )
             session_event_store.log(
                 session_id=ss.id,
                 agent_name=agent_name,
@@ -12603,22 +12616,23 @@ npm run build</pre>
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
-        await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
-
-        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
-        _refresh_streaming_launch_config(name, ss)
-        ss._config.resume_handle = ""
-        ss._config.restart_reason = "force_restart"
-        ss._config.force_fresh_context_once = True
-        ss.resume_handle = ""
-        if hasattr(ss, "codex_session_id"):
-            if ss.codex_session_id:
-                _log(
-                    f"api: clearing stale codex thread {ss.codex_session_id[:12]} "
-                    f"for {name} (force-restart)"
-                )
-            ss.codex_session_id = ""
+        def _configure_forced_restart() -> None:
+            agents.set_streaming_session_id(name, "", label="main")
+            ss._config.wake_context = _build_streaming_wake_context(
+                name, commit=False
+            )
+            _refresh_streaming_launch_config(name, ss)
+            ss._config.resume_handle = ""
+            ss._config.restart_reason = "force_restart"
+            ss._config.force_fresh_context_once = True
+            ss.resume_handle = ""
+            if hasattr(ss, "codex_session_id"):
+                if ss.codex_session_id:
+                    _log(
+                        f"api: clearing stale codex thread "
+                        f"{ss.codex_session_id[:12]} for {name} (force-restart)"
+                    )
+                ss.codex_session_id = ""
 
         audit_meta = {
             "label": "main",
@@ -12630,7 +12644,7 @@ npm run build</pre>
             "source": "force_restart_endpoint",
         }
         try:
-            await ss.connect()
+            await ss.restart_transport(configure=_configure_forced_restart)
             _log(
                 f"api: FORCE-restarted streaming session for {name} "
                 f"(heartbeat_age={heartbeat_age_sec}s, "

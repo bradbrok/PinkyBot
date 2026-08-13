@@ -21,6 +21,7 @@ from pathlib import Path
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import (
@@ -138,6 +139,7 @@ class StreamingSessionConfig:
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
     # effort drifts from thinking_effort. Default False (warn-only). See #429.
@@ -263,7 +265,7 @@ def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
     return name
 
 
-class StreamingSession:
+class StreamingSession(TransportReplacementMixin):
     """Persistent bidirectional Claude Code session via SDK client.
 
     Unlike Session which blocks on each send(), StreamingSession:

@@ -1000,7 +1000,7 @@ class TestDiscoverCodexRollout:
     def test_returns_none_when_no_sessions_root(self, tmp_path, monkeypatch):
         """No ~/.codex/sessions → returns None, no crash."""
         monkeypatch.setattr(
-            "pinky_daemon.codex_tmux_transcript.Path.home",
+            "pinky_daemon.codex_home.Path.home",
             lambda: tmp_path,
         )
         result = _discover_codex_rollout("/some/cwd")
@@ -1019,7 +1019,7 @@ class TestDiscoverCodexRollout:
         match = self._fake_rollout(sessions, "rollout-new.jsonl", target_cwd, mtime_offset=0)
 
         monkeypatch.setattr(
-            "pinky_daemon.codex_tmux_transcript.Path.home",
+            "pinky_daemon.codex_home.Path.home",
             lambda: tmp_path,
         )
         result = _discover_codex_rollout(target_cwd)
@@ -1037,7 +1037,7 @@ class TestDiscoverCodexRollout:
         newer = self._fake_rollout(sessions, "rollout-newer.jsonl", target_cwd, mtime_offset=-5)
 
         monkeypatch.setattr(
-            "pinky_daemon.codex_tmux_transcript.Path.home",
+            "pinky_daemon.codex_home.Path.home",
             lambda: tmp_path,
         )
         result = _discover_codex_rollout(target_cwd)
@@ -1050,7 +1050,7 @@ class TestDiscoverCodexRollout:
         self._fake_rollout(sessions, "rollout-other.jsonl", "/some/other/cwd")
 
         monkeypatch.setattr(
-            "pinky_daemon.codex_tmux_transcript.Path.home",
+            "pinky_daemon.codex_home.Path.home",
             lambda: tmp_path,
         )
         result = _discover_codex_rollout("/requested/cwd")
@@ -1072,7 +1072,7 @@ class TestDiscoverCodexRollout:
         good = self._fake_rollout(sessions, "rollout-good.jsonl", target_cwd, mtime_offset=0)
 
         monkeypatch.setattr(
-            "pinky_daemon.codex_tmux_transcript.Path.home",
+            "pinky_daemon.codex_home.Path.home",
             lambda: tmp_path,
         )
         result = _discover_codex_rollout(target_cwd)
@@ -1092,7 +1092,7 @@ class TestDiscoverCodexRollout:
         empty_home = tmp_path / "wrong-home"
         empty_home.mkdir()
         monkeypatch.setattr(
-            "pinky_daemon.codex_tmux_transcript.Path.home",
+            "pinky_daemon.codex_home.Path.home",
             lambda: empty_home,
         )
         result = _discover_codex_rollout(target_cwd)

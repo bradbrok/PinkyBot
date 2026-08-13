@@ -29,6 +29,10 @@ from pinky_daemon.codex_app_server import (
     spawn_app_server,
 )
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
+from pinky_daemon.codex_home import (
+    per_agent_codex_home_enabled,
+    prepare_agent_codex_home,
+)
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
@@ -37,6 +41,7 @@ from pinky_daemon.streaming_session import (
     _log,
     _notify_turn_idle,
 )
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
     OwnerToken,
     SessionState,
@@ -80,7 +85,7 @@ class CodexTurnResult:
         return max(0, self.input_tokens - self.cached_input_tokens)
 
 
-class CodexSession:
+class CodexSession(TransportReplacementMixin):
     """Agent session backed by Codex CLI.
 
     Drop-in replacement for StreamingSession — exposes the same public
@@ -196,6 +201,7 @@ class CodexSession:
                 self.agent_name,
                 working_dir=self._working_dir,
                 openai_api_key=self._openai_api_key,
+                agent_config=config,
                 log=_log,
             )
         self._app_client: CodexAppServerClient | None = None
@@ -914,6 +920,26 @@ class CodexSession:
         cmd.append("-")
         return cmd
 
+    def _build_codex_env(self) -> dict[str, str]:
+        """Build the full process environment with the agent-home overlay."""
+        env = {**os.environ}
+        if self._openai_api_key:
+            env["OPENAI_API_KEY"] = self._openai_api_key
+        prepared_home = self._preflight_agent_codex_home()
+        if prepared_home is not None:
+            env["CODEX_HOME"] = prepared_home
+        return env
+
+    def _preflight_agent_codex_home(self) -> str | None:
+        """Validate and prepare replacement-home state before teardown/spawn."""
+        if not per_agent_codex_home_enabled():
+            return None
+        return str(prepare_agent_codex_home(self._config, log=_log))
+
+    def _preflight_transport_replacement(self) -> None:
+        """Keep retained-session replacement refusal ahead of teardown."""
+        self._preflight_agent_codex_home()
+
     async def _exec_codex(
         self,
         prompt: str,
@@ -938,10 +964,7 @@ class CodexSession:
 
         cmd = self._build_codex_cmd()
 
-        # Build environment
-        env = {**os.environ}
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
+        env = self._build_codex_env()
 
         _log(
             f"codex[{self.agent_name}]: exec "
@@ -1104,7 +1127,20 @@ class CodexSession:
         if self._app_client is not None and self._app_proc is not None:
             if self._app_proc.returncode is None:
                 return  # still running
-            # Process died under us — drop the stale client and respawn.
+
+        # Refuse an unsafe/missing per-agent auth setup before mutating any
+        # cached transport. In particular, a dead cached app-server must not be
+        # closed/cleared (and a tmux supervisor must not be started) before the
+        # replacement spawn proves its Codex home can be prepared safely.
+        direct_env: dict[str, str] | None = None
+        if self._use_tmux_app_server:
+            self._preflight_agent_codex_home()
+        else:
+            direct_env = self._build_codex_env()
+
+        if self._app_client is not None or self._app_proc is not None:
+            # Process died under us — drop the stale client and respawn only
+            # after the replacement environment passed preparation above.
             await self._teardown_app_server()
 
         if self._use_tmux_app_server:
@@ -1119,13 +1155,10 @@ class CodexSession:
                 server_request_handler=self._on_appserver_request,
             )
         else:
-            env = {**os.environ}
-            if self._openai_api_key:
-                env["OPENAI_API_KEY"] = self._openai_api_key
-
+            assert direct_env is not None
             self._app_client, self._app_proc = await spawn_app_server(
                 cwd=self._working_dir,
-                env=env,
+                env=direct_env,
                 notification_handler=self._on_appserver_notification,
                 server_request_handler=self._on_appserver_request,
                 log=_log,
@@ -1774,6 +1807,15 @@ class CodexSession:
                 _log(f"codex[{self.agent_name}]: restart blocked")
                 return False
 
+        # Prove the replacement home before taking transition ownership or
+        # touching the current process/client. A refusal leaves the live
+        # transport and its CONNECTED state intact in both app-server modes.
+        try:
+            self._preflight_agent_codex_home()
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: force restart preflight failed: {e}")
+            return False
+
         _log(f"codex[{self.agent_name}]: force restarting")
 
         # Own the CONNECTED → RECONNECTING transition (USER_AGENT = the agent's
@@ -1895,6 +1937,15 @@ class CodexSession:
         / IDLE_SLEEPING / DEAD via WATCHDOG (the default; the heartbeat-resurrect
         + watchdog-recovery callers).
         """
+        # Like force_restart, this path tears down with the intent to replace.
+        # Refuse before touching an existing transport when the replacement
+        # home cannot be prepared.
+        try:
+            self._preflight_agent_codex_home()
+        except Exception as e:
+            _log(f"codex[{self.agent_name}]: reconnect preflight failed: {e}")
+            return
+
         res = await self._state_machine.request_transition(
             SessionState.RECONNECTING, trigger, reason="attempt_reconnect"
         )

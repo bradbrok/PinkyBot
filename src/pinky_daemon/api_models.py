@@ -342,6 +342,7 @@ class RegisterAgentRequest(BaseModel):
     provider_key: str = ""  # ANTHROPIC_API_KEY override
     provider_model: str = ""  # Model name override for this provider
     provider_ref: str = ""  # ID of a global provider from the providers table
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool = False  # PR #429 — block tool calls when effort drifts
     # #550/Picard — opt-in: a LOCAL agent runs its own Claude account via a
@@ -426,6 +427,7 @@ class UpdateAgentRequest(BaseModel):
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
     provider_ref: str | None = None  # ID of a global provider from the providers table
+    codex_home: str | None = None  # Explicit per-agent CODEX_HOME override
     thinking_effort: str | None = None  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
     # #550/Picard — opt-in dedicated CLAUDE_CONFIG_DIR for a LOCAL agent;

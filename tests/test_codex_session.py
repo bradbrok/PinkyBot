@@ -1697,6 +1697,109 @@ class TestCodexStateMachine:
         assert s._app_proc is not None
 
     @pytest.mark.asyncio
+    async def test_direct_auth_refusal_precedes_stale_transport_teardown(
+        self, tmp_path, monkeypatch
+    ):
+        """Review P2: replacement auth is proven before cached state mutates."""
+        shared_home = tmp_path / "shared"
+        working_dir = tmp_path / "agent"
+        shared_home.mkdir()
+        working_dir.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(shared_home))
+        monkeypatch.setenv("PINKY_CODEX_PER_AGENT_HOME", "1")
+        s = _appserver_session(working_dir=str(working_dir))
+
+        class _StaleClient:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        class _StaleProc:
+            returncode = 1
+            pid = 123
+
+            def kill(self):  # pragma: no cover - refusal must precede teardown
+                raise AssertionError("stale process was killed")
+
+            async def wait(self):  # pragma: no cover
+                raise AssertionError("stale process was waited")
+
+        client = _StaleClient()
+        proc = _StaleProc()
+        s._app_client = client
+        s._app_proc = proc
+
+        with pytest.raises(RuntimeError, match="shared auth file is absent or unreadable"):
+            await s._ensure_app_server()
+
+        assert client.closed is False
+        assert s._app_client is client
+        assert s._app_proc is proc
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "entry_point",
+        ["force_restart", "attempt_reconnect", "restart_transport"],
+    )
+    async def test_direct_replacement_preflight_preserves_cached_transport(
+        self, tmp_path, monkeypatch, entry_point
+    ):
+        """R2 P1-3: every replacement entry preflights before teardown."""
+        shared_home = tmp_path / "shared"
+        working_dir = tmp_path / "agent"
+        shared_home.mkdir()
+        working_dir.mkdir()
+        monkeypatch.setenv("CODEX_HOME", str(shared_home))
+        monkeypatch.setenv("PINKY_CODEX_PER_AGENT_HOME", "1")
+        s = _appserver_session(working_dir=str(working_dir))
+        await _to_connected(s)
+
+        class _CachedClient:
+            def __init__(self):
+                self.closed = False
+
+            async def close(self):
+                self.closed = True
+
+        class _CachedProc:
+            returncode = None
+            pid = 123
+
+            def __init__(self):
+                self.killed = False
+
+            def kill(self):
+                self.killed = True
+
+            async def wait(self):
+                return -9
+
+        client = _CachedClient()
+        proc = _CachedProc()
+        s._app_client = client
+        s._app_proc = proc
+
+        if entry_point == "restart_transport":
+            with pytest.raises(RuntimeError, match="shared auth file is absent"):
+                await s.restart_transport()
+            result = None
+        else:
+            result = await getattr(s, entry_point)()
+
+        if entry_point == "force_restart":
+            assert result is False
+        else:
+            assert result is None
+        assert s.state == SessionState.CONNECTED
+        assert s._app_client is client
+        assert s._app_proc is proc
+        assert client.closed is False
+        assert proc.killed is False
+        assert s.stats["reconnects"] == 0
+
+    @pytest.mark.asyncio
     async def test_warm_reconnect_exposes_reconnecting_then_connected(self):
         s = _appserver_session()
         await _to_dead(s)
