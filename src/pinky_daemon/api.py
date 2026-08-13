@@ -126,6 +126,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
+from pinky_daemon.codex_home import codex_home_for
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
@@ -3803,6 +3804,7 @@ def create_api(
             subagents=subagents,
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
+            codex_home=getattr(agent, "codex_home", "") or "",
             thinking_effort=agent.thinking_effort or "medium",
             strict_effort_enforcement=bool(
                 getattr(agent, "strict_effort_enforcement", False)
@@ -6364,6 +6366,7 @@ npm run build</pre>
             provider_key=req.provider_key,
             provider_model=req.provider_model,
             provider_ref=req.provider_ref,
+            codex_home=req.codex_home,
             thinking_effort=req.thinking_effort,
             strict_effort_enforcement=req.strict_effort_enforcement,
             dedicated_config_dir=req.dedicated_config_dir,
@@ -6810,12 +6813,7 @@ npm run build</pre>
         allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
         # #215: codex tmux agents tail rollouts under the codex session store
         # (``$CODEX_HOME/sessions`` or ``~/.codex/sessions``), not ~/.claude.
-        _codex_home = os.environ.get("CODEX_HOME", "").strip()
-        allowed_roots.append(
-            (Path(_codex_home) / "sessions").resolve()
-            if _codex_home
-            else (Path.home() / ".codex" / "sessions").resolve()
-        )
+        allowed_roots.append((codex_home_for(agent) / "sessions").resolve())
         if getattr(agent, "isolation_mode", "local") == "container":
             wd = (agent.working_dir or "").strip()
             if wd and Path(wd).is_absolute():

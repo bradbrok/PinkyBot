@@ -29,6 +29,10 @@ from pinky_daemon.codex_app_server import (
     spawn_app_server,
 )
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
+from pinky_daemon.codex_home import (
+    per_agent_codex_home_enabled,
+    prepare_agent_codex_home,
+)
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
@@ -196,6 +200,7 @@ class CodexSession:
                 self.agent_name,
                 working_dir=self._working_dir,
                 openai_api_key=self._openai_api_key,
+                agent_config=config,
                 log=_log,
             )
         self._app_client: CodexAppServerClient | None = None
@@ -914,6 +919,17 @@ class CodexSession:
         cmd.append("-")
         return cmd
 
+    def _build_codex_env(self) -> dict[str, str]:
+        """Build the full process environment with the agent-home overlay."""
+        env = {**os.environ}
+        if self._openai_api_key:
+            env["OPENAI_API_KEY"] = self._openai_api_key
+        if per_agent_codex_home_enabled():
+            env["CODEX_HOME"] = str(
+                prepare_agent_codex_home(self._config, log=_log)
+            )
+        return env
+
     async def _exec_codex(
         self,
         prompt: str,
@@ -938,10 +954,7 @@ class CodexSession:
 
         cmd = self._build_codex_cmd()
 
-        # Build environment
-        env = {**os.environ}
-        if self._openai_api_key:
-            env["OPENAI_API_KEY"] = self._openai_api_key
+        env = self._build_codex_env()
 
         _log(
             f"codex[{self.agent_name}]: exec "
@@ -1119,9 +1132,7 @@ class CodexSession:
                 server_request_handler=self._on_appserver_request,
             )
         else:
-            env = {**os.environ}
-            if self._openai_api_key:
-                env["OPENAI_API_KEY"] = self._openai_api_key
+            env = self._build_codex_env()
 
             self._app_client, self._app_proc = await spawn_app_server(
                 cwd=self._working_dir,

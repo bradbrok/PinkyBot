@@ -481,6 +481,18 @@ class TestAgentCRUD:
         registry.register("plain", dedicated_config_dir=True)
         assert registry.get("plain").dedicated_config_dir is True
 
+    def test_codex_home_override_round_trip(self, registry, tmp_path):
+        override = str(tmp_path / "codex-home")
+
+        created = registry.register("codex-home-test", codex_home=override)
+
+        assert created.codex_home == override
+        assert registry.get("codex-home-test").codex_home == override
+        assert registry.get("codex-home-test").to_dict()["codex_home"] == override
+
+        updated = registry.register("codex-home-test", codex_home="")
+        assert updated.codex_home == ""
+
     def test_isolation_mode_round_trip(self, registry):
         """#149 phase-3: isolation_mode persists through insert/get/to_dict,
         defaults to 'local', and is settable via the update path."""

@@ -1765,6 +1765,75 @@ class TestAPI:
                 assert resp.status_code == 403
                 assert "projects" in resp.json()["detail"].lower()
 
+    def test_transcript_path_uses_agent_codex_home_when_enabled(
+        self, monkeypatch
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            shared_home = os.path.join(tmpdir, "shared-codex")
+            work_dir = os.path.join(tmpdir, "agents", "codex-test")
+            monkeypatch.setenv("CODEX_HOME", shared_home)
+            monkeypatch.setenv("PINKY_CODEX_PER_AGENT_HOME", "1")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                registered = client.post(
+                    "/agents",
+                    json={
+                        "name": "codex-test",
+                        "model": "gpt-test",
+                        "runtime": "codex_cli",
+                        "working_dir": work_dir,
+                    },
+                )
+                assert registered.status_code == 200
+
+                isolated = os.path.join(
+                    work_dir, ".codex", "sessions", "2026", "rollout.jsonl"
+                )
+                accepted = client.post(
+                    "/agents/codex-test/transport/transcript-path",
+                    json={"transcript_path": isolated},
+                )
+                assert accepted.status_code == 200
+
+                shared = os.path.join(
+                    shared_home, "sessions", "2026", "rollout.jsonl"
+                )
+                denied = client.post(
+                    "/agents/codex-test/transport/transcript-path",
+                    json={"transcript_path": shared},
+                )
+                assert denied.status_code == 403
+
+    def test_transcript_path_flag_off_keeps_shared_codex_root(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            shared_home = os.path.join(tmpdir, "shared-codex")
+            work_dir = os.path.join(tmpdir, "agents", "codex-test")
+            monkeypatch.setenv("CODEX_HOME", shared_home)
+            monkeypatch.delenv("PINKY_CODEX_PER_AGENT_HOME", raising=False)
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                registered = client.post(
+                    "/agents",
+                    json={
+                        "name": "codex-test",
+                        "model": "gpt-test",
+                        "runtime": "codex_cli",
+                        "working_dir": work_dir,
+                    },
+                )
+                assert registered.status_code == 200
+
+                shared = os.path.join(
+                    shared_home, "sessions", "2026", "rollout.jsonl"
+                )
+                accepted = client.post(
+                    "/agents/codex-test/transport/transcript-path",
+                    json={"transcript_path": shared},
+                )
+                assert accepted.status_code == 200
+
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
         'unix_user' is accepted at registration but REFUSES to start (501)

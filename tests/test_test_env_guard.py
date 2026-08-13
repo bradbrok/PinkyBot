@@ -30,6 +30,7 @@ class _TransportItem:
 
 
 def test_runtime_env_is_deterministic():
+    assert os.environ["CODEX_HOME"] == suite_conftest.TEST_CODEX_HOME
     assert os.environ["PINKY_DREAM_TRANSPORT"] == "sdk"
     assert os.environ["PINKY_AUTH_DENY_DEFAULT"] == "shadow"
     assert "PINKY_CONTAINER_RUNTIME" not in os.environ

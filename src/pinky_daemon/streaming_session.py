@@ -138,6 +138,7 @@ class StreamingSessionConfig:
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
     # effort drifts from thinking_effort. Default False (warn-only). See #429.

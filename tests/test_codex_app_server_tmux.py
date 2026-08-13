@@ -18,11 +18,14 @@ import stat
 import subprocess
 import sys
 import tempfile
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from pinky_daemon import codex_app_server_tmux as mod
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor, _TmuxAppServerProc
+from pinky_daemon.codex_home import PER_AGENT_CODEX_HOME_ENV
 
 _REPO_SRC = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "src"))
 _FAKE = os.path.join(os.path.dirname(__file__), "_fake_app_server.py")
@@ -97,7 +100,10 @@ def workdir():
 
 def _make_supervisor(workdir: str, fake: FakeTmux, **kw) -> CodexAppServerSupervisor:
     sup = CodexAppServerSupervisor(
-        "kztest", working_dir=workdir, openai_api_key=kw.get("key", "sk-SENTINEL"),
+        "test-agent",
+        working_dir=workdir,
+        openai_api_key=kw.get("key", "test-key"),
+        agent_config=kw.get("agent_config"),
     )
     sup._tmux = fake
     return sup
@@ -115,7 +121,7 @@ async def test_start_spawns_shim_and_initialize_round_trips(workdir):
         # Env injected for the shell/child: PATH (codex resolution) + the key
         # (item H — must reach the grandchild codex via tmux -e -> shim -> child).
         assert "PATH" in fake.new_session_env
-        assert fake.new_session_env.get("OPENAI_API_KEY") == "sk-SENTINEL"
+        assert fake.new_session_env.get("OPENAI_API_KEY") == "test-key"
         # The single initialize (the daemon's real gate) round-trips end to end.
         res = await client.initialize(name="pinkybot", version="1")
         assert res["userAgent"] == "fake/1"
@@ -161,8 +167,41 @@ async def test_full_daemon_env_propagated_to_session(workdir, monkeypatch):
     }.items():
         assert env.get(key) == val, f"daemon env {key} not propagated to tmux session"
     # The configured key is overlaid (item H), and tmux-internal vars are dropped.
-    assert env.get("OPENAI_API_KEY") == "sk-SENTINEL"
+    assert env.get("OPENAI_API_KEY") == "test-key"
     assert "TMUX" not in env
+
+
+def test_per_agent_home_overlaid_for_tmux_app_server(workdir, monkeypatch):
+    shared_home = Path(workdir) / "shared-codex"
+    shared_home.mkdir()
+    (shared_home / "auth.json").write_text('{"test": true}\n', encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    fake = FakeTmux(spawn=False)
+    config = SimpleNamespace(working_dir=workdir, codex_home="")
+    sup = _make_supervisor(workdir, fake, agent_config=config)
+
+    env = sup._build_env()
+
+    agent_home = Path(workdir).resolve() / ".codex"
+    assert env["CODEX_HOME"] == str(agent_home)
+    assert (agent_home / "auth.json").is_symlink()
+
+
+@pytest.mark.asyncio
+async def test_auth_absence_fails_before_tmux_cleanup(workdir, monkeypatch):
+    shared_home = Path(workdir) / "missing-auth-codex"
+    shared_home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    fake = FakeTmux(spawn=False)
+    config = SimpleNamespace(working_dir=workdir, codex_home="")
+    sup = _make_supervisor(workdir, fake, agent_config=config)
+
+    with pytest.raises(RuntimeError, match="shared auth file is absent or unreadable"):
+        await sup.start()
+
+    assert fake.calls == []
 
 
 @pytest.mark.asyncio
@@ -171,7 +210,7 @@ async def test_long_working_dir_falls_back_to_short_sock_dir():
     to a short, owner-only 0700 dir — not a predictable /tmp path, and not an
     unbindable long one (would surface as a readiness timeout)."""
     long_wd = "/tmp/" + ("d" * 140)
-    sup = CodexAppServerSupervisor("kztest", working_dir=long_wd)
+    sup = CodexAppServerSupervisor("test-agent", working_dir=long_wd)
     try:
         assert sup._sock_dir_is_tmp is True
         assert len(sup.sock_path) <= 104

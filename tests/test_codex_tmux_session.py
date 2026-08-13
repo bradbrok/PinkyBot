@@ -12,12 +12,14 @@ bottom (opt-in, like the app-server soak) — it's the make-or-break proof and w
 validated live 2026-06-17.
 """
 import asyncio
+import json
 import os
 import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
+from pinky_daemon.codex_home import PER_AGENT_CODEX_HOME_ENV
 from pinky_daemon.codex_tmux_session import (
     _CODEX_ENTER_DELAY_MS,
     CodexTmuxSession,
@@ -55,13 +57,14 @@ def _mock_tmux() -> MagicMock:
 
 
 def _session(*, model="gpt-5.5", effort="medium", mcp=None, working_dir="/tmp/codex-tmux-test",
-             provider_key="sk-test", tmux=None) -> CodexTmuxSession:
+             provider_key="sk-test", codex_home="", tmux=None) -> CodexTmuxSession:
     cfg = StreamingSessionConfig(
         agent_name="murzik",
         working_dir=working_dir,
         model=model,
         thinking_effort=effort,
         provider_key=provider_key,
+        codex_home=codex_home,
         mcp_servers=mcp or {},
     )
     return CodexTmuxSession(cfg, tmux_control=tmux or _mock_tmux())
@@ -173,6 +176,17 @@ def test_build_repl_env_falls_back_to_openai_env(monkeypatch):
     assert ss._build_repl_env()["OPENAI_API_KEY"] == "sk-env"
 
 
+def test_build_repl_env_overlays_agent_home_when_enabled(monkeypatch, tmp_path):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+
+    env = _session(working_dir=str(working_dir))._build_repl_env()
+
+    assert env["CODEX_HOME"] == str(working_dir / ".codex")
+
+
 # ── transcript discovery ────────────────────────────────────────────────────
 def test_project_dir_is_codex_sessions(monkeypatch, tmp_path):
     monkeypatch.setenv("CODEX_HOME", str(tmp_path / "ch"))
@@ -180,13 +194,56 @@ def test_project_dir_is_codex_sessions(monkeypatch, tmp_path):
     assert ss._project_dir() == (tmp_path / "ch" / "sessions")
 
 
+def test_project_dir_uses_agent_home_when_enabled(monkeypatch, tmp_path):
+    working_dir = tmp_path / "agent"
+    monkeypatch.setenv("CODEX_HOME", str(tmp_path / "shared"))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    ss = _session(working_dir=str(working_dir))
+
+    assert ss._project_dir() == working_dir / ".codex" / "sessions"
+
+
+def test_resume_gate_reads_agent_home_only(monkeypatch, tmp_path):
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    shared_home = tmp_path / "shared"
+    agent_home = working_dir / ".codex"
+
+    def write_rollout(home, name):
+        path = home / "sessions" / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(
+            json.dumps(
+                {
+                    "type": "session_meta",
+                    "payload": {"id": name, "cwd": str(working_dir)},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        return path
+
+    shared_rollout = write_rollout(shared_home, "rollout-shared.jsonl")
+    agent_rollout = write_rollout(agent_home, "rollout-agent.jsonl")
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    ss = _session(working_dir=str(working_dir))
+
+    assert "resume --last" in ss._build_claude_cmd()
+    agent_rollout.unlink()
+    assert shared_rollout.exists()
+    assert "resume --last" not in ss._build_claude_cmd()
+
+
 def test_discovery_delegates_to_codex_rollout(monkeypatch):
     import pinky_daemon.codex_tmux_session as cm
     sentinel = object()
     seen = {}
 
-    def fake(wd):
+    def fake(wd, *, agent=None):
         seen["wd"] = wd
+        seen["agent"] = agent
         return sentinel
 
     monkeypatch.setattr(cm, "_discover_codex_rollout", fake)
@@ -194,6 +251,7 @@ def test_discovery_delegates_to_codex_rollout(monkeypatch):
     assert ss._discover_transcript_path() is sentinel
     assert ss._has_prior_transcript() is True
     assert seen["wd"] == "/tmp/abc"
+    assert seen["agent"] is ss._config
 
 
 # ── codex trust pre-seed ────────────────────────────────────────────────────
@@ -211,11 +269,55 @@ def test_seed_codex_trust_writes_and_idempotent(monkeypatch, tmp_path):
     assert (ch / "config.toml").read_text().count(f'[projects."{real}"]') == 1
 
 
+def test_flag_off_trust_seed_preserves_legacy_path_and_bytes(monkeypatch, tmp_path):
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    config = shared_home / "config.toml"
+    original = "[features]\napps = true\n"
+    config.write_text(original, encoding="utf-8")
+    working_dir = tmp_path / "agent"
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.delenv(PER_AGENT_CODEX_HOME_ENV, raising=False)
+    ss = _session(working_dir=str(working_dir))
+
+    ss._seed_codex_trust(str(working_dir))
+
+    real = os.path.realpath(working_dir)
+    assert config.read_text(encoding="utf-8") == (
+        original + f'\n[projects."{real}"]\ntrust_level = "trusted"\n'
+    )
+    assert not (working_dir / ".codex").exists()
+
+
+def test_flag_on_trust_seed_preserves_unmanaged_agent_config(
+    monkeypatch, tmp_path
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    agent_home = working_dir / ".codex"
+    agent_home.mkdir(parents=True)
+    config = agent_home / "config.toml"
+    manual = "# manual\n[features]\nplugins = true\n"
+    config.write_text(manual, encoding="utf-8")
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    ss = _session(working_dir=str(working_dir))
+
+    ss._seed_codex_trust(str(working_dir))
+
+    assert config.read_text(encoding="utf-8") == manual
+    assert not (shared_home / "config.toml").exists()
+
+
 # ── tailer class ────────────────────────────────────────────────────────────
 @pytest.mark.asyncio
 async def test_start_tailer_uses_codex_tailer(monkeypatch):
     import pinky_daemon.codex_tmux_session as cm
-    monkeypatch.setattr(cm, "_discover_codex_rollout", lambda wd: None)  # cold start
+    monkeypatch.setattr(
+        cm,
+        "_discover_codex_rollout",
+        lambda wd, *, agent=None: None,
+    )  # cold start
     ss = _session()
     await ss._start_tailer()
     try:

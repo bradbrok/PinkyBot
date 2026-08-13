@@ -496,6 +496,7 @@ class Agent:
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
     # ``ultracode`` (#151): xhigh reasoning + standing workflow orchestration.
     # Resolves to xhigh for the actual effort knob (the CLI flag rejects the
@@ -576,6 +577,7 @@ class Agent:
             "provider_key_set": bool(self.provider_key),
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
+            "codex_home": self.codex_home,
             "thinking_effort": self.thinking_effort,
             "strict_effort_enforcement": self.strict_effort_enforcement,
             "dedicated_config_dir": self.dedicated_config_dir,
@@ -1827,6 +1829,8 @@ class AgentRegistry:
             # Operator-supplied container image for isolation_mode="container".
             # Empty for other modes; bring-your-own (Pinky never builds it).
             ("container_image", "TEXT NOT NULL DEFAULT ''"),
+            # Explicit per-agent CODEX_HOME. Inert unless the isolation flag is on.
+            ("codex_home", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
@@ -2649,6 +2653,7 @@ except Exception as exc:
                     "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
                     "librarian_enabled", "librarian_schedule",
                     "runtime", "transport", "provider_url", "provider_model", "provider_ref",
+                    "codex_home",
                     "thinking_effort", "strict_effort_enforcement",
                     "dedicated_config_dir", "isolated",
                     "isolation_mode", "container_image"):
@@ -2783,6 +2788,7 @@ except Exception as exc:
                 provider_key=kwargs.get("provider_key", ""),
                 provider_model=kwargs.get("provider_model", ""),
                 provider_ref=kwargs.get("provider_ref", ""),
+                codex_home=kwargs.get("codex_home", ""),
                 thinking_effort=kwargs.get("thinking_effort", "medium"),
                 strict_effort_enforcement=kwargs.get("strict_effort_enforcement", False),
                 dedicated_config_dir=kwargs.get("dedicated_config_dir", False),
@@ -2802,10 +2808,11 @@ except Exception as exc:
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
+                    codex_home,
                     thinking_effort, strict_effort_enforcement, dedicated_config_dir,
                     watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -2822,6 +2829,7 @@ except Exception as exc:
                  int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
                  agent.provider_model, agent.provider_ref,
+                 agent.codex_home,
                  agent.thinking_effort, int(agent.strict_effort_enforcement),
                  int(agent.dedicated_config_dir),
                  json.dumps(agent.watchdog_config),
@@ -2862,7 +2870,7 @@ except Exception as exc:
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
-        "isolation_mode, container_image, dedicated_config_dir"
+        "isolation_mode, container_image, dedicated_config_dir, codex_home"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -7040,6 +7048,7 @@ except Exception as exc:
             isolation_mode=row[52] if len(row) > 52 and row[52] else "local",
             container_image=row[53] if len(row) > 53 and row[53] else "",
             dedicated_config_dir=bool(row[54]) if len(row) > 54 else False,
+            codex_home=row[55] if len(row) > 55 and row[55] else "",
         )
 
     # ── Cost Tracking ──────────────────────────────────────
