@@ -16,6 +16,7 @@ from __future__ import annotations
 import asyncio
 import inspect
 import json
+import math
 import os
 import sys
 import time
@@ -59,6 +60,7 @@ _SCHEDULE_PROMPT_WARN_INTERVAL_SEC = 15 * 60
 _PERSISTED_WAKE_MAX_AGE_SEC = 60 * 60
 _RECEIPT_EXTENSION_MAX_AGE_ENV = "PINKY_SCHEDULE_RECEIPT_EXTENSION_MAX_AGE_SEC"
 _RECEIPT_EXTENSION_MAX_AGE_SEC = 60 * 60
+_PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC = 60
 
 
 class _ReceiptAbandonedError(RuntimeError):
@@ -296,6 +298,11 @@ class AgentScheduler:
             )
             try:
                 receipt_extension_max_age_sec = float(raw_extension_max_age)
+                if (
+                    not math.isfinite(receipt_extension_max_age_sec)
+                    or receipt_extension_max_age_sec <= 0
+                ):
+                    raise ValueError("ceiling must be finite and positive")
             except (TypeError, ValueError):
                 receipt_extension_max_age_sec = _RECEIPT_EXTENSION_MAX_AGE_SEC
                 _log(
@@ -303,8 +310,13 @@ class AgentScheduler:
                     f"{raw_extension_max_age!r}; using "
                     f"{_RECEIPT_EXTENSION_MAX_AGE_SEC:g}s"
                 )
-        if receipt_extension_max_age_sec <= 0:
-            raise ValueError("receipt_extension_max_age_sec must be positive")
+        if (
+            not math.isfinite(receipt_extension_max_age_sec)
+            or receipt_extension_max_age_sec <= 0
+        ):
+            raise ValueError(
+                "receipt_extension_max_age_sec must be finite and positive"
+            )
         self._receipt_extension_max_age_sec = float(
             receipt_extension_max_age_sec
         )
@@ -337,6 +349,7 @@ class AgentScheduler:
         self._pending_replay_again: set[str] = set()
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
+        self._last_pending_wake_liveness_drain_at: float | None = None
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -425,6 +438,11 @@ class AgentScheduler:
 
         # Check clock-aligned wakes
         await self._check_clock_aligned_wakes(now)
+
+        # Idle notifications are the primary low-latency outbox drain.  This
+        # bounded fallback prevents a lost edge from stranding a busy-deferred
+        # fire forever, including agents that keep the default heartbeat=0.
+        self._check_pending_wake_liveness(now)
 
         # Check heartbeat health
         await self._check_heartbeats(now)
@@ -1332,7 +1350,21 @@ class AgentScheduler:
                 current_schedule, pending.fired_at
             )
             row_age = max(0.0, replay_now - pending.fired_at)
-            if row_age > replay_max_age:
+            # Invariant: pasted/inflight classification precedes stale
+            # deletion.  Once a prompt is observable in the transport it
+            # cannot be recalled, so when the replay and receipt ceilings meet,
+            # ABANDONMENT WINS: retain the exact row for RECEIPT_ABANDONED,
+            # detach its observer, and preserve late-receipt authority.
+            inflight_past_replay_ceiling = (
+                row_age > replay_max_age
+                and self._wake_prompt_inflight(
+                    pending,
+                    prompt=self._wake_prompt_with_recurring_stale_drops(
+                        pending
+                    )[0],
+                )
+            )
+            if row_age > replay_max_age and not inflight_past_replay_ceiling:
                 discarded = self._registry.delete_pending_schedule_wake(
                     pending.id
                 )
@@ -1361,6 +1393,12 @@ class AgentScheduler:
                         row_age=row_age,
                     )
                 continue
+            if inflight_past_replay_ceiling:
+                _log(
+                    f"scheduler: pasted pending wake #{pending.id} crossed "
+                    "its replay ceiling; receipt abandonment takes "
+                    "precedence over stale deletion"
+                )
             pending_wakes.append(pending)
 
         # A recurring schedule describes current work, not a FIFO event log.
@@ -1741,6 +1779,44 @@ class AgentScheduler:
             "outbox; triggering durable replay"
         )
         self.replay_pending_for_agent(agent_name)
+
+    def _check_pending_wake_liveness(self, now: float) -> None:
+        """Periodically drain live-daemon outboxes without heartbeat opt-in.
+
+        Turn-idle remains the primary path.  This once-per-minute scan is the
+        bounded fallback for a lost idle callback; the positive busy gate is
+        checked both here and again under the per-agent replay lock.
+        """
+        last_drain = self._last_pending_wake_liveness_drain_at
+        if last_drain is None:
+            self._last_pending_wake_liveness_drain_at = now
+            return
+        if now - last_drain < _PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC:
+            return
+        self._last_pending_wake_liveness_drain_at = now
+        try:
+            agent_names = {
+                pending.agent_name
+                for pending in self._registry.list_pending_schedule_wakes()
+            }
+        except Exception as exc:
+            _log(
+                "scheduler: periodic outbox drain scan failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return
+        for agent_name in sorted(agent_names):
+            if self._agent_busy_not_wedged(agent_name):
+                _log(
+                    f"scheduler: periodic outbox drain deferred for "
+                    f"'{agent_name}': transport remains busy-not-wedged"
+                )
+                continue
+            _log(
+                f"scheduler: periodic liveness drain found pending wakes "
+                f"for '{agent_name}'"
+            )
+            self.replay_pending_for_agent(agent_name)
 
     # Resurrection cap: at most this many attempts per RESURRECTION_WINDOW_SECONDS
     # per agent. Prevents thrashing on a persistently-broken session while still

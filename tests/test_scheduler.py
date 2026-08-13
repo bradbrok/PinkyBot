@@ -968,6 +968,24 @@ class TestSessionTypes:
 
 
 class TestScheduler:
+    @pytest.mark.parametrize(
+        "raw_value", ["garbage", "0", "-1", "-inf", "inf", "nan"]
+    )
+    def test_invalid_receipt_extension_env_uses_finite_default(
+        self, registry, monkeypatch, capsys, raw_value
+    ):
+        monkeypatch.setenv(
+            "PINKY_SCHEDULE_RECEIPT_EXTENSION_MAX_AGE_SEC", raw_value
+        )
+
+        scheduler = AgentScheduler(registry)
+
+        assert scheduler._receipt_extension_max_age_sec == 3_600.0
+        error_log = capsys.readouterr().err
+        assert "invalid receipt-extension ceiling" in error_log
+        assert repr(raw_value) in error_log
+        assert "using 3600s" in error_log
+
     def test_init(self, registry):
         scheduler = AgentScheduler(registry)
         assert scheduler.running is False
@@ -1769,6 +1787,67 @@ class TestScheduler:
         restarted_registry.close()
 
     @pytest.mark.asyncio
+    async def test_production_ceiling_abandons_pasted_replay_before_stale_drop(
+        self, registry, monkeypatch, capsys
+    ):
+        """At 3601s with both defaults, abandonment wins over stale deletion."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 8 * * *", name="production-edge", prompt="pasted"
+        )
+        fired_at = 1_800_000_000.0
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: fired_at + 3_601.0
+        )
+        receipt = asyncio.get_running_loop().create_future()
+        attempts: list[str] = []
+        probes: list[tuple[str, str]] = []
+
+        async def pasted(agent_name, session_id, prompt, **kwargs):
+            del agent_name, session_id, kwargs
+            attempts.append(prompt)
+            return receipt
+
+        def inflight(agent_name, prompt):
+            probes.append((agent_name, prompt))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=pasted,
+            delivery_inflight_fn=inflight,
+            schedule_delivery_timeout=10.0,
+        )
+
+        await scheduler._replay_pending_locked("worker")
+        await asyncio.sleep(0)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.ledger_state == "quarantined"
+        assert "RECEIPT_ABANDONED" in ledger.last_error
+        assert attempts == ["pasted"]
+        assert probes and set(probes) == {("worker", "pasted")}
+        assert len(scheduler._detached_receipt_tasks) == 1
+        logs = capsys.readouterr().err
+        assert "receipt abandonment takes precedence over stale deletion" in logs
+        assert "age_s=3601.0 ceiling_s=3600.0" in logs
+
+        receipt.set_result(True)
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
     async def test_pending_recurrences_collapse_to_newest_with_trace(
         self, registry, capsys
     ):
@@ -1843,6 +1922,64 @@ class TestScheduler:
 
         assert attempts == ["deliver on idle"]
         assert registry.list_pending_schedule_wakes("worker") == []
+
+    @pytest.mark.asyncio
+    async def test_periodic_drain_recovers_busy_fire_when_idle_edge_is_lost(
+        self, registry, monkeypatch
+    ):
+        """Heartbeat=0 agents still drain a lost-idle deferred fire live."""
+        registry.register("worker")
+        registry.add_schedule(
+            "worker", "* * * * *", name="recurring", prompt="run work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        busy = True
+        attempts: list[float] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            attempts.append(clock[0])
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_busy_fn=lambda agent_name: busy,
+        )
+
+        await scheduler._check_schedules(base)
+        await asyncio.gather(*list(scheduler._schedule_delivery_tasks))
+        assert attempts == []
+        assert len(registry.list_pending_schedule_wakes("worker")) == 1
+
+        # Model the lost on_turn_idle callback: busy clears, but no explicit
+        # notify_agent_idle call occurs.  Establish the periodic cadence.
+        busy = False
+        scheduler._check_pending_wake_liveness(base)
+
+        # A later recurrence delivers normally; the periodic fallback then
+        # drains the original exact fire at the replay-window boundary.
+        clock[0] = base + 60.0
+        await scheduler._check_schedules(clock[0])
+        await asyncio.gather(*list(scheduler._schedule_delivery_tasks))
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+
+        clock[0] = base + 120.0
+        await scheduler._check_schedules(clock[0])
+        await asyncio.gather(*list(scheduler._schedule_delivery_tasks))
+        scheduler._check_pending_wake_liveness(clock[0])
+
+        assert attempts == [base + 60.0, base + 60.0, base + 120.0]
+        assert registry.list_pending_schedule_wakes("worker") == []
+        ledger = registry.list_schedule_wake_ledger("worker")
+        assert len(ledger) == 3
+        assert all(row.ledger_state == "receipted-ran-once" for row in ledger)
+        assert registry.get("worker").heartbeat_interval == 0
 
     @pytest.mark.asyncio
     async def test_idle_trigger_during_replay_guarantees_follow_up_pass(
@@ -3774,6 +3911,53 @@ class TestRecurringStaleDropSurfacing:
         retained = registry.list_recurring_schedule_stale_drops("oleg")
         assert len(retained) == 1
         assert retained[0].drop_count == 2
+        assert retained[0].generation == 2
+
+    def test_late_ack_cannot_erase_post_ack_drop(self, registry):
+        """A retained revision prevents delete/reinsert ABA acknowledgement."""
+        registry.register("worker")
+        casualty = registry.add_schedule(
+            "worker", "* * * * *", name="casualty", prompt="work"
+        )
+        first_at = 1_800_000_000.0
+        registry.record_recurring_schedule_stale_drop(
+            casualty.id,
+            agent_name="worker",
+            schedule_name=casualty.name,
+            dropped_at=first_at,
+            row_age_s=61.0,
+        )
+
+        abandoned_snapshot = registry.list_recurring_schedule_stale_drops(
+            "worker"
+        )
+        superseding_snapshot = list(abandoned_snapshot)
+        assert {notice.generation for notice in abandoned_snapshot} == {1}
+
+        assert (
+            registry.acknowledge_recurring_schedule_stale_drops(
+                "worker", superseding_snapshot
+            )
+            == 1
+        )
+        registry.record_recurring_schedule_stale_drop(
+            casualty.id,
+            agent_name="worker",
+            schedule_name=casualty.name,
+            dropped_at=first_at + 1.0,
+            row_age_s=62.0,
+        )
+
+        assert (
+            registry.acknowledge_recurring_schedule_stale_drops(
+                "worker", abandoned_snapshot
+            )
+            == 0
+        )
+        retained = registry.list_recurring_schedule_stale_drops("worker")
+        assert len(retained) == 1
+        assert retained[0].schedule_id == casualty.id
+        assert retained[0].drop_count == 1
         assert retained[0].generation == 2
 
     @pytest.mark.asyncio

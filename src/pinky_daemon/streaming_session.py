@@ -731,19 +731,30 @@ class StreamingSession:
             except Exception as e:
                 _log(f"streaming[{self.agent_name}]: conversation store append failed: {e}")
 
+        # Book the turn before ``query()`` can make its transport write
+        # observable to the reader.  The SDK awaits that write, so a fast
+        # ResultMessage can otherwise arrive before this coroutine resumes and
+        # manufacture a false idle boundary with the turn still unrepresented.
+        # One routing reservation is the single source of truth for both
+        # response correlation and turn-idle detection.
+        reservation = (platform, chat_id, message_id)
+        self._pending_chats.append(reservation)
         try:
             self._analytics_log_activity(
                 "prompt_submitted",
                 metadata={"platform": platform, "chat_id": chat_id},
             )
             await self._client.query(prompt + agent_hint)
-            # Always enqueue one routing entry per query -- even with no
-            # chat_id -- so ResultMessage pops stay 1:1 with queries and a
-            # system/internal turn can't consume a user turn's routing.
-            self._pending_chats.append((platform, chat_id, message_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
             return True
         except Exception as e:
+            # Roll back only this submission.  A fast ResultMessage may have
+            # consumed it already, and concurrent reservations can contain
+            # equal routing values, so identity (not tuple equality) matters.
+            for index, pending in enumerate(self._pending_chats):
+                if pending is reservation:
+                    self._pending_chats.pop(index)
+                    break
             self._stats["errors"] += 1
             _log(f"streaming[{self.agent_name}]: send error: {e}")
             # Try to reconnect

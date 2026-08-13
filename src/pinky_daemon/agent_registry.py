@@ -4537,8 +4537,9 @@ except Exception as exc:
         """Aggregate one stale recurring fire into one bounded schedule row.
 
         The table has exactly one row per live schedule and cascades on
-        schedule deletion. ``generation`` lets delivery acknowledge only the
-        snapshot it actually surfaced; a concurrent newer drop stays pending.
+        schedule deletion. ``generation`` is a non-reusable revision: an
+        acknowledgement retains a zero-count tombstone, so a later drop can
+        never recycle the revision held by an older receipt observer.
         """
         if schedule_id <= 0:
             raise ValueError("schedule_id must be positive")
@@ -4558,19 +4559,35 @@ except Exception as exc:
                    ON CONFLICT(schedule_id) DO UPDATE SET
                        agent_name=excluded.agent_name,
                        schedule_name=excluded.schedule_name,
-                       drop_count=recurring_schedule_stale_drops.drop_count + 1,
-                       first_dropped_at=MIN(
-                           recurring_schedule_stale_drops.first_dropped_at,
-                           excluded.first_dropped_at
-                       ),
-                       last_dropped_at=MAX(
-                           recurring_schedule_stale_drops.last_dropped_at,
-                           excluded.last_dropped_at
-                       ),
-                       max_row_age_s=MAX(
-                           recurring_schedule_stale_drops.max_row_age_s,
-                           excluded.max_row_age_s
-                       ),
+                       drop_count=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN 1
+                           ELSE recurring_schedule_stale_drops.drop_count + 1
+                       END,
+                       first_dropped_at=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN excluded.first_dropped_at
+                           ELSE MIN(
+                               recurring_schedule_stale_drops.first_dropped_at,
+                               excluded.first_dropped_at
+                           )
+                       END,
+                       last_dropped_at=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN excluded.last_dropped_at
+                           ELSE MAX(
+                               recurring_schedule_stale_drops.last_dropped_at,
+                               excluded.last_dropped_at
+                           )
+                       END,
+                       max_row_age_s=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN excluded.max_row_age_s
+                           ELSE MAX(
+                               recurring_schedule_stale_drops.max_row_age_s,
+                               excluded.max_row_age_s
+                           )
+                       END,
                        generation=recurring_schedule_stale_drops.generation + 1""",
                 (
                     schedule_id,
@@ -4601,7 +4618,7 @@ except Exception as exc:
                       first_dropped_at, last_dropped_at, max_row_age_s,
                       generation
                FROM recurring_schedule_stale_drops
-               WHERE agent_name=?
+               WHERE agent_name=? AND drop_count > 0
                ORDER BY schedule_id ASC""",
             (agent_name,),
         ).fetchall()
@@ -4612,7 +4629,13 @@ except Exception as exc:
         agent_name: str,
         notices: list[RecurringScheduleStaleDrop],
     ) -> int:
-        """Clear only versioned aggregates included in a confirmed delivery."""
+        """Clear only versioned aggregates included in a confirmed delivery.
+
+        Clearing retains a zero-count revision tombstone.  Deleting the row
+        would let a later INSERT restart at generation 1, allowing a delayed
+        acknowledgement for an older generation-1 snapshot to erase the new
+        unsurfaced casualty (an ABA race).
+        """
         if not notices:
             return 0
         cleared = 0
@@ -4621,8 +4644,10 @@ except Exception as exc:
                 if notice.agent_name != agent_name:
                     continue
                 cursor = self._db.execute(
-                    """DELETE FROM recurring_schedule_stale_drops
-                       WHERE agent_name=? AND schedule_id=? AND generation=?""",
+                    """UPDATE recurring_schedule_stale_drops
+                       SET drop_count=0
+                       WHERE agent_name=? AND schedule_id=? AND generation=?
+                         AND drop_count > 0""",
                     (agent_name, notice.schedule_id, notice.generation),
                 )
                 cleared += cursor.rowcount
