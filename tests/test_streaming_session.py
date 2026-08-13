@@ -248,6 +248,19 @@ def _make_result_message(
     )
 
 
+def _make_text_assistant_message(text: str):
+    """Build a successful AssistantMessage carrying visible console text."""
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="claude-opus-4-7",
+        error=None,
+        usage={"input_tokens": 0, "output_tokens": 1},
+        stop_reason="end_turn",
+    )
+
+
 async def _run_reader_against_stream(ss: StreamingSession, messages: list) -> None:
     """Wire up a fake client whose receive_messages() yields the given list,
     then run the reader_loop until the iterator drains."""
@@ -944,15 +957,11 @@ async def test_billing_error_assistant_does_not_block_subsequent_auth_alert() ->
     assert args == (ss.agent_name, "authentication_failed")
 
 
-# -- _pending_chats routing-queue 1:1 invariant -------------------------------
+# -- _pending_chats turn-boundary drain invariant -----------------------------
 #
-# Response routing relies on FIFO correlation: one _pending_chats entry per
-# query, one pop per ResultMessage. System-initiated queries (wake prompt,
-# context warn, restart-blocked notice, idle-sleep save prompt) used to skip
-# the enqueue, so their ResultMessages consumed USER routing tuples and the
-# real user turn popped ("", "", "") -- silently dropping the reply (or
-# delivering a system turn's text to the user's chat). The queue also
-# survived disconnect(), leaking stale chat_ids into a resumed session.
+# The SDK may coalesce several submitted messages into one turn and emit one
+# ResultMessage. Every reservation visible at the start of that boundary must
+# be drained together; pop-one leaves stale route state for an unrelated turn.
 
 
 @pytest.mark.asyncio
@@ -1013,6 +1022,41 @@ async def test_send_books_turn_before_fast_result_can_emit_idle(
 
     release_query.set()
     assert await send_task is True
+    await reader_task
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
+async def test_unrouted_query_books_before_fast_result_boundary() -> None:
+    """Notification/system queries use the same reserve-before-write rule as
+    send(), so a fast Result cannot leave a late sentinel behind."""
+    ss = _make_session()
+    write_visible = asyncio.Event()
+    release_query = asyncio.Event()
+    result_consumed = asyncio.Event()
+
+    async def held_query(prompt: str) -> None:
+        del prompt
+        write_visible.set()
+        await release_query.wait()
+
+    async def receive_messages():
+        await write_visible.wait()
+        yield _make_result_message()
+        result_consumed.set()
+
+    ss._client.query = held_query
+    ss._client.receive_messages = receive_messages
+
+    query_task = asyncio.create_task(ss._query_unrouted("notification prompt"))
+    reader_task = asyncio.create_task(ss._reader_loop())
+
+    await result_consumed.wait()
+    assert not query_task.done()
+    assert ss._pending_chats == []
+
+    release_query.set()
+    await query_task
     await reader_task
     assert ss._pending_chats == []
 
@@ -1090,31 +1134,64 @@ async def test_disconnect_fires_empty_callback_for_routed_pending_entries() -> N
 
 
 @pytest.mark.asyncio
-async def test_system_turn_does_not_consume_user_routing() -> None:
-    """A system turn (sentinel entry) completing before a user turn must pop
-    its own sentinel, leaving the user tuple for the user turn."""
+async def test_coalesced_turn_boundary_drains_all_pending_routes_loudly(
+    capsys,
+) -> None:
+    """N>1 queued messages may share one SDK result; no reservation survives
+    and the stale count is operator-visible."""
     ss = _make_session()
-    routed: list[tuple[str, str]] = []
+    routed: list[tuple[str, str, str]] = []
 
     async def capture(turn_result):
-        routed.append((turn_result.platform, turn_result.chat_id))
+        routed.append(
+            (turn_result.platform, turn_result.chat_id, turn_result.response_text)
+        )
 
     ss._response_callback = capture
-    # System turn queued first (e.g. wake prompt), then a user message.
+    # Two explicit agent packets plus a notification-origin prompt coalesced
+    # into the same live SDK turn. Agent injects are deliberately unrouted.
     ss._pending_chats.append(("", "", ""))
-    ss._pending_chats.append(("telegram", "123", "9"))
+    ss._pending_chats.append(("", "", ""))
+    ss._pending_chats.append(("", "", ""))
 
     await _run_reader_against_stream(
         ss,
         [
-            _make_result_message(),  # system turn -- pops the sentinel
-            _make_result_message(),  # user turn -- pops the user tuple
+            _make_text_assistant_message("web-only turn-final narration"),
+            _make_result_message(),
         ],
     )
 
-    assert routed == [("telegram", "123")], (
-        f"user turn must route to the user's chat, got {routed}"
+    assert ss._pending_chats == []
+    assert routed == [("", "", "web-only turn-final narration")]
+    assert "TURN_BOUNDARY_STALE_ROUTE_DRAIN" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_notification_after_agent_inbound_is_web_record_only(tmp_path) -> None:
+    """A notification-origin completion after an earlier agent inbound is
+    retained in the web conversation store without retaining either route."""
+    from pinky_daemon.conversation_store import ConversationStore
+
+    store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    ss = _make_session()
+    ss._conversation_store = store
+    ss._pending_chats.append(("agent", "requester", "agent-message"))
+    ss._pending_chats.append(("", "", ""))
+
+    await _run_reader_against_stream(
+        ss,
+        [
+            _make_text_assistant_message("notification turn console text"),
+            _make_result_message(),
+        ],
     )
+
+    assert ss._pending_chats == []
+    assistant = [m for m in store.get_history(ss.id) if m.role == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0].content == "notification turn console text"
+    assert (assistant[0].platform, assistant[0].chat_id) == ("", "")
 
 
 # -- Typing-indicator leak: callback must fire for every routed turn ----------
