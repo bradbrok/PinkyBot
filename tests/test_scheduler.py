@@ -1807,6 +1807,63 @@ class TestScheduler:
         restarted_registry.close()
 
     @pytest.mark.asyncio
+    async def test_never_pasted_replay_over_receipt_ceiling_gets_first_budget(
+        self, registry, monkeypatch
+    ):
+        """An old never-pasted wake must reach its first acceptance edge.
+
+        This catches the cancel-before-acceptance bug where the original
+        ``fired_at`` produced timeout=0, cancelled normal async transport
+        setup, and left owed work to consume attempts until parking.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 8 * * *", name="daily", prompt="deliver once"
+        )
+        fired_at = 1_800_000_000.0
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: fired_at + 91.0
+        )
+        submissions: list[str] = []
+
+        async def accept_after_setup(
+            agent_name,
+            session_id,
+            prompt,
+            *,
+            schedule_receipt,
+        ):
+            del agent_name, session_id
+            await asyncio.sleep(0.01)
+            submissions.append(prompt)
+            assert schedule_receipt.accept() is True
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=accept_after_setup,
+            delivery_inflight_fn=lambda agent_name, prompt: False,
+            schedule_delivery_timeout=0.05,
+            receipt_extension_max_age_sec=90.0,
+            pending_wake_max_age_sec=3_600.0,
+        )
+
+        await scheduler._replay_pending_locked("worker")
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert submissions == ["deliver once"]
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
     async def test_production_ceiling_abandons_pasted_replay_before_stale_drop(
         self, registry, monkeypatch, capsys
     ):
@@ -1950,6 +2007,85 @@ class TestScheduler:
         assert ledger.ledger_state == "receipted-ran-once"
         replay.cancel()
         await asyncio.gather(replay, return_exceptions=True)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("extension_source", ["busy", "inflight"])
+    async def test_replay_extension_log_uses_schedule_id_not_pending_id(
+        self, registry, capsys, extension_source
+    ):
+        """Generic extension logs must not claim the replay-row identity.
+
+        The active row is deliberately #2 for schedule #1. Parameterizing the
+        two extension sources catches both diagnostic sites that interpolated
+        ``pending.id`` instead of the durable schedule identity.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker",
+            "0 * * * *",
+            name="diagnostic-identity",
+            prompt="log exactly",
+        )
+        fired_at = time.time()
+        prior, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at - 1.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            prior.id, delivered_at=fired_at - 0.5
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        assert pending.id != pending.schedule_id
+        receipt = asyncio.get_running_loop().create_future()
+
+        async def delayed_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            asyncio.get_running_loop().call_later(
+                0.025, receipt.set_result, True
+            )
+            return receipt
+
+        busy_checks = 0
+
+        def busy_after_replay_admission(agent_name):
+            nonlocal busy_checks
+            del agent_name
+            busy_checks += 1
+            return extension_source == "busy" and busy_checks > 1
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=delayed_receipt,
+            delivery_busy_fn=busy_after_replay_admission,
+            delivery_inflight_fn=(
+                lambda agent_name, prompt: extension_source == "inflight"
+            ),
+            schedule_delivery_timeout=0.01,
+        )
+
+        await scheduler._replay_pending_locked("worker")
+
+        logs = capsys.readouterr().err
+        assert (
+            f"schedule 'diagnostic-identity' (#{schedule.id}) for agent"
+            in logs
+        )
+        assert (
+            f"schedule 'diagnostic-identity' (#{pending.id}) for agent"
+            not in logs
+        )
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
 
     @pytest.mark.asyncio
     async def test_replay_abandonment_and_late_receipt_use_schedule_id(

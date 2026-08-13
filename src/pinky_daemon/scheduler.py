@@ -998,8 +998,9 @@ class AgentScheduler:
         schedule,
         *,
         attempt_started: asyncio.Event | None = None,
+        fresh_receipt_budget: bool = False,
     ) -> bool:
-        """Wait for one exact receipt within the original fire's deadline."""
+        """Wait for one exact receipt within its applicable delivery budget."""
         delivery_prompt, stale_drop_notices = (
             self._wake_prompt_with_recurring_stale_drops(schedule)
         )
@@ -1018,6 +1019,15 @@ class AgentScheduler:
                         self._receipt_extension_max_age_sec
                         - self._receipt_age(schedule),
                     )
+                    if fresh_receipt_budget:
+                        # Replay already proved this old prompt was never
+                        # pasted. Give the owed first transport attempt one
+                        # real acceptance window instead of cancelling its
+                        # task at timeout=0 from the historical fired_at.
+                        remaining = max(
+                            remaining, self._schedule_delivery_timeout
+                        )
+                        fresh_receipt_budget = False
                     confirmed = await asyncio.wait_for(
                         asyncio.shield(delivery),
                         timeout=min(
@@ -1054,7 +1064,8 @@ class AgentScheduler:
                     if self._agent_busy_not_wedged(schedule.agent_name):
                         _log(
                             f"scheduler: receipt still pending for schedule "
-                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.name}' "
+                            f"(#{self._schedule_id(schedule)}) for agent "
                             f"'{schedule.agent_name}', but inflight watchdog "
                             "reports busy-not-wedged; extending delivery timeout"
                         )
@@ -1064,7 +1075,8 @@ class AgentScheduler:
                     ):
                         _log(
                             f"scheduler: receipt still pending for schedule "
-                            f"'{schedule.name}' (#{schedule.id}) for agent "
+                            f"'{schedule.name}' "
+                            f"(#{self._schedule_id(schedule)}) for agent "
                             f"'{schedule.agent_name}', but its prompt is "
                             "already pasted to the transport — a cancel "
                             "cannot recall it, and declaring undelivered "
@@ -1442,6 +1454,7 @@ class AgentScheduler:
                 # a no-longer-inflight tombstone must not starve newer work.
                 abandoned_schedule_ids.add(pending.schedule_id)
         pending_wakes = []
+        fresh_receipt_budget_ids: set[int] = set()
         for pending in all_pending_wakes:
             current_schedule = self._registry.get_schedule(pending.schedule_id)
             zombie_reason = ""
@@ -1494,11 +1507,12 @@ class AgentScheduler:
             # cannot be recalled, so replay must quarantine that exact fire
             # in place and retain its existing durable acceptance authority.
             # Calling _wait_for_wake_confirmation here would paste a duplicate.
-            inflight_past_receipt_ceiling = (
+            past_receipt_ceiling = (
                 row_age >= self._receipt_extension_max_age_sec
-                and self._wake_prompt_inflight(
-                    pending, prompt=delivery_prompt
-                )
+            )
+            inflight_past_receipt_ceiling = (
+                past_receipt_ceiling
+                and self._wake_prompt_inflight(pending, prompt=delivery_prompt)
             )
             if inflight_past_receipt_ceiling:
                 retained = self._abandon_inflight_replay(
@@ -1544,6 +1558,10 @@ class AgentScheduler:
                         row_age=row_age,
                     )
                 continue
+            if past_receipt_ceiling:
+                # The inflight probe above proved this old row was never
+                # pasted. It remains owed work inside its replay window.
+                fresh_receipt_budget_ids.add(pending.id)
             pending_wakes.append(pending)
 
         # A recurring schedule describes current work, not a FIFO event log.
@@ -1602,7 +1620,15 @@ class AgentScheduler:
             if attempts is None:
                 continue
             try:
-                confirmed = await self._wait_for_wake_confirmation(pending)
+                confirmed = await self._wait_for_wake_confirmation(
+                    pending,
+                    # Any over-ceiling row that reached this point is not
+                    # currently pasted and survived the replay-age policy.
+                    # Its first legitimate transport acceptance is still owed.
+                    fresh_receipt_budget=(
+                        pending.id in fresh_receipt_budget_ids
+                    ),
+                )
             except asyncio.CancelledError:
                 raise
             except _ReceiptAbandonedError:
