@@ -5695,9 +5695,11 @@ class TestAgentCRUD:
     ):
         import pinky_daemon.api as api_module
         from pinky_daemon import provisioning
+        from pinky_daemon.agent_registry import AgentRegistry
 
         provisioned = []
         deprovisioned = []
+        observed_at_mcp_gap = {}
 
         class SuccessfulProvisioner:
             def provision(self, agent):
@@ -5715,6 +5717,24 @@ class TestAgentCRUD:
         )
 
         def fail_mcp(*_args, **_kwargs):
+            # Reproduce the migration race: a second registry starts after the
+            # HTTP claim committed and provisioning succeeded, but before MCP
+            # publication fails and compensation removes the claim row.
+            concurrent_registry = AgentRegistry(db_path=registry._db_path)
+            try:
+                observed_at_mcp_gap.update(
+                    agent_exists=concurrent_registry.get("barsik") is not None,
+                    finalized=concurrent_registry._db.execute(
+                        "SELECT registration_finalized FROM agents "
+                        "WHERE name='barsik'"
+                    ).fetchone()[0],
+                    contacts=concurrent_registry.list_verified_contacts("barsik"),
+                    marker=concurrent_registry.get_setting(
+                        "migration:verified_contacts_brad_owner_seed_v1"
+                    ),
+                )
+            finally:
+                concurrent_registry.close()
             raise RuntimeError("injected MCP publication failure")
 
         monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
@@ -5730,6 +5750,12 @@ class TestAgentCRUD:
         assert response.status_code == 500
         assert provisioned == ["barsik"]
         assert deprovisioned == ["barsik"]
+        assert observed_at_mcp_gap == {
+            "agent_exists": True,
+            "finalized": 0,
+            "contacts": [],
+            "marker": "",
+        }
         self._assert_failed_registration_left_no_state(
             client,
             "barsik",
@@ -5742,6 +5768,8 @@ class TestAgentCRUD:
         ) == ""
 
     def test_successful_barsik_registration_finalizes_bootstrap_state(self, tmp_path):
+        from pinky_daemon.agent_registry import AgentRegistry
+
         client = self._make_client()
         registry = client.app.state.agents
 
@@ -5759,6 +5787,22 @@ class TestAgentCRUD:
         assert registry.get_setting(
             "migration:verified_contacts_brad_owner_seed_v1"
         ) == "1"
+        finalized = registry._db.execute(
+            "SELECT registration_finalized FROM agents WHERE name='barsik'"
+        ).fetchone()[0]
+        assert finalized == 1
+
+        # A post-success registry startup runs migration seeding again. The
+        # marker/unique key make that pass idempotent, as is a repeat finalize.
+        concurrent_registry = AgentRegistry(db_path=registry._db_path)
+        try:
+            concurrent_registry.finalize_registration("barsik")
+            assert len(concurrent_registry.list_verified_contacts("barsik")) == 1
+            assert concurrent_registry.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == "1"
+        finally:
+            concurrent_registry.close()
 
     def test_register_failure_restores_preexisting_workspace_files(
         self,

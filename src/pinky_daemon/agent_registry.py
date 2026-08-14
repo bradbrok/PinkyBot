@@ -1430,6 +1430,7 @@ class AgentRegistry:
                 groups TEXT NOT NULL DEFAULT '[]',
                 max_sessions INTEGER NOT NULL DEFAULT 5,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                registration_finalized INTEGER NOT NULL DEFAULT 1,
                 auto_start INTEGER NOT NULL DEFAULT 0,
                 heartbeat_interval INTEGER NOT NULL DEFAULT 0,
                 plain_text_fallback INTEGER NOT NULL DEFAULT 0,
@@ -1866,6 +1867,11 @@ class AgentRegistry:
         }
         migrations = [
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
+            # HTTP create-only registration commits its ownership claim before
+            # fallible provisioning/MCP publication. Pre-upgrade rows are all
+            # completed registrations; new claim rows override this default to
+            # 0 until finalize_registration() publishes bootstrap state.
+            ("registration_finalized", "INTEGER NOT NULL DEFAULT 1"),
             ("heartbeat_interval", "INTEGER NOT NULL DEFAULT 0"),
             # Off by default — must match the dataclass + CREATE TABLE default (0).
             # A DEFAULT 1 here silently backfilled every pre-existing agent with
@@ -2172,12 +2178,15 @@ class AgentRegistry:
         # Seed default models
         self._seed_models()
 
-    def _seed_verified_contacts(self) -> None:
-        """Install caller-specified verified contacts when their agent exists."""
+    def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
+        """Install caller-specified contacts for a finalized registration."""
         marker = "migration:verified_contacts_brad_owner_seed_v1"
         if self.get_setting(marker) == "1":
             return
-        if self._db.execute("SELECT 1 FROM agents WHERE name='barsik'").fetchone() is None:
+        if self._db.execute(
+            "SELECT 1 FROM agents "
+            "WHERE name='barsik' AND registration_finalized=1"
+        ).fetchone() is None:
             return
         try:
             cursor = self._db.execute(
@@ -2197,20 +2206,32 @@ class AgentRegistry:
                    ON CONFLICT(key) DO UPDATE SET value='1'""",
                 (marker,),
             )
-            self._db.commit()
+            if _commit:
+                self._db.commit()
         except Exception:
-            self._db.rollback()
+            if _commit:
+                self._db.rollback()
             raise
         if cursor.rowcount:
             _log("agent_registry: seeded barsik Buzz owner verified contact")
 
     def finalize_registration(self, name: str) -> None:
-        """Publish bootstrap state only after every external registration stage."""
+        """Atomically finalize registration and publish its bootstrap state."""
         name = _validate_agent_name(name)
         with self._rmw_lock:
-            if not self.get(name):
-                raise KeyError(f"Agent '{name}' not found")
-            self._seed_verified_contacts()
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                cursor = self._db.execute(
+                    "UPDATE agents SET registration_finalized=1 WHERE name=?",
+                    (name,),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"Agent '{name}' not found")
+                self._seed_verified_contacts(_commit=False)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     def _backfill_runtime_from_provider_url(self) -> None:
         """One-shot migration from legacy provider_url runtime selection."""
@@ -3302,7 +3323,8 @@ except Exception as exc:
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
                     restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
-                    max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
+                    max_sessions, enabled, registration_finalized, auto_start,
+                    heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
                     isolation_mode, container_image,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
@@ -3312,7 +3334,7 @@ except Exception as exc:
                     thinking_effort, strict_effort_enforcement, dedicated_config_dir,
                     watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
@@ -3321,7 +3343,8 @@ except Exception as exc:
                  agent.restart_threshold_pct, agent.context_nudge_threshold_pct,
                  int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
-                 int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
+                 int(agent.enabled), int(not create_only), int(agent.auto_start),
+                 agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role, int(agent.isolated),
                  agent.isolation_mode, agent.container_image,

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import threading
 import time
@@ -29,6 +30,101 @@ def registry():
     yield r
     r.close()
     os.unlink(path)
+
+
+class TestVerifiedContactBootstrap:
+    def test_finalize_rolls_back_state_bit_and_contact_if_marker_write_fails(
+        self,
+        tmp_path,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register(
+                "barsik",
+                create_only=True,
+                working_dir=str(tmp_path / "barsik"),
+            )
+            registry._db.execute(
+                """CREATE TRIGGER fail_registration_marker
+                   BEFORE INSERT ON system_settings
+                   WHEN NEW.key='migration:verified_contacts_brad_owner_seed_v1'
+                   BEGIN
+                     SELECT RAISE(ABORT, 'injected marker failure');
+                   END"""
+            )
+            registry._db.commit()
+
+            with pytest.raises(sqlite3.IntegrityError, match="injected marker failure"):
+                registry.finalize_registration("barsik")
+
+            finalized = registry._db.execute(
+                "SELECT registration_finalized FROM agents WHERE name='barsik'"
+            ).fetchone()[0]
+            assert finalized == 0
+            assert registry.list_verified_contacts("barsik") == []
+            assert registry.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == ""
+        finally:
+            registry.close()
+
+    def test_legacy_reregister_cannot_seed_unfinalized_http_claim(self, tmp_path):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register(
+                "barsik",
+                create_only=True,
+                working_dir=str(tmp_path / "barsik"),
+            )
+
+            finalized = registry._db.execute(
+                "SELECT registration_finalized FROM agents WHERE name='barsik'"
+            ).fetchone()[0]
+            assert finalized == 0
+
+            # The historical upsert-style register path also invokes the seed.
+            # It must not publish bootstrap state for an HTTP claim whose
+            # provisioning/MCP stages have not finalized yet.
+            registry.register("barsik", model="sonnet")
+
+            assert registry.list_verified_contacts("barsik") == []
+            assert registry.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == ""
+        finally:
+            registry.close()
+
+    def test_upgrade_backfills_existing_agent_before_migration_seed(self, tmp_path):
+        db_path = tmp_path / "agents.db"
+        legacy = AgentRegistry(db_path=str(db_path))
+        try:
+            legacy.register("barsik", working_dir=str(tmp_path / "barsik"))
+            legacy._db.execute("DELETE FROM verified_contacts WHERE agent_name='barsik'")
+            legacy._db.execute(
+                "DELETE FROM system_settings WHERE key=?",
+                ("migration:verified_contacts_brad_owner_seed_v1",),
+            )
+            legacy._db.commit()
+        finally:
+            legacy.close()
+
+        # Model a pre-R4 database: its durable Barsik row is a completed legacy
+        # registration, but neither the finalized column nor seed marker exists.
+        with sqlite3.connect(db_path) as db:
+            db.execute("ALTER TABLE agents DROP COLUMN registration_finalized")
+
+        upgraded = AgentRegistry(db_path=str(db_path))
+        try:
+            finalized = upgraded._db.execute(
+                "SELECT registration_finalized FROM agents WHERE name='barsik'"
+            ).fetchone()[0]
+            assert finalized == 1
+            assert len(upgraded.list_verified_contacts("barsik")) == 1
+            assert upgraded.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == "1"
+        finally:
+            upgraded.close()
 
 
 class TestOwnerNotificationDestinations:
