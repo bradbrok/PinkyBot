@@ -23,11 +23,13 @@ Hierarchy:
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shlex
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -97,6 +99,60 @@ def _validate_agent_name(name: str) -> str:
             f"starts with letter or digit; up to 63 chars)"
         )
     return name
+
+
+class AgentPathContainmentError(ValueError):
+    """A requested agent path resolved outside its owning workspace."""
+
+
+def resolve_agent_path(
+    agent_name: str,
+    agent_dir: str | Path,
+    *parts: str | Path,
+) -> Path:
+    """Resolve an agent-owned path and refuse aliases outside its workspace.
+
+    ``agent_dir`` is the persisted owning workspace.  Resolution happens
+    before any caller reads or writes the result, so ``..`` components,
+    absolute children, symlinks, and case-normalized aliases cannot escape
+    the workspace.  The agent name is validated here as well so every path
+    boundary shares the registry's existing strict allowlist.
+    """
+    _validate_agent_name(agent_name)
+    if not agent_dir:
+        raise AgentPathContainmentError("agent workspace is not configured")
+    workspace_path = Path(agent_dir)
+    if not workspace_path.is_absolute():
+        raise AgentPathContainmentError("agent workspace is not an absolute path")
+    workspace = workspace_path.resolve()
+    candidate = workspace.joinpath(*parts) if parts else workspace
+    resolved = candidate.resolve()
+    if resolved != workspace and not resolved.is_relative_to(workspace):
+        raise AgentPathContainmentError("agent path is outside its workspace")
+    return resolved
+
+
+def replace_agent_text(
+    agent_name: str,
+    agent_dir: str | Path,
+    path: str | Path,
+    content: str,
+) -> Path:
+    """Atomically replace one contained agent file without following links."""
+    target = resolve_agent_path(agent_name, agent_dir, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def _log(msg: str) -> None:
@@ -770,6 +826,52 @@ class ScheduleNameConflictError(ValueError):
     """An enabled schedule already uses the requested agent/name pair."""
 
 
+class AgentAlreadyExistsError(ValueError):
+    """A create-only registration collided with an existing agent name."""
+
+
+class AgentRegistrationIncompleteError(RuntimeError):
+    """A create-only registration won its DB name but failed before completion."""
+
+    def __init__(self, name: str, *, row_committed: bool):
+        super().__init__(f"registration incomplete for {name}")
+        self.row_committed = row_committed
+
+
+class AgentWorkspacePathError(ValueError):
+    """An agent workspace could not be resolved to a usable absolute path."""
+
+
+class AgentWorkspaceOverlapError(ValueError):
+    """An agent workspace overlaps another registered agent's owner root."""
+
+
+@dataclass(frozen=True)
+class SoulMutationSummary:
+    """Content-free evidence explaining why a soul replacement is risky."""
+
+    old_length: int
+    new_length: int
+    shrink_percent: float
+    missing_anchors: tuple[str, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "old_length": self.old_length,
+            "new_length": self.new_length,
+            "shrink_percent": self.shrink_percent,
+            "missing_anchors": list(self.missing_anchors),
+        }
+
+
+class SoulMutationRejectedError(ValueError):
+    """A soul replacement needs an explicit force flag before it may run."""
+
+    def __init__(self, summary: SoulMutationSummary) -> None:
+        super().__init__("soul mutation rejected by shrink/identity guard")
+        self.summary = summary
+
+
 @dataclass
 class AgentHeartbeat:
     """A heartbeat record for an agent."""
@@ -1328,6 +1430,7 @@ class AgentRegistry:
                 groups TEXT NOT NULL DEFAULT '[]',
                 max_sessions INTEGER NOT NULL DEFAULT 5,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                registration_finalized INTEGER NOT NULL DEFAULT 1,
                 auto_start INTEGER NOT NULL DEFAULT 0,
                 heartbeat_interval INTEGER NOT NULL DEFAULT 0,
                 plain_text_fallback INTEGER NOT NULL DEFAULT 0,
@@ -1764,6 +1867,11 @@ class AgentRegistry:
         }
         migrations = [
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
+            # HTTP create-only registration commits its ownership claim before
+            # fallible provisioning/MCP publication. Pre-upgrade rows are all
+            # completed registrations; new claim rows override this default to
+            # 0 until finalize_registration() publishes bootstrap state.
+            ("registration_finalized", "INTEGER NOT NULL DEFAULT 1"),
             ("heartbeat_interval", "INTEGER NOT NULL DEFAULT 0"),
             # Off by default — must match the dataclass + CREATE TABLE default (0).
             # A DEFAULT 1 here silently backfilled every pre-existing agent with
@@ -1836,6 +1944,13 @@ class AgentRegistry:
             if col not in existing:
                 self._db.execute(f"ALTER TABLE agents ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added column {col}")
+        # Structural belt for the exact persisted-root case. Legacy placeholder
+        # values are excluded; resolved aliases and nested/enclosing roots still
+        # require the BEGIN IMMEDIATE overlap check in register().
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_working_dir_owner_exact "
+            "ON agents(working_dir) WHERE working_dir NOT IN ('', '.')"
+        )
         self._db.commit()
         self._backfill_runtime_from_provider_url()
         self._warn_codex_runtime_mismatches()
@@ -2063,33 +2178,60 @@ class AgentRegistry:
         # Seed default models
         self._seed_models()
 
-    def _seed_verified_contacts(self) -> None:
-        """Install caller-specified verified contacts when their agent exists."""
+    def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
+        """Install caller-specified contacts for a finalized registration."""
         marker = "migration:verified_contacts_brad_owner_seed_v1"
         if self.get_setting(marker) == "1":
             return
-        if self._db.execute("SELECT 1 FROM agents WHERE name='barsik'").fetchone() is None:
+        if self._db.execute(
+            "SELECT 1 FROM agents "
+            "WHERE name='barsik' AND registration_finalized=1"
+        ).fetchone() is None:
             return
-        cursor = self._db.execute(
-            """INSERT INTO verified_contacts
-               (agent_name, platform, principal, name, role, added_at)
-               VALUES ('barsik', 'buzz', ?, 'Brad', 'owner', ?)
-               ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
-                 name='Brad', role='owner'""",
-            (
-                "buzz:posspecialists:"
-                "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b",
-                time.time(),
-            ),
-        )
-        self._db.execute(
-            """INSERT INTO system_settings (key, value) VALUES (?, '1')
-               ON CONFLICT(key) DO UPDATE SET value='1'""",
-            (marker,),
-        )
-        self._db.commit()
+        try:
+            cursor = self._db.execute(
+                """INSERT INTO verified_contacts
+                   (agent_name, platform, principal, name, role, added_at)
+                   VALUES ('barsik', 'buzz', ?, 'Brad', 'owner', ?)
+                   ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
+                     name='Brad', role='owner'""",
+                (
+                    "buzz:posspecialists:"
+                    "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b",
+                    time.time(),
+                ),
+            )
+            self._db.execute(
+                """INSERT INTO system_settings (key, value) VALUES (?, '1')
+                   ON CONFLICT(key) DO UPDATE SET value='1'""",
+                (marker,),
+            )
+            if _commit:
+                self._db.commit()
+        except Exception:
+            if _commit:
+                self._db.rollback()
+            raise
         if cursor.rowcount:
             _log("agent_registry: seeded barsik Buzz owner verified contact")
+
+    def finalize_registration(self, name: str) -> None:
+        """Atomically finalize registration and publish its bootstrap state."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                cursor = self._db.execute(
+                    "UPDATE agents SET registration_finalized=1 WHERE name=?",
+                    (name,),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"Agent '{name}' not found")
+                self._seed_verified_contacts(_commit=False)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     def _backfill_runtime_from_provider_url(self) -> None:
         """One-shot migration from legacy provider_url runtime selection."""
@@ -2143,10 +2285,11 @@ class AgentRegistry:
         from #429) on agents whose workspace pre-dates them, without nuking
         any user customizations to existing scripts.
         """
+        agent_name = _validate_agent_name(agent_name)
         agent = self.get(agent_name)
         if not agent or not agent.working_dir:
             return
-        work_dir = Path(agent.working_dir)
+        work_dir = resolve_agent_path(agent_name, agent.working_dir)
         if not work_dir.exists():
             return
         try:
@@ -2165,11 +2308,21 @@ class AgentRegistry:
             ├── .claude/        # Claude Code hooks + settings
             └── CLAUDE.md       # Written by spawn, not here
         """
+        if agent_name:
+            work_dir = resolve_agent_path(agent_name, work_dir)
+            data_dir = resolve_agent_path(agent_name, work_dir, "data")
+            output_dir = resolve_agent_path(agent_name, work_dir, "output")
+            workspace_dir = resolve_agent_path(agent_name, work_dir, "workspace")
+        else:
+            work_dir = Path(work_dir).resolve()
+            data_dir = work_dir / "data"
+            output_dir = work_dir / "output"
+            workspace_dir = work_dir / "workspace"
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
-            (work_dir / "data").mkdir(exist_ok=True)
-            (work_dir / "output").mkdir(exist_ok=True)
-            (work_dir / "workspace").mkdir(exist_ok=True)
+            data_dir.mkdir(exist_ok=True)
+            output_dir.mkdir(exist_ok=True)
+            workspace_dir.mkdir(exist_ok=True)
         except PermissionError:
             _log(f"agent_registry: workspace init skipped for {work_dir} (permission denied)")
             return
@@ -2181,6 +2334,7 @@ class AgentRegistry:
     @staticmethod
     def _write_hook_if_changed(
         *,
+        agent_dir: Path,
         hook_path: Path,
         new_source: str,
         hook_filename: str,
@@ -2200,11 +2354,11 @@ class AgentRegistry:
         ``_validate_agent_name``). The validation is cheap and raises
         ``ValueError`` on bad input rather than corrupting disk layout.
         """
-        _validate_agent_name(agent_name)
+        hook_path = resolve_agent_path(agent_name, agent_dir, hook_path)
         existing = hook_path.read_text() if hook_path.exists() else ""
         if existing == new_source:
             return
-        hook_path.write_text(new_source)
+        replace_agent_text(agent_name, agent_dir, hook_path, new_source)
         verb = "updated" if existing else "created"
         _log(f"agent_registry: {verb} {hook_filename} for {agent_name}")
 
@@ -2225,8 +2379,8 @@ class AgentRegistry:
         # the public entry point. Cheap re-check; raises ``ValueError`` on
         # bad input so the daemon crashes loudly rather than corrupting
         # filesystem layout.
-        _validate_agent_name(agent_name)
-        claude_dir = work_dir / ".claude"
+        work_dir = resolve_agent_path(agent_name, work_dir)
+        claude_dir = resolve_agent_path(agent_name, work_dir, ".claude")
         claude_dir.mkdir(exist_ok=True)
 
         hook_template = '''\
@@ -2294,14 +2448,26 @@ except Exception as exc:
         "%s: %s" % (type(exc).__name__, exc),
     )
 '''
-        working_path = claude_dir / "hook_working.py"
-        idle_path = claude_dir / "hook_idle.py"
-        verify_effort_path = claude_dir / "hook_verify_effort.py"
-        tmux_wake_path = claude_dir / "hook_tmux_wake.py"
-        tmux_session_start_path = claude_dir / "hook_tmux_session_start.py"
-        tmux_pre_tool_path = claude_dir / "hook_tmux_pre_tool.py"
-        tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
-        tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
+        working_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_working.py")
+        idle_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_idle.py")
+        verify_effort_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_verify_effort.py"
+        )
+        tmux_wake_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_wake.py"
+        )
+        tmux_session_start_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_session_start.py"
+        )
+        tmux_pre_tool_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_pre_tool.py"
+        )
+        tmux_post_tool_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_post_tool.py"
+        )
+        tmux_stop_failure_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_stop_failure.py"
+        )
 
         # #638: these two were historically written once and left alone, which
         # stranded fleet agents on stale sources (e.g. the hardcoded
@@ -2309,12 +2475,14 @@ except Exception as exc:
         # are fully PinkyBot-managed, so keep them current like the five
         # always-rewritten hooks below.
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=working_path,
             new_source=hook_template.format(agent_name=agent_name, status="working"),
             hook_filename="hook_working.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=idle_path,
             new_source=hook_template.format(agent_name=agent_name, status="idle"),
             hook_filename="hook_idle.py",
@@ -2339,36 +2507,42 @@ except Exception as exc:
         # returns ``ok: True, session: None`` for non-tmux runtimes, so each
         # is a cheap no-op for SDK / codex agents (one extra POST per turn).
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=verify_effort_path,
             new_source=_verify_effort_hook_source(),
             hook_filename="hook_verify_effort.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_wake_path,
             new_source=_tmux_wake_hook_source(agent_name),
             hook_filename="hook_tmux_wake.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_session_start_path,
             new_source=_tmux_session_start_hook_source(agent_name),
             hook_filename="hook_tmux_session_start.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_pre_tool_path,
             new_source=_tmux_pre_tool_hook_source(agent_name),
             hook_filename="hook_tmux_pre_tool.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_post_tool_path,
             new_source=_tmux_post_tool_hook_source(agent_name),
             hook_filename="hook_tmux_post_tool.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_stop_failure_path,
             new_source=_tmux_stop_failure_hook_source(agent_name),
             hook_filename="hook_tmux_stop_failure.py",
@@ -2376,7 +2550,8 @@ except Exception as exc:
         )
 
         AgentRegistry._sync_hooks_settings(
-            claude_dir / "settings.json",
+            resolve_agent_path(agent_name, work_dir, ".claude", "settings.json"),
+            agent_dir=work_dir,
             working_path=working_path.resolve(),
             idle_path=idle_path.resolve(),
             verify_effort_path=verify_effort_path.resolve(),
@@ -2392,6 +2567,7 @@ except Exception as exc:
     def _sync_hooks_settings(
         settings_path: Path,
         *,
+        agent_dir: Path,
         working_path: Path,
         idle_path: Path,
         verify_effort_path: Path,
@@ -2412,6 +2588,36 @@ except Exception as exc:
           appearing in the command string.
         """
         import json as _json
+
+        settings_path = resolve_agent_path(agent_name, agent_dir, settings_path)
+        working_path = resolve_agent_path(agent_name, agent_dir, working_path)
+        idle_path = resolve_agent_path(agent_name, agent_dir, idle_path)
+        verify_effort_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            verify_effort_path,
+        )
+        tmux_wake_path = resolve_agent_path(agent_name, agent_dir, tmux_wake_path)
+        tmux_session_start_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_session_start_path,
+        )
+        tmux_pre_tool_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_pre_tool_path,
+        )
+        tmux_post_tool_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_post_tool_path,
+        )
+        tmux_stop_failure_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_stop_failure_path,
+        )
 
         # Quote script paths: a working_dir containing spaces would otherwise
         # make python3 open a nonexistent file, and the trailing
@@ -2501,7 +2707,12 @@ except Exception as exc:
                     ],
                 }
             }
-            settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
+            replace_agent_text(
+                agent_name,
+                agent_dir,
+                settings_path,
+                _json.dumps(settings, indent=2) + "\n",
+            )
             _log(f"agent_registry: created settings.json for {agent_name}")
             return
 
@@ -2579,7 +2790,12 @@ except Exception as exc:
         )
 
         if changed:
-            settings_path.write_text(_json.dumps(data, indent=2) + "\n")
+            replace_agent_text(
+                agent_name,
+                agent_dir,
+                settings_path,
+                _json.dumps(data, indent=2) + "\n",
+            )
             _log(
                 f"agent_registry: merged PinkyBot hooks into settings.json "
                 f"for {agent_name}"
@@ -2625,7 +2841,133 @@ except Exception as exc:
 
     # ── Agent CRUD ──────────────────────────────────────────
 
-    def update(self, name: str, **kwargs) -> Agent:
+    @staticmethod
+    def _markdown_heading_text(line: str, level: int) -> str | None:
+        """Parse one ATX heading in linear time, without regex backtracking."""
+        prefix = "#" * level
+        if not line.startswith(prefix):
+            return None
+        if len(line) == level or not line[level].isspace():
+            return None
+        body = line[level:].lstrip()
+        if not body:
+            return None
+        closing_start = len(body)
+        while closing_start and body[closing_start - 1] == "#":
+            closing_start -= 1
+        if closing_start < len(body) and body[closing_start - 1].isspace():
+            body = body[:closing_start].rstrip()
+        return body or None
+
+    @staticmethod
+    def _has_identity_label(line: str, label: str) -> bool:
+        """Recognize the legacy name/role label prefix in linear time."""
+        starts = [0]
+        if line[:1] in {"-", "*"}:
+            after_bullet = 1
+            while after_bullet < len(line) and line[after_bullet].isspace():
+                after_bullet += 1
+            starts.append(after_bullet)
+        for start in starts:
+            cursor = start
+            if line[cursor : cursor + 2] == "**":
+                cursor += 2
+            end = cursor + len(label)
+            if line[cursor:end].casefold() != label:
+                continue
+            cursor = end
+            while cursor < len(line) and line[cursor].isspace():
+                cursor += 1
+            if cursor < len(line) and line[cursor] == ":":
+                return True
+        return False
+
+    @staticmethod
+    def _soul_identity_anchors(
+        content: str,
+        *,
+        agent_name: str,
+        display_name: str = "",
+    ) -> set[str]:
+        """Return recognized identity structure without retaining its text."""
+        anchors: set[str] = set()
+        identities = {
+            value.strip().casefold()
+            for value in (agent_name, display_name)
+            if value and value.strip()
+        }
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            heading = AgentRegistry._markdown_heading_text(line, 1)
+            if heading and heading.casefold() in identities:
+                anchors.add("agent_heading")
+            identity_heading = AgentRegistry._markdown_heading_text(line, 2)
+            if identity_heading and identity_heading.casefold() == "identity":
+                anchors.add("identity_heading")
+            if AgentRegistry._has_identity_label(line, "name"):
+                anchors.add("name_label")
+            if AgentRegistry._has_identity_label(line, "role"):
+                anchors.add("role_label")
+        return anchors
+
+    def assess_soul_mutation(
+        self,
+        name: str,
+        old_content: str,
+        new_content: str,
+        *,
+        display_name: str = "",
+    ) -> SoulMutationSummary:
+        """Describe a proposed soul replacement without exposing soul text."""
+        name = _validate_agent_name(name)
+        if not isinstance(old_content, str) or not isinstance(new_content, str):
+            raise TypeError("soul content must be text")
+        old_length = len(old_content)
+        new_length = len(new_content)
+        shrink_percent = (
+            round(max(0.0, (old_length - new_length) * 100.0 / old_length), 2)
+            if old_length
+            else 0.0
+        )
+        old_anchors = self._soul_identity_anchors(
+            old_content,
+            agent_name=name,
+            display_name=display_name,
+        )
+        new_anchors = self._soul_identity_anchors(
+            new_content,
+            agent_name=name,
+            display_name=display_name,
+        )
+        return SoulMutationSummary(
+            old_length=old_length,
+            new_length=new_length,
+            shrink_percent=shrink_percent,
+            missing_anchors=tuple(sorted(old_anchors - new_anchors)),
+        )
+
+    def guard_soul_mutation(
+        self,
+        name: str,
+        old_content: str,
+        new_content: str,
+        *,
+        display_name: str = "",
+        force_soul: bool = False,
+    ) -> SoulMutationSummary:
+        """Reject destructive soul replacement unless explicitly forced."""
+        summary = self.assess_soul_mutation(
+            name,
+            old_content,
+            new_content,
+            display_name=display_name,
+        )
+        shrinks_more_than_half = summary.new_length * 2 < summary.old_length
+        if not force_soul and (shrinks_more_than_half or summary.missing_anchors):
+            raise SoulMutationRejectedError(summary)
+        return summary
+
+    def update(self, name: str, *, _commit: bool = True, **kwargs) -> Agent:
         """Partially update an existing agent without creating one.
 
         Only explicitly supplied, allowlisted fields are changed.  This is
@@ -2634,69 +2976,255 @@ except Exception as exc:
         agent or reset fields omitted from a PATCH-like request.
         """
         name = _validate_agent_name(name)
-        existing = self.get(name)
-        if not existing:
-            raise KeyError(f"Agent '{name}' not found")
-        if "working_dir" in kwargs:
-            raise ValueError(
-                "working_dir is not supported by partial update; use register()"
-            )
+        force_soul = bool(kwargs.pop("force_soul", False))
+        soul_source = str(kwargs.pop("soul_source", "registry-update") or "registry-update")
+        with self._rmw_lock:
+            existing = self.get(name)
+            if not existing:
+                raise KeyError(f"Agent '{name}' not found")
+            if "working_dir" in kwargs:
+                raise ValueError(
+                    "working_dir is not supported by partial update; use register()"
+                )
 
-        updates = {}
-        for key in ("display_name", "model", "soul", "users", "boundaries",
-                    "system_prompt",
-                    "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
-                    "context_nudge_threshold_pct",
-                    "auto_restart", "parent", "max_sessions", "enabled",
-                    "auto_start", "heartbeat_interval", "wake_interval",
-                    "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
-                    "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
-                    "librarian_enabled", "librarian_schedule",
-                    "runtime", "transport", "provider_url", "provider_model", "provider_ref",
-                    "codex_home",
-                    "thinking_effort", "strict_effort_enforcement",
-                    "dedicated_config_dir", "isolated",
-                    "isolation_mode", "container_image"):
-            if key in kwargs:
-                updates[key] = kwargs[key]
+            updates = {}
+            for key in ("display_name", "model", "soul", "users", "boundaries",
+                        "system_prompt",
+                        "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
+                        "context_nudge_threshold_pct",
+                        "auto_restart", "parent", "max_sessions", "enabled",
+                        "auto_start", "heartbeat_interval", "wake_interval",
+                        "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
+                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
+                        "librarian_enabled", "librarian_schedule",
+                        "runtime", "transport", "provider_url", "provider_model", "provider_ref",
+                        "codex_home",
+                        "thinking_effort", "strict_effort_enforcement",
+                        "dedicated_config_dir", "isolated",
+                        "isolation_mode", "container_image"):
+                if key in kwargs:
+                    updates[key] = kwargs[key]
 
-        # Secret: empty/absent means "unchanged" so callers round-tripping
-        # the redacted to_dict() (provider_key_set) can't wipe the key.
-        # Wiping requires the explicit clear_provider_key flag.
-        if kwargs.get("provider_key"):
-            updates["provider_key"] = kwargs["provider_key"]
-        elif kwargs.get("clear_provider_key"):
-            updates["provider_key"] = ""
+            # Secret: empty/absent means "unchanged" so callers round-tripping
+            # the redacted to_dict() (provider_key_set) can't wipe the key.
+            # Wiping requires the explicit clear_provider_key flag.
+            if kwargs.get("provider_key"):
+                updates["provider_key"] = kwargs["provider_key"]
+            elif kwargs.get("clear_provider_key"):
+                updates["provider_key"] = ""
 
-        for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
-            if key in kwargs:
-                updates[key] = json.dumps(kwargs[key])
+            for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
+                if key in kwargs:
+                    updates[key] = json.dumps(kwargs[key])
 
-        for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
-                    "plain_text_fallback", "dream_enabled", "dream_notify",
-                    "librarian_enabled", "strict_effort_enforcement",
-                    "dedicated_config_dir", "isolated"):
-            if key in updates:
-                updates[key] = int(updates[key])
-        if "voice_config" in updates and isinstance(updates["voice_config"], dict):
-            updates["voice_config"] = json.dumps(updates["voice_config"])
+            for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
+                        "plain_text_fallback", "dream_enabled", "dream_notify",
+                        "librarian_enabled", "strict_effort_enforcement",
+                        "dedicated_config_dir", "isolated"):
+                if key in updates:
+                    updates[key] = int(updates[key])
+            if "voice_config" in updates and isinstance(updates["voice_config"], dict):
+                updates["voice_config"] = json.dumps(updates["voice_config"])
 
-        if updates:
-            updates["updated_at"] = time.time()
-            set_clause = ", ".join(f"{key}=?" for key in updates)
-            self._db.execute(
-                f"UPDATE agents SET {set_clause} WHERE name=?",
-                list(updates.values()) + [name],
-            )
-            self._db.commit()
+            soul_changed = "soul" in updates and updates["soul"] != existing.soul
+            if "soul" in updates and not soul_changed:
+                updates.pop("soul")
+            if soul_changed:
+                self.guard_soul_mutation(
+                    name,
+                    existing.soul,
+                    updates["soul"],
+                    display_name=existing.display_name,
+                    force_soul=force_soul,
+                )
+
+            if updates:
+                updates["updated_at"] = time.time()
+                set_clause = ", ".join(f"{key}=?" for key in updates)
+                try:
+                    if soul_changed:
+                        self._insert_soul_version_uncommitted(
+                            name,
+                            existing.soul,
+                            source=f"{soul_source}:before",
+                        )
+                    self._db.execute(
+                        f"UPDATE agents SET {set_clause} WHERE name=?",
+                        list(updates.values()) + [name],
+                    )
+                    if _commit:
+                        self._db.commit()
+                except Exception:
+                    if _commit:
+                        self._db.rollback()
+                    raise
 
         updated = self.get(name)
         if not updated:  # Defensive against a concurrent delete.
             raise KeyError(f"Agent '{name}' not found")
         return updated
 
-    def register(self, name: str, **kwargs) -> Agent:
-        """Register a new agent or update an existing one."""
+    def _insert_agent_row(
+        self,
+        sql: str,
+        params: tuple,
+        *,
+        name: str,
+        create_only: bool,
+        work_dir: Path,
+    ) -> None:
+        """Atomically claim an owner root, insert, and initialize the winner."""
+        with self._rmw_lock:
+            insert_won = False
+            try:
+                # The advisory preflight in register() is intentionally repeated
+                # under SQLite's cross-connection writer lock. Different names do
+                # not contend on the agents.name PRIMARY KEY, so BEGIN IMMEDIATE is
+                # the authority that serializes overlap-check + INSERT across
+                # daemon processes. The second writer observes the first commit
+                # before it can evaluate owner-root equality or nesting.
+                self._db.execute("BEGIN IMMEDIATE")
+                self._refuse_workspace_overlap(name, work_dir)
+                self._db.execute(sql, params)
+                insert_won = True
+                # A losing create-only request must not reinitialize files in
+                # either the winner's workspace or an attacker-chosen path.
+                # Keep the insert transaction open so only the PRIMARY KEY
+                # winner reaches filesystem setup; rollback the row if setup
+                # itself fails.
+                self._init_workspace(work_dir, agent_name=name)
+                self._db.commit()
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                if create_only:
+                    # The exact-root belt may be evaluated before the name
+                    # PRIMARY KEY when a same-name loser also reuses the
+                    # winner's root. Classify from committed DB state after
+                    # rollback instead of depending on SQLite's index order.
+                    if self._db.execute(
+                        "SELECT 1 FROM agents WHERE name=?",
+                        (name,),
+                    ).fetchone():
+                        raise AgentAlreadyExistsError(
+                            f"Agent '{name}' already exists"
+                        ) from exc
+                    if "agents.working_dir" in str(exc):
+                        raise AgentWorkspaceOverlapError(
+                            "agent workspace overlaps another registered agent"
+                        ) from exc
+                raise
+            except Exception:
+                self._db.rollback()
+                if create_only and insert_won:
+                    raise AgentRegistrationIncompleteError(
+                        name,
+                        row_committed=False,
+                    )
+                raise
+
+    def _update_existing_registration(
+        self,
+        name: str,
+        *,
+        working_dir: str | Path,
+        update_kwargs: dict,
+    ) -> Agent:
+        """Serialize a legacy register-update workspace claim across connections."""
+        root = self._resolve_workspace_root(name, working_dir)
+        # Preserve the early, side-effect-free refusal while making the repeated
+        # check inside BEGIN IMMEDIATE authoritative for concurrent writers.
+        self._refuse_workspace_overlap(name, root)
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self.get(name)
+            if not existing:
+                raise KeyError(f"Agent '{name}' not found")
+            self._refuse_workspace_overlap(name, root)
+            if str(root) != existing.working_dir:
+                self._init_workspace(root, agent_name=name)
+
+            # update() owns soul-guard and snapshot semantics. Suppress its
+            # commit so those field mutations and the owner-root claim land in
+            # the same transaction, or all roll back on overlap/guard failure.
+            self.update(name, _commit=False, **update_kwargs)
+            self._db.execute(
+                "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
+                (str(root), time.time(), name),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+        refreshed = self.get(name)
+        if not refreshed:  # Defensive against a concurrent delete.
+            raise KeyError(f"Agent '{name}' not found")
+        return refreshed
+
+    @staticmethod
+    def _resolve_workspace_root(name: str, working_dir: str | Path) -> Path:
+        """Return a stable absolute owner root suitable for persistence."""
+        _validate_agent_name(name)
+        try:
+            root = Path(working_dir).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise AgentWorkspacePathError("agent workspace path is invalid") from exc
+        if not root.is_absolute() or (root.exists() and not root.is_dir()):
+            raise AgentWorkspacePathError("agent workspace path is invalid")
+        return root
+
+    def _refuse_workspace_overlap(self, name: str, root: Path) -> None:
+        """Fail closed when ``root`` intersects another agent's owner root."""
+        _validate_agent_name(name)
+        rows = self._db.execute(
+            "SELECT name, working_dir FROM agents WHERE name<>?",
+            (name,),
+        ).fetchall()
+        for other_name, other_working_dir in rows:
+            try:
+                other_root = self._resolve_workspace_root(
+                    other_name,
+                    other_working_dir,
+                )
+            except (AgentWorkspacePathError, ValueError) as exc:
+                raise AgentWorkspacePathError(
+                    "registered agent workspace path is invalid"
+                ) from exc
+            if (
+                root == other_root
+                or root.is_relative_to(other_root)
+                or other_root.is_relative_to(root)
+            ):
+                raise AgentWorkspaceOverlapError(
+                    "agent workspace overlaps another registered agent"
+                )
+
+    def resolve_registration_workspace(
+        self,
+        name: str,
+        working_dir: str | Path,
+    ) -> Path:
+        """Resolve and preflight a proposed owner root without mutating state."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            root = self._resolve_workspace_root(name, working_dir)
+            self._refuse_workspace_overlap(name, root)
+            return root
+
+    def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
+        """Register atomically, including cross-agent workspace ownership."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            return self._register_locked(name, create_only=create_only, **kwargs)
+
+    def _register_locked(
+        self,
+        name: str,
+        *,
+        create_only: bool = False,
+        **kwargs,
+    ) -> Agent:
+        """Register while ``_rmw_lock`` protects root checks and mutation."""
         # Sanitize before any path is constructed downstream. Same regex as
         # the API model — duplicated here so in-process callers (tests,
         # scripts, future routes) can't bypass it. ``_validate_agent_name``
@@ -2704,33 +3232,25 @@ except Exception as exc:
         # source-of-path-construction.
         name = _validate_agent_name(name)
         now = time.time()
-        existing = self.get(name)
+        # A create-only caller must reach INSERT OR ABORT without a read-side
+        # availability decision. The agents.name PRIMARY KEY is authoritative,
+        # including when multiple daemon processes race on the same DB.
+        existing = None if create_only else self.get(name)
 
         if existing:
             # Keep the legacy workspace mutation on register(), whose admin
             # callers and path-handling contract predate the partial update
             # API. AgentRegistry.update() is intentionally path-free.
-            updated_working_dir = ""
-            if kwargs.get("working_dir"):
-                upd_dir = Path(kwargs["working_dir"])
-                upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
-                if str(upd_dir_abs) != existing.working_dir:
-                    self._init_workspace(upd_dir_abs, agent_name=name)
-                updated_working_dir = str(upd_dir_abs)
-
             update_kwargs = dict(kwargs)
             update_kwargs.pop("working_dir", None)
-            updated = self.update(name, **update_kwargs)
-            if updated_working_dir:
-                self._db.execute(
-                    "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
-                    (updated_working_dir, time.time(), name),
+            if kwargs.get("working_dir"):
+                updated = self._update_existing_registration(
+                    name,
+                    working_dir=kwargs["working_dir"],
+                    update_kwargs=update_kwargs,
                 )
-                self._db.commit()
-                refreshed = self.get(name)
-                if not refreshed:  # Defensive against a concurrent delete.
-                    raise KeyError(f"Agent '{name}' not found")
-                updated = refreshed
+            else:
+                updated = self.update(name, **update_kwargs)
             # Preserve register()'s historical signing-key backfill contract
             # for legacy rows even though the field mutation is delegated.
             self.get_or_create_signing_key(name)
@@ -2740,9 +3260,8 @@ except Exception as exc:
             # Set up workspace — always store absolute path for portability.
             # Relative paths break when daemon CWD differs from install dir.
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
-            work_dir = Path(raw_dir)
-            work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
-            self._init_workspace(work_dir_abs, agent_name=name)
+            work_dir_abs = self._resolve_workspace_root(name, raw_dir)
+            self._refuse_workspace_overlap(name, work_dir_abs)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
@@ -2796,13 +3315,16 @@ except Exception as exc:
                 created_at=now,
                 updated_at=now,
             )
-            self._db.execute(
-                """INSERT INTO agents
+            insert_complete = False
+            try:
+                self._insert_agent_row(
+                    """INSERT OR ABORT INTO agents
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
                     restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
-                    max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
+                    max_sessions, enabled, registration_finalized, auto_start,
+                    heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
                     isolation_mode, container_image,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
@@ -2812,8 +3334,8 @@ except Exception as exc:
                     thinking_effort, strict_effort_enforcement, dedicated_config_dir,
                     watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (agent.name, agent.display_name, agent.model, agent.soul,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), json.dumps(agent.disallowed_tools),
@@ -2821,7 +3343,8 @@ except Exception as exc:
                  agent.restart_threshold_pct, agent.context_nudge_threshold_pct,
                  int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
-                 int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
+                 int(agent.enabled), int(not create_only), int(agent.auto_start),
+                 agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role, int(agent.isolated),
                  agent.isolation_mode, agent.container_image,
@@ -2833,29 +3356,45 @@ except Exception as exc:
                  agent.thinking_effort, int(agent.strict_effort_enforcement),
                  int(agent.dedicated_config_dir),
                  json.dumps(agent.watchdog_config),
-                 agent.created_at, agent.updated_at),
-            )
-            self._db.commit()
-            _log(f"agents: registered {name}")
+                     agent.created_at, agent.updated_at),
+                    name=name,
+                    create_only=create_only,
+                    work_dir=work_dir_abs,
+                )
+                insert_complete = True
+                _log(f"agents: registered {name}")
 
-            # First-run convenience: if no main agent is designated yet, adopt
-            # this newly created agent. Without a main agent the daemon starts
-            # no autonomy loop and the agent never auto-wakes — a silent
-            # dead-end for fresh installs. Only fires on creation of an enabled
-            # agent when main is unset, so it never overrides an existing choice.
-            if agent.enabled and not self.get_setting("main_agent"):
-                self.set_setting("main_agent", name)
-                _log(f"agents: auto-assigned main_agent={name} (first agent)")
+                # First-run convenience: if no main agent is designated yet, adopt
+                # this newly created agent. Without a main agent the daemon starts
+                # no autonomy loop and the agent never auto-wakes — a silent
+                # dead-end for fresh installs. Only fires on creation of an enabled
+                # agent when main is unset, so it never overrides an existing choice.
+                if agent.enabled and not self.get_setting("main_agent"):
+                    self.set_setting("main_agent", name)
+                    _log(f"agents: auto-assigned main_agent={name} (first agent)")
 
-        # Ensure the agent has a per-agent signing key (#623). Idempotent —
-        # returns the existing key on re-registration / update.
-        self.get_or_create_signing_key(name)
-        # Fresh databases initialize before any agents exist. Retry the
-        # caller-specified bootstrap after registration so the seed ships for
-        # both upgrades and new installs without weakening the unique key.
-        self._seed_verified_contacts()
+                # Ensure the agent has a per-agent signing key (#623). Idempotent —
+                # returns the existing key on re-registration / update.
+                self.get_or_create_signing_key(name)
+                # The HTTP create-only path has fallible provisioning and MCP
+                # publication stages after this registry commit. Defer its
+                # verified-contact bootstrap to finalize_registration() so a
+                # failed POST cannot leave the contact or migration marker.
+                # Direct legacy registrations have no later external stages and
+                # retain their historical bootstrap behavior.
+                if not create_only:
+                    self._seed_verified_contacts()
+            except (AgentAlreadyExistsError, AgentRegistrationIncompleteError):
+                raise
+            except Exception as exc:
+                if create_only and insert_complete:
+                    raise AgentRegistrationIncompleteError(
+                        name,
+                        row_committed=True,
+                    ) from exc
+                raise
 
-        return self.get(name)  # type: ignore
+            return self.get(name)  # type: ignore
 
     _AGENT_COLUMNS = (
         "name, display_name, model, soul, system_prompt, working_dir, "
@@ -4134,28 +4673,76 @@ except Exception as exc:
 
     # ── Soul Versioning ─────────────────────────────────────
 
+    def _insert_soul_version_uncommitted(
+        self,
+        agent_name: str,
+        content: str,
+        *,
+        source: str,
+    ) -> int:
+        """Insert one version row; the caller owns commit/rollback."""
+        agent_name = _validate_agent_name(agent_name)
+        cursor = self._db.execute(
+            "INSERT INTO soul_versions (agent_name, content, source, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (agent_name, content, source, time.time()),
+        )
+        return int(cursor.lastrowid)
+
+    def snapshot_soul_before_mutation(
+        self,
+        agent_name: str,
+        content: str,
+        *,
+        source: str,
+    ) -> int:
+        """Durably snapshot replaced content before a non-DB mutation."""
+        agent_name = _validate_agent_name(agent_name)
+        with self._rmw_lock:
+            try:
+                version_id = self._insert_soul_version_uncommitted(
+                    agent_name,
+                    content,
+                    source=source,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return version_id
+
     def save_soul_version(self, agent_name: str, content: str, source: str = "unknown") -> int:
         """Archive a soul version. Returns the version ID.
 
         Sources: 'ui', 'agent', 'spawn', 'refresh', 'api'
         """
-        # Skip if content matches the latest version
-        latest = self.get_soul_versions(agent_name, limit=1)
-        if latest:
-            full = self.get_soul_version(agent_name, latest[0]["id"])
-            if full and full["content"] == content:
-                return latest[0]["id"]
+        agent_name = _validate_agent_name(agent_name)
+        with self._rmw_lock:
+            try:
+                # Spawn publication records the installed content after writing.
+                # Keep that historical deduplication contract; mutation snapshots
+                # use _insert_soul_version_uncommitted so every actual replacement
+                # gets an audit row even when the same content appeared previously.
+                latest = self.get_soul_versions(agent_name, limit=1)
+                if latest:
+                    full = self.get_soul_version(agent_name, latest[0]["id"])
+                    if full and full["content"] == content:
+                        return latest[0]["id"]
 
-        now = time.time()
-        cursor = self._db.execute(
-            "INSERT INTO soul_versions (agent_name, content, source, created_at) VALUES (?, ?, ?, ?)",
-            (agent_name, content, source, now),
-        )
-        self._db.commit()
-        return cursor.lastrowid
+                version_id = self._insert_soul_version_uncommitted(
+                    agent_name,
+                    content,
+                    source=source,
+                )
+                self._db.commit()
+                return version_id
+            except Exception:
+                self._db.rollback()
+                raise
 
     def get_soul_versions(self, agent_name: str, limit: int = 20) -> list[dict]:
         """List soul versions for an agent, newest first."""
+        agent_name = _validate_agent_name(agent_name)
         rows = self._db.execute(
             "SELECT id, agent_name, source, created_at, LENGTH(content) as size FROM soul_versions WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
             (agent_name, limit),
@@ -4167,6 +4754,7 @@ except Exception as exc:
 
     def get_soul_version(self, agent_name: str, version_id: int) -> dict | None:
         """Get a specific soul version by ID."""
+        agent_name = _validate_agent_name(agent_name)
         row = self._db.execute(
             "SELECT id, agent_name, content, source, created_at FROM soul_versions WHERE agent_name=? AND id=?",
             (agent_name, version_id),

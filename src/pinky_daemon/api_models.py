@@ -53,6 +53,13 @@ class SendMessageRequest(BaseModel):
     content: str
 
 
+class WriteAgentFileRequest(BaseModel):
+    """Write an agent-owned file, with an explicit soul safety override."""
+
+    content: str
+    force_soul: bool = False
+
+
 class AuthSetupRequest(BaseModel):
     """Create the initial UI password."""
 
@@ -303,20 +310,9 @@ class RegisterAgentRequest(BaseModel):
     @field_validator("name")
     @classmethod
     def _name_safe(cls, v: str) -> str:
-        """Reject agent names that don't match the safe-char allowlist.
-
-        The name becomes part of filesystem paths (working_dir, hook scripts,
-        settings.json) downstream. Blocking unsafe characters at request
-        parse time short-circuits any path-construction code in
-        agent_registry from ever seeing tainted input. See _AGENT_NAME_RE
-        for the allowed shape.
-        """
+        """Reject agent names that don't match the shared safe allowlist."""
         if not _AGENT_NAME_RE.fullmatch(v):
-            raise ValueError(
-                "agent name must match ^[a-z0-9][a-z0-9_-]{0,62}$ "
-                "(lowercase alphanumeric, underscore, hyphen; "
-                "starts with letter or digit; up to 63 chars)"
-            )
+            raise ValueError("invalid agent name")
         return v
 
     model: str = "opus"
@@ -443,6 +439,9 @@ class UpdateAgentRequest(BaseModel):
     # refuses to actually *run* a mode whose provisioner isn't implemented yet.
     isolation_mode: str | None = None
     container_image: str | None = None  # bring-your-own image for mode=container; None = leave unchanged
+    # Safety override for an explicitly supplied soul replacement. This is an
+    # API control only and is never persisted as agent configuration.
+    force_soul: bool = False
 
     @field_validator("isolation_mode")
     @classmethod
@@ -455,6 +454,12 @@ class UpdateAgentRequest(BaseModel):
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
             )
         return v
+
+
+class RestoreSoulVersionRequest(BaseModel):
+    """Restore an archived soul, optionally accepting destructive shrink."""
+
+    force_soul: bool = False
 
 
 class ContainerizeRequest(BaseModel):

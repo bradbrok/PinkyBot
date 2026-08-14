@@ -4,12 +4,22 @@ from __future__ import annotations
 
 import json
 import os
+import sqlite3
 import tempfile
 import threading
+import time
 
 import pytest
 
-from pinky_daemon.agent_registry import AgentContext, AgentRegistry
+from pinky_daemon.agent_registry import (
+    AgentAlreadyExistsError,
+    AgentContext,
+    AgentPathContainmentError,
+    AgentRegistry,
+    AgentWorkspaceOverlapError,
+    SoulMutationRejectedError,
+    resolve_agent_path,
+)
 
 
 @pytest.fixture
@@ -20,6 +30,101 @@ def registry():
     yield r
     r.close()
     os.unlink(path)
+
+
+class TestVerifiedContactBootstrap:
+    def test_finalize_rolls_back_state_bit_and_contact_if_marker_write_fails(
+        self,
+        tmp_path,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register(
+                "barsik",
+                create_only=True,
+                working_dir=str(tmp_path / "barsik"),
+            )
+            registry._db.execute(
+                """CREATE TRIGGER fail_registration_marker
+                   BEFORE INSERT ON system_settings
+                   WHEN NEW.key='migration:verified_contacts_brad_owner_seed_v1'
+                   BEGIN
+                     SELECT RAISE(ABORT, 'injected marker failure');
+                   END"""
+            )
+            registry._db.commit()
+
+            with pytest.raises(sqlite3.IntegrityError, match="injected marker failure"):
+                registry.finalize_registration("barsik")
+
+            finalized = registry._db.execute(
+                "SELECT registration_finalized FROM agents WHERE name='barsik'"
+            ).fetchone()[0]
+            assert finalized == 0
+            assert registry.list_verified_contacts("barsik") == []
+            assert registry.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == ""
+        finally:
+            registry.close()
+
+    def test_legacy_reregister_cannot_seed_unfinalized_http_claim(self, tmp_path):
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        try:
+            registry.register(
+                "barsik",
+                create_only=True,
+                working_dir=str(tmp_path / "barsik"),
+            )
+
+            finalized = registry._db.execute(
+                "SELECT registration_finalized FROM agents WHERE name='barsik'"
+            ).fetchone()[0]
+            assert finalized == 0
+
+            # The historical upsert-style register path also invokes the seed.
+            # It must not publish bootstrap state for an HTTP claim whose
+            # provisioning/MCP stages have not finalized yet.
+            registry.register("barsik", model="sonnet")
+
+            assert registry.list_verified_contacts("barsik") == []
+            assert registry.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == ""
+        finally:
+            registry.close()
+
+    def test_upgrade_backfills_existing_agent_before_migration_seed(self, tmp_path):
+        db_path = tmp_path / "agents.db"
+        legacy = AgentRegistry(db_path=str(db_path))
+        try:
+            legacy.register("barsik", working_dir=str(tmp_path / "barsik"))
+            legacy._db.execute("DELETE FROM verified_contacts WHERE agent_name='barsik'")
+            legacy._db.execute(
+                "DELETE FROM system_settings WHERE key=?",
+                ("migration:verified_contacts_brad_owner_seed_v1",),
+            )
+            legacy._db.commit()
+        finally:
+            legacy.close()
+
+        # Model a pre-R4 database: its durable Barsik row is a completed legacy
+        # registration, but neither the finalized column nor seed marker exists.
+        with sqlite3.connect(db_path) as db:
+            db.execute("ALTER TABLE agents DROP COLUMN registration_finalized")
+
+        upgraded = AgentRegistry(db_path=str(db_path))
+        try:
+            finalized = upgraded._db.execute(
+                "SELECT registration_finalized FROM agents WHERE name='barsik'"
+            ).fetchone()[0]
+            assert finalized == 1
+            assert len(upgraded.list_verified_contacts("barsik")) == 1
+            assert upgraded.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == "1"
+        finally:
+            upgraded.close()
 
 
 class TestOwnerNotificationDestinations:
@@ -549,6 +654,285 @@ class TestAgentCRUD:
         agent = registry.register("oleg", model="opus")
         assert agent.model == "opus"
 
+    def test_create_only_collision_preserves_winner(self, registry, tmp_path):
+        original = "# Oleg\n\n## IDENTITY\n- **Name:** Oleg\n- **Role:** Lead\n"
+        registry.register(
+            "oleg",
+            create_only=True,
+            model="opus",
+            soul=original,
+            working_dir=str(tmp_path / "winner"),
+        )
+
+        with pytest.raises(AgentAlreadyExistsError, match="already exists"):
+            registry.register(
+                "oleg",
+                create_only=True,
+                model="haiku",
+                soul="loser",
+                working_dir=str(tmp_path / "loser"),
+            )
+
+        winner = registry.get("oleg")
+        assert winner.model == "opus"
+        assert winner.soul == original
+        assert winner.working_dir == str(tmp_path / "winner")
+        assert not (tmp_path / "loser").exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_register_refuses_cross_agent_workspace_overlap_without_side_effects(
+        self,
+        registry,
+        tmp_path,
+        relation,
+    ):
+        victim_root = tmp_path / "victim"
+        registry.register("victim", working_dir=str(victim_root), model="opus")
+        marker = victim_root / "identity-marker"
+        marker.write_text("victim-private")
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-attacker",
+            "enclosing": tmp_path,
+        }[relation]
+
+        with pytest.raises(AgentWorkspaceOverlapError):
+            registry.register(
+                "attacker",
+                working_dir=str(candidate),
+                model="haiku",
+                soul="must-not-land",
+            )
+
+        assert registry.get("attacker") is None
+        assert registry.get("victim").model == "opus"
+        assert marker.read_text() == "victim-private"
+        if relation == "nested":
+            assert not candidate.exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_update_refuses_cross_agent_workspace_overlap_before_other_mutations(
+        self,
+        registry,
+        tmp_path,
+        relation,
+    ):
+        victim_root = tmp_path / "victim"
+        mover_root = tmp_path / "mover"
+        registry.register("victim", working_dir=str(victim_root))
+        registry.register("mover", working_dir=str(mover_root), model="opus")
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-mover",
+            "enclosing": tmp_path,
+        }[relation]
+
+        with pytest.raises(AgentWorkspaceOverlapError):
+            registry.register(
+                "mover",
+                working_dir=str(candidate),
+                model="haiku",
+            )
+
+        mover = registry.get("mover")
+        assert mover.working_dir == str(mover_root)
+        assert mover.model == "opus"
+        if relation == "nested":
+            assert not candidate.exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_concurrent_register_updates_serialize_workspace_claims(
+        self,
+        tmp_path,
+        relation,
+    ):
+        db_path = tmp_path / "agents.db"
+        registry_a = AgentRegistry(db_path=str(db_path))
+        registry_b = AgentRegistry(db_path=str(db_path))
+        try:
+            alice_root = tmp_path / "alice-original"
+            bob_root = tmp_path / "bob-original"
+            shared_root = tmp_path / "shared"
+            alice_candidate, bob_candidate = {
+                "equal": (shared_root, shared_root),
+                "nested": (shared_root, shared_root / "sub"),
+                "enclosing": (shared_root / "sub", shared_root),
+            }[relation]
+            registry_a.register("alice", working_dir=str(alice_root), model="opus")
+            registry_a.register("bob", working_dir=str(bob_root), model="opus")
+
+            phase_barrier = threading.Barrier(2)
+
+            def gate_advisory_check(candidate_registry):
+                original = candidate_registry._refuse_workspace_overlap
+                call_count = 0
+
+                def wrapped(name, root):
+                    nonlocal call_count
+                    original(name, root)
+                    call_count += 1
+                    if call_count == 1:
+                        phase_barrier.wait(timeout=5)
+
+                candidate_registry._refuse_workspace_overlap = wrapped
+
+            gate_advisory_check(registry_a)
+            gate_advisory_check(registry_b)
+            outcomes = {}
+
+            def move(candidate_registry, name, candidate_root):
+                try:
+                    outcomes[name] = candidate_registry.register(
+                        name,
+                        working_dir=str(candidate_root),
+                        model="haiku",
+                    )
+                except BaseException as exc:
+                    outcomes[name] = exc
+
+            threads = [
+                threading.Thread(
+                    target=move,
+                    args=(registry_a, "alice", alice_candidate),
+                ),
+                threading.Thread(
+                    target=move,
+                    args=(registry_b, "bob", bob_candidate),
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            winners = [
+                name for name, outcome in outcomes.items()
+                if not isinstance(outcome, BaseException)
+            ]
+            losers = [
+                name for name, outcome in outcomes.items()
+                if isinstance(outcome, AgentWorkspaceOverlapError)
+            ]
+            assert len(winners) == 1
+            assert len(losers) == 1
+
+            winner = registry_a.get(winners[0])
+            loser = registry_a.get(losers[0])
+            winner_root = (
+                alice_candidate if winners[0] == "alice" else bob_candidate
+            )
+            assert winner.working_dir == str(winner_root)
+            assert winner.model == "haiku"
+            assert loser.working_dir == str(
+                alice_root if losers[0] == "alice" else bob_root
+            )
+            assert loser.model == "opus"
+        finally:
+            registry_a.close()
+            registry_b.close()
+
+    def test_soul_update_snapshots_replaced_value_before_write(
+        self, registry, monkeypatch,
+    ):
+        original = "A" * 100
+        replacement = "B" * 75
+        registry.register("oleg", soul=original)
+        insert = registry._insert_soul_version_uncommitted
+
+        def assert_old_value_is_still_live(agent_name, content, *, source):
+            assert registry.get(agent_name).soul == original
+            assert content == original
+            assert source == "unit-test:before"
+            return insert(agent_name, content, source=source)
+
+        monkeypatch.setattr(
+            registry,
+            "_insert_soul_version_uncommitted",
+            assert_old_value_is_still_live,
+        )
+
+        updated = registry.update(
+            "oleg",
+            soul=replacement,
+            soul_source="unit-test",
+        )
+
+        assert updated.soul == replacement
+        versions = registry.get_soul_versions("oleg")
+        assert len(versions) == 1
+        assert registry.get_soul_version("oleg", versions[0]["id"])["content"] == original
+
+    def test_soul_shrink_threshold_is_strictly_more_than_half(self, registry):
+        registry.register("oleg", soul="x" * 100)
+
+        assert registry.update("oleg", soul="y" * 50).soul == "y" * 50
+
+        with pytest.raises(SoulMutationRejectedError) as rejected:
+            registry.update("oleg", soul="z" * 24)
+        assert rejected.value.summary.old_length == 50
+        assert rejected.value.summary.new_length == 24
+        assert rejected.value.summary.shrink_percent == 52.0
+        assert registry.get("oleg").soul == "y" * 50
+
+    def test_soul_identity_anchor_loss_requires_force(self, registry):
+        original = (
+            "# Oleg\n\n## IDENTITY\n- **Name:** Oleg\n- **Role:** Lead\n\n"
+            + "x" * 80
+        )
+        replacement = "# Notes\n" + "y" * (len(original) - len("# Notes\n"))
+        registry.register("oleg", display_name="Oleg", soul=original)
+
+        with pytest.raises(SoulMutationRejectedError) as rejected:
+            registry.update("oleg", soul=replacement)
+
+        assert rejected.value.summary.missing_anchors == (
+            "agent_heading",
+            "identity_heading",
+            "name_label",
+            "role_label",
+        )
+        assert registry.get("oleg").soul == original
+
+        forced = registry.update("oleg", soul=replacement, force_soul=True)
+        assert forced.soul == replacement
+
+    def test_soul_anchor_scan_is_linear_on_codeql_pathological_shape(
+        self,
+        monkeypatch,
+    ):
+        def regex_must_not_run(*_args, **_kwargs):
+            raise AssertionError("anchor detection must not use backtracking regexes")
+
+        monkeypatch.setattr("pinky_daemon.agent_registry.re.fullmatch", regex_must_not_run)
+        # Near-suffix family from Murzik's r1 probe. The old lazy multiline
+        # regex explored the spaces/hash suffix quadratically (~4x for 2x n).
+        pathological = "# a" + " " * 100_000 + "#" * 100_000 + "!"
+        started = time.perf_counter()
+
+        anchors = AgentRegistry._soul_identity_anchors(
+            pathological,
+            agent_name="alice",
+        )
+
+        assert anchors == set()
+        # Deliberately generous: the structural no-regex assertion proves the
+        # algorithmic fix; this only catches accidental synchronous blowups.
+        assert time.perf_counter() - started < 5.0
+
+    def test_soul_anchor_scan_preserves_legacy_markdown_forms(self):
+        anchors = AgentRegistry._soul_identity_anchors(
+            "# Oleg ###\n## IDENTITY ##\n**Name:** Oleg\n***Role:** Lead",
+            agent_name="oleg",
+        )
+
+        assert anchors == {
+            "agent_heading",
+            "identity_heading",
+            "name_label",
+            "role_label",
+        }
+
     def test_update_is_partial_and_preserves_unset_fields(self, registry):
         registry.register(
             "murzik",
@@ -865,6 +1249,25 @@ class TestAgentNameValidation:
     def test_register_accepts_safe_name(self, registry, good_name):
         agent = registry.register(good_name)
         assert agent.name == good_name
+
+
+def test_resolve_agent_path_refuses_out_of_tree_alias(tmp_path):
+    owner_root = tmp_path / "alice"
+    owner_root.mkdir()
+    outside = tmp_path / "victim-soul"
+    outside.write_text("victim-private")
+    (owner_root / "CLAUDE.md").symlink_to(outside)
+
+    with pytest.raises(AgentPathContainmentError):
+        resolve_agent_path("alice", owner_root, "CLAUDE.md")
+
+    assert outside.read_text() == "victim-private"
+
+
+@pytest.mark.parametrize("owner_root", ["", "relative/agent-root"])
+def test_resolve_agent_path_requires_persisted_absolute_owner_root(owner_root):
+    with pytest.raises(AgentPathContainmentError):
+        resolve_agent_path("alice", owner_root, "CLAUDE.md")
 
 
 class TestDirectives:

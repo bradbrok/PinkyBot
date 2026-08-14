@@ -2319,11 +2319,9 @@ class TestRegisterAgent:
     def test_creates_and_assigns_skills(self, srv):
         # Mock ordering (matched in insertion order, method-blind):
         #   /skills/      → skill-assign POSTs
-        #   /agents/mora  → the create-only GET pre-check; "error" body = not found
         #   /agents       → the POST create
         with _mock_api({
             "/skills/": {"assigned": True},
-            "/agents/mora": {"error": "not found", "status": 404},
             "/agents": {"name": "mora", "display_name": "Mora", "model": "opus"},
             "*": {},
         }):
@@ -2345,7 +2343,6 @@ class TestRegisterAgent:
     def test_privileged_role_with_confirm_proceeds(self, srv):
         with _mock_api({
             "/skills/": {"assigned": True},
-            "/agents/mora": {"error": "not found", "status": 404},
             "/agents": {"name": "mora", "display_name": "Mora", "model": "opus"},
             "*": {},
         }):
@@ -2358,48 +2355,49 @@ class TestRegisterAgent:
 
     def test_create_error_surfaces(self, srv):
         # POST /agents genuinely fails on e.g. an invalid name
-        # (_validate_agent_name → 400). The create-only GET pre-check returns
-        # not-found so we reach the create call, whose error must surface.
-        # (Previously this mocked a "name taken" error that the upsert endpoint
-        # never returns; collisions are now handled by the create-only guard —
-        # see test_existing_name_refused.)
+        # (_validate_agent_name → 400), and the error must surface.
         with _mock_api({
-            "/agents/mora": {"error": "not found", "status": 404},
-            "/agents": {"error": "invalid agent name", "status": 400},
+            "/agents": {
+                "error": '{"detail":{"code":"invalid_agent_name"}}',
+                "status": 400,
+            },
             "*": {},
         }):
-            out = _tools(srv)["register_agent"](name="mora", role="worker")
+            out = _tools(srv)["register_agent"](
+                name="../victim",
+                role="worker",
+            )
         assert "Failed to register" in out
+        assert "HTTP 400" in out
+        assert "invalid_agent_name" in out
+        assert "victim" not in out
 
     def test_existing_name_refused(self, srv):
-        # Create-only guard: an existing name is refused, not silently upserted.
-        # The GET pre-check returns an agent dict (no "error") → refuse before
-        # any POST, so register_agent('barsik') can't blank Barsik's soul/role.
+        # The API's DB-level collision is authoritative; MCP surfaces its 409.
         with _mock_api({
-            "/agents/barsik": {"name": "barsik", "role": "sidekick", "soul": "x"},
+            "/agents": {"error": "already exists", "status": 409},
             "*": {},
         }):
             out = _tools(srv)["register_agent"](
                 name="barsik", role="worker", soul="would-overwrite",
             )
         assert "Refusing to register 'barsik'" in out
+        assert "HTTP 409" in out
         assert "already exists" in out
         assert "Registered agent" not in out
 
-    def test_non_404_get_error_aborts(self, srv):
-        # Guard must fail-closed on non-404 errors (500/timeout), not proceed to create.
+    def test_create_transport_error_aborts(self, srv):
         with _mock_api({
-            "/agents/mora": {"error": "internal server error", "status": 500},
+            "/agents": {"error": "internal server error", "status": 500},
             "*": {},
         }):
             out = _tools(srv)["register_agent"](name="mora", role="worker")
-        assert "couldn't verify name availability" in out
+        assert "HTTP 500" in out
         assert "Registered agent" not in out
 
     def test_skill_failure_reported(self, srv):
         with _mock_api({
             "/skills/": {"error": "no such skill"},
-            "/agents/mora": {"error": "not found", "status": 404},
             "/agents": {"name": "mora"},
             "*": {},
         }):
