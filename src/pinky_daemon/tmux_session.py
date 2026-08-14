@@ -2858,6 +2858,9 @@ class TmuxSession(TransportReplacementMixin):
                 f"(reason={reason.value}) — session remains CONNECTED"
             )
 
+    def _prepare_tmux_spawn(self) -> None:
+        """Publish transport-specific state at the final spawn boundary."""
+
     async def _spawn_tmux_repl(self) -> None:
         """Spawn the tmux session and the in-pane claude REPL, then start
         the response tailer.
@@ -2944,13 +2947,27 @@ class TmuxSession(TransportReplacementMixin):
 
         # If a stale session is left over from a previous daemon run (e.g.
         # crash without graceful disconnect), reap it. We're the cold-start
-        # owner; reclaiming the name is safe.
+        # owner; reclaiming the name is safe. A non-ok result is a known failed
+        # precondition, not best-effort cleanup: abort before the transport's
+        # spawn hook can publish state for a child that will never launch.
         if await self._tmux.has_session():
             _log(
                 f"tmux[{self.agent_name}]: stale session {self._session_name} "
                 f"found, reaping before fresh spawn"
             )
-            await self._tmux.kill_session()
+            kill_result = await self._tmux.kill_session()
+            if not kill_result.ok:
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: stale kill-session failed before "
+                    f"spawn: rc={kill_result.returncode} "
+                    f"stderr={kill_result.stderr.strip()!r}"
+                )
+
+        # Transport-specific state publication belongs after every teardown
+        # precondition and immediately before command/env construction. The
+        # default is a no-op; Codex uses this exact boundary for AGENTS.md and
+        # soul-version publication.
+        self._prepare_tmux_spawn()
 
         # Build the in-pane command. ``claude --continue`` resumes the
         # most-recent transcript for ``cwd``; falls back to fresh session

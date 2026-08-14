@@ -1250,8 +1250,10 @@ class CodexSession(TransportReplacementMixin):
 
         if self._app_client is not None or self._app_proc is not None:
             # Process died under us — drop the stale client and respawn only
-            # after the replacement environment passed preparation above.
-            await self._teardown_app_server()
+            # after strict replacement cleanup succeeds. A tmux kill can fail
+            # as a non-ok command result rather than an exception; that known
+            # failure must abort before the spawn boundary publishes a soul.
+            await self._teardown_app_server(strict=True)
 
         started_at = time.monotonic()
 
@@ -1337,31 +1339,57 @@ class CodexSession(TransportReplacementMixin):
             f"app_server_degraded_to_exec agent={self.agent_name} reason={reason}"
         )
 
-    async def _teardown_app_server(self) -> None:
-        """Close the client and kill the process. Idempotent."""
+    async def _teardown_app_server(self, *, strict: bool = False) -> None:
+        """Close the client and kill the process.
+
+        Ordinary shutdown is best-effort. Replacement uses ``strict=True`` so
+        a failed kill/wait remains observable, cached handles remain available
+        for a later cleanup attempt, and no replacement spawn can continue.
+        """
         self._report_appserver_terminal_stream_survivors(phase="teardown")
-        if self._app_client is not None:
+        client = self._app_client
+        proc = self._app_proc
+        if client is not None:
             try:
-                await self._app_client.close()
+                await client.close()
             except Exception:
                 pass
-            self._app_client = None
-        if self._app_proc is not None:
+            if not strict:
+                self._app_client = None
+        supervisor_cleaned = False
+        proc_cleaned = proc is None or proc.returncode is not None
+        if proc is not None:
             try:
-                if self._app_proc.returncode is None:
-                    self._app_proc.kill()
-                    await asyncio.wait_for(self._app_proc.wait(), timeout=5)
+                if proc.returncode is None:
+                    proc.kill()
+                    strict_wait = getattr(proc, "wait_strict", None)
+                    if strict and strict_wait is not None:
+                        await asyncio.wait_for(strict_wait(), timeout=5)
+                        supervisor_cleaned = True
+                    else:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    proc_cleaned = True
             except Exception:
-                pass
-            self._app_proc = None
+                if strict:
+                    raise
+            if not strict and proc_cleaned:
+                self._app_proc = None
         # A tmux supervisor may have started its shim but timed out/cancelled
         # before returning a client/proc adapter. Always run its idempotent
         # teardown so that partial spawn cannot leak a session or socket.
-        if self._use_tmux_app_server and self._app_supervisor is not None:
+        if (
+            self._use_tmux_app_server
+            and self._app_supervisor is not None
+            and not supervisor_cleaned
+        ):
             try:
-                await self._app_supervisor.teardown()
+                await self._app_supervisor.teardown(strict=strict)
             except Exception:
-                pass
+                if strict:
+                    raise
+        if strict:
+            self._app_client = None
+            self._app_proc = None
 
     def _appserver_config(self) -> dict:
         """Build the per-thread ``config`` override for MCP servers.

@@ -573,14 +573,17 @@ class CodexTmuxSession(TmuxSession):
             soul_version_store=self._registry,
         )
 
-    async def _spawn_tmux_repl(self) -> None:
-        cwd = str(Path(self._config.working_dir or ".").resolve())
+    def _prepare_tmux_spawn(self) -> None:
+        """Snapshot and publish only after inherited strict stale cleanup."""
         prepare_agent_codex_home(
             self._config,
             log=_log,
             soul_version_store=self._registry,
         )
+        cwd = str(Path(self._config.working_dir or ".").resolve())
         self._seed_codex_trust(cwd)
+
+    async def _spawn_tmux_repl(self) -> None:
         await super()._spawn_tmux_repl()
         await self._codex_dismiss_nux_and_ready()
 

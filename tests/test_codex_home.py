@@ -17,7 +17,10 @@ from types import SimpleNamespace
 import pytest
 
 from pinky_daemon import codex_home as codex_home_mod
-from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
+from pinky_daemon.codex_app_server_tmux import (
+    CodexAppServerSupervisor,
+    _TmuxAppServerProc,
+)
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     PER_AGENT_CODEX_HOME_ENV,
@@ -31,6 +34,7 @@ from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.codex_tmux_transcript import _discover_codex_rollout
 from pinky_daemon.streaming_session import StreamingSessionConfig
+from pinky_daemon.tmux_session import TmuxCommandResult
 
 
 def _scope(
@@ -2160,7 +2164,7 @@ async def test_tmux_replacement_publishes_and_snapshots_soul_once(
         return None
 
     async def _base_spawn(_session):
-        return None
+        _session._prepare_tmux_spawn()
 
     monkeypatch.setattr(session, "disconnect", _noop)
     monkeypatch.setattr(session, "_seed_codex_trust", lambda _cwd: None)
@@ -2206,7 +2210,7 @@ async def test_tmux_child_spawn_inside_replacement_resnapshots_self_edit(
         return None
 
     async def _base_spawn(_session):
-        return None
+        _session._prepare_tmux_spawn()
 
     async def _spawn_child_after_preflight():
         agents_md.write_text("self edit after preflight", encoding="utf-8")
@@ -2265,7 +2269,7 @@ async def test_tmux_refused_replacement_does_not_stale_next_spawn_soul(
         return None
 
     async def _base_spawn(_session):
-        return None
+        _session._prepare_tmux_spawn()
 
     monkeypatch.setattr(session, "_seed_codex_trust", lambda _cwd: None)
     monkeypatch.setattr(session, "_codex_dismiss_nux_and_ready", _noop)
@@ -2379,7 +2383,7 @@ async def test_tmux_app_server_replacement_publishes_and_snapshots_soul_once(
     session._app_client = stale_client
     session._app_proc = _Proc(1)
 
-    async def _noop_teardown() -> None:
+    async def _noop_teardown(*, strict: bool = False) -> None:
         return None
 
     async def _start(**_kwargs):
@@ -2398,6 +2402,265 @@ async def test_tmux_app_server_replacement_publishes_and_snapshots_soul_once(
     assert soul_store.calls == [
         ("test-agent", "compiled app-server soul", "spawn")
     ]
+
+
+@pytest.mark.asyncio
+async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """R5: a known-live stale tmux session is a strict spawn precondition."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    supervisor = CodexAppServerSupervisor(
+        "test-agent",
+        working_dir=str(working_dir),
+        agent_config=config,
+        soul_version_store=soul_store,
+    )
+    build_env_calls = 0
+    real_build_env = supervisor._build_env
+
+    async def _failed_kill():
+        return TmuxCommandResult(
+            returncode=1,
+            stdout="",
+            stderr="stale session still alive",
+        )
+
+    async def _unexpected_new_session(**_kwargs):
+        raise AssertionError("new_session reached after failed stale kill")
+
+    def _tracked_build_env():
+        nonlocal build_env_calls
+        build_env_calls += 1
+        return real_build_env()
+
+    monkeypatch.setattr(supervisor._tmux, "kill_session", _failed_kill)
+    monkeypatch.setattr(supervisor._tmux, "new_session", _unexpected_new_session)
+    monkeypatch.setattr(supervisor, "_build_env", _tracked_build_env)
+
+    with pytest.raises(RuntimeError, match="kill-session failed"):
+        await supervisor.start()
+
+    assert build_env_calls == 0
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tmux_app_server_cached_kill_failure_blocks_replacement_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """R5: the cached proc kill/wait seam must propagate strict cleanup failure."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+    monkeypatch.setenv("PINKY_CODEX_TMUX_APP_SERVER", "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    session = CodexSession(config, registry=soul_store)
+    assert session._app_supervisor is not None
+    supervisor = session._app_supervisor
+
+    class _Client:
+        is_closed = True
+
+        async def close(self) -> None:
+            return None
+
+    async def _failed_kill():
+        return TmuxCommandResult(
+            returncode=1,
+            stdout="",
+            stderr="stale session still alive",
+        )
+
+    async def _unexpected_start(**_kwargs):
+        raise AssertionError("replacement start reached after failed cached kill")
+
+    monkeypatch.setattr(supervisor._tmux, "kill_session", _failed_kill)
+    monkeypatch.setattr(supervisor, "start", _unexpected_start)
+    stale_proc = _TmuxAppServerProc(supervisor, pid=4321)
+    session._app_client = _Client()
+    session._app_proc = stale_proc
+
+    with pytest.raises(RuntimeError, match="kill-session failed"):
+        await session._ensure_app_server()
+
+    assert session._app_proc is stale_proc
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_direct_app_server_failed_shutdown_handle_blocks_replacement_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """R5 sibling: best-effort shutdown retains proof of a failed direct kill."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    monkeypatch.setenv("PINKY_CODEX_APP_SERVER", "1")
+    monkeypatch.delenv("PINKY_CODEX_TMUX_APP_SERVER", raising=False)
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    session = CodexSession(config, registry=soul_store)
+
+    class _Client:
+        is_closed = False
+
+        async def close(self) -> None:
+            self.is_closed = True
+
+    class _Proc:
+        returncode = None
+        pid = 4321
+
+        def kill(self) -> None:
+            raise RuntimeError("direct kill failed")
+
+        async def wait(self) -> int:
+            raise AssertionError("wait reached after failed direct kill")
+
+    async def _unexpected_spawn(**_kwargs):
+        raise AssertionError("replacement spawn reached after failed direct kill")
+
+    stale_proc = _Proc()
+    session._app_client = _Client()
+    session._app_proc = stale_proc
+    monkeypatch.setattr(
+        "pinky_daemon.codex_session.spawn_app_server",
+        _unexpected_spawn,
+    )
+
+    with pytest.raises(RuntimeError, match="direct kill failed"):
+        await session.restart_transport()
+
+    assert session._app_proc is stale_proc
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """R5 sibling: inherited tmux REPL cleanup gates Codex publication too."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    session = CodexTmuxSession(config, registry=soul_store)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _has_stale_session():
+        return True
+
+    async def _failed_kill():
+        return TmuxCommandResult(
+            returncode=1,
+            stdout="",
+            stderr="stale session still alive",
+        )
+
+    async def _unexpected_new_session(**_kwargs):
+        raise AssertionError("new_session reached after failed stale kill")
+
+    monkeypatch.setattr(session, "_container_agent", lambda *, strict: None)
+    monkeypatch.setattr(
+        session,
+        "_select_command_runner",
+        lambda _container_agent: session._tmux._runner,
+    )
+    monkeypatch.setattr(session, "_ensure_container_started", _noop)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._seed_claude_trust_file",
+        lambda _path, _cwd: False,
+    )
+    monkeypatch.setattr(session._tmux, "has_session", _has_stale_session)
+    monkeypatch.setattr(session._tmux, "kill_session", _failed_kill)
+    monkeypatch.setattr(session._tmux, "new_session", _unexpected_new_session)
+
+    with pytest.raises(RuntimeError, match="kill-session failed"):
+        await session._spawn_tmux_repl()
+
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
 
 
 def test_reverse_migration_moves_only_matching_rollouts(tmp_path):

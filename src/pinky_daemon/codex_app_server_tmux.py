@@ -97,6 +97,13 @@ class _TmuxAppServerProc:
             self.returncode = -9
         return self.returncode
 
+    async def wait_strict(self) -> int:
+        """Wait for replacement cleanup, propagating any failed tmux kill."""
+        await self._sup.teardown(strict=True)
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
 
 class CodexAppServerSupervisor:
     """Owns the tmux session + socket lifecycle for one agent's app-server."""
@@ -170,7 +177,7 @@ class CodexAppServerSupervisor:
 
         # Idempotent pre-start cleanup: a crashed predecessor can leave a live
         # tmux session and/or a stale socket; either would wedge a fresh start.
-        await self._tmux.kill_session()
+        await self._kill_tmux_session(strict=True)
         self._unlink_sock()
 
         self._ensure_sock_dir_secure()
@@ -302,12 +309,38 @@ class CodexAppServerSupervisor:
     def request_kill(self) -> None:
         self._kill_requested = True
 
-    async def teardown(self) -> None:
-        """Idempotent: kill the tmux session and unlink the socket."""
+    async def _kill_tmux_session(self, *, strict: bool) -> bool:
+        """Kill the owned tmux session, optionally making failure terminal."""
         try:
-            await self._tmux.kill_session()
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
-            self._log(f"codex[{self.agent_name}]: tmux app-server kill_session failed: {exc}")
+            result = await self._tmux.kill_session()
+        except Exception as exc:
+            message = (
+                f"codex app-server tmux kill-session failed for "
+                f"{self.agent_name}: {exc}"
+            )
+            self._log(message)
+            if strict:
+                raise RuntimeError(message) from exc
+            return False
+        if result.ok:
+            return True
+        message = (
+            f"codex app-server tmux kill-session failed for {self.agent_name}: "
+            f"rc={result.returncode} stderr={result.stderr.strip()!r}"
+        )
+        self._log(message)
+        if strict:
+            raise RuntimeError(message)
+        return False
+
+    async def teardown(self, *, strict: bool = False) -> None:
+        """Kill the tmux session and unlink its socket.
+
+        Terminal shutdown remains best-effort. Replacement cleanup passes
+        ``strict=True`` so a known failed kill aborts before any new child's
+        environment is prepared or published.
+        """
+        await self._kill_tmux_session(strict=strict)
         self._unlink_sock()
 
     def stats(self) -> dict:
