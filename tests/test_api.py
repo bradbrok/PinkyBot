@@ -5515,18 +5515,44 @@ class TestAgentScheduleEndpoints:
         assert body["records"][0]["state"] == "receipted-ran-once"
         assert body["records"][0]["fired_at"] == 100.0
 
+        abandoned, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="Ambiguous receipt",
+            fired_at=200.0,
+        )
+        assert registry.abandon_pending_schedule_wake(
+            abandoned.id, abandoned_at=210.0
+        )
+        response = client.get(
+            "/scheduler/wake-ledger",
+            params={"agent_name": "alice", "state": "abandoned"},
+        )
+        assert response.status_code == 200
+        assert response.json()["records"][0]["state"] == "abandoned"
+        assert response.json()["records"][0]["abandoned_at"] == 210.0
+
     def test_scheduler_status_surfaces_pending_count_and_age(self):
         client = self._make_client()
         self._register(client, "alice")
         created = self._create_schedule(client).json()
         registry = client.app.state.agents
-        registry.persist_schedule_wake(
+        active, _ = registry.persist_schedule_wake(
             created["id"],
             agent_name="alice",
             schedule_name="morning",
             prompt="frozen",
             fired_at=time.time() - 120.0,
         )
+        abandoned, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="ambiguous",
+            fired_at=active.fired_at - 120.0,
+        )
+        assert registry.abandon_pending_schedule_wake(abandoned.id)
 
         response = client.get("/scheduler/status")
 
@@ -5535,6 +5561,7 @@ class TestAgentScheduleEndpoints:
         assert body["pending_schedule_wake_count"] == 1
         assert body["pending_schedule_wakes"][0]["agent_name"] == "alice"
         assert body["pending_schedule_wakes"][0]["count"] == 1
+        assert body["pending_schedule_wakes"][0]["abandoned_count"] == 1
         assert body["pending_schedule_wakes"][0]["oldest_age_seconds"] >= 119
 
     def test_discard_pending_wake_is_agent_scoped(self):

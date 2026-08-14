@@ -13,7 +13,12 @@ from datetime import datetime
 
 import pytest
 
-from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
+import pinky_daemon.agent_registry as agent_registry_module
+from pinky_daemon.agent_registry import (
+    OUTBOX_REAPER_PAYLOAD_TRIMMED,
+    AgentRegistry,
+    ScheduleNameConflictError,
+)
 from pinky_daemon.scheduler import (
     _SCHEDULE_PROMPT_WARN_INTERVAL_SEC,
     AgentScheduler,
@@ -507,6 +512,7 @@ class TestAgentSchedules:
             {
                 "agent_name": "oleg",
                 "count": 1,
+                "abandoned_count": 0,
                 "oldest_fired_at": 100.0,
                 "newest_fired_at": 100.0,
                 "oldest_age_seconds": 400.0,
@@ -652,6 +658,7 @@ class TestAgentSchedules:
             assert columns.count("accepted_at") == 1
             assert columns.count("failed_at") == 1
             assert columns.count("last_error") == 1
+            assert columns.count("abandoned_at") == 1
         finally:
             reopened.close()
             os.unlink(path)
@@ -756,6 +763,847 @@ class TestAgentSchedules:
         enabled = registry.get_schedules("oleg")
         assert len(enabled) == 1
         assert enabled[0].name == "morning"
+
+
+# ── Scheduler wake outbox reaper tests ────────────────────
+
+
+class TestOutboxReaper:
+    DAY = 24 * 60 * 60
+
+    @classmethod
+    def _reap(
+        cls,
+        registry,
+        *,
+        now: float,
+        abandon_after: float = 3_600,
+        retain_accepted: float | None = None,
+        retain_abandoned: float | None = None,
+        retain_parked: float | None = None,
+        payload_trim_after: float | None = None,
+        batch_size: int = 10_000,
+    ):
+        return registry.reap_pending_schedule_wakes(
+            now=now,
+            abandon_after=abandon_after,
+            retain_accepted=(
+                7 * cls.DAY
+                if retain_accepted is None
+                else retain_accepted
+            ),
+            retain_abandoned=(
+                14 * cls.DAY
+                if retain_abandoned is None
+                else retain_abandoned
+            ),
+            retain_parked=(
+                30 * cls.DAY if retain_parked is None else retain_parked
+            ),
+            payload_trim_after=(
+                1_000_000_000
+                if payload_trim_after is None
+                else payload_trim_after
+            ),
+            batch_size=batch_size,
+        )
+
+    def test_transition_is_strict_at_ceiling_and_separates_health(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="boundary", prompt="run"
+        )
+        now = 2_000_000_000.0
+        stranded, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            prompt="stranded",
+            fired_at=now - 3_601,
+        )
+        boundary, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            prompt="boundary",
+            fired_at=now - 3_600,
+        )
+        young, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            prompt="young",
+            fired_at=now - 3_599,
+        )
+        legacy_parked, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            prompt="legacy abandoned",
+            fired_at=now - 3_602,
+        )
+        assert registry.park_pending_schedule_wake(
+            legacy_parked.id,
+            parked_at=now - 2,
+            reason="RECEIPT_ABANDONED: legacy ceiling marker",
+        )
+        capsys.readouterr()
+
+        metrics = self._reap(
+            registry,
+            now=now,
+            batch_size=2,
+        )
+
+        assert metrics == [
+            {
+                "agent_name": "oleg",
+                "abandoned": 2,
+                "accepted_reaped": 0,
+                "abandoned_reaped": 0,
+                "parked_reaped": 0,
+                "payloads_trimmed": 0,
+                "retained_active": 2,
+            }
+        ]
+        by_id = {
+            row.id: row for row in registry.list_schedule_wake_ledger("oleg")
+        }
+        assert by_id[stranded.id].ledger_state == "abandoned"
+        assert by_id[stranded.id].abandoned_at == now
+        assert by_id[legacy_parked.id].ledger_state == "abandoned"
+        assert by_id[legacy_parked.id].abandoned_at == now
+        assert by_id[legacy_parked.id].parked_at == 0
+        assert by_id[boundary.id].ledger_state == "pending"
+        assert by_id[young.id].ledger_state == "pending"
+        assert [
+            row.id for row in registry.list_pending_schedule_wakes("oleg")
+        ] == [boundary.id, young.id]
+        assert registry.get_pending_schedule_wake_health(
+            "oleg", now=now
+        ) == [
+            {
+                "agent_name": "oleg",
+                "count": 2,
+                "abandoned_count": 2,
+                "oldest_fired_at": now - 3_600,
+                "newest_fired_at": now - 3_599,
+                "oldest_age_seconds": 3_600.0,
+            }
+        ]
+        logs = capsys.readouterr().err
+        assert (
+            "outbox-reaper: agent=oleg abandoned=+2 accepted_reaped=0 "
+            "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
+            "retained_active=2"
+        ) in logs
+        assert "outbox-reaper: summary agents=1 abandoned=+2" in logs
+
+    def test_transition_chunks_rows_above_batch_limit(self, registry):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "0 8 * * *", name="batch", prompt="run"
+        )
+        now = 2_000_000_000.0
+        rows = [
+            registry.persist_schedule_wake(
+                schedule.id,
+                agent_name="oleg",
+                schedule_name=schedule.name,
+                prompt=f"old-{index}",
+                fired_at=now - 4_000 - index,
+            )[0]
+            for index in range(5)
+        ]
+
+        metrics = self._reap(
+            registry,
+            now=now,
+            batch_size=2,
+        )
+
+        assert metrics[0]["abandoned"] == 5
+        assert metrics[0]["retained_active"] == 0
+        assert {
+            registry.get_schedule_wake_by_fire(
+                schedule.id, row.fired_at
+            ).ledger_state
+            for row in rows
+        } == {"abandoned"}
+        assert registry.get_pending_schedule_wake_health(
+            "oleg", now=now
+        ) == [
+            {
+                "agent_name": "oleg",
+                "count": 0,
+                "abandoned_count": 5,
+                "oldest_fired_at": 0.0,
+                "newest_fired_at": 0.0,
+                "oldest_age_seconds": 0.0,
+            }
+        ]
+
+    def test_retention_boundaries_and_newest_parked_specimen(
+        self, registry
+    ):
+        registry.register("oleg")
+        now = 2_000_000_000.0
+        accepted_schedule = registry.add_schedule(
+            "oleg", "0 1 * * *", name="accepted", prompt="accepted"
+        )
+        abandoned_schedule = registry.add_schedule(
+            "oleg", "0 2 * * *", name="abandoned", prompt="abandoned"
+        )
+        discarded_schedule = registry.add_schedule(
+            "oleg", "0 3 * * *", name="discarded", prompt="discarded"
+        )
+        parked_schedule = registry.add_schedule(
+            "oleg", "0 4 * * *", name="parked", prompt="parked"
+        )
+        boundary_parked_schedule = registry.add_schedule(
+            "oleg", "0 5 * * *", name="parked-boundary", prompt="parked"
+        )
+
+        accepted_old, _ = registry.persist_schedule_wake(
+            accepted_schedule.id,
+            agent_name="oleg",
+            schedule_name=accepted_schedule.name,
+            prompt="accepted-old",
+            fired_at=now - 7 * self.DAY - 100,
+        )
+        accepted_boundary, _ = registry.persist_schedule_wake(
+            accepted_schedule.id,
+            agent_name="oleg",
+            schedule_name=accepted_schedule.name,
+            prompt="accepted-boundary",
+            fired_at=now - 7 * self.DAY - 99,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            accepted_old.id, delivered_at=now - 7 * self.DAY - 1
+        )
+        assert registry.confirm_pending_schedule_wake(
+            accepted_boundary.id, delivered_at=now - 7 * self.DAY
+        )
+
+        abandoned_old, _ = registry.persist_schedule_wake(
+            abandoned_schedule.id,
+            agent_name="oleg",
+            schedule_name=abandoned_schedule.name,
+            prompt="abandoned-old",
+            fired_at=now - 14 * self.DAY - 100,
+        )
+        abandoned_boundary, _ = registry.persist_schedule_wake(
+            abandoned_schedule.id,
+            agent_name="oleg",
+            schedule_name=abandoned_schedule.name,
+            prompt="abandoned-boundary",
+            fired_at=now - 14 * self.DAY - 99,
+        )
+        assert registry.abandon_pending_schedule_wake(
+            abandoned_old.id,
+            abandoned_at=now - 14 * self.DAY - 1,
+        )
+        assert registry.abandon_pending_schedule_wake(
+            abandoned_boundary.id,
+            abandoned_at=now - 14 * self.DAY,
+        )
+
+        discarded_old, _ = registry.persist_schedule_wake(
+            discarded_schedule.id,
+            agent_name="oleg",
+            schedule_name=discarded_schedule.name,
+            prompt="discarded-old",
+            fired_at=now - 14 * self.DAY - 98,
+        )
+        discarded_boundary, _ = registry.persist_schedule_wake(
+            discarded_schedule.id,
+            agent_name="oleg",
+            schedule_name=discarded_schedule.name,
+            prompt="discarded-boundary",
+            fired_at=now - 14 * self.DAY - 97,
+        )
+        assert registry.discard_pending_schedule_wake(discarded_old.id)
+        assert registry.discard_pending_schedule_wake(discarded_boundary.id)
+        registry._db.execute(
+            "UPDATE pending_schedule_wakes SET parked_at=? WHERE id=?",
+            (now - 14 * self.DAY - 1, discarded_old.id),
+        )
+        registry._db.execute(
+            "UPDATE pending_schedule_wakes SET parked_at=? WHERE id=?",
+            (now - 14 * self.DAY, discarded_boundary.id),
+        )
+
+        parked_oldest, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="oleg",
+            schedule_name=parked_schedule.name,
+            prompt="parked-oldest",
+            fired_at=now - 30 * self.DAY - 100,
+        )
+        parked_newest, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="oleg",
+            schedule_name=parked_schedule.name,
+            prompt="parked-newest",
+            fired_at=now - 30 * self.DAY - 99,
+        )
+        assert registry.park_pending_schedule_wake(
+            parked_oldest.id,
+            parked_at=now - 30 * self.DAY - 2,
+            reason="old quarantine",
+        )
+        assert registry.park_pending_schedule_wake(
+            parked_newest.id,
+            parked_at=now - 30 * self.DAY - 1,
+            reason="newest open quarantine",
+        )
+        parked_boundary, _ = registry.persist_schedule_wake(
+            boundary_parked_schedule.id,
+            agent_name="oleg",
+            schedule_name=boundary_parked_schedule.name,
+            prompt="parked-boundary",
+            fired_at=now - 30 * self.DAY - 98,
+        )
+        assert registry.park_pending_schedule_wake(
+            parked_boundary.id,
+            parked_at=now - 30 * self.DAY,
+            reason="boundary quarantine",
+        )
+        registry._db.commit()
+
+        metrics = self._reap(registry, now=now)
+
+        assert metrics[0]["accepted_reaped"] == 1
+        assert metrics[0]["abandoned_reaped"] == 2
+        assert metrics[0]["parked_reaped"] == 1
+        remaining = {
+            row.id for row in registry.list_schedule_wake_ledger("oleg")
+        }
+        assert accepted_old.id not in remaining
+        assert abandoned_old.id not in remaining
+        assert discarded_old.id not in remaining
+        assert parked_oldest.id not in remaining
+        assert accepted_boundary.id in remaining
+        assert abandoned_boundary.id in remaining
+        assert discarded_boundary.id in remaining
+        assert parked_newest.id in remaining
+        assert parked_boundary.id in remaining
+
+    def test_payload_trim_is_auditable_quarantine_safe_and_idempotent(
+        self, registry
+    ):
+        registry.register("oleg")
+        now = 2_000_000_000.0
+        schedule = registry.add_schedule(
+            "oleg", "0 1 * * *", name="payloads", prompt="payload"
+        )
+        parked_schedule = registry.add_schedule(
+            "oleg", "0 2 * * *", name="parked-payloads", prompt="payload"
+        )
+
+        def persist(prompt: str, offset: float):
+            return registry.persist_schedule_wake(
+                schedule.id,
+                agent_name="oleg",
+                schedule_name=schedule.name,
+                prompt=prompt,
+                fired_at=now - offset,
+            )[0]
+
+        accepted = persist("accepted secret", 3 * self.DAY + 100)
+        abandoned = persist("abandoned secret", 3 * self.DAY + 99)
+        discarded = persist("discarded secret", 3 * self.DAY + 98)
+        trim_boundary = persist("exactly 48h", 2 * self.DAY + 97)
+        active = persist("active secret", 10)
+        terminal_at = now - 3 * self.DAY
+        assert registry.confirm_pending_schedule_wake(
+            accepted.id, delivered_at=terminal_at
+        )
+        assert registry.abandon_pending_schedule_wake(
+            abandoned.id, abandoned_at=terminal_at
+        )
+        assert registry.discard_pending_schedule_wake(discarded.id)
+        registry._db.execute(
+            "UPDATE pending_schedule_wakes SET parked_at=? WHERE id=?",
+            (terminal_at, discarded.id),
+        )
+        assert registry.confirm_pending_schedule_wake(
+            trim_boundary.id,
+            delivered_at=now - 2 * self.DAY,
+        )
+
+        parked_old, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="oleg",
+            schedule_name=parked_schedule.name,
+            prompt="closed quarantine secret",
+            fired_at=now - 3 * self.DAY - 96,
+        )
+        parked_latest, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="oleg",
+            schedule_name=parked_schedule.name,
+            prompt="open quarantine specimen",
+            fired_at=now - 3 * self.DAY - 95,
+        )
+        assert registry.park_pending_schedule_wake(
+            parked_old.id,
+            parked_at=now - 3 * self.DAY,
+            reason="older quarantine",
+        )
+        assert registry.park_pending_schedule_wake(
+            parked_latest.id,
+            parked_at=now - 3 * self.DAY + 1,
+            reason="latest quarantine",
+        )
+        registry._db.commit()
+        health_before = registry.get_pending_schedule_wake_health(
+            "oleg", now=now
+        )
+
+        first = self._reap(
+            registry,
+            now=now,
+            abandon_after=3_600,
+            retain_accepted=100 * self.DAY,
+            retain_abandoned=100 * self.DAY,
+            retain_parked=100 * self.DAY,
+            payload_trim_after=2 * self.DAY,
+        )
+
+        by_id = {
+            row.id: row for row in registry.list_schedule_wake_ledger("oleg")
+        }
+        assert first[0]["payloads_trimmed"] == 4
+        for row_id in (
+            accepted.id,
+            abandoned.id,
+            discarded.id,
+            parked_old.id,
+        ):
+            assert by_id[row_id].prompt == OUTBOX_REAPER_PAYLOAD_TRIMMED
+        assert by_id[trim_boundary.id].prompt == "exactly 48h"
+        assert by_id[parked_latest.id].prompt == "open quarantine specimen"
+        assert by_id[active.id].prompt == "active secret"
+        assert registry.get_pending_schedule_wake_health(
+            "oleg", now=now
+        ) == health_before
+
+        second = self._reap(
+            registry,
+            now=now,
+            abandon_after=3_600,
+            retain_accepted=100 * self.DAY,
+            retain_abandoned=100 * self.DAY,
+            retain_parked=100 * self.DAY,
+            payload_trim_after=2 * self.DAY,
+        )
+        assert second[0]["abandoned"] == 0
+        assert second[0]["accepted_reaped"] == 0
+        assert second[0]["abandoned_reaped"] == 0
+        assert second[0]["parked_reaped"] == 0
+        assert second[0]["payloads_trimmed"] == 0
+        assert second[0]["retained_active"] == 1
+
+    def test_zero_work_run_logs_one_summary(self, registry, capsys):
+        capsys.readouterr()
+
+        assert self._reap(registry, now=2_000_000_000.0) == []
+
+        lines = [
+            line
+            for line in capsys.readouterr().err.splitlines()
+            if line.startswith("outbox-reaper:")
+        ]
+        assert lines == [
+            "outbox-reaper: summary agents=0 abandoned=+0 "
+            "accepted_reaped=0 abandoned_reaped=0 parked_reaped=0 "
+            "payloads_trimmed=0 retained_active=0"
+        ]
+
+    def test_late_phase_failure_reports_commits_and_retry_matches_clean_run(
+        self, registry, tmp_path, monkeypatch, capsys
+    ):
+        now = 2_000_000_000.0
+        backoff = 100.0
+
+        def seed(reg):
+            reg.register("fault")
+            reg.register("witness")
+            schedule = reg.add_schedule(
+                "fault", "0 1 * * *", name="fault", prompt="run"
+            )
+            witness_schedule = reg.add_schedule(
+                "witness", "0 2 * * *", name="witness", prompt="run"
+            )
+            expired, _ = reg.persist_schedule_wake(
+                schedule.id,
+                agent_name="fault",
+                schedule_name=schedule.name,
+                prompt="delete me",
+                fired_at=now - 8 * self.DAY,
+            )
+            retained, _ = reg.persist_schedule_wake(
+                schedule.id,
+                agent_name="fault",
+                schedule_name=schedule.name,
+                prompt="trim me",
+                fired_at=now - 3 * self.DAY,
+            )
+            assert reg.confirm_pending_schedule_wake(
+                expired.id, delivered_at=now - 7 * self.DAY - 1
+            )
+            assert reg.confirm_pending_schedule_wake(
+                retained.id, delivered_at=now - 3 * self.DAY
+            )
+            reg.persist_schedule_wake(
+                witness_schedule.id,
+                agent_name="witness",
+                schedule_name=witness_schedule.name,
+                prompt="stay active",
+                fired_at=now - 10,
+            )
+            return expired, retained
+
+        expired, retained = seed(registry)
+        registry._db.execute(
+            f"""CREATE TRIGGER fail_outbox_payload_trim
+               BEFORE UPDATE OF prompt ON pending_schedule_wakes
+               WHEN NEW.prompt={OUTBOX_REAPER_PAYLOAD_TRIMMED!r}
+                    AND OLD.prompt<>NEW.prompt
+               BEGIN
+                 SELECT RAISE(ABORT, 'injected payload trim failure');
+               END"""
+        )
+        registry._db.commit()
+
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC", str(backoff)
+        )
+        scheduler = AgentScheduler(registry)
+        actual_reap = registry.reap_pending_schedule_wakes
+        failures: list[Exception] = []
+        successes: list[list[dict[str, int | str]]] = []
+
+        def observe_reap(**kwargs):
+            try:
+                result = actual_reap(**kwargs)
+            except Exception as exc:
+                failures.append(exc)
+                raise
+            successes.append(result)
+            return result
+
+        monkeypatch.setattr(
+            registry, "reap_pending_schedule_wakes", observe_reap
+        )
+        original_log = agent_registry_module._log
+        emitted: list[str] = []
+        failed_once = False
+
+        def flaky_log(message: str) -> None:
+            nonlocal failed_once
+            if not failed_once and message.startswith(
+                "outbox-reaper: agent="
+            ):
+                failed_once = True
+                raise OSError("injected one-shot disposition failure")
+            emitted.append(message)
+            original_log(message)
+
+        monkeypatch.setattr(agent_registry_module, "_log", flaky_log)
+        capsys.readouterr()
+
+        assert scheduler._run_outbox_reaper_if_due(now) is False
+        assert failed_once is True
+        assert len(failures) == 1
+        assert type(failures[0]) is sqlite3.IntegrityError
+        assert "injected payload trim failure" in str(failures[0])
+        assert scheduler._last_outbox_reaper_day is None
+        assert scheduler._last_outbox_reaper_failed_at == now
+        assert registry.get_schedule_wake_by_fire(
+            expired.schedule_id, expired.fired_at
+        ) is None
+        assert registry.get_schedule_wake_by_fire(
+            retained.schedule_id, retained.fired_at
+        ).prompt == "trim me"
+        partial_logs = capsys.readouterr().err
+        assert (
+            "outbox-reaper: agent=witness abandoned=+0 accepted_reaped=0 "
+            "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
+            "retained_active=1"
+        ) in partial_logs
+        assert (
+            "outbox-reaper: summary PARTIAL failed_phase=payload_trim "
+            "agents=2 abandoned=+0 accepted_reaped=1 "
+            "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
+            "retained_active=1"
+        ) in partial_logs
+        assert "outbox-reaper: ERROR maintenance pass failed" in emitted
+        assert any(
+            line.startswith(
+                "outbox-reaper: emission ERROR while reporting "
+                "maintenance failure: OSError: "
+            )
+            for line in emitted
+        )
+
+        assert scheduler._run_outbox_reaper_if_due(
+            now + backoff - 1
+        ) is False
+        assert len(failures) == 1
+        assert successes == []
+        assert capsys.readouterr().err == ""
+
+        registry._db.execute("DROP TRIGGER fail_outbox_payload_trim")
+        registry._db.commit()
+        assert scheduler._run_outbox_reaper_if_due(
+            now + backoff
+        ) is True
+        assert scheduler._run_outbox_reaper_if_due(
+            now + backoff + 1
+        ) is False
+        assert scheduler._last_outbox_reaper_failed_at is None
+        assert len(successes) == 1
+        retry_metrics = successes[0][0]
+        assert retry_metrics["accepted_reaped"] == 0
+        assert retry_metrics["payloads_trimmed"] == 1
+        assert registry.get_schedule_wake_by_fire(
+            retained.schedule_id, retained.fired_at
+        ).prompt == OUTBOX_REAPER_PAYLOAD_TRIMMED
+
+        clean_registry = AgentRegistry(
+            db_path=str(tmp_path / "clean-reaper.db")
+        )
+        try:
+            seed(clean_registry)
+            clean_metrics = self._reap(
+                clean_registry,
+                now=now + backoff,
+                payload_trim_after=2 * self.DAY,
+            )[0]
+
+            def snapshot(reg):
+                return reg._db.execute(
+                    """SELECT agent_name, schedule_name, prompt, fired_at,
+                              accepted_at, parked_at, abandoned_at, last_error
+                       FROM pending_schedule_wakes
+                       ORDER BY id"""
+                ).fetchall()
+
+            assert snapshot(registry) == snapshot(clean_registry)
+            partial_commits = {
+                "abandoned": 0,
+                "accepted_reaped": 1,
+                "abandoned_reaped": 0,
+                "parked_reaped": 0,
+                "payloads_trimmed": 0,
+            }
+            for field, partial_count in partial_commits.items():
+                assert clean_metrics[field] == (
+                    partial_count + int(retry_metrics[field])
+                )
+        finally:
+            clean_registry.close()
+
+    @pytest.mark.asyncio
+    async def test_inflight_drain_and_reap_converge_to_one_receipt(
+        self, registry, monkeypatch
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 0 * * *", name="concurrent", prompt="deliver once"
+        )
+        now = 2_000_000_000.0
+        fired_at = now - 91
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: now
+        )
+        delivery_started = asyncio.Event()
+        release_delivery = asyncio.Event()
+        deliveries: list[str] = []
+
+        async def confirm_once(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            delivery_started.set()
+            await release_delivery.wait()
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirm_once,
+            delivery_inflight_fn=lambda agent_name, prompt: (
+                delivery_started.is_set()
+            ),
+            schedule_delivery_timeout=10,
+            pending_wake_max_age_sec=1_000,
+            receipt_extension_max_age_sec=90,
+        )
+        scheduler.replay_pending_for_agent("worker")
+        await asyncio.wait_for(delivery_started.wait(), timeout=1)
+
+        metrics = self._reap(
+            registry,
+            now=now,
+            abandon_after=90,
+            retain_accepted=100 * self.DAY,
+            retain_abandoned=100 * self.DAY,
+            retain_parked=100 * self.DAY,
+        )
+        assert metrics[0]["abandoned"] == 1
+        release_delivery.set()
+        await scheduler._pending_replay_tasks["worker"]
+
+        row = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert deliveries == ["deliver once"]
+        assert row.id == pending.id
+        assert row.ledger_state == "receipted-ran-once"
+        assert row.accepted_at == now
+        assert row.abandoned_at == 0
+        assert row.parked_at == 0
+
+    @pytest.mark.asyncio
+    async def test_reap_before_boot_drain_never_delivers_abandoned_row(
+        self, registry
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 0 * * *", name="old", prompt="never replay"
+        )
+        now = 2_000_000_000.0
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 3_601,
+        )
+        deliveries: list[str] = []
+
+        async def unexpected(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=unexpected)
+        self._reap(registry, now=now)
+
+        scheduler._drain_outbox_if_pending("worker")
+        await asyncio.sleep(0)
+
+        assert deliveries == []
+        assert "worker" not in scheduler._pending_replay_tasks
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ).ledger_state == "abandoned"
+
+    @pytest.mark.asyncio
+    async def test_daemon_start_reaps_before_boot_replay(
+        self, registry, monkeypatch
+    ):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 0 * * *", name="boot", prompt="deliver young"
+        )
+        now = 2_000_000_000.0
+        old, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt="do not deliver old",
+            fired_at=now - 3_601,
+        )
+        young, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt="deliver young",
+            fired_at=now - 60,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: now
+        )
+        deliveries: list[str] = []
+
+        async def confirm(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirm)
+
+        async def no_loop():
+            return None
+
+        monkeypatch.setattr(scheduler, "_loop", no_loop)
+        await scheduler.start()
+        await asyncio.gather(*scheduler._pending_replay_tasks.values())
+        await scheduler.stop()
+
+        assert deliveries == ["deliver young"]
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, old.fired_at
+        ).ledger_state == "abandoned"
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, young.fired_at
+        ).ledger_state == "receipted-ran-once"
+
+    def test_daemon_schedule_runs_once_per_day_with_configured_windows(
+        self, registry, monkeypatch
+    ):
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_RETAIN_ACCEPTED_SEC", "101"
+        )
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_RETAIN_ABANDONED_SEC", "202"
+        )
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_RETAIN_PARKED_SEC", "303"
+        )
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC", "404"
+        )
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC", "505"
+        )
+        calls: list[dict] = []
+        monkeypatch.setattr(
+            registry,
+            "reap_pending_schedule_wakes",
+            lambda **kwargs: calls.append(kwargs),
+        )
+        scheduler = AgentScheduler(
+            registry,
+            receipt_extension_max_age_sec=90,
+        )
+        now = 2_000_000_000.0
+
+        assert scheduler._run_outbox_reaper_if_due(now) is True
+        assert scheduler._run_outbox_reaper_if_due(now + 60) is False
+        assert scheduler._run_outbox_reaper_if_due(
+            now + self.DAY
+        ) is True
+
+        assert len(calls) == 2
+        assert calls[0] == {
+            "now": now,
+            "abandon_after": 90.0,
+            "retain_accepted": 101.0,
+            "retain_abandoned": 202.0,
+            "retain_parked": 303.0,
+            "payload_trim_after": 404.0,
+        }
+        assert scheduler._outbox_reaper_failure_backoff_sec == 505.0
 
 
 # ── Agent Heartbeat Tests ──────────────────────────────────
@@ -1791,7 +2639,7 @@ class TestScheduler:
         ledger = restarted_registry.get_schedule_wake_by_fire(
             schedule.id, fired_at
         )
-        assert ledger.ledger_state == "quarantined"
+        assert ledger.ledger_state == "abandoned"
         assert "RECEIPT_ABANDONED" in ledger.last_error
         assert submissions == []
         assert not restarted._schedule_delivery_locks["worker"].locked()
@@ -1928,7 +2776,7 @@ class TestScheduler:
         assert ledger is not None
         assert ledger.id == pending.id
         assert ledger.id != ledger.schedule_id
-        assert ledger.ledger_state == "quarantined"
+        assert ledger.ledger_state == "abandoned"
         assert "RECEIPT_ABANDONED" in ledger.last_error
         assert submissions == []
         assert probes and set(probes) == {("worker", "pasted")}
@@ -2152,13 +3000,13 @@ class TestScheduler:
         ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
         assert ledger is not None
         assert ledger.id == pending.id
-        assert ledger.ledger_state == "quarantined"
+        assert ledger.ledger_state == "abandoned"
         assert "RECEIPT_ABANDONED" in ledger.last_error
         assert durable_receipt is not None
         assert durable_receipt.schedule_id == schedule.id
         logs = capsys.readouterr().err
         assert "schedule 'late-identity' (#1)" in logs
-        assert "quarantined=True" in logs
+        assert "abandoned=True" in logs
 
         assert durable_receipt.accept() is True
         process_local_receipt.set_result(True)
@@ -2228,7 +3076,7 @@ class TestScheduler:
             row.id: row for row in registry.list_schedule_wake_ledger("worker")
         }
         assert submissions == []
-        assert by_id[older.id].ledger_state == "quarantined"
+        assert by_id[older.id].ledger_state == "abandoned"
         assert "RECEIPT_ABANDONED" in by_id[older.id].last_error
         assert by_id[newer.id].ledger_state == "pending"
         assert by_id[newer.id].attempts == 0
