@@ -11441,6 +11441,25 @@ npm run build</pre>
             return False
         return probe(prompt) is True
 
+    def _scheduler_wake_queued(agent_name: str, prompt: str) -> bool:
+        """Per-turn queue state: is this wake live and still recallable?"""
+        ss = broker._get_streaming_session(agent_name)
+        probe = getattr(ss, "scheduler_wake_queued", None) if ss else None
+        if not callable(probe):
+            return False
+        return probe(prompt) is True
+
+    async def _cancel_scheduler_wake(agent_name: str, prompt: str) -> bool:
+        """Recall an exact queued wake and preserve the transport outcome."""
+        ss = broker._get_streaming_session(agent_name)
+        cancel = getattr(ss, "cancel_scheduler_wake", None) if ss else None
+        if not callable(cancel):
+            return False
+        result = cancel(prompt)
+        if inspect.isawaitable(result):
+            result = await result
+        return result is True
+
     async def _notify_owner_alert(
         agent_name: str, message: str
     ) -> bool:
@@ -11599,6 +11618,8 @@ npm run build</pre>
         comms_cleanup_fn=comms.cleanup_expired,
         delivery_busy_fn=_scheduler_delivery_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
+        delivery_queued_fn=_scheduler_wake_queued,
+        delivery_cancel_queued_fn=_cancel_scheduler_wake,
         owner_notify_callback=_notify_owner_alert,
         trigger_store=trigger_store,
         activity=activity,

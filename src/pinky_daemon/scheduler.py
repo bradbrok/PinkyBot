@@ -264,6 +264,8 @@ class AgentScheduler:
         comms_cleanup_fn=None,
         delivery_busy_fn=None,
         delivery_inflight_fn=None,
+        delivery_queued_fn=None,
+        delivery_cancel_queued_fn=None,
         owner_notify_callback=None,
         trigger_store=None,
         activity=None,
@@ -313,6 +315,17 @@ class AgentScheduler:
         # At the ceiling the waiter detaches, the exact row is explicitly
         # abandoned, and a later positive receipt can still win.
         self._delivery_inflight_fn = delivery_inflight_fn
+        # fn(agent_name, prompt) -> bool. True means THIS wake remains queued
+        # and recallable before its first pane paste on a live transport. This
+        # is positive in-progress evidence just like ``delivery_inflight_fn``:
+        # timing it out would persist a replay row while the original remains
+        # deliverable. The companion cancel callback owns the ceiling edge.
+        self._delivery_queued_fn = delivery_queued_fn
+        # fn(agent_name, prompt) -> bool | Awaitable[bool]. True proves the
+        # exact queued-unpasted turn was recalled. False means the scheduler
+        # must re-read transport state: the turn may have raced to paste, in
+        # which case the unrecallable inflight abandonment path owns it.
+        self._delivery_cancel_queued_fn = delivery_cancel_queued_fn
         # async fn(agent_name, text) -> bool. Delivers operator-facing owner
         # alerts for terminal dead-letter events (PERSISTED_WAKE_PARKED, stale
         # one-shot drop) through an out-of-band transport. Routine
@@ -1147,10 +1160,128 @@ class AgentScheduler:
                 except asyncio.TimeoutError:
                     age = self._receipt_age(schedule)
                     if age >= self._receipt_extension_max_age_sec:
+                        queued = self._wake_prompt_queued(
+                            schedule, prompt=delivery_prompt
+                        )
+                        if queued:
+                            cancelled = await self._cancel_queued_wake(
+                                schedule, prompt=delivery_prompt
+                            )
+                            if cancelled:
+                                # Transport recall is the load-bearing first
+                                # transition. Retire the process-local waiter
+                                # only after the pane turn is no longer
+                                # deliverable, then abandon its durable row.
+                                delivery.cancel()
+                                await asyncio.gather(
+                                    delivery, return_exceptions=True
+                                )
+                                _log(
+                                    "scheduler: cancelled-queued schedule "
+                                    f"'{schedule.name}' "
+                                    f"(#{self._schedule_id(schedule)}) for "
+                                    f"agent '{schedule.agent_name}' before "
+                                    "receipt abandonment"
+                                )
+                                self._mark_abandoned_receipt(
+                                    schedule, age=age
+                                )
+                                raise _ReceiptAbandonedError
+
+                            # Acceptance can land while the transport recall
+                            # waits for its pane lock. Positive consumption is
+                            # terminal and outranks both queued and pasted
+                            # timeout handling.
+                            await asyncio.sleep(0)
+                            settled, confirmed = (
+                                self._delivery_result_if_done(delivery)
+                            )
+                            if settled:
+                                if confirmed and stale_drop_notices:
+                                    self._acknowledge_recurring_stale_drops(
+                                        schedule.agent_name,
+                                        stale_drop_notices,
+                                    )
+                                return confirmed
+
+                            # The queued probe and recall are separate edges.
+                            # If pane delivery won between them, cancellation
+                            # is no longer safe; retain late-receipt authority
+                            # exactly like every other pasted turn.
+                            if self._wake_prompt_inflight(
+                                schedule, prompt=delivery_prompt
+                            ):
+                                self._abandon_receipt_wait(
+                                    schedule,
+                                    delivery,
+                                    age=age,
+                                    stale_drop_notices=stale_drop_notices,
+                                )
+                                raise _ReceiptAbandonedError
+
+                            # A transport without an explicit recall hook (or
+                            # one that failed while the exact turn remains
+                            # queued) still gets the established receipt-
+                            # cancellation fence. There is no await between
+                            # the positive recheck and Task.cancel(), so the
+                            # pane path cannot advance in this event-loop turn;
+                            # its in-lock cancelled-receipt guard completes
+                            # the recall before any later paste.
+                            if self._wake_prompt_queued(
+                                schedule, prompt=delivery_prompt
+                            ):
+                                task_cancelled = delivery.cancel()
+                                await asyncio.gather(
+                                    delivery, return_exceptions=True
+                                )
+                                if task_cancelled:
+                                    _log(
+                                        "scheduler: cancelled-queued schedule "
+                                        f"'{schedule.name}' "
+                                        f"(#{self._schedule_id(schedule)}) "
+                                        f"for agent '{schedule.agent_name}' "
+                                        "before receipt abandonment "
+                                        "(receipt-fence fallback)"
+                                    )
+                                    self._mark_abandoned_receipt(
+                                        schedule, age=age
+                                    )
+                                    raise _ReceiptAbandonedError
+
                         inflight = self._wake_prompt_inflight(
                             schedule, prompt=delivery_prompt
                         )
                         if inflight:
+                            self._abandon_receipt_wait(
+                                schedule,
+                                delivery,
+                                age=age,
+                                stale_drop_notices=stale_drop_notices,
+                            )
+                            raise _ReceiptAbandonedError
+
+                        # A transcript acceptance can resolve the transport
+                        # Future in the same event-loop turn as this timeout.
+                        # Give the delivery task one scheduling edge before a
+                        # stale negative cancel, then re-read exact state.
+                        await asyncio.sleep(0)
+                        settled, confirmed = self._delivery_result_if_done(
+                            delivery
+                        )
+                        if settled:
+                            if confirmed and stale_drop_notices:
+                                self._acknowledge_recurring_stale_drops(
+                                    schedule.agent_name,
+                                    stale_drop_notices,
+                                )
+                            return confirmed
+                        if self._wake_prompt_queued(
+                            schedule, prompt=delivery_prompt
+                        ):
+                            continue
+                        if self._wake_prompt_inflight(
+                            schedule, prompt=delivery_prompt
+                        ):
                             self._abandon_receipt_wait(
                                 schedule,
                                 delivery,
@@ -1188,6 +1319,34 @@ class AgentScheduler:
                             "would re-persist a wake that is about to "
                             "execute (duplicate execution); extending"
                         )
+                        continue
+                    if self._wake_prompt_queued(
+                        schedule, prompt=delivery_prompt
+                    ):
+                        _log(
+                            f"scheduler: receipt still pending for schedule "
+                            f"'{schedule.name}' "
+                            f"(#{self._schedule_id(schedule)}) for agent "
+                            f"'{schedule.agent_name}', but its prompt is "
+                            "queued-unpasted on a connected transport; "
+                            "extending delivery timeout"
+                        )
+                        continue
+                    await asyncio.sleep(0)
+                    settled, confirmed = self._delivery_result_if_done(
+                        delivery
+                    )
+                    if settled:
+                        if confirmed and stale_drop_notices:
+                            self._acknowledge_recurring_stale_drops(
+                                schedule.agent_name, stale_drop_notices
+                            )
+                        return confirmed
+                    if self._wake_prompt_inflight(
+                        schedule, prompt=delivery_prompt
+                    ) or self._wake_prompt_queued(
+                        schedule, prompt=delivery_prompt
+                    ):
                         continue
                     delivery.cancel()
                     await asyncio.gather(delivery, return_exceptions=True)
@@ -1907,6 +2066,55 @@ class AgentScheduler:
                 f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
             )
             return False
+
+    def _wake_prompt_queued(self, schedule, *, prompt: str | None = None) -> bool:
+        """True when this wake is queued-unpasted and safely recallable."""
+        if self._delivery_queued_fn is None:
+            return False
+        try:
+            return (
+                self._delivery_queued_fn(
+                    schedule.agent_name,
+                    self._wake_prompt(schedule) if prompt is None else prompt,
+                )
+                is True
+            )
+        except Exception as exc:
+            _log(
+                f"scheduler: wake-queued check failed for "
+                f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return False
+
+    async def _cancel_queued_wake(
+        self, schedule, *, prompt: str | None = None
+    ) -> bool:
+        """Recall one exact queued wake, returning only positive evidence."""
+        if self._delivery_cancel_queued_fn is None:
+            return False
+        try:
+            cancelled = self._delivery_cancel_queued_fn(
+                schedule.agent_name,
+                self._wake_prompt(schedule) if prompt is None else prompt,
+            )
+            if inspect.isawaitable(cancelled):
+                cancelled = await cancelled
+            return cancelled is True
+        except Exception as exc:
+            _log(
+                f"scheduler: queued-wake cancel failed for "
+                f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return False
+
+    @staticmethod
+    def _delivery_result_if_done(
+        delivery: asyncio.Task,
+    ) -> tuple[bool, bool]:
+        """Return ``(settled, confirmed)`` without consuming cancellation."""
+        if not delivery.done() or delivery.cancelled():
+            return False, False
+        return True, delivery.result()
 
     async def _wake_and_confirm(
         self,

@@ -8929,6 +8929,32 @@ class TestBuildStreamingWakeContextReasonGating:
             assert idle_agents == ["test-agent"]
 
     @pytest.mark.asyncio
+    async def test_scheduler_queued_probe_and_recall_are_wired_to_transport(
+        self,
+    ):
+        """The production scheduler preserves exact tmux queue outcomes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            cancel = AsyncMock(return_value=True)
+            session = SimpleNamespace(
+                scheduler_wake_queued=lambda prompt: prompt == "exact wake",
+                cancel_scheduler_wake=cancel,
+            )
+            with patch.object(
+                app.state.broker,
+                "_get_streaming_session",
+                return_value=session,
+            ):
+                assert app.state.scheduler._delivery_queued_fn(
+                    "dymok", "exact wake"
+                ) is True
+                assert await app.state.scheduler._delivery_cancel_queued_fn(
+                    "dymok", "exact wake"
+                ) is True
+
+            cancel.assert_awaited_once_with("exact wake")
+
+    @pytest.mark.asyncio
     async def test_scheduler_owner_alert_uses_owner_destination(self):
         """The owner-notify callback (dead-letter alerts: PARKED / stale
         one-shot drop) routes to the durable #863 owner destination."""
