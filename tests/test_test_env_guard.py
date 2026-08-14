@@ -2,12 +2,17 @@
 
 from __future__ import annotations
 
+import json
 import os
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
+from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk._internal.transport.subprocess_cli import (
+    SubprocessCLITransport,
+)
 
 import tests.conftest as suite_conftest
 
@@ -30,10 +35,51 @@ class _TransportItem:
 
 
 def test_runtime_env_is_deterministic():
+    assert os.environ["HOME"] == suite_conftest.TEST_HOME
+    assert os.environ["CLAUDE_CONFIG_DIR"] == suite_conftest.TEST_CLAUDE_CONFIG_DIR
     assert os.environ["CODEX_HOME"] == suite_conftest.TEST_CODEX_HOME
+    assert Path(os.environ["HOME"]).is_dir()
+    assert Path(os.environ["CLAUDE_CONFIG_DIR"]).is_dir()
+    assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == ""
+    assert os.environ["ANTHROPIC_API_KEY"] == ""
+    assert os.environ["ANTHROPIC_AUTH_TOKEN"] == ""
     assert os.environ["PINKY_DREAM_TRANSPORT"] == "sdk"
     assert os.environ["PINKY_AUTH_DENY_DEFAULT"] == "shadow"
+    assert os.environ["PINKY_TEST_TRANSPORT_GUARD"] == "1"
     assert "PINKY_CONTAINER_RUNTIME" not in os.environ
+
+
+def test_bundled_claude_cli_cannot_authenticate_under_test_env():
+    """The suite environment must never expose usable Claude credentials."""
+    transport = SubprocessCLITransport(prompt="", options=ClaudeAgentOptions())
+    cli_path = transport._find_bundled_cli()
+    assert cli_path is not None, "claude-agent-sdk wheel has no bundled CLI"
+
+    result = subprocess.run(
+        [cli_path, "auth", "status", "--json"],
+        cwd=_REPO_ROOT,
+        env=os.environ.copy(),
+        capture_output=True,
+        text=True,
+        timeout=10,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 1, output
+    auth_status = json.loads(result.stdout)
+    assert auth_status["loggedIn"] is False, output
+    assert auth_status["authMethod"] == "none", output
+
+
+def test_unpatched_sdk_construction_fails_loudly():
+    from claude_agent_sdk import ClaudeSDKClient
+
+    with pytest.raises(
+        pytest.fail.Exception,
+        match="unpatched _ensure_streaming_session boundary",
+    ):
+        ClaudeSDKClient(ClaudeAgentOptions())
 
 
 def test_real_transport_marker_requires_process_opt_in(monkeypatch):

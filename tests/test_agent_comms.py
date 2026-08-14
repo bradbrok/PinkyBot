@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import os
 import sqlite3
 import tempfile
@@ -858,8 +859,70 @@ class TestAgentCommsNewFeatures:
 
     # ── Inbox Fallback (API) ──────────────────────────────────
 
-    def test_agent_message_auto_wake_or_live_delivery_only(self):
-        """Inter-agent messages may auto-wake, but they are never queued."""
+    def test_agent_message_auto_wake_or_live_delivery_only(self, monkeypatch):
+        """Auto-wake delivers live and consumes the transport's terminal frame."""
+        import claude_agent_sdk
+        from claude_agent_sdk.types import ResultMessage
+
+        terminal_frame_consumed = threading.Event()
+
+        class FakeClaudeSDKClient:
+            def __init__(self, options):
+                self.options = options
+                self.results: asyncio.Queue[
+                    tuple[ResultMessage, asyncio.Event, bool]
+                ] = asyncio.Queue()
+
+            async def connect(self):
+                return None
+
+            async def disconnect(self):
+                return None
+
+            async def get_server_info(self):
+                return None
+
+            async def get_context_usage(self):
+                return {"totalTokens": 0, "maxTokens": 200_000}
+
+            async def query(self, prompt):
+                is_agent_message = "Hello offline agent" in prompt
+                consumed = asyncio.Event()
+                await self.results.put((
+                    ResultMessage(
+                        subtype="success",
+                        duration_ms=1,
+                        duration_api_ms=1,
+                        is_error=False,
+                        num_turns=1,
+                        session_id="test-auto-wake",
+                        stop_reason="end_turn",
+                        total_cost_usd=0,
+                        usage={},
+                        model_usage={},
+                    ),
+                    consumed,
+                    is_agent_message,
+                ))
+                if is_agent_message:
+                    await asyncio.wait_for(consumed.wait(), timeout=2)
+
+            async def receive_messages(self):
+                while True:
+                    result, consumed, is_agent_message = await self.results.get()
+                    yield result
+                    consumed.set()
+                    if is_agent_message:
+                        # The generator resumes only after _reader_loop has
+                        # handled this ResultMessage turn boundary.
+                        terminal_frame_consumed.set()
+
+        monkeypatch.setattr(
+            claude_agent_sdk,
+            "ClaudeSDKClient",
+            FakeClaudeSDKClient,
+        )
+
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         from pinky_daemon.api import create_api
@@ -867,7 +930,10 @@ class TestAgentCommsNewFeatures:
         client = TestClient(app)
 
         # Register an agent
-        client.post("/agents", json={"name": "target_agent", "model": "opus"})
+        client.post(
+            "/agents",
+            json={"name": "target_agent", "model": "opus"},
+        )
 
         # Send message to agent that has no streaming session
         resp = client.post("/agents/target_agent/message", json={
@@ -877,8 +943,14 @@ class TestAgentCommsNewFeatures:
         assert resp.status_code == 200
         data = resp.json()
         assert data["message_id"] > 0
+        assert data["delivered"] is True
+        assert data["confirmed"] is True
         assert data["queued"] is False
+        assert terminal_frame_consumed.is_set(), (
+            "reader loop did not consume the agent-message ResultMessage"
+        )
         assert client.get("/sessions/target_agent/inbox").json()["messages"] == []
+        client.close()
         os.unlink(path)
 
     # ── Agent Card (API) ──────────────────────────────────────

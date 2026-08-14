@@ -36,7 +36,11 @@ from fastapi.testclient import TestClient
 # production. Tests that need to override (e.g. test_auth.py) do so via
 # ``monkeypatch.setenv`` for the duration of their test.
 TEST_SESSION_SECRET = "test-session-secret-do-not-use-in-prod-32bytes-min"
+TEST_HOME = tempfile.mkdtemp(prefix="pinkybot-test-home-")
+TEST_CLAUDE_CONFIG_DIR = tempfile.mkdtemp(prefix="pinkybot-test-claude-config-")
 TEST_CODEX_HOME = tempfile.mkdtemp(prefix="pinkybot-test-codex-home-")
+atexit.register(shutil.rmtree, TEST_HOME, ignore_errors=True)
+atexit.register(shutil.rmtree, TEST_CLAUDE_CONFIG_DIR, ignore_errors=True)
 atexit.register(shutil.rmtree, TEST_CODEX_HOME, ignore_errors=True)
 
 # Repository tests must not inherit live daemon behavior from their invoking
@@ -45,10 +49,16 @@ atexit.register(shutil.rmtree, TEST_CODEX_HOME, ignore_errors=True)
 # Scrub the whole namespace so newly-added switches are isolated by default,
 # then pin only the deterministic values the suite relies on.
 _PINNED_TEST_ENV = {
+    "ANTHROPIC_API_KEY": "",
+    "ANTHROPIC_AUTH_TOKEN": "",
+    "CLAUDE_CODE_OAUTH_TOKEN": "",
+    "CLAUDE_CONFIG_DIR": TEST_CLAUDE_CONFIG_DIR,
     "CODEX_HOME": TEST_CODEX_HOME,
+    "HOME": TEST_HOME,
     "PINKY_AUTH_DENY_DEFAULT": "shadow",
     "PINKY_DREAM_TRANSPORT": "sdk",
     "PINKY_SESSION_SECRET": TEST_SESSION_SECRET,
+    "PINKY_TEST_TRANSPORT_GUARD": "1",
 }
 _REAL_TRANSPORT_OPT_IN_ENV = "PINKY_TEST_REAL_TRANSPORT"
 _REAL_TRANSPORT_OPTED_IN = os.environ.get(
@@ -115,7 +125,7 @@ def _ensure_test_session_secret():
 
 
 @pytest.fixture(autouse=True)
-def _isolate_test_env(monkeypatch):
+def _isolate_test_env(request, monkeypatch):
     """Re-apply the ambient guard before every test.
 
     Tests remain free to override a value explicitly with ``monkeypatch`` in
@@ -127,11 +137,41 @@ def _isolate_test_env(monkeypatch):
             monkeypatch.delenv(key, raising=False)
     for key, value in _PINNED_TEST_ENV.items():
         monkeypatch.setenv(key, value)
+    if (
+        request.node.get_closest_marker("real_transport")
+        and _REAL_TRANSPORT_OPTED_IN
+    ):
+        # The process-level flag is captured before the import-time PINKY_*
+        # scrub. Marked tests still begin credential-empty and must inject the
+        # exact live transport configuration they intend to exercise.
+        monkeypatch.setenv("PINKY_TEST_TRANSPORT_GUARD", "0")
     try:
         yield
     finally:
         # Also contain direct os.environ writes that bypassed monkeypatch.
         _scrub_test_env()
+
+
+@pytest.fixture(autouse=True)
+def _guard_real_sdk_transport(monkeypatch, _isolate_test_env):
+    """Fail before an unpatched test can construct the real Claude SDK client."""
+    if os.environ.get("PINKY_TEST_TRANSPORT_GUARD") != "1":
+        yield
+        return
+
+    import claude_agent_sdk
+
+    def blocked_sdk_client(*args, **kwargs):
+        del args, kwargs
+        pytest.fail(
+            "PINKY_TEST_TRANSPORT_GUARD blocked real ClaudeSDKClient "
+            "construction through an unpatched _ensure_streaming_session "
+            "boundary; patch that boundary (or ClaudeSDKClient) in this test",
+            pytrace=False,
+        )
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", blocked_sdk_client)
+    yield
 
 
 @pytest.fixture(autouse=True)
