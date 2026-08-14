@@ -144,7 +144,11 @@ class TestSession:
     async def test_send_resumes_after_first(self):
         session = Session(session_id="test")
         session._runner.run = AsyncMock(
-            return_value=RunResult(output="ok", exit_code=0)
+            return_value=RunResult(
+                output="ok",
+                exit_code=0,
+                session_id="11111111-1111-4111-8111-111111111111",
+            )
         )
 
         await session.send("First message")
@@ -159,7 +163,11 @@ class TestSession:
     async def test_send_system_prompt_first_only(self):
         session = Session(session_id="test", system_prompt="Be helpful")
         session._runner.run = AsyncMock(
-            return_value=RunResult(output="ok", exit_code=0)
+            return_value=RunResult(
+                output="ok",
+                exit_code=0,
+                session_id="11111111-1111-4111-8111-111111111111",
+            )
         )
 
         await session.send("First")

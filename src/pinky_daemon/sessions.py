@@ -305,6 +305,7 @@ class Session:
                     sdk_config,
                     hook_manager=self._hook_manager,
                     agent_name=self.agent_name,
+                    session_id_callback=self._update_sdk_session_id,
                 )
                 self._runner_type = "sdk"
                 _log(f"session {self.id}: using SDK runner")
@@ -388,18 +389,24 @@ class Session:
                 active = self._active_history()
                 is_first = len(active) <= 1  # Only the message we just added
 
-                # Build system prompt for fresh starts
-                system_prompt = ""
-                if is_first:
-                    system_prompt = self._build_restart_prompt()
-
                 start = time.time()
 
                 can_resume = not is_first
                 resume_id = ""
-                if can_resume and self._runner_type == "sdk" and self._sdk_session_id:
-                    # SDK sessions should prefer the real Claude session ID when we have it.
-                    resume_id = self._sdk_session_id
+                if self._runner_type == "sdk":
+                    # SDK continuation is safe only with the exact persisted
+                    # handle. In particular, a /clear reset synchronously
+                    # invalidates it; falling back to continue_conversation
+                    # could resurrect the transcript the user discarded.
+                    can_resume = can_resume and bool(self._sdk_session_id)
+                    if can_resume:
+                        resume_id = self._sdk_session_id
+
+                # Build system prompt for every genuinely fresh start,
+                # including a post-reset send with non-empty local history.
+                system_prompt = ""
+                if not can_resume:
+                    system_prompt = self._build_restart_prompt()
 
                 result = await self._runner.run(
                     content,
@@ -658,6 +665,11 @@ class Session:
             provider_key=self._provider_key,
         )
         self._store.save(record)
+
+    def _update_sdk_session_id(self, sdk_session_id: str) -> None:
+        """Synchronously mirror an SDK reset/capture into durable state."""
+        self._sdk_session_id = sdk_session_id
+        self._persist()
 
     def refresh(self) -> None:
         """Refresh the session — reinitialize runner with fresh MCP config while preserving state.

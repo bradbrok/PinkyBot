@@ -3435,6 +3435,35 @@ def create_api(
             f"(reason={decision.get('reason')})"
         )
 
+    def _persist_streaming_resume_handle(
+        agent_name: str,
+        label: str,
+        resume_handle: str,
+        *,
+        log_context_restart: bool,
+    ) -> None:
+        """Synchronously persist one streaming SDK resume-handle update."""
+        agents.set_streaming_session_id(agent_name, resume_handle, label=label)
+        short_id = resume_handle[:12] if resume_handle else ""
+        _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
+        if not resume_handle and log_context_restart:
+            # Empty = auto context restart triggered internally by the session
+            try:
+                session_event_store.log(
+                    session_id=f"{agent_name}-{label}",
+                    agent_name=agent_name,
+                    event_type="context_restart",
+                    metadata={"label": label, "source": "auto"},
+                )
+                activity.log(
+                    agent_name=agent_name,
+                    event_type="context_restart",
+                    title=f"{agent_name} auto context restart",
+                    metadata={"label": label, "source": "auto"},
+                )
+            except Exception:
+                pass
+
     async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
         """Persist a streaming session's SDK resume handle when captured.
 
@@ -3447,27 +3476,25 @@ def create_api(
         deliberate follow-up to avoid bundling a migration into this PR.
         """
         async def _on_resume_handle(_agent_name: str, resume_handle: str):
-            agents.set_streaming_session_id(agent_name, resume_handle, label=label)
-            short_id = resume_handle[:12] if resume_handle else ""
-            _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
-            if not resume_handle:
-                # Empty = auto context restart triggered internally by the session
-                try:
-                    session_event_store.log(
-                        session_id=f"{agent_name}-{label}",
-                        agent_name=agent_name,
-                        event_type="context_restart",
-                        metadata={"label": label, "source": "auto"},
-                    )
-                    activity.log(
-                        agent_name=agent_name,
-                        event_type="context_restart",
-                        title=f"{agent_name} auto context restart",
-                        metadata={"label": label, "source": "auto"},
-                    )
-                except Exception:
-                    pass
+            _persist_streaming_resume_handle(
+                agent_name,
+                label,
+                resume_handle,
+                log_context_restart=True,
+            )
         return _on_resume_handle
+
+    def _make_streaming_resume_handle_sync_callback(agent_name: str, label: str):
+        """Build the no-await persistence path used by reset frames."""
+        def _on_resume_handle_sync(_agent_name: str, resume_handle: str) -> None:
+            _persist_streaming_resume_handle(
+                agent_name,
+                label,
+                resume_handle,
+                log_context_restart=False,
+            )
+
+        return _on_resume_handle_sync
 
     # Cache context usage per session to avoid blocking health checks
     _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
@@ -3875,6 +3902,11 @@ def create_api(
 
         ss = SessionClass(config, **init_kwargs)
         ss._on_resume_handle = sid_callback
+        if hasattr(ss, "_on_resume_handle_sync"):
+            ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
+                agent_name,
+                label,
+            )
         try:
             await _bounded_cold_start_connect(
                 ss,
@@ -9132,6 +9164,11 @@ npm run build</pre>
         # session keeps persisting turns and resume handles under the old name.
         ss._config.label = new_label
         ss._on_resume_handle = await _make_streaming_resume_handle_callback(name, new_label)
+        if hasattr(ss, "_on_resume_handle_sync"):
+            ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
+                name,
+                new_label,
+            )
         # Update stored session ID mapping
         old_sid = agents.get_streaming_session_id(name, label=label)
         if old_sid:
