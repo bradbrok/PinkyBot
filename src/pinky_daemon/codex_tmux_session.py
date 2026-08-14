@@ -158,6 +158,7 @@ class CodexTmuxSession(TmuxSession):
                 self._session_name,
                 tmux_binary=self._tmux.tmux_binary,
                 socket_name=self._tmux.socket_name,
+                socket_path=self._tmux.socket_path,
                 command_runner=self._tmux._runner,
             )
         # codex identity/config (mirrors CodexSession.__init__).

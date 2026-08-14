@@ -34,7 +34,12 @@ from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.codex_tmux_transcript import _discover_codex_rollout
 from pinky_daemon.streaming_session import StreamingSessionConfig
-from pinky_daemon.tmux_session import TmuxCommandResult, TmuxSession, _TmuxControl
+from pinky_daemon.tmux_session import (
+    TmuxCommandResult,
+    TmuxSession,
+    _TmuxControl,
+    reconcile_tmux_spawn_cleanup_debts,
+)
 
 
 def _scope(
@@ -121,6 +126,7 @@ class _SpawnRollbackTmuxTrace:
         self.pending_list_reason = ""
         self.calls: list[tuple[str, ...]] = []
         self.spawned = asyncio.Event()
+        self.cancel_spawn_task = None
         self.permission_error = TmuxCommandResult(
             returncode=1,
             stdout="",
@@ -156,6 +162,8 @@ class _SpawnRollbackTmuxTrace:
         if operation == "new-session":
             self.live = True
             self.spawned.set()
+            if self.cancel_spawn_task is not None:
+                self.cancel_spawn_task()
             if self.new_session_hangs:
                 await asyncio.Event().wait()
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
@@ -3445,6 +3453,36 @@ async def test_post_spawn_cancellation_waits_for_strict_rollback_and_no_leak(
 
 
 @pytest.mark.asyncio
+async def test_repeated_cancellation_cannot_strand_strict_spawn_rollback(
+    tmp_path,
+    monkeypatch,
+):
+    """R10: repeated caller cancels stay outside the shielded cleanup task."""
+    trace = _SpawnRollbackTmuxTrace(first_kill="non_ok_then_ok")
+    session, _tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 60
+    )
+
+    spawn_task = asyncio.create_task(session._spawn_tmux_repl())
+    await trace.spawned.wait()
+    assert spawn_task.cancel() is True
+    while trace.kill_calls == 0:
+        await asyncio.sleep(0)
+    for _ in range(18):
+        assert spawn_task.cancel() is True
+        await asyncio.sleep(0)
+
+    with pytest.raises(asyncio.CancelledError):
+        await spawn_task
+
+    assert spawn_task.cancelling() == 19
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert not session._spawn_cleanup_debt_path().exists()
+
+
+@pytest.mark.asyncio
 async def test_cold_start_timeout_uses_strict_rollback_and_leaves_no_session(
     tmp_path,
     monkeypatch,
@@ -3491,6 +3529,183 @@ async def test_tailer_start_failure_uses_strict_rollback_and_leaves_no_session(
     assert trace.kill_calls == 2
     assert trace.live is False
     assert await tmux.has_session() is False
+
+
+@pytest.mark.parametrize(
+    ("failure_site", "record_site"),
+    [
+        ("post_liveness", "post-spawn liveness"),
+        ("cold_timeout", "cold-start timeout"),
+        ("tailer_failure", "tailer-start failure"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_persistent_spawn_ambiguity_retains_and_reaps_cleanup_debt_per_site(
+    tmp_path,
+    monkeypatch,
+    failure_site,
+    record_site,
+):
+    """R10: every give-up site leaves durable debt that the next spawn reaps."""
+    trace = _SpawnRollbackTmuxTrace(
+        first_kill="always_non_ok",
+        ambiguous_verify=True,
+        new_session_hangs=failure_site == "cold_timeout",
+        post_probe_error=failure_site == "post_liveness",
+    )
+    session, _tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 0
+    )
+
+    if failure_site == "cold_timeout":
+        monkeypatch.setattr(
+            "pinky_daemon.tmux_session._COLD_START_TIMEOUT_SEC", 0.01
+        )
+    elif failure_site == "tailer_failure":
+        trace.ambiguous_verify = False
+
+        async def _tailer_failure():
+            trace.ambiguous_verify = True
+            raise RuntimeError("synthetic tailer-start failure")
+
+        monkeypatch.setattr(session, "_start_tailer", _tailer_failure)
+
+    if failure_site == "cold_timeout":
+        with pytest.raises(RuntimeError, match="cold-start timed out"):
+            await session._spawn_tmux_repl()
+    elif failure_site == "tailer_failure":
+        with pytest.raises(RuntimeError, match="synthetic tailer-start failure"):
+            await session._spawn_tmux_repl()
+    else:
+        with pytest.raises(RuntimeError, match="has-session failed"):
+            await session._spawn_tmux_repl()
+
+    debt_path = session._spawn_cleanup_debt_path()
+    assert debt_path.is_file()
+    debt = json.loads(debt_path.read_text(encoding="utf-8"))
+    assert debt["agent_name"] == "test-agent"
+    assert debt["session_name"] == "pinky-test-agent"
+    assert debt["socket_name"] == ""
+    assert debt["socket_path"].endswith(f"tmux-{os.getuid()}/default")
+    assert debt["tmux_binary"] == "tmux"
+    assert debt["runner"] == {"kind": "local"}
+    assert debt["site"] == record_site
+    assert stat.S_IMODE(debt_path.stat().st_mode) == 0o600
+    assert trace.live is True
+
+    # Permission/transport ambiguity clears before the next spawn. The exact
+    # preflight method used by _spawn_tmux_repl must kill the retained child
+    # under its recorded execution identity, then durably clear the record.
+    trace.first_kill = "non_ok_then_ok"
+    trace.ambiguous_verify = False
+    trace.post_probe_error = False
+    await session._reap_retained_spawn_cleanup_debt()
+
+    assert trace.live is False
+    assert not debt_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_daemon_boot_reconciler_reaps_retained_spawn_cleanup_debt(
+    tmp_path,
+    monkeypatch,
+):
+    """R10: daemon boot scans debt even when no session gets registered."""
+    trace = _SpawnRollbackTmuxTrace(
+        first_kill="always_non_ok", ambiguous_verify=True
+    )
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    trace.live = True
+
+    failure = await session._rollback_spawned_session(site="boot fixture")
+    debt_path = session._spawn_cleanup_debt_path()
+    assert failure is not None
+    assert debt_path.exists()
+    assert trace.live is True
+
+    trace.first_kill = "non_ok_then_ok"
+    trace.ambiguous_verify = False
+    reaped, outstanding = await reconcile_tmux_spawn_cleanup_debts(
+        session._spawn_cleanup_state_dir(),
+        _control_factory=lambda _debt: tmux,
+    )
+
+    assert (reaped, outstanding) == (1, 0)
+    assert trace.live is False
+    assert not debt_path.exists()
+
+
+@pytest.mark.asyncio
+async def test_spawn_rollback_outer_deadline_is_hard(
+    tmp_path,
+    monkeypatch,
+):
+    """R10: the outer timeout escapes attempt handlers instead of being eaten."""
+    trace = _SpawnRollbackTmuxTrace(first_kill="always_non_ok")
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    operations = []
+    never = asyncio.Event()
+
+    async def _hung_run(*args, timeout=5.0, stdin_data=None):
+        del timeout, stdin_data
+        operations.append(args[0])
+        await never.wait()
+        raise AssertionError("unreachable")
+
+    monkeypatch.setattr(tmux, "_run", _hung_run)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC", 0.02
+    )
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._SPAWN_ROLLBACK_RETRY_DELAY_SEC", 0.01
+    )
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._SPAWN_ROLLBACK_TIMEOUT_SEC", 0.07
+    )
+
+    started = asyncio.get_running_loop().time()
+    failure = await session._rollback_spawned_session(site="scaled deadline")
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert failure is not None
+    assert "within 0.07s" in failure
+    assert elapsed < 0.085
+    assert operations == ["kill-session", "has-session", "kill-session"]
+    assert session._spawn_cleanup_debt_path().exists()
+
+
+@pytest.mark.asyncio
+async def test_cold_start_completion_boundary_honors_cancellation_on_python_311(
+    tmp_path,
+    monkeypatch,
+):
+    """R10: cancellation at _spawn completion cannot be consumed by wait_for."""
+    trace = _SpawnRollbackTmuxTrace(first_kill="non_ok_then_ok")
+    session, _tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 0
+    )
+    spawn_task = None
+
+    def _cancel_outer_spawn():
+        assert spawn_task is not None
+        assert spawn_task.cancel() is True
+
+    trace.cancel_spawn_task = _cancel_outer_spawn
+    spawn_task = asyncio.create_task(session._spawn_tmux_repl())
+
+    with pytest.raises(asyncio.CancelledError):
+        await spawn_task
+
+    operations = [call[0] for call in trace.calls]
+    new_session_index = operations.index("new-session")
+    assert operations[new_session_index + 1] == "kill-session"
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert spawn_task.cancelled() is True
+    assert spawn_task.cancelling() == 1
+    assert not session._spawn_cleanup_debt_path().exists()
 
 
 def test_reverse_migration_moves_only_matching_rollouts(tmp_path):

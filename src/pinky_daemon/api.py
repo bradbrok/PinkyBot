@@ -11556,6 +11556,38 @@ npm run build</pre>
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
 
+        # R10/#580: a spawn that failed before broker registration may have
+        # retained a durable, possibly-live tmux child. Reconcile every record
+        # at daemon boot, including debts for dormant/disabled agents that the
+        # normal streaming-session loop below would never instantiate.
+        try:
+            from pinky_daemon.tmux_session import (
+                reconcile_tmux_spawn_cleanup_debts,
+            )
+
+            reaped_debts, outstanding_debts = (
+                await reconcile_tmux_spawn_cleanup_debts(
+                    Path(db_path).resolve().parent
+                )
+            )
+            if reaped_debts:
+                _log(
+                    f"startup: reaped {reaped_debts} retained tmux spawn "
+                    "cleanup debt(s)"
+                )
+            if outstanding_debts:
+                _log(
+                    f"ERROR startup: {outstanding_debts} retained tmux spawn "
+                    "cleanup debt(s) remain outstanding"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log(
+                f"ERROR startup: tmux spawn cleanup debt reconciliation "
+                f"failed ({type(exc).__name__}: {exc})"
+            )
+
         # #863: resume durable owner-approval notification retries before
         # pollers can accept more inbound messages.
         app.state.approval_notification_retry_task = (

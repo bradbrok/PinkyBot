@@ -74,6 +74,7 @@ from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
     LocalCommandRunner,
+    RunuserCommandRunner,
 )
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
@@ -567,6 +568,7 @@ class _TmuxControl:
         *,
         tmux_binary: str = "tmux",
         socket_name: str = "",
+        socket_path: str = "",
         command_runner: CommandRunner | None = None,
     ) -> None:
         self.session_name = session_name
@@ -574,6 +576,10 @@ class _TmuxControl:
         # An explicit socket isolates Pinky's tmux sessions from the
         # operator's own. Empty = use tmux's default socket.
         self.socket_name = socket_name
+        # Cleanup-debt replay pins the exact local server path with ``-S`` so
+        # a daemon restart under a changed TMUX/TMUX_TMPDIR cannot silently
+        # target a different server. Ordinary controls leave this empty.
+        self.socket_path = socket_path
         # #149 phase-3 execution seam: who runs the tmux subprocess. Default
         # LocalCommandRunner reproduces the prior inline create_subprocess_exec
         # verbatim (daemon's own user). An isolation_mode='unix_user' tenant is
@@ -595,7 +601,9 @@ class _TmuxControl:
 
     def _base_cmd(self) -> list[str]:
         cmd = [self.tmux_binary]
-        if self.socket_name:
+        if self.socket_path:
+            cmd.extend(["-S", self.socket_path])
+        elif self.socket_name:
             cmd.extend(["-L", self.socket_name])
         return cmd
 
@@ -669,6 +677,8 @@ class _TmuxControl:
         """
         if not isinstance(self._runner, LocalCommandRunner):
             return None
+        if self.socket_path:
+            return Path(self.socket_path)
         if not self.socket_name:
             inherited = os.environ.get("TMUX", "")
             inherited_parts = inherited.rsplit(",", 2)
@@ -926,6 +936,349 @@ class _TmuxControl:
             args.append("-J")  # join wrapped lines (de-wrap long URLs)
         args.extend(["-S", str(-abs(lines))])
         return await self._run(*args)
+
+
+_TMUX_SPAWN_CLEANUP_DEBT_DIR = "tmux-spawn-cleanup-debt"
+_TMUX_SPAWN_CLEANUP_DEBT_VERSION = 1
+
+
+def _tmux_spawn_cleanup_identity_key(
+    *,
+    agent_name: str,
+    session_name: str,
+) -> str:
+    # One owned session name per agent. Keep the record location stable when
+    # daemon environment or execution mode changes; the JSON retains the full
+    # binary/socket/runner identity needed to reach the original child.
+    raw = "\0".join((agent_name, session_name))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _TmuxSpawnCleanupDebt:
+    """Durable identity for an owned tmux child whose teardown is unresolved."""
+
+    agent_name: str
+    session_name: str
+    socket_name: str
+    socket_path: str
+    tmux_binary: str
+    runner: dict[str, object]
+    site: str
+    created_at: float
+
+    def identity_key(self) -> str:
+        return _tmux_spawn_cleanup_identity_key(
+            agent_name=self.agent_name,
+            session_name=self.session_name,
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "version": _TMUX_SPAWN_CLEANUP_DEBT_VERSION,
+                "agent_name": self.agent_name,
+                "session_name": self.session_name,
+                "socket_name": self.socket_name,
+                "socket_path": self.socket_path,
+                "tmux_binary": self.tmux_binary,
+                "runner": self.runner,
+                "site": self.site,
+                "created_at": self.created_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+
+    @classmethod
+    def from_path(cls, path: Path) -> _TmuxSpawnCleanupDebt:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("record root is not an object")
+        if raw.get("version") != _TMUX_SPAWN_CLEANUP_DEBT_VERSION:
+            raise ValueError(f"unsupported record version {raw.get('version')!r}")
+        required_strings = (
+            "agent_name",
+            "session_name",
+            "socket_name",
+            "socket_path",
+            "tmux_binary",
+            "site",
+        )
+        if any(not isinstance(raw.get(key), str) for key in required_strings):
+            raise ValueError("record identity fields must be strings")
+        if not raw["agent_name"] or not raw["session_name"] or not raw["tmux_binary"]:
+            raise ValueError("record identity fields must be non-empty")
+        runner = raw.get("runner")
+        if not isinstance(runner, dict) or not isinstance(runner.get("kind"), str):
+            raise ValueError("record runner is invalid")
+        try:
+            created_at = float(raw["created_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("record created_at is invalid") from exc
+        record = cls(
+            agent_name=raw["agent_name"],
+            session_name=raw["session_name"],
+            socket_name=raw["socket_name"],
+            socket_path=raw["socket_path"],
+            tmux_binary=raw["tmux_binary"],
+            runner=runner,
+            site=raw["site"],
+            created_at=created_at,
+        )
+        if path.name != f"{record.identity_key()}.json":
+            raise ValueError("record filename does not match owned identity")
+        return record
+
+
+def _tmux_cleanup_runner_spec(runner: CommandRunner) -> dict[str, object]:
+    if isinstance(runner, ContainerCommandRunner):
+        return {
+            "kind": "container",
+            "container": runner.container,
+            "user": runner.user,
+            "workdir": runner.workdir,
+            "container_binary": runner.container_binary,
+        }
+    if isinstance(runner, RunuserCommandRunner):
+        return {
+            "kind": "runuser",
+            "username": runner.username,
+            "runuser_binary": runner.runuser_binary,
+        }
+    if isinstance(runner, LocalCommandRunner):
+        return {"kind": "local"}
+    raise TypeError(
+        f"unsupported tmux cleanup runner {type(runner).__name__}; "
+        "cannot durably retain its execution identity"
+    )
+
+
+def _tmux_cleanup_runner_from_spec(spec: dict[str, object]) -> CommandRunner:
+    kind = spec.get("kind")
+    if kind == "local":
+        return LocalCommandRunner()
+    if kind == "runuser":
+        username = spec.get("username")
+        binary = spec.get("runuser_binary")
+        if not isinstance(username, str) or not username:
+            raise ValueError("runuser cleanup record has no username")
+        if not isinstance(binary, str) or not binary:
+            raise ValueError("runuser cleanup record has no binary")
+        return RunuserCommandRunner(username, runuser_binary=binary)
+    if kind == "container":
+        container = spec.get("container")
+        binary = spec.get("container_binary")
+        user = spec.get("user")
+        workdir = spec.get("workdir")
+        if not isinstance(container, str) or not container:
+            raise ValueError("container cleanup record has no container")
+        if not isinstance(binary, str) or not binary:
+            raise ValueError("container cleanup record has no binary")
+        if user is not None and not isinstance(user, str):
+            raise ValueError("container cleanup record user is invalid")
+        if workdir is not None and not isinstance(workdir, str):
+            raise ValueError("container cleanup record workdir is invalid")
+        return ContainerCommandRunner(
+            container,
+            user=user,
+            workdir=workdir,
+            container_binary=binary,
+        )
+    raise ValueError(f"unsupported cleanup runner kind {kind!r}")
+
+
+def _tmux_spawn_cleanup_debt_dir(state_dir: Path) -> Path:
+    return state_dir / _TMUX_SPAWN_CLEANUP_DEBT_DIR
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _persist_tmux_spawn_cleanup_debt(
+    state_dir: Path,
+    debt: _TmuxSpawnCleanupDebt,
+) -> Path:
+    """Atomically retain cleanup debt before bounded teardown starts."""
+    debt_dir = _tmux_spawn_cleanup_debt_dir(state_dir)
+    debt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        debt_dir.chmod(0o700)
+    except OSError:
+        pass
+    path = debt_dir / f"{debt.identity_key()}.json"
+    tmp_path = debt_dir / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        payload = debt.to_json().encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        try:
+            # link() is the publish point: atomic and no-clobber, so two
+            # concurrent rollback owners cannot overwrite each other's debt.
+            os.link(tmp_path, path)
+        except FileExistsError:
+            existing = _TmuxSpawnCleanupDebt.from_path(path)
+            if existing.identity_key() != debt.identity_key():
+                raise RuntimeError("cleanup debt identity collision")
+            if (
+                existing.tmux_binary != debt.tmux_binary
+                or existing.socket_name != debt.socket_name
+                or existing.socket_path != debt.socket_path
+                or existing.runner != debt.runner
+            ):
+                raise RuntimeError(
+                    "cleanup debt already exists for this agent/session under "
+                    "a different tmux execution identity"
+                )
+        _fsync_directory(debt_dir)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def _clear_tmux_spawn_cleanup_debt(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
+async def _strict_owned_tmux_cleanup(
+    control: _TmuxControl,
+    *,
+    agent_name: str,
+    action: str,
+) -> str | None:
+    """Prove teardown under per-command limits and one hard outer deadline."""
+
+    async def _attempts() -> str | None:
+        diagnostics: list[str] = []
+        for attempt in range(1, _SPAWN_ROLLBACK_ATTEMPTS + 1):
+            try:
+                async with asyncio.timeout(_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC):
+                    kill_result = await control.kill_session()
+            except Exception as exc:
+                diagnostics.append(
+                    f"attempt {attempt} kill raised {type(exc).__name__}: {exc}"
+                )
+            else:
+                if kill_result.ok:
+                    _log(
+                        f"tmux[{agent_name}]: {action} proved teardown on "
+                        f"kill attempt {attempt}"
+                    )
+                    return None
+                diagnostics.append(
+                    f"attempt {attempt} kill returned rc={kill_result.returncode} "
+                    f"stderr={kill_result.stderr.strip()!r}"
+                )
+
+            try:
+                async with asyncio.timeout(_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC):
+                    live = await control.has_session()
+            except Exception as exc:
+                diagnostics.append(
+                    f"attempt {attempt} verify couldn't answer "
+                    f"({type(exc).__name__}: {exc})"
+                )
+            else:
+                if not live:
+                    _log(
+                        f"tmux[{agent_name}]: {action} verified absence after "
+                        f"failed kill attempt {attempt}"
+                    )
+                    return None
+                diagnostics.append(f"attempt {attempt} verify found session live")
+
+            if attempt < _SPAWN_ROLLBACK_ATTEMPTS:
+                await asyncio.sleep(_SPAWN_ROLLBACK_RETRY_DELAY_SEC)
+
+        message = (
+            f"tmux[{agent_name}]: {action} could not prove teardown after "
+            f"{_SPAWN_ROLLBACK_ATTEMPTS} attempts; owned session is possibly "
+            f"live: {'; '.join(diagnostics)}"
+        )
+        _log(f"ERROR {message}")
+        return message
+
+    try:
+        async with asyncio.timeout(_SPAWN_ROLLBACK_TIMEOUT_SEC):
+            return await _attempts()
+    except TimeoutError as exc:
+        message = (
+            f"tmux[{agent_name}]: {action} could not prove teardown within "
+            f"{_SPAWN_ROLLBACK_TIMEOUT_SEC}s; owned session is possibly live "
+            f"({type(exc).__name__}: {exc})"
+        )
+        _log(f"ERROR {message}")
+        return message
+
+
+async def reconcile_tmux_spawn_cleanup_debts(
+    state_dir: Path,
+    *,
+    _control_factory=None,
+) -> tuple[int, int]:
+    """Daemon-boot reaper for every durable, pre-registration tmux debt."""
+    debt_dir = _tmux_spawn_cleanup_debt_dir(Path(state_dir))
+    if not debt_dir.exists():
+        return (0, 0)
+
+    reaped = 0
+    outstanding = 0
+    for path in sorted(debt_dir.glob("*.json")):
+        try:
+            debt = _TmuxSpawnCleanupDebt.from_path(path)
+            _log(
+                f"ERROR tmux[{debt.agent_name}]: retained spawn cleanup debt "
+                f"is outstanding at daemon boot ({path})"
+            )
+            control = (
+                _control_factory(debt)
+                if _control_factory is not None
+                else _TmuxControl(
+                    debt.session_name,
+                    tmux_binary=debt.tmux_binary,
+                    socket_name=debt.socket_name,
+                    socket_path=debt.socket_path,
+                    command_runner=_tmux_cleanup_runner_from_spec(debt.runner),
+                )
+            )
+            failure = await _strict_owned_tmux_cleanup(
+                control,
+                agent_name=debt.agent_name,
+                action="daemon-boot retained spawn cleanup",
+            )
+            if failure is not None:
+                outstanding += 1
+                continue
+            _clear_tmux_spawn_cleanup_debt(path)
+            reaped += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            outstanding += 1
+            _log(
+                f"ERROR tmux spawn cleanup debt reconciliation failed for "
+                f"{path}: {type(exc).__name__}: {exc}"
+            )
+    return (reaped, outstanding)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -2943,6 +3296,76 @@ class TmuxSession(TransportReplacementMixin):
     def _prepare_tmux_spawn(self) -> None:
         """Publish transport-specific state at the final spawn boundary."""
 
+    def _spawn_cleanup_state_dir(self) -> Path:
+        registry_path = getattr(self._registry, "_db_path", "")
+        if isinstance(registry_path, str) and registry_path:
+            return Path(registry_path).resolve().parent
+        return Path(self._config.working_dir or ".").resolve() / "data"
+
+    def _spawn_cleanup_debt(self, *, site: str) -> _TmuxSpawnCleanupDebt:
+        local_socket_path = self._tmux._local_socket_path()
+        return _TmuxSpawnCleanupDebt(
+            agent_name=self.agent_name,
+            session_name=self._tmux.session_name,
+            socket_name=self._tmux.socket_name,
+            socket_path=str(local_socket_path) if local_socket_path is not None else "",
+            tmux_binary=self._tmux.tmux_binary,
+            runner=_tmux_cleanup_runner_spec(self._tmux._runner),
+            site=site,
+            created_at=time.time(),
+        )
+
+    def _spawn_cleanup_debt_path(self) -> Path:
+        session_name = getattr(self._tmux, "session_name", self._session_name)
+        if not isinstance(session_name, str):
+            session_name = self._session_name
+        identity_key = _tmux_spawn_cleanup_identity_key(
+            agent_name=self.agent_name,
+            session_name=session_name,
+        )
+        return (
+            _tmux_spawn_cleanup_debt_dir(self._spawn_cleanup_state_dir())
+            / f"{identity_key}.json"
+        )
+
+    async def _reap_retained_spawn_cleanup_debt(self) -> None:
+        """Next-spawn preflight: resolve this agent's retained child first."""
+        path = self._spawn_cleanup_debt_path()
+        if not path.exists():
+            return
+        debt = _TmuxSpawnCleanupDebt.from_path(path)
+        _log(
+            f"ERROR tmux[{self.agent_name}]: retained spawn cleanup debt is "
+            f"outstanding at next-spawn preflight ({path})"
+        )
+        current_runner = _tmux_cleanup_runner_spec(self._tmux._runner)
+        current_socket_path = self._tmux._local_socket_path()
+        if (
+            debt.session_name == self._tmux.session_name
+            and debt.socket_name == self._tmux.socket_name
+            and debt.socket_path
+            == (str(current_socket_path) if current_socket_path is not None else "")
+            and debt.tmux_binary == self._tmux.tmux_binary
+            and debt.runner == current_runner
+        ):
+            control = self._tmux
+        else:
+            control = _TmuxControl(
+                debt.session_name,
+                tmux_binary=debt.tmux_binary,
+                socket_name=debt.socket_name,
+                socket_path=debt.socket_path,
+                command_runner=_tmux_cleanup_runner_from_spec(debt.runner),
+            )
+        failure = await _strict_owned_tmux_cleanup(
+            control,
+            agent_name=debt.agent_name,
+            action="next-spawn retained spawn cleanup",
+        )
+        if failure is not None:
+            raise RuntimeError(f"{failure}; cleanup debt retained at {path}")
+        _clear_tmux_spawn_cleanup_debt(path)
+
     async def _rollback_spawned_session(self, *, site: str) -> str | None:
         """Strictly and boundedly roll back a possibly-created tmux session.
 
@@ -2959,84 +3382,52 @@ class TmuxSession(TransportReplacementMixin):
         that the caller must attach to the original exception.
         """
 
-        async def _attempts() -> str | None:
-            diagnostics: list[str] = []
-            for attempt in range(1, _SPAWN_ROLLBACK_ATTEMPTS + 1):
-                try:
-                    kill_result = await asyncio.wait_for(
-                        self._tmux.kill_session(),
-                        timeout=_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC,
-                    )
-                except BaseException as exc:
-                    diagnostics.append(
-                        f"attempt {attempt} kill raised "
-                        f"{type(exc).__name__}: {exc}"
-                    )
-                else:
-                    if kill_result.ok:
-                        _log(
-                            f"tmux[{self.agent_name}]: spawn rollback at "
-                            f"{site} proved teardown on kill attempt {attempt}"
-                        )
-                        return None
-                    diagnostics.append(
-                        f"attempt {attempt} kill returned "
-                        f"rc={kill_result.returncode} "
-                        f"stderr={kill_result.stderr.strip()!r}"
-                    )
-
-                # False is verified absence; True is live; a raise is
-                # couldn't-answer. Only the first state is clean.
-                try:
-                    live = await asyncio.wait_for(
-                        self._tmux.has_session(),
-                        timeout=_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC,
-                    )
-                except BaseException as exc:
-                    diagnostics.append(
-                        f"attempt {attempt} verify couldn't answer "
-                        f"({type(exc).__name__}: {exc})"
-                    )
-                else:
-                    if not live:
-                        _log(
-                            f"tmux[{self.agent_name}]: spawn rollback at "
-                            f"{site} verified absence after failed kill "
-                            f"attempt {attempt}"
-                        )
-                        return None
-                    diagnostics.append(
-                        f"attempt {attempt} verify found session live"
-                    )
-
-                if attempt < _SPAWN_ROLLBACK_ATTEMPTS:
-                    await asyncio.sleep(_SPAWN_ROLLBACK_RETRY_DELAY_SEC)
-
-            message = (
-                f"tmux[{self.agent_name}]: spawn rollback at {site} could not "
-                f"prove teardown after {_SPAWN_ROLLBACK_ATTEMPTS} attempts; "
-                f"owned session is possibly live: {'; '.join(diagnostics)}"
+        debt_path: Path | None = None
+        debt_persist_error: Exception | None = None
+        try:
+            debt_path = _persist_tmux_spawn_cleanup_debt(
+                self._spawn_cleanup_state_dir(),
+                self._spawn_cleanup_debt(site=site),
             )
-            _log(f"ERROR {message}")
-            return message
+        except Exception as exc:
+            debt_persist_error = exc
+            _log(
+                f"ERROR tmux[{self.agent_name}]: could not persist spawn "
+                f"cleanup debt before {site} rollback: {type(exc).__name__}: {exc}"
+            )
 
-        async def _bounded() -> str | None:
-            try:
-                return await asyncio.wait_for(
-                    _attempts(), timeout=_SPAWN_ROLLBACK_TIMEOUT_SEC
+        async def _cleanup() -> str | None:
+            failure = await _strict_owned_tmux_cleanup(
+                self._tmux,
+                agent_name=self.agent_name,
+                action=f"spawn rollback at {site}",
+            )
+            if failure is None:
+                if debt_path is not None:
+                    try:
+                        _clear_tmux_spawn_cleanup_debt(debt_path)
+                    except Exception as exc:
+                        _log(
+                            f"ERROR tmux[{self.agent_name}]: teardown proved but "
+                            f"cleanup debt clear failed at {debt_path}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                return None
+            if debt_path is not None:
+                failure = f"{failure}; cleanup debt retained at {debt_path}"
+                _log(
+                    f"ERROR tmux[{self.agent_name}]: retained spawn cleanup "
+                    f"debt remains outstanding at {debt_path}"
                 )
-            except BaseException as exc:
-                message = (
-                    f"tmux[{self.agent_name}]: spawn rollback at {site} "
-                    f"could not prove teardown within "
-                    f"{_SPAWN_ROLLBACK_TIMEOUT_SEC}s; owned session is "
-                    f"possibly live ({type(exc).__name__}: {exc})"
+            elif debt_persist_error is not None:
+                failure = (
+                    f"{failure}; cleanup debt persistence failed "
+                    f"({type(debt_persist_error).__name__}: {debt_persist_error})"
                 )
-                _log(f"ERROR {message}")
-                return message
+            return failure
 
         cleanup_task = asyncio.create_task(
-            _bounded(), name=f"tmux-spawn-rollback-{self.agent_name}"
+            _cleanup(), name=f"tmux-spawn-rollback-{self.agent_name}"
         )
         while True:
             try:
@@ -3044,6 +3435,15 @@ class TmuxSession(TransportReplacementMixin):
             except asyncio.CancelledError:
                 # Preserve the exception that selected this rollback site.
                 # A second cancellation cannot strand bounded cleanup.
+                if cleanup_task.cancelled():
+                    message = (
+                        f"tmux[{self.agent_name}]: spawn rollback at {site} "
+                        "cleanup task was cancelled; owned session is possibly live"
+                    )
+                    if debt_path is not None:
+                        message = f"{message}; cleanup debt retained at {debt_path}"
+                    _log(f"ERROR {message}")
+                    return message
                 continue
 
     @staticmethod
@@ -3101,6 +3501,13 @@ class TmuxSession(TransportReplacementMixin):
         # umbrella below — this can include a multi-minute image pull and
         # runs under its own budget (see _ensure_container_started).
         await self._ensure_container_started(container_agent)
+
+        # A prior spawn may have exhausted bounded rollback while its owned
+        # child was still live or unobservable. That debt is durable precisely
+        # because this session was never registered with the broker/watchdog.
+        # Resolve it before the ordinary stale-session probe and before any new
+        # spawn side effects; an unresolved record fails this spawn closed.
+        await self._reap_retained_spawn_cleanup_debt()
 
         # If a stale session is left over from a previous daemon run (e.g.
         # crash without graceful disconnect), reap it. We're the cold-start
@@ -3202,8 +3609,26 @@ class TmuxSession(TransportReplacementMixin):
             # observation window.
             self._watchdog_frozen_live_status = None
 
+        current_task = asyncio.current_task()
+        cancel_requests_before_spawn = (
+            current_task.cancelling() if current_task is not None else 0
+        )
         try:
-            await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
+            # Python 3.11's wait_for() can consume an accepted caller
+            # cancellation when its inner task has completed but its waiter has
+            # not resumed yet (tasks.py's ``if fut.done(): return fut.result()``
+            # branch). A task-local timeout context removes that inner-task
+            # completion race. The residual cancel-count check also covers a
+            # cancellation requested synchronously at the final _spawn await,
+            # before the task has another suspension point at which to inject
+            # CancelledError.
+            async with asyncio.timeout(_COLD_START_TIMEOUT_SEC):
+                await _spawn()
+            if (
+                current_task is not None
+                and current_task.cancelling() > cancel_requests_before_spawn
+            ):
+                raise asyncio.CancelledError
         except asyncio.TimeoutError as exc:
             rollback_failure = await self._rollback_spawned_session(
                 site="cold-start timeout"
@@ -3215,6 +3640,12 @@ class TmuxSession(TransportReplacementMixin):
             if rollback_failure is not None:
                 message = f"{message}; {rollback_failure}"
             raise RuntimeError(message) from exc
+        except asyncio.CancelledError as exc:
+            rollback_failure = await self._rollback_spawned_session(
+                site="cold-start cancellation"
+            )
+            self._annotate_spawn_rollback_failure(exc, rollback_failure)
+            raise
 
         # ``tmux new-session -d`` only proves that tmux launched the in-pane
         # command. The command can then fail fast (bad CLI flag, auth error,
