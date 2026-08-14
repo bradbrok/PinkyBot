@@ -62,10 +62,40 @@ _RECEIPT_EXTENSION_MAX_AGE_ENV = "PINKY_SCHEDULE_RECEIPT_EXTENSION_MAX_AGE_SEC"
 _RECEIPT_EXTENSION_MAX_AGE_SEC = 60 * 60
 _ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC = 1.0
 _PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC = 60
+_OUTBOX_REAPER_RETAIN_ACCEPTED_ENV = (
+    "PINKY_OUTBOX_REAPER_RETAIN_ACCEPTED_SEC"
+)
+_OUTBOX_REAPER_RETAIN_ABANDONED_ENV = (
+    "PINKY_OUTBOX_REAPER_RETAIN_ABANDONED_SEC"
+)
+_OUTBOX_REAPER_RETAIN_PARKED_ENV = "PINKY_OUTBOX_REAPER_RETAIN_PARKED_SEC"
+_OUTBOX_REAPER_PAYLOAD_TRIM_ENV = (
+    "PINKY_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC"
+)
+_OUTBOX_REAPER_RETAIN_ACCEPTED_SEC = 7 * 24 * 60 * 60
+_OUTBOX_REAPER_RETAIN_ABANDONED_SEC = 14 * 24 * 60 * 60
+_OUTBOX_REAPER_RETAIN_PARKED_SEC = 30 * 24 * 60 * 60
+_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC = 48 * 60 * 60
 
 
 class _ReceiptAbandonedError(RuntimeError):
     """An already-pasted wake exceeded its original-fire receipt deadline."""
+
+
+def _positive_env_seconds(name: str, default: float) -> float:
+    """Read one finite positive duration, falling back loudly."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = float(raw_value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("duration must be finite and positive")
+    except (TypeError, ValueError):
+        _log(
+            f"scheduler: invalid {name} duration {raw_value!r}; "
+            f"using {default:g}s"
+        )
+        return float(default)
+    return value
 
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
@@ -276,8 +306,8 @@ class AgentScheduler:
         # A pasted-unresolved prompt cannot be safely cancelled and replayed,
         # but it also cannot hold the per-agent lock forever. Receipt waiting
         # is therefore capped against the wake's durable original fired_at.
-        # At the ceiling the waiter detaches, the exact row is quarantined as
-        # RECEIPT_ABANDONED, and a later positive receipt can still win.
+        # At the ceiling the waiter detaches, the exact row is explicitly
+        # abandoned, and a later positive receipt can still win.
         self._delivery_inflight_fn = delivery_inflight_fn
         # async fn(agent_name, text) -> bool. Delivers operator-facing owner
         # alerts for terminal dead-letter events (PERSISTED_WAKE_PARKED, stale
@@ -321,6 +351,22 @@ class AgentScheduler:
         self._receipt_extension_max_age_sec = float(
             receipt_extension_max_age_sec
         )
+        self._outbox_reaper_retain_accepted_sec = _positive_env_seconds(
+            _OUTBOX_REAPER_RETAIN_ACCEPTED_ENV,
+            _OUTBOX_REAPER_RETAIN_ACCEPTED_SEC,
+        )
+        self._outbox_reaper_retain_abandoned_sec = _positive_env_seconds(
+            _OUTBOX_REAPER_RETAIN_ABANDONED_ENV,
+            _OUTBOX_REAPER_RETAIN_ABANDONED_SEC,
+        )
+        self._outbox_reaper_retain_parked_sec = _positive_env_seconds(
+            _OUTBOX_REAPER_RETAIN_PARKED_ENV,
+            _OUTBOX_REAPER_RETAIN_PARKED_SEC,
+        )
+        self._outbox_reaper_payload_trim_after_sec = _positive_env_seconds(
+            _OUTBOX_REAPER_PAYLOAD_TRIM_ENV,
+            _OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC,
+        )
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
@@ -351,6 +397,7 @@ class AgentScheduler:
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
+        self._last_outbox_reaper_day: date | None = None
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -361,7 +408,9 @@ class AgentScheduler:
         if self._running:
             return
         self._running = True
-        self._warn_oversized_schedule_prompts(time.time(), force=True)
+        now = time.time()
+        self._run_outbox_reaper_if_due(now)
+        self._warn_oversized_schedule_prompts(now, force=True)
         for pending in self._registry.list_pending_schedule_wakes():
             self.replay_pending_for_agent(pending.agent_name)
         # Queue startup catch-up before the first live tick can enqueue newer
@@ -432,6 +481,7 @@ class AgentScheduler:
         """Single scheduler tick — check schedules, heartbeats, clock-aligned wakes, auto-sleep, idle sessions, expired messages, dreams, and url watchers."""
         now = time.time()
 
+        self._run_outbox_reaper_if_due(now)
         self._warn_oversized_schedule_prompts(now)
 
         # Check cron schedules
@@ -465,6 +515,33 @@ class AgentScheduler:
 
         # Check URL watcher triggers
         await self._check_url_watchers(now)
+
+    def _run_outbox_reaper_if_due(self, now: float) -> bool:
+        """Run host-owned outbox maintenance once per local calendar day."""
+        current_day = date.fromtimestamp(now)
+        if self._last_outbox_reaper_day == current_day:
+            return False
+        # Record the attempt before entering storage so a persistent failure
+        # emits one loud daily error instead of flooding every scheduler tick.
+        self._last_outbox_reaper_day = current_day
+        try:
+            self._registry.reap_pending_schedule_wakes(
+                now=now,
+                abandon_after=self._receipt_extension_max_age_sec,
+                retain_accepted=self._outbox_reaper_retain_accepted_sec,
+                retain_abandoned=self._outbox_reaper_retain_abandoned_sec,
+                retain_parked=self._outbox_reaper_retain_parked_sec,
+                payload_trim_after=(
+                    self._outbox_reaper_payload_trim_after_sec
+                ),
+            )
+        except Exception as exc:
+            _log(
+                "scheduler: outbox reaper failed: "
+                f"{type(exc).__name__}: {exc}"
+            )
+            return False
+        return True
 
     def _warn_oversized_schedule_prompts(
         self,
@@ -772,13 +849,17 @@ class AgentScheduler:
                 prompt=self._wake_prompt(schedule),
                 fired_at=schedule.last_run,
             )
-            # A retired (parked) or already-accepted fire must not be delivered:
+            # A terminal or already-accepted fire must not be delivered:
             # an operator may have discarded this fire while its cohort task
             # waited behind the per-agent delivery lock. Delivering would
             # resurrect the tombstone (and the delivery-confirm would clear it).
             # Set the cohort-start event first so ``_check_schedules`` does not
             # wait out its timeout on a discarded first cohort member.
-            if row is not None and (row.parked_at > 0 or row.accepted_at > 0):
+            if row is not None and (
+                row.parked_at > 0
+                or row.abandoned_at > 0
+                or row.accepted_at > 0
+            ):
                 if attempt_started is not None:
                     attempt_started.set()
                 return
@@ -957,6 +1038,15 @@ class AgentScheduler:
                         "duplicate undelivered verdict"
                     )
                     return
+                if row is not None and row.abandoned_at > 0:
+                    _log(
+                        f"scheduler: schedule '{schedule.name}' "
+                        f"(#{schedule.id}) for agent "
+                        f"'{schedule.agent_name}' is already abandoned "
+                        f"(fired_at={schedule.last_run}); suppressing "
+                        "duplicate undelivered verdict"
+                    )
+                    return
             except Exception as exc:
                 _log(
                     f"scheduler: SCHEDULER_WAKE_PERSIST_FAILURE schedule "
@@ -1101,7 +1191,7 @@ class AgentScheduler:
         stale_drop_notices: list[RecurringScheduleStaleDrop],
     ) -> None:
         """Release the delivery lock while retaining late-receipt authority."""
-        schedule_id, fired_at, _ = self._quarantine_abandoned_receipt(
+        schedule_id, fired_at, _ = self._mark_abandoned_receipt(
             schedule, age=age
         )
 
@@ -1133,10 +1223,10 @@ class AgentScheduler:
 
         self._track_detached_receipt_task(_observe_late_receipt())
 
-    def _quarantine_abandoned_receipt(
+    def _mark_abandoned_receipt(
         self, schedule, *, age: float
     ) -> tuple[int, float, bool]:
-        """Quarantine one unrecallable fire without submitting new work."""
+        """Abandon one unrecallable fire without submitting new work."""
         reason = (
             "RECEIPT_ABANDONED: original fired_at exceeded receipt-extension "
             f"ceiling ({age:.1f}s >= {self._receipt_extension_max_age_sec:.1f}s)"
@@ -1146,10 +1236,11 @@ class AgentScheduler:
         row = self._registry.get_schedule_wake_by_fire(
             schedule_id, fired_at
         )
-        parked = bool(
+        abandoned = bool(
             row is not None
-            and self._registry.park_pending_schedule_wake(
+            and self._registry.abandon_pending_schedule_wake(
                 row.id,
+                abandoned_at=time.time(),
                 reason=reason,
             )
         )
@@ -1158,7 +1249,7 @@ class AgentScheduler:
             f"(#{schedule_id}) for agent '{schedule.agent_name}' "
             f"fired_at={fired_at} age_s={age:.1f} "
             f"ceiling_s={self._receipt_extension_max_age_sec:.1f} "
-            f"quarantined={parked}"
+            f"abandoned={abandoned}"
         )
         if self._activity:
             try:
@@ -1170,7 +1261,7 @@ class AgentScheduler:
                 )
             except Exception:
                 pass
-        return schedule_id, fired_at, parked
+        return schedule_id, fired_at, abandoned
 
     def _abandon_inflight_replay(
         self,
@@ -1186,16 +1277,16 @@ class AgentScheduler:
         callback.  Polling only observes that existing authority; it never
         creates another transport turn.
         """
-        schedule_id, fired_at, parked = self._quarantine_abandoned_receipt(
+        schedule_id, fired_at, abandoned = self._mark_abandoned_receipt(
             schedule, age=age
         )
         row = self._registry.get_schedule_wake_by_fire(schedule_id, fired_at)
         retained = bool(
-            parked
+            abandoned
             or (
                 row is not None
                 and row.accepted_at == 0
-                and row.parked_at > 0
+                and row.abandoned_at > 0
                 and row.last_error.startswith("RECEIPT_ABANDONED")
             )
         )
@@ -1420,11 +1511,12 @@ class AgentScheduler:
         health = self._registry.get_pending_schedule_wake_health(
             agent_name, now=replay_now
         )
-        if health:
+        if health and health[0]["count"] > 0:
             summary = health[0]
             _log(
                 f"scheduler: PERSISTED_WAKE_OUTBOX_HEALTH agent="
                 f"'{agent_name}' count={summary['count']} "
+                f"abandoned_count={summary['abandoned_count']} "
                 f"oldest_age_s={summary['oldest_age_seconds']:.1f} "
                 f"oldest_fired_at={summary['oldest_fired_at']}"
             )
@@ -1440,7 +1532,7 @@ class AgentScheduler:
         abandoned_schedule_ids = set()
         for pending in all_pending_wakes:
             if (
-                pending.parked_at > 0
+                pending.abandoned_at > 0
                 and pending.last_error.startswith("RECEIPT_ABANDONED")
                 and self._wake_prompt_inflight(
                     pending,
@@ -1465,7 +1557,7 @@ class AgentScheduler:
             elif not current_schedule.enabled and not current_schedule.one_shot:
                 zombie_reason = "schedule disabled"
             if zombie_reason:
-                if pending.parked_at != 0:
+                if pending.parked_at != 0 or pending.abandoned_at != 0:
                     continue
                 quarantined = self._registry.park_pending_schedule_wake(
                     pending.id,
@@ -1486,7 +1578,7 @@ class AgentScheduler:
                         "park returned no state change"
                     )
                 continue
-            if pending.parked_at != 0:
+            if pending.parked_at != 0 or pending.abandoned_at != 0:
                 continue
             if pending.schedule_id in abandoned_schedule_ids:
                 _log(
@@ -1504,7 +1596,7 @@ class AgentScheduler:
             )
             # Invariant: abandonment precedes both stale deletion and
             # recurrence collapse. Once a prompt is physically pasted it
-            # cannot be recalled, so replay must quarantine that exact fire
+            # cannot be recalled, so replay must abandon that exact fire
             # in place and retain its existing durable acceptance authority.
             # Calling _wait_for_wake_confirmation here would paste a duplicate.
             past_receipt_ceiling = (

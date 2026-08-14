@@ -23,6 +23,7 @@ Hierarchy:
 from __future__ import annotations
 
 import json
+import math
 import os
 import re
 import secrets
@@ -54,6 +55,8 @@ _BARSIK_BUZZ_RELAY_SIGNING_PUBKEY = (
 )
 BUZZ_OWNER_SILENCE_DAYS = 14
 BUZZ_INBOUND_CLAIM_LEASE_SECONDS = 5 * 60
+OUTBOX_REAPER_BATCH_SIZE = 10_000
+OUTBOX_REAPER_PAYLOAD_TRIMMED = "[payload trimmed by outbox reaper]"
 
 
 def _validate_buzz_pubkey(value: str, *, field_name: str = "pubkey") -> str:
@@ -759,8 +762,8 @@ class PendingScheduleWake:
     """One durable exact-fire scheduler ledger record.
 
     The historical class name is retained because active rows are also the
-    replay outbox.  ``accepted_at`` and ``parked_at`` make the terminal state
-    explicit without deleting the forensic receipt.
+    replay outbox.  ``accepted_at``, ``parked_at``, and ``abandoned_at`` make
+    terminal states explicit without deleting the forensic receipt.
     """
 
     id: int = 0
@@ -775,6 +778,7 @@ class PendingScheduleWake:
     accepted_at: float = 0.0
     failed_at: float = 0.0
     last_error: str = ""
+    abandoned_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -786,6 +790,8 @@ class PendingScheduleWake:
         """Return the exact operational outcome used by fleet health."""
         if self.accepted_at > 0:
             return "receipted-ran-once"
+        if self.abandoned_at > 0:
+            return "abandoned"
         if self.parked_at > 0:
             return "quarantined"
         return "pending"
@@ -804,6 +810,7 @@ class PendingScheduleWake:
             "accepted_at": self.accepted_at,
             "failed_at": self.failed_at,
             "last_error": self.last_error,
+            "abandoned_at": self.abandoned_at,
             "state": self.ledger_state,
         }
 
@@ -1489,6 +1496,7 @@ class AgentRegistry:
                 accepted_at REAL NOT NULL DEFAULT 0,
                 failed_at REAL NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
+                abandoned_at REAL NOT NULL DEFAULT 0,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -1984,6 +1992,7 @@ class AgentRegistry:
             ("accepted_at", "REAL NOT NULL DEFAULT 0"),
             ("failed_at", "REAL NOT NULL DEFAULT 0"),
             ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in wake_migrations:
             if col not in wake_existing:
@@ -1998,6 +2007,12 @@ class AgentRegistry:
             """CREATE INDEX IF NOT EXISTS idx_schedule_wake_ledger_state
                ON pending_schedule_wakes(
                    agent_name, accepted_at, parked_at, fired_at
+               )"""
+        )
+        self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_schedule_wake_reaper_state
+               ON pending_schedule_wakes(
+                   accepted_at, parked_at, abandoned_at, fired_at
                )"""
         )
         self._db.commit()
@@ -5304,7 +5319,7 @@ except Exception as exc:
         return self._db.execute(
             """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                       fired_at, created_at, attempts, parked_at, accepted_at,
-                      failed_at, last_error
+                      failed_at, last_error, abandoned_at
                FROM pending_schedule_wakes
                WHERE schedule_id=? AND fired_at=?""",
             (schedule_id, fired_at),
@@ -5348,7 +5363,7 @@ except Exception as exc:
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                           fired_at, created_at, attempts, parked_at, accepted_at,
-                          failed_at, last_error
+                          failed_at, last_error, abandoned_at
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -5364,13 +5379,13 @@ except Exception as exc:
     ) -> list[PendingScheduleWake]:
         """Return pending scheduler wakes oldest-first.
 
-        Accepted receipts are always excluded. Quarantined rows are excluded
-        by default; pass ``include_parked=True`` to inspect those terminal
-        records alongside the active replay outbox.
+        Accepted receipts are always excluded. Quarantined and abandoned rows
+        are excluded by default; pass ``include_parked=True`` to inspect those
+        terminal records alongside the active replay outbox.
         """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error
+                        failed_at, last_error, abandoned_at
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5379,7 +5394,7 @@ except Exception as exc:
             params.append(agent_name)
         conditions.append("accepted_at=0")
         if not include_parked:
-            conditions.append("parked_at=0")
+            conditions.extend(("parked_at=0", "abandoned_at=0"))
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at ASC, id ASC"
@@ -5392,12 +5407,17 @@ except Exception as exc:
         *,
         now: float | None = None,
     ) -> list[dict]:
-        """Return active outbox count and oldest-row age per agent.
+        """Return active outbox debt and abandoned history per agent.
 
-        Accepted receipts and quarantined rows are terminal ledger history,
-        not stranded replay work, so they are intentionally excluded.
+        Accepted receipts and quarantined rows are terminal ledger history and
+        remain excluded. Explicitly abandoned rows surface as their own count,
+        never as active replay debt.
         """
-        sql = """SELECT agent_name, COUNT(*), MIN(fired_at), MAX(fired_at)
+        sql = """SELECT agent_name,
+                        SUM(CASE WHEN abandoned_at=0 THEN 1 ELSE 0 END),
+                        MIN(CASE WHEN abandoned_at=0 THEN fired_at END),
+                        MAX(CASE WHEN abandoned_at=0 THEN fired_at END),
+                        SUM(CASE WHEN abandoned_at>0 THEN 1 ELSE 0 END)
                  FROM pending_schedule_wakes
                  WHERE accepted_at=0 AND parked_at=0"""
         params: list = []
@@ -5407,16 +5427,25 @@ except Exception as exc:
         sql += " GROUP BY agent_name ORDER BY agent_name"
         rows = self._db.execute(sql, params).fetchall()
         observed_at = time.time() if now is None else float(now)
-        return [
-            {
-                "agent_name": str(row[0]),
-                "count": int(row[1]),
-                "oldest_fired_at": float(row[2]),
-                "newest_fired_at": float(row[3]),
-                "oldest_age_seconds": max(0.0, observed_at - float(row[2])),
-            }
-            for row in rows
-        ]
+        result = []
+        for row in rows:
+            oldest_fired_at = float(row[2]) if row[2] is not None else 0.0
+            newest_fired_at = float(row[3]) if row[3] is not None else 0.0
+            result.append(
+                {
+                    "agent_name": str(row[0]),
+                    "count": int(row[1]),
+                    "abandoned_count": int(row[4]),
+                    "oldest_fired_at": oldest_fired_at,
+                    "newest_fired_at": newest_fired_at,
+                    "oldest_age_seconds": (
+                        max(0.0, observed_at - oldest_fired_at)
+                        if oldest_fired_at > 0
+                        else 0.0
+                    ),
+                }
+            )
+        return result
 
     def list_schedule_wake_ledger(
         self,
@@ -5432,11 +5461,12 @@ except Exception as exc:
             "pending",
             "receipted-ran-once",
             "quarantined",
+            "abandoned",
         }:
             raise ValueError(f"invalid scheduler wake ledger state: {state}")
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error
+                        failed_at, last_error, abandoned_at
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5447,11 +5477,19 @@ except Exception as exc:
             conditions.append("fired_at>=?")
             params.append(fired_after)
         if state == "pending":
-            conditions.extend(("accepted_at=0", "parked_at=0"))
+            conditions.extend(
+                ("accepted_at=0", "parked_at=0", "abandoned_at=0")
+            )
         elif state == "receipted-ran-once":
             conditions.append("accepted_at>0")
         elif state == "quarantined":
-            conditions.extend(("accepted_at=0", "parked_at>0"))
+            conditions.extend(
+                ("accepted_at=0", "parked_at>0", "abandoned_at=0")
+            )
+        elif state == "abandoned":
+            conditions.extend(
+                ("accepted_at=0", "parked_at=0", "abandoned_at>0")
+            )
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at DESC, id DESC LIMIT ?"
@@ -5480,14 +5518,19 @@ except Exception as exc:
             if row is None:
                 return None, False
             current = PendingScheduleWake(*row)
-            if current.accepted_at > 0 or current.parked_at > 0:
+            if (
+                current.accepted_at > 0
+                or current.parked_at > 0
+                or current.abandoned_at > 0
+            ):
                 return current, False
             first_failure = current.failed_at == 0
             self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
-                   WHERE id=? AND accepted_at=0 AND parked_at=0""",
+                   WHERE id=? AND accepted_at=0 AND parked_at=0
+                     AND abandoned_at=0""",
                 (timestamp, reason, current.id),
             )
             row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
@@ -5502,7 +5545,8 @@ except Exception as exc:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET attempts=attempts + 1
-                   WHERE id=? AND parked_at=0""",
+                   WHERE id=? AND accepted_at=0 AND parked_at=0
+                     AND abandoned_at=0""",
                 (pending_id,),
             )
             if cursor.rowcount == 0:
@@ -5530,7 +5574,35 @@ except Exception as exc:
                    SET parked_at=?,
                        failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
-                   WHERE id=? AND parked_at=0 AND accepted_at=0""",
+                   WHERE id=? AND parked_at=0 AND accepted_at=0
+                     AND abandoned_at=0""",
+                (timestamp, timestamp, reason, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def abandon_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        abandoned_at: float = 0.0,
+        reason: str = "receipt confirmation ceiling exceeded",
+    ) -> bool:
+        """Atomically move an active wake to explicit abandonment once.
+
+        Abandonment is distinct from delivery quarantine: it records the
+        ambiguous receipt-gap outcome without replaying or discarding the row.
+        A later positive receipt remains authoritative and clears this marker.
+        """
+        timestamp = abandoned_at or time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET abandoned_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND parked_at=0 AND accepted_at=0
+                     AND abandoned_at=0""",
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
@@ -5555,7 +5627,8 @@ except Exception as exc:
                    SET parked_at=?,
                        failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
-                   WHERE id=? AND parked_at=0 AND accepted_at=0""",
+                   WHERE id=? AND parked_at=0 AND accepted_at=0
+                     AND abandoned_at=0""",
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
@@ -5585,6 +5658,7 @@ except Exception as exc:
                    SET accepted_at=CASE
                            WHEN accepted_at=0 THEN ? ELSE accepted_at END,
                        parked_at=0,
+                       abandoned_at=0,
                        last_error=''
                    WHERE id=?""",
                 (timestamp, pending_id),
@@ -5620,6 +5694,7 @@ except Exception as exc:
                    SET accepted_at=CASE
                            WHEN accepted_at=0 THEN ? ELSE accepted_at END,
                        parked_at=0,
+                       abandoned_at=0,
                        last_error=''
                    WHERE schedule_id=? AND fired_at=?""",
                 (timestamp, schedule_id, fired_at),
@@ -5653,14 +5728,16 @@ except Exception as exc:
         re-created nor re-delivered.
 
         ``agent_name`` scopes self-service callers to their own outbox. Rows that
-        are already accepted or parked are terminal evidence and are left as-is.
+        are already accepted, parked, or abandoned are terminal evidence and
+        are left as-is.
 
         Parked tombstones accumulate until a terminal-row reaper prunes them
         (tracked separately; accepted rows already accumulate the same way).
         """
         sql = """UPDATE pending_schedule_wakes
                  SET parked_at=?, last_error=?
-                 WHERE id=? AND accepted_at=0 AND parked_at=0"""
+                 WHERE id=? AND accepted_at=0 AND parked_at=0
+                   AND abandoned_at=0"""
         params: list = [time.time(), "retired via discard", pending_id]
         if agent_name is not None:
             sql += " AND agent_name=?"
@@ -5677,17 +5754,292 @@ except Exception as exc:
         of frequently-recurring schedules — tombstoning there would accumulate
         rows unboundedly without a reaper. Deliberate/manual retirement uses
         ``discard_pending_schedule_wake`` (which tombstones) so a retired fire
-        cannot be re-created by a later reconciliation. Accepted or already
-        parked rows are terminal and are left as-is.
+        cannot be re-created by a later reconciliation. Accepted, parked, or
+        abandoned rows are terminal and are left as-is.
         """
         with self._rmw_lock:
             cursor = self._db.execute(
                 """DELETE FROM pending_schedule_wakes
-                   WHERE id=? AND accepted_at=0 AND parked_at=0""",
+                   WHERE id=? AND accepted_at=0 AND parked_at=0
+                     AND abandoned_at=0""",
                 (pending_id,),
             )
             self._db.commit()
             return cursor.rowcount > 0
+
+    def reap_pending_schedule_wakes(
+        self,
+        *,
+        now: float,
+        abandon_after: float,
+        retain_accepted: float,
+        retain_abandoned: float,
+        retain_parked: float,
+        payload_trim_after: float,
+        batch_size: int = OUTBOX_REAPER_BATCH_SIZE,
+    ) -> list[dict[str, int | str]]:
+        """Transition stranded wakes and prune bounded terminal history.
+
+        This maintenance pass never delivers or re-queues work. Active rows
+        cross into explicit abandonment only after the strict fired-at
+        ceiling. Legacy ``RECEIPT_ABANDONED`` quarantine markers are reclassified
+        into the same explicit state. Retention is measured from each transition,
+        so every newly backfilled abandonment survives its full forensic window.
+        Large populations are committed in bounded chunks while the registry's
+        mutation lock prevents in-process replay races.
+        """
+        observed_at = float(now)
+        windows = {
+            "abandon_after": float(abandon_after),
+            "retain_accepted": float(retain_accepted),
+            "retain_abandoned": float(retain_abandoned),
+            "retain_parked": float(retain_parked),
+            "payload_trim_after": float(payload_trim_after),
+        }
+        if not math.isfinite(observed_at) or observed_at <= 0:
+            raise ValueError("outbox reaper now must be positive")
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in windows.values()
+        ):
+            raise ValueError("outbox reaper windows must be positive")
+        if batch_size <= 0:
+            raise ValueError("outbox reaper batch_size must be positive")
+
+        metric_fields = (
+            "abandoned",
+            "accepted_reaped",
+            "abandoned_reaped",
+            "parked_reaped",
+            "payloads_trimmed",
+            "retained_active",
+        )
+        metrics: dict[str, dict[str, int | str]] = {}
+
+        def _agent_metrics(agent_name: str) -> dict[str, int | str]:
+            if agent_name not in metrics:
+                metrics[agent_name] = {
+                    "agent_name": agent_name,
+                    **{field: 0 for field in metric_fields},
+                }
+            return metrics[agent_name]
+
+        def _apply_batched(
+            sql: str,
+            params: tuple,
+            metric_field: str,
+        ) -> None:
+            while True:
+                rows = self._db.execute(
+                    sql,
+                    (*params, int(batch_size)),
+                ).fetchall()
+                self._db.commit()
+                for row in rows:
+                    agent_metrics = _agent_metrics(str(row[0]))
+                    agent_metrics[metric_field] = (
+                        int(agent_metrics[metric_field]) + 1
+                    )
+                if len(rows) < batch_size:
+                    return
+
+        discard_reason = "retired via discard"
+        abandon_cutoff = observed_at - windows["abandon_after"]
+        accepted_cutoff = observed_at - windows["retain_accepted"]
+        abandoned_cutoff = observed_at - windows["retain_abandoned"]
+        parked_cutoff = observed_at - windows["retain_parked"]
+        trim_cutoff = observed_at - windows["payload_trim_after"]
+
+        with self._rmw_lock:
+            try:
+                for row in self._db.execute(
+                    "SELECT DISTINCT agent_name FROM pending_schedule_wakes"
+                ).fetchall():
+                    _agent_metrics(str(row[0]))
+
+                _apply_batched(
+                    """UPDATE pending_schedule_wakes
+                       SET abandoned_at=?, parked_at=0
+                       WHERE id IN (
+                           SELECT id FROM pending_schedule_wakes
+                           WHERE accepted_at=0 AND abandoned_at=0
+                             AND (
+                                 (parked_at=0 AND fired_at < ?)
+                                 OR (
+                                     parked_at>0
+                                     AND last_error LIKE 'RECEIPT_ABANDONED:%'
+                                 )
+                             )
+                           ORDER BY id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (observed_at, abandon_cutoff),
+                    "abandoned",
+                )
+                _apply_batched(
+                    """DELETE FROM pending_schedule_wakes
+                       WHERE id IN (
+                           SELECT id FROM pending_schedule_wakes
+                           WHERE accepted_at>0 AND accepted_at < ?
+                           ORDER BY id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (accepted_cutoff,),
+                    "accepted_reaped",
+                )
+                _apply_batched(
+                    """DELETE FROM pending_schedule_wakes
+                       WHERE id IN (
+                           SELECT id FROM pending_schedule_wakes
+                           WHERE (
+                               accepted_at=0 AND parked_at=0
+                               AND abandoned_at>0 AND abandoned_at < ?
+                           ) OR (
+                               accepted_at=0 AND abandoned_at=0
+                               AND parked_at>0 AND parked_at < ?
+                               AND last_error=?
+                           )
+                           ORDER BY id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (abandoned_cutoff, abandoned_cutoff, discard_reason),
+                    "abandoned_reaped",
+                )
+                _apply_batched(
+                    """DELETE FROM pending_schedule_wakes AS parked
+                       WHERE parked.id IN (
+                           SELECT candidate.id
+                           FROM pending_schedule_wakes AS candidate
+                           WHERE candidate.accepted_at=0
+                             AND candidate.abandoned_at=0
+                             AND candidate.parked_at>0
+                             AND candidate.parked_at < ?
+                             AND candidate.last_error<>?
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM pending_schedule_wakes AS newer
+                                 WHERE newer.schedule_id=candidate.schedule_id
+                                   AND newer.accepted_at=0
+                                   AND newer.abandoned_at=0
+                                   AND newer.parked_at>0
+                                   AND newer.last_error<>?
+                                   AND (
+                                       newer.parked_at > candidate.parked_at
+                                       OR (
+                                           newer.parked_at=candidate.parked_at
+                                           AND newer.id > candidate.id
+                                       )
+                                   )
+                             )
+                           ORDER BY candidate.id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (parked_cutoff, discard_reason, discard_reason),
+                    "parked_reaped",
+                )
+                _apply_batched(
+                    """UPDATE pending_schedule_wakes AS terminal
+                       SET prompt=?
+                       WHERE terminal.id IN (
+                           SELECT candidate.id
+                           FROM pending_schedule_wakes AS candidate
+                           WHERE candidate.prompt<>?
+                             AND (
+                                 (
+                                     candidate.accepted_at>0
+                                     AND candidate.accepted_at < ?
+                                 ) OR (
+                                     candidate.accepted_at=0
+                                     AND candidate.parked_at=0
+                                     AND candidate.abandoned_at>0
+                                     AND candidate.abandoned_at < ?
+                                 ) OR (
+                                     candidate.accepted_at=0
+                                     AND candidate.abandoned_at=0
+                                     AND candidate.parked_at>0
+                                     AND candidate.parked_at < ?
+                                     AND candidate.last_error=?
+                                 ) OR (
+                                     candidate.accepted_at=0
+                                     AND candidate.abandoned_at=0
+                                     AND candidate.parked_at>0
+                                     AND candidate.parked_at < ?
+                                     AND candidate.last_error<>?
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM pending_schedule_wakes AS newer
+                                         WHERE newer.schedule_id=candidate.schedule_id
+                                           AND newer.accepted_at=0
+                                           AND newer.abandoned_at=0
+                                           AND newer.parked_at>0
+                                           AND newer.last_error<>?
+                                           AND (
+                                               newer.parked_at > candidate.parked_at
+                                               OR (
+                                                   newer.parked_at=candidate.parked_at
+                                                   AND newer.id > candidate.id
+                                               )
+                                           )
+                                     )
+                                 )
+                             )
+                           ORDER BY candidate.id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (
+                        OUTBOX_REAPER_PAYLOAD_TRIMMED,
+                        OUTBOX_REAPER_PAYLOAD_TRIMMED,
+                        trim_cutoff,
+                        trim_cutoff,
+                        trim_cutoff,
+                        discard_reason,
+                        trim_cutoff,
+                        discard_reason,
+                        discard_reason,
+                    ),
+                    "payloads_trimmed",
+                )
+
+                active_rows = self._db.execute(
+                    """SELECT agent_name, COUNT(*)
+                       FROM pending_schedule_wakes
+                       WHERE accepted_at=0 AND parked_at=0 AND abandoned_at=0
+                       GROUP BY agent_name"""
+                ).fetchall()
+                for agent_name, count in active_rows:
+                    _agent_metrics(str(agent_name))["retained_active"] = int(
+                        count
+                    )
+            except Exception:
+                self._db.rollback()
+                _log("outbox-reaper: ERROR maintenance pass failed")
+                raise
+
+        result = [metrics[name] for name in sorted(metrics)]
+        for row in result:
+            _log(
+                f"outbox-reaper: agent={row['agent_name']} "
+                f"abandoned=+{row['abandoned']} "
+                f"accepted_reaped={row['accepted_reaped']} "
+                f"abandoned_reaped={row['abandoned_reaped']} "
+                f"parked_reaped={row['parked_reaped']} "
+                f"payloads_trimmed={row['payloads_trimmed']} "
+                f"retained_active={row['retained_active']}"
+            )
+        totals = {
+            field: sum(int(row[field]) for row in result)
+            for field in metric_fields
+        }
+        _log(
+            f"outbox-reaper: summary agents={len(result)} "
+            f"abandoned=+{totals['abandoned']} "
+            f"accepted_reaped={totals['accepted_reaped']} "
+            f"abandoned_reaped={totals['abandoned_reaped']} "
+            f"parked_reaped={totals['parked_reaped']} "
+            f"payloads_trimmed={totals['payloads_trimmed']} "
+            f"retained_active={totals['retained_active']}"
+        )
+        return result
 
     # ── Heartbeats ─────────────────────────────────────────
 
