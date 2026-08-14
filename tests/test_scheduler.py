@@ -13,6 +13,7 @@ from datetime import datetime
 
 import pytest
 
+import pinky_daemon.agent_registry as agent_registry_module
 from pinky_daemon.agent_registry import (
     OUTBOX_REAPER_PAYLOAD_TRIMMED,
     AgentRegistry,
@@ -1230,8 +1231,12 @@ class TestOutboxReaper:
 
         def seed(reg):
             reg.register("fault")
+            reg.register("witness")
             schedule = reg.add_schedule(
                 "fault", "0 1 * * *", name="fault", prompt="run"
+            )
+            witness_schedule = reg.add_schedule(
+                "witness", "0 2 * * *", name="witness", prompt="run"
             )
             expired, _ = reg.persist_schedule_wake(
                 schedule.id,
@@ -1253,6 +1258,13 @@ class TestOutboxReaper:
             assert reg.confirm_pending_schedule_wake(
                 retained.id, delivered_at=now - 3 * self.DAY
             )
+            reg.persist_schedule_wake(
+                witness_schedule.id,
+                agent_name="witness",
+                schedule_name=witness_schedule.name,
+                prompt="stay active",
+                fired_at=now - 10,
+            )
             return expired, retained
 
         expired, retained = seed(registry)
@@ -1272,14 +1284,14 @@ class TestOutboxReaper:
         )
         scheduler = AgentScheduler(registry)
         actual_reap = registry.reap_pending_schedule_wakes
-        failures: list[type[Exception]] = []
+        failures: list[Exception] = []
         successes: list[list[dict[str, int | str]]] = []
 
         def observe_reap(**kwargs):
             try:
                 result = actual_reap(**kwargs)
             except Exception as exc:
-                failures.append(type(exc))
+                failures.append(exc)
                 raise
             successes.append(result)
             return result
@@ -1287,10 +1299,28 @@ class TestOutboxReaper:
         monkeypatch.setattr(
             registry, "reap_pending_schedule_wakes", observe_reap
         )
+        original_log = agent_registry_module._log
+        emitted: list[str] = []
+        failed_once = False
+
+        def flaky_log(message: str) -> None:
+            nonlocal failed_once
+            if not failed_once and message.startswith(
+                "outbox-reaper: agent="
+            ):
+                failed_once = True
+                raise OSError("injected one-shot disposition failure")
+            emitted.append(message)
+            original_log(message)
+
+        monkeypatch.setattr(agent_registry_module, "_log", flaky_log)
         capsys.readouterr()
 
         assert scheduler._run_outbox_reaper_if_due(now) is False
-        assert failures == [sqlite3.IntegrityError]
+        assert failed_once is True
+        assert len(failures) == 1
+        assert type(failures[0]) is sqlite3.IntegrityError
+        assert "injected payload trim failure" in str(failures[0])
         assert scheduler._last_outbox_reaper_day is None
         assert scheduler._last_outbox_reaper_failed_at == now
         assert registry.get_schedule_wake_by_fire(
@@ -1301,21 +1331,29 @@ class TestOutboxReaper:
         ).prompt == "trim me"
         partial_logs = capsys.readouterr().err
         assert (
-            "outbox-reaper: agent=fault abandoned=+0 accepted_reaped=1 "
+            "outbox-reaper: agent=witness abandoned=+0 accepted_reaped=0 "
             "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
-            "retained_active=0"
+            "retained_active=1"
         ) in partial_logs
         assert (
             "outbox-reaper: summary PARTIAL failed_phase=payload_trim "
-            "agents=1 abandoned=+0 accepted_reaped=1 "
+            "agents=2 abandoned=+0 accepted_reaped=1 "
             "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
-            "retained_active=0"
+            "retained_active=1"
         ) in partial_logs
+        assert "outbox-reaper: ERROR maintenance pass failed" in emitted
+        assert any(
+            line.startswith(
+                "outbox-reaper: emission ERROR while reporting "
+                "maintenance failure: OSError: "
+            )
+            for line in emitted
+        )
 
         assert scheduler._run_outbox_reaper_if_due(
             now + backoff - 1
         ) is False
-        assert failures == [sqlite3.IntegrityError]
+        assert len(failures) == 1
         assert successes == []
         assert capsys.readouterr().err == ""
 

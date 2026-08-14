@@ -5855,19 +5855,35 @@ except Exception as exc:
             for agent_name, count in active_rows:
                 _agent_metrics(str(agent_name))["retained_active"] = int(count)
 
+        def _emit_log(
+            message: str,
+            *,
+            emission_errors: list[Exception] | None = None,
+        ) -> None:
+            if emission_errors is None:
+                _log(message)
+                return
+            try:
+                _log(message)
+            except Exception as exc:
+                emission_errors.append(exc)
+
         def _emit_metrics(
-            *, failed_phase: str | None = None
+            *,
+            failed_phase: str | None = None,
+            emission_errors: list[Exception] | None = None,
         ) -> list[dict[str, int | str]]:
             result = [metrics[name] for name in sorted(metrics)]
             for row in result:
-                _log(
+                _emit_log(
                     f"outbox-reaper: agent={row['agent_name']} "
                     f"abandoned=+{row['abandoned']} "
                     f"accepted_reaped={row['accepted_reaped']} "
                     f"abandoned_reaped={row['abandoned_reaped']} "
                     f"parked_reaped={row['parked_reaped']} "
                     f"payloads_trimmed={row['payloads_trimmed']} "
-                    f"retained_active={row['retained_active']}"
+                    f"retained_active={row['retained_active']}",
+                    emission_errors=emission_errors,
                 )
             totals = {
                 field: sum(int(row[field]) for row in result)
@@ -5878,14 +5894,15 @@ except Exception as exc:
                 if failed_phase is not None
                 else ""
             )
-            _log(
+            _emit_log(
                 f"outbox-reaper: summary{partial} agents={len(result)} "
                 f"abandoned=+{totals['abandoned']} "
                 f"accepted_reaped={totals['accepted_reaped']} "
                 f"abandoned_reaped={totals['abandoned_reaped']} "
                 f"parked_reaped={totals['parked_reaped']} "
                 f"payloads_trimmed={totals['payloads_trimmed']} "
-                f"retained_active={totals['retained_active']}"
+                f"retained_active={totals['retained_active']}",
+                emission_errors=emission_errors,
             )
             return result
 
@@ -6062,8 +6079,28 @@ except Exception as exc:
                     # Preserve and report the maintenance failure even if the
                     # diagnostic read is unavailable on a broken connection.
                     pass
-                _emit_metrics(failed_phase=failed_phase)
-                _log("outbox-reaper: ERROR maintenance pass failed")
+                emission_errors: list[Exception] = []
+                try:
+                    _emit_metrics(
+                        failed_phase=failed_phase,
+                        emission_errors=emission_errors,
+                    )
+                except Exception as exc:
+                    emission_errors.append(exc)
+                _emit_log(
+                    "outbox-reaper: ERROR maintenance pass failed",
+                    emission_errors=emission_errors,
+                )
+                for emission_error in tuple(emission_errors):
+                    try:
+                        _log(
+                            "outbox-reaper: emission ERROR while reporting "
+                            "maintenance failure: "
+                            f"{type(emission_error).__name__}: "
+                            f"{emission_error}"
+                        )
+                    except Exception:
+                        pass
                 raise
 
         return _emit_metrics()
