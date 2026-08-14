@@ -57,6 +57,7 @@ from pinky_daemon.codex_home import (
     codex_home_for,
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
+    validate_agent_codex_home,
 )
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
@@ -157,6 +158,7 @@ class CodexTmuxSession(TmuxSession):
                 self._session_name,
                 tmux_binary=self._tmux.tmux_binary,
                 socket_name=self._tmux.socket_name,
+                socket_path=self._tmux.socket_path,
                 command_runner=self._tmux._runner,
             )
         # codex identity/config (mirrors CodexSession.__init__).
@@ -566,13 +568,23 @@ class CodexTmuxSession(TmuxSession):
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     def _preflight_transport_replacement(self) -> None:
-        """Prove the isolated Codex home before an inherited tmux teardown."""
-        prepare_agent_codex_home(self._config, log=_log)
+        """Validate the isolated Codex home before inherited tmux teardown."""
+        validate_agent_codex_home(
+            self._config,
+            soul_version_store=self._registry,
+        )
+
+    def _prepare_tmux_spawn(self) -> None:
+        """Snapshot and publish only after inherited strict stale cleanup."""
+        prepare_agent_codex_home(
+            self._config,
+            log=_log,
+            soul_version_store=self._registry,
+        )
+        cwd = str(Path(self._config.working_dir or ".").resolve())
+        self._seed_codex_trust(cwd)
 
     async def _spawn_tmux_repl(self) -> None:
-        cwd = str(Path(self._config.working_dir or ".").resolve())
-        prepare_agent_codex_home(self._config, log=_log)
-        self._seed_codex_trust(cwd)
         await super()._spawn_tmux_repl()
         await self._codex_dismiss_nux_and_ready()
 

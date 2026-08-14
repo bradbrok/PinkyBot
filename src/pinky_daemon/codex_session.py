@@ -34,6 +34,7 @@ from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.codex_home import (
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
+    validate_agent_codex_home,
 )
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import SessionUsage
@@ -268,6 +269,7 @@ class CodexSession(TransportReplacementMixin):
                 working_dir=self._working_dir,
                 openai_api_key=self._openai_api_key,
                 agent_config=config,
+                soul_version_store=registry,
                 log=_log,
             )
         self._app_client: CodexAppServerClient | None = None
@@ -1015,16 +1017,33 @@ class CodexSession(TransportReplacementMixin):
         env = {**os.environ}
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
-        prepared_home = self._preflight_agent_codex_home()
+        prepared_home = self._prepare_agent_codex_home()
         if prepared_home is not None:
             env["CODEX_HOME"] = prepared_home
         return env
 
-    def _preflight_agent_codex_home(self) -> str | None:
-        """Validate and prepare replacement-home state before teardown/spawn."""
+    def _prepare_agent_codex_home(self) -> str | None:
+        """Snapshot and publish isolated-home state for an actual spawn."""
         if not per_agent_codex_home_enabled():
             return None
-        return str(prepare_agent_codex_home(self._config, log=_log))
+        return str(
+            prepare_agent_codex_home(
+                self._config,
+                log=_log,
+                soul_version_store=self._registry,
+            )
+        )
+
+    def _preflight_agent_codex_home(self) -> str | None:
+        """Validate replacement-home state without publishing before teardown."""
+        if not per_agent_codex_home_enabled():
+            return None
+        return str(
+            validate_agent_codex_home(
+                self._config,
+                soul_version_store=self._registry,
+            )
+        )
 
     def _preflight_transport_replacement(self) -> None:
         """Keep retained-session replacement refusal ahead of teardown."""
@@ -1225,19 +1244,16 @@ class CodexSession(TransportReplacementMixin):
                 )
 
         # Refuse an unsafe/missing per-agent auth setup before mutating any
-        # cached transport. In particular, a dead cached app-server must not be
-        # closed/cleared (and a tmux supervisor must not be started) before the
-        # replacement spawn proves its Codex home can be prepared safely.
-        direct_env: dict[str, str] | None = None
-        if self._use_tmux_app_server:
-            self._preflight_agent_codex_home()
-        else:
-            direct_env = self._build_codex_env()
+        # cached transport. Soul snapshot/publication stays at the actual spawn
+        # below, after this non-mutating validation and any stale teardown.
+        self._preflight_agent_codex_home()
 
         if self._app_client is not None or self._app_proc is not None:
             # Process died under us — drop the stale client and respawn only
-            # after the replacement environment passed preparation above.
-            await self._teardown_app_server()
+            # after strict replacement cleanup succeeds. A tmux kill can fail
+            # as a non-ok command result rather than an exception; that known
+            # failure must abort before the spawn boundary publishes a soul.
+            await self._teardown_app_server(strict=True)
 
         started_at = time.monotonic()
 
@@ -1252,11 +1268,10 @@ class CodexSession(TransportReplacementMixin):
                     server_request_handler=self._on_appserver_request,
                 )
             else:
-                assert direct_env is not None
                 self._app_client, self._app_proc = await spawn_app_server(
                     command=self._app_server_command,
                     cwd=self._working_dir,
-                    env=direct_env,
+                    env=self._build_codex_env(),
                     notification_handler=self._on_appserver_notification,
                     server_request_handler=self._on_appserver_request,
                     log=_log,
@@ -1324,31 +1339,57 @@ class CodexSession(TransportReplacementMixin):
             f"app_server_degraded_to_exec agent={self.agent_name} reason={reason}"
         )
 
-    async def _teardown_app_server(self) -> None:
-        """Close the client and kill the process. Idempotent."""
+    async def _teardown_app_server(self, *, strict: bool = False) -> None:
+        """Close the client and kill the process.
+
+        Ordinary shutdown is best-effort. Replacement uses ``strict=True`` so
+        a failed kill/wait remains observable, cached handles remain available
+        for a later cleanup attempt, and no replacement spawn can continue.
+        """
         self._report_appserver_terminal_stream_survivors(phase="teardown")
-        if self._app_client is not None:
+        client = self._app_client
+        proc = self._app_proc
+        if client is not None:
             try:
-                await self._app_client.close()
+                await client.close()
             except Exception:
                 pass
-            self._app_client = None
-        if self._app_proc is not None:
+            if not strict:
+                self._app_client = None
+        supervisor_cleaned = False
+        proc_cleaned = proc is None or proc.returncode is not None
+        if proc is not None:
             try:
-                if self._app_proc.returncode is None:
-                    self._app_proc.kill()
-                    await asyncio.wait_for(self._app_proc.wait(), timeout=5)
+                if proc.returncode is None:
+                    proc.kill()
+                    strict_wait = getattr(proc, "wait_strict", None)
+                    if strict and strict_wait is not None:
+                        await asyncio.wait_for(strict_wait(), timeout=5)
+                        supervisor_cleaned = True
+                    else:
+                        await asyncio.wait_for(proc.wait(), timeout=5)
+                    proc_cleaned = True
             except Exception:
-                pass
-            self._app_proc = None
+                if strict:
+                    raise
+            if not strict and proc_cleaned:
+                self._app_proc = None
         # A tmux supervisor may have started its shim but timed out/cancelled
         # before returning a client/proc adapter. Always run its idempotent
         # teardown so that partial spawn cannot leak a session or socket.
-        if self._use_tmux_app_server and self._app_supervisor is not None:
+        if (
+            self._use_tmux_app_server
+            and self._app_supervisor is not None
+            and not supervisor_cleaned
+        ):
             try:
-                await self._app_supervisor.teardown()
+                await self._app_supervisor.teardown(strict=strict)
             except Exception:
-                pass
+                if strict:
+                    raise
+        if strict:
+            self._app_client = None
+            self._app_proc = None
 
     def _appserver_config(self) -> dict:
         """Build the per-thread ``config`` override for MCP servers.

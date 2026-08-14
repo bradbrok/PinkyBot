@@ -142,6 +142,90 @@ def _write_managed_config(codex_home: Path, working_dir: Path, log: LogFn) -> No
     config_path.chmod(0o600)
 
 
+def _write_agent_soul(
+    codex_home: Path,
+    agent: object,
+    soul_version_store: object | None,
+) -> None:
+    """Atomically install the compiled agent soul in an isolated Codex home.
+
+    The caller has already proved that ``codex_home`` is not the shared home.
+    Replacing the directory entry from a same-directory temporary file also
+    prevents a linked ``AGENTS.md`` from redirecting the write outside the
+    isolated home. Existing content is versioned before replacement; the
+    installed content is versioned after publication.
+    """
+    publication = _validate_agent_soul_publication(
+        codex_home,
+        agent,
+        soul_version_store,
+    )
+    if publication is None:
+        return
+    content, agent_name, save_version, existing = publication
+    agents_path = codex_home / "AGENTS.md"
+    if existing is not None:
+        save_version(agent_name, existing, source="agent")
+
+    fd, temp_name = tempfile.mkstemp(
+        dir=codex_home,
+        prefix=".AGENTS.md-",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, agents_path)
+        _fsync_directory(codex_home)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    save_version(agent_name, content, source="spawn")
+
+
+def _validate_agent_soul_publication(
+    codex_home: Path,
+    agent: object,
+    soul_version_store: object | None,
+) -> tuple[str, str, Callable[..., object], str | None] | None:
+    """Return validated publication inputs without changing persistent state."""
+    content = getattr(agent, "system_prompt", "")
+    if not isinstance(content, str) or not content:
+        return None
+
+    agent_name = (getattr(agent, "agent_name", "") or "").strip()
+    save_version = getattr(soul_version_store, "save_soul_version", None)
+    if not agent_name or not callable(save_version):
+        raise RuntimeError(
+            "refusing Codex spawn: compiled agent soul cannot be versioned"
+        )
+
+    agents_path = codex_home / "AGENTS.md"
+    try:
+        agents_stat = agents_path.lstat()
+    except FileNotFoundError:
+        agents_stat = None
+    existing: str | None = None
+    if agents_stat is not None and not stat.S_ISLNK(agents_stat.st_mode):
+        try:
+            existing = agents_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(
+                f"refusing Codex spawn: existing agent soul cannot be read: {agents_path}"
+            ) from exc
+    return content, agent_name, save_version, existing
+
+
 def _ensure_auth_link(codex_home: Path, auth_source: Path) -> None:
     auth_path = codex_home / "auth.json"
     auth_target = auth_source.resolve(strict=True)
@@ -1536,18 +1620,23 @@ def _run_initial_rollout_migration(
         return result.moved
 
 
-def prepare_agent_codex_home(agent: object, *, log: LogFn) -> Path:
-    """Prepare the isolated home before a Codex process is spawned.
+def validate_agent_codex_home(
+    agent: object,
+    *,
+    soul_version_store: object | None = None,
+) -> Path:
+    """Validate an isolated home before teardown without changing the filesystem.
 
-    With the flag disabled this function performs no filesystem work. With it
-    enabled, auth absence is a hard error before launch, config generation is
-    non-destructive, and cwd-matched rollouts move into the isolated store.
+    This is the retained-transport preflight seam. Publication deliberately
+    does not happen here: a later task may inherit async context from the
+    replacement operation, while every actual process spawn must snapshot and
+    publish the soul for the state that exists at that exact boundary.
     """
     codex_home = codex_home_for(agent)
     if not per_agent_codex_home_enabled():
         return codex_home
 
-    working_dir = _agent_working_dir(agent)
+    _agent_working_dir(agent)
     shared_home = shared_codex_home().expanduser().resolve()
     resolved_home = codex_home.expanduser().resolve()
     if resolved_home == shared_home:
@@ -1559,6 +1648,48 @@ def prepare_agent_codex_home(agent: object, *, log: LogFn) -> Path:
             f"refusing Codex spawn: shared auth file is absent or unreadable: {auth_source}"
         )
 
+    auth_path = resolved_home / "auth.json"
+    try:
+        auth_stat = auth_path.lstat()
+    except FileNotFoundError:
+        auth_stat = None
+    if auth_stat is not None and not stat.S_ISLNK(auth_stat.st_mode):
+        raise RuntimeError(
+            f"refusing Codex spawn: {auth_path} is not the managed auth symlink"
+        )
+
+    _validate_agent_soul_publication(
+        resolved_home,
+        agent,
+        soul_version_store,
+    )
+    _migration_lock_timeout_seconds()
+    return resolved_home
+
+
+def prepare_agent_codex_home(
+    agent: object,
+    *,
+    log: LogFn,
+    soul_version_store: object | None = None,
+) -> Path:
+    """Prepare the isolated home at the actual Codex process-spawn boundary.
+
+    With the flag disabled this function performs no filesystem work. With it
+    enabled, auth absence is a hard error before launch, config generation is
+    non-destructive, the compiled soul is installed with version snapshots,
+    and cwd-matched rollouts move into the isolated store.
+    """
+    resolved_home = validate_agent_codex_home(
+        agent,
+        soul_version_store=soul_version_store,
+    )
+    if not per_agent_codex_home_enabled():
+        return resolved_home
+
+    working_dir = _agent_working_dir(agent)
+    shared_home = shared_codex_home().expanduser().resolve()
+    auth_source = shared_home / "auth.json"
     resolved_home.mkdir(parents=True, exist_ok=True)
     resolved_home.chmod(0o700)
     sessions = resolved_home / "sessions"
@@ -1566,6 +1697,7 @@ def prepare_agent_codex_home(agent: object, *, log: LogFn) -> Path:
     sessions.chmod(0o700)
     _write_managed_config(resolved_home, working_dir, log)
     _ensure_auth_link(resolved_home, auth_source)
+    _write_agent_soul(resolved_home, agent, soul_version_store)
 
     moved = _run_initial_rollout_migration(
         shared_home,
