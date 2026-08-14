@@ -89,6 +89,17 @@ def _rollout(home: Path, name: str, cwd: Path) -> Path:
     return path
 
 
+def _mark_tmux_server_socket(tmp_path: Path, monkeypatch) -> Path:
+    """Make the verifier take its server-alive session-listing leg."""
+    tmux_tmpdir = tmp_path / "tmux-tmp"
+    socket_path = tmux_tmpdir / f"tmux-{os.getuid()}" / "default"
+    socket_path.parent.mkdir(parents=True)
+    socket_path.touch()
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmux_tmpdir))
+    return socket_path
+
+
 def test_flag_off_preserves_shared_path_and_performs_no_bootstrap(tmp_path, monkeypatch):
     shared_home = tmp_path / "shared"
     working_dir = tmp_path / "agent"
@@ -2416,6 +2427,8 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
     _auth(shared_home)
     monkeypatch.setenv("CODEX_HOME", str(shared_home))
     monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    monkeypatch.delenv("TMUX", raising=False)
+    monkeypatch.setenv("TMUX_TMPDIR", str(tmp_path / "absent-tmux"))
     config = StreamingSessionConfig(
         agent_name="test-agent",
         working_dir=str(working_dir),
@@ -2450,7 +2463,7 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
 
     async def _tmux_run(*args, timeout=5.0, stdin_data=None):
         tmux_calls.append(args)
-        if args[0] in {"kill-session", "has-session"}:
+        if args[0] == "kill-session":
             return absent_server
         raise AssertionError(f"unexpected direct tmux call: {args}")
 
@@ -2488,7 +2501,7 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
 
     assert isinstance(client, _Client)
     assert isinstance(proc, _TmuxAppServerProc)
-    assert [call[0] for call in tmux_calls] == ["kill-session", "has-session"]
+    assert [call[0] for call in tmux_calls] == ["kill-session"]
     assert build_env_calls == 1
     assert new_session_calls == 1
     assert client_start_calls == 1
@@ -2511,26 +2524,26 @@ async def test_tmux_repl_stale_kill_already_gone_race_proceeds(
     )
     tmux = _TmuxControl("pinky-test-agent")
     session = TmuxSession(config, tmux_control=tmux)
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
     tmux_calls: list[tuple[str, ...]] = []
-    has_session_calls = 0
-    absent_server = TmuxCommandResult(
+    failed_kill = TmuxCommandResult(
         returncode=1,
         stdout="",
-        stderr=("error connecting to /private/tmp/tmux-501/pinky-test (No such file or directory)"),
+        stderr="target disappeared during kill",
     )
 
     async def _tmux_run(*args, timeout=5.0, stdin_data=None):
-        nonlocal has_session_calls
         tmux_calls.append(args)
         if args[0] == "has-session":
-            has_session_calls += 1
-            if has_session_calls == 1:
-                return TmuxCommandResult(returncode=0, stdout="", stderr="")
-            if has_session_calls == 2:
-                return absent_server
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         if args[0] == "kill-session":
-            return absent_server
+            return failed_kill
+        if args[0] == "list-sessions":
+            return TmuxCommandResult(
+                returncode=0,
+                stdout="pinky-some-other-session\n",
+                stderr="",
+            )
         if args[0] == "new-session":
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected tmux call: {args}")
@@ -2568,7 +2581,7 @@ async def test_tmux_repl_stale_kill_already_gone_race_proceeds(
     assert [call[0] for call in tmux_calls] == [
         "has-session",
         "kill-session",
-        "has-session",
+        "list-sessions",
         "new-session",
         "has-session",
     ]
@@ -2607,6 +2620,7 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
         agent_config=config,
         soul_version_store=soul_store,
     )
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
     build_env_calls = 0
     tmux_calls: list[tuple[str, ...]] = []
     real_build_env = supervisor._build_env
@@ -2619,8 +2633,12 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
                 stdout="",
                 stderr="stale session still alive",
             )
-        if args[0] == "has-session":
-            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if args[0] == "list-sessions":
+            return TmuxCommandResult(
+                returncode=0,
+                stdout=f"{supervisor.session_name}\n",
+                stderr="",
+            )
         raise AssertionError(f"unexpected direct tmux call: {args}")
 
     async def _unexpected_new_session(**_kwargs):
@@ -2639,9 +2657,106 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
         await supervisor.start()
 
     assert build_env_calls == 0
-    assert [call[0] for call in tmux_calls] == ["kill-session", "has-session"]
+    assert [call[0] for call in tmux_calls] == ["kill-session", "list-sessions"]
     assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
     assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tmux_app_server_permission_probe_refuses_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """R7: a returned verifier error is not proof that the target is absent."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    supervisor = CodexAppServerSupervisor(
+        "test-agent",
+        working_dir=str(working_dir),
+        agent_config=config,
+        soul_version_store=soul_store,
+    )
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+    build_env_calls = 0
+    permission_error = TmuxCommandResult(
+        returncode=1,
+        stdout="",
+        stderr="couldn't create directory /blocked/tmux-501 (Permission denied)",
+    )
+    real_build_env = supervisor._build_env
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] in {"kill-session", "list-sessions"}:
+            return permission_error
+        raise AssertionError(f"unexpected direct tmux call: {args}")
+
+    async def _unexpected_new_session(**_kwargs):
+        raise AssertionError("new_session reached after verifier error")
+
+    def _tracked_build_env():
+        nonlocal build_env_calls
+        build_env_calls += 1
+        return real_build_env()
+
+    monkeypatch.setattr(supervisor._tmux, "_run", _tmux_run)
+    monkeypatch.setattr(supervisor._tmux, "new_session", _unexpected_new_session)
+    monkeypatch.setattr(supervisor, "_build_env", _tracked_build_env)
+
+    with pytest.raises(RuntimeError, match="kill-session failed"):
+        await supervisor.start()
+
+    assert [call[0] for call in tmux_calls] == ["kill-session", "list-sessions"]
+    assert build_env_calls == 0
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tmux_kill_session_listing_timeout_propagates(tmp_path, monkeypatch):
+    """R7: exceptions from the positive-absence verifier remain terminal."""
+    control = _TmuxControl("pinky-test-agent")
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] == "kill-session":
+            return TmuxCommandResult(
+                returncode=1,
+                stdout="",
+                stderr="kill transport failed",
+            )
+        if args[0] == "list-sessions":
+            raise asyncio.TimeoutError("tmux verifier timed out")
+        raise AssertionError(f"unexpected direct tmux call: {args}")
+
+    monkeypatch.setattr(control, "_run", _tmux_run)
+
+    with pytest.raises(asyncio.TimeoutError, match="tmux verifier timed out"):
+        await control.kill_session()
+
+    assert [call[0] for call in tmux_calls] == ["kill-session", "list-sessions"]
 
 
 @pytest.mark.asyncio
@@ -2801,6 +2916,7 @@ async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
     agents_md = working_dir / ".codex" / "AGENTS.md"
     agents_md.write_text("self edit before replacement", encoding="utf-8")
     session = CodexTmuxSession(config, registry=soul_store)
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
     tmux_calls: list[tuple[str, ...]] = []
 
     async def _noop(*_args, **_kwargs):
@@ -2815,6 +2931,12 @@ async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
                 returncode=1,
                 stdout="",
                 stderr="stale session still alive",
+            )
+        if args[0] == "list-sessions":
+            return TmuxCommandResult(
+                returncode=0,
+                stdout=f"{session._session_name}\n",
+                stderr="",
             )
         raise AssertionError(f"unexpected direct tmux call: {args}")
 
@@ -2845,7 +2967,87 @@ async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
     assert [call[0] for call in tmux_calls] == [
         "has-session",
         "kill-session",
+        "list-sessions",
+    ]
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tmux_repl_permission_probe_refuses_before_publication(
+    tmp_path,
+    monkeypatch,
+):
+    """R7 sibling: returned verifier errors gate shared REPL publication."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    session = CodexTmuxSession(config, registry=soul_store)
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+    permission_error = TmuxCommandResult(
+        returncode=1,
+        stdout="",
+        stderr="couldn't create directory /blocked/tmux-501 (Permission denied)",
+    )
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] == "has-session":
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if args[0] in {"kill-session", "list-sessions"}:
+            return permission_error
+        raise AssertionError(f"unexpected direct tmux call: {args}")
+
+    async def _unexpected_new_session(**_kwargs):
+        raise AssertionError("new_session reached after verifier error")
+
+    monkeypatch.setattr(
+        session,
+        "_container_agent",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        session,
+        "_select_command_runner",
+        lambda _container_agent: session._tmux._runner,
+    )
+    monkeypatch.setattr(session, "_ensure_container_started", _noop)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._seed_claude_trust_file",
+        lambda _path, _cwd: False,
+    )
+    monkeypatch.setattr(session._tmux, "_run", _tmux_run)
+    monkeypatch.setattr(session._tmux, "new_session", _unexpected_new_session)
+
+    with pytest.raises(RuntimeError, match="kill-session failed"):
+        await session._spawn_tmux_repl()
+
+    assert [call[0] for call in tmux_calls] == [
         "has-session",
+        "kill-session",
+        "list-sessions",
     ]
     assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
     assert soul_store.calls == []

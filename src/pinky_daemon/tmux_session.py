@@ -642,6 +642,54 @@ class _TmuxControl:
         result = await self._run("has-session", "-t", self.session_name)
         return result.ok
 
+    def _local_socket_path(self) -> Path | None:
+        """Return the socket path used by a locally executed tmux command.
+
+        A missing socket is the one stderr-independent proof that a failed
+        command cannot have left a live server behind.  Wrapped runners may
+        execute in another filesystem namespace, so their socket cannot be
+        safely statted from the daemon process and deliberately returns
+        ``None``.
+        """
+        if not isinstance(self._runner, LocalCommandRunner):
+            return None
+        if not self.socket_name:
+            inherited = os.environ.get("TMUX", "")
+            inherited_parts = inherited.rsplit(",", 2)
+            if len(inherited_parts) == 3 and inherited_parts[0]:
+                return Path(inherited_parts[0])
+        socket_dir = Path(os.environ.get("TMUX_TMPDIR") or "/tmp")
+        return socket_dir / f"tmux-{os.getuid()}" / (self.socket_name or "default")
+
+    def _server_socket_is_missing(self) -> bool:
+        """Return True only when local socket absence is positively known."""
+        socket_path = self._local_socket_path()
+        if socket_path is None:
+            return False
+        try:
+            os.lstat(socket_path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            # Permission, transport, and other stat errors are not absence.
+            return False
+        return False
+
+    async def _session_absence_is_verified(self) -> bool:
+        """Prove the owned target absent without classifying tmux stderr."""
+        if self._server_socket_is_missing():
+            return True
+        listing = await self._run("list-sessions", "-F", "#{session_name}")
+        if not listing.ok:
+            return False
+        session_names = listing.stdout.splitlines()
+        # A live tmux server cannot successfully enumerate zero sessions.
+        # Treat empty/malformed output conservatively instead of inventing
+        # absence from an ambiguous result.
+        if not session_names or any(not name for name in session_names):
+            return False
+        return self.session_name not in session_names
+
     async def new_session(
         self,
         *,
@@ -673,11 +721,12 @@ class _TmuxControl:
             return result
         # Do not classify absence from stderr: tmux versions and platforms use
         # different text for a missing session versus a missing server/socket.
-        # Verify the owned target's state after the failed kill instead. A
-        # session still reported alive preserves the original failure so strict
-        # replacement callers fail closed; an already-gone target makes the
-        # kill idempotently successful. Probe exceptions still propagate.
-        if not await self.has_session():
+        # Positive absence is either a missing local server socket, or an rc=0
+        # session enumeration which omits the owned target. Non-ok probes,
+        # ambiguous output, stat errors, and a still-listed target all preserve
+        # the original failure so strict replacement callers fail closed.
+        # Probe exceptions still propagate.
+        if await self._session_absence_is_verified():
             return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
         return result
 
