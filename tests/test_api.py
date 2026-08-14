@@ -1456,17 +1456,16 @@ class TestAPI:
                 assert "boom" in r.text
                 assert client.get("/agents/tenant").status_code == 404  # rolled back
 
-    def test_register_upsert_keeps_existing_agent_on_provision_failure(self, monkeypatch):
-        """#638: POST /agents is an UPSERT — a provision failure must only roll
-        back a NEWLY created agent. A pre-existing agent re-POSTed through a
-        failing provisioner is KEPT (500 says so explicitly): hard-deleting it
-        over a transient podman error would destroy a live tenant."""
+    def test_register_collision_never_reprovisions_existing_agent(self, monkeypatch):
+        """Create rollback remains, while collisions stop before provisioning."""
         from pinky_daemon import provisioning
 
         fail = {"on": False}
+        provision_calls = []
 
         class _TogglableProv:
             def provision(self, agent):
+                provision_calls.append(agent.name)
                 if fail["on"]:
                     return provisioning.ProvisionResult(
                         ok=False, mode="container", message="podman flaked"
@@ -1491,18 +1490,20 @@ class TestAPI:
                 assert "existing agent kept" not in r.text  # new-agent branch
                 assert client.get("/agents/newbie").status_code == 404
 
-                # Case B: agent exists (provision succeeded), then a re-POST
-                # hits a failing provisioner -> 500 but the agent SURVIVES.
+                # Case B: once the agent exists, re-POST is a DB collision.
+                # It never reaches the now-failing provisioner and the winner
+                # remains unchanged.
                 fail["on"] = False
                 r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
                 assert r.status_code == 200
+                calls_before_collision = list(provision_calls)
 
                 fail["on"] = True
-                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
-                assert r.status_code == 500
-                assert "podman flaked" in r.text
-                assert "existing agent kept" in r.text
+                r = client.post("/agents", json={"name": "tenant", "model": "haiku"})
+                assert r.status_code == 409
+                assert provision_calls == calls_before_collision
                 assert client.get("/agents/tenant").status_code == 200  # NOT deleted
+                assert client.get("/agents/tenant").json()["model"] == "sonnet"
 
     def test_container_agent_mcp_json_carries_bearer_auth(self, monkeypatch):
         """#638/#623: a container agent's .mcp.json points every pinky-* server
@@ -5660,6 +5661,243 @@ class TestAgentCRUD:
         data = resp.json()
         assert data["display_name"] == "Bob"
         assert data["soul"] == "You are Bob, a helpful assistant."
+
+    def test_post_existing_returns_409_without_mutation(self, tmp_path):
+        client = self._make_client()
+        original = "winner-private-soul"
+        payload = {
+            "name": "alice",
+            "model": "opus",
+            "soul": original,
+            "working_dir": str(tmp_path / "alice"),
+        }
+        assert client.post("/agents", json=payload).status_code == 200
+
+        collision = client.post(
+            "/agents",
+            json={
+                **payload,
+                "model": "haiku",
+                "soul": "loser-must-not-land",
+                "working_dir": str(tmp_path / "loser"),
+            },
+        )
+
+        assert collision.status_code == 409
+        current = client.get("/agents/alice").json()
+        assert current["model"] == "opus"
+        assert current["soul"] == original
+        assert current["working_dir"] == str(tmp_path / "alice")
+        assert not (tmp_path / "loser").exists()
+
+    def test_concurrent_double_post_has_one_db_winner(self, tmp_path):
+        from pinky_daemon.api import create_api
+
+        db_path = str(tmp_path / "agents.db")
+        app_a = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        app_b = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        barrier = threading.Barrier(2)
+        responses = []
+        payloads = [
+            {
+                "name": "race",
+                "display_name": "First",
+                "model": "opus",
+                "soul": "first-private-soul",
+                "working_dir": str(tmp_path / "first"),
+            },
+            {
+                "name": "race",
+                "display_name": "Second",
+                "model": "haiku",
+                "soul": "second-private-soul",
+                "working_dir": str(tmp_path / "second"),
+            },
+        ]
+
+        def post(client, payload):
+            barrier.wait(timeout=5)
+            responses.append((payload, client.post("/agents", json=payload)))
+
+        with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+            threads = [
+                threading.Thread(target=post, args=(client_a, payloads[0])),
+                threading.Thread(target=post, args=(client_b, payloads[1])),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            assert all(not thread.is_alive() for thread in threads)
+
+            assert sorted(response.status_code for _, response in responses) == [200, 409]
+            winning_payload, winning_response = next(
+                pair for pair in responses if pair[1].status_code == 200
+            )
+            losing_payload, _ = next(
+                pair for pair in responses if pair[1].status_code == 409
+            )
+            current = client_a.get("/agents/race").json()
+            assert winning_response.json()["soul"] == winning_payload["soul"]
+            assert current["display_name"] == winning_payload["display_name"]
+            assert current["model"] == winning_payload["model"]
+            assert current["soul"] == winning_payload["soul"]
+            assert current["working_dir"] == winning_payload["working_dir"]
+            assert not Path(losing_payload["working_dir"]).exists()
+
+    def test_absent_soul_is_noop_empty_rejects_and_force_snapshots(self, tmp_path):
+        client = self._make_client()
+        original = (
+            "# Alice\n\n## IDENTITY\n- **Name:** Alice\n- **Role:** Lead\n\n"
+            + "private-old-soul-" * 12
+        )
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "display_name": "Alice",
+                "soul": original,
+                "working_dir": str(tmp_path / "alice"),
+            },
+        ).status_code == 200
+        registry = client.app.state.agents
+        assert registry.get_soul_versions("alice") == []
+
+        absent = client.put("/agents/alice", json={"model": "sonnet"})
+        assert absent.status_code == 200
+        assert absent.json()["soul"] == original
+        assert registry.get_soul_versions("alice") == []
+
+        rejected = client.put("/agents/alice", json={"soul": ""})
+        assert rejected.status_code == 400
+        detail = rejected.json()["detail"]
+        assert detail == {
+            "code": "soul_mutation_requires_force",
+            "old_length": len(original),
+            "new_length": 0,
+            "shrink_percent": 100.0,
+            "missing_anchors": [
+                "agent_heading",
+                "identity_heading",
+                "name_label",
+                "role_label",
+            ],
+        }
+        assert "private-old-soul" not in rejected.text
+        assert registry.get("alice").soul == original
+        assert registry.get_soul_versions("alice") == []
+
+        forced = client.put(
+            "/agents/alice",
+            json={"soul": "", "force_soul": True},
+        )
+        assert forced.status_code == 200
+        assert forced.json()["soul"] == ""
+        versions = registry.get_soul_versions("alice")
+        assert len(versions) == 1
+        assert versions[0]["source"] == "api-put-force:before"
+        assert registry.get_soul_version("alice", versions[0]["id"])["content"] == original
+
+    def test_direct_claude_md_write_uses_guard_and_force_snapshot(self, tmp_path):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        original = "private-file-soul-" * 10
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": original,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        claude_md = work_dir / "CLAUDE.md"
+        assert not claude_md.exists()
+
+        rejected = client.put(
+            "/agents/alice/files/CLAUDE.md",
+            json={"content": "short"},
+        )
+        assert rejected.status_code == 400
+        assert "private-file-soul" not in rejected.text
+        assert not claude_md.exists()
+        assert client.app.state.agents.get_soul_versions("alice") == []
+
+        forced = client.put(
+            "/agents/alice/files/CLAUDE.md",
+            json={"content": "short", "force_soul": True},
+        )
+        assert forced.status_code == 200
+        assert claude_md.read_text() == "short"
+        versions = client.app.state.agents.get_soul_versions("alice")
+        assert len(versions) == 1
+        assert versions[0]["source"] == "api-file-force:before-file"
+        assert client.app.state.agents.get_soul_version(
+            "alice", versions[0]["id"]
+        )["content"] == original
+
+        alias = work_dir / "soul-link"
+        alias.symlink_to(claude_md.name)
+        alias_rejected = client.put(
+            "/agents/alice/files/soul-link",
+            json={"content": ""},
+        )
+        assert alias_rejected.status_code == 400
+        assert claude_md.read_text() == "short"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+        lowercase_rejected = client.put(
+            "/agents/alice/files/claude.md",
+            json={"content": ""},
+        )
+        assert lowercase_rejected.status_code == 400
+        assert claude_md.read_text() == "short"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+    def test_restore_shorter_soul_requires_explicit_force(self, tmp_path):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        original = "private-current-soul-" * 12
+        target = "old-short-soul"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": original,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        work_dir.mkdir(parents=True, exist_ok=True)
+        claude_md = work_dir / "CLAUDE.md"
+        claude_md.write_text(original)
+        registry = client.app.state.agents
+        version_id = registry.save_soul_version("alice", target, source="fixture")
+
+        rejected = client.post(f"/agents/alice/soul/versions/{version_id}/restore")
+        assert rejected.status_code == 400
+        assert "private-current-soul" not in rejected.text
+        assert registry.get("alice").soul == original
+        assert claude_md.read_text() == original
+        assert len(registry.get_soul_versions("alice")) == 1
+
+        restored = client.post(
+            f"/agents/alice/soul/versions/{version_id}/restore",
+            json={"force_soul": True},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["force_soul"] is True
+        assert registry.get("alice").soul == target
+        assert claude_md.read_text() == target
+        sources = [row["source"] for row in registry.get_soul_versions("alice")]
+        assert "restore-v%d-force:before" % version_id in sources
+        assert "restore-v%d-force:before-file" % version_id in sources
 
     def test_list_agents_empty(self):
         client = self._make_client()

@@ -50,7 +50,12 @@ from fastapi.staticfiles import StaticFiles
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
-from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
+from pinky_daemon.agent_registry import (
+    AgentAlreadyExistsError,
+    AgentRegistry,
+    ScheduleNameConflictError,
+    SoulMutationRejectedError,
+)
 from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.api_models import (
     AddDirectiveRequest,
@@ -88,6 +93,7 @@ from pinky_daemon.api_models import (
     RecordHeartbeatRequest,
     RegisterAgentRequest,
     RestartResponse,
+    RestoreSoulVersionRequest,
     SearchResponse,
     SendAgentMessageRequest,
     SendMessageRequest,
@@ -109,6 +115,7 @@ from pinky_daemon.api_models import (
     UpdateMcpServerRequest,
     UpdatePasswordRequest,
     UpdateScheduleRequest,
+    WriteAgentFileRequest,
 )
 from pinky_daemon.app_store import AppStore
 from pinky_daemon.auth import (
@@ -6309,16 +6316,71 @@ npm run build</pre>
 
     # ── Agent Registry Endpoints ────────────────────────────
 
+    def _guard_soul_or_400(
+        agent,
+        old_content: str,
+        new_content: str,
+        *,
+        force_soul: bool,
+    ) -> None:
+        try:
+            agents.guard_soul_mutation(
+                agent.name,
+                old_content,
+                new_content,
+                display_name=agent.display_name,
+                force_soul=force_soul,
+            )
+        except SoulMutationRejectedError as exc:
+            # Deliberately content-free: HTTP errors routinely land in client
+            # logs, MCP transcripts, and operator consoles.
+            raise HTTPException(
+                400,
+                {
+                    "code": "soul_mutation_requires_force",
+                    **exc.summary.to_dict(),
+                },
+            ) from exc
+
+    def _write_guarded_soul_file(
+        agent,
+        path: Path,
+        content: str,
+        *,
+        force_soul: bool,
+        source: str,
+    ) -> bool:
+        """Snapshot and replace a CLAUDE.md, returning whether it changed."""
+        path_existed = path.exists()
+        old_content = path.read_text() if path_existed else agent.soul
+        if path_existed and old_content == content:
+            return False
+        _guard_soul_or_400(
+            agent,
+            old_content,
+            content,
+            force_soul=force_soul,
+        )
+        agents.snapshot_soul_before_mutation(
+            agent.name,
+            old_content,
+            source=f"{source}:before-file",
+        )
+        path.write_text(content)
+        return True
+
     @app.post("/agents")
     async def register_agent(req: RegisterAgentRequest, request: Request):
-        """Register a new agent or update an existing one."""
-        # #149: registering/upserting agents is an ADMIN capability. This is the
-        # agent-mint/upsert collection route — it has no target agent in the
+        """Register a new agent; existing names are updated only via PUT."""
+        # #149: registering agents is an ADMIN capability. This is the
+        # agent-mint collection route — it has no target agent in the
         # PATH, so the middleware's path-based isolation guard can't see it
         # (target is None → flows through). An isolated tenant reaching here with
         # a valid signature could mint a new full-trust agent OR upsert an
-        # existing record (including dropping its OWN isolated flag — a direct
-        # escape). Deny the whole route for isolated callers; agents are minted
+        # existing record under the historical upsert contract (including
+        # dropping its OWN isolated flag — a direct escape). POST is now
+        # create-only, but minting still remains admin-only. Deny the whole
+        # route for isolated callers; agents are minted
         # by an operator/admin, never self-served by a tenant. (Murzik #635
         # re-review catch.) Operator/browser sessions carry no internal-agent
         # header → caller "" → not isolated → unaffected.
@@ -6326,48 +6388,50 @@ npm run build</pre>
         if _is_isolated_agent(caller):
             _log(
                 f"isolation: denied isolated agent '{caller}' from POST /agents "
-                f"(admin mint/upsert, body name='{req.name}')"
+                f"(admin mint, body name='{req.name}')"
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
-        # POST /agents is an UPSERT — remember whether this name already
-        # existed so a provisioning failure below rolls back only a NEWLY
-        # created agent. Hard-deleting a pre-existing agent (row + signing
-        # key) over a transient podman error would destroy a live tenant.
-        agent_existed_before = agents.get(req.name) is not None
-        agent = agents.register(
-            req.name,
-            display_name=req.display_name,
-            model=req.model,
-            soul=req.soul,
-            users=req.users,
-            boundaries=req.boundaries,
-            system_prompt=req.system_prompt,
-            working_dir=req.working_dir,
-            permission_mode=req.permission_mode,
-            allowed_tools=req.allowed_tools,
-            max_turns=req.max_turns,
-            timeout=req.timeout,
-            max_sessions=req.max_sessions,
-            plain_text_fallback=req.plain_text_fallback,
-            groups=req.groups,
-            auto_start=req.auto_start,
-            role=req.role,
-            heartbeat_interval=req.heartbeat_interval,
-            runtime=req.runtime,
-            transport=req.transport,
-            provider_url=req.provider_url,
-            provider_key=req.provider_key,
-            provider_model=req.provider_model,
-            provider_ref=req.provider_ref,
-            codex_home=req.codex_home,
-            thinking_effort=req.thinking_effort,
-            strict_effort_enforcement=req.strict_effort_enforcement,
-            dedicated_config_dir=req.dedicated_config_dir,
-            watchdog_config=req.watchdog_config or {},
-            isolated=req.isolated,
-            isolation_mode=req.isolation_mode,
-            container_image=req.container_image,
-        )
+        # No availability read: agents.name is a PRIMARY KEY and the registry
+        # executes INSERT OR ABORT. That database decision is authoritative
+        # when concurrent clients race on the same name.
+        try:
+            agent = agents.register(
+                req.name,
+                create_only=True,
+                display_name=req.display_name,
+                model=req.model,
+                soul=req.soul,
+                users=req.users,
+                boundaries=req.boundaries,
+                system_prompt=req.system_prompt,
+                working_dir=req.working_dir,
+                permission_mode=req.permission_mode,
+                allowed_tools=req.allowed_tools,
+                max_turns=req.max_turns,
+                timeout=req.timeout,
+                max_sessions=req.max_sessions,
+                plain_text_fallback=req.plain_text_fallback,
+                groups=req.groups,
+                auto_start=req.auto_start,
+                role=req.role,
+                heartbeat_interval=req.heartbeat_interval,
+                runtime=req.runtime,
+                transport=req.transport,
+                provider_url=req.provider_url,
+                provider_key=req.provider_key,
+                provider_model=req.provider_model,
+                provider_ref=req.provider_ref,
+                codex_home=req.codex_home,
+                thinking_effort=req.thinking_effort,
+                strict_effort_enforcement=req.strict_effort_enforcement,
+                dedicated_config_dir=req.dedicated_config_dir,
+                watchdog_config=req.watchdog_config or {},
+                isolated=req.isolated,
+                isolation_mode=req.isolation_mode,
+                container_image=req.container_image,
+            )
+        except AgentAlreadyExistsError as exc:
+            raise HTTPException(409, f"Agent '{req.name}' already exists") from exc
         # Provision OS-level isolation resources. No-op for local (the default);
         # gated for container — when the runtime gate is OFF, get_provisioner
         # raises NotImplementedError and we skip (the start-time guard then
@@ -6398,19 +6462,10 @@ npm run build</pre>
                     ok=False, mode=agent.isolation_mode, message=str(e)
                 )
             if not result.ok:
-                if not agent_existed_before:
-                    agents.delete(agent.name)  # roll back the NEW registration
-                    raise HTTPException(
-                        500, f"provisioning failed for '{agent.name}': {result.message}"
-                    )
-                # Pre-existing agent: keep the (updated) record — the cold-start
-                # ensure_started path re-provisions lazily once the cause is
-                # fixed. Deleting here would destroy a live tenant over a
-                # transient runtime error.
+                agents.delete(agent.name)  # roll back the NEW registration
                 raise HTTPException(
                     500,
-                    f"provisioning failed for '{agent.name}': {result.message} "
-                    f"(existing agent kept; it will re-provision at next start)",
+                    f"provisioning failed for '{agent.name}': {result.message}",
                 )
         # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
         work_dir = Path(agent.working_dir) if agent.working_dir else None
@@ -7121,6 +7176,7 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        force_soul = bool(kwargs.pop("force_soul", False))
         # #638: flipping an agent to a non-local isolation_mode implies
         # isolated=True (same coupling RegisterAgentRequest enforces) — without
         # it a container tenant updated via PUT would keep isolated=False and
@@ -7144,7 +7200,21 @@ npm run build</pre>
                 "(bring-your-own image, e.g. 'registry/image:tag')",
             )
         was_container = getattr(existing, "isolation_mode", "local") == "container"
-        agent = agents.register(name, **kwargs)
+        try:
+            agent = agents.register(
+                name,
+                **kwargs,
+                force_soul=force_soul,
+                soul_source="api-put-force" if force_soul else "api-put",
+            )
+        except SoulMutationRejectedError as exc:
+            raise HTTPException(
+                400,
+                {
+                    "code": "soul_mutation_requires_force",
+                    **exc.summary.to_dict(),
+                },
+            ) from exc
 
         isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
         if isolation_touched:
@@ -7570,18 +7640,70 @@ npm run build</pre>
         return version
 
     @app.post("/agents/{name}/soul/versions/{version_id}/restore")
-    async def restore_soul_version(name: str, version_id: int):
+    async def restore_soul_version(
+        name: str,
+        version_id: int,
+        req: RestoreSoulVersionRequest | None = None,
+    ):
         """Restore an agent's soul from an archived version."""
         version = agents.get_soul_version(name, version_id)
         if not version:
             raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
-        agent = agents.register(name, soul=version["content"])
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        force_soul = bool(req and req.force_soul)
         work_dir = Path(agent.working_dir or default_working_dir).resolve()
         work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "CLAUDE.md").write_text(version["content"])
-        agents.save_soul_version(name, version["content"], source=f"restore-v{version_id}")
+        claude_md = work_dir / "CLAUDE.md"
+
+        # Validate both durable representations before changing either. Inc 2
+        # will make the dedicated soul endpoint own cross-store consistency;
+        # this keeps the existing restore adapter from bypassing Inc 1 policy.
+        _guard_soul_or_400(
+            agent,
+            agent.soul,
+            version["content"],
+            force_soul=force_soul,
+        )
+        if claude_md.exists():
+            _guard_soul_or_400(
+                agent,
+                claude_md.read_text(),
+                version["content"],
+                force_soul=force_soul,
+            )
+
+        source = f"restore-v{version_id}" + ("-force" if force_soul else "")
+        try:
+            agents.register(
+                name,
+                soul=version["content"],
+                force_soul=force_soul,
+                soul_source=source,
+            )
+        except SoulMutationRejectedError as exc:  # defensive after preflight
+            raise HTTPException(
+                400,
+                {
+                    "code": "soul_mutation_requires_force",
+                    **exc.summary.to_dict(),
+                },
+            ) from exc
+        _write_guarded_soul_file(
+            agent,
+            claude_md,
+            version["content"],
+            force_soul=force_soul,
+            source=source,
+        )
         _log(f"api: restored soul version {version_id} for {name}")
-        return {"restored": True, "agent": name, "version_id": version_id}
+        return {
+            "restored": True,
+            "agent": name,
+            "version_id": version_id,
+            "force_soul": force_soul,
+        }
 
     @app.delete("/agents/{name}")
     async def retire_agent(name: str):
@@ -10242,7 +10364,7 @@ npm run build</pre>
         return {"name": filename, "content": file_path.read_text(errors="replace")}
 
     @app.put("/agents/{name}/files/{filename}")
-    async def write_agent_file(name: str, filename: str, req: SendMessageRequest):
+    async def write_agent_file(name: str, filename: str, req: WriteAgentFileRequest):
         """Write a heart file to the agent's working directory.
 
         Uses content field for file contents.
@@ -10256,9 +10378,22 @@ npm run build</pre>
         # Safety check (resolve first; is_relative_to avoids prefix pitfalls)
         if not file_path.resolve().is_relative_to(work_dir):
             raise HTTPException(403, "Access denied")
-        file_path.write_text(req.content)
-        if filename == "CLAUDE.md":
-            agents.save_soul_version(name, req.content, source="api")
+        claude_md = work_dir / "CLAUDE.md"
+        is_soul_file = filename.casefold() == "claude.md"
+        if not is_soul_file and file_path.exists() and claude_md.exists():
+            # A symlink or case-insensitive alias must not turn the generic
+            # heart-file writer into a CLAUDE.md guard bypass.
+            is_soul_file = file_path.samefile(claude_md)
+        if is_soul_file:
+            _write_guarded_soul_file(
+                agent,
+                file_path,
+                req.content,
+                force_soul=req.force_soul,
+                source="api-file-force" if req.force_soul else "api-file",
+            )
+        else:
+            file_path.write_text(req.content)
         _log(f"api: wrote {filename} to {work_dir} for agent {name}")
         return {"written": True, "name": filename, "size": len(req.content)}
 

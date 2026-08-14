@@ -53,6 +53,13 @@ class SendMessageRequest(BaseModel):
     content: str
 
 
+class WriteAgentFileRequest(BaseModel):
+    """Write an agent-owned file, with an explicit soul safety override."""
+
+    content: str
+    force_soul: bool = False
+
+
 class AuthSetupRequest(BaseModel):
     """Create the initial UI password."""
 
@@ -443,6 +450,9 @@ class UpdateAgentRequest(BaseModel):
     # refuses to actually *run* a mode whose provisioner isn't implemented yet.
     isolation_mode: str | None = None
     container_image: str | None = None  # bring-your-own image for mode=container; None = leave unchanged
+    # Safety override for an explicitly supplied soul replacement. This is an
+    # API control only and is never persisted as agent configuration.
+    force_soul: bool = False
 
     @field_validator("isolation_mode")
     @classmethod
@@ -455,6 +465,12 @@ class UpdateAgentRequest(BaseModel):
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
             )
         return v
+
+
+class RestoreSoulVersionRequest(BaseModel):
+    """Restore an archived soul, optionally accepting destructive shrink."""
+
+    force_soul: bool = False
 
 
 class ContainerizeRequest(BaseModel):

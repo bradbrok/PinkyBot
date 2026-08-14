@@ -770,6 +770,36 @@ class ScheduleNameConflictError(ValueError):
     """An enabled schedule already uses the requested agent/name pair."""
 
 
+class AgentAlreadyExistsError(ValueError):
+    """A create-only registration collided with an existing agent name."""
+
+
+@dataclass(frozen=True)
+class SoulMutationSummary:
+    """Content-free evidence explaining why a soul replacement is risky."""
+
+    old_length: int
+    new_length: int
+    shrink_percent: float
+    missing_anchors: tuple[str, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "old_length": self.old_length,
+            "new_length": self.new_length,
+            "shrink_percent": self.shrink_percent,
+            "missing_anchors": list(self.missing_anchors),
+        }
+
+
+class SoulMutationRejectedError(ValueError):
+    """A soul replacement needs an explicit force flag before it may run."""
+
+    def __init__(self, summary: SoulMutationSummary) -> None:
+        super().__init__("soul mutation rejected by shrink/identity guard")
+        self.summary = summary
+
+
 @dataclass
 class AgentHeartbeat:
     """A heartbeat record for an agent."""
@@ -2625,6 +2655,98 @@ except Exception as exc:
 
     # ── Agent CRUD ──────────────────────────────────────────
 
+    @staticmethod
+    def _soul_identity_anchors(
+        content: str,
+        *,
+        agent_name: str,
+        display_name: str = "",
+    ) -> set[str]:
+        """Return recognized identity structure without retaining its text."""
+        anchors: set[str] = set()
+        identities = {
+            value.strip().casefold()
+            for value in (agent_name, display_name)
+            if value and value.strip()
+        }
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            heading = re.fullmatch(r"#\s+(.+?)(?:\s+#+)?", line)
+            if heading and heading.group(1).strip().casefold() in identities:
+                anchors.add("agent_heading")
+            if re.fullmatch(r"##\s+identity(?:\s+#+)?", line, re.IGNORECASE):
+                anchors.add("identity_heading")
+            if re.match(
+                r"^(?:[-*]\s*)?(?:\*\*)?name\s*:(?:\s*\*\*)?",
+                line,
+                re.IGNORECASE,
+            ):
+                anchors.add("name_label")
+            if re.match(
+                r"^(?:[-*]\s*)?(?:\*\*)?role\s*:(?:\s*\*\*)?",
+                line,
+                re.IGNORECASE,
+            ):
+                anchors.add("role_label")
+        return anchors
+
+    def assess_soul_mutation(
+        self,
+        name: str,
+        old_content: str,
+        new_content: str,
+        *,
+        display_name: str = "",
+    ) -> SoulMutationSummary:
+        """Describe a proposed soul replacement without exposing soul text."""
+        name = _validate_agent_name(name)
+        if not isinstance(old_content, str) or not isinstance(new_content, str):
+            raise TypeError("soul content must be text")
+        old_length = len(old_content)
+        new_length = len(new_content)
+        shrink_percent = (
+            round(max(0.0, (old_length - new_length) * 100.0 / old_length), 2)
+            if old_length
+            else 0.0
+        )
+        old_anchors = self._soul_identity_anchors(
+            old_content,
+            agent_name=name,
+            display_name=display_name,
+        )
+        new_anchors = self._soul_identity_anchors(
+            new_content,
+            agent_name=name,
+            display_name=display_name,
+        )
+        return SoulMutationSummary(
+            old_length=old_length,
+            new_length=new_length,
+            shrink_percent=shrink_percent,
+            missing_anchors=tuple(sorted(old_anchors - new_anchors)),
+        )
+
+    def guard_soul_mutation(
+        self,
+        name: str,
+        old_content: str,
+        new_content: str,
+        *,
+        display_name: str = "",
+        force_soul: bool = False,
+    ) -> SoulMutationSummary:
+        """Reject destructive soul replacement unless explicitly forced."""
+        summary = self.assess_soul_mutation(
+            name,
+            old_content,
+            new_content,
+            display_name=display_name,
+        )
+        shrinks_more_than_half = summary.new_length * 2 < summary.old_length
+        if not force_soul and (shrinks_more_than_half or summary.missing_anchors):
+            raise SoulMutationRejectedError(summary)
+        return summary
+
     def update(self, name: str, **kwargs) -> Agent:
         """Partially update an existing agent without creating one.
 
@@ -2634,69 +2756,125 @@ except Exception as exc:
         agent or reset fields omitted from a PATCH-like request.
         """
         name = _validate_agent_name(name)
-        existing = self.get(name)
-        if not existing:
-            raise KeyError(f"Agent '{name}' not found")
-        if "working_dir" in kwargs:
-            raise ValueError(
-                "working_dir is not supported by partial update; use register()"
-            )
+        force_soul = bool(kwargs.pop("force_soul", False))
+        soul_source = str(kwargs.pop("soul_source", "registry-update") or "registry-update")
+        with self._rmw_lock:
+            existing = self.get(name)
+            if not existing:
+                raise KeyError(f"Agent '{name}' not found")
+            if "working_dir" in kwargs:
+                raise ValueError(
+                    "working_dir is not supported by partial update; use register()"
+                )
 
-        updates = {}
-        for key in ("display_name", "model", "soul", "users", "boundaries",
-                    "system_prompt",
-                    "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
-                    "context_nudge_threshold_pct",
-                    "auto_restart", "parent", "max_sessions", "enabled",
-                    "auto_start", "heartbeat_interval", "wake_interval",
-                    "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
-                    "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
-                    "librarian_enabled", "librarian_schedule",
-                    "runtime", "transport", "provider_url", "provider_model", "provider_ref",
-                    "codex_home",
-                    "thinking_effort", "strict_effort_enforcement",
-                    "dedicated_config_dir", "isolated",
-                    "isolation_mode", "container_image"):
-            if key in kwargs:
-                updates[key] = kwargs[key]
+            updates = {}
+            for key in ("display_name", "model", "soul", "users", "boundaries",
+                        "system_prompt",
+                        "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
+                        "context_nudge_threshold_pct",
+                        "auto_restart", "parent", "max_sessions", "enabled",
+                        "auto_start", "heartbeat_interval", "wake_interval",
+                        "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
+                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
+                        "librarian_enabled", "librarian_schedule",
+                        "runtime", "transport", "provider_url", "provider_model", "provider_ref",
+                        "codex_home",
+                        "thinking_effort", "strict_effort_enforcement",
+                        "dedicated_config_dir", "isolated",
+                        "isolation_mode", "container_image"):
+                if key in kwargs:
+                    updates[key] = kwargs[key]
 
-        # Secret: empty/absent means "unchanged" so callers round-tripping
-        # the redacted to_dict() (provider_key_set) can't wipe the key.
-        # Wiping requires the explicit clear_provider_key flag.
-        if kwargs.get("provider_key"):
-            updates["provider_key"] = kwargs["provider_key"]
-        elif kwargs.get("clear_provider_key"):
-            updates["provider_key"] = ""
+            # Secret: empty/absent means "unchanged" so callers round-tripping
+            # the redacted to_dict() (provider_key_set) can't wipe the key.
+            # Wiping requires the explicit clear_provider_key flag.
+            if kwargs.get("provider_key"):
+                updates["provider_key"] = kwargs["provider_key"]
+            elif kwargs.get("clear_provider_key"):
+                updates["provider_key"] = ""
 
-        for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
-            if key in kwargs:
-                updates[key] = json.dumps(kwargs[key])
+            for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
+                if key in kwargs:
+                    updates[key] = json.dumps(kwargs[key])
 
-        for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
-                    "plain_text_fallback", "dream_enabled", "dream_notify",
-                    "librarian_enabled", "strict_effort_enforcement",
-                    "dedicated_config_dir", "isolated"):
-            if key in updates:
-                updates[key] = int(updates[key])
-        if "voice_config" in updates and isinstance(updates["voice_config"], dict):
-            updates["voice_config"] = json.dumps(updates["voice_config"])
+            for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
+                        "plain_text_fallback", "dream_enabled", "dream_notify",
+                        "librarian_enabled", "strict_effort_enforcement",
+                        "dedicated_config_dir", "isolated"):
+                if key in updates:
+                    updates[key] = int(updates[key])
+            if "voice_config" in updates and isinstance(updates["voice_config"], dict):
+                updates["voice_config"] = json.dumps(updates["voice_config"])
 
-        if updates:
-            updates["updated_at"] = time.time()
-            set_clause = ", ".join(f"{key}=?" for key in updates)
-            self._db.execute(
-                f"UPDATE agents SET {set_clause} WHERE name=?",
-                list(updates.values()) + [name],
-            )
-            self._db.commit()
+            soul_changed = "soul" in updates and updates["soul"] != existing.soul
+            if "soul" in updates and not soul_changed:
+                updates.pop("soul")
+            if soul_changed:
+                self.guard_soul_mutation(
+                    name,
+                    existing.soul,
+                    updates["soul"],
+                    display_name=existing.display_name,
+                    force_soul=force_soul,
+                )
+
+            if updates:
+                updates["updated_at"] = time.time()
+                set_clause = ", ".join(f"{key}=?" for key in updates)
+                try:
+                    if soul_changed:
+                        self._insert_soul_version_uncommitted(
+                            name,
+                            existing.soul,
+                            source=f"{soul_source}:before",
+                        )
+                    self._db.execute(
+                        f"UPDATE agents SET {set_clause} WHERE name=?",
+                        list(updates.values()) + [name],
+                    )
+                    self._db.commit()
+                except Exception:
+                    self._db.rollback()
+                    raise
 
         updated = self.get(name)
         if not updated:  # Defensive against a concurrent delete.
             raise KeyError(f"Agent '{name}' not found")
         return updated
 
-    def register(self, name: str, **kwargs) -> Agent:
-        """Register a new agent or update an existing one."""
+    def _insert_agent_row(
+        self,
+        sql: str,
+        params: tuple,
+        *,
+        name: str,
+        create_only: bool,
+        work_dir: Path,
+    ) -> None:
+        """Insert first, then initialize only the DB-winning workspace."""
+        with self._rmw_lock:
+            try:
+                self._db.execute(sql, params)
+                # A losing create-only request must not reinitialize files in
+                # either the winner's workspace or an attacker-chosen path.
+                # Keep the insert transaction open so only the PRIMARY KEY
+                # winner reaches filesystem setup; rollback the row if setup
+                # itself fails.
+                self._init_workspace(work_dir, agent_name=name)
+                self._db.commit()
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                if create_only and "agents.name" in str(exc):
+                    raise AgentAlreadyExistsError(
+                        f"Agent '{name}' already exists"
+                    ) from exc
+                raise
+            except Exception:
+                self._db.rollback()
+                raise
+
+    def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
+        """Register an agent, optionally refusing DB-level name collisions."""
         # Sanitize before any path is constructed downstream. Same regex as
         # the API model — duplicated here so in-process callers (tests,
         # scripts, future routes) can't bypass it. ``_validate_agent_name``
@@ -2704,7 +2882,10 @@ except Exception as exc:
         # source-of-path-construction.
         name = _validate_agent_name(name)
         now = time.time()
-        existing = self.get(name)
+        # A create-only caller must reach INSERT OR ABORT without a read-side
+        # availability decision. The agents.name PRIMARY KEY is authoritative,
+        # including when multiple daemon processes race on the same DB.
+        existing = None if create_only else self.get(name)
 
         if existing:
             # Keep the legacy workspace mutation on register(), whose admin
@@ -2742,7 +2923,6 @@ except Exception as exc:
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
             work_dir = Path(raw_dir)
             work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
-            self._init_workspace(work_dir_abs, agent_name=name)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
@@ -2796,8 +2976,8 @@ except Exception as exc:
                 created_at=now,
                 updated_at=now,
             )
-            self._db.execute(
-                """INSERT INTO agents
+            self._insert_agent_row(
+                """INSERT OR ABORT INTO agents
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
@@ -2834,8 +3014,10 @@ except Exception as exc:
                  int(agent.dedicated_config_dir),
                  json.dumps(agent.watchdog_config),
                  agent.created_at, agent.updated_at),
+                name=name,
+                create_only=create_only,
+                work_dir=work_dir_abs,
             )
-            self._db.commit()
             _log(f"agents: registered {name}")
 
             # First-run convenience: if no main agent is designated yet, adopt
@@ -4134,25 +4316,69 @@ except Exception as exc:
 
     # ── Soul Versioning ─────────────────────────────────────
 
+    def _insert_soul_version_uncommitted(
+        self,
+        agent_name: str,
+        content: str,
+        *,
+        source: str,
+    ) -> int:
+        """Insert one version row; the caller owns commit/rollback."""
+        cursor = self._db.execute(
+            "INSERT INTO soul_versions (agent_name, content, source, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (agent_name, content, source, time.time()),
+        )
+        return int(cursor.lastrowid)
+
+    def snapshot_soul_before_mutation(
+        self,
+        agent_name: str,
+        content: str,
+        *,
+        source: str,
+    ) -> int:
+        """Durably snapshot replaced content before a non-DB mutation."""
+        with self._rmw_lock:
+            try:
+                version_id = self._insert_soul_version_uncommitted(
+                    agent_name,
+                    content,
+                    source=source,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return version_id
+
     def save_soul_version(self, agent_name: str, content: str, source: str = "unknown") -> int:
         """Archive a soul version. Returns the version ID.
 
         Sources: 'ui', 'agent', 'spawn', 'refresh', 'api'
         """
-        # Skip if content matches the latest version
-        latest = self.get_soul_versions(agent_name, limit=1)
-        if latest:
-            full = self.get_soul_version(agent_name, latest[0]["id"])
-            if full and full["content"] == content:
-                return latest[0]["id"]
+        with self._rmw_lock:
+            try:
+                # Spawn publication records the installed content after writing.
+                # Keep that historical deduplication contract; mutation snapshots
+                # use _insert_soul_version_uncommitted so every actual replacement
+                # gets an audit row even when the same content appeared previously.
+                latest = self.get_soul_versions(agent_name, limit=1)
+                if latest:
+                    full = self.get_soul_version(agent_name, latest[0]["id"])
+                    if full and full["content"] == content:
+                        return latest[0]["id"]
 
-        now = time.time()
-        cursor = self._db.execute(
-            "INSERT INTO soul_versions (agent_name, content, source, created_at) VALUES (?, ?, ?, ?)",
-            (agent_name, content, source, now),
-        )
-        self._db.commit()
-        return cursor.lastrowid
+                version_id = self._insert_soul_version_uncommitted(
+                    agent_name,
+                    content,
+                    source=source,
+                )
+                self._db.commit()
+                return version_id
+            except Exception:
+                self._db.rollback()
+                raise
 
     def get_soul_versions(self, agent_name: str, limit: int = 20) -> list[dict]:
         """List soul versions for an agent, newest first."""

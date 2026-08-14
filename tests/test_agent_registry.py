@@ -9,7 +9,12 @@ import threading
 
 import pytest
 
-from pinky_daemon.agent_registry import AgentContext, AgentRegistry
+from pinky_daemon.agent_registry import (
+    AgentAlreadyExistsError,
+    AgentContext,
+    AgentRegistry,
+    SoulMutationRejectedError,
+)
 
 
 @pytest.fixture
@@ -548,6 +553,96 @@ class TestAgentCRUD:
         registry.register("oleg", model="sonnet")
         agent = registry.register("oleg", model="opus")
         assert agent.model == "opus"
+
+    def test_create_only_collision_preserves_winner(self, registry, tmp_path):
+        original = "# Oleg\n\n## IDENTITY\n- **Name:** Oleg\n- **Role:** Lead\n"
+        registry.register(
+            "oleg",
+            create_only=True,
+            model="opus",
+            soul=original,
+            working_dir=str(tmp_path / "winner"),
+        )
+
+        with pytest.raises(AgentAlreadyExistsError, match="already exists"):
+            registry.register(
+                "oleg",
+                create_only=True,
+                model="haiku",
+                soul="loser",
+                working_dir=str(tmp_path / "loser"),
+            )
+
+        winner = registry.get("oleg")
+        assert winner.model == "opus"
+        assert winner.soul == original
+        assert winner.working_dir == str(tmp_path / "winner")
+        assert not (tmp_path / "loser").exists()
+
+    def test_soul_update_snapshots_replaced_value_before_write(
+        self, registry, monkeypatch,
+    ):
+        original = "A" * 100
+        replacement = "B" * 75
+        registry.register("oleg", soul=original)
+        insert = registry._insert_soul_version_uncommitted
+
+        def assert_old_value_is_still_live(agent_name, content, *, source):
+            assert registry.get(agent_name).soul == original
+            assert content == original
+            assert source == "unit-test:before"
+            return insert(agent_name, content, source=source)
+
+        monkeypatch.setattr(
+            registry,
+            "_insert_soul_version_uncommitted",
+            assert_old_value_is_still_live,
+        )
+
+        updated = registry.update(
+            "oleg",
+            soul=replacement,
+            soul_source="unit-test",
+        )
+
+        assert updated.soul == replacement
+        versions = registry.get_soul_versions("oleg")
+        assert len(versions) == 1
+        assert registry.get_soul_version("oleg", versions[0]["id"])["content"] == original
+
+    def test_soul_shrink_threshold_is_strictly_more_than_half(self, registry):
+        registry.register("oleg", soul="x" * 100)
+
+        assert registry.update("oleg", soul="y" * 50).soul == "y" * 50
+
+        with pytest.raises(SoulMutationRejectedError) as rejected:
+            registry.update("oleg", soul="z" * 24)
+        assert rejected.value.summary.old_length == 50
+        assert rejected.value.summary.new_length == 24
+        assert rejected.value.summary.shrink_percent == 52.0
+        assert registry.get("oleg").soul == "y" * 50
+
+    def test_soul_identity_anchor_loss_requires_force(self, registry):
+        original = (
+            "# Oleg\n\n## IDENTITY\n- **Name:** Oleg\n- **Role:** Lead\n\n"
+            + "x" * 80
+        )
+        replacement = "# Notes\n" + "y" * (len(original) - len("# Notes\n"))
+        registry.register("oleg", display_name="Oleg", soul=original)
+
+        with pytest.raises(SoulMutationRejectedError) as rejected:
+            registry.update("oleg", soul=replacement)
+
+        assert rejected.value.summary.missing_anchors == (
+            "agent_heading",
+            "identity_heading",
+            "name_label",
+            "role_label",
+        )
+        assert registry.get("oleg").soul == original
+
+        forced = registry.update("oleg", soul=replacement, force_soul=True)
+        assert forced.soul == replacement
 
     def test_update_is_partial_and_preserves_unset_fields(self, registry):
         registry.register(
