@@ -3718,6 +3718,192 @@ class TestScheduler:
         assert registry.get_schedules("oleg")[0].last_delivered > 0
 
     @pytest.mark.asyncio
+    async def test_undelivered_skips_owner_alert_when_agent_proved_live(
+        self, registry
+    ):
+        """A recent agent-authored heartbeat means the agent is alive and the
+        wake will replay on its own — the owner does not need paging."""
+        registry.register("oleg")
+        registry.record_heartbeat("oleg", session_id="s1", status="busy")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="live", prompt="live prompt"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        alerts: list[tuple[str, str]] = []
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+        await asyncio.sleep(0)
+
+        assert alerts == []
+        # Durable recovery is unchanged: the wake still replays next boot.
+        pending = registry.list_pending_schedule_wakes("oleg")
+        assert [wake.prompt for wake in pending] == ["live prompt"]
+
+    @pytest.mark.asyncio
+    async def test_undelivered_alerts_when_only_server_presence_is_fresh(
+        self, registry
+    ):
+        """A fresh ``server_presence`` row is the scheduler's own writing, not
+        the agent's — it must never suppress the alert (wedged reader loop)."""
+        registry.register("oleg")
+        registry.record_heartbeat(
+            "oleg",
+            session_id="s1",
+            status="alive",
+            metadata={"source": "server_presence"},
+        )
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="wedged", prompt="wedged prompt"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        alerts: list[tuple[str, str]] = []
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+        await asyncio.sleep(0)
+
+        assert len(alerts) == 1
+        assert "FIRED BUT UNDELIVERED" in alerts[0][1]
+
+    @pytest.mark.asyncio
+    async def test_undelivered_alerts_when_agent_heartbeat_is_stale(
+        self, registry
+    ):
+        """An agent-authored heartbeat older than the liveness window proves
+        nothing about now — the owner still gets paged."""
+        registry.register("oleg")
+        registry.record_heartbeat("oleg", session_id="s1", status="busy")
+        registry._db.execute(
+            "UPDATE agent_heartbeats SET timestamp = ? WHERE agent_name = ?",
+            (time.time() - 3600, "oleg"),
+        )
+        registry._db.commit()
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="old", prompt="old prompt"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        alerts: list[tuple[str, str]] = []
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=no_receipt,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+        )
+        await scheduler._deliver_schedule(schedule)
+        await asyncio.sleep(0)
+
+        assert len(alerts) == 1
+        assert "FIRED BUT UNDELIVERED" in alerts[0][1]
+
+    @pytest.mark.asyncio
+    async def test_undelivered_suppresses_alert_on_persisted_retries_1_to_4(
+        self, registry
+    ):
+        """Retries 1-4 of a persisted wake should not alert the owner.
+
+        The system will auto-retry on next session, so alerting only wastes
+        owner attention. Only alert on attempts >= 5 (PERSISTED_WAKE_ATTEMPT_CAP).
+        """
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="retry_test", prompt="retry prompt"
+        )
+        alerts: list[tuple[str, str]] = []
+
+        async def no_receipt(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return asyncio.get_running_loop().create_future()
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        # Test each attempt level separately with unique fired_at timestamps
+        for attempt in list(range(1, 5)) + [5]:
+            alerts.clear()
+            # Use unique fired_at for each test run
+            fired_at = time.time() + attempt * 0.01
+            registry.update_schedule_last_run(schedule.id, fired_at)
+            schedule.last_run = fired_at
+
+            # Create and set attempts
+            pending_wake, _created = registry.persist_schedule_wake(
+                schedule.id,
+                agent_name="oleg",
+                schedule_name="retry_test",
+                prompt="retry prompt",
+                fired_at=fired_at,
+            )
+            registry._db.execute(
+                "UPDATE pending_schedule_wakes SET attempts=? WHERE id=?",
+                (attempt, pending_wake.id),
+            )
+            registry._db.commit()
+
+            # Now test the delivery with this attempt count
+            scheduler = AgentScheduler(
+                registry,
+                wake_callback=no_receipt,
+                owner_notify_callback=owner_notify,
+                schedule_delivery_timeout=0.01,
+            )
+            await scheduler._deliver_schedule(schedule)
+            await asyncio.sleep(0)
+
+            # Verify alert behavior based on attempt count
+            if attempt < 5:
+                assert (
+                    len(alerts) == 0
+                ), f"Attempt {attempt} should not alert but got: {alerts}"
+            else:
+                assert (
+                    len(alerts) == 1
+                ), f"Attempt {attempt} should alert, got {len(alerts)} alerts"
+                assert "FIRED BUT UNDELIVERED" in alerts[0][1]
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["alive", "ok", "busy", "finishing"])
     async def test_fresh_heartbeat_drains_stranded_outbox(
         self, registry, status

@@ -1075,6 +1075,19 @@ class AgentScheduler:
                         "duplicate undelivered verdict"
                     )
                     return
+                if (
+                    persisted
+                    and row is not None
+                    and 0 < row.attempts < self.PERSISTED_WAKE_ATTEMPT_CAP
+                ):
+                    _log(
+                        f"scheduler: schedule '{schedule.name}' "
+                        f"(#{schedule.id}) for agent '{schedule.agent_name}' "
+                        f"is on retry attempt {row.attempts} (of "
+                        f"{self.PERSISTED_WAKE_ATTEMPT_CAP}); suppressing owner "
+                        "alert — wake will be retried automatically"
+                    )
+                    return
             except Exception as exc:
                 _log(
                     f"scheduler: SCHEDULER_WAKE_PERSIST_FAILURE schedule "
