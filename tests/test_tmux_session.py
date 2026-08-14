@@ -3795,7 +3795,7 @@ async def test_disconnect_clears_inflight_meta() -> None:
 
 @pytest.mark.asyncio
 async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
-    """Successful pane keystrokes are not a scheduler delivery receipt."""
+    """#966: consumption receipts before the accepted turn completes."""
     ss, tmux = _make_session(state=SessionState.CONNECTED)
     ss._config.live_status_fn = lambda: {
         "status": "idle",
@@ -3823,6 +3823,10 @@ async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
         "operation": "dequeue",
     })
     assert await receipt is True
+    assert len(ss._inflight_metas) == 1
+    assert not ss._turn_done.is_set(), (
+        "transport acceptance must not wait for turn completion"
+    )
     await ss.disconnect()
 
 
@@ -3906,12 +3910,83 @@ async def test_scheduler_cancel_before_paste_never_pastes() -> None:
     await asyncio.sleep(0.02)
     assert tmux.paste_text.await_count == 0
     assert ss.scheduler_wake_inflight("scheduled") is False
+    assert ss.scheduler_wake_queued("scheduled") is True
+    assert ss.scheduler_wake_queued("some other prompt") is False
 
-    receipt.cancel()
+    assert await ss.cancel_scheduler_wake("scheduled") is True
+    assert receipt.cancelled()
+    assert ss.scheduler_wake_queued("scheduled") is False
     live["status"] = "idle"
     live["last_updated"] = _time.time()
     await asyncio.sleep(0.35)  # > slot-wait poll interval
     assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wake_queued_tracks_943_requeued_head() -> None:
+    """#943's ordinary-worker replay queue remains visible and recallable."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    receipt = asyncio.get_running_loop().create_future()
+    replayed_head = _QueuedTurn(
+        prompt="requeued scheduler head",
+        scheduler_delivery=receipt,
+        scheduler_serialized=True,
+    )
+    ss._message_queue.put_nowait(replayed_head)
+
+    assert replayed_head not in ss._scheduler_pending_turns
+    assert ss.scheduler_wake_queued("requeued scheduler head") is True
+    assert await ss.cancel_scheduler_wake("requeued scheduler head") is True
+    assert receipt.cancelled()
+
+    ss._worker_task = asyncio.create_task(ss._message_worker())
+    for _ in range(100):
+        if ss._message_queue.empty():
+            break
+        await asyncio.sleep(0.001)
+    await asyncio.sleep(0)
+    assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_paste_race_reports_pasted() -> None:
+    """The REPL lock adjudicates a paste that starts during queued recall."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+
+    await ss._repl_control_lock.acquire()
+    try:
+        receipt = await ss.send_scheduler_prompt("paste race")
+        # The delivery waiter enters the lock queue first; the cancellation
+        # waiter starts from a positive queued probe immediately behind it.
+        await asyncio.sleep(0.02)
+        assert ss.scheduler_wake_queued("paste race") is True
+        cancel = asyncio.create_task(
+            ss.cancel_scheduler_wake("paste race")
+        )
+        await asyncio.sleep(0)
+    finally:
+        ss._repl_control_lock.release()
+
+    assert await cancel is False
+    assert tmux.paste_text.await_count == 1
+    assert ss.scheduler_wake_inflight("paste race") is True
+    assert not receipt.cancelled()
+
+    ss._on_transcript_entry({
+        "type": "user",
+        "message": {"role": "user", "content": "paste race"},
+    })
+    assert await receipt is True
     await ss.disconnect()
 
 

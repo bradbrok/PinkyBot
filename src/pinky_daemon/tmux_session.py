@@ -4410,6 +4410,66 @@ class TmuxSession(TransportReplacementMixin):
                 return True
         return False
 
+    def _scheduler_wake_candidates(self) -> list[_QueuedTurn]:
+        """Return every known scheduler turn, including #943 queue replay."""
+        candidates = self._acceptance_candidates()
+        # The #943 unaccepted-head recovery deliberately removes its turn from
+        # ``_scheduler_pending_turns`` before disconnect, then preserves it in
+        # the ordinary worker queue across the replacement pane. There is a
+        # real queued-unpasted window before the new worker pulls that head.
+        # asyncio.Queue has no public snapshot API; this event-loop-local read
+        # is non-mutating and the only way to include that load-bearing shape.
+        candidates.extend(
+            turn
+            for turn in self._message_queue._queue  # type: ignore[attr-defined]
+            if turn.scheduler_serialized
+        )
+        unique: dict[int, _QueuedTurn] = {}
+        for turn in candidates:
+            unique.setdefault(id(turn), turn)
+        return sorted(unique.values(), key=lambda turn: turn.queued_at)
+
+    def scheduler_wake_queued(self, prompt: str) -> bool:
+        """True when this exact wake is live, queued-unpasted, and recallable."""
+        if self.state != SessionState.CONNECTED:
+            return False
+        for turn in self._scheduler_wake_candidates():
+            receipt = turn.scheduler_delivery
+            if (
+                turn.scheduler_serialized
+                and receipt is not None
+                and not receipt.done()
+                and not turn.pane_delivery_started
+                and turn.prompt == prompt
+            ):
+                return True
+        return False
+
+    async def cancel_scheduler_wake(self, prompt: str) -> bool:
+        """Recall one exact queued-unpasted wake before its pane paste.
+
+        The shared REPL-control lock makes the outcome authoritative. If this
+        coroutine wins the lock, cancelling the receipt fences both scheduler
+        and #943 ordinary-worker paste paths. If pane delivery won first,
+        ``pane_delivery_started`` is already true and False tells the
+        scheduler to fall back to its unrecallable pasted-state handling.
+        """
+        if self.state != SessionState.CONNECTED:
+            return False
+        async with self._repl_control_lock:
+            for turn in self._scheduler_wake_candidates():
+                receipt = turn.scheduler_delivery
+                if (
+                    turn.scheduler_serialized
+                    and receipt is not None
+                    and not receipt.done()
+                    and turn.prompt == prompt
+                ):
+                    if turn.pane_delivery_started:
+                        return False
+                    return receipt.cancel()
+        return False
+
     async def _queue_external_turn(
         self,
         prompt: str,

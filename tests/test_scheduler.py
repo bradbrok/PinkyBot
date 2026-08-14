@@ -2584,6 +2584,333 @@ class TestScheduler:
         assert "already pasted to the transport" in capsys.readouterr().err
 
     @pytest.mark.asyncio
+    async def test_queued_wake_extends_until_consumed_without_replay(
+        self, registry, capsys
+    ):
+        """#1068: queued-unpasted is positive evidence, not a replay trigger."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="busy-morning", prompt="run once"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        queued = True
+        submissions = 0
+
+        async def consume_after_busy_turn() -> None:
+            nonlocal queued
+            await asyncio.sleep(0.035)
+            queued = False
+            receipt.set_result(True)
+
+        async def wake_cb(agent_name, session_id, prompt):
+            nonlocal submissions
+            del agent_name, session_id, prompt
+            submissions += 1
+            asyncio.create_task(consume_after_busy_turn())
+            return receipt
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=lambda agent_name, prompt: False,
+            delivery_queued_fn=lambda agent_name, prompt: queued,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=1.0,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert submissions == 1
+        assert ledger is not None
+        assert ledger.attempts == 0
+        assert ledger.accepted_at > 0
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        assert "queued-unpasted on a connected transport" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_queued_wake_ceiling_cancels_before_abandoning(
+        self, registry, monkeypatch, capsys
+    ):
+        """A ceiling cannot abandon while the original turn is deliverable."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="bounded", prompt="recall me"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        queued = True
+        transitions: list[str] = []
+        original_abandon = registry.abandon_pending_schedule_wake
+
+        def abandon(*args, **kwargs):
+            transitions.append("abandon")
+            return original_abandon(*args, **kwargs)
+
+        monkeypatch.setattr(
+            registry, "abandon_pending_schedule_wake", abandon
+        )
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return receipt
+
+        async def cancel_queued(agent_name, prompt):
+            nonlocal queued
+            del agent_name, prompt
+            transitions.append("cancel")
+            queued = False
+            assert receipt.cancel() is True
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=lambda agent_name, prompt: False,
+            delivery_queued_fn=lambda agent_name, prompt: queued,
+            delivery_cancel_queued_fn=cancel_queued,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=0.03,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert transitions == ["cancel", "abandon"]
+        assert ledger is not None
+        assert ledger.ledger_state == "abandoned"
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        logs = capsys.readouterr().err
+        assert logs.index("cancelled-queued") < logs.index("RECEIPT_ABANDONED")
+
+    @pytest.mark.asyncio
+    async def test_queued_cancel_paste_race_uses_inflight_abandonment(
+        self, registry
+    ):
+        """A paste winning the recall race retains late-receipt authority."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="race", prompt="paste wins"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        state = {"queued": True, "inflight": False}
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return receipt
+
+        async def lose_cancel_race(agent_name, prompt):
+            del agent_name, prompt
+            state.update(queued=False, inflight=True)
+            return False
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=(
+                lambda agent_name, prompt: state["inflight"]
+            ),
+            delivery_queued_fn=lambda agent_name, prompt: state["queued"],
+            delivery_cancel_queued_fn=lose_cancel_race,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=0.03,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.ledger_state == "abandoned"
+        assert not receipt.cancelled()
+        receipt.set_result(True)
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
+    async def test_acceptance_during_queued_cancel_wins_over_abandonment(
+        self, registry
+    ):
+        """A fast consumption while recall awaits its lock is terminal True."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="fast-race", prompt="accepted"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        state = {"queued": True, "inflight": False}
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return receipt
+
+        async def acceptance_wins(agent_name, prompt):
+            del agent_name, prompt
+            state["queued"] = False
+            receipt.set_result(True)
+            await asyncio.sleep(0)
+            return False
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=(
+                lambda agent_name, prompt: state["inflight"]
+            ),
+            delivery_queued_fn=lambda agent_name, prompt: state["queued"],
+            delivery_cancel_queued_fn=acceptance_wins,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=0.03,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
+        assert ledger.abandoned_at == 0
+        assert registry.list_pending_schedule_wakes("oleg") == []
+
+    @pytest.mark.asyncio
+    async def test_settled_receipt_beats_transient_double_negative(
+        self, registry, capsys
+    ):
+        """Both probes can read False before the positive waiter resumes."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="settle-edge", prompt="accepted once"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        submissions = 0
+
+        async def wake_cb(agent_name, session_id, prompt):
+            nonlocal submissions
+            del agent_name, session_id, prompt
+            submissions += 1
+            return receipt
+
+        def double_negative_at_acceptance(agent_name, prompt):
+            del agent_name, prompt
+            # The transport persisted/observed acceptance and resolved its
+            # Future, but _wake_and_confirm has not had a scheduling edge to
+            # turn that into a completed delivery Task yet. Both exact state
+            # probes therefore read False in this transient window.
+            if not receipt.done():
+                receipt.set_result(True)
+            return False
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=lambda agent_name, prompt: False,
+            delivery_queued_fn=double_negative_at_acceptance,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=1.0,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert submissions == 1
+        assert receipt.result() is True
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
+        assert ledger.attempts == 0
+        assert registry.list_pending_schedule_wakes("oleg") == []
+        assert "FIRED BUT UNDELIVERED" not in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_busy_replay_accepts_at_consumption_before_turn_completion(
+        self, registry, capsys
+    ):
+        """#966/#1068: the 08-14 replay shape receipts during the turn."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 7 * * *", name="morning", prompt="daily work"
+        )
+        fired_at = time.time()
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        receipt = asyncio.get_running_loop().create_future()
+        state = {"queued": True, "inflight": False, "turn_done": False}
+        durable_receipt = None
+        submissions = 0
+
+        async def wake_cb(
+            agent_name,
+            session_id,
+            prompt,
+            *,
+            schedule_receipt,
+        ):
+            nonlocal durable_receipt, submissions
+            del agent_name, session_id, prompt
+            submissions += 1
+            durable_receipt = schedule_receipt
+            return receipt
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=(
+                lambda agent_name, prompt: state["inflight"]
+            ),
+            delivery_queued_fn=lambda agent_name, prompt: state["queued"],
+            schedule_delivery_timeout=0.01,
+            receipt_extension_max_age_sec=1.0,
+        )
+
+        replay = asyncio.create_task(
+            scheduler._replay_pending_locked("worker")
+        )
+        for _ in range(100):
+            if durable_receipt is not None:
+                break
+            await asyncio.sleep(0.001)
+        await asyncio.sleep(0.02)
+        state.update(queued=False, inflight=True)
+        assert state["turn_done"] is False
+        assert durable_receipt is not None
+        assert durable_receipt.accept() is True
+        receipt.set_result(True)
+        await replay
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert submissions == 1
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.attempts == 1
+        assert ledger.accepted_at > 0
+        assert state["turn_done"] is False
+        assert registry.list_pending_schedule_wakes("worker") == []
+        assert "queued-unpasted on a connected transport" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
     async def test_receipt_ceiling_uses_persisted_fired_at_across_restart(
         self, registry, monkeypatch, capsys
     ):
