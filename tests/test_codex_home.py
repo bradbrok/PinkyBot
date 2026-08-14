@@ -100,6 +100,117 @@ def _mark_tmux_server_socket(tmp_path: Path, monkeypatch) -> Path:
     return socket_path
 
 
+class _SpawnRollbackTmuxTrace:
+    """Stateful raw-tmux seam for spawn rollback/no-leak regressions."""
+
+    def __init__(
+        self,
+        *,
+        first_kill: str,
+        post_probe_error: bool = True,
+        ambiguous_verify: bool = False,
+        new_session_hangs: bool = False,
+    ) -> None:
+        self.first_kill = first_kill
+        self.post_probe_error = post_probe_error
+        self.ambiguous_verify = ambiguous_verify
+        self.new_session_hangs = new_session_hangs
+        self.live = False
+        self.kill_calls = 0
+        self.post_probe_seen = False
+        self.pending_list_reason = ""
+        self.calls: list[tuple[str, ...]] = []
+        self.spawned = asyncio.Event()
+        self.permission_error = TmuxCommandResult(
+            returncode=1,
+            stdout="",
+            stderr="couldn't access tmux socket (Permission denied)",
+        )
+
+    async def run(self, *args, timeout=5.0, stdin_data=None):
+        del timeout, stdin_data
+        self.calls.append(args)
+        operation = args[0]
+        if operation == "has-session":
+            if not self.live:
+                self.pending_list_reason = "absence"
+                return TmuxCommandResult(
+                    returncode=1, stdout="", stderr="can't find session"
+                )
+            if self.post_probe_error and not self.post_probe_seen:
+                self.post_probe_seen = True
+                self.pending_list_reason = "ambiguous"
+                return self.permission_error
+            self.post_probe_seen = True
+            if self.ambiguous_verify:
+                self.pending_list_reason = "ambiguous"
+                return self.permission_error
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if operation == "list-sessions":
+            reason = self.pending_list_reason
+            self.pending_list_reason = ""
+            if reason == "ambiguous":
+                return self.permission_error
+            sessions = "pinky-test-agent\n" if self.live else "operator\n"
+            return TmuxCommandResult(returncode=0, stdout=sessions, stderr="")
+        if operation == "new-session":
+            self.live = True
+            self.spawned.set()
+            if self.new_session_hangs:
+                await asyncio.Event().wait()
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if operation == "kill-session":
+            self.kill_calls += 1
+            if self.first_kill == "raise_then_ok" and self.kill_calls == 1:
+                raise RuntimeError("rollback kill transport error")
+            if self.first_kill == "always_non_ok" or self.kill_calls == 1:
+                self.pending_list_reason = "kill"
+                return TmuxCommandResult(
+                    returncode=1, stdout="", stderr="rollback kill denied"
+                )
+            self.live = False
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected tmux call: {args}")
+
+
+def _spawn_rollback_session(
+    tmp_path: Path,
+    monkeypatch,
+    trace: _SpawnRollbackTmuxTrace,
+) -> tuple[TmuxSession, _TmuxControl]:
+    """Build a real ``_TmuxControl`` around the stateful raw-command seam."""
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(tmp_path / "agent"),
+    )
+    tmux = _TmuxControl("pinky-test-agent")
+    session = TmuxSession(config, tmux_control=tmux)
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(tmux, "_run", trace.run)
+    monkeypatch.setattr(
+        session, "_container_agent", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr(
+        session,
+        "_select_command_runner",
+        lambda _container_agent: tmux._runner,
+    )
+    monkeypatch.setattr(session, "_ensure_container_started", _noop)
+    monkeypatch.setattr(session, "_seed_container_trust", _noop)
+    monkeypatch.setattr(session, "_seed_container_home_creds", _noop)
+    monkeypatch.setattr(session, "_start_tailer", _noop)
+    monkeypatch.setattr(session, "_build_claude_cmd", lambda: "claude")
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._seed_claude_trust_file",
+        lambda _path, _cwd: False,
+    )
+    return session, tmux
+
+
 def test_flag_off_preserves_shared_path_and_performs_no_bootstrap(tmp_path, monkeypatch):
     shared_home = tmp_path / "shared"
     working_dir = tmp_path / "agent"
@@ -3227,6 +3338,159 @@ async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_ef
     assert new_session_count == 0
     assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
     assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_post_spawn_rollback_retries_returned_non_ok_and_leaves_no_session(
+    tmp_path,
+    monkeypatch,
+):
+    """R9: returned kill failure is a signal, then retry proves no leak."""
+    trace = _SpawnRollbackTmuxTrace(first_kill="non_ok_then_ok")
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 0
+    )
+
+    with pytest.raises(RuntimeError, match="has-session failed"):
+        await session._spawn_tmux_repl()
+
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert await tmux.has_session() is False
+    assert [call[0] for call in trace.calls] == [
+        "has-session", "list-sessions", "new-session",
+        "has-session", "list-sessions",
+        "kill-session", "list-sessions", "has-session",
+        "kill-session", "has-session", "list-sessions",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_post_spawn_rollback_retries_kill_exception_and_leaves_no_session(
+    tmp_path,
+    monkeypatch,
+):
+    """R9: a raised kill follows the same verify/retry/no-leak path."""
+    trace = _SpawnRollbackTmuxTrace(first_kill="raise_then_ok")
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 0
+    )
+
+    with pytest.raises(RuntimeError, match="has-session failed"):
+        await session._spawn_tmux_repl()
+
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert await tmux.has_session() is False
+
+
+@pytest.mark.asyncio
+async def test_post_spawn_rollback_ambiguous_verify_surfaces_possibly_live(
+    tmp_path,
+    monkeypatch,
+    capsys,
+):
+    """R9: couldn't-answer after both kills remains loudly conservative."""
+    trace = _SpawnRollbackTmuxTrace(
+        first_kill="always_non_ok", ambiguous_verify=True
+    )
+    session, _tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 0
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        await session._spawn_tmux_repl()
+
+    raised_text = str(caught.value)
+    assert "has-session failed" in raised_text
+    assert "owned session is possibly live" in raised_text
+    assert "verify couldn't answer" in raised_text
+    assert trace.kill_calls == 2
+    assert trace.live is True
+    assert [call[0] for call in trace.calls] == [
+        "has-session", "list-sessions", "new-session",
+        "has-session", "list-sessions",
+        "kill-session", "list-sessions", "has-session", "list-sessions",
+        "kill-session", "list-sessions", "has-session", "list-sessions",
+    ]
+    assert "ERROR tmux[test-agent]: spawn rollback" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_post_spawn_cancellation_waits_for_strict_rollback_and_no_leak(
+    tmp_path,
+    monkeypatch,
+):
+    """R9: original CancelledError propagates only after bounded rollback."""
+    trace = _SpawnRollbackTmuxTrace(first_kill="non_ok_then_ok")
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 60
+    )
+
+    spawn_task = asyncio.create_task(session._spawn_tmux_repl())
+    await trace.spawned.wait()
+    await asyncio.sleep(0)
+    spawn_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await spawn_task
+
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert await tmux.has_session() is False
+
+
+@pytest.mark.asyncio
+async def test_cold_start_timeout_uses_strict_rollback_and_leaves_no_session(
+    tmp_path,
+    monkeypatch,
+):
+    """R9 Site A: a partial timed-out spawn uses the central rollback."""
+    trace = _SpawnRollbackTmuxTrace(
+        first_kill="non_ok_then_ok", new_session_hangs=True
+    )
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._COLD_START_TIMEOUT_SEC", 0.01
+    )
+
+    with pytest.raises(RuntimeError, match="cold-start timed out"):
+        await session._spawn_tmux_repl()
+
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert await tmux.has_session() is False
+
+
+@pytest.mark.asyncio
+async def test_tailer_start_failure_uses_strict_rollback_and_leaves_no_session(
+    tmp_path,
+    monkeypatch,
+):
+    """R9 Site C: tailer failure uses the same strict rollback helper."""
+    trace = _SpawnRollbackTmuxTrace(
+        first_kill="non_ok_then_ok", post_probe_error=False
+    )
+    session, tmux = _spawn_rollback_session(tmp_path, monkeypatch, trace)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC", 0
+    )
+
+    async def _tailer_failure():
+        raise RuntimeError("synthetic tailer-start failure")
+
+    monkeypatch.setattr(session, "_start_tailer", _tailer_failure)
+
+    with pytest.raises(RuntimeError, match="synthetic tailer-start failure"):
+        await session._spawn_tmux_repl()
+
+    assert trace.kill_calls == 2
+    assert trace.live is False
+    assert await tmux.has_session() is False
 
 
 def test_reverse_migration_moves_only_matching_rollouts(tmp_path):

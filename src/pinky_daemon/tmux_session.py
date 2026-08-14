@@ -1125,6 +1125,17 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
+# Spawn rollback is deliberately tighter than the normal tmux command bound.
+# Local tmux IPC should complete in well under 100ms; two seconds per command
+# still leaves ample headroom while ensuring cancellation cannot park forever
+# behind cleanup. Two attempts let a transient permission/socket race clear,
+# and the outer ceiling is the hard guarantee that preserving the original
+# spawn exception remains bounded.
+_SPAWN_ROLLBACK_ATTEMPTS = 2
+_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC = 2.0
+_SPAWN_ROLLBACK_RETRY_DELAY_SEC = 0.05
+_SPAWN_ROLLBACK_TIMEOUT_SEC = 9.0
+
 # A detached tmux session can reap itself just after ``new-session`` reports
 # success when the in-pane command exits immediately. Give that failure time
 # to surface, then verify the session still exists before starting the tailer
@@ -2932,6 +2943,124 @@ class TmuxSession(TransportReplacementMixin):
     def _prepare_tmux_spawn(self) -> None:
         """Publish transport-specific state at the final spawn boundary."""
 
+    async def _rollback_spawned_session(self, *, site: str) -> str | None:
+        """Strictly and boundedly roll back a possibly-created tmux session.
+
+        A returned non-ok kill enters the same verification path as a raise:
+        ``has_session() is False`` is the only clean fallback, while ``True``
+        or an exception remains possibly-live and is retried. A successful
+        kill is already positive proof because ``_TmuxControl.kill_session``
+        only reduces a failed raw command to success after verifying absence.
+
+        Cleanup runs in a shielded task so cancellation cannot strand the
+        just-created REPL. The per-command and outer ceilings keep waiting for
+        cleanup bounded while the caller preserves the original exception.
+        Returns ``None`` when teardown is proven, otherwise a loud diagnostic
+        that the caller must attach to the original exception.
+        """
+
+        async def _attempts() -> str | None:
+            diagnostics: list[str] = []
+            for attempt in range(1, _SPAWN_ROLLBACK_ATTEMPTS + 1):
+                try:
+                    kill_result = await asyncio.wait_for(
+                        self._tmux.kill_session(),
+                        timeout=_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC,
+                    )
+                except BaseException as exc:
+                    diagnostics.append(
+                        f"attempt {attempt} kill raised "
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                else:
+                    if kill_result.ok:
+                        _log(
+                            f"tmux[{self.agent_name}]: spawn rollback at "
+                            f"{site} proved teardown on kill attempt {attempt}"
+                        )
+                        return None
+                    diagnostics.append(
+                        f"attempt {attempt} kill returned "
+                        f"rc={kill_result.returncode} "
+                        f"stderr={kill_result.stderr.strip()!r}"
+                    )
+
+                # False is verified absence; True is live; a raise is
+                # couldn't-answer. Only the first state is clean.
+                try:
+                    live = await asyncio.wait_for(
+                        self._tmux.has_session(),
+                        timeout=_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC,
+                    )
+                except BaseException as exc:
+                    diagnostics.append(
+                        f"attempt {attempt} verify couldn't answer "
+                        f"({type(exc).__name__}: {exc})"
+                    )
+                else:
+                    if not live:
+                        _log(
+                            f"tmux[{self.agent_name}]: spawn rollback at "
+                            f"{site} verified absence after failed kill "
+                            f"attempt {attempt}"
+                        )
+                        return None
+                    diagnostics.append(
+                        f"attempt {attempt} verify found session live"
+                    )
+
+                if attempt < _SPAWN_ROLLBACK_ATTEMPTS:
+                    await asyncio.sleep(_SPAWN_ROLLBACK_RETRY_DELAY_SEC)
+
+            message = (
+                f"tmux[{self.agent_name}]: spawn rollback at {site} could not "
+                f"prove teardown after {_SPAWN_ROLLBACK_ATTEMPTS} attempts; "
+                f"owned session is possibly live: {'; '.join(diagnostics)}"
+            )
+            _log(f"ERROR {message}")
+            return message
+
+        async def _bounded() -> str | None:
+            try:
+                return await asyncio.wait_for(
+                    _attempts(), timeout=_SPAWN_ROLLBACK_TIMEOUT_SEC
+                )
+            except BaseException as exc:
+                message = (
+                    f"tmux[{self.agent_name}]: spawn rollback at {site} "
+                    f"could not prove teardown within "
+                    f"{_SPAWN_ROLLBACK_TIMEOUT_SEC}s; owned session is "
+                    f"possibly live ({type(exc).__name__}: {exc})"
+                )
+                _log(f"ERROR {message}")
+                return message
+
+        cleanup_task = asyncio.create_task(
+            _bounded(), name=f"tmux-spawn-rollback-{self.agent_name}"
+        )
+        while True:
+            try:
+                return await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # Preserve the exception that selected this rollback site.
+                # A second cancellation cannot strand bounded cleanup.
+                continue
+
+    @staticmethod
+    def _annotate_spawn_rollback_failure(
+        original: BaseException,
+        rollback_failure: str | None,
+    ) -> None:
+        """Surface rollback uncertainty without replacing ``original``."""
+        if rollback_failure is None:
+            return
+        original.add_note(rollback_failure)
+        # Notes render in tracebacks; keep ordinary stringification loud too.
+        if not original.args:
+            original.args = (rollback_failure,)
+        elif len(original.args) == 1 and isinstance(original.args[0], str):
+            original.args = (f"{original.args[0]}; {rollback_failure}",)
+
     async def _spawn_tmux_repl(self) -> None:
         """Spawn the tmux session and the in-pane claude REPL, then start
         the response tailer.
@@ -3075,18 +3204,17 @@ class TmuxSession(TransportReplacementMixin):
 
         try:
             await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            # Reap whatever partial state we may have left.
-            try:
-                await self._tmux.kill_session()
-            except Exception:
-                # Best-effort cleanup; ignore failure since we're already
-                # raising the cold-start timeout to the caller.
-                pass
-            raise RuntimeError(
+        except asyncio.TimeoutError as exc:
+            rollback_failure = await self._rollback_spawned_session(
+                site="cold-start timeout"
+            )
+            message = (
                 f"tmux[{self.agent_name}]: cold-start timed out after "
                 f"{_COLD_START_TIMEOUT_SEC}s"
-            ) from None
+            )
+            if rollback_failure is not None:
+                message = f"{message}; {rollback_failure}"
+            raise RuntimeError(message) from exc
 
         # ``tmux new-session -d`` only proves that tmux launched the in-pane
         # command. The command can then fail fast (bad CLI flag, auth error,
@@ -3101,16 +3229,16 @@ class TmuxSession(TransportReplacementMixin):
                     "spawn; the in-pane command exited before the REPL became "
                     "available (inspect in-pane startup and authentication errors)"
                 )
-        except BaseException:
+        except BaseException as exc:
             # ``new-session`` already succeeded, so cancellation during the
             # delay or an exception from the liveness probe can otherwise
             # leave a live tmux REPL unmanaged while the caller transitions
-            # the Python state machine to DEAD. Reap best-effort and preserve
-            # the original failure (including CancelledError).
-            try:
-                await self._tmux.kill_session()
-            except BaseException:
-                pass
+            # the Python state machine to DEAD. Strict rollback stays bounded
+            # and preserves the original failure (including CancelledError).
+            rollback_failure = await self._rollback_spawned_session(
+                site="post-spawn liveness"
+            )
+            self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
 
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
@@ -3127,7 +3255,7 @@ class TmuxSession(TransportReplacementMixin):
         # symmetric "spawn raised → caller transitions DEAD" semantics.
         try:
             await self._start_tailer()
-        except Exception:
+        except BaseException as exc:
             # Murzik's PR #496 round-3 cleanup-hole fix: if _start_tailer
             # raises AFTER constructing self._tailer but before/during
             # the await on start(), we'd otherwise transition DEAD with
@@ -3136,15 +3264,13 @@ class TmuxSession(TransportReplacementMixin):
             # clean state. Symmetric with the tmux kill below.
             try:
                 await self._stop_tailer()
-            except Exception:
+            except BaseException:
                 pass
             self._tailer = None
-            try:
-                await self._tmux.kill_session()
-            except Exception:
-                # Best-effort cleanup; ignore failure since we're already
-                # re-raising the tailer-start error to the caller.
-                pass
+            rollback_failure = await self._rollback_spawned_session(
+                site="tailer-start failure"
+            )
+            self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
 
         # REPL + tailer are both up as a unit — NOW it's safe to
