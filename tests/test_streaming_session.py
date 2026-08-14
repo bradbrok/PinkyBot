@@ -274,6 +274,26 @@ async def _run_reader_against_stream(ss: StreamingSession, messages: list) -> No
 
 
 @pytest.mark.asyncio
+async def test_reader_warns_on_conversation_reset_and_unknown_frame(capsys) -> None:
+    """A widened SDK Message union must never degrade to a silent drop."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    ss = _make_session()
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id="session-uuid",
+    )
+
+    await _run_reader_against_stream(ss, [reset, object()])
+
+    logs = capsys.readouterr().err
+    assert "WARNING SDK conversation reset" in logs
+    assert "new_conversation_id='new-conversation'" in logs
+    assert "WARNING unhandled SDK message type=object; continuing" in logs
+
+
+@pytest.mark.asyncio
 async def test_auth_callback_fires_once_when_both_paths_signal_for_same_turn() -> None:
     """Regression for PR #404 / Murzik's review.
 

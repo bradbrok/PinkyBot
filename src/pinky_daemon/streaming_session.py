@@ -787,11 +787,16 @@ class StreamingSession(TransportReplacementMixin):
         from claude_agent_sdk.types import (
             AssistantMessage,
             AssistantMessageError,
+            ConversationResetMessage,
+            RateLimitEvent,
             ResultMessage,
+            StreamEvent,
+            SystemMessage,
             TextBlock,
             ThinkingBlock,
             ToolResultBlock,
             ToolUseBlock,
+            UserMessage,
         )
 
         # Defensive invariant: ``_is_auth_error_assistant`` does an exact
@@ -1264,6 +1269,32 @@ class StreamingSession(TransportReplacementMixin):
                         and not self._pending_chats
                     ):
                         _notify_turn_idle(self._config, self.agent_name)
+
+                elif isinstance(msg, ConversationResetMessage):
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING SDK conversation "
+                        "reset; transcript was discarded "
+                        f"new_conversation_id={msg.new_conversation_id!r} "
+                        f"session_id={msg.session_id!r}"
+                    )
+
+                elif isinstance(msg, RateLimitEvent):
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING SDK rate-limit "
+                        f"event status={msg.rate_limit_info.status!r}"
+                    )
+
+                elif isinstance(msg, (SystemMessage, UserMessage, StreamEvent)):
+                    # Known non-boundary frames are intentionally ignored.
+                    continue
+
+                else:
+                    # The SDK Message union is open across dependency bumps.
+                    # Never let a newly added frame disappear silently.
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING unhandled SDK "
+                        f"message type={type(msg).__name__}; continuing"
+                    )
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")

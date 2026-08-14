@@ -122,9 +122,13 @@ class SDKRunner:
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
+            ConversationResetMessage,
+            RateLimitEvent,
             ResultMessage,
+            StreamEvent,
             SystemMessage,
             TextBlock,
+            UserMessage,
             query,
         )
 
@@ -245,6 +249,36 @@ class SDKRunner:
                                 session_id=result_session_id,
                                 data={"tool": {"tool_name": tool_name, "tool_input": tool_input}},
                             )
+
+                elif isinstance(message, AssistantMessage):
+                    # Result content already won the existing dedupe rule.
+                    pass
+
+                elif isinstance(message, ConversationResetMessage):
+                    _log(
+                        "sdk-runner: WARNING SDK conversation reset; transcript "
+                        "was discarded "
+                        f"new_conversation_id={message.new_conversation_id!r} "
+                        f"session_id={message.session_id!r}"
+                    )
+
+                elif isinstance(message, RateLimitEvent):
+                    _log(
+                        "sdk-runner: WARNING SDK rate-limit event "
+                        f"status={message.rate_limit_info.status!r}"
+                    )
+
+                elif isinstance(message, (UserMessage, StreamEvent)):
+                    # Known non-result frames are intentionally ignored.
+                    pass
+
+                else:
+                    # The SDK Message union is open across dependency bumps.
+                    # Never let a newly added frame disappear silently.
+                    _log(
+                        "sdk-runner: WARNING unhandled SDK message "
+                        f"type={type(message).__name__}; continuing"
+                    )
 
                 # Detect subagent activity
                 if isinstance(message, AssistantMessage):

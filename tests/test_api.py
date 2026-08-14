@@ -324,6 +324,14 @@ class TestStreamingSession:
         fake_types.ToolResultBlock = ToolResultBlock
         fake_types.AssistantMessage = AssistantMessage
         fake_types.ResultMessage = ResultMessage
+        for message_type in (
+            "ConversationResetMessage",
+            "RateLimitEvent",
+            "StreamEvent",
+            "SystemMessage",
+            "UserMessage",
+        ):
+            setattr(fake_types, message_type, type(message_type, (), {}))
         # Stub for the SDK Literal — reader_loop's import-time invariant
         # check (PR #404) reads __args__ to defend against SDK rename.
         from typing import Literal as _Literal

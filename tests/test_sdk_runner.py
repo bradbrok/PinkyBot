@@ -87,6 +87,32 @@ class TestSDKRunner:
         assert hasattr(runner, "health_check")
         assert runner._config.working_dir == "."
 
+    @pytest.mark.asyncio
+    async def test_run_warns_on_conversation_reset_and_unknown_frame(
+        self, monkeypatch, capsys
+    ):
+        """A widened SDK Message union must never degrade to a silent drop."""
+        import claude_agent_sdk
+        from claude_agent_sdk import ConversationResetMessage
+
+        async def fake_query(*, prompt, options):
+            del prompt, options
+            yield ConversationResetMessage(
+                new_conversation_id="new-conversation",
+                uuid="reset-uuid",
+                session_id="session-uuid",
+            )
+            yield object()
+
+        monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+        result = await SDKRunner().run("clear")
+
+        assert result.ok
+        logs = capsys.readouterr().err
+        assert "WARNING SDK conversation reset" in logs
+        assert "new_conversation_id='new-conversation'" in logs
+        assert "WARNING unhandled SDK message type=object; continuing" in logs
+
 
 class TestSessionSDKIntegration:
     """Test that Session correctly initializes with SDK runner."""
