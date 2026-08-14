@@ -29,4 +29,4 @@ def test_buzz_dependencies_are_in_base_install() -> None:
 
 
 def test_claude_agent_sdk_excludes_allowed_tools_injection_versions() -> None:
-    assert "claude-agent-sdk>=0.2.129,<0.3" in _project()["dependencies"]
+    assert "claude-agent-sdk>=0.2.138,<0.3" in _project()["dependencies"]

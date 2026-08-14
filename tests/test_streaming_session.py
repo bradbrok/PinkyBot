@@ -15,6 +15,9 @@ import pytest
 from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
 from pinky_daemon.transport_state import SessionState
 
+OLD_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+NEW_SESSION_ID = "22222222-2222-4222-8222-222222222222"
+
 
 def _make_session(
     *,
@@ -231,6 +234,7 @@ def _make_result_message(
     is_error: bool = False,
     api_error_status: int | None = None,
     errors: list[str] | None = None,
+    session_id: str = "test-session",
 ):
     """Build a ResultMessage with the minimum fields the reader_loop reads."""
     from claude_agent_sdk.types import ResultMessage
@@ -241,7 +245,7 @@ def _make_result_message(
         duration_api_ms=5,
         is_error=is_error,
         num_turns=1,
-        session_id="test-session",
+        session_id=session_id,
         stop_reason="end_turn" if not is_error else "error",
         api_error_status=api_error_status,
         errors=errors,
@@ -271,6 +275,88 @@ async def _run_reader_against_stream(ss: StreamingSession, messages: list) -> No
 
     ss._client.receive_messages = _receive_messages
     await ss._reader_loop()
+
+
+@pytest.mark.asyncio
+async def test_reader_warns_on_conversation_reset_and_unknown_frame(capsys) -> None:
+    """A widened SDK Message union must never degrade to a silent drop."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    ss = _make_session()
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id="session-uuid",
+    )
+
+    await _run_reader_against_stream(ss, [reset, object()])
+
+    logs = capsys.readouterr().err
+    assert "WARNING SDK conversation reset" in logs
+    assert "new_conversation_id='new-conversation'" in logs
+    assert "WARNING unhandled SDK message type=object; continuing" in logs
+
+
+@pytest.mark.asyncio
+async def test_reset_replaces_old_resume_handle_from_result_message() -> None:
+    """Reset(old) + Result(new) persists empty first, then the fresh handle."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    persisted = OLD_SESSION_ID
+    writes: list[str] = []
+    ss = _make_session()
+    ss.resume_handle = OLD_SESSION_ID
+
+    def persist(_agent_name: str, resume_handle: str) -> None:
+        nonlocal persisted
+        persisted = resume_handle
+        writes.append(resume_handle)
+
+    ss._on_resume_handle_sync = persist
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id=OLD_SESSION_ID,
+    )
+
+    await _run_reader_against_stream(
+        ss,
+        [reset, _make_result_message(session_id=NEW_SESSION_ID)],
+    )
+
+    assert writes == ["", NEW_SESSION_ID]
+    assert persisted == NEW_SESSION_ID
+    assert ss.resume_handle == NEW_SESSION_ID
+
+
+@pytest.mark.asyncio
+async def test_reset_without_fresh_frame_clears_resume_handle_before_death() -> None:
+    """A reset-window death leaves durable and in-memory handles empty."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    persisted = OLD_SESSION_ID
+    ss = _make_session()
+    ss.resume_handle = OLD_SESSION_ID
+
+    def persist(_agent_name: str, resume_handle: str) -> None:
+        nonlocal persisted
+        persisted = resume_handle
+
+    ss._on_resume_handle_sync = persist
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id=OLD_SESSION_ID,
+    )
+
+    await _run_reader_against_stream(ss, [reset])
+
+    assert persisted == ""
+    assert ss.resume_handle == ""
+    restarted = StreamingSession(
+        StreamingSessionConfig(agent_name="test", resume_handle=persisted)
+    )
+    assert restarted.resume_handle == ""
 
 
 @pytest.mark.asyncio

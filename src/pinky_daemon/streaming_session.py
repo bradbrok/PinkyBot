@@ -360,7 +360,11 @@ class StreamingSession(TransportReplacementMixin):
         self._activity_log: list[str] = []  # All tool activities this turn
         self._current_thinking = ""  # Latest thinking block (for UI streaming)
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
-        self._on_resume_handle = None  # async fn(agent_name, resume_handle) — called when SDK resume token is captured
+        self._on_resume_handle = None  # async fn(agent_name, resume_handle) — used by restart paths
+        # Reset frames invalidate the persisted handle synchronously: awaiting
+        # between observing /clear and clearing durable state leaves a window
+        # where a process death can resurrect the discarded transcript.
+        self._on_resume_handle_sync = None  # sync fn(agent_name, resume_handle)
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
@@ -787,11 +791,16 @@ class StreamingSession(TransportReplacementMixin):
         from claude_agent_sdk.types import (
             AssistantMessage,
             AssistantMessageError,
+            ConversationResetMessage,
+            RateLimitEvent,
             ResultMessage,
+            StreamEvent,
+            SystemMessage,
             TextBlock,
             ThinkingBlock,
             ToolResultBlock,
             ToolUseBlock,
+            UserMessage,
         )
 
         # Defensive invariant: ``_is_auth_error_assistant`` does an exact
@@ -818,6 +827,33 @@ class StreamingSession(TransportReplacementMixin):
         # threshold early and skewing the multi-agent baseline. Reset at the
         # end of ResultMessage handling (turn boundary).
         auth_reported_this_turn = False
+        invalidated_resume_handles: set[str] = set()
+
+        async def _capture_resume_handle(candidate: object) -> None:
+            """Persist a non-empty SDK handle that was not invalidated by /clear."""
+            if not isinstance(candidate, str) or not candidate:
+                return
+            if candidate in invalidated_resume_handles:
+                _log(
+                    f"streaming[{self.agent_name}]: WARNING refusing invalidated "
+                    f"resume_handle {candidate[:12]}"
+                )
+                return
+            if candidate == self.resume_handle:
+                return
+
+            self.resume_handle = candidate
+            _log(
+                f"streaming[{self.agent_name}]: captured resume_handle "
+                f"{self.resume_handle[:12]}"
+            )
+            if self._on_resume_handle_sync:
+                self._on_resume_handle_sync(self.agent_name, self.resume_handle)
+            elif self._on_resume_handle:
+                try:
+                    await self._on_resume_handle(self.agent_name, self.resume_handle)
+                except Exception:
+                    pass
 
         try:
             async for msg in self._client.receive_messages():
@@ -923,17 +959,15 @@ class StreamingSession(TransportReplacementMixin):
                         self.usage.input_tokens += msg.usage.get("input_tokens", 0)
                         self.usage.output_tokens += msg.usage.get("output_tokens", 0)
 
-                    # Capture SDK resume handle for persistence
-                    if msg.session_id and msg.session_id != self.resume_handle:
-                        self.resume_handle = msg.session_id
-                        _log(f"streaming[{self.agent_name}]: captured resume_handle {self.resume_handle[:12]}")
-                        if self._on_resume_handle:
-                            try:
-                                await self._on_resume_handle(self.agent_name, self.resume_handle)
-                            except Exception:
-                                pass
+                    # Capture SDK resume handle for persistence.
+                    await _capture_resume_handle(getattr(msg, "session_id", None))
 
                 elif isinstance(msg, ResultMessage):
+                    # A local slash command such as /clear may produce no
+                    # AssistantMessage for the fresh conversation. Result is
+                    # therefore an equally authoritative resume-handle frame.
+                    await _capture_resume_handle(getattr(msg, "session_id", None))
+
                     # Debug: log result message details
                     if msg.num_turns and msg.num_turns > 0:
                         _log(f"streaming[{self.agent_name}]: result — turns={msg.num_turns}, cost=${msg.total_cost_usd or 0:.4f}, model_usage={msg.model_usage}")
@@ -1264,6 +1298,51 @@ class StreamingSession(TransportReplacementMixin):
                         and not self._pending_chats
                     ):
                         _notify_turn_idle(self._config, self.agent_name)
+
+                elif isinstance(msg, ConversationResetMessage):
+                    # The reset frame names the outgoing session. Invalidate
+                    # both it and our current handle before doing any other
+                    # work, then synchronously clear durable state. There must
+                    # be no await gap here: death before the next fresh-session
+                    # frame must produce a clean start, never resume /clear's
+                    # discarded transcript.
+                    if msg.session_id:
+                        invalidated_resume_handles.add(msg.session_id)
+                    if self.resume_handle:
+                        invalidated_resume_handles.add(self.resume_handle)
+                    self.resume_handle = ""
+                    if self._on_resume_handle_sync:
+                        self._on_resume_handle_sync(self.agent_name, "")
+                    elif self._on_resume_handle:
+                        raise RuntimeError(
+                            "conversation reset requires synchronous "
+                            "resume-handle persistence"
+                        )
+
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING SDK conversation "
+                        "reset; transcript was discarded "
+                        f"new_conversation_id={msg.new_conversation_id!r} "
+                        f"session_id={msg.session_id!r}"
+                    )
+
+                elif isinstance(msg, RateLimitEvent):
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING SDK rate-limit "
+                        f"event status={msg.rate_limit_info.status!r}"
+                    )
+
+                elif isinstance(msg, (SystemMessage, UserMessage, StreamEvent)):
+                    # Known non-boundary frames are intentionally ignored.
+                    continue
+
+                else:
+                    # The SDK Message union is open across dependency bumps.
+                    # Never let a newly added frame disappear silently.
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING unhandled SDK "
+                        f"message type={type(msg).__name__}; continuing"
+                    )
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")

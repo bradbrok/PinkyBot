@@ -144,7 +144,11 @@ class TestSession:
     async def test_send_resumes_after_first(self):
         session = Session(session_id="test")
         session._runner.run = AsyncMock(
-            return_value=RunResult(output="ok", exit_code=0)
+            return_value=RunResult(
+                output="ok",
+                exit_code=0,
+                session_id="11111111-1111-4111-8111-111111111111",
+            )
         )
 
         await session.send("First message")
@@ -159,7 +163,11 @@ class TestSession:
     async def test_send_system_prompt_first_only(self):
         session = Session(session_id="test", system_prompt="Be helpful")
         session._runner.run = AsyncMock(
-            return_value=RunResult(output="ok", exit_code=0)
+            return_value=RunResult(
+                output="ok",
+                exit_code=0,
+                session_id="11111111-1111-4111-8111-111111111111",
+            )
         )
 
         await session.send("First")
@@ -324,6 +332,14 @@ class TestStreamingSession:
         fake_types.ToolResultBlock = ToolResultBlock
         fake_types.AssistantMessage = AssistantMessage
         fake_types.ResultMessage = ResultMessage
+        for message_type in (
+            "ConversationResetMessage",
+            "RateLimitEvent",
+            "StreamEvent",
+            "SystemMessage",
+            "UserMessage",
+        ):
+            setattr(fake_types, message_type, type(message_type, (), {}))
         # Stub for the SDK Literal — reader_loop's import-time invariant
         # check (PR #404) reads __args__ to defend against SDK rename.
         from typing import Literal as _Literal
