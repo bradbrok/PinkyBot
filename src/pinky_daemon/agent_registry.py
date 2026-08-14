@@ -5843,6 +5843,52 @@ except Exception as exc:
                 if len(rows) < batch_size:
                     return
 
+        def _refresh_retained_active() -> None:
+            for agent_metrics in metrics.values():
+                agent_metrics["retained_active"] = 0
+            active_rows = self._db.execute(
+                """SELECT agent_name, COUNT(*)
+                   FROM pending_schedule_wakes
+                   WHERE accepted_at=0 AND parked_at=0 AND abandoned_at=0
+                   GROUP BY agent_name"""
+            ).fetchall()
+            for agent_name, count in active_rows:
+                _agent_metrics(str(agent_name))["retained_active"] = int(count)
+
+        def _emit_metrics(
+            *, failed_phase: str | None = None
+        ) -> list[dict[str, int | str]]:
+            result = [metrics[name] for name in sorted(metrics)]
+            for row in result:
+                _log(
+                    f"outbox-reaper: agent={row['agent_name']} "
+                    f"abandoned=+{row['abandoned']} "
+                    f"accepted_reaped={row['accepted_reaped']} "
+                    f"abandoned_reaped={row['abandoned_reaped']} "
+                    f"parked_reaped={row['parked_reaped']} "
+                    f"payloads_trimmed={row['payloads_trimmed']} "
+                    f"retained_active={row['retained_active']}"
+                )
+            totals = {
+                field: sum(int(row[field]) for row in result)
+                for field in metric_fields
+            }
+            partial = (
+                f" PARTIAL failed_phase={failed_phase}"
+                if failed_phase is not None
+                else ""
+            )
+            _log(
+                f"outbox-reaper: summary{partial} agents={len(result)} "
+                f"abandoned=+{totals['abandoned']} "
+                f"accepted_reaped={totals['accepted_reaped']} "
+                f"abandoned_reaped={totals['abandoned_reaped']} "
+                f"parked_reaped={totals['parked_reaped']} "
+                f"payloads_trimmed={totals['payloads_trimmed']} "
+                f"retained_active={totals['retained_active']}"
+            )
+            return result
+
         discard_reason = "retired via discard"
         abandon_cutoff = observed_at - windows["abandon_after"]
         accepted_cutoff = observed_at - windows["retain_accepted"]
@@ -5850,6 +5896,7 @@ except Exception as exc:
         parked_cutoff = observed_at - windows["retain_parked"]
         trim_cutoff = observed_at - windows["payload_trim_after"]
 
+        failed_phase = "agent_scan"
         with self._rmw_lock:
             try:
                 for row in self._db.execute(
@@ -5857,6 +5904,7 @@ except Exception as exc:
                 ).fetchall():
                     _agent_metrics(str(row[0]))
 
+                failed_phase = "abandon"
                 _apply_batched(
                     """UPDATE pending_schedule_wakes
                        SET abandoned_at=?, parked_at=0
@@ -5876,6 +5924,7 @@ except Exception as exc:
                     (observed_at, abandon_cutoff),
                     "abandoned",
                 )
+                failed_phase = "accepted_reap"
                 _apply_batched(
                     """DELETE FROM pending_schedule_wakes
                        WHERE id IN (
@@ -5887,6 +5936,7 @@ except Exception as exc:
                     (accepted_cutoff,),
                     "accepted_reaped",
                 )
+                failed_phase = "abandoned_reap"
                 _apply_batched(
                     """DELETE FROM pending_schedule_wakes
                        WHERE id IN (
@@ -5905,6 +5955,7 @@ except Exception as exc:
                     (abandoned_cutoff, abandoned_cutoff, discard_reason),
                     "abandoned_reaped",
                 )
+                failed_phase = "parked_reap"
                 _apply_batched(
                     """DELETE FROM pending_schedule_wakes AS parked
                        WHERE parked.id IN (
@@ -5937,6 +5988,7 @@ except Exception as exc:
                     (parked_cutoff, discard_reason, discard_reason),
                     "parked_reaped",
                 )
+                failed_phase = "payload_trim"
                 _apply_batched(
                     """UPDATE pending_schedule_wakes AS terminal
                        SET prompt=?
@@ -6000,46 +6052,21 @@ except Exception as exc:
                     "payloads_trimmed",
                 )
 
-                active_rows = self._db.execute(
-                    """SELECT agent_name, COUNT(*)
-                       FROM pending_schedule_wakes
-                       WHERE accepted_at=0 AND parked_at=0 AND abandoned_at=0
-                       GROUP BY agent_name"""
-                ).fetchall()
-                for agent_name, count in active_rows:
-                    _agent_metrics(str(agent_name))["retained_active"] = int(
-                        count
-                    )
+                failed_phase = "retained_active"
+                _refresh_retained_active()
             except Exception:
                 self._db.rollback()
+                try:
+                    _refresh_retained_active()
+                except Exception:
+                    # Preserve and report the maintenance failure even if the
+                    # diagnostic read is unavailable on a broken connection.
+                    pass
+                _emit_metrics(failed_phase=failed_phase)
                 _log("outbox-reaper: ERROR maintenance pass failed")
                 raise
 
-        result = [metrics[name] for name in sorted(metrics)]
-        for row in result:
-            _log(
-                f"outbox-reaper: agent={row['agent_name']} "
-                f"abandoned=+{row['abandoned']} "
-                f"accepted_reaped={row['accepted_reaped']} "
-                f"abandoned_reaped={row['abandoned_reaped']} "
-                f"parked_reaped={row['parked_reaped']} "
-                f"payloads_trimmed={row['payloads_trimmed']} "
-                f"retained_active={row['retained_active']}"
-            )
-        totals = {
-            field: sum(int(row[field]) for row in result)
-            for field in metric_fields
-        }
-        _log(
-            f"outbox-reaper: summary agents={len(result)} "
-            f"abandoned=+{totals['abandoned']} "
-            f"accepted_reaped={totals['accepted_reaped']} "
-            f"abandoned_reaped={totals['abandoned_reaped']} "
-            f"parked_reaped={totals['parked_reaped']} "
-            f"payloads_trimmed={totals['payloads_trimmed']} "
-            f"retained_active={totals['retained_active']}"
-        )
-        return result
+        return _emit_metrics()
 
     # ── Heartbeats ─────────────────────────────────────────
 

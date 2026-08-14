@@ -1222,6 +1222,154 @@ class TestOutboxReaper:
             "payloads_trimmed=0 retained_active=0"
         ]
 
+    def test_late_phase_failure_reports_commits_and_retry_matches_clean_run(
+        self, registry, tmp_path, monkeypatch, capsys
+    ):
+        now = 2_000_000_000.0
+        backoff = 100.0
+
+        def seed(reg):
+            reg.register("fault")
+            schedule = reg.add_schedule(
+                "fault", "0 1 * * *", name="fault", prompt="run"
+            )
+            expired, _ = reg.persist_schedule_wake(
+                schedule.id,
+                agent_name="fault",
+                schedule_name=schedule.name,
+                prompt="delete me",
+                fired_at=now - 8 * self.DAY,
+            )
+            retained, _ = reg.persist_schedule_wake(
+                schedule.id,
+                agent_name="fault",
+                schedule_name=schedule.name,
+                prompt="trim me",
+                fired_at=now - 3 * self.DAY,
+            )
+            assert reg.confirm_pending_schedule_wake(
+                expired.id, delivered_at=now - 7 * self.DAY - 1
+            )
+            assert reg.confirm_pending_schedule_wake(
+                retained.id, delivered_at=now - 3 * self.DAY
+            )
+            return expired, retained
+
+        expired, retained = seed(registry)
+        registry._db.execute(
+            f"""CREATE TRIGGER fail_outbox_payload_trim
+               BEFORE UPDATE OF prompt ON pending_schedule_wakes
+               WHEN NEW.prompt={OUTBOX_REAPER_PAYLOAD_TRIMMED!r}
+                    AND OLD.prompt<>NEW.prompt
+               BEGIN
+                 SELECT RAISE(ABORT, 'injected payload trim failure');
+               END"""
+        )
+        registry._db.commit()
+
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC", str(backoff)
+        )
+        scheduler = AgentScheduler(registry)
+        actual_reap = registry.reap_pending_schedule_wakes
+        failures: list[type[Exception]] = []
+        successes: list[list[dict[str, int | str]]] = []
+
+        def observe_reap(**kwargs):
+            try:
+                result = actual_reap(**kwargs)
+            except Exception as exc:
+                failures.append(type(exc))
+                raise
+            successes.append(result)
+            return result
+
+        monkeypatch.setattr(
+            registry, "reap_pending_schedule_wakes", observe_reap
+        )
+        capsys.readouterr()
+
+        assert scheduler._run_outbox_reaper_if_due(now) is False
+        assert failures == [sqlite3.IntegrityError]
+        assert scheduler._last_outbox_reaper_day is None
+        assert scheduler._last_outbox_reaper_failed_at == now
+        assert registry.get_schedule_wake_by_fire(
+            expired.schedule_id, expired.fired_at
+        ) is None
+        assert registry.get_schedule_wake_by_fire(
+            retained.schedule_id, retained.fired_at
+        ).prompt == "trim me"
+        partial_logs = capsys.readouterr().err
+        assert (
+            "outbox-reaper: agent=fault abandoned=+0 accepted_reaped=1 "
+            "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
+            "retained_active=0"
+        ) in partial_logs
+        assert (
+            "outbox-reaper: summary PARTIAL failed_phase=payload_trim "
+            "agents=1 abandoned=+0 accepted_reaped=1 "
+            "abandoned_reaped=0 parked_reaped=0 payloads_trimmed=0 "
+            "retained_active=0"
+        ) in partial_logs
+
+        assert scheduler._run_outbox_reaper_if_due(
+            now + backoff - 1
+        ) is False
+        assert failures == [sqlite3.IntegrityError]
+        assert successes == []
+        assert capsys.readouterr().err == ""
+
+        registry._db.execute("DROP TRIGGER fail_outbox_payload_trim")
+        registry._db.commit()
+        assert scheduler._run_outbox_reaper_if_due(
+            now + backoff
+        ) is True
+        assert scheduler._run_outbox_reaper_if_due(
+            now + backoff + 1
+        ) is False
+        assert scheduler._last_outbox_reaper_failed_at is None
+        assert len(successes) == 1
+        retry_metrics = successes[0][0]
+        assert retry_metrics["accepted_reaped"] == 0
+        assert retry_metrics["payloads_trimmed"] == 1
+        assert registry.get_schedule_wake_by_fire(
+            retained.schedule_id, retained.fired_at
+        ).prompt == OUTBOX_REAPER_PAYLOAD_TRIMMED
+
+        clean_registry = AgentRegistry(
+            db_path=str(tmp_path / "clean-reaper.db")
+        )
+        try:
+            seed(clean_registry)
+            clean_metrics = self._reap(
+                clean_registry,
+                now=now + backoff,
+                payload_trim_after=2 * self.DAY,
+            )[0]
+
+            def snapshot(reg):
+                return reg._db.execute(
+                    """SELECT agent_name, schedule_name, prompt, fired_at,
+                              accepted_at, parked_at, abandoned_at, last_error
+                       FROM pending_schedule_wakes
+                       ORDER BY id"""
+                ).fetchall()
+
+            assert snapshot(registry) == snapshot(clean_registry)
+            partial_commits = {
+                "abandoned": 0,
+                "accepted_reaped": 1,
+                "abandoned_reaped": 0,
+                "parked_reaped": 0,
+                "payloads_trimmed": 0,
+            }
+            for field, partial_count in partial_commits.items():
+                assert clean_metrics[field] == (
+                    partial_count + int(retry_metrics[field])
+                )
+        finally:
+            clean_registry.close()
+
     @pytest.mark.asyncio
     async def test_inflight_drain_and_reap_converge_to_one_receipt(
         self, registry, monkeypatch
@@ -1387,6 +1535,9 @@ class TestOutboxReaper:
         monkeypatch.setenv(
             "PINKY_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC", "404"
         )
+        monkeypatch.setenv(
+            "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC", "505"
+        )
         calls: list[dict] = []
         monkeypatch.setattr(
             registry,
@@ -1414,6 +1565,7 @@ class TestOutboxReaper:
             "retain_parked": 303.0,
             "payload_trim_after": 404.0,
         }
+        assert scheduler._outbox_reaper_failure_backoff_sec == 505.0
 
 
 # ── Agent Heartbeat Tests ──────────────────────────────────

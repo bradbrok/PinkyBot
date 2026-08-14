@@ -72,10 +72,14 @@ _OUTBOX_REAPER_RETAIN_PARKED_ENV = "PINKY_OUTBOX_REAPER_RETAIN_PARKED_SEC"
 _OUTBOX_REAPER_PAYLOAD_TRIM_ENV = (
     "PINKY_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC"
 )
+_OUTBOX_REAPER_FAILURE_BACKOFF_ENV = (
+    "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC"
+)
 _OUTBOX_REAPER_RETAIN_ACCEPTED_SEC = 7 * 24 * 60 * 60
 _OUTBOX_REAPER_RETAIN_ABANDONED_SEC = 14 * 24 * 60 * 60
 _OUTBOX_REAPER_RETAIN_PARKED_SEC = 30 * 24 * 60 * 60
 _OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC = 48 * 60 * 60
+_OUTBOX_REAPER_FAILURE_BACKOFF_SEC = 60 * 60
 
 
 class _ReceiptAbandonedError(RuntimeError):
@@ -367,6 +371,10 @@ class AgentScheduler:
             _OUTBOX_REAPER_PAYLOAD_TRIM_ENV,
             _OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC,
         )
+        self._outbox_reaper_failure_backoff_sec = _positive_env_seconds(
+            _OUTBOX_REAPER_FAILURE_BACKOFF_ENV,
+            _OUTBOX_REAPER_FAILURE_BACKOFF_SEC,
+        )
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
@@ -398,6 +406,7 @@ class AgentScheduler:
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
         self._last_outbox_reaper_day: date | None = None
+        self._last_outbox_reaper_failed_at: float | None = None
         # Resurrection rate-limit: agent_name -> list[timestamp] of recent attempts.
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
@@ -521,9 +530,12 @@ class AgentScheduler:
         current_day = date.fromtimestamp(now)
         if self._last_outbox_reaper_day == current_day:
             return False
-        # Record the attempt before entering storage so a persistent failure
-        # emits one loud daily error instead of flooding every scheduler tick.
-        self._last_outbox_reaper_day = current_day
+        if (
+            self._last_outbox_reaper_failed_at is not None
+            and now - self._last_outbox_reaper_failed_at
+            < self._outbox_reaper_failure_backoff_sec
+        ):
+            return False
         try:
             self._registry.reap_pending_schedule_wakes(
                 now=now,
@@ -536,11 +548,14 @@ class AgentScheduler:
                 ),
             )
         except Exception as exc:
+            self._last_outbox_reaper_failed_at = now
             _log(
                 "scheduler: outbox reaper failed: "
                 f"{type(exc).__name__}: {exc}"
             )
             return False
+        self._last_outbox_reaper_day = current_day
+        self._last_outbox_reaper_failed_at = None
         return True
 
     def _warn_oversized_schedule_prompts(
