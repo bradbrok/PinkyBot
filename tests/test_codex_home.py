@@ -2176,6 +2176,60 @@ async def test_tmux_replacement_publishes_and_snapshots_soul_once(
     assert soul_store.calls == [("test-agent", "compiled tmux soul", "spawn")]
 
 
+@pytest.mark.asyncio
+async def test_tmux_refused_replacement_does_not_stale_next_spawn_soul(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+        restart_guard=lambda _session: {"restart_safe": False},
+    )
+    soul_store = _SoulStore()
+    session = CodexTmuxSession(config, registry=soul_store)
+    session._has_completed_turn = True
+
+    async def _noop():
+        return None
+
+    async def _base_spawn(_session):
+        return None
+
+    monkeypatch.setattr(session, "_seed_codex_trust", lambda _cwd: None)
+    monkeypatch.setattr(session, "_codex_dismiss_nux_and_ready", _noop)
+    monkeypatch.setattr(
+        "pinky_daemon.codex_tmux_session.TmuxSession._spawn_tmux_repl",
+        _base_spawn,
+    )
+
+    assert await session.force_restart() is False
+    assert soul_store.calls == [
+        ("test-agent", "compiled tmux soul", "spawn"),
+    ]
+    assert session._preflighted_codex_homes == {}
+
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit after refused restart", encoding="utf-8")
+
+    await session._spawn_tmux_repl()
+
+    assert agents_md.read_text(encoding="utf-8") == "compiled tmux soul"
+    assert soul_store.calls == [
+        ("test-agent", "compiled tmux soul", "spawn"),
+        ("test-agent", "self edit after refused restart", "agent"),
+        ("test-agent", "compiled tmux soul", "spawn"),
+    ]
+
+
 def test_tmux_app_server_boundary_uses_the_shared_soul_writer(
     tmp_path,
     monkeypatch,
