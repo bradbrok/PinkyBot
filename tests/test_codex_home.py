@@ -34,7 +34,7 @@ from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.codex_tmux_transcript import _discover_codex_rollout
 from pinky_daemon.streaming_session import StreamingSessionConfig
-from pinky_daemon.tmux_session import TmuxCommandResult
+from pinky_daemon.tmux_session import TmuxCommandResult, TmuxSession, _TmuxControl
 
 
 def _scope(
@@ -2405,6 +2405,176 @@ async def test_tmux_app_server_replacement_publishes_and_snapshots_soul_once(
 
 
 @pytest.mark.asyncio
+async def test_tmux_app_server_first_start_with_absent_server_proceeds(
+    tmp_path,
+    monkeypatch,
+):
+    """R6: a missing tmux server is an idempotent pre-start cleanup result."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled app-server soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before first start", encoding="utf-8")
+    supervisor = CodexAppServerSupervisor(
+        "test-agent",
+        working_dir=str(working_dir),
+        agent_config=config,
+        soul_version_store=soul_store,
+    )
+    tmux_calls: list[tuple[str, ...]] = []
+    build_env_calls = 0
+    new_session_calls = 0
+    client_start_calls = 0
+    absent_server = TmuxCommandResult(
+        returncode=1,
+        stdout="",
+        stderr=("error connecting to /private/tmp/tmux-501/pinky-test (No such file or directory)"),
+    )
+    real_build_env = supervisor._build_env
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] in {"kill-session", "has-session"}:
+            return absent_server
+        raise AssertionError(f"unexpected direct tmux call: {args}")
+
+    async def _new_session(**_kwargs):
+        nonlocal new_session_calls
+        new_session_calls += 1
+        return TmuxCommandResult(returncode=0, stdout="", stderr="")
+
+    async def _await_accept():
+        return object(), object()
+
+    def _tracked_build_env():
+        nonlocal build_env_calls
+        build_env_calls += 1
+        return real_build_env()
+
+    class _Client:
+        def __init__(self, *_args, **_kwargs):
+            pass
+
+        def start(self):
+            nonlocal client_start_calls
+            client_start_calls += 1
+
+    monkeypatch.setattr(supervisor._tmux, "_run", _tmux_run)
+    monkeypatch.setattr(supervisor._tmux, "new_session", _new_session)
+    monkeypatch.setattr(supervisor, "_await_accept", _await_accept)
+    monkeypatch.setattr(supervisor, "_build_env", _tracked_build_env)
+    monkeypatch.setattr(
+        "pinky_daemon.codex_app_server_tmux.CodexAppServerClient",
+        _Client,
+    )
+
+    client, proc = await supervisor.start()
+
+    assert isinstance(client, _Client)
+    assert isinstance(proc, _TmuxAppServerProc)
+    assert [call[0] for call in tmux_calls] == ["kill-session", "has-session"]
+    assert build_env_calls == 1
+    assert new_session_calls == 1
+    assert client_start_calls == 1
+    assert agents_md.read_text(encoding="utf-8") == "compiled app-server soul"
+    assert soul_store.calls == [
+        ("test-agent", "self edit before first start", "agent"),
+        ("test-agent", "compiled app-server soul", "spawn"),
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tmux_repl_stale_kill_already_gone_race_proceeds(
+    tmp_path,
+    monkeypatch,
+):
+    """R6 sibling: a stale session that exits during kill may be respawned."""
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(tmp_path / "agent"),
+    )
+    tmux = _TmuxControl("pinky-test-agent")
+    session = TmuxSession(config, tmux_control=tmux)
+    tmux_calls: list[tuple[str, ...]] = []
+    has_session_calls = 0
+    absent_server = TmuxCommandResult(
+        returncode=1,
+        stdout="",
+        stderr=("error connecting to /private/tmp/tmux-501/pinky-test (No such file or directory)"),
+    )
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        nonlocal has_session_calls
+        tmux_calls.append(args)
+        if args[0] == "has-session":
+            has_session_calls += 1
+            if has_session_calls == 1:
+                return TmuxCommandResult(returncode=0, stdout="", stderr="")
+            if has_session_calls == 2:
+                return absent_server
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if args[0] == "kill-session":
+            return absent_server
+        if args[0] == "new-session":
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected tmux call: {args}")
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(tmux, "_run", _tmux_run)
+    monkeypatch.setattr(
+        session,
+        "_container_agent",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        session,
+        "_select_command_runner",
+        lambda _container_agent: tmux._runner,
+    )
+    monkeypatch.setattr(session, "_ensure_container_started", _noop)
+    monkeypatch.setattr(session, "_seed_container_trust", _noop)
+    monkeypatch.setattr(session, "_seed_container_home_creds", _noop)
+    monkeypatch.setattr(session, "_start_tailer", _noop)
+    monkeypatch.setattr(session, "_build_claude_cmd", lambda: "claude")
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._seed_claude_trust_file",
+        lambda _path, _cwd: False,
+    )
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC",
+        0,
+    )
+
+    await session._spawn_tmux_repl()
+
+    assert [call[0] for call in tmux_calls] == [
+        "has-session",
+        "kill-session",
+        "has-session",
+        "new-session",
+        "has-session",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
     tmp_path,
     monkeypatch,
@@ -2438,14 +2608,20 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
         soul_version_store=soul_store,
     )
     build_env_calls = 0
+    tmux_calls: list[tuple[str, ...]] = []
     real_build_env = supervisor._build_env
 
-    async def _failed_kill():
-        return TmuxCommandResult(
-            returncode=1,
-            stdout="",
-            stderr="stale session still alive",
-        )
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] == "kill-session":
+            return TmuxCommandResult(
+                returncode=1,
+                stdout="",
+                stderr="stale session still alive",
+            )
+        if args[0] == "has-session":
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected direct tmux call: {args}")
 
     async def _unexpected_new_session(**_kwargs):
         raise AssertionError("new_session reached after failed stale kill")
@@ -2455,7 +2631,7 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
         build_env_calls += 1
         return real_build_env()
 
-    monkeypatch.setattr(supervisor._tmux, "kill_session", _failed_kill)
+    monkeypatch.setattr(supervisor._tmux, "_run", _tmux_run)
     monkeypatch.setattr(supervisor._tmux, "new_session", _unexpected_new_session)
     monkeypatch.setattr(supervisor, "_build_env", _tracked_build_env)
 
@@ -2463,6 +2639,7 @@ async def test_tmux_app_server_stale_kill_failure_refuses_before_publication(
         await supervisor.start()
 
     assert build_env_calls == 0
+    assert [call[0] for call in tmux_calls] == ["kill-session", "has-session"]
     assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
     assert soul_store.calls == []
 
@@ -2624,24 +2801,31 @@ async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
     agents_md = working_dir / ".codex" / "AGENTS.md"
     agents_md.write_text("self edit before replacement", encoding="utf-8")
     session = CodexTmuxSession(config, registry=soul_store)
+    tmux_calls: list[tuple[str, ...]] = []
 
     async def _noop(*_args, **_kwargs):
         return None
 
-    async def _has_stale_session():
-        return True
-
-    async def _failed_kill():
-        return TmuxCommandResult(
-            returncode=1,
-            stdout="",
-            stderr="stale session still alive",
-        )
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] == "has-session":
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if args[0] == "kill-session":
+            return TmuxCommandResult(
+                returncode=1,
+                stdout="",
+                stderr="stale session still alive",
+            )
+        raise AssertionError(f"unexpected direct tmux call: {args}")
 
     async def _unexpected_new_session(**_kwargs):
         raise AssertionError("new_session reached after failed stale kill")
 
-    monkeypatch.setattr(session, "_container_agent", lambda *, strict: None)
+    monkeypatch.setattr(
+        session,
+        "_container_agent",
+        lambda *args, **kwargs: None,
+    )
     monkeypatch.setattr(
         session,
         "_select_command_runner",
@@ -2652,13 +2836,17 @@ async def test_tmux_repl_stale_kill_failure_refuses_before_publication(
         "pinky_daemon.tmux_session._seed_claude_trust_file",
         lambda _path, _cwd: False,
     )
-    monkeypatch.setattr(session._tmux, "has_session", _has_stale_session)
-    monkeypatch.setattr(session._tmux, "kill_session", _failed_kill)
+    monkeypatch.setattr(session._tmux, "_run", _tmux_run)
     monkeypatch.setattr(session._tmux, "new_session", _unexpected_new_session)
 
     with pytest.raises(RuntimeError, match="kill-session failed"):
         await session._spawn_tmux_repl()
 
+    assert [call[0] for call in tmux_calls] == [
+        "has-session",
+        "kill-session",
+        "has-session",
+    ]
     assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
     assert soul_store.calls == []
 

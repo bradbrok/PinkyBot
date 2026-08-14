@@ -669,9 +669,15 @@ class _TmuxControl:
         """Kill the tmux session. Idempotent — succeeds whether or not the
         session exists (callers shouldn't pre-check)."""
         result = await self._run("kill-session", "-t", self.session_name)
-        # tmux returns 1 if the session didn't exist; treat that as ok
-        # so callers can use this idempotently.
-        if not result.ok and "can't find session" in result.stderr:
+        if result.ok:
+            return result
+        # Do not classify absence from stderr: tmux versions and platforms use
+        # different text for a missing session versus a missing server/socket.
+        # Verify the owned target's state after the failed kill instead. A
+        # session still reported alive preserves the original failure so strict
+        # replacement callers fail closed; an already-gone target makes the
+        # kill idempotently successful. Probe exceptions still propagate.
+        if not await self.has_session():
             return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
         return result
 
@@ -3664,8 +3670,8 @@ class TmuxSession(TransportReplacementMixin):
         # so stats/path persist; only the background task is cancelled.
         await self._stop_tailer()
 
-        # Kill tmux session. ``kill_session`` is idempotent (treats
-        # "can't find session" as ok).
+        # Kill tmux session. ``kill_session`` is idempotent after verifying
+        # that a failed kill left no owned session behind.
         try:
             await self._tmux.kill_session()
         except Exception as e:
