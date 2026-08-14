@@ -1938,6 +1938,13 @@ class AgentRegistry:
             if col not in existing:
                 self._db.execute(f"ALTER TABLE agents ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added column {col}")
+        # Structural belt for the exact persisted-root case. Legacy placeholder
+        # values are excluded; resolved aliases and nested/enclosing roots still
+        # require the BEGIN IMMEDIATE overlap check in register().
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_working_dir_owner_exact "
+            "ON agents(working_dir) WHERE working_dir NOT IN ('', '.')"
+        )
         self._db.commit()
         self._backfill_runtime_from_provider_url()
         self._warn_codex_runtime_mismatches()
@@ -2172,26 +2179,38 @@ class AgentRegistry:
             return
         if self._db.execute("SELECT 1 FROM agents WHERE name='barsik'").fetchone() is None:
             return
-        cursor = self._db.execute(
-            """INSERT INTO verified_contacts
-               (agent_name, platform, principal, name, role, added_at)
-               VALUES ('barsik', 'buzz', ?, 'Brad', 'owner', ?)
-               ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
-                 name='Brad', role='owner'""",
-            (
-                "buzz:posspecialists:"
-                "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b",
-                time.time(),
-            ),
-        )
-        self._db.execute(
-            """INSERT INTO system_settings (key, value) VALUES (?, '1')
-               ON CONFLICT(key) DO UPDATE SET value='1'""",
-            (marker,),
-        )
-        self._db.commit()
+        try:
+            cursor = self._db.execute(
+                """INSERT INTO verified_contacts
+                   (agent_name, platform, principal, name, role, added_at)
+                   VALUES ('barsik', 'buzz', ?, 'Brad', 'owner', ?)
+                   ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
+                     name='Brad', role='owner'""",
+                (
+                    "buzz:posspecialists:"
+                    "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b",
+                    time.time(),
+                ),
+            )
+            self._db.execute(
+                """INSERT INTO system_settings (key, value) VALUES (?, '1')
+                   ON CONFLICT(key) DO UPDATE SET value='1'""",
+                (marker,),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
         if cursor.rowcount:
             _log("agent_registry: seeded barsik Buzz owner verified contact")
+
+    def finalize_registration(self, name: str) -> None:
+        """Publish bootstrap state only after every external registration stage."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            if not self.get(name):
+                raise KeyError(f"Agent '{name}' not found")
+            self._seed_verified_contacts()
 
     def _backfill_runtime_from_provider_url(self) -> None:
         """One-shot migration from legacy provider_url runtime selection."""
@@ -2927,7 +2946,7 @@ except Exception as exc:
             raise SoulMutationRejectedError(summary)
         return summary
 
-    def update(self, name: str, **kwargs) -> Agent:
+    def update(self, name: str, *, _commit: bool = True, **kwargs) -> Agent:
         """Partially update an existing agent without creating one.
 
         Only explicitly supplied, allowlisted fields are changed.  This is
@@ -3012,9 +3031,11 @@ except Exception as exc:
                         f"UPDATE agents SET {set_clause} WHERE name=?",
                         list(updates.values()) + [name],
                     )
-                    self._db.commit()
+                    if _commit:
+                        self._db.commit()
                 except Exception:
-                    self._db.rollback()
+                    if _commit:
+                        self._db.rollback()
                     raise
 
         updated = self.get(name)
@@ -3031,10 +3052,18 @@ except Exception as exc:
         create_only: bool,
         work_dir: Path,
     ) -> None:
-        """Insert first, then initialize only the DB-winning workspace."""
+        """Atomically claim an owner root, insert, and initialize the winner."""
         with self._rmw_lock:
             insert_won = False
             try:
+                # The advisory preflight in register() is intentionally repeated
+                # under SQLite's cross-connection writer lock. Different names do
+                # not contend on the agents.name PRIMARY KEY, so BEGIN IMMEDIATE is
+                # the authority that serializes overlap-check + INSERT across
+                # daemon processes. The second writer observes the first commit
+                # before it can evaluate owner-root equality or nesting.
+                self._db.execute("BEGIN IMMEDIATE")
+                self._refuse_workspace_overlap(name, work_dir)
                 self._db.execute(sql, params)
                 insert_won = True
                 # A losing create-only request must not reinitialize files in
@@ -3046,10 +3075,22 @@ except Exception as exc:
                 self._db.commit()
             except sqlite3.IntegrityError as exc:
                 self._db.rollback()
-                if create_only and "agents.name" in str(exc):
-                    raise AgentAlreadyExistsError(
-                        f"Agent '{name}' already exists"
-                    ) from exc
+                if create_only:
+                    # The exact-root belt may be evaluated before the name
+                    # PRIMARY KEY when a same-name loser also reuses the
+                    # winner's root. Classify from committed DB state after
+                    # rollback instead of depending on SQLite's index order.
+                    if self._db.execute(
+                        "SELECT 1 FROM agents WHERE name=?",
+                        (name,),
+                    ).fetchone():
+                        raise AgentAlreadyExistsError(
+                            f"Agent '{name}' already exists"
+                        ) from exc
+                    if "agents.working_dir" in str(exc):
+                        raise AgentWorkspaceOverlapError(
+                            "agent workspace overlaps another registered agent"
+                        ) from exc
                 raise
             except Exception:
                 self._db.rollback()
@@ -3059,6 +3100,45 @@ except Exception as exc:
                         row_committed=False,
                     )
                 raise
+
+    def _update_existing_registration(
+        self,
+        name: str,
+        *,
+        working_dir: str | Path,
+        update_kwargs: dict,
+    ) -> Agent:
+        """Serialize a legacy register-update workspace claim across connections."""
+        root = self._resolve_workspace_root(name, working_dir)
+        # Preserve the early, side-effect-free refusal while making the repeated
+        # check inside BEGIN IMMEDIATE authoritative for concurrent writers.
+        self._refuse_workspace_overlap(name, root)
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self.get(name)
+            if not existing:
+                raise KeyError(f"Agent '{name}' not found")
+            self._refuse_workspace_overlap(name, root)
+            if str(root) != existing.working_dir:
+                self._init_workspace(root, agent_name=name)
+
+            # update() owns soul-guard and snapshot semantics. Suppress its
+            # commit so those field mutations and the owner-root claim land in
+            # the same transaction, or all roll back on overlap/guard failure.
+            self.update(name, _commit=False, **update_kwargs)
+            self._db.execute(
+                "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
+                (str(root), time.time(), name),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+        refreshed = self.get(name)
+        if not refreshed:  # Defensive against a concurrent delete.
+            raise KeyError(f"Agent '{name}' not found")
+        return refreshed
 
     @staticmethod
     def _resolve_workspace_root(name: str, working_dir: str | Path) -> Path:
@@ -3140,27 +3220,16 @@ except Exception as exc:
             # Keep the legacy workspace mutation on register(), whose admin
             # callers and path-handling contract predate the partial update
             # API. AgentRegistry.update() is intentionally path-free.
-            updated_working_dir = ""
-            if kwargs.get("working_dir"):
-                upd_dir_abs = self._resolve_workspace_root(name, kwargs["working_dir"])
-                self._refuse_workspace_overlap(name, upd_dir_abs)
-                if str(upd_dir_abs) != existing.working_dir:
-                    self._init_workspace(upd_dir_abs, agent_name=name)
-                updated_working_dir = str(upd_dir_abs)
-
             update_kwargs = dict(kwargs)
             update_kwargs.pop("working_dir", None)
-            updated = self.update(name, **update_kwargs)
-            if updated_working_dir:
-                self._db.execute(
-                    "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
-                    (updated_working_dir, time.time(), name),
+            if kwargs.get("working_dir"):
+                updated = self._update_existing_registration(
+                    name,
+                    working_dir=kwargs["working_dir"],
+                    update_kwargs=update_kwargs,
                 )
-                self._db.commit()
-                refreshed = self.get(name)
-                if not refreshed:  # Defensive against a concurrent delete.
-                    raise KeyError(f"Agent '{name}' not found")
-                updated = refreshed
+            else:
+                updated = self.update(name, **update_kwargs)
             # Preserve register()'s historical signing-key backfill contract
             # for legacy rows even though the field mutation is delegated.
             self.get_or_create_signing_key(name)
@@ -3284,10 +3353,14 @@ except Exception as exc:
                 # Ensure the agent has a per-agent signing key (#623). Idempotent —
                 # returns the existing key on re-registration / update.
                 self.get_or_create_signing_key(name)
-                # Fresh databases initialize before any agents exist. Retry the
-                # caller-specified bootstrap after registration so the seed ships for
-                # both upgrades and new installs without weakening the unique key.
-                self._seed_verified_contacts()
+                # The HTTP create-only path has fallible provisioning and MCP
+                # publication stages after this registry commit. Defer its
+                # verified-contact bootstrap to finalize_registration() so a
+                # failed POST cannot leave the contact or migration marker.
+                # Direct legacy registrations have no later external stages and
+                # retain their historical bootstrap behavior.
+                if not create_only:
+                    self._seed_verified_contacts()
             except (AgentAlreadyExistsError, AgentRegistrationIncompleteError):
                 raise
             except Exception as exc:

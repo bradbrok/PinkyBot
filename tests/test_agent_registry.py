@@ -644,6 +644,98 @@ class TestAgentCRUD:
         if relation == "nested":
             assert not candidate.exists()
 
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_concurrent_register_updates_serialize_workspace_claims(
+        self,
+        tmp_path,
+        relation,
+    ):
+        db_path = tmp_path / "agents.db"
+        registry_a = AgentRegistry(db_path=str(db_path))
+        registry_b = AgentRegistry(db_path=str(db_path))
+        try:
+            alice_root = tmp_path / "alice-original"
+            bob_root = tmp_path / "bob-original"
+            shared_root = tmp_path / "shared"
+            alice_candidate, bob_candidate = {
+                "equal": (shared_root, shared_root),
+                "nested": (shared_root, shared_root / "sub"),
+                "enclosing": (shared_root / "sub", shared_root),
+            }[relation]
+            registry_a.register("alice", working_dir=str(alice_root), model="opus")
+            registry_a.register("bob", working_dir=str(bob_root), model="opus")
+
+            phase_barrier = threading.Barrier(2)
+
+            def gate_advisory_check(candidate_registry):
+                original = candidate_registry._refuse_workspace_overlap
+                call_count = 0
+
+                def wrapped(name, root):
+                    nonlocal call_count
+                    original(name, root)
+                    call_count += 1
+                    if call_count == 1:
+                        phase_barrier.wait(timeout=5)
+
+                candidate_registry._refuse_workspace_overlap = wrapped
+
+            gate_advisory_check(registry_a)
+            gate_advisory_check(registry_b)
+            outcomes = {}
+
+            def move(candidate_registry, name, candidate_root):
+                try:
+                    outcomes[name] = candidate_registry.register(
+                        name,
+                        working_dir=str(candidate_root),
+                        model="haiku",
+                    )
+                except BaseException as exc:
+                    outcomes[name] = exc
+
+            threads = [
+                threading.Thread(
+                    target=move,
+                    args=(registry_a, "alice", alice_candidate),
+                ),
+                threading.Thread(
+                    target=move,
+                    args=(registry_b, "bob", bob_candidate),
+                ),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            winners = [
+                name for name, outcome in outcomes.items()
+                if not isinstance(outcome, BaseException)
+            ]
+            losers = [
+                name for name, outcome in outcomes.items()
+                if isinstance(outcome, AgentWorkspaceOverlapError)
+            ]
+            assert len(winners) == 1
+            assert len(losers) == 1
+
+            winner = registry_a.get(winners[0])
+            loser = registry_a.get(losers[0])
+            winner_root = (
+                alice_candidate if winners[0] == "alice" else bob_candidate
+            )
+            assert winner.working_dir == str(winner_root)
+            assert winner.model == "haiku"
+            assert loser.working_dir == str(
+                alice_root if losers[0] == "alice" else bob_root
+            )
+            assert loser.model == "opus"
+        finally:
+            registry_a.close()
+            registry_b.close()
+
     def test_soul_update_snapshots_replaced_value_before_write(
         self, registry, monkeypatch,
     ):

@@ -6768,14 +6768,18 @@ npm run build</pre>
                         f"provisioning failed for '{agent.name}': {result.message}",
                     )
 
-            # Publish MCP config only after provisioning succeeds. This is the
-            # final fallible stage before the POST winner is acknowledged.
+            # Publish MCP config only after provisioning succeeds.
             _write_mcp_json(
                 registration_work_dir,
                 name,
                 agent_registry=agents,
                 skill_store=skills,
             )
+            # The verified-contact bootstrap and its migration marker are the
+            # final registration stage. AgentRegistry makes those two writes
+            # atomic; ordering them after provisioning and MCP publication means
+            # no durable bootstrap state exists for a failed POST winner.
+            agents.finalize_registration(name)
         except Exception as exc:
             await _rollback_agent_registration(
                 name=name,

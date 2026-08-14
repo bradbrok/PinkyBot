@@ -5688,6 +5688,78 @@ class TestAgentCRUD:
             main_agent_before,
         )
 
+    def test_register_mcp_failure_leaves_no_barsik_bootstrap_state(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import pinky_daemon.api as api_module
+        from pinky_daemon import provisioning
+
+        provisioned = []
+        deprovisioned = []
+
+        class SuccessfulProvisioner:
+            def provision(self, agent):
+                provisioned.append(agent.name)
+                return provisioning.ProvisionResult(ok=True, mode="local")
+
+            def deprovision(self, agent):
+                deprovisioned.append(agent.name)
+                return provisioning.ProvisionResult(ok=True, mode="local")
+
+        monkeypatch.setattr(
+            provisioning,
+            "get_provisioner",
+            lambda _mode, **_kwargs: SuccessfulProvisioner(),
+        )
+
+        def fail_mcp(*_args, **_kwargs):
+            raise RuntimeError("injected MCP publication failure")
+
+        monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "barsik"
+
+        response = client.post(
+            "/agents",
+            json={"name": "barsik", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert provisioned == ["barsik"]
+        assert deprovisioned == ["barsik"]
+        self._assert_failed_registration_left_no_state(
+            client,
+            "barsik",
+            work_dir,
+            "",
+        )
+        assert registry.list_verified_contacts("barsik") == []
+        assert registry.get_setting(
+            "migration:verified_contacts_brad_owner_seed_v1"
+        ) == ""
+
+    def test_successful_barsik_registration_finalizes_bootstrap_state(self, tmp_path):
+        client = self._make_client()
+        registry = client.app.state.agents
+
+        response = client.post(
+            "/agents",
+            json={"name": "barsik", "working_dir": str(tmp_path / "barsik")},
+        )
+
+        assert response.status_code == 200
+        contacts = registry.list_verified_contacts("barsik")
+        assert len(contacts) == 1
+        assert contacts[0]["platform"] == "buzz"
+        assert contacts[0]["name"] == "Brad"
+        assert contacts[0]["role"] == "owner"
+        assert registry.get_setting(
+            "migration:verified_contacts_brad_owner_seed_v1"
+        ) == "1"
+
     def test_register_failure_restores_preexisting_workspace_files(
         self,
         monkeypatch,
@@ -6004,6 +6076,115 @@ class TestAgentCRUD:
             assert current["soul"] == winning_payload["soul"]
             assert current["working_dir"] == winning_payload["working_dir"]
             assert not Path(losing_payload["working_dir"]).exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_concurrent_different_names_same_workspace_has_one_owner(
+        self,
+        tmp_path,
+        relation,
+    ):
+        from pinky_daemon.api import create_api
+
+        db_path = str(tmp_path / "agents.db")
+        shared_root = tmp_path / "shared"
+        alice_root, bob_root = {
+            "equal": (shared_root, shared_root),
+            "nested": (shared_root, shared_root / "sub"),
+            "enclosing": (shared_root / "sub", shared_root),
+        }[relation]
+        app_a = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        app_b = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        phase_barrier = threading.Barrier(2)
+        alice_done = threading.Event()
+
+        def gate_advisory_checks(registry, *, wait_for_alice):
+            original = registry._refuse_workspace_overlap
+            call_count = 0
+
+            def wrapped(name, root):
+                nonlocal call_count
+                original(name, root)
+                call_count += 1
+                # Both route and registry pre-insert checks must observe the
+                # empty DB before either request reaches BEGIN IMMEDIATE. The
+                # third call is the authoritative in-transaction recheck.
+                if call_count <= 2:
+                    phase_barrier.wait(timeout=5)
+                if call_count == 2 and wait_for_alice:
+                    assert alice_done.wait(timeout=10)
+
+            registry._refuse_workspace_overlap = wrapped
+
+        gate_advisory_checks(app_a.state.agents, wait_for_alice=False)
+        gate_advisory_checks(app_b.state.agents, wait_for_alice=True)
+        payloads = [
+            {
+                "name": "alice",
+                "display_name": "Alice",
+                "model": "opus",
+                "soul": "alice-private-soul",
+                "working_dir": str(alice_root),
+            },
+            {
+                "name": "bob",
+                "display_name": "Bob",
+                "model": "haiku",
+                "soul": "bob-private-soul",
+                "working_dir": str(bob_root),
+            },
+        ]
+        responses = {}
+
+        def post(client, payload):
+            try:
+                responses[payload["name"]] = client.post("/agents", json=payload)
+            finally:
+                if payload["name"] == "alice":
+                    alice_done.set()
+
+        with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+            threads = [
+                threading.Thread(target=post, args=(client_a, payloads[0])),
+                threading.Thread(target=post, args=(client_b, payloads[1])),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert sorted(response.status_code for response in responses.values()) == [200, 409]
+            winner_name = next(
+                name for name, response in responses.items()
+                if response.status_code == 200
+            )
+            loser_name = next(
+                name for name, response in responses.items()
+                if response.status_code == 409
+            )
+            assert responses[loser_name].json() == {
+                "detail": {"code": "agent_workspace_overlap"}
+            }
+
+            registry = app_a.state.agents
+            assert [agent.name for agent in registry.list()] == [winner_name]
+            winner_root = alice_root if winner_name == "alice" else bob_root
+            assert registry.get(winner_name).working_dir == str(winner_root)
+            assert registry.get(loser_name) is None
+            assert registry.get_signing_key(winner_name)
+            assert registry.get_signing_key(loser_name) is None
+            assert registry.get_main_agent() == winner_name
+            assert registry.get_soul_versions(loser_name) == []
+            assert registry.list_tokens(loser_name) == []
+            assert (winner_root / ".mcp.json").is_file()
 
     def test_absent_soul_is_noop_empty_rejects_and_force_snapshots(self, tmp_path):
         client = self._make_client()
