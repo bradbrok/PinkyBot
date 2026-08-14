@@ -2513,6 +2513,77 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
 
 
 @pytest.mark.asyncio
+async def test_tmux_repl_absent_server_cold_start_proceeds(
+    tmp_path,
+    monkeypatch,
+):
+    """R8: a missing local socket remains positive cold-start absence."""
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(tmp_path / "agent"),
+    )
+    tmux = _TmuxControl("pinky-test-agent")
+    session = TmuxSession(config, tmux_control=tmux)
+    socket_dir = tmp_path / "tmux-empty"
+    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
+    monkeypatch.delenv("TMUX", raising=False)
+    tmux_calls: list[tuple[str, ...]] = []
+    has_session_calls = 0
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        nonlocal has_session_calls
+        tmux_calls.append(args)
+        if args[0] == "has-session":
+            has_session_calls += 1
+            if has_session_calls == 1:
+                return TmuxCommandResult(
+                    returncode=1,
+                    stdout="",
+                    stderr="no server running",
+                )
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        if args[0] == "new-session":
+            return TmuxCommandResult(returncode=0, stdout="", stderr="")
+        raise AssertionError(f"unexpected tmux call: {args}")
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    monkeypatch.setattr(tmux, "_run", _tmux_run)
+    monkeypatch.setattr(
+        session,
+        "_container_agent",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        session,
+        "_select_command_runner",
+        lambda _container_agent: tmux._runner,
+    )
+    monkeypatch.setattr(session, "_ensure_container_started", _noop)
+    monkeypatch.setattr(session, "_seed_container_trust", _noop)
+    monkeypatch.setattr(session, "_seed_container_home_creds", _noop)
+    monkeypatch.setattr(session, "_start_tailer", _noop)
+    monkeypatch.setattr(session, "_build_claude_cmd", lambda: "claude")
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._seed_claude_trust_file",
+        lambda _path, _cwd: False,
+    )
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._POST_SPAWN_LIVENESS_DELAY_SEC",
+        0,
+    )
+
+    await session._spawn_tmux_repl()
+
+    assert [call[0] for call in tmux_calls] == [
+        "has-session",
+        "new-session",
+        "has-session",
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tmux_repl_stale_kill_already_gone_race_proceeds(
     tmp_path,
     monkeypatch,
@@ -3049,6 +3120,111 @@ async def test_tmux_repl_permission_probe_refuses_before_publication(
         "kill-session",
         "list-sessions",
     ]
+    assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
+    assert soul_store.calls == []
+
+
+@pytest.mark.asyncio
+async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_effects(
+    tmp_path,
+    monkeypatch,
+):
+    """R8: an ambiguous stale-session probe must fail before spawn effects."""
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+    )
+    soul_store = _SoulStore()
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+    agents_md.write_text("self edit before replacement", encoding="utf-8")
+    session = CodexTmuxSession(config, registry=soul_store)
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+    env_build_count = 0
+    publication_count = 0
+    new_session_count = 0
+    permission_error = TmuxCommandResult(
+        returncode=1,
+        stdout="",
+        stderr="couldn't create directory /blocked/tmux-501 (Permission denied)",
+    )
+    real_build_env = session._build_repl_env
+    real_prepare_spawn = session._prepare_tmux_spawn
+
+    async def _noop(*_args, **_kwargs):
+        return None
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] in {"has-session", "list-sessions"}:
+            return permission_error
+        raise AssertionError(f"unexpected direct tmux call: {args}")
+
+    async def _tracked_new_session(**_kwargs):
+        nonlocal new_session_count
+        new_session_count += 1
+        return TmuxCommandResult(
+            returncode=1,
+            stdout="",
+            stderr="new-session reached after ambiguous has-session probe",
+        )
+
+    def _tracked_build_env():
+        nonlocal env_build_count
+        env_build_count += 1
+        return real_build_env()
+
+    def _tracked_prepare_spawn():
+        nonlocal publication_count
+        publication_count += 1
+        return real_prepare_spawn()
+
+    monkeypatch.setattr(
+        session,
+        "_container_agent",
+        lambda *args, **kwargs: None,
+    )
+    monkeypatch.setattr(
+        session,
+        "_select_command_runner",
+        lambda _container_agent: session._tmux._runner,
+    )
+    monkeypatch.setattr(session, "_ensure_container_started", _noop)
+    monkeypatch.setattr(session, "_seed_container_trust", _noop)
+    monkeypatch.setattr(session, "_seed_container_home_creds", _noop)
+    monkeypatch.setattr(
+        "pinky_daemon.tmux_session._seed_claude_trust_file",
+        lambda _path, _cwd: False,
+    )
+    monkeypatch.setattr(session._tmux, "_run", _tmux_run)
+    monkeypatch.setattr(session._tmux, "new_session", _tracked_new_session)
+    monkeypatch.setattr(session, "_build_repl_env", _tracked_build_env)
+    monkeypatch.setattr(session, "_prepare_tmux_spawn", _tracked_prepare_spawn)
+
+    with pytest.raises(RuntimeError, match="has-session failed"):
+        await session._spawn_tmux_repl()
+
+    assert [call[0] for call in tmux_calls] == [
+        "has-session",
+        "list-sessions",
+    ]
+    assert env_build_count == 0
+    assert publication_count == 0
+    assert new_session_count == 0
     assert agents_md.read_text(encoding="utf-8") == "self edit before replacement"
     assert soul_store.calls == []
 

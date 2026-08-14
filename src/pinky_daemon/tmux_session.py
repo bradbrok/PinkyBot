@@ -638,9 +638,25 @@ class _TmuxControl:
         )
 
     async def has_session(self) -> bool:
-        """Return True if a tmux session with our name exists."""
+        """Return presence, or False only after positively proving absence.
+
+        ``tmux has-session`` uses a non-zero status both for an absent target
+        and for transport/permission failures.  Collapsing those cases to
+        False lets spawn callers overwrite state while the owned session may
+        still be live.  Preserve that third, ambiguous state as an exception;
+        callers that merely observe liveness already treat probe exceptions as
+        diagnostic uncertainty.
+        """
         result = await self._run("has-session", "-t", self.session_name)
-        return result.ok
+        if result.ok:
+            return True
+        if await self._session_absence_is_verified():
+            return False
+        raise RuntimeError(
+            f"tmux has-session failed without verified absence: "
+            f"rc={result.returncode} stdout={result.stdout.strip()!r} "
+            f"stderr={result.stderr.strip()!r}"
+        )
 
     def _local_socket_path(self) -> Path | None:
         """Return the socket path used by a locally executed tmux command.
@@ -2957,6 +2973,25 @@ class TmuxSession(TransportReplacementMixin):
         # runs under its own budget (see _ensure_container_started).
         await self._ensure_container_started(container_agent)
 
+        # If a stale session is left over from a previous daemon run (e.g.
+        # crash without graceful disconnect), reap it. We're the cold-start
+        # owner; reclaiming the name is safe. Ambiguous ``has-session`` and
+        # non-ok kill results are failed preconditions: abort before env
+        # construction, trust seeding, or the transport's spawn hook can
+        # publish state for a child that will never launch.
+        if await self._tmux.has_session():
+            _log(
+                f"tmux[{self.agent_name}]: stale session {self._session_name} "
+                f"found, reaping before fresh spawn"
+            )
+            kill_result = await self._tmux.kill_session()
+            if not kill_result.ok:
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: stale kill-session failed before "
+                    f"spawn: rc={kill_result.returncode} "
+                    f"stderr={kill_result.stderr.strip()!r}"
+                )
+
         # Pre-seed Claude Code's first-run trust/bypass flags (#112) so a
         # FRESH REPL doesn't wedge on the "trust this folder?" / "Bypass
         # Permissions mode" gates that --dangerously-skip-permissions does
@@ -2999,24 +3034,6 @@ class TmuxSession(TransportReplacementMixin):
         # the fresh launch carries the stashed override via --effort, and
         # typing into the new pane's splash phase would get eaten anyway.
         self._pending_live_effort = None
-
-        # If a stale session is left over from a previous daemon run (e.g.
-        # crash without graceful disconnect), reap it. We're the cold-start
-        # owner; reclaiming the name is safe. A non-ok result is a known failed
-        # precondition, not best-effort cleanup: abort before the transport's
-        # spawn hook can publish state for a child that will never launch.
-        if await self._tmux.has_session():
-            _log(
-                f"tmux[{self.agent_name}]: stale session {self._session_name} "
-                f"found, reaping before fresh spawn"
-            )
-            kill_result = await self._tmux.kill_session()
-            if not kill_result.ok:
-                raise RuntimeError(
-                    f"tmux[{self.agent_name}]: stale kill-session failed before "
-                    f"spawn: rc={kill_result.returncode} "
-                    f"stderr={kill_result.stderr.strip()!r}"
-                )
 
         # Transport-specific state publication belongs after every teardown
         # precondition and immediately before command/env construction. The
