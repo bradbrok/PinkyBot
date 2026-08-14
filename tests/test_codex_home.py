@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import fcntl
 import json
 import os
@@ -2109,7 +2110,7 @@ def test_subprocess_transport_overlays_prepared_home(tmp_path, monkeypatch):
     assert not (shared_home / "AGENTS.md").exists()
 
 
-def test_tmux_transport_preflight_writes_soul_only_to_agent_home(
+def test_tmux_transport_preflight_validates_without_publishing_soul(
     tmp_path,
     monkeypatch,
 ):
@@ -2130,10 +2131,8 @@ def test_tmux_transport_preflight_writes_soul_only_to_agent_home(
 
     session._preflight_transport_replacement()
 
-    assert (working_dir / ".codex" / "AGENTS.md").read_text(
-        encoding="utf-8"
-    ) == "compiled tmux soul"
-    assert soul_store.calls == [("test-agent", "compiled tmux soul", "spawn")]
+    assert not (working_dir / ".codex").exists()
+    assert soul_store.calls == []
     assert not (shared_home / "AGENTS.md").exists()
 
 
@@ -2177,6 +2176,63 @@ async def test_tmux_replacement_publishes_and_snapshots_soul_once(
 
 
 @pytest.mark.asyncio
+async def test_tmux_child_spawn_inside_replacement_resnapshots_self_edit(
+    tmp_path,
+    monkeypatch,
+):
+    shared_home = tmp_path / "shared"
+    working_dir = tmp_path / "agent"
+    working_dir.mkdir()
+    _auth(shared_home)
+    monkeypatch.setenv("CODEX_HOME", str(shared_home))
+    monkeypatch.setenv(PER_AGENT_CODEX_HOME_ENV, "1")
+    config = StreamingSessionConfig(
+        agent_name="test-agent",
+        working_dir=str(working_dir),
+        provider_url="codex_cli",
+        system_prompt="compiled tmux soul",
+    )
+    soul_store = _SoulStore()
+    session = CodexTmuxSession(config, registry=soul_store)
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
+
+    async def _noop():
+        return None
+
+    async def _base_spawn(_session):
+        return None
+
+    async def _spawn_child_after_preflight():
+        agents_md.write_text("self edit after preflight", encoding="utf-8")
+        await asyncio.create_task(session._spawn_tmux_repl())
+
+    monkeypatch.setattr(session, "disconnect", _noop)
+    monkeypatch.setattr(session, "_seed_codex_trust", lambda _cwd: None)
+    monkeypatch.setattr(session, "_codex_dismiss_nux_and_ready", _noop)
+    monkeypatch.setattr(
+        "pinky_daemon.codex_tmux_session.TmuxSession._spawn_tmux_repl",
+        _base_spawn,
+    )
+
+    await session.restart_transport(
+        configure=_spawn_child_after_preflight,
+        bring_up=_noop,
+    )
+
+    assert agents_md.read_text(encoding="utf-8") == "compiled tmux soul"
+    assert soul_store.calls == [
+        ("test-agent", "self edit after preflight", "agent"),
+        ("test-agent", "compiled tmux soul", "spawn"),
+    ]
+
+
+@pytest.mark.asyncio
 async def test_tmux_refused_replacement_does_not_stale_next_spawn_soul(
     tmp_path,
     monkeypatch,
@@ -2197,6 +2253,13 @@ async def test_tmux_refused_replacement_does_not_stale_next_spawn_soul(
     soul_store = _SoulStore()
     session = CodexTmuxSession(config, registry=soul_store)
     session._has_completed_turn = True
+    prepare_agent_codex_home(
+        config,
+        log=lambda _message: None,
+        soul_version_store=soul_store,
+    )
+    soul_store.calls.clear()
+    agents_md = working_dir / ".codex" / "AGENTS.md"
 
     async def _noop():
         return None
@@ -2212,19 +2275,15 @@ async def test_tmux_refused_replacement_does_not_stale_next_spawn_soul(
     )
 
     assert await session.force_restart() is False
-    assert soul_store.calls == [
-        ("test-agent", "compiled tmux soul", "spawn"),
-    ]
-    assert session._preflighted_codex_homes == {}
+    assert soul_store.calls == []
+    assert agents_md.read_text(encoding="utf-8") == "compiled tmux soul"
 
-    agents_md = working_dir / ".codex" / "AGENTS.md"
     agents_md.write_text("self edit after refused restart", encoding="utf-8")
 
     await session._spawn_tmux_repl()
 
     assert agents_md.read_text(encoding="utf-8") == "compiled tmux soul"
     assert soul_store.calls == [
-        ("test-agent", "compiled tmux soul", "spawn"),
         ("test-agent", "self edit after refused restart", "agent"),
         ("test-agent", "compiled tmux soul", "spawn"),
     ]
@@ -2323,12 +2382,10 @@ async def test_tmux_app_server_replacement_publishes_and_snapshots_soul_once(
     async def _noop_teardown() -> None:
         return None
 
-    async def _start(**kwargs):
-        prepared_home = kwargs.get("prepared_codex_home")
-        if prepared_home is None:
-            env = supervisor._build_env()
-        else:
-            env = supervisor._build_env(prepared_codex_home=prepared_home)
+    async def _start(**_kwargs):
+        assert stale_client.is_closed is True
+        assert soul_store.calls == []
+        env = supervisor._build_env()
         assert env["CODEX_HOME"] == str(working_dir / ".codex")
         return _Client(), _Proc(None)
 

@@ -34,6 +34,7 @@ from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.codex_home import (
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
+    validate_agent_codex_home,
 )
 from pinky_daemon.context_estimator import ContextTextEstimator
 from pinky_daemon.sessions import SessionUsage
@@ -1016,19 +1017,30 @@ class CodexSession(TransportReplacementMixin):
         env = {**os.environ}
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
-        prepared_home = self._preflight_agent_codex_home()
+        prepared_home = self._prepare_agent_codex_home()
         if prepared_home is not None:
             env["CODEX_HOME"] = prepared_home
         return env
 
-    def _preflight_agent_codex_home(self) -> str | None:
-        """Validate and prepare replacement-home state before teardown/spawn."""
+    def _prepare_agent_codex_home(self) -> str | None:
+        """Snapshot and publish isolated-home state for an actual spawn."""
         if not per_agent_codex_home_enabled():
             return None
         return str(
             prepare_agent_codex_home(
                 self._config,
                 log=_log,
+                soul_version_store=self._registry,
+            )
+        )
+
+    def _preflight_agent_codex_home(self) -> str | None:
+        """Validate replacement-home state without publishing before teardown."""
+        if not per_agent_codex_home_enabled():
+            return None
+        return str(
+            validate_agent_codex_home(
+                self._config,
                 soul_version_store=self._registry,
             )
         )
@@ -1232,15 +1244,9 @@ class CodexSession(TransportReplacementMixin):
                 )
 
         # Refuse an unsafe/missing per-agent auth setup before mutating any
-        # cached transport. In particular, a dead cached app-server must not be
-        # closed/cleared (and a tmux supervisor must not be started) before the
-        # replacement spawn proves its Codex home can be prepared safely.
-        direct_env: dict[str, str] | None = None
-        prepared_tmux_home: str | None = None
-        if self._use_tmux_app_server:
-            prepared_tmux_home = self._preflight_agent_codex_home()
-        else:
-            direct_env = self._build_codex_env()
+        # cached transport. Soul snapshot/publication stays at the actual spawn
+        # below, after this non-mutating validation and any stale teardown.
+        self._preflight_agent_codex_home()
 
         if self._app_client is not None or self._app_proc is not None:
             # Process died under us — drop the stale client and respawn only
@@ -1255,21 +1261,15 @@ class CodexSession(TransportReplacementMixin):
                 # hands back an UN-initialized client. The initialize below is
                 # the single end-to-end gate for that child.
                 assert self._app_supervisor is not None
-                start_kwargs = {
-                    "notification_handler": self._on_appserver_notification,
-                    "server_request_handler": self._on_appserver_request,
-                }
-                if prepared_tmux_home is not None:
-                    start_kwargs["prepared_codex_home"] = prepared_tmux_home
                 self._app_client, self._app_proc = await self._app_supervisor.start(
-                    **start_kwargs
+                    notification_handler=self._on_appserver_notification,
+                    server_request_handler=self._on_appserver_request,
                 )
             else:
-                assert direct_env is not None
                 self._app_client, self._app_proc = await spawn_app_server(
                     command=self._app_server_command,
                     cwd=self._working_dir,
-                    env=direct_env,
+                    env=self._build_codex_env(),
                     notification_handler=self._on_appserver_notification,
                     server_request_handler=self._on_appserver_request,
                     log=_log,

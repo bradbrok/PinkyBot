@@ -50,16 +50,14 @@ import re
 import shlex
 import time
 from collections import deque
-from collections.abc import Awaitable
-from contextvars import ContextVar
 from pathlib import Path
-from typing import TypeVar
 
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
+    validate_agent_codex_home,
 )
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
@@ -73,10 +71,6 @@ from pinky_daemon.tmux_session import (
     _SchedulerDeliveryCancelled,
     _TmuxControl,
 )
-from pinky_daemon.transport import ReplacementConnectWrapper, ReplacementStep
-from pinky_daemon.transport_state import Trigger
-
-_T = TypeVar("_T")
 
 # Codex's inline composer renders slower than claude's REPL; the bracketed-paste
 # needs a longer settle before the submit Enter or the Enter lands before the
@@ -172,11 +166,6 @@ class CodexTmuxSession(TmuxSession):
         self._reasoning_effort = config.thinking_effort or "medium"
         self._codex_mcp_servers = config.mcp_servers or {}
         self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
-        self._codex_replacement_transaction: ContextVar[object | None] = ContextVar(
-            f"codex_replacement_transaction_{id(self)}",
-            default=None,
-        )
-        self._preflighted_codex_homes: dict[object, Path] = {}
 
     # ── seam: session name ──────────────────────────────────────────────────
     def _build_session_name(self) -> str:
@@ -577,75 +566,20 @@ class CodexTmuxSession(TmuxSession):
         super()._on_transcript_entry(entry)
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
-    async def _run_codex_replacement_transaction(
-        self,
-        operation: Awaitable[_T],
-    ) -> _T:
-        """Keep a prepared-home handoff inside one replacement operation."""
-        transaction = object()
-        reset_token = self._codex_replacement_transaction.set(transaction)
-        try:
-            return await operation
-        finally:
-            # A successful spawn consumes this entry itself. Every other exit
-            # (guard refusal, transition rejection, configure/disconnect error,
-            # cancellation, or exhausted reconnect) discards it here so an
-            # unrelated later spawn cannot skip its own soul publication.
-            self._preflighted_codex_homes.pop(transaction, None)
-            self._codex_replacement_transaction.reset(reset_token)
-
-    async def restart_transport(
-        self,
-        *,
-        configure: ReplacementStep | None = None,
-        bring_up: ReplacementStep | None = None,
-        connect_wrapper: ReplacementConnectWrapper | None = None,
-        suppress_teardown_errors: bool = False,
-    ) -> None:
-        await self._run_codex_replacement_transaction(
-            super().restart_transport(
-                configure=configure,
-                bring_up=bring_up,
-                connect_wrapper=connect_wrapper,
-                suppress_teardown_errors=suppress_teardown_errors,
-            )
-        )
-
-    async def force_restart(self, *, bypass_guard: bool = False) -> bool:
-        return await self._run_codex_replacement_transaction(
-            super().force_restart(bypass_guard=bypass_guard)
-        )
-
-    async def attempt_reconnect(self, *, trigger: Trigger = Trigger.BROKER) -> None:
-        await self._run_codex_replacement_transaction(
-            super().attempt_reconnect(trigger=trigger)
-        )
-
     def _preflight_transport_replacement(self) -> None:
-        """Prove the isolated Codex home before an inherited tmux teardown."""
-        prepared_home = prepare_agent_codex_home(
+        """Validate the isolated Codex home before inherited tmux teardown."""
+        validate_agent_codex_home(
+            self._config,
+            soul_version_store=self._registry,
+        )
+
+    async def _spawn_tmux_repl(self) -> None:
+        cwd = str(Path(self._config.working_dir or ".").resolve())
+        prepare_agent_codex_home(
             self._config,
             log=_log,
             soul_version_store=self._registry,
         )
-        transaction = self._codex_replacement_transaction.get()
-        if transaction is not None:
-            self._preflighted_codex_homes[transaction] = prepared_home
-
-    async def _spawn_tmux_repl(self) -> None:
-        cwd = str(Path(self._config.working_dir or ".").resolve())
-        transaction = self._codex_replacement_transaction.get()
-        prepared_home = (
-            self._preflighted_codex_homes.pop(transaction, None)
-            if transaction is not None
-            else None
-        )
-        if prepared_home is None:
-            prepare_agent_codex_home(
-                self._config,
-                log=_log,
-                soul_version_store=self._registry,
-            )
         self._seed_codex_trust(cwd)
         await super()._spawn_tmux_repl()
         await self._codex_dismiss_nux_and_ready()

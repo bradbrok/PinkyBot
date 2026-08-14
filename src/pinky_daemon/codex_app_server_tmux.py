@@ -49,6 +49,7 @@ from pinky_daemon.codex_app_server import (
 from pinky_daemon.codex_home import (
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
+    validate_agent_codex_home,
 )
 from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.streaming_session import _log
@@ -152,13 +153,20 @@ class CodexAppServerSupervisor:
         *,
         notification_handler: NotificationHandler | None = None,
         server_request_handler: ServerRequestHandler | None = None,
-        prepared_codex_home: str | None = None,
     ) -> tuple[CodexAppServerClient, _TmuxAppServerProc]:
         """Launch the shim under tmux and return a started, UN-initialized
         client plus its process adapter. Raises on tmux failure or readiness
         timeout. The caller (CodexSession) performs the single ``initialize``."""
         self._kill_requested = False
-        env = self._build_env(prepared_codex_home=prepared_codex_home)
+        if per_agent_codex_home_enabled():
+            if self._agent_config is None:
+                raise RuntimeError(
+                    "per-agent Codex home requires app-server agent config"
+                )
+            validate_agent_codex_home(
+                self._agent_config,
+                soul_version_store=self._soul_version_store,
+            )
 
         # Idempotent pre-start cleanup: a crashed predecessor can leave a live
         # tmux session and/or a stale socket; either would wedge a fresh start.
@@ -166,6 +174,7 @@ class CodexAppServerSupervisor:
         self._unlink_sock()
 
         self._ensure_sock_dir_secure()
+        env = self._build_env()
 
         command = " ".join(
             shlex.quote(p)
@@ -200,7 +209,7 @@ class CodexAppServerSupervisor:
     # tmux-internal vars that must not leak into a nested session's children.
     _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})
 
-    def _build_env(self, *, prepared_codex_home: str | None = None) -> dict[str, str]:
+    def _build_env(self) -> dict[str, str]:
         """Full daemon-env parity for the tmux session — NOT just PATH.
 
         tmux ``new-session`` drops the parent process env (only ``-e KEY=VAL``
@@ -234,15 +243,13 @@ class CodexAppServerSupervisor:
                 raise RuntimeError(
                     "per-agent Codex home requires app-server agent config"
                 )
-            if prepared_codex_home is None:
-                prepared_codex_home = str(
-                    prepare_agent_codex_home(
-                        self._agent_config,
-                        log=self._log,
-                        soul_version_store=self._soul_version_store,
-                    )
+            env["CODEX_HOME"] = str(
+                prepare_agent_codex_home(
+                    self._agent_config,
+                    log=self._log,
+                    soul_version_store=self._soul_version_store,
                 )
-            env["CODEX_HOME"] = prepared_codex_home
+            )
         return env
 
     async def _await_accept(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
