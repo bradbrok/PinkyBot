@@ -20,6 +20,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -39,6 +40,8 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -52,9 +55,16 @@ from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
     AgentAlreadyExistsError,
+    AgentPathContainmentError,
+    AgentRegistrationIncompleteError,
     AgentRegistry,
+    AgentWorkspaceOverlapError,
+    AgentWorkspacePathError,
     ScheduleNameConflictError,
     SoulMutationRejectedError,
+    _validate_agent_name,
+    replace_agent_text,
+    resolve_agent_path,
 )
 from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.api_models import (
@@ -1189,6 +1199,7 @@ def _write_mcp_json(
     When PINKY_SHARED_MCP=1, all three core servers use SSE transport pointing
     at the shared MCP server. Memory uses a per-agent store pool for DB isolation.
     """
+    work_dir = resolve_agent_path(agent_name, work_dir)
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
@@ -1285,9 +1296,9 @@ def _write_mcp_json(
         }
     else:
         # Memory: per-agent SQLite long-term memory with vector search (stdio)
-        data_dir = work_dir / "data"
+        data_dir = resolve_agent_path(agent_name, work_dir, "data")
         data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(data_dir / "memory.db")
+        db_path = str(resolve_agent_path(agent_name, work_dir, "data", "memory.db"))
         mcp_config["mcpServers"]["pinky-memory"] = {
             "command": sys.executable,
             "args": ["-m", "pinky_memory", "--db", db_path],
@@ -1378,7 +1389,7 @@ def _write_mcp_json(
             mcp_config["mcpServers"][sname] = entry
 
     # Merge with existing .mcp.json if present
-    mcp_json = work_dir / ".mcp.json"
+    mcp_json = resolve_agent_path(agent_name, work_dir, ".mcp.json")
     if mcp_json.exists():
         try:
             existing = json.loads(mcp_json.read_text())
@@ -1388,7 +1399,12 @@ def _write_mcp_json(
             mcp_config = existing
         except Exception:
             pass
-    mcp_json.write_text(json.dumps(mcp_config, indent=2))
+    mcp_json = replace_agent_text(
+        agent_name,
+        work_dir,
+        mcp_json,
+        json.dumps(mcp_config, indent=2),
+    )
     # Contains the agent's PINKY_AGENT_KEY — restrict to owner-only (0600).
     try:
         os.chmod(mcp_json, 0o600)
@@ -1682,6 +1698,21 @@ def create_api(
         version="0.1.0",
     )
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
+
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_response(
+        request: Request,
+        error: RequestValidationError,
+    ):
+        if request.method == "POST" and request.url.path == "/agents" and any(
+            tuple(item.get("loc", ()))[:2] == ("body", "name")
+            for item in error.errors()
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": {"code": "invalid_agent_name"}},
+            )
+        return await request_validation_exception_handler(request, error)
 
     @app.exception_handler(_IsolationDeniedError)
     async def _isolation_denied_response(
@@ -6316,6 +6347,218 @@ npm run build</pre>
 
     # ── Agent Registry Endpoints ────────────────────────────
 
+    def _agent_name_or_400(name: str) -> str:
+        """Validate request-derived names without echoing hostile content."""
+        try:
+            return _validate_agent_name(name)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, {"code": "invalid_agent_name"}) from exc
+
+    def _agent_path_or_400(agent, *parts: str | Path) -> Path:
+        """Resolve one path inside the persisted owner root or refuse it."""
+        try:
+            return resolve_agent_path(
+                agent.name,
+                agent.working_dir,
+                *parts,
+            )
+        except (AgentPathContainmentError, OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                400,
+                {"code": "agent_path_outside_workspace"},
+            ) from exc
+
+    def _write_agent_text(agent, path: Path, content: str) -> Path:
+        """Atomically replace an agent-owned text file without following links."""
+        try:
+            return replace_agent_text(
+                agent.name,
+                agent.working_dir,
+                path,
+                content,
+            )
+        except (AgentPathContainmentError, OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                400,
+                {"code": "agent_path_outside_workspace"},
+            ) from exc
+
+    registration_managed_dirs = ("data", "output", "workspace", ".claude")
+    registration_managed_files = (
+        ".mcp.json",
+        ".claude/hook_working.py",
+        ".claude/hook_idle.py",
+        ".claude/hook_verify_effort.py",
+        ".claude/hook_tmux_wake.py",
+        ".claude/hook_tmux_session_start.py",
+        ".claude/hook_tmux_pre_tool.py",
+        ".claude/hook_tmux_post_tool.py",
+        ".claude/hook_tmux_stop_failure.py",
+        ".claude/settings.json",
+    )
+
+    def _path_node_exists(path: Path) -> bool:
+        """Return true for ordinary nodes and broken symlinks."""
+        return path.is_symlink() or path.exists()
+
+    def _remove_path_node(path: Path) -> None:
+        """Remove one explicit node without following directory symlinks."""
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.exists():
+            shutil.rmtree(path)
+
+    def _backup_path_node(source: Path, destination: Path) -> None:
+        """Back up one managed node, preserving symlink and inode semantics."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            destination.symlink_to(os.readlink(source))
+        elif source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except OSError:
+                shutil.copy2(source, destination, follow_symlinks=False)
+
+    def _restore_path_node(source: Path, destination: Path) -> None:
+        """Restore one managed node from a private registration backup."""
+        _remove_path_node(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            destination.symlink_to(os.readlink(source))
+        elif source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except OSError:
+                shutil.copy2(source, destination, follow_symlinks=False)
+
+    def _capture_registration_workspace(agent_name: str, work_dir: Path) -> dict:
+        """Capture only the files registration may create or rewrite."""
+        backup_dir = Path(tempfile.mkdtemp(prefix="pinky-agent-registration-"))
+        try:
+            root_existed = _path_node_exists(work_dir)
+            dirs_existed = {}
+            for rel in registration_managed_dirs:
+                resolve_agent_path(agent_name, work_dir, rel)
+                dirs_existed[rel] = _path_node_exists(work_dir / rel)
+            files_existed = {}
+            file_targets = {}
+            if root_existed:
+                for rel in registration_managed_files:
+                    source = resolve_agent_path(agent_name, work_dir, rel)
+                    file_targets[rel] = source
+                    existed = _path_node_exists(source)
+                    files_existed[rel] = existed
+                    if existed:
+                        _backup_path_node(source, backup_dir / rel)
+            else:
+                files_existed = {
+                    rel: False for rel in registration_managed_files
+                }
+                file_targets = {
+                    rel: resolve_agent_path(agent_name, work_dir, rel)
+                    for rel in registration_managed_files
+                }
+            return {
+                "root": work_dir,
+                "root_existed": root_existed,
+                "dirs_existed": dirs_existed,
+                "files_existed": files_existed,
+                "file_targets": file_targets,
+                "backup_dir": backup_dir,
+            }
+        except Exception:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            raise
+
+    def _discard_registration_workspace_capture(state: dict) -> None:
+        shutil.rmtree(state["backup_dir"], ignore_errors=True)
+
+    def _restore_registration_workspace(state: dict) -> None:
+        """Remove registration artifacts and restore pre-existing managed files."""
+        work_dir = state["root"]
+        try:
+            if not state["root_existed"]:
+                _remove_path_node(work_dir)
+                return
+
+            backup_dir = state["backup_dir"]
+            for rel, existed in state["files_existed"].items():
+                target = state["file_targets"][rel]
+                if existed:
+                    _restore_path_node(backup_dir / rel, target)
+                else:
+                    _remove_path_node(target)
+            for rel in reversed(registration_managed_dirs):
+                if not state["dirs_existed"][rel]:
+                    _remove_path_node(work_dir / rel)
+        finally:
+            _discard_registration_workspace_capture(state)
+
+    async def _rollback_agent_registration(
+        *,
+        name: str,
+        agent,
+        main_agent_before: str,
+        provisioner,
+        provision_attempted: bool,
+        delete_registration_row: bool,
+        workspace_state: dict,
+    ) -> None:
+        """Best-effort compensation for every post-winner registration stage."""
+        rollback_agent = agent or agents.get(name)
+        if provision_attempted and provisioner is not None and rollback_agent is not None:
+            try:
+                await asyncio.to_thread(provisioner.deprovision, rollback_agent)
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation deprovision failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+        if delete_registration_row:
+            try:
+                agents.delete(name)
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation DB delete failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+            try:
+                if agents.get_main_agent() == name:
+                    if main_agent_before:
+                        agents.set_main_agent(main_agent_before)
+                    else:
+                        agents.delete_setting("main_agent")
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation main-agent restore failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+        restore_workspace = True
+        if not delete_registration_row:
+            current = agents.get(name)
+            if current and current.working_dir:
+                try:
+                    restore_workspace = (
+                        Path(current.working_dir).resolve()
+                        != workspace_state["root"]
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    restore_workspace = False
+        if restore_workspace:
+            try:
+                _restore_registration_workspace(workspace_state)
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation workspace restore failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+        else:
+            _discard_registration_workspace_capture(workspace_state)
+
     def _guard_soul_or_400(
         agent,
         old_content: str,
@@ -6351,6 +6594,7 @@ npm run build</pre>
         source: str,
     ) -> bool:
         """Snapshot and replace a CLAUDE.md, returning whether it changed."""
+        path = _agent_path_or_400(agent, path)
         path_existed = path.exists()
         old_content = path.read_text() if path_existed else agent.soul
         if path_existed and old_content == content:
@@ -6366,12 +6610,13 @@ npm run build</pre>
             old_content,
             source=f"{source}:before-file",
         )
-        path.write_text(content)
+        _write_agent_text(agent, path, content)
         return True
 
     @app.post("/agents")
     async def register_agent(req: RegisterAgentRequest, request: Request):
         """Register a new agent; existing names are updated only via PUT."""
+        name = _agent_name_or_400(req.name)
         # #149: registering agents is an ADMIN capability. This is the
         # agent-mint collection route — it has no target agent in the
         # PATH, so the middleware's path-based isolation guard can't see it
@@ -6388,15 +6633,42 @@ npm run build</pre>
         if _is_isolated_agent(caller):
             _log(
                 f"isolation: denied isolated agent '{caller}' from POST /agents "
-                f"(admin mint, body name='{req.name}')"
+                "(admin mint, body name validated)"
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
+
+        raw_work_dir = req.working_dir or f"data/agents/{name}"
+        try:
+            registration_work_dir = agents.resolve_registration_workspace(
+                name,
+                raw_work_dir,
+            )
+        except AgentWorkspaceOverlapError as exc:
+            raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
+        except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
+            raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
+        main_agent_before = agents.get_main_agent()
+        try:
+            workspace_state = _capture_registration_workspace(
+                name,
+                registration_work_dir
+            )
+        except AgentPathContainmentError as exc:
+            raise HTTPException(
+                400,
+                {"code": "agent_path_outside_workspace"},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
         # No availability read: agents.name is a PRIMARY KEY and the registry
         # executes INSERT OR ABORT. That database decision is authoritative
         # when concurrent clients race on the same name.
         try:
             agent = agents.register(
-                req.name,
+                name,
                 create_only=True,
                 display_name=req.display_name,
                 model=req.model,
@@ -6431,46 +6703,97 @@ npm run build</pre>
                 container_image=req.container_image,
             )
         except AgentAlreadyExistsError as exc:
-            raise HTTPException(409, f"Agent '{req.name}' already exists") from exc
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(409, f"Agent '{name}' already exists") from exc
+        except AgentWorkspaceOverlapError as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
+        except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
+        except AgentRegistrationIncompleteError as exc:
+            await _rollback_agent_registration(
+                name=name,
+                agent=agents.get(name),
+                main_agent_before=main_agent_before,
+                provisioner=None,
+                provision_attempted=False,
+                delete_registration_row=exc.row_committed,
+                workspace_state=workspace_state,
+            )
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+        except Exception as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+
         # Provision OS-level isolation resources. No-op for local (the default);
         # gated for container — when the runtime gate is OFF, get_provisioner
         # raises NotImplementedError and we skip (the start-time guard then
-        # blocks the agent until an operator opts in). On a real provision
-        # failure we roll back the just-registered agent so we never leave a
-        # half-provisioned tenant behind.
+        # blocks the agent until an operator opts in). Every failure after the
+        # INSERT winner is compensated across DB state, main-agent assignment,
+        # provisioning, MCP publication, and the managed workspace surface.
         from pinky_daemon.provisioning import ProvisionResult, get_provisioner
 
+        provisioner = None
+        provision_attempted = False
         try:
-            provisioner = get_provisioner(
-                agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
-            )
-        except NotImplementedError:
-            provisioner = None  # dormant mode (e.g. container gate off)
-        if provisioner is not None:
-            # to_thread: provision drives blocking podman subprocesses (incl.
-            # a possible multi-minute image pull) — inline it would freeze the
-            # entire event loop (every poller + hook POST + UI request).
-            # provision() is an idempotent reconcile, so the (rare) overlap
-            # with a cold-start ensure_started in another thread converges:
-            # the loser errors on a name conflict and the next attempt heals.
             try:
-                result = await asyncio.to_thread(provisioner.provision, agent)
-            except Exception as e:  # belt-and-braces: the ABC contract is
-                # "return ok=False", but a provisioner that raises instead
-                # must hit the same rollback logic, not skip it.
-                result = ProvisionResult(
-                    ok=False, mode=agent.isolation_mode, message=str(e)
+                provisioner = get_provisioner(
+                    agent.isolation_mode,
+                    signing_key_provider=agents.get_or_create_signing_key,
                 )
-            if not result.ok:
-                agents.delete(agent.name)  # roll back the NEW registration
-                raise HTTPException(
-                    500,
-                    f"provisioning failed for '{agent.name}': {result.message}",
-                )
-        # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
-        work_dir = Path(agent.working_dir) if agent.working_dir else None
-        if work_dir:
-            _write_mcp_json(work_dir, req.name, agent_registry=agents, skill_store=skills)
+            except NotImplementedError:
+                provisioner = None  # dormant mode (e.g. container gate off)
+            if provisioner is not None:
+                # to_thread: provision drives blocking podman subprocesses
+                # (including a possible multi-minute image pull).
+                provision_attempted = True
+                try:
+                    result = await asyncio.to_thread(provisioner.provision, agent)
+                except Exception as exc:
+                    result = ProvisionResult(
+                        ok=False,
+                        mode=agent.isolation_mode,
+                        message=str(exc),
+                    )
+                if not result.ok:
+                    raise HTTPException(
+                        500,
+                        f"provisioning failed for '{agent.name}': {result.message}",
+                    )
+
+            # Publish MCP config only after provisioning succeeds. This is the
+            # final fallible stage before the POST winner is acknowledged.
+            _write_mcp_json(
+                registration_work_dir,
+                name,
+                agent_registry=agents,
+                skill_store=skills,
+            )
+        except Exception as exc:
+            await _rollback_agent_registration(
+                name=name,
+                agent=agent,
+                main_agent_before=main_agent_before,
+                provisioner=provisioner,
+                provision_attempted=provision_attempted,
+                delete_registration_row=True,
+                workspace_state=workspace_state,
+            )
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+
+        _discard_registration_workspace_capture(workspace_state)
         return agent.to_dict()
 
     @app.get("/agents")
@@ -7171,6 +7494,7 @@ npm run build</pre>
     @app.put("/agents/{name}")
     async def update_agent(name: str, req: UpdateAgentRequest):
         """Update an agent's configuration."""
+        name = _agent_name_or_400(name)
         existing = agents.get(name)
         if not existing:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -7215,6 +7539,10 @@ npm run build</pre>
                     **exc.summary.to_dict(),
                 },
             ) from exc
+        except AgentWorkspaceOverlapError as exc:
+            raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
+        except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
+            raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
 
         isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
         if isolation_touched:
@@ -7584,12 +7912,12 @@ npm run build</pre>
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
         """Deprecated — CLAUDE.md is now agent-owned. Returns current file content."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
 
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
-        claude_md = work_dir / "CLAUDE.md"
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
         content = claude_md.read_text() if claude_md.exists() else agent.soul or ""
         return {"content": content, "size": len(content), "deprecated": True}
 
@@ -7625,6 +7953,7 @@ npm run build</pre>
     @app.get("/agents/{name}/soul/versions")
     async def list_soul_versions(name: str, limit: int = 20):
         """List archived soul versions for an agent."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -7634,6 +7963,7 @@ npm run build</pre>
     @app.get("/agents/{name}/soul/versions/{version_id}")
     async def get_soul_version(name: str, version_id: int):
         """Get a specific soul version content."""
+        name = _agent_name_or_400(name)
         version = agents.get_soul_version(name, version_id)
         if not version:
             raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
@@ -7646,6 +7976,7 @@ npm run build</pre>
         req: RestoreSoulVersionRequest | None = None,
     ):
         """Restore an agent's soul from an archived version."""
+        name = _agent_name_or_400(name)
         version = agents.get_soul_version(name, version_id)
         if not version:
             raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
@@ -7653,9 +7984,9 @@ npm run build</pre>
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
         force_soul = bool(req and req.force_soul)
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         work_dir.mkdir(parents=True, exist_ok=True)
-        claude_md = work_dir / "CLAUDE.md"
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
 
         # Validate both durable representations before changing either. Inc 2
         # will make the dedicated soul endpoint own cross-store consistency;
@@ -7736,6 +8067,7 @@ npm run build</pre>
     @app.post("/agents/{name}/restore")
     async def restore_agent(name: str):
         """Restore a retired agent back to active."""
+        name = _agent_name_or_400(name)
         restored = agents.restore(name)
         if not restored:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -10326,19 +10658,21 @@ npm run build</pre>
     @app.get("/agents/{name}/files")
     async def list_agent_files(name: str):
         """List heart files in the agent's working directory."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        work_dir = Path(agent.working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         if not work_dir.exists():
             return {"agent": name, "working_dir": str(work_dir), "files": [], "exists": False}
         # Heart file extensions — config, soul, and docs
         heart_exts = {".md", ".yaml", ".yml", ".toml", ".json", ".txt", ".cfg", ".ini"}
         files = []
-        for f in sorted(work_dir.iterdir()):
+        for entry in sorted(work_dir.iterdir()):
+            f = _agent_path_or_400(agent, entry.name)
             if f.is_file() and not f.name.startswith('.') and (f.suffix in heart_exts or f.name == "CLAUDE.md"):
                 files.append({
-                    "name": f.name,
+                    "name": entry.name,
                     "size": f.stat().st_size,
                     "modified": f.stat().st_mtime,
                     "is_claude_md": f.name == "CLAUDE.md",
@@ -10348,17 +10682,11 @@ npm run build</pre>
     @app.get("/agents/{name}/files/{filename}")
     async def read_agent_file(name: str, filename: str):
         """Read a heart file from the agent's working directory."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        work_dir = Path(agent.working_dir).resolve()
-        file_path = work_dir / filename
-        # Safety: don't serve files outside the working dir. Resolve first so
-        # a symlink inside the dir pointing elsewhere is rejected too, and
-        # check containment before existence so outside paths 403, not 404.
-        # is_relative_to avoids the '/dir' vs '/dir-evil' prefix pitfall.
-        if not file_path.resolve().is_relative_to(work_dir):
-            raise HTTPException(403, "Access denied")
+        file_path = _agent_path_or_400(agent, filename)
         if not file_path.exists() or not file_path.is_file():
             raise HTTPException(404, f"File '{filename}' not found")
         return {"name": filename, "content": file_path.read_text(errors="replace")}
@@ -10369,22 +10697,21 @@ npm run build</pre>
 
         Uses content field for file contents.
         """
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        work_dir = Path(agent.working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         work_dir.mkdir(parents=True, exist_ok=True)
-        file_path = work_dir / filename
-        # Safety check (resolve first; is_relative_to avoids prefix pitfalls)
-        if not file_path.resolve().is_relative_to(work_dir):
-            raise HTTPException(403, "Access denied")
-        claude_md = work_dir / "CLAUDE.md"
+        file_path = _agent_path_or_400(agent, filename)
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
         is_soul_file = filename.casefold() == "claude.md"
         if not is_soul_file and file_path.exists() and claude_md.exists():
             # A symlink or case-insensitive alias must not turn the generic
             # heart-file writer into a CLAUDE.md guard bypass.
             is_soul_file = file_path.samefile(claude_md)
         if is_soul_file:
+            file_path = claude_md
             _write_guarded_soul_file(
                 agent,
                 file_path,
@@ -10393,7 +10720,7 @@ npm run build</pre>
                 source="api-file-force" if req.force_soul else "api-file",
             )
         else:
-            file_path.write_text(req.content)
+            _write_agent_text(agent, file_path, req.content)
         _log(f"api: wrote {filename} to {work_dir} for agent {name}")
         return {"written": True, "name": filename, "size": len(req.content)}
 
@@ -10407,6 +10734,7 @@ npm run build</pre>
         tools, permissions, and active directives. Writes CLAUDE.md to
         the agent's working directory before spawning.
         """
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -10417,13 +10745,18 @@ npm run build</pre>
         system_prompt = agents.build_system_prompt(name, skill_store=skills)
 
         # Ensure working directory exists and write CLAUDE.md
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         work_dir.mkdir(parents=True, exist_ok=True)
-        claude_md = work_dir / "CLAUDE.md"
-        # Snapshot on-disk content before overwriting (catches agent self-edits)
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
+        # Accepted-by-design publication semantics: CLAUDE.md is a compiled
+        # artifact from the DB-authoritative soul plus current directives and
+        # skills. Spawn intentionally overwrites it without the shrink/anchor
+        # guard, while the common writer still enforces owner-root containment
+        # and atomically replaces links instead of writing through their inode.
+        # Snapshot on-disk content before overwriting (catches agent self-edits).
         if claude_md.exists():
             agents.save_soul_version(name, claude_md.read_text(), source="agent")
-        claude_md.write_text(system_prompt)
+        _write_agent_text(agent, claude_md, system_prompt)
         agents.save_soul_version(name, system_prompt, source="spawn")
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
 

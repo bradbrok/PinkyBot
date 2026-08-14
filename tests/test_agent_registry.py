@@ -6,14 +6,18 @@ import json
 import os
 import tempfile
 import threading
+import time
 
 import pytest
 
 from pinky_daemon.agent_registry import (
     AgentAlreadyExistsError,
     AgentContext,
+    AgentPathContainmentError,
     AgentRegistry,
+    AgentWorkspaceOverlapError,
     SoulMutationRejectedError,
+    resolve_agent_path,
 )
 
 
@@ -579,6 +583,67 @@ class TestAgentCRUD:
         assert winner.working_dir == str(tmp_path / "winner")
         assert not (tmp_path / "loser").exists()
 
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_register_refuses_cross_agent_workspace_overlap_without_side_effects(
+        self,
+        registry,
+        tmp_path,
+        relation,
+    ):
+        victim_root = tmp_path / "victim"
+        registry.register("victim", working_dir=str(victim_root), model="opus")
+        marker = victim_root / "identity-marker"
+        marker.write_text("victim-private")
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-attacker",
+            "enclosing": tmp_path,
+        }[relation]
+
+        with pytest.raises(AgentWorkspaceOverlapError):
+            registry.register(
+                "attacker",
+                working_dir=str(candidate),
+                model="haiku",
+                soul="must-not-land",
+            )
+
+        assert registry.get("attacker") is None
+        assert registry.get("victim").model == "opus"
+        assert marker.read_text() == "victim-private"
+        if relation == "nested":
+            assert not candidate.exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_update_refuses_cross_agent_workspace_overlap_before_other_mutations(
+        self,
+        registry,
+        tmp_path,
+        relation,
+    ):
+        victim_root = tmp_path / "victim"
+        mover_root = tmp_path / "mover"
+        registry.register("victim", working_dir=str(victim_root))
+        registry.register("mover", working_dir=str(mover_root), model="opus")
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-mover",
+            "enclosing": tmp_path,
+        }[relation]
+
+        with pytest.raises(AgentWorkspaceOverlapError):
+            registry.register(
+                "mover",
+                working_dir=str(candidate),
+                model="haiku",
+            )
+
+        mover = registry.get("mover")
+        assert mover.working_dir == str(mover_root)
+        assert mover.model == "opus"
+        if relation == "nested":
+            assert not candidate.exists()
+
     def test_soul_update_snapshots_replaced_value_before_write(
         self, registry, monkeypatch,
     ):
@@ -643,6 +708,42 @@ class TestAgentCRUD:
 
         forced = registry.update("oleg", soul=replacement, force_soul=True)
         assert forced.soul == replacement
+
+    def test_soul_anchor_scan_is_linear_on_codeql_pathological_shape(
+        self,
+        monkeypatch,
+    ):
+        def regex_must_not_run(*_args, **_kwargs):
+            raise AssertionError("anchor detection must not use backtracking regexes")
+
+        monkeypatch.setattr("pinky_daemon.agent_registry.re.fullmatch", regex_must_not_run)
+        # Near-suffix family from Murzik's r1 probe. The old lazy multiline
+        # regex explored the spaces/hash suffix quadratically (~4x for 2x n).
+        pathological = "# a" + " " * 100_000 + "#" * 100_000 + "!"
+        started = time.perf_counter()
+
+        anchors = AgentRegistry._soul_identity_anchors(
+            pathological,
+            agent_name="alice",
+        )
+
+        assert anchors == set()
+        # Deliberately generous: the structural no-regex assertion proves the
+        # algorithmic fix; this only catches accidental synchronous blowups.
+        assert time.perf_counter() - started < 5.0
+
+    def test_soul_anchor_scan_preserves_legacy_markdown_forms(self):
+        anchors = AgentRegistry._soul_identity_anchors(
+            "# Oleg ###\n## IDENTITY ##\n**Name:** Oleg\n***Role:** Lead",
+            agent_name="oleg",
+        )
+
+        assert anchors == {
+            "agent_heading",
+            "identity_heading",
+            "name_label",
+            "role_label",
+        }
 
     def test_update_is_partial_and_preserves_unset_fields(self, registry):
         registry.register(
@@ -960,6 +1061,25 @@ class TestAgentNameValidation:
     def test_register_accepts_safe_name(self, registry, good_name):
         agent = registry.register(good_name)
         assert agent.name == good_name
+
+
+def test_resolve_agent_path_refuses_out_of_tree_alias(tmp_path):
+    owner_root = tmp_path / "alice"
+    owner_root.mkdir()
+    outside = tmp_path / "victim-soul"
+    outside.write_text("victim-private")
+    (owner_root / "CLAUDE.md").symlink_to(outside)
+
+    with pytest.raises(AgentPathContainmentError):
+        resolve_agent_path("alice", owner_root, "CLAUDE.md")
+
+    assert outside.read_text() == "victim-private"
+
+
+@pytest.mark.parametrize("owner_root", ["", "relative/agent-root"])
+def test_resolve_agent_path_requires_persisted_absolute_owner_root(owner_root):
+    with pytest.raises(AgentPathContainmentError):
+        resolve_agent_path("alice", owner_root, "CLAUDE.md")
 
 
 class TestDirectives:

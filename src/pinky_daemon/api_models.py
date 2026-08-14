@@ -310,20 +310,9 @@ class RegisterAgentRequest(BaseModel):
     @field_validator("name")
     @classmethod
     def _name_safe(cls, v: str) -> str:
-        """Reject agent names that don't match the safe-char allowlist.
-
-        The name becomes part of filesystem paths (working_dir, hook scripts,
-        settings.json) downstream. Blocking unsafe characters at request
-        parse time short-circuits any path-construction code in
-        agent_registry from ever seeing tainted input. See _AGENT_NAME_RE
-        for the allowed shape.
-        """
+        """Reject agent names that don't match the shared safe allowlist."""
         if not _AGENT_NAME_RE.fullmatch(v):
-            raise ValueError(
-                "agent name must match ^[a-z0-9][a-z0-9_-]{0,62}$ "
-                "(lowercase alphanumeric, underscore, hyphen; "
-                "starts with letter or digit; up to 63 chars)"
-            )
+            raise ValueError("invalid agent name")
         return v
 
     model: str = "opus"

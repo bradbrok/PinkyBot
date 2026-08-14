@@ -2357,11 +2357,20 @@ class TestRegisterAgent:
         # POST /agents genuinely fails on e.g. an invalid name
         # (_validate_agent_name → 400), and the error must surface.
         with _mock_api({
-            "/agents": {"error": "invalid agent name", "status": 400},
+            "/agents": {
+                "error": '{"detail":{"code":"invalid_agent_name"}}',
+                "status": 400,
+            },
             "*": {},
         }):
-            out = _tools(srv)["register_agent"](name="mora", role="worker")
+            out = _tools(srv)["register_agent"](
+                name="../victim",
+                role="worker",
+            )
         assert "Failed to register" in out
+        assert "HTTP 400" in out
+        assert "invalid_agent_name" in out
+        assert "victim" not in out
 
     def test_existing_name_refused(self, srv):
         # The API's DB-level collision is authoritative; MCP surfaces its 409.

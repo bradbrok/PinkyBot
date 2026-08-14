@@ -2233,6 +2233,10 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                 "isolation_mode": isolation_mode,
             })
             if isinstance(create, dict) and "error" in create:
+                if create.get("status") == 400 and "invalid_agent_name" in str(
+                    create.get("error", "")
+                ):
+                    return "Failed to register agent (HTTP 400): invalid_agent_name"
                 if create.get("status") == 409:
                     return (
                         f"Refusing to register '{name}': HTTP 409 — an agent with "

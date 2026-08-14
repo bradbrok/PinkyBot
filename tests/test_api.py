@@ -5615,6 +5615,164 @@ class TestAgentCRUD:
         app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
         return TestClient(app)
 
+    @staticmethod
+    def _assert_failed_registration_left_no_state(
+        client,
+        name,
+        work_dir,
+        main_agent_before,
+    ):
+        registry = client.app.state.agents
+        assert registry.get(name) is None
+        assert registry.get_signing_key(name) is None
+        assert registry.get_main_agent() == main_agent_before
+        assert not work_dir.exists()
+
+    def test_register_signing_key_failure_compensates_every_winner_side_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "signing-failure"
+        main_agent_before = registry.get_main_agent()
+
+        def fail_signing_key(_name):
+            raise RuntimeError("injected signing-key failure")
+
+        monkeypatch.setattr(registry, "get_or_create_signing_key", fail_signing_key)
+
+        response = client.post(
+            "/agents",
+            json={"name": "signing-failure", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {"code": "agent_registration_failed"}
+        self._assert_failed_registration_left_no_state(
+            client,
+            "signing-failure",
+            work_dir,
+            main_agent_before,
+        )
+
+    def test_register_mcp_failure_compensates_every_winner_side_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import pinky_daemon.api as api_module
+
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "mcp-failure"
+        main_agent_before = registry.get_main_agent()
+
+        def fail_mcp(*_args, **_kwargs):
+            raise RuntimeError("injected MCP publication failure")
+
+        monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
+
+        response = client.post(
+            "/agents",
+            json={"name": "mcp-failure", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {"code": "agent_registration_failed"}
+        self._assert_failed_registration_left_no_state(
+            client,
+            "mcp-failure",
+            work_dir,
+            main_agent_before,
+        )
+
+    def test_register_failure_restores_preexisting_workspace_files(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import pinky_daemon.api as api_module
+
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "preexisting"
+        claude_dir = work_dir / ".claude"
+        claude_dir.mkdir(parents=True)
+        marker = work_dir / "operator-marker"
+        marker.write_text("operator-private")
+        settings = claude_dir / "settings.json"
+        settings.write_text('{"operator": true}\n')
+
+        def fail_mcp(*_args, **_kwargs):
+            raise RuntimeError("injected MCP publication failure")
+
+        monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
+
+        response = client.post(
+            "/agents",
+            json={"name": "preexisting", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert registry.get("preexisting") is None
+        assert registry.get_signing_key("preexisting") is None
+        assert registry.get_main_agent() == ""
+        assert marker.read_text() == "operator-private"
+        assert settings.read_text() == '{"operator": true}\n'
+        assert sorted(path.name for path in claude_dir.iterdir()) == ["settings.json"]
+        assert not (work_dir / ".mcp.json").exists()
+        assert not (work_dir / "data").exists()
+        assert not (work_dir / "output").exists()
+        assert not (work_dir / "workspace").exists()
+
+    def test_register_provision_failure_compensates_every_winner_side_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from pinky_daemon import provisioning
+
+        deprovisioned = []
+
+        class FailingProvisioner:
+            def provision(self, agent):
+                return provisioning.ProvisionResult(
+                    ok=False,
+                    mode="container",
+                    message="injected provision failure",
+                )
+
+            def deprovision(self, agent):
+                deprovisioned.append(agent.name)
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+        monkeypatch.setattr(
+            provisioning,
+            "get_provisioner",
+            lambda _mode, **_kwargs: FailingProvisioner(),
+        )
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "provision-failure"
+        main_agent_before = registry.get_main_agent()
+
+        response = client.post(
+            "/agents",
+            json={"name": "provision-failure", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert "injected provision failure" in response.text
+        assert deprovisioned == ["provision-failure"]
+        self._assert_failed_registration_left_no_state(
+            client,
+            "provision-failure",
+            work_dir,
+            main_agent_before,
+        )
+
     def test_register_agent(self):
         client = self._make_client()
         resp = client.post("/agents", json={
@@ -5632,6 +5790,100 @@ class TestAgentCRUD:
         assert data["transport"] == "sdk"
         assert data["provider_url"] == "codex_cli"
         assert data["provider_model"] == "gpt-5-codex"
+
+    def test_invalid_agent_name_is_content_free_400_at_every_mutation_surface(self):
+        client = self._make_client()
+        responses = [
+            client.post("/agents", json={"name": "../victim"}),
+            client.put("/agents/BAD", json={"model": "haiku"}),
+            client.post("/agents/BAD/soul/versions/1/restore"),
+            client.put(
+                "/agents/BAD/files/CLAUDE.md",
+                json={"content": "must-not-land", "force_soul": True},
+            ),
+        ]
+
+        for response in responses:
+            assert response.status_code == 400
+            assert response.json()["detail"] == {"code": "invalid_agent_name"}
+            assert "victim" not in response.text
+            assert "BAD" not in response.text
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_register_refuses_cross_agent_workspace_overlap_without_side_effects(
+        self,
+        tmp_path,
+        relation,
+    ):
+        client = self._make_client()
+        victim_root = tmp_path / "victim"
+        assert client.post(
+            "/agents",
+            json={"name": "victim", "working_dir": str(victim_root)},
+        ).status_code == 200
+        marker = victim_root / "identity-marker"
+        marker.write_text("victim-private")
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-attacker",
+            "enclosing": tmp_path,
+        }[relation]
+
+        refused = client.post(
+            "/agents",
+            json={
+                "name": "attacker",
+                "working_dir": str(candidate),
+                "soul": "must-not-land",
+            },
+        )
+
+        assert refused.status_code == 409
+        assert refused.json()["detail"] == {"code": "agent_workspace_overlap"}
+        assert client.app.state.agents.get("attacker") is None
+        assert marker.read_text() == "victim-private"
+        if relation == "nested":
+            assert not candidate.exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_update_refuses_cross_agent_workspace_overlap_before_config_mutation(
+        self,
+        tmp_path,
+        relation,
+    ):
+        client = self._make_client()
+        victim_root = tmp_path / "victim"
+        mover_root = tmp_path / "mover"
+        assert client.post(
+            "/agents",
+            json={"name": "victim", "working_dir": str(victim_root)},
+        ).status_code == 200
+        assert client.post(
+            "/agents",
+            json={
+                "name": "mover",
+                "working_dir": str(mover_root),
+                "model": "opus",
+            },
+        ).status_code == 200
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-mover",
+            "enclosing": tmp_path,
+        }[relation]
+
+        refused = client.put(
+            "/agents/mover",
+            json={"working_dir": str(candidate), "model": "haiku"},
+        )
+
+        assert refused.status_code == 409
+        assert refused.json()["detail"] == {"code": "agent_workspace_overlap"}
+        mover = client.app.state.agents.get("mover")
+        assert mover.working_dir == str(mover_root)
+        assert mover.model == "opus"
+        if relation == "nested":
+            assert not candidate.exists()
 
     def test_update_agent_runtime(self):
         client = self._make_client()
@@ -5853,6 +6105,16 @@ class TestAgentCRUD:
         assert claude_md.read_text() == "short"
         assert len(client.app.state.agents.get_soul_versions("alice")) == 1
 
+        hardlink = work_dir / "soul-hardlink"
+        os.link(claude_md, hardlink)
+        hardlink_rejected = client.put(
+            "/agents/alice/files/soul-hardlink",
+            json={"content": ""},
+        )
+        assert hardlink_rejected.status_code == 400
+        assert claude_md.read_text() == "short"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
         lowercase_rejected = client.put(
             "/agents/alice/files/claude.md",
             json={"content": ""},
@@ -5860,6 +6122,112 @@ class TestAgentCRUD:
         assert lowercase_rejected.status_code == 400
         assert claude_md.read_text() == "short"
         assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+        outside_soul = tmp_path / "outside-soul"
+        outside_soul.write_text("outside-private")
+        outside_alias = work_dir / "outside-link"
+        outside_alias.symlink_to(outside_soul)
+        outside_rejected = client.put(
+            "/agents/alice/files/outside-link",
+            json={"content": "must-not-land", "force_soul": True},
+        )
+        assert outside_rejected.status_code == 400
+        assert outside_rejected.json()["detail"] == {
+            "code": "agent_path_outside_workspace"
+        }
+        assert outside_soul.read_text() == "outside-private"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+    def test_guarded_write_replaces_hardlink_without_mutating_external_inode(
+        self,
+        tmp_path,
+    ):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        original = "external-private-soul-" * 8
+        replacement = "compiled-safe-replacement"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": original,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        outside = tmp_path / "external-claude"
+        outside.write_text(original)
+        claude_md = work_dir / "CLAUDE.md"
+        os.link(outside, claude_md)
+        shared_inode = outside.stat().st_ino
+        assert claude_md.stat().st_ino == shared_inode
+
+        written = client.put(
+            "/agents/alice/files/CLAUDE.md",
+            json={"content": replacement, "force_soul": True},
+        )
+
+        assert written.status_code == 200
+        assert claude_md.read_text() == replacement
+        assert outside.read_text() == original
+        assert outside.stat().st_ino == shared_inode
+        assert claude_md.stat().st_ino != shared_inode
+
+    def test_restore_refuses_outside_claude_symlink_before_db_or_file_mutation(
+        self,
+        tmp_path,
+    ):
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "alice"
+        current = "current-private-soul-" * 8
+        target = "archived-target-soul"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": current,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        version_id = registry.save_soul_version("alice", target, source="test")
+        outside = tmp_path / "outside-restore-target"
+        outside.write_text("outside-byte-identical")
+        (work_dir / "CLAUDE.md").symlink_to(outside)
+
+        restored = client.post(
+            f"/agents/alice/soul/versions/{version_id}/restore",
+            json={"force_soul": True},
+        )
+
+        assert restored.status_code == 400
+        assert restored.json()["detail"] == {
+            "code": "agent_path_outside_workspace"
+        }
+        assert registry.get("alice").soul == current
+        assert outside.read_text() == "outside-byte-identical"
+
+    def test_spawn_publication_refuses_outside_claude_symlink(self, tmp_path):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": "db-authoritative-soul",
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        outside = tmp_path / "outside-spawn-target"
+        outside.write_text("outside-byte-identical")
+        (work_dir / "CLAUDE.md").symlink_to(outside)
+
+        spawned = client.post("/agents/alice/sessions", json={})
+
+        assert spawned.status_code == 400
+        assert spawned.json()["detail"] == {
+            "code": "agent_path_outside_workspace"
+        }
+        assert outside.read_text() == "outside-byte-identical"
 
     def test_restore_shorter_soul_requires_explicit_force(self, tmp_path):
         client = self._make_client()

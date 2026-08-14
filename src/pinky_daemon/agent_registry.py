@@ -23,11 +23,13 @@ Hierarchy:
 from __future__ import annotations
 
 import json
+import os
 import re
 import secrets
 import shlex
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
@@ -97,6 +99,60 @@ def _validate_agent_name(name: str) -> str:
             f"starts with letter or digit; up to 63 chars)"
         )
     return name
+
+
+class AgentPathContainmentError(ValueError):
+    """A requested agent path resolved outside its owning workspace."""
+
+
+def resolve_agent_path(
+    agent_name: str,
+    agent_dir: str | Path,
+    *parts: str | Path,
+) -> Path:
+    """Resolve an agent-owned path and refuse aliases outside its workspace.
+
+    ``agent_dir`` is the persisted owning workspace.  Resolution happens
+    before any caller reads or writes the result, so ``..`` components,
+    absolute children, symlinks, and case-normalized aliases cannot escape
+    the workspace.  The agent name is validated here as well so every path
+    boundary shares the registry's existing strict allowlist.
+    """
+    _validate_agent_name(agent_name)
+    if not agent_dir:
+        raise AgentPathContainmentError("agent workspace is not configured")
+    workspace_path = Path(agent_dir)
+    if not workspace_path.is_absolute():
+        raise AgentPathContainmentError("agent workspace is not an absolute path")
+    workspace = workspace_path.resolve()
+    candidate = workspace.joinpath(*parts) if parts else workspace
+    resolved = candidate.resolve()
+    if resolved != workspace and not resolved.is_relative_to(workspace):
+        raise AgentPathContainmentError("agent path is outside its workspace")
+    return resolved
+
+
+def replace_agent_text(
+    agent_name: str,
+    agent_dir: str | Path,
+    path: str | Path,
+    content: str,
+) -> Path:
+    """Atomically replace one contained agent file without following links."""
+    target = resolve_agent_path(agent_name, agent_dir, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def _log(msg: str) -> None:
@@ -772,6 +828,22 @@ class ScheduleNameConflictError(ValueError):
 
 class AgentAlreadyExistsError(ValueError):
     """A create-only registration collided with an existing agent name."""
+
+
+class AgentRegistrationIncompleteError(RuntimeError):
+    """A create-only registration won its DB name but failed before completion."""
+
+    def __init__(self, name: str, *, row_committed: bool):
+        super().__init__(f"registration incomplete for {name}")
+        self.row_committed = row_committed
+
+
+class AgentWorkspacePathError(ValueError):
+    """An agent workspace could not be resolved to a usable absolute path."""
+
+
+class AgentWorkspaceOverlapError(ValueError):
+    """An agent workspace overlaps another registered agent's owner root."""
 
 
 @dataclass(frozen=True)
@@ -2173,10 +2245,11 @@ class AgentRegistry:
         from #429) on agents whose workspace pre-dates them, without nuking
         any user customizations to existing scripts.
         """
+        agent_name = _validate_agent_name(agent_name)
         agent = self.get(agent_name)
         if not agent or not agent.working_dir:
             return
-        work_dir = Path(agent.working_dir)
+        work_dir = resolve_agent_path(agent_name, agent.working_dir)
         if not work_dir.exists():
             return
         try:
@@ -2195,11 +2268,21 @@ class AgentRegistry:
             ├── .claude/        # Claude Code hooks + settings
             └── CLAUDE.md       # Written by spawn, not here
         """
+        if agent_name:
+            work_dir = resolve_agent_path(agent_name, work_dir)
+            data_dir = resolve_agent_path(agent_name, work_dir, "data")
+            output_dir = resolve_agent_path(agent_name, work_dir, "output")
+            workspace_dir = resolve_agent_path(agent_name, work_dir, "workspace")
+        else:
+            work_dir = Path(work_dir).resolve()
+            data_dir = work_dir / "data"
+            output_dir = work_dir / "output"
+            workspace_dir = work_dir / "workspace"
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
-            (work_dir / "data").mkdir(exist_ok=True)
-            (work_dir / "output").mkdir(exist_ok=True)
-            (work_dir / "workspace").mkdir(exist_ok=True)
+            data_dir.mkdir(exist_ok=True)
+            output_dir.mkdir(exist_ok=True)
+            workspace_dir.mkdir(exist_ok=True)
         except PermissionError:
             _log(f"agent_registry: workspace init skipped for {work_dir} (permission denied)")
             return
@@ -2211,6 +2294,7 @@ class AgentRegistry:
     @staticmethod
     def _write_hook_if_changed(
         *,
+        agent_dir: Path,
         hook_path: Path,
         new_source: str,
         hook_filename: str,
@@ -2230,11 +2314,11 @@ class AgentRegistry:
         ``_validate_agent_name``). The validation is cheap and raises
         ``ValueError`` on bad input rather than corrupting disk layout.
         """
-        _validate_agent_name(agent_name)
+        hook_path = resolve_agent_path(agent_name, agent_dir, hook_path)
         existing = hook_path.read_text() if hook_path.exists() else ""
         if existing == new_source:
             return
-        hook_path.write_text(new_source)
+        replace_agent_text(agent_name, agent_dir, hook_path, new_source)
         verb = "updated" if existing else "created"
         _log(f"agent_registry: {verb} {hook_filename} for {agent_name}")
 
@@ -2255,8 +2339,8 @@ class AgentRegistry:
         # the public entry point. Cheap re-check; raises ``ValueError`` on
         # bad input so the daemon crashes loudly rather than corrupting
         # filesystem layout.
-        _validate_agent_name(agent_name)
-        claude_dir = work_dir / ".claude"
+        work_dir = resolve_agent_path(agent_name, work_dir)
+        claude_dir = resolve_agent_path(agent_name, work_dir, ".claude")
         claude_dir.mkdir(exist_ok=True)
 
         hook_template = '''\
@@ -2324,14 +2408,26 @@ except Exception as exc:
         "%s: %s" % (type(exc).__name__, exc),
     )
 '''
-        working_path = claude_dir / "hook_working.py"
-        idle_path = claude_dir / "hook_idle.py"
-        verify_effort_path = claude_dir / "hook_verify_effort.py"
-        tmux_wake_path = claude_dir / "hook_tmux_wake.py"
-        tmux_session_start_path = claude_dir / "hook_tmux_session_start.py"
-        tmux_pre_tool_path = claude_dir / "hook_tmux_pre_tool.py"
-        tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
-        tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
+        working_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_working.py")
+        idle_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_idle.py")
+        verify_effort_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_verify_effort.py"
+        )
+        tmux_wake_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_wake.py"
+        )
+        tmux_session_start_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_session_start.py"
+        )
+        tmux_pre_tool_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_pre_tool.py"
+        )
+        tmux_post_tool_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_post_tool.py"
+        )
+        tmux_stop_failure_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_stop_failure.py"
+        )
 
         # #638: these two were historically written once and left alone, which
         # stranded fleet agents on stale sources (e.g. the hardcoded
@@ -2339,12 +2435,14 @@ except Exception as exc:
         # are fully PinkyBot-managed, so keep them current like the five
         # always-rewritten hooks below.
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=working_path,
             new_source=hook_template.format(agent_name=agent_name, status="working"),
             hook_filename="hook_working.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=idle_path,
             new_source=hook_template.format(agent_name=agent_name, status="idle"),
             hook_filename="hook_idle.py",
@@ -2369,36 +2467,42 @@ except Exception as exc:
         # returns ``ok: True, session: None`` for non-tmux runtimes, so each
         # is a cheap no-op for SDK / codex agents (one extra POST per turn).
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=verify_effort_path,
             new_source=_verify_effort_hook_source(),
             hook_filename="hook_verify_effort.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_wake_path,
             new_source=_tmux_wake_hook_source(agent_name),
             hook_filename="hook_tmux_wake.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_session_start_path,
             new_source=_tmux_session_start_hook_source(agent_name),
             hook_filename="hook_tmux_session_start.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_pre_tool_path,
             new_source=_tmux_pre_tool_hook_source(agent_name),
             hook_filename="hook_tmux_pre_tool.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_post_tool_path,
             new_source=_tmux_post_tool_hook_source(agent_name),
             hook_filename="hook_tmux_post_tool.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_stop_failure_path,
             new_source=_tmux_stop_failure_hook_source(agent_name),
             hook_filename="hook_tmux_stop_failure.py",
@@ -2406,7 +2510,8 @@ except Exception as exc:
         )
 
         AgentRegistry._sync_hooks_settings(
-            claude_dir / "settings.json",
+            resolve_agent_path(agent_name, work_dir, ".claude", "settings.json"),
+            agent_dir=work_dir,
             working_path=working_path.resolve(),
             idle_path=idle_path.resolve(),
             verify_effort_path=verify_effort_path.resolve(),
@@ -2422,6 +2527,7 @@ except Exception as exc:
     def _sync_hooks_settings(
         settings_path: Path,
         *,
+        agent_dir: Path,
         working_path: Path,
         idle_path: Path,
         verify_effort_path: Path,
@@ -2442,6 +2548,36 @@ except Exception as exc:
           appearing in the command string.
         """
         import json as _json
+
+        settings_path = resolve_agent_path(agent_name, agent_dir, settings_path)
+        working_path = resolve_agent_path(agent_name, agent_dir, working_path)
+        idle_path = resolve_agent_path(agent_name, agent_dir, idle_path)
+        verify_effort_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            verify_effort_path,
+        )
+        tmux_wake_path = resolve_agent_path(agent_name, agent_dir, tmux_wake_path)
+        tmux_session_start_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_session_start_path,
+        )
+        tmux_pre_tool_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_pre_tool_path,
+        )
+        tmux_post_tool_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_post_tool_path,
+        )
+        tmux_stop_failure_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_stop_failure_path,
+        )
 
         # Quote script paths: a working_dir containing spaces would otherwise
         # make python3 open a nonexistent file, and the trailing
@@ -2531,7 +2667,12 @@ except Exception as exc:
                     ],
                 }
             }
-            settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
+            replace_agent_text(
+                agent_name,
+                agent_dir,
+                settings_path,
+                _json.dumps(settings, indent=2) + "\n",
+            )
             _log(f"agent_registry: created settings.json for {agent_name}")
             return
 
@@ -2609,7 +2750,12 @@ except Exception as exc:
         )
 
         if changed:
-            settings_path.write_text(_json.dumps(data, indent=2) + "\n")
+            replace_agent_text(
+                agent_name,
+                agent_dir,
+                settings_path,
+                _json.dumps(data, indent=2) + "\n",
+            )
             _log(
                 f"agent_registry: merged PinkyBot hooks into settings.json "
                 f"for {agent_name}"
@@ -2656,6 +2802,47 @@ except Exception as exc:
     # ── Agent CRUD ──────────────────────────────────────────
 
     @staticmethod
+    def _markdown_heading_text(line: str, level: int) -> str | None:
+        """Parse one ATX heading in linear time, without regex backtracking."""
+        prefix = "#" * level
+        if not line.startswith(prefix):
+            return None
+        if len(line) == level or not line[level].isspace():
+            return None
+        body = line[level:].lstrip()
+        if not body:
+            return None
+        closing_start = len(body)
+        while closing_start and body[closing_start - 1] == "#":
+            closing_start -= 1
+        if closing_start < len(body) and body[closing_start - 1].isspace():
+            body = body[:closing_start].rstrip()
+        return body or None
+
+    @staticmethod
+    def _has_identity_label(line: str, label: str) -> bool:
+        """Recognize the legacy name/role label prefix in linear time."""
+        starts = [0]
+        if line[:1] in {"-", "*"}:
+            after_bullet = 1
+            while after_bullet < len(line) and line[after_bullet].isspace():
+                after_bullet += 1
+            starts.append(after_bullet)
+        for start in starts:
+            cursor = start
+            if line[cursor : cursor + 2] == "**":
+                cursor += 2
+            end = cursor + len(label)
+            if line[cursor:end].casefold() != label:
+                continue
+            cursor = end
+            while cursor < len(line) and line[cursor].isspace():
+                cursor += 1
+            if cursor < len(line) and line[cursor] == ":":
+                return True
+        return False
+
+    @staticmethod
     def _soul_identity_anchors(
         content: str,
         *,
@@ -2671,22 +2858,15 @@ except Exception as exc:
         }
         for raw_line in content.splitlines():
             line = raw_line.strip()
-            heading = re.fullmatch(r"#\s+(.+?)(?:\s+#+)?", line)
-            if heading and heading.group(1).strip().casefold() in identities:
+            heading = AgentRegistry._markdown_heading_text(line, 1)
+            if heading and heading.casefold() in identities:
                 anchors.add("agent_heading")
-            if re.fullmatch(r"##\s+identity(?:\s+#+)?", line, re.IGNORECASE):
+            identity_heading = AgentRegistry._markdown_heading_text(line, 2)
+            if identity_heading and identity_heading.casefold() == "identity":
                 anchors.add("identity_heading")
-            if re.match(
-                r"^(?:[-*]\s*)?(?:\*\*)?name\s*:(?:\s*\*\*)?",
-                line,
-                re.IGNORECASE,
-            ):
+            if AgentRegistry._has_identity_label(line, "name"):
                 anchors.add("name_label")
-            if re.match(
-                r"^(?:[-*]\s*)?(?:\*\*)?role\s*:(?:\s*\*\*)?",
-                line,
-                re.IGNORECASE,
-            ):
+            if AgentRegistry._has_identity_label(line, "role"):
                 anchors.add("role_label")
         return anchors
 
@@ -2853,8 +3033,10 @@ except Exception as exc:
     ) -> None:
         """Insert first, then initialize only the DB-winning workspace."""
         with self._rmw_lock:
+            insert_won = False
             try:
                 self._db.execute(sql, params)
+                insert_won = True
                 # A losing create-only request must not reinitialize files in
                 # either the winner's workspace or an attacker-chosen path.
                 # Keep the insert transaction open so only the PRIMARY KEY
@@ -2871,10 +3053,77 @@ except Exception as exc:
                 raise
             except Exception:
                 self._db.rollback()
+                if create_only and insert_won:
+                    raise AgentRegistrationIncompleteError(
+                        name,
+                        row_committed=False,
+                    )
                 raise
 
+    @staticmethod
+    def _resolve_workspace_root(name: str, working_dir: str | Path) -> Path:
+        """Return a stable absolute owner root suitable for persistence."""
+        _validate_agent_name(name)
+        try:
+            root = Path(working_dir).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise AgentWorkspacePathError("agent workspace path is invalid") from exc
+        if not root.is_absolute() or (root.exists() and not root.is_dir()):
+            raise AgentWorkspacePathError("agent workspace path is invalid")
+        return root
+
+    def _refuse_workspace_overlap(self, name: str, root: Path) -> None:
+        """Fail closed when ``root`` intersects another agent's owner root."""
+        _validate_agent_name(name)
+        rows = self._db.execute(
+            "SELECT name, working_dir FROM agents WHERE name<>?",
+            (name,),
+        ).fetchall()
+        for other_name, other_working_dir in rows:
+            try:
+                other_root = self._resolve_workspace_root(
+                    other_name,
+                    other_working_dir,
+                )
+            except (AgentWorkspacePathError, ValueError) as exc:
+                raise AgentWorkspacePathError(
+                    "registered agent workspace path is invalid"
+                ) from exc
+            if (
+                root == other_root
+                or root.is_relative_to(other_root)
+                or other_root.is_relative_to(root)
+            ):
+                raise AgentWorkspaceOverlapError(
+                    "agent workspace overlaps another registered agent"
+                )
+
+    def resolve_registration_workspace(
+        self,
+        name: str,
+        working_dir: str | Path,
+    ) -> Path:
+        """Resolve and preflight a proposed owner root without mutating state."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            root = self._resolve_workspace_root(name, working_dir)
+            self._refuse_workspace_overlap(name, root)
+            return root
+
     def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
-        """Register an agent, optionally refusing DB-level name collisions."""
+        """Register atomically, including cross-agent workspace ownership."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            return self._register_locked(name, create_only=create_only, **kwargs)
+
+    def _register_locked(
+        self,
+        name: str,
+        *,
+        create_only: bool = False,
+        **kwargs,
+    ) -> Agent:
+        """Register while ``_rmw_lock`` protects root checks and mutation."""
         # Sanitize before any path is constructed downstream. Same regex as
         # the API model — duplicated here so in-process callers (tests,
         # scripts, future routes) can't bypass it. ``_validate_agent_name``
@@ -2893,8 +3142,8 @@ except Exception as exc:
             # API. AgentRegistry.update() is intentionally path-free.
             updated_working_dir = ""
             if kwargs.get("working_dir"):
-                upd_dir = Path(kwargs["working_dir"])
-                upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
+                upd_dir_abs = self._resolve_workspace_root(name, kwargs["working_dir"])
+                self._refuse_workspace_overlap(name, upd_dir_abs)
                 if str(upd_dir_abs) != existing.working_dir:
                     self._init_workspace(upd_dir_abs, agent_name=name)
                 updated_working_dir = str(upd_dir_abs)
@@ -2921,8 +3170,8 @@ except Exception as exc:
             # Set up workspace — always store absolute path for portability.
             # Relative paths break when daemon CWD differs from install dir.
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
-            work_dir = Path(raw_dir)
-            work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
+            work_dir_abs = self._resolve_workspace_root(name, raw_dir)
+            self._refuse_workspace_overlap(name, work_dir_abs)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
@@ -2976,8 +3225,10 @@ except Exception as exc:
                 created_at=now,
                 updated_at=now,
             )
-            self._insert_agent_row(
-                """INSERT OR ABORT INTO agents
+            insert_complete = False
+            try:
+                self._insert_agent_row(
+                    """INSERT OR ABORT INTO agents
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
@@ -2993,7 +3244,7 @@ except Exception as exc:
                     watchdog_config,
                     created_at, updated_at)
                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (agent.name, agent.display_name, agent.model, agent.soul,
+                    (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), json.dumps(agent.disallowed_tools),
@@ -3013,31 +3264,41 @@ except Exception as exc:
                  agent.thinking_effort, int(agent.strict_effort_enforcement),
                  int(agent.dedicated_config_dir),
                  json.dumps(agent.watchdog_config),
-                 agent.created_at, agent.updated_at),
-                name=name,
-                create_only=create_only,
-                work_dir=work_dir_abs,
-            )
-            _log(f"agents: registered {name}")
+                     agent.created_at, agent.updated_at),
+                    name=name,
+                    create_only=create_only,
+                    work_dir=work_dir_abs,
+                )
+                insert_complete = True
+                _log(f"agents: registered {name}")
 
-            # First-run convenience: if no main agent is designated yet, adopt
-            # this newly created agent. Without a main agent the daemon starts
-            # no autonomy loop and the agent never auto-wakes — a silent
-            # dead-end for fresh installs. Only fires on creation of an enabled
-            # agent when main is unset, so it never overrides an existing choice.
-            if agent.enabled and not self.get_setting("main_agent"):
-                self.set_setting("main_agent", name)
-                _log(f"agents: auto-assigned main_agent={name} (first agent)")
+                # First-run convenience: if no main agent is designated yet, adopt
+                # this newly created agent. Without a main agent the daemon starts
+                # no autonomy loop and the agent never auto-wakes — a silent
+                # dead-end for fresh installs. Only fires on creation of an enabled
+                # agent when main is unset, so it never overrides an existing choice.
+                if agent.enabled and not self.get_setting("main_agent"):
+                    self.set_setting("main_agent", name)
+                    _log(f"agents: auto-assigned main_agent={name} (first agent)")
 
-        # Ensure the agent has a per-agent signing key (#623). Idempotent —
-        # returns the existing key on re-registration / update.
-        self.get_or_create_signing_key(name)
-        # Fresh databases initialize before any agents exist. Retry the
-        # caller-specified bootstrap after registration so the seed ships for
-        # both upgrades and new installs without weakening the unique key.
-        self._seed_verified_contacts()
+                # Ensure the agent has a per-agent signing key (#623). Idempotent —
+                # returns the existing key on re-registration / update.
+                self.get_or_create_signing_key(name)
+                # Fresh databases initialize before any agents exist. Retry the
+                # caller-specified bootstrap after registration so the seed ships for
+                # both upgrades and new installs without weakening the unique key.
+                self._seed_verified_contacts()
+            except (AgentAlreadyExistsError, AgentRegistrationIncompleteError):
+                raise
+            except Exception as exc:
+                if create_only and insert_complete:
+                    raise AgentRegistrationIncompleteError(
+                        name,
+                        row_committed=True,
+                    ) from exc
+                raise
 
-        return self.get(name)  # type: ignore
+            return self.get(name)  # type: ignore
 
     _AGENT_COLUMNS = (
         "name, display_name, model, soul, system_prompt, working_dir, "
@@ -4324,6 +4585,7 @@ except Exception as exc:
         source: str,
     ) -> int:
         """Insert one version row; the caller owns commit/rollback."""
+        agent_name = _validate_agent_name(agent_name)
         cursor = self._db.execute(
             "INSERT INTO soul_versions (agent_name, content, source, created_at) "
             "VALUES (?, ?, ?, ?)",
@@ -4339,6 +4601,7 @@ except Exception as exc:
         source: str,
     ) -> int:
         """Durably snapshot replaced content before a non-DB mutation."""
+        agent_name = _validate_agent_name(agent_name)
         with self._rmw_lock:
             try:
                 version_id = self._insert_soul_version_uncommitted(
@@ -4357,6 +4620,7 @@ except Exception as exc:
 
         Sources: 'ui', 'agent', 'spawn', 'refresh', 'api'
         """
+        agent_name = _validate_agent_name(agent_name)
         with self._rmw_lock:
             try:
                 # Spawn publication records the installed content after writing.
@@ -4382,6 +4646,7 @@ except Exception as exc:
 
     def get_soul_versions(self, agent_name: str, limit: int = 20) -> list[dict]:
         """List soul versions for an agent, newest first."""
+        agent_name = _validate_agent_name(agent_name)
         rows = self._db.execute(
             "SELECT id, agent_name, source, created_at, LENGTH(content) as size FROM soul_versions WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
             (agent_name, limit),
@@ -4393,6 +4658,7 @@ except Exception as exc:
 
     def get_soul_version(self, agent_name: str, version_id: int) -> dict | None:
         """Get a specific soul version by ID."""
+        agent_name = _validate_agent_name(agent_name)
         row = self._db.execute(
             "SELECT id, agent_name, content, source, created_at FROM soul_versions WHERE agent_name=? AND id=?",
             (agent_name, version_id),

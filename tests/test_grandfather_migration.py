@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -23,7 +24,7 @@ from pinky_daemon.sessions import SessionManager
 def migration_stores(tmp_path):
     registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
     conversations = ConversationStore(db_path=str(tmp_path / "conversations.db"))
-    registry.register("kuzya", working_dir=str(tmp_path))
+    registry.register("kuzya", working_dir=str(tmp_path / "kuzya"))
     yield registry, conversations
     conversations.close()
     registry.close()
@@ -89,8 +90,9 @@ def test_migration_unions_active_groups_and_tool_sends_only(migration_stores):
 
 def test_outbound_history_uses_exact_agent_main_session(migration_stores):
     registry, conversations = migration_stores
+    agents_root = Path(registry.get("kuzya").working_dir).parent
     for agent_name in ("foo", "foo-bar", "a_b", "axb"):
-        registry.register(agent_name, working_dir=registry.get("kuzya").working_dir)
+        registry.register(agent_name, working_dir=str(agents_root / agent_name))
     _tool_send(conversations, "FROM_FOO_BAR", agent_name="foo-bar")
     _tool_send(conversations, "FROM_AXB", agent_name="axb")
 
