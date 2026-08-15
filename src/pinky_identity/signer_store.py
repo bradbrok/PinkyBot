@@ -21,7 +21,9 @@ Design rules (see ``docs/design/agent-asymmetric-identity.md`` and #461):
   cleanup so an attacker who somehow obtains a stale row plus the device
   key still can't impersonate a retired agent (the registry won't return
   the kid as active).
-- **WAL mode + journal_mode=WAL**, same as other PinkyBot SQLite stores.
+- **Rollback (TRUNCATE) journalling**, same as other PinkyBot SQLite
+  stores — see :mod:`pinky_daemon.sqlite_journal` for why WAL is unsafe
+  for the way this process holds SQLite open.
 - **No SQL injection surface.** All writes use parameterized queries; no
   string concatenation into SQL.
 - **Errors normalize to** :class:`pinky_identity.keystore.KeystoreError`
@@ -41,6 +43,7 @@ from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
 from pinky_identity.fs_security import harden_secret_file
 from pinky_identity.keys import SigningKeypair
 from pinky_identity.keystore import (
@@ -146,7 +149,7 @@ class EncryptedSignerStore:
             str(self._db_path), isolation_level=None, check_same_thread=False
         )
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(self._db, db_label="signer store")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
         harden_secret_file(self._db_path)

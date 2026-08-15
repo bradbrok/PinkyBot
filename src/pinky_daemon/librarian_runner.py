@@ -22,6 +22,7 @@ from pathlib import Path
 from pinky_daemon.kb_store import _FRONTMATTER_RE, KBStore, _content_hash
 from pinky_daemon.librarian_prompt import LIBRARIAN_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
+from pinky_daemon.sqlite_journal import configure_rollback_journal
 
 
 def _log(msg: str) -> None:
@@ -66,7 +67,7 @@ class LibrarianRunner:
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(conn, db_label="librarian_state.db")
         conn.row_factory = sqlite3.Row
         return conn
 

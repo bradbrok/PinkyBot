@@ -497,6 +497,7 @@ def test_tenant_signing_keys_fk_cascades_on_tenant_delete(store: FederationState
     assert rows == []
 
 
-def test_db_uses_wal_mode(store: FederationStateStore) -> None:
+def test_db_uses_rollback_journalling(store: FederationStateStore) -> None:
+    """WAL is unsafe here — see pinky_daemon.sqlite_journal for why."""
     mode = store._db.execute("PRAGMA journal_mode").fetchone()[0]  # noqa: SLF001
-    assert mode.lower() == "wal"
+    assert mode.lower() == "truncate"
