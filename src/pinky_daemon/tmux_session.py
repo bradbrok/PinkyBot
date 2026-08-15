@@ -658,7 +658,7 @@ class _TmuxControl:
         result = await self._run("has-session", "-t", self.session_name)
         if result.ok:
             return True
-        if await self._session_absence_is_verified():
+        if await self._session_absence_is_verified(result):
             return False
         raise RuntimeError(
             f"tmux has-session failed without verified absence: "
@@ -701,8 +701,26 @@ class _TmuxControl:
             return False
         return False
 
-    async def _session_absence_is_verified(self) -> bool:
-        """Prove the owned target absent without classifying tmux stderr."""
+    @staticmethod
+    def _server_absence_is_reported(result: TmuxCommandResult) -> bool:
+        """Recognize only tmux's canonical, unambiguous no-server result."""
+        return (
+            result.returncode == 1
+            and result.stdout == ""
+            and re.fullmatch(
+                r"no server running on \S+",
+                result.stderr.strip(),
+            )
+            is not None
+        )
+
+    async def _session_absence_is_verified(
+        self,
+        failed_result: TmuxCommandResult,
+    ) -> bool:
+        """Prove the owned target absent from the failed command or server state."""
+        if self._server_absence_is_reported(failed_result):
+            return True
         if self._server_socket_is_missing():
             return True
         listing = await self._run("list-sessions", "-F", "#{session_name}")
@@ -745,14 +763,12 @@ class _TmuxControl:
         result = await self._run("kill-session", "-t", self.session_name)
         if result.ok:
             return result
-        # Do not classify absence from stderr: tmux versions and platforms use
-        # different text for a missing session versus a missing server/socket.
-        # Positive absence is either a missing local server socket, or an rc=0
-        # session enumeration which omits the owned target. Non-ok probes,
-        # ambiguous output, stat errors, and a still-listed target all preserve
-        # the original failure so strict replacement callers fail closed.
-        # Probe exceptions still propagate.
-        if await self._session_absence_is_verified():
+        # Positive absence is tmux's exact canonical no-server result, a missing
+        # local server socket, or an rc=0 session enumeration which omits the
+        # owned target. Non-ok probes, ambiguous output, stat errors, and a
+        # still-listed target all preserve the original failure so strict
+        # replacement callers fail closed. Probe exceptions still propagate.
+        if await self._session_absence_is_verified(result):
             return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
         return result
 
