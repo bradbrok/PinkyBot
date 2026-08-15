@@ -40,6 +40,16 @@ def client(tmp_path):
         resolve_agent_history=lambda name, **kw: [],
     )
     app = FastAPI()
+
+    # The real auth middleware (api.py) stamps who authenticated; this app has
+    # no middleware, so stand in for it. Default "owner" — these tests cover the
+    # routes' own behaviour, not the owner-only guard (see
+    # test_memory_write_owner_only.py for that, against the real middleware).
+    @app.middleware("http")
+    async def _stamp_actor(request, call_next):
+        request.state.auth_actor = request.headers.get("x-test-actor", "owner")
+        return await call_next(request)
+
     app.include_router(memory_routes.router)
     return TestClient(app), working_dir
 
@@ -147,3 +157,31 @@ class TestDeleteMemory:
         ).fetchone()[0]
         store.close()
         assert count == 1
+
+
+class TestOwnerOnlyGuard:
+    """#463 phase 2: a non-owner caller is refused before the store is touched."""
+
+    def test_agent_actor_cannot_patch(self, client):
+        api, wd = client
+        mid = _insert(wd)
+        resp = api.patch(
+            f"/agents/engineer/memories/{mid}",
+            json={"content": "rewritten"},
+            headers={"x-test-actor": "agent"},
+        )
+        assert resp.status_code == 403
+        store = _store(wd)
+        assert store.get(mid).content == "original"
+        store.close()
+
+    def test_agent_actor_cannot_delete(self, client):
+        api, wd = client
+        mid = _insert(wd)
+        resp = api.delete(
+            f"/agents/engineer/memories/{mid}", headers={"x-test-actor": "agent"}
+        )
+        assert resp.status_code == 403
+        store = _store(wd)
+        assert store.get(mid).active is True
+        store.close()
