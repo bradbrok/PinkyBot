@@ -1097,6 +1097,21 @@ class AgentScheduler:
                         "alert — wake will be retried automatically"
                     )
                     return
+                # Alert on attempts >= CAP since we've exhausted retries
+                if (
+                    persisted
+                    and row is not None
+                    and row.attempts >= self.PERSISTED_WAKE_ATTEMPT_CAP
+                ):
+                    self._queue_owner_alert(
+                        schedule.agent_name,
+                        (
+                            f"🚨 FIRED BUT UNDELIVERED: schedule "
+                            f"'{schedule.name}' (#{schedule.id}) on agent "
+                            f"'{schedule.agent_name}' reached {row.attempts} "
+                            f"unconfirmed delivery attempts. {failure_reason}"
+                        ),
+                    )
             except Exception as exc:
                 _log(
                     f"scheduler: SCHEDULER_WAKE_PERSIST_FAILURE schedule "
