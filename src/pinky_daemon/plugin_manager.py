@@ -38,6 +38,8 @@ from typing import Any, Callable
 
 import yaml
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -139,7 +141,7 @@ class PluginContext:
                 data_dir.mkdir(parents=True, exist_ok=True)
                 self._db_path = str(data_dir / "plugins.db")
             self._db = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._db.execute("PRAGMA journal_mode=WAL")
+            configure_rollback_journal(self._db, db_label="plugins.db")
         return self._db
 
     def create_table(self, table_name: str, schema: str) -> None:
@@ -296,7 +298,7 @@ class PluginManager:
         """Initialize the plugin state tracking table."""
         Path(self._state_db_path).parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(self._state_db_path, check_same_thread=False)
-        db.execute("PRAGMA journal_mode=WAL")
+        configure_rollback_journal(db, db_label="plugins.db")
         db.execute("""
             CREATE TABLE IF NOT EXISTS plugin_state (
                 name TEXT PRIMARY KEY,

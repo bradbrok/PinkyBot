@@ -71,7 +71,7 @@ def test_context_survives_broker_restart_via_load_through(tmp_path):
     second_store.close()
 
 
-def test_store_uses_wal_and_self_heals_optional_columns(tmp_path):
+def test_store_uses_rollback_journal_and_self_heals_optional_columns(tmp_path):
     db_path = tmp_path / "message-context.db"
     legacy = sqlite3.connect(db_path)
     legacy.execute(
@@ -104,7 +104,9 @@ def test_store_uses_wal_and_self_heals_optional_columns(tmp_path):
         for row in store._db.execute("PRAGMA table_info(message_contexts)").fetchall()
     }
 
-    assert str(mode).lower() == "wal"
+    # Rollback journalling, not WAL: an unlinked -wal silently strands
+    # committed writes in the daemon's address space (#797/#220).
+    assert str(mode).lower() == "truncate"
     assert {"reply_to", "attachments_json", "metadata_json", "stored_at"} <= columns
     primary_key = tuple(
         row["name"]

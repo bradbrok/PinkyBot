@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_MAX_PER_AGENT = 1000
 
@@ -30,8 +32,10 @@ class MessageContextStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
-        self._db.execute("PRAGMA busy_timeout=5000")
+        # configure_rollback_journal also installs a 30s busy_timeout, which
+        # replaces the 5s this store used to set: rollback journalling
+        # serialises readers against the writer, so waiting longer is right.
+        configure_rollback_journal(self._db, db_label="message_context.db")
         self._create_schema()
         self._ensure_columns()
         self._ensure_identity_key()

@@ -39,7 +39,7 @@ class TestPresentationStoreConcurrency:
                 connection_id = id(connection)
                 assert connection.execute(
                     "PRAGMA journal_mode"
-                ).fetchone()[0].lower() == "wal"
+                ).fetchone()[0].lower() == "truncate"
                 assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
                 for round_index in range(rounds):
                     marker = f"{worker_index}-{round_index}"

@@ -13,6 +13,8 @@ import threading
 import time
 from pathlib import Path
 
+from pinky_daemon.sqlite_journal import configure_rollback_journal
+
 
 class ActivityStore:
     """SQLite-backed activity log."""
@@ -29,8 +31,7 @@ class ActivityStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=30000")
+            configure_rollback_journal(connection, db_label="activity.db")
             self._thread_local.connection = connection
         return connection
 

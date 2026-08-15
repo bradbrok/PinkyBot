@@ -33,7 +33,7 @@ class TestVoiceStoreConcurrency:
                 connection_id = id(connection)
                 assert connection.execute(
                     "PRAGMA journal_mode"
-                ).fetchone()[0].lower() == "wal"
+                ).fetchone()[0].lower() == "truncate"
                 assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
                 assert connection.row_factory is sqlite3.Row
                 for round_index in range(rounds):
