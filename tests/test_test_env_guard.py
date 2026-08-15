@@ -9,10 +9,16 @@ import sys
 from pathlib import Path
 
 import pytest
-from claude_agent_sdk import ClaudeAgentOptions
+from claude_agent_sdk import ClaudeAgentOptions, query
 from claude_agent_sdk._internal.transport.subprocess_cli import (
     SubprocessCLITransport,
 )
+
+# Bound at module collection time, BEFORE the autouse fixture patches
+# ``claude_agent_sdk.ClaudeSDKClient``. This is exactly the bypass the guard
+# must defeat: a reference captured this early holds the real class, so the
+# package-attribute patch never sees it — only the transport-level guard does.
+from claude_agent_sdk.client import ClaudeSDKClient as _CollectionTimeClientAlias
 
 import tests.conftest as suite_conftest
 
@@ -59,37 +65,43 @@ def test_runtime_env_is_deterministic():
     assert "PINKY_CONTAINER_RUNTIME" not in os.environ
 
 
-def test_transport_connect_is_blocked_via_query_path():
-    """query() and any transport-level spawn hit the guard, not just the client.
+def test_query_entrypoint_is_blocked_before_spawn():
+    """The public query() path — used by SDKRunner — hits the guard.
 
-    ``SDKRunner.run`` uses ``claude_agent_sdk.query`` which builds its own
-    ``SubprocessCLITransport``; the package-attribute ``ClaudeSDKClient`` patch
-    never sees it. The guard therefore has to cover the transport spawn itself.
+    This exercises the ACTUAL escape from the review: ``query()`` builds its own
+    ``SubprocessCLITransport`` and the package-attribute ``ClaudeSDKClient``
+    patch never sees it. Driving query() (not constructing the transport by
+    hand) locks the real path, so a permitted SDK update that reroutes query's
+    transport can't leave this test falsely green while the credential path
+    reopens.
     """
     import asyncio
 
-    transport = SubprocessCLITransport(prompt="", options=ClaudeAgentOptions())
+    async def _drive_query() -> None:
+        async for _message in query(
+            prompt="isolation probe", options=ClaudeAgentOptions()
+        ):
+            pass
 
     with pytest.raises(
         pytest.fail.Exception,
         match="blocked a real Claude CLI subprocess spawn",
     ):
-        asyncio.run(transport.connect())
+        asyncio.run(_drive_query())
 
 
 def test_preimport_client_alias_is_blocked_at_transport():
-    """A ClaudeSDKClient reference captured before the attribute patch still fails.
+    """A ClaudeSDKClient captured at collection time still fails at the transport.
 
-    Importing the class from its defining module bypasses the
-    ``claude_agent_sdk.ClaudeSDKClient`` attribute patch (this models an alias
-    bound at collection time). Construction succeeds, but ``connect`` reaches
-    the guarded transport and fails loudly instead of spawning the real CLI.
+    ``_CollectionTimeClientAlias`` was bound at module import, before the autouse
+    fixture patched ``claude_agent_sdk.ClaudeSDKClient`` — so it holds the real
+    class and bypasses the attribute patch. Construction succeeds, but
+    ``connect`` reaches the guarded transport and fails loudly instead of
+    spawning the real CLI.
     """
     import asyncio
 
-    from claude_agent_sdk.client import ClaudeSDKClient as RealClientAlias
-
-    client = RealClientAlias(ClaudeAgentOptions())
+    client = _CollectionTimeClientAlias(ClaudeAgentOptions())
     with pytest.raises(
         pytest.fail.Exception,
         match="blocked a real Claude CLI subprocess spawn",
