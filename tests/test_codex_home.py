@@ -2632,20 +2632,116 @@ async def test_tmux_app_server_first_start_with_absent_server_proceeds(
 
 
 @pytest.mark.asyncio
+async def test_tmux_has_session_accepts_exact_reported_server_absence(
+    tmp_path,
+    monkeypatch,
+):
+    """The canonical tmux no-server result positively proves no target exists."""
+    control = _TmuxControl("pinky-test-agent")
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] == "has-session":
+            return TmuxCommandResult(
+                returncode=1,
+                stdout="",
+                stderr="no server running on /tmp/tmux-1000/default\n",
+            )
+        raise AssertionError(f"unexpected tmux call: {args}")
+
+    monkeypatch.setattr(control, "_run", _tmux_run)
+
+    assert await control.has_session() is False
+    assert [call[0] for call in tmux_calls] == ["has-session"]
+
+
+@pytest.mark.parametrize(
+    ("returncode", "stdout", "stderr"),
+    [
+        (2, "", "no server running on /tmp/tmux-1000/default"),
+        (1, "unexpected", "no server running on /tmp/tmux-1000/default"),
+        (1, "", ""),
+        (1, "", "no server running on "),
+        (1, "", "tmux: no server running on /tmp/tmux-1000/default"),
+        (1, "", "no server running on /tmp/tmux-1000/default (ambiguous)"),
+        (1, "", "couldn't create directory /blocked/tmux-501 (Permission denied)"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_tmux_has_session_rejects_noncanonical_server_absence(
+    tmp_path,
+    monkeypatch,
+    returncode,
+    stdout,
+    stderr,
+):
+    """Wrong, empty, and near-match probe shapes remain loudly ambiguous."""
+    control = _TmuxControl("pinky-test-agent")
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+    ambiguous = TmuxCommandResult(
+        returncode=returncode,
+        stdout=stdout,
+        stderr=stderr,
+    )
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] in {"has-session", "list-sessions"}:
+            return ambiguous
+        raise AssertionError(f"unexpected tmux call: {args}")
+
+    monkeypatch.setattr(control, "_run", _tmux_run)
+
+    with pytest.raises(RuntimeError, match="failed without verified absence"):
+        await control.has_session()
+
+    assert [call[0] for call in tmux_calls] == ["has-session", "list-sessions"]
+
+
+@pytest.mark.asyncio
+async def test_tmux_kill_session_inherits_exact_reported_server_absence(
+    tmp_path,
+    monkeypatch,
+):
+    """Idempotent cleanup shares the canonical no-server absence proof."""
+    control = _TmuxControl("pinky-test-agent")
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
+    tmux_calls: list[tuple[str, ...]] = []
+
+    async def _tmux_run(*args, timeout=5.0, stdin_data=None):
+        tmux_calls.append(args)
+        if args[0] == "kill-session":
+            return TmuxCommandResult(
+                returncode=1,
+                stdout="",
+                stderr="no server running on /tmp/tmux-1000/default\n",
+            )
+        raise AssertionError(f"unexpected tmux call: {args}")
+
+    monkeypatch.setattr(control, "_run", _tmux_run)
+
+    result = await control.kill_session()
+
+    assert result.ok
+    assert [call[0] for call in tmux_calls] == ["kill-session"]
+
+
+@pytest.mark.asyncio
 async def test_tmux_repl_absent_server_cold_start_proceeds(
     tmp_path,
     monkeypatch,
 ):
-    """R8: a missing local socket remains positive cold-start absence."""
+    """R8: tmux's exact no-server result permits boot despite a stale socket."""
     config = StreamingSessionConfig(
         agent_name="test-agent",
         working_dir=str(tmp_path / "agent"),
     )
     tmux = _TmuxControl("pinky-test-agent")
     session = TmuxSession(config, tmux_control=tmux)
-    socket_dir = tmp_path / "tmux-empty"
-    monkeypatch.setenv("TMUX_TMPDIR", str(socket_dir))
-    monkeypatch.delenv("TMUX", raising=False)
+    _mark_tmux_server_socket(tmp_path, monkeypatch)
     tmux_calls: list[tuple[str, ...]] = []
     has_session_calls = 0
 
@@ -2658,7 +2754,7 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
                 return TmuxCommandResult(
                     returncode=1,
                     stdout="",
-                    stderr="no server running",
+                    stderr="no server running on /tmp/tmux-1000/default\n",
                 )
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         if args[0] == "new-session":
@@ -3243,10 +3339,19 @@ async def test_tmux_repl_permission_probe_refuses_before_publication(
     assert soul_store.calls == []
 
 
+@pytest.mark.parametrize(
+    "probe_stderr",
+    [
+        "couldn't create directory /blocked/tmux-501 (Permission denied)",
+        "",
+        "no server running on ",
+    ],
+)
 @pytest.mark.asyncio
 async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_effects(
     tmp_path,
     monkeypatch,
+    probe_stderr,
 ):
     """R8: an ambiguous stale-session probe must fail before spawn effects."""
     shared_home = tmp_path / "shared"
@@ -3276,10 +3381,10 @@ async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_ef
     env_build_count = 0
     publication_count = 0
     new_session_count = 0
-    permission_error = TmuxCommandResult(
+    probe_error = TmuxCommandResult(
         returncode=1,
         stdout="",
-        stderr="couldn't create directory /blocked/tmux-501 (Permission denied)",
+        stderr=probe_stderr,
     )
     real_build_env = session._build_repl_env
     real_prepare_spawn = session._prepare_tmux_spawn
@@ -3290,7 +3395,7 @@ async def test_tmux_repl_returned_has_session_error_refuses_before_spawn_side_ef
     async def _tmux_run(*args, timeout=5.0, stdin_data=None):
         tmux_calls.append(args)
         if args[0] in {"has-session", "list-sessions"}:
-            return permission_error
+            return probe_error
         raise AssertionError(f"unexpected direct tmux call: {args}")
 
     async def _tracked_new_session(**_kwargs):
