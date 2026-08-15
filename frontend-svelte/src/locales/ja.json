@@ -282,7 +282,20 @@
     "type_insight": "インサイト",
     "type_interaction_pattern": "インタラクションパターン",
     "type_label": "種類",
-    "type_project_state": "プロジェクト状態"
+    "type_project_state": "プロジェクト状態",
+    "edit_title": "記憶を編集",
+    "edit_hint": "編集すると埋め込みが無効化され、次のリフレクション時に意味検索用へ再インデックスされます。",
+    "edit_empty": "内容を空にはできません",
+    "edit_failed": "記憶の更新に失敗しました",
+    "updated": "記憶を更新しました",
+    "delete_title": "記憶を削除",
+    "delete_explain": "アーカイブは記憶を非表示にするだけで元に戻せます。完全削除は元に戻せません。",
+    "delete_archive": "アーカイブ（取り消し可能）",
+    "delete_hard": "完全に削除",
+    "delete_hard_confirm": "記憶は完全に削除されます。もう一度クリックして確認してください。",
+    "delete_failed": "記憶の削除に失敗しました",
+    "archived": "記憶をアーカイブしました",
+    "deleted": "記憶を完全に削除しました"
   },
   "chat": {
     "select_agent": "エージェントを選択してチャットを開始",

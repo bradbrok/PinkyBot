@@ -282,7 +282,20 @@
     "type_insight": "洞察",
     "type_interaction_pattern": "交互模式",
     "type_label": "类型",
-    "type_project_state": "项目状态"
+    "type_project_state": "项目状态",
+    "edit_title": "编辑记忆",
+    "edit_hint": "编辑会清除旧的向量；智能体下次反思时会重新索引该记忆以供语义检索。",
+    "edit_empty": "内容不能为空",
+    "edit_failed": "更新记忆失败",
+    "updated": "记忆已更新",
+    "delete_title": "删除记忆",
+    "delete_explain": "归档只是隐藏记忆，可以撤销。永久删除无法撤销。",
+    "delete_archive": "归档（可撤销）",
+    "delete_hard": "永久删除",
+    "delete_hard_confirm": "该记忆将被永久删除。请再次点击确认。",
+    "delete_failed": "删除记忆失败",
+    "archived": "记忆已归档",
+    "deleted": "记忆已永久删除"
   },
   "chat": {
     "select_agent": "选择一个智能体开始聊天",

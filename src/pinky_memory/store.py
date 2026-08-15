@@ -2106,13 +2106,74 @@ class ReflectionStore:
         reflection_id: str,
         content: str,
     ) -> None:
-        """Update a reflection's content."""
+        """Update a reflection's content and invalidate its stale vector.
+
+        Keyword search self-heals (the ``reflections_au`` FTS5 trigger fires on
+        a content UPDATE), but the embedding does not: leaving it in place would
+        keep semantic ``recall`` matching the text the caller just rewrote away,
+        and the vec row would return this reflection for the OLD wording.
+
+        So the embedding is cleared to ``'[]'`` and any ``reflections_vec`` row
+        dropped, which puts the reflection back in the heal-on-write backlog
+        (:meth:`get_unembedded`, #630). The next successful ``reflect()`` on
+        this store re-embeds it from the new content. Until then the reflection
+        is still fully findable by structured query and keyword search — only
+        the vector path skips it.
+        """
         with self._lock:
+            row = self._conn.execute(
+                "SELECT rowid FROM reflections WHERE id = ?", (reflection_id,)
+            ).fetchone()
+            if row is None:
+                return
             self._conn.execute(
-                "UPDATE reflections SET content = ? WHERE id = ?",
+                "UPDATE reflections SET content = ?, embedding = '[]' WHERE id = ?",
                 (content, reflection_id),
             )
+            self._drop_vec_row(row[0])
             self._conn.commit()
+
+    def _drop_vec_row(self, rowid: int) -> None:
+        """Remove a reflection's vector row. Caller holds the lock and commits.
+
+        Non-fatal on failure, mirroring :meth:`set_embedding`: a store without
+        the sqlite-vec extension (or with a vec table that never got created)
+        simply has no vector to drop.
+        """
+        if not self._vec_available or self._vec_dimensions == 0:
+            return
+        try:
+            self._conn.execute("DELETE FROM reflections_vec WHERE rowid = ?", (rowid,))
+        except sqlite3.OperationalError as exc:
+            logger.debug("vec drop failed for rowid=%s: %s", rowid, exc)
+
+    def delete_reflection(self, reflection_id: str) -> bool:
+        """Permanently delete a reflection. Returns ``True`` if a row was removed.
+
+        This is the HARD delete and it is irreversible — there is no
+        ``memory_events`` row to revert, unlike :meth:`archive_reflection`,
+        which is the reversible soft-delete and should stay the default for
+        anything user-facing.
+
+        Removes the reflection, its vector row, and its links in both
+        directions (``reflection_links`` has no FK cascade, so orphan rows
+        would otherwise survive and surface in :meth:`get_links` as dangling
+        neighbours). The FTS5 row is dropped by the ``reflections_ad`` trigger.
+        """
+        with self._lock:
+            row = self._conn.execute(
+                "SELECT rowid FROM reflections WHERE id = ?", (reflection_id,)
+            ).fetchone()
+            if row is None:
+                return False
+            self._drop_vec_row(row[0])
+            self._conn.execute(
+                "DELETE FROM reflection_links WHERE source_id = ? OR target_id = ?",
+                (reflection_id, reflection_id),
+            )
+            self._conn.execute("DELETE FROM reflections WHERE id = ?", (reflection_id,))
+            self._conn.commit()
+            return True
 
     # ── Spaced review methods ──
 
