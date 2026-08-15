@@ -1113,7 +1113,9 @@ class TestAgentIsolationScoping:
                      working_dir=str(tmp_path / "sasha"))
         return TestClient(app), path
 
-    def test_isolated_same_group_peer_message_allowed(self, monkeypatch, tmp_path):
+    def test_isolated_same_group_peer_message_allowed(
+        self, monkeypatch, tmp_path, stub_sdk_transport
+    ):
         # geordi → chekov /message, shared group → isolation guard lets it
         # through (handler runs; the guard's own signal is "not 403").
         client, path = self._make_client_grouped(monkeypatch, tmp_path)

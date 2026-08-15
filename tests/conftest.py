@@ -211,3 +211,29 @@ def _auto_cookie_test_client(request, monkeypatch, _isolate_test_env):
 
     monkeypatch.setattr(TestClient, "__init__", patched_init)
     yield
+
+
+@pytest.fixture
+def stub_sdk_transport(monkeypatch):
+    """Allow incidental streaming-session boots without a real SDK client.
+
+    For tests whose subject is elsewhere (auth scoping, buzz startup) but whose
+    API calls boot sessions as a side effect. The stub permits construction —
+    satisfying the transport guard — and then fails the connect exactly like a
+    credential-less real client would, so the session lands in the same
+    boot_failed state these tests always ran against.
+    """
+    import claude_agent_sdk
+
+    class StubbedSDKClient:
+        def __init__(self, options):
+            self.options = options
+
+        async def connect(self):
+            raise RuntimeError("stub_sdk_transport: no real transport in tests")
+
+        async def disconnect(self):
+            return None
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", StubbedSDKClient)
+    yield
