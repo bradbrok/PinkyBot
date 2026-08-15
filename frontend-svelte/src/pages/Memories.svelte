@@ -81,6 +81,67 @@
     let modalTitle = '';
     let modalBody = '';
 
+    // Edit / delete (#463)
+    let editOpen = false;
+    let editTarget = null;
+    let editContent = '';
+    let editSaving = false;
+    let deleteOpen = false;
+    let deleteTarget = null;
+    let deleteHardStep = false;   // second confirmation, only for the hard delete
+    let deleteBusy = false;
+
+    function memId(m) { return m.id || m._id; }
+
+    function openEdit(m) {
+        editTarget = m;
+        editContent = m.content || '';
+        editOpen = true;
+    }
+
+    async function saveEdit() {
+        if (!editTarget || editSaving) return;
+        const content = editContent.trim();
+        if (!content) { toast($_('memories.edit_empty'), 'error'); return; }
+        const id = memId(editTarget);
+        editSaving = true;
+        try {
+            const updated = await api('PATCH', `/agents/${currentAgent}/memories/${id}`, { content });
+            memories = memories.map(m => (memId(m) === id ? { ...m, ...updated } : m));
+            toast($_('memories.updated'));
+            editOpen = false;
+        } catch (e) { toast(`${$_('memories.edit_failed')}: ${e.message}`, 'error'); }
+        finally { editSaving = false; }
+    }
+
+    function openDelete(m) {
+        deleteTarget = m;
+        deleteHardStep = false;
+        deleteOpen = true;
+    }
+
+    async function confirmDelete(hard) {
+        if (!deleteTarget || deleteBusy) return;
+        // The permanent delete is the one that cannot be walked back, so it
+        // costs a second, explicit click.
+        if (hard && !deleteHardStep) { deleteHardStep = true; return; }
+        const id = memId(deleteTarget);
+        deleteBusy = true;
+        try {
+            await api('DELETE', `/agents/${currentAgent}/memories/${id}${hard ? '?hard=true' : ''}`);
+            if (hard || activeOnly) {
+                // Gone, or no longer matching the active-only filter.
+                memories = memories.filter(m => memId(m) !== id);
+                totalCount = Math.max(0, totalCount - 1);
+            } else {
+                memories = memories.map(m => (memId(m) === id ? { ...m, active: false } : m));
+            }
+            toast(hard ? $_('memories.deleted') : $_('memories.archived'));
+            deleteOpen = false;
+        } catch (e) { toast(`${$_('memories.delete_failed')}: ${e.message}`, 'error'); }
+        finally { deleteBusy = false; }
+    }
+
     async function init() {
         try {
             const agents = await api('GET', '/agents');
@@ -647,7 +708,11 @@
                             <span>{m.access_count || 0} views</span>
                             <span>w: {m.weight != null ? m.weight.toFixed(2) : '--'}</span>
                         </div>
-                        {#if !isActive}<span style="color:var(--red)">INACTIVE</span>{/if}
+                        <div class="card-actions">
+                            {#if !isActive}<span style="color:var(--red)">INACTIVE</span>{/if}
+                            <button class="card-action" title={$_('common.edit')} aria-label={$_('common.edit')} on:click|stopPropagation={() => openEdit(m)}>✎</button>
+                            <button class="card-action danger" title={$_('common.delete')} aria-label={$_('common.delete')} on:click|stopPropagation={() => openDelete(m)}>✕</button>
+                        </div>
                     </div>
                 </div>
             {/each}
@@ -906,6 +971,35 @@
     {@html modalBody}
 </Modal>
 
+<!-- Edit memory (#463) -->
+<Modal bind:show={editOpen} title={$_('memories.edit_title')} width="640px" maxWidth="640px">
+    <textarea class="edit-textarea" bind:value={editContent} rows="10" placeholder={$_('memories.edit_title')}></textarea>
+    <div class="edit-hint">{$_('memories.edit_hint')}</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => editOpen = false} disabled={editSaving}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveEdit} disabled={editSaving || !editContent.trim()}>
+            {editSaving ? $_('common.saving') : $_('common.save')}
+        </button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Delete memory (#463) -->
+<Modal bind:show={deleteOpen} title={$_('memories.delete_title')} width="560px" maxWidth="560px">
+    {#if deleteTarget}
+        <div class="delete-preview">{(deleteTarget.content || '').substring(0, 300)}</div>
+    {/if}
+    <div class="edit-hint">{deleteHardStep ? $_('memories.delete_hard_confirm') : $_('memories.delete_explain')}</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => deleteOpen = false} disabled={deleteBusy}>{$_('common.cancel')}</button>
+        {#if !deleteHardStep}
+            <button class="btn" on:click={() => confirmDelete(true)} disabled={deleteBusy}>{$_('memories.delete_hard')}</button>
+            <button class="btn btn-primary" on:click={() => confirmDelete(false)} disabled={deleteBusy}>{$_('memories.delete_archive')}</button>
+        {:else}
+            <button class="btn btn-danger" on:click={() => confirmDelete(true)} disabled={deleteBusy}>{$_('memories.delete_hard')}</button>
+        {/if}
+    </svelte:fragment>
+</Modal>
+
 <style>
     .controls { display: flex; gap: 1rem; flex-wrap: wrap; align-items: center; margin-bottom: 1.5rem; }
     .controls-group { display: flex; gap: 0.5rem; align-items: center; }
@@ -953,6 +1047,13 @@
     .card-tag.source { background: var(--tone-warning-bg); color: var(--tone-warning-text); }
     .card-footer { display: flex; justify-content: space-between; align-items: center; font-family: var(--font-grotesk); font-size: 0.65rem; color: var(--text-muted); padding-top: 0.6rem; }
     .card-footer-left { display: flex; gap: 1rem; }
+    .card-actions { display: flex; gap: 0.35rem; align-items: center; }
+    .card-action { border: none; background: transparent; cursor: pointer; color: var(--text-muted); font-size: 0.85rem; line-height: 1; padding: 0.2rem 0.35rem; border-radius: var(--radius-md); }
+    .card-action:hover { background: var(--surface-3); color: var(--text); }
+    .card-action.danger:hover { background: var(--tone-error-bg); color: var(--tone-error-text); }
+    .edit-textarea { width: 100%; box-sizing: border-box; font-family: var(--font-body); font-size: 0.85rem; line-height: 1.6; padding: 0.7rem; border: 1px solid var(--border); border-radius: var(--radius-md); background: var(--surface-1); color: var(--text); resize: vertical; }
+    .edit-hint { font-family: var(--font-grotesk); font-size: 0.7rem; color: var(--text-muted); margin-top: 0.6rem; }
+    .delete-preview { font-family: var(--font-body); font-size: 0.85rem; line-height: 1.6; white-space: pre-wrap; padding: 0.7rem; background: var(--surface-2); border-radius: var(--radius-md); }
     .pagination { display: flex; justify-content: center; gap: 0.5rem; margin-top: 1.5rem; }
 
     :global(.detail-field) { margin-bottom: 1rem; }

@@ -282,7 +282,20 @@
     "type_insight": "Perspectiva",
     "type_interaction_pattern": "Patrón de interacción",
     "type_label": "Tipo",
-    "type_project_state": "Estado del proyecto"
+    "type_project_state": "Estado del proyecto",
+    "edit_title": "Editar memoria",
+    "edit_hint": "Al editar se invalida el embedding; la búsqueda semántica reindexará esta memoria en la próxima reflexión del agente.",
+    "edit_empty": "El contenido no puede estar vacío",
+    "edit_failed": "No se pudo actualizar la memoria",
+    "updated": "Memoria actualizada",
+    "delete_title": "Eliminar memoria",
+    "delete_explain": "Archivar oculta la memoria y se puede deshacer. La eliminación permanente no.",
+    "delete_archive": "Archivar (reversible)",
+    "delete_hard": "Eliminar permanentemente",
+    "delete_hard_confirm": "Esto elimina la memoria para siempre. Haz clic de nuevo para confirmar.",
+    "delete_failed": "No se pudo eliminar la memoria",
+    "archived": "Memoria archivada",
+    "deleted": "Memoria eliminada permanentemente"
   },
   "chat": {
     "select_agent": "Selecciona un agente para empezar a chatear",
