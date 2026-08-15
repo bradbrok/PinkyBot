@@ -1931,9 +1931,12 @@ class TestScheduler:
             "oleg", "* * * * *", name="second", prompt="second prompt"
         )
 
-        busy = False
         delivered: list[str] = []
         events: list[str] = []
+        prompts = ("first prompt", "second prompt")
+        started = {prompt: asyncio.Event() for prompt in prompts}
+        release = {prompt: asyncio.Event() for prompt in prompts}
+        confirmed = {prompt: asyncio.Event() for prompt in prompts}
 
         class Activity:
             def log(self, agent_name, event_type, summary):
@@ -1941,29 +1944,35 @@ class TestScheduler:
                 events.append(event_type)
 
         async def wake_cb(agent_name, session_id, prompt):
-            nonlocal busy
             del agent_name, session_id
-            receipt = asyncio.get_running_loop().create_future()
-            if busy:
-                receipt.set_result(False)
-                return receipt
-
-            busy = True
-
-            def confirm_delivery():
-                nonlocal busy
-                delivered.append(prompt)
-                busy = False
-                receipt.set_result(True)
-
-            asyncio.get_running_loop().call_soon(confirm_delivery)
-            return receipt
+            started[prompt].set()
+            await release[prompt].wait()
+            delivered.append(prompt)
+            confirmed[prompt].set()
+            return True
 
         scheduler = AgentScheduler(
             registry, wake_callback=wake_cb, activity=Activity()
         )
         await scheduler._check_schedules(time.time())
-        await asyncio.sleep(0.05)
+
+        delivery_tasks = tuple(scheduler._schedule_delivery_tasks)
+        assert len(delivery_tasks) == 1
+        try:
+            await asyncio.wait_for(started["first prompt"].wait(), timeout=2)
+            assert not started["second prompt"].is_set()
+
+            release["first prompt"].set()
+            await asyncio.wait_for(started["second prompt"].wait(), timeout=2)
+            assert confirmed["first prompt"].is_set()
+            assert delivered == ["first prompt"]
+
+            release["second prompt"].set()
+            await asyncio.wait_for(confirmed["second prompt"].wait(), timeout=2)
+        finally:
+            for gate in release.values():
+                gate.set()
+            await asyncio.gather(*delivery_tasks, return_exceptions=True)
 
         assert delivered == ["first prompt", "second prompt"]
         schedules = registry.get_schedules("oleg")
