@@ -424,6 +424,15 @@ class AgentScheduler:
         # Used by _check_heartbeats to cap how often we ping the heartbeat_callback
         # for a stuck agent (avoid thrashing on a persistently-broken session).
         self._resurrection_attempts: dict[str, list[float]] = {}
+        # In-process dedup for replayed wakes during this startup session.
+        # Prevents duplicate delivery when daemon restarts before receipt
+        # persists to DB: (schedule_id, fired_at) tuples already delivered.
+        self._replayed_wakes_this_startup: set[tuple[int, float]] = set()
+        # Throttle per pending wake to prevent replay cycling: pending_wake_id -> last_replay_attempt_time.
+        # When _drain_outbox_if_pending() is called repeatedly (e.g. on each heartbeat),
+        # this prevents creating new replay tasks for the same pending wake within 10 minutes.
+        # Addresses bug: undelivered wakes cycling 4x in 4h due to repeated replay attempts.
+        self._pending_wake_replay_throttle: dict[int, float] = {}
 
     async def start(self) -> None:
         """Start the scheduler background loop."""
@@ -2260,12 +2269,17 @@ class AgentScheduler:
         pending only through the bounded attempt cap, preventing one
         never-confirming row from spawning replay tasks forever while preserving
         the proven-live-only drain policy.
+
+        Throttled per pending wake to prevent cycling: if a wake was replayed
+        within the last 10 minutes, skip replay to avoid creating multiple retry
+        cycles on each heartbeat (see #escalation: schedule #3 repeating 4x in 4h).
         """
         existing = self._pending_replay_tasks.get(agent_name)
         if existing is not None and not existing.done():
             return
         try:
-            if not self._registry.list_pending_schedule_wakes(agent_name):
+            pendings = self._registry.list_pending_schedule_wakes(agent_name)
+            if not pendings:
                 return
         except Exception as exc:
             _log(
@@ -2273,6 +2287,20 @@ class AgentScheduler:
                 f"{type(exc).__name__}: {exc}"
             )
             return
+
+        # Throttle check: prevent replaying the same pending wake within 10 minutes.
+        # If the oldest pending wake was recently replayed, skip this drain cycle.
+        _PENDING_WAKE_REPLAY_THROTTLE_SECONDS = 600  # 10 minutes
+        now = time.time()
+        oldest_wake = pendings[0]
+        last_attempt = self._pending_wake_replay_throttle.get(oldest_wake.id)
+        if last_attempt is not None and (now - last_attempt) < _PENDING_WAKE_REPLAY_THROTTLE_SECONDS:
+            return
+
+        # Update throttle for this wake and all others being replayed
+        for wake in pendings:
+            self._pending_wake_replay_throttle[wake.id] = now
+
         _log(
             f"scheduler: proven-live agent '{agent_name}' has a stranded wake "
             "outbox; triggering durable replay"
