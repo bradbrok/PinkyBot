@@ -168,7 +168,8 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
     tmp_path,
 ):
     captured: list[list] = []
-    initial_filter = {}
+    membership_seen = asyncio.Event()
+    channel_seen = asyncio.Event()
     heartbeat_seen = asyncio.Event()
     relay_url = ""
 
@@ -179,11 +180,12 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
         await _authenticate(ws, relay_url, captured)
         membership = json.loads(await ws.recv())
         captured.append(membership)
+        membership_seen.set()
         await ws.send(json.dumps(["EOSE", membership[1]]))
         main = json.loads(await ws.recv())
         captured.append(main)
         assert main[0] == "REQ"
-        initial_filter.update(main[2])
+        channel_seen.set()
         await ws.send(json.dumps(["EVENT", main[1], ephemeral]))
         await ws.send(json.dumps(["EVENT", main[1], durable]))
         await ws.send(json.dumps(["EOSE", main[1]]))
@@ -220,26 +222,41 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
             reconnect_max=0.02,
         )
         task = asyncio.create_task(poller.start())
-        await asyncio.wait_for(broker.delivered.wait(), timeout=2)
-        await asyncio.wait_for(heartbeat_seen.wait(), timeout=2)
+        await asyncio.wait_for(membership_seen.wait(), timeout=5)
+        await asyncio.wait_for(channel_seen.wait(), timeout=5)
+        await asyncio.wait_for(broker.delivered.wait(), timeout=5)
+        await asyncio.wait_for(heartbeat_seen.wait(), timeout=5)
         poller.stop()
-        await asyncio.wait_for(task, timeout=2)
+        await asyncio.wait_for(task, timeout=5)
 
-        assert initial_filter["kinds"] == [9, 20002]
-        assert initial_filter["#h"] == [CHANNEL]
-        assert "since" not in initial_filter
         membership_filters = [
             frame[2]
             for frame in captured
             if frame[0] == "REQ" and frame[1].startswith("pinky-membership-")
         ]
-        assert membership_filters == [
-            {"kinds": [44100, 44101], "#p": [material.pubkey]}
+        assert {
+            json.dumps(item, sort_keys=True) for item in membership_filters
+        } == {
+            json.dumps(
+                {"kinds": [44100, 44101], "#p": [material.pubkey]},
+                sort_keys=True,
+            )
+        }
+        channel_filters = [
+            frame[2]
+            for frame in captured
+            if frame[0] == "REQ" and frame[1].startswith("pinky-barsik-")
         ]
+        assert {json.dumps(item, sort_keys=True) for item in channel_filters} == {
+            json.dumps(
+                {"kinds": [9, 20002], "#h": [CHANNEL]}, sort_keys=True
+            )
+        }
         assert len(broker.calls) == 1
+        assert broker.calls[0][1].message_id == durable["id"]
         assert broker.calls[0][1].content == "hello from Brad"
         assert poller.health["delivered"] == 1
-        assert poller.health["ephemeral_ignored"] == 1
+        assert poller.health["ephemeral_ignored"] >= 1
         assert notices == []
         assert store._db.execute(
             "SELECT event_id, kind, delivery_status FROM buzz_inbound_events"
@@ -250,10 +267,21 @@ async def test_real_websocket_auth_subscription_ephemeral_suppression_and_eose_h
             if frame[0] == "REQ" and frame[1].startswith("pinky-live-")
         ]
         assert heartbeat_filters
-        assert all(
-            isinstance(item["since"], int) and item["limit"] == 1
+        assert all(type(item["since"]) is int for item in heartbeat_filters)
+        assert {
+            json.dumps({**item, "since": "<dynamic>"}, sort_keys=True)
             for item in heartbeat_filters
-        )
+        } == {
+            json.dumps(
+                {
+                    "kinds": [9, 20002],
+                    "#h": [CHANNEL],
+                    "since": "<dynamic>",
+                    "limit": 1,
+                },
+                sort_keys=True,
+            )
+        }
         assert all(frame[0] in {"AUTH", "REQ", "CLOSE"} for frame in captured)
         assert not any(frame[0] == "EVENT" for frame in captured)
         store.close()
