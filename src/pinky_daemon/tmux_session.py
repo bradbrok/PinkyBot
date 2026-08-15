@@ -1380,6 +1380,30 @@ class _QueuedTurn:
     submission_receipt: asyncio.Future[bool] | None = None
 
 
+@dataclass(frozen=True)
+class _QueuedPromptEvidence:
+    """One native queue occurrence plus optional cleanup ownership.
+
+    ``retired`` is a tombstone, not permission to delete the occurrence. A
+    contentless dequeue must consume the same FIFO slot Claude recorded at
+    enqueue time even if a racing Stop has already retired that turn's meta.
+    """
+
+    content: str | None
+    turn: _QueuedTurn | None
+    retired: bool = False
+
+
+@dataclass(frozen=True)
+class _DequeuedPromptEvidence:
+    """Content proof carried from a native queue dequeue to its user row."""
+
+    content: str | None
+    accepted_at_dequeue: bool
+    turn: _QueuedTurn | None
+    retired: bool = False
+
+
 @dataclass
 class _WakeContextReloadGuard:
     """Short-lived fence joining one failed wake to its broker fallback."""
@@ -1807,10 +1831,12 @@ class TmuxSession(TransportReplacementMixin):
         self._scheduler_delivery_lock = asyncio.Lock()
         # Turns remain here after paste until their exact transcript receipt
         # resolves. Raw queue-operation dequeue rows carry no content, so the
-        # companion deque preserves enqueue ordering across all pane turns.
+        # companion deques preserve enqueue content ordering across all pane
+        # turns. Exact-content tickets survive a racing Stop that retires the local
+        # turn object before Claude emits its dequeue row (#1098).
         self._scheduler_pending_turns: list[_QueuedTurn] = []
-        self._pane_queue_operations: deque[_QueuedTurn | None] = deque()
-        self._pane_dequeued_turns: deque[_QueuedTurn | None] = deque()
+        self._pane_queue_operations: deque[_QueuedPromptEvidence] = deque()
+        self._pane_dequeued_turns: deque[_DequeuedPromptEvidence] = deque()
         # Dashboard terminal requests start immediately and may arrive out of
         # order. Serialize pane input and remember each client's acknowledged
         # sequence so cumulative retries never duplicate text or Enter.
@@ -5797,16 +5823,14 @@ class TmuxSession(TransportReplacementMixin):
             return
 
         entry = self._inflight_metas.popleft()
-        self._pane_queue_operations = deque(
-            queued
-            for queued in self._pane_queue_operations
-            if queued is not entry.turn
-        )
-        self._pane_dequeued_turns = deque(
-            dequeued
-            for dequeued in self._pane_dequeued_turns
-            if dequeued is not entry.turn
-        )
+        # A racing prompt can make this Stop retire a turn's local FIFO meta
+        # before Claude emits that prompt's contentless dequeue row. Preserve
+        # every native occurrence until dequeue: unresolved receipt owners stay
+        # live, while ordinary/already-accepted owners become tombstones. Deleting
+        # either kind here shifts every later occurrence and can make an equal
+        # scheduler prompt consume the wrong ticket.
+        if not self._turn_has_unresolved_acceptance(entry.turn):
+            self._retire_acceptance_evidence(entry.turn)
         if (
             self._fresh_context_respawn_grace_until
             and self._fresh_context_respawn_epoch
@@ -7985,6 +8009,13 @@ class TmuxSession(TransportReplacementMixin):
             )
         ):
             return True
+        # An observed physical paste with an unresolved exact receipt is live
+        # state. It outranks a newer idle row: idle may clear stale accepted
+        # metas, but it cannot make an unreceipted paste safe to overlap or
+        # replay. Include occurrence tickets because a racing Stop can retire
+        # the turn from the ordinary inflight collections before dequeue.
+        if self._has_unresolved_pasted_acceptance():
+            return True
         live_status_fn = getattr(self._config, "live_status_fn", None)
         if live_status_fn is None:
             return True
@@ -8017,6 +8048,19 @@ class TmuxSession(TransportReplacementMixin):
             ):
                 return True
         return False
+
+    def scheduler_drain_busy(self) -> bool:
+        """Fresh conservative pane verdict for the periodic wake drain.
+
+        Receipt waits deliberately use the wider watchdog liveness window.
+        The drain instead asks whether pane FIFO/tool state or a live status
+        newer than every paste still blocks a scheduler turn right now. This
+        lets an explicit idle boundary override monitor writes attached to a
+        stale inflight meta without weakening teardown protection (#1098).
+        """
+        if self.state != SessionState.CONNECTED:
+            return False
+        return self._scheduler_pane_busy()
 
     @staticmethod
     def _transcript_user_text(entry: dict) -> str | None:
@@ -8053,11 +8097,17 @@ class TmuxSession(TransportReplacementMixin):
         self, prompt: str, *, for_enqueue: bool = False
     ) -> _QueuedTurn | None:
         """Match an exact transcript prompt to its oldest pending pane turn."""
+        return self._match_acceptance_content(prompt, for_enqueue=for_enqueue)
+
+    def _match_acceptance_content(
+        self, content: str, *, for_enqueue: bool = False
+    ) -> _QueuedTurn | None:
+        """Match exact content even when its original turn meta was retired."""
         for turn in self._acceptance_candidates():
             if (
                 not turn.pane_delivery_started
                 or turn.transport_accepted
-                or turn.prompt != prompt
+                or turn.prompt != content
                 or (
                     turn.submission_receipt is not None
                     and turn.submission_receipt.done()
@@ -8070,10 +8120,97 @@ class TmuxSession(TransportReplacementMixin):
             return turn
         return None
 
-    def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> None:
-        """Resolve exact receipts only on observed pane acceptance."""
-        if turn is None or turn.transport_accepted:
+    @staticmethod
+    def _turn_has_unresolved_acceptance(turn: _QueuedTurn) -> bool:
+        """Whether a consumed-content ticket must survive a racing Stop."""
+        if turn.transport_accepted:
+            return False
+        return any(
+            receipt is not None and not receipt.done()
+            for receipt in (turn.scheduler_delivery, turn.submission_receipt)
+        )
+
+    def _has_unresolved_pasted_acceptance(self) -> bool:
+        """Whether any live pane occurrence owns an unresolved exact receipt."""
+        candidates = self._acceptance_candidates()
+        candidates.extend(
+            evidence.turn
+            for evidence in self._pane_queue_operations
+            if not evidence.retired and evidence.turn is not None
+        )
+        candidates.extend(
+            evidence.turn
+            for evidence in self._pane_dequeued_turns
+            if not evidence.retired and evidence.turn is not None
+        )
+        seen: set[int] = set()
+        for turn in candidates:
+            identity = id(turn)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if (
+                turn.pane_delivery_started
+                and self._turn_has_unresolved_acceptance(turn)
+            ):
+                return True
+        return False
+
+    def _retire_acceptance_evidence(self, turn: _QueuedTurn) -> None:
+        """Tombstone this occurrence without shifting the native FIFO ledger."""
+        for index, evidence in enumerate(self._pane_queue_operations):
+            if evidence.turn is turn:
+                self._pane_queue_operations[index] = _QueuedPromptEvidence(
+                    evidence.content,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+        for index, evidence in enumerate(self._pane_dequeued_turns):
+            if evidence.turn is turn:
+                self._pane_dequeued_turns[index] = _DequeuedPromptEvidence(
+                    evidence.content,
+                    evidence.accepted_at_dequeue,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+        if turn.pane_queue_enqueued:
+            # A matched ticket no longer present was already consumed. Never
+            # tombstone a later equal-content occurrence owned by another turn.
             return
+        for index, evidence in enumerate(self._pane_queue_operations):
+            if (
+                not evidence.retired
+                and evidence.turn is None
+                and evidence.content == turn.prompt
+            ):
+                self._pane_queue_operations[index] = _QueuedPromptEvidence(
+                    evidence.content,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+        for index, evidence in enumerate(self._pane_dequeued_turns):
+            if (
+                not evidence.retired
+                and evidence.turn is None
+                and evidence.content == turn.prompt
+            ):
+                self._pane_dequeued_turns[index] = _DequeuedPromptEvidence(
+                    evidence.content,
+                    evidence.accepted_at_dequeue,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+
+    def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
+        """Resolve exact receipts only on observed pane acceptance."""
+        if turn is None:
+            return False
+        if turn.transport_accepted:
+            return True
         # A fast wake can write user+assistant+Stop rows before paste_text's
         # final tmux subprocess coroutine resumes. Reserve its FIFO metadata
         # synchronously on the exact user/dequeue row so the same-read Stop
@@ -8104,6 +8241,7 @@ class TmuxSession(TransportReplacementMixin):
         for receipt in (turn.scheduler_delivery, turn.submission_receipt):
             if receipt is not None and not receipt.done():
                 receipt.set_result(True)
+        return True
 
     def _wake_context_reload_guard_for(
         self, turn: _QueuedTurn
@@ -8129,17 +8267,36 @@ class TmuxSession(TransportReplacementMixin):
             if operation == "enqueue":
                 content = entry.get("content")
                 turn = (
-                    self._match_acceptance_turn(content, for_enqueue=True)
+                    self._match_acceptance_content(content, for_enqueue=True)
                     if isinstance(content, str)
                     else None
                 )
                 if turn is not None:
                     turn.pane_queue_enqueued = True
-                self._pane_queue_operations.append(turn)
+                self._pane_queue_operations.append(
+                    _QueuedPromptEvidence(
+                        content if isinstance(content, str) else None,
+                        turn,
+                    )
+                )
             elif operation == "dequeue" and self._pane_queue_operations:
-                turn = self._pane_queue_operations.popleft()
-                self._pane_dequeued_turns.append(turn)
-                self._mark_transport_accepted(turn)
+                queued_evidence = self._pane_queue_operations.popleft()
+                content = queued_evidence.content
+                # Dequeue rows are contentless. Their identity is the exact FIFO
+                # occurrence captured at enqueue, never a fresh content match:
+                # rematching after Stop can jump to a later equal scheduler row.
+                turn = (
+                    None if queued_evidence.retired else queued_evidence.turn
+                )
+                accepted = self._mark_transport_accepted(turn)
+                self._pane_dequeued_turns.append(
+                    _DequeuedPromptEvidence(
+                        content,
+                        accepted,
+                        queued_evidence.turn,
+                        queued_evidence.retired,
+                    )
+                )
             return
 
         if entry_type == "user":
@@ -8157,14 +8314,25 @@ class TmuxSession(TransportReplacementMixin):
                         "for original orientation wake; remaining broker "
                         "escalation will be fenced"
                     )
-                if self._pane_dequeued_turns:
-                    dequeued = self._pane_dequeued_turns[0]
-                    if dequeued is None or dequeued.prompt == prompt:
-                        self._pane_dequeued_turns.popleft()
-                        self._mark_transport_accepted(dequeued)
-                        return
+                matching_dequeue = next(
+                    (
+                        index
+                        for index, evidence in enumerate(
+                            self._pane_dequeued_turns
+                        )
+                        if evidence.content is None
+                        or evidence.content == prompt
+                    ),
+                    None,
+                )
+                if matching_dequeue is not None:
+                    evidence = self._pane_dequeued_turns[matching_dequeue]
+                    del self._pane_dequeued_turns[matching_dequeue]
+                    if not evidence.accepted_at_dequeue and not evidence.retired:
+                        self._mark_transport_accepted(evidence.turn)
+                    return
                 self._mark_transport_accepted(
-                    self._match_acceptance_turn(prompt)
+                    self._match_acceptance_content(prompt)
                 )
 
     @staticmethod
@@ -8199,16 +8367,10 @@ class TmuxSession(TransportReplacementMixin):
             if removed_index == 0:
                 self._inflight_pane_ext_anchor = None
                 self._head_started_at = time.time() if entries else None
-        self._pane_queue_operations = deque(
-            queued
-            for queued in self._pane_queue_operations
-            if queued is not turn
-        )
-        self._pane_dequeued_turns = deque(
-            dequeued
-            for dequeued in self._pane_dequeued_turns
-            if dequeued is not turn
-        )
+        # Receipt exhaustion retires ownership but cannot delete the physical
+        # occurrence: a late dequeue still has to consume this FIFO slot before
+        # any later equal-content turn can become eligible.
+        self._retire_acceptance_evidence(turn)
         turn.pane_delivery_recorded = False
 
     @staticmethod

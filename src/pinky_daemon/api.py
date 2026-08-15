@@ -11466,6 +11466,16 @@ npm run build</pre>
             or stats.get("inflight_active") is True
         )
 
+    def _scheduler_drain_busy(agent_name: str) -> bool:
+        """Recheck current pane state for the periodic durable-outbox drain."""
+        ss = broker._get_streaming_session(agent_name)
+        if ss is None:
+            return False
+        probe = getattr(ss, "scheduler_drain_busy", None)
+        if not callable(probe):
+            return _scheduler_delivery_busy(agent_name)
+        return probe() is True
+
     def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
         """Per-turn execution state: is this wake pasted with an open receipt?
 
@@ -11654,6 +11664,7 @@ npm run build</pre>
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
         delivery_busy_fn=_scheduler_delivery_busy,
+        delivery_drain_busy_fn=_scheduler_drain_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
         delivery_queued_fn=_scheduler_wake_queued,
         delivery_cancel_queued_fn=_cancel_scheduler_wake,

@@ -1835,6 +1835,41 @@ class TestScheduler:
         assert repr(raw_value) in error_log
         assert "using 3600s" in error_log
 
+    @pytest.mark.parametrize(
+        ("env_name", "attribute", "expected"),
+        [
+            (
+                "PINKY_SCHEDULE_RECEIPT_EXTENSION_ATTEMPT_CAP",
+                "_receipt_extension_attempt_cap",
+                3,
+            ),
+            (
+                "PINKY_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP",
+                "_outbox_drain_extension_attempt_cap",
+                30,
+            ),
+            (
+                "PINKY_OUTBOX_DRAIN_EXTENSION_MAX_AGE_SEC",
+                "_outbox_drain_extension_max_age_sec",
+                1_800.0,
+            ),
+            (
+                "PINKY_OUTBOX_DRAIN_PROBE_TIMEOUT_SEC",
+                "_outbox_drain_probe_timeout_sec",
+                5.0,
+            ),
+        ],
+    )
+    def test_invalid_new_bound_env_uses_safe_default(
+        self, registry, monkeypatch, capsys, env_name, attribute, expected
+    ):
+        monkeypatch.setenv(env_name, "0")
+
+        scheduler = AgentScheduler(registry)
+
+        assert getattr(scheduler, attribute) == expected
+        assert env_name in capsys.readouterr().err
+
     def test_init(self, registry):
         scheduler = AgentScheduler(registry)
         assert scheduler.running is False
@@ -2546,6 +2581,107 @@ class TestScheduler:
         assert registry.list_pending_schedule_wakes("oleg") == []
         assert "busy-not-wedged; extending" in capsys.readouterr().err
 
+    @pytest.mark.parametrize(
+        ("attempt_cap", "max_age", "expected_bound"),
+        [
+            (2, 10.0, "attempt cap"),
+            (100, 0.025, "wall-clock cap"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_receipt_extension_bounds_abandon_and_alert_once(
+        self,
+        registry,
+        capsys,
+        attempt_cap,
+        max_age,
+        expected_bound,
+    ):
+        """#1098: positive busy evidence extends generously but never forever."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="bounded busy", prompt="run once"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        alerts: list[tuple[str, str]] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id, prompt
+            return receipt
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_inflight_fn=lambda agent_name, prompt: True,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_attempt_cap=attempt_cap,
+            receipt_extension_max_age_sec=max_age,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.ledger_state == "abandoned"
+        assert not receipt.cancelled()
+        assert len(alerts) == 1
+        assert alerts[0][0] == "oleg"
+        assert "RECEIPT EXTENSION EXPIRED" in alerts[0][1]
+        assert expected_bound in alerts[0][1]
+        assert "RECEIPT_EXTENSION_EXPIRED" in capsys.readouterr().err
+
+        await scheduler.stop()
+
+    @pytest.mark.asyncio
+    async def test_receipt_extension_expiry_alert_dedupes_exact_fire(
+        self, registry, capsys
+    ):
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="deduped alert", prompt="run once"
+        )
+        fired_at = time.time()
+        schedule.last_run = fired_at
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="oleg",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        alerts: list[str] = []
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            owner_notify_callback=owner_notify,
+        )
+        for _ in range(2):
+            scheduler._alert_receipt_extension_expired(
+                schedule,
+                age=1_800.0,
+                bound_reason="attempt cap",
+                wait_attempts=3,
+            )
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        assert len(alerts) == 1
+        assert "owner already alerted" in capsys.readouterr().err
+
     @pytest.mark.asyncio
     async def test_pasted_wake_extends_timeout_instead_of_cancelling(
         self, registry, capsys
@@ -2584,6 +2720,7 @@ class TestScheduler:
             delivery_busy_fn=lambda agent_name: False,  # liveness blip
             delivery_inflight_fn=inflight_fn,
             schedule_delivery_timeout=0.01,
+            receipt_extension_attempt_cap=10,
         )
         await scheduler._deliver_schedule(schedule)
 
@@ -2591,6 +2728,65 @@ class TestScheduler:
         assert registry.get_schedules("oleg")[0].last_delivered > 0
         assert registry.list_pending_schedule_wakes("oleg") == []
         assert "already pasted to the transport" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_pasted_wake_expiry_abandons_without_replay_then_late_accepts(
+        self, registry
+    ):
+        """A physical paste has one authority after expiry, never a replay."""
+        registry.register("oleg")
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="single authority", prompt="run once"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        submissions = 0
+        alerts: list[str] = []
+
+        async def wake_cb(agent_name, session_id, prompt):
+            nonlocal submissions
+            del agent_name, session_id, prompt
+            submissions += 1
+            return receipt
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: False,
+            delivery_inflight_fn=lambda agent_name, prompt: True,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_attempt_cap=2,
+            receipt_extension_max_age_sec=1.0,
+        )
+
+        await scheduler._deliver_schedule(schedule)
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.ledger_state == "abandoned"
+        assert not receipt.cancelled()
+        assert len(scheduler._detached_receipt_tasks) == 1
+        assert submissions == 1
+        assert len(alerts) == 1
+
+        await scheduler._replay_pending_locked("oleg")
+        assert submissions == 1
+
+        receipt.set_result(True)
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "receipted-ran-once"
+        await scheduler._replay_pending_locked("oleg")
+        assert submissions == 1
 
     @pytest.mark.asyncio
     async def test_queued_wake_extends_until_consumed_without_replay(
@@ -2628,6 +2824,7 @@ class TestScheduler:
             delivery_inflight_fn=lambda agent_name, prompt: False,
             delivery_queued_fn=lambda agent_name, prompt: queued,
             schedule_delivery_timeout=0.01,
+            receipt_extension_attempt_cap=10,
             receipt_extension_max_age_sec=1.0,
         )
 
@@ -2696,6 +2893,7 @@ class TestScheduler:
         assert ledger is not None
         assert ledger.ledger_state == "abandoned"
         assert registry.list_pending_schedule_wakes("oleg") == []
+        assert scheduler._detached_receipt_tasks == set()
         logs = capsys.readouterr().err
         assert logs.index("cancelled-queued") < logs.index("RECEIPT_ABANDONED")
 
@@ -3565,6 +3763,242 @@ class TestScheduler:
         assert len(ledger) == 3
         assert all(row.ledger_state == "receipted-ran-once" for row in ledger)
         assert registry.get("worker").heartbeat_interval == 0
+
+    @pytest.mark.asyncio
+    async def test_periodic_drain_rechecks_transport_instead_of_wide_watchdog(
+        self, registry, monkeypatch
+    ):
+        """#1098: a live idle recheck can drain despite stale wide evidence."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="recheck", prompt="deliver now"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        delivered: list[str] = []
+        drain_checks: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            delivered.append(prompt)
+            return True
+
+        def drain_busy(agent_name):
+            drain_checks.append(agent_name)
+            return False
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=drain_busy,
+            pending_wake_max_age_sec=1_000,
+        )
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+
+        assert drain_checks == ["worker"]
+        assert delivered == ["deliver now"]
+        assert registry.list_pending_schedule_wakes("worker") == []
+
+    @pytest.mark.parametrize(
+        ("attempt_cap", "max_age", "cycles", "expected_bound"),
+        [
+            (2, 1_000.0, 2, "attempt cap"),
+            (99, 30.0, 1, "wall-clock cap"),
+        ],
+    )
+    @pytest.mark.asyncio
+    async def test_periodic_drain_deferral_bounds_alert_once(
+        self,
+        registry,
+        monkeypatch,
+        capsys,
+        attempt_cap,
+        max_age,
+        cycles,
+        expected_bound,
+    ):
+        """A genuinely busy transport is protected, but starvation is loud."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="busy drain", prompt="owed work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        alerts: list[tuple[str, str]] = []
+        deliveries: list[str] = []
+
+        async def unexpected(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        async def owner_notify(agent_name, message):
+            alerts.append((agent_name, message))
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=unexpected,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=lambda agent_name: True,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=1_000,
+            outbox_drain_extension_attempt_cap=attempt_cap,
+            outbox_drain_extension_max_age_sec=max_age,
+        )
+        scheduler._check_pending_wake_liveness(base)
+        for cycle in range(1, cycles + 1):
+            clock[0] = base + (cycle * 60)
+            scheduler._check_pending_wake_liveness(clock[0])
+            await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        assert deliveries == []
+        ledger = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert ledger is not None
+        assert ledger.attempts == 0
+        assert ledger.ledger_state == "abandoned"
+        assert ledger.last_error.startswith("OUTBOX_DRAIN_ABANDONED:")
+        assert len(alerts) == 1
+        assert alerts[0][0] == "worker"
+        assert "OUTBOX DRAIN EXTENSION EXPIRED" in alerts[0][1]
+        assert expected_bound in alerts[0][1]
+
+        clock[0] += 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await asyncio.sleep(0)
+        assert "worker" not in scheduler._pending_replay_tasks
+        assert "worker" not in scheduler._outbox_drain_extensions
+        assert len(alerts) == 1
+        logs = capsys.readouterr().err
+        assert "OUTBOX_DRAIN_EXTENSION_EXPIRED" in logs
+        assert "terminalized=1/1" in logs
+
+    @pytest.mark.asyncio
+    async def test_drain_probe_timeout_counts_busy_and_releases_replay_lock(
+        self, registry, capsys
+    ):
+        """A hung transport probe cannot wedge the per-agent scheduler lane."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="probe timeout", prompt="owed work"
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=time.time(),
+        )
+        probe_started = threading.Event()
+        release_probe = threading.Event()
+        deliveries: list[str] = []
+
+        def hung_probe(agent_name):
+            del agent_name
+            probe_started.set()
+            release_probe.wait(timeout=0.2)
+            return False
+
+        async def unexpected(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=unexpected,
+            delivery_drain_busy_fn=hung_probe,
+            outbox_drain_probe_timeout_sec=0.01,
+            outbox_drain_extension_attempt_cap=2,
+        )
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        task = scheduler._pending_replay_tasks["worker"]
+        await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+        release_probe.set()
+
+        assert probe_started.is_set()
+        assert deliveries == []
+        assert len(registry.list_pending_schedule_wakes("worker")) == 1
+        assert scheduler._outbox_drain_extensions["worker"].attempts == 1
+        assert "counting as busy and releasing" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_drain_wall_cap_uses_oldest_active_not_abandoned_history(
+        self, registry, monkeypatch
+    ):
+        """A terminal old row cannot age a newer active wake into abandonment."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="active age", prompt="owed work"
+        )
+        now = 1_800_000_000.0
+        old, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 3_600,
+        )
+        assert registry.abandon_pending_schedule_wake(old.id, abandoned_at=now - 3_500)
+        active, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 10,
+        )
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: now)
+        alerts: list[str] = []
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            delivery_drain_busy_fn=lambda agent_name: True,
+            owner_notify_callback=owner_notify,
+            outbox_drain_extension_attempt_cap=2,
+            outbox_drain_extension_max_age_sec=30.0,
+        )
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        await scheduler._pending_replay_tasks["worker"]
+
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, active.fired_at)
+        assert ledger is not None
+        assert ledger.ledger_state == "pending"
+        assert alerts == []
+        assert scheduler._outbox_drain_extensions["worker"].oldest_fired_at == (
+            active.fired_at
+        )
 
     @pytest.mark.asyncio
     async def test_idle_trigger_during_replay_guarantees_follow_up_pass(
