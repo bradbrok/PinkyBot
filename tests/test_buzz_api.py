@@ -356,7 +356,9 @@ def test_inbound_policy_rejects_caller_authority_and_internal_agent_auth(tmp_pat
         assert app.state.agents.get_buzz_inbound_policy("barsik") is None
 
 
-def test_daemon_restart_resumes_configured_native_buzz_poller(tmp_path, monkeypatch):
+def test_daemon_restart_resumes_configured_native_buzz_poller(
+    tmp_path, monkeypatch, stub_sdk_transport
+):
     registry = AgentRegistry(
         str(tmp_path / "conversations_agents.db"),
         buzz_device_key_path=str(tmp_path / "identity" / ".device_key"),
@@ -503,7 +505,9 @@ def test_broker_send_thread_and_react_route_to_native_buzz_adapter(tmp_path):
         react.assert_called_once_with(CHANNEL, parent, "👍")
 
 
-def test_startup_refuses_enabled_identity_when_buzz_dependency_is_missing(tmp_path, monkeypatch):
+def test_startup_refuses_enabled_identity_when_buzz_dependency_is_missing(
+    tmp_path, monkeypatch, stub_sdk_transport
+):
     conversation_db = tmp_path / "conversations.db"
     registry = AgentRegistry(
         str(tmp_path / "conversations_agents.db"),
