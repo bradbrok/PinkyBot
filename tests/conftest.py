@@ -38,9 +38,17 @@ from fastapi.testclient import TestClient
 TEST_SESSION_SECRET = "test-session-secret-do-not-use-in-prod-32bytes-min"
 TEST_HOME = tempfile.mkdtemp(prefix="pinkybot-test-home-")
 TEST_CLAUDE_CONFIG_DIR = tempfile.mkdtemp(prefix="pinkybot-test-claude-config-")
+TEST_CLAUDE_SECURESTORAGE_DIR = tempfile.mkdtemp(
+    prefix="pinkybot-test-claude-securestorage-"
+)
+TEST_ANTHROPIC_CONFIG_DIR = tempfile.mkdtemp(
+    prefix="pinkybot-test-anthropic-config-"
+)
 TEST_CODEX_HOME = tempfile.mkdtemp(prefix="pinkybot-test-codex-home-")
 atexit.register(shutil.rmtree, TEST_HOME, ignore_errors=True)
 atexit.register(shutil.rmtree, TEST_CLAUDE_CONFIG_DIR, ignore_errors=True)
+atexit.register(shutil.rmtree, TEST_CLAUDE_SECURESTORAGE_DIR, ignore_errors=True)
+atexit.register(shutil.rmtree, TEST_ANTHROPIC_CONFIG_DIR, ignore_errors=True)
 atexit.register(shutil.rmtree, TEST_CODEX_HOME, ignore_errors=True)
 
 # Repository tests must not inherit live daemon behavior from their invoking
@@ -48,11 +56,22 @@ atexit.register(shutil.rmtree, TEST_CODEX_HOME, ignore_errors=True)
 # transports, containers, shared services, auth policy, or process launchers.
 # Scrub the whole namespace so newly-added switches are isolated by default,
 # then pin only the deterministic values the suite relies on.
+# Credential vars are pinned to EMPTY (tokens) or FRESH EMPTY DIRS (config/
+# storage roots). Empty-string shadowing, not deletion: a bare unset lets a
+# parent environment re-supply the value, and pointing a *_CONFIG_DIR at a
+# populated inherited path re-authenticates the bundled CLI. Enumerating every
+# credential var is a losing game (the CLI reads dozens and gains more per
+# release), so this list is defense-in-depth beneath two structural backstops:
+# the transport guard below (no test may spawn the real CLI) and the
+# credential tripwire in test_test_env_guard.py (asserts loggedIn=false, so any
+# credential link this list misses fails CI loudly rather than leaking).
 _PINNED_TEST_ENV = {
     "ANTHROPIC_API_KEY": "",
     "ANTHROPIC_AUTH_TOKEN": "",
+    "ANTHROPIC_CONFIG_DIR": TEST_ANTHROPIC_CONFIG_DIR,
     "CLAUDE_CODE_OAUTH_TOKEN": "",
     "CLAUDE_CONFIG_DIR": TEST_CLAUDE_CONFIG_DIR,
+    "CLAUDE_SECURESTORAGE_CONFIG_DIR": TEST_CLAUDE_SECURESTORAGE_DIR,
     "CODEX_HOME": TEST_CODEX_HOME,
     "HOME": TEST_HOME,
     "PINKY_AUTH_DENY_DEFAULT": "shadow",
@@ -154,12 +173,29 @@ def _isolate_test_env(request, monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _guard_real_sdk_transport(monkeypatch, _isolate_test_env):
-    """Fail before an unpatched test can construct the real Claude SDK client."""
+    """Fail before any test can spawn the real bundled Claude CLI.
+
+    Two layers, because a single high-level patch is bypassable:
+
+    1. ``claude_agent_sdk.ClaudeSDKClient`` — the clearest early failure for
+       the common ``streaming_session`` path.
+    2. ``SubprocessCLITransport.connect`` — the actual subprocess spawn, the
+       single choke point BOTH ``ClaudeSDKClient.connect()`` and the module-
+       level ``query()`` funnel through. Patching the transport method (not
+       just the package attribute) also defeats a ``ClaudeSDKClient`` alias
+       captured at import/collection time before the attribute patch applies:
+       the alias still constructs the real transport at runtime. Without this
+       layer a test reaching ``query()`` (e.g. ``SDKRunner.run``) or holding
+       such an alias could spawn the real credential-bearing CLI.
+    """
     if os.environ.get("PINKY_TEST_TRANSPORT_GUARD") != "1":
         yield
         return
 
     import claude_agent_sdk
+    from claude_agent_sdk._internal.transport.subprocess_cli import (
+        SubprocessCLITransport,
+    )
 
     def blocked_sdk_client(*args, **kwargs):
         del args, kwargs
@@ -170,7 +206,20 @@ def _guard_real_sdk_transport(monkeypatch, _isolate_test_env):
             pytrace=False,
         )
 
+    async def blocked_transport_connect(self, *args, **kwargs):
+        del self, args, kwargs
+        pytest.fail(
+            "PINKY_TEST_TRANSPORT_GUARD blocked a real Claude CLI subprocess "
+            "spawn (SubprocessCLITransport.connect) — reached via query(), a "
+            "pre-import ClaudeSDKClient alias, or another unpatched boundary; "
+            "patch the SDK entry point this test exercises",
+            pytrace=False,
+        )
+
     monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", blocked_sdk_client)
+    monkeypatch.setattr(
+        SubprocessCLITransport, "connect", blocked_transport_connect
+    )
     yield
 
 
@@ -215,25 +264,47 @@ def _auto_cookie_test_client(request, monkeypatch, _isolate_test_env):
 
 @pytest.fixture
 def stub_sdk_transport(monkeypatch):
-    """Allow incidental streaming-session boots without a real SDK client.
+    """Provide a connecting in-process fake SDK client for incidental boots.
 
     For tests whose subject is elsewhere (auth scoping, buzz startup) but whose
-    API calls boot sessions as a side effect. The stub permits construction —
-    satisfying the transport guard — and then fails the connect exactly like a
-    credential-less real client would, so the session lands in the same
-    boot_failed state these tests always ran against.
+    API calls boot a streaming session as a side effect. The fake replaces
+    ``ClaudeSDKClient`` entirely — so no real ``SubprocessCLITransport`` is
+    constructed and the transport guard is satisfied — and connects
+    successfully with an idle receive loop, reaching the same CONNECTED state
+    the real credential-backed client reached at these tests' baseline. It is
+    NOT a credential-less client (which fails connect); it is a deterministic
+    in-process transport, so a boot side effect never spawns a subprocess and
+    never diverges the session lifecycle from the reviewed baseline.
     """
     import claude_agent_sdk
 
-    class StubbedSDKClient:
+    class ConnectingFakeSDKClient:
         def __init__(self, options):
             self.options = options
 
         async def connect(self):
-            raise RuntimeError("stub_sdk_transport: no real transport in tests")
+            return None
 
         async def disconnect(self):
             return None
 
-    monkeypatch.setattr(claude_agent_sdk, "ClaudeSDKClient", StubbedSDKClient)
+        async def get_server_info(self):
+            return None
+
+        async def get_context_usage(self):
+            return {"totalTokens": 0, "maxTokens": 200_000}
+
+        async def query(self, prompt):
+            del prompt
+            return None
+
+        async def receive_messages(self):
+            # Idle transport: connected, no turn output to deliver. The reader
+            # loop completes cleanly rather than blocking or spawning anything.
+            return
+            yield  # pragma: no cover — makes this an async generator
+
+    monkeypatch.setattr(
+        claude_agent_sdk, "ClaudeSDKClient", ConnectingFakeSDKClient
+    )
     yield

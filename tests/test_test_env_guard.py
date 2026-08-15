@@ -37,9 +37,19 @@ class _TransportItem:
 def test_runtime_env_is_deterministic():
     assert os.environ["HOME"] == suite_conftest.TEST_HOME
     assert os.environ["CLAUDE_CONFIG_DIR"] == suite_conftest.TEST_CLAUDE_CONFIG_DIR
+    assert (
+        os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"]
+        == suite_conftest.TEST_CLAUDE_SECURESTORAGE_DIR
+    )
+    assert (
+        os.environ["ANTHROPIC_CONFIG_DIR"]
+        == suite_conftest.TEST_ANTHROPIC_CONFIG_DIR
+    )
     assert os.environ["CODEX_HOME"] == suite_conftest.TEST_CODEX_HOME
     assert Path(os.environ["HOME"]).is_dir()
     assert Path(os.environ["CLAUDE_CONFIG_DIR"]).is_dir()
+    assert Path(os.environ["CLAUDE_SECURESTORAGE_CONFIG_DIR"]).is_dir()
+    assert Path(os.environ["ANTHROPIC_CONFIG_DIR"]).is_dir()
     assert os.environ["CLAUDE_CODE_OAUTH_TOKEN"] == ""
     assert os.environ["ANTHROPIC_API_KEY"] == ""
     assert os.environ["ANTHROPIC_AUTH_TOKEN"] == ""
@@ -47,6 +57,82 @@ def test_runtime_env_is_deterministic():
     assert os.environ["PINKY_AUTH_DENY_DEFAULT"] == "shadow"
     assert os.environ["PINKY_TEST_TRANSPORT_GUARD"] == "1"
     assert "PINKY_CONTAINER_RUNTIME" not in os.environ
+
+
+def test_transport_connect_is_blocked_via_query_path():
+    """query() and any transport-level spawn hit the guard, not just the client.
+
+    ``SDKRunner.run`` uses ``claude_agent_sdk.query`` which builds its own
+    ``SubprocessCLITransport``; the package-attribute ``ClaudeSDKClient`` patch
+    never sees it. The guard therefore has to cover the transport spawn itself.
+    """
+    import asyncio
+
+    transport = SubprocessCLITransport(prompt="", options=ClaudeAgentOptions())
+
+    with pytest.raises(
+        pytest.fail.Exception,
+        match="blocked a real Claude CLI subprocess spawn",
+    ):
+        asyncio.run(transport.connect())
+
+
+def test_preimport_client_alias_is_blocked_at_transport():
+    """A ClaudeSDKClient reference captured before the attribute patch still fails.
+
+    Importing the class from its defining module bypasses the
+    ``claude_agent_sdk.ClaudeSDKClient`` attribute patch (this models an alias
+    bound at collection time). Construction succeeds, but ``connect`` reaches
+    the guarded transport and fails loudly instead of spawning the real CLI.
+    """
+    import asyncio
+
+    from claude_agent_sdk.client import ClaudeSDKClient as RealClientAlias
+
+    client = RealClientAlias(ClaudeAgentOptions())
+    with pytest.raises(
+        pytest.fail.Exception,
+        match="blocked a real Claude CLI subprocess spawn",
+    ):
+        asyncio.run(client.connect())
+
+
+def test_inherited_securestorage_dir_cannot_reauthenticate():
+    """A hostile inherited CLAUDE_SECURESTORAGE_CONFIG_DIR is overridden.
+
+    Pointing that var at a populated directory re-authenticated the bundled CLI
+    before this scrub covered it. The suite must replace any inherited value
+    with its fresh empty dir; a subprocess run with a hostile value set proves
+    the override holds rather than leaking through.
+    """
+    env = os.environ.copy()
+    env["CLAUDE_SECURESTORAGE_CONFIG_DIR"] = "/nonexistent/hostile/securestorage"
+    env["ANTHROPIC_CONFIG_DIR"] = "/nonexistent/hostile/anthropic-config"
+    env.pop("PINKY_TEST_REAL_TRANSPORT", None)
+
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "pytest",
+            "-q",
+            _SANITIZER_TEST,
+            (
+                "tests/test_test_env_guard.py::"
+                "test_bundled_claude_cli_cannot_authenticate_under_test_env"
+            ),
+        ],
+        cwd=_REPO_ROOT,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=40,
+        check=False,
+    )
+
+    output = result.stdout + result.stderr
+    assert result.returncode == 0, output
+    assert "2 passed" in output
 
 
 def test_bundled_claude_cli_cannot_authenticate_under_test_env():
