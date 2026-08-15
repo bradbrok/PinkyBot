@@ -20,6 +20,7 @@ import math
 import os
 import sys
 import time
+from dataclasses import dataclass
 from datetime import date, datetime, timedelta
 from zoneinfo import ZoneInfo
 
@@ -60,8 +61,22 @@ _SCHEDULE_PROMPT_WARN_INTERVAL_SEC = 15 * 60
 _PERSISTED_WAKE_MAX_AGE_SEC = 60 * 60
 _RECEIPT_EXTENSION_MAX_AGE_ENV = "PINKY_SCHEDULE_RECEIPT_EXTENSION_MAX_AGE_SEC"
 _RECEIPT_EXTENSION_MAX_AGE_SEC = 60 * 60
+_RECEIPT_EXTENSION_ATTEMPT_CAP_ENV = (
+    "PINKY_SCHEDULE_RECEIPT_EXTENSION_ATTEMPT_CAP"
+)
+_RECEIPT_EXTENSION_ATTEMPT_CAP = 3
 _ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC = 1.0
 _PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC = 60
+_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP_ENV = (
+    "PINKY_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP"
+)
+_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP = 30
+_OUTBOX_DRAIN_EXTENSION_MAX_AGE_ENV = (
+    "PINKY_OUTBOX_DRAIN_EXTENSION_MAX_AGE_SEC"
+)
+_OUTBOX_DRAIN_EXTENSION_MAX_AGE_SEC = 30 * 60
+_OUTBOX_DRAIN_PROBE_TIMEOUT_ENV = "PINKY_OUTBOX_DRAIN_PROBE_TIMEOUT_SEC"
+_OUTBOX_DRAIN_PROBE_TIMEOUT_SEC = 5.0
 _OUTBOX_REAPER_RETAIN_ACCEPTED_ENV = (
     "PINKY_OUTBOX_REAPER_RETAIN_ACCEPTED_SEC"
 )
@@ -83,7 +98,16 @@ _OUTBOX_REAPER_FAILURE_BACKOFF_SEC = 60 * 60
 
 
 class _ReceiptAbandonedError(RuntimeError):
-    """An already-pasted wake exceeded its original-fire receipt deadline."""
+    """An unconfirmed wake exhausted its receipt-extension budget."""
+
+
+@dataclass
+class _OutboxDrainExtensionState:
+    """One oldest pending fire's consecutive busy-drain evidence."""
+
+    oldest_fired_at: float
+    attempts: int = 0
+    alerted: bool = False
 
 
 def _positive_env_seconds(name: str, default: float) -> float:
@@ -99,6 +123,21 @@ def _positive_env_seconds(name: str, default: float) -> float:
             f"using {default:g}s"
         )
         return float(default)
+    return value
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    """Read one positive integer, falling back loudly."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+        if str(value) != raw_value.strip() or value <= 0:
+            raise ValueError("value must be a positive integer")
+    except (TypeError, ValueError):
+        _log(
+            f"scheduler: invalid {name} value {raw_value!r}; using {default}"
+        )
+        return default
     return value
 
 
@@ -263,6 +302,7 @@ class AgentScheduler:
         is_resurrectable_fn=None,
         comms_cleanup_fn=None,
         delivery_busy_fn=None,
+        delivery_drain_busy_fn=None,
         delivery_inflight_fn=None,
         delivery_queued_fn=None,
         delivery_cancel_queued_fn=None,
@@ -272,7 +312,11 @@ class AgentScheduler:
         tick_interval: int = 30,
         schedule_delivery_timeout: float = 600.0,
         pending_wake_max_age_sec: float = _PERSISTED_WAKE_MAX_AGE_SEC,
+        receipt_extension_attempt_cap: int | None = None,
         receipt_extension_max_age_sec: float | None = None,
+        outbox_drain_extension_attempt_cap: int | None = None,
+        outbox_drain_extension_max_age_sec: float | None = None,
+        outbox_drain_probe_timeout_sec: float | None = None,
     ) -> None:
         self._registry = registry
         # async fn(agent_name, session_id, prompt, *, schedule_receipt=None)
@@ -315,6 +359,13 @@ class AgentScheduler:
         # At the ceiling the waiter detaches, the exact row is explicitly
         # abandoned, and a later positive receipt can still win.
         self._delivery_inflight_fn = delivery_inflight_fn
+        # fn(agent_name) -> bool. A fresh, drain-specific pane-state probe
+        # evaluated under the scheduler's per-agent replay lock. This is
+        # deliberately narrower than the wide watchdog signal above: a stale
+        # inflight meta plus periodic monitor output may keep the watchdog
+        # positive after the REPL has reported a newer idle boundary (#1098).
+        # Missing implementations fall back to delivery_busy_fn.
+        self._delivery_drain_busy_fn = delivery_drain_busy_fn
         # fn(agent_name, prompt) -> bool. True means THIS wake remains queued
         # and recallable before its first pane paste on a live transport. This
         # is positive in-progress evidence just like ``delivery_inflight_fn``:
@@ -327,10 +378,10 @@ class AgentScheduler:
         # which case the unrecallable inflight abandonment path owns it.
         self._delivery_cancel_queued_fn = delivery_cancel_queued_fn
         # async fn(agent_name, text) -> bool. Delivers operator-facing owner
-        # alerts for terminal dead-letter events (PERSISTED_WAKE_PARKED, stale
-        # one-shot drop) through an out-of-band transport. Routine
-        # FIRED-BUT-UNDELIVERED receipt failures are logged only, NOT
-        # owner-notified (#1043).
+        # alerts for terminal dead-letter events (bounded receipt/drain expiry,
+        # PERSISTED_WAKE_PARKED, stale one-shot drop) through an out-of-band
+        # transport. Routine FIRED-BUT-UNDELIVERED receipt failures are logged
+        # only, NOT owner-notified (#1043).
         self._owner_notify_callback = owner_notify_callback
         self._trigger_store = trigger_store  # TriggerStore | None
         self._activity = activity  # ActivityStore | None
@@ -339,6 +390,20 @@ class AgentScheduler:
         if pending_wake_max_age_sec <= 0:
             raise ValueError("pending_wake_max_age_sec must be positive")
         self._pending_wake_max_age_sec = float(pending_wake_max_age_sec)
+        if receipt_extension_attempt_cap is None:
+            receipt_extension_attempt_cap = _positive_env_int(
+                _RECEIPT_EXTENSION_ATTEMPT_CAP_ENV,
+                _RECEIPT_EXTENSION_ATTEMPT_CAP,
+            )
+        if (
+            isinstance(receipt_extension_attempt_cap, bool)
+            or not isinstance(receipt_extension_attempt_cap, int)
+            or receipt_extension_attempt_cap <= 0
+        ):
+            raise ValueError(
+                "receipt_extension_attempt_cap must be a positive integer"
+            )
+        self._receipt_extension_attempt_cap = receipt_extension_attempt_cap
         if receipt_extension_max_age_sec is None:
             raw_extension_max_age = os.environ.get(
                 _RECEIPT_EXTENSION_MAX_AGE_ENV,
@@ -367,6 +432,52 @@ class AgentScheduler:
             )
         self._receipt_extension_max_age_sec = float(
             receipt_extension_max_age_sec
+        )
+        if outbox_drain_extension_attempt_cap is None:
+            outbox_drain_extension_attempt_cap = _positive_env_int(
+                _OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP_ENV,
+                _OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP,
+            )
+        if (
+            isinstance(outbox_drain_extension_attempt_cap, bool)
+            or not isinstance(outbox_drain_extension_attempt_cap, int)
+            or outbox_drain_extension_attempt_cap <= 0
+        ):
+            raise ValueError(
+                "outbox_drain_extension_attempt_cap must be a positive integer"
+            )
+        self._outbox_drain_extension_attempt_cap = (
+            outbox_drain_extension_attempt_cap
+        )
+        if outbox_drain_extension_max_age_sec is None:
+            outbox_drain_extension_max_age_sec = _positive_env_seconds(
+                _OUTBOX_DRAIN_EXTENSION_MAX_AGE_ENV,
+                _OUTBOX_DRAIN_EXTENSION_MAX_AGE_SEC,
+            )
+        if (
+            not math.isfinite(outbox_drain_extension_max_age_sec)
+            or outbox_drain_extension_max_age_sec <= 0
+        ):
+            raise ValueError(
+                "outbox_drain_extension_max_age_sec must be finite and positive"
+            )
+        self._outbox_drain_extension_max_age_sec = float(
+            outbox_drain_extension_max_age_sec
+        )
+        if outbox_drain_probe_timeout_sec is None:
+            outbox_drain_probe_timeout_sec = _positive_env_seconds(
+                _OUTBOX_DRAIN_PROBE_TIMEOUT_ENV,
+                _OUTBOX_DRAIN_PROBE_TIMEOUT_SEC,
+            )
+        if (
+            not math.isfinite(outbox_drain_probe_timeout_sec)
+            or outbox_drain_probe_timeout_sec <= 0
+        ):
+            raise ValueError(
+                "outbox_drain_probe_timeout_sec must be finite and positive"
+            )
+        self._outbox_drain_probe_timeout_sec = float(
+            outbox_drain_probe_timeout_sec
         )
         self._outbox_reaper_retain_accepted_sec = _positive_env_seconds(
             _OUTBOX_REAPER_RETAIN_ACCEPTED_ENV,
@@ -415,6 +526,11 @@ class AgentScheduler:
         self._detached_receipt_tasks: set[asyncio.Task] = set()
         self._pending_replay_tasks: dict[str, asyncio.Task] = {}
         self._pending_replay_again: set[str] = set()
+        self._pending_replay_drain_recheck: set[str] = set()
+        self._outbox_drain_extensions: dict[
+            str, _OutboxDrainExtensionState
+        ] = {}
+        self._receipt_extension_alerted: set[tuple[int, float]] = set()
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
@@ -477,6 +593,7 @@ class AgentScheduler:
             await asyncio.gather(*detached_receipts, return_exceptions=True)
         self._detached_receipt_tasks.clear()
         self._pending_replay_again.clear()
+        self._pending_replay_drain_recheck.clear()
         replay_tasks = list(self._pending_replay_tasks.values())
         for task in replay_tasks:
             if not task.done():
@@ -484,6 +601,7 @@ class AgentScheduler:
         if replay_tasks:
             await asyncio.gather(*replay_tasks, return_exceptions=True)
         self._pending_replay_tasks.clear()
+        self._outbox_drain_extensions.clear()
         alert_tasks = list(self._owner_alert_tasks)
         if alert_tasks:
             await asyncio.gather(*alert_tasks, return_exceptions=True)
@@ -1129,6 +1247,7 @@ class AgentScheduler:
                 attempt_started=attempt_started,
             )
         )
+        receipt_wait_attempts = 0
         try:
             while True:
                 try:
@@ -1146,6 +1265,7 @@ class AgentScheduler:
                             remaining, self._schedule_delivery_timeout
                         )
                         fresh_receipt_budget = False
+                    receipt_wait_attempts += 1
                     confirmed = await asyncio.wait_for(
                         asyncio.shield(delivery),
                         timeout=min(
@@ -1159,7 +1279,19 @@ class AgentScheduler:
                     return confirmed
                 except asyncio.TimeoutError:
                     age = self._receipt_age(schedule)
-                    if age >= self._receipt_extension_max_age_sec:
+                    wall_clock_expired = (
+                        age >= self._receipt_extension_max_age_sec
+                    )
+                    attempts_expired = (
+                        receipt_wait_attempts
+                        >= self._receipt_extension_attempt_cap
+                    )
+                    if wall_clock_expired or attempts_expired:
+                        bound_reason = (
+                            "wall-clock cap"
+                            if wall_clock_expired
+                            else "attempt cap"
+                        )
                         queued = self._wake_prompt_queued(
                             schedule, prompt=delivery_prompt
                         )
@@ -1184,7 +1316,10 @@ class AgentScheduler:
                                     "receipt abandonment"
                                 )
                                 self._mark_abandoned_receipt(
-                                    schedule, age=age
+                                    schedule,
+                                    age=age,
+                                    bound_reason=bound_reason,
+                                    wait_attempts=receipt_wait_attempts,
                                 )
                                 raise _ReceiptAbandonedError
 
@@ -1215,6 +1350,8 @@ class AgentScheduler:
                                     schedule,
                                     delivery,
                                     age=age,
+                                    bound_reason=bound_reason,
+                                    wait_attempts=receipt_wait_attempts,
                                     stale_drop_notices=stale_drop_notices,
                                 )
                                 raise _ReceiptAbandonedError
@@ -1244,7 +1381,10 @@ class AgentScheduler:
                                         "(receipt-fence fallback)"
                                     )
                                     self._mark_abandoned_receipt(
-                                        schedule, age=age
+                                        schedule,
+                                        age=age,
+                                        bound_reason=bound_reason,
+                                        wait_attempts=receipt_wait_attempts,
                                     )
                                     raise _ReceiptAbandonedError
 
@@ -1256,6 +1396,8 @@ class AgentScheduler:
                                 schedule,
                                 delivery,
                                 age=age,
+                                bound_reason=bound_reason,
+                                wait_attempts=receipt_wait_attempts,
                                 stale_drop_notices=stale_drop_notices,
                             )
                             raise _ReceiptAbandonedError
@@ -1278,7 +1420,21 @@ class AgentScheduler:
                         if self._wake_prompt_queued(
                             schedule, prompt=delivery_prompt
                         ):
-                            continue
+                            # Positive recallability never owns a late-receipt
+                            # observer. Cancel the delivery task so the
+                            # transport's in-lock receipt fence prevents a
+                            # later paste, then terminalize the exact fire.
+                            delivery.cancel()
+                            await asyncio.gather(
+                                delivery, return_exceptions=True
+                            )
+                            self._mark_abandoned_receipt(
+                                schedule,
+                                age=age,
+                                bound_reason=bound_reason,
+                                wait_attempts=receipt_wait_attempts,
+                            )
+                            raise _ReceiptAbandonedError
                         if self._wake_prompt_inflight(
                             schedule, prompt=delivery_prompt
                         ):
@@ -1286,6 +1442,8 @@ class AgentScheduler:
                                 schedule,
                                 delivery,
                                 age=age,
+                                bound_reason=bound_reason,
+                                wait_attempts=receipt_wait_attempts,
                                 stale_drop_notices=stale_drop_notices,
                             )
                             raise _ReceiptAbandonedError
@@ -1293,17 +1451,22 @@ class AgentScheduler:
                         await asyncio.gather(
                             delivery, return_exceptions=True
                         )
-                        raise asyncio.TimeoutError(
-                            "delivery receipt ceiling reached from original "
-                            f"fired_at after {age:.1f}s"
+                        self._mark_abandoned_receipt(
+                            schedule,
+                            age=age,
+                            bound_reason=bound_reason,
+                            wait_attempts=receipt_wait_attempts,
                         )
+                        raise _ReceiptAbandonedError
                     if self._agent_busy_not_wedged(schedule.agent_name):
                         _log(
                             f"scheduler: receipt still pending for schedule "
                             f"'{schedule.name}' "
                             f"(#{self._schedule_id(schedule)}) for agent "
                             f"'{schedule.agent_name}', but inflight watchdog "
-                            "reports busy-not-wedged; extending delivery timeout"
+                            "reports busy-not-wedged; extending delivery timeout "
+                            f"(wait {receipt_wait_attempts}/"
+                            f"{self._receipt_extension_attempt_cap})"
                         )
                         continue
                     if self._wake_prompt_inflight(
@@ -1317,7 +1480,9 @@ class AgentScheduler:
                             "already pasted to the transport — a cancel "
                             "cannot recall it, and declaring undelivered "
                             "would re-persist a wake that is about to "
-                            "execute (duplicate execution); extending"
+                            "execute (duplicate execution); extending "
+                            f"(wait {receipt_wait_attempts}/"
+                            f"{self._receipt_extension_attempt_cap})"
                         )
                         continue
                     if self._wake_prompt_queued(
@@ -1329,7 +1494,9 @@ class AgentScheduler:
                             f"(#{self._schedule_id(schedule)}) for agent "
                             f"'{schedule.agent_name}', but its prompt is "
                             "queued-unpasted on a connected transport; "
-                            "extending delivery timeout"
+                            "extending delivery timeout "
+                            f"(wait {receipt_wait_attempts}/"
+                            f"{self._receipt_extension_attempt_cap})"
                         )
                         continue
                     await asyncio.sleep(0)
@@ -1362,11 +1529,16 @@ class AgentScheduler:
         delivery: asyncio.Task,
         *,
         age: float,
+        bound_reason: str,
+        wait_attempts: int,
         stale_drop_notices: list[RecurringScheduleStaleDrop],
     ) -> None:
         """Release the delivery lock while retaining late-receipt authority."""
         schedule_id, fired_at, _ = self._mark_abandoned_receipt(
-            schedule, age=age
+            schedule,
+            age=age,
+            bound_reason=bound_reason,
+            wait_attempts=wait_attempts,
         )
 
         async def _observe_late_receipt() -> None:
@@ -1398,12 +1570,24 @@ class AgentScheduler:
         self._track_detached_receipt_task(_observe_late_receipt())
 
     def _mark_abandoned_receipt(
-        self, schedule, *, age: float
+        self,
+        schedule,
+        *,
+        age: float,
+        bound_reason: str = "wall-clock cap",
+        wait_attempts: int | None = None,
     ) -> tuple[int, float, bool]:
-        """Abandon one unrecallable fire without submitting new work."""
+        """Move one budget-expired unconfirmed fire to explicit abandonment."""
+        attempt_detail = (
+            f", wait_attempts={wait_attempts}"
+            if wait_attempts is not None
+            else ""
+        )
         reason = (
-            "RECEIPT_ABANDONED: original fired_at exceeded receipt-extension "
-            f"ceiling ({age:.1f}s >= {self._receipt_extension_max_age_sec:.1f}s)"
+            "RECEIPT_ABANDONED: receipt-extension budget expired "
+            f"by {bound_reason} (age={age:.1f}s, "
+            f"max_age={self._receipt_extension_max_age_sec:.1f}s"
+            f"{attempt_detail})"
         )
         schedule_id = self._schedule_id(schedule)
         fired_at = self._schedule_fired_at(schedule)
@@ -1423,7 +1607,14 @@ class AgentScheduler:
             f"(#{schedule_id}) for agent '{schedule.agent_name}' "
             f"fired_at={fired_at} age_s={age:.1f} "
             f"ceiling_s={self._receipt_extension_max_age_sec:.1f} "
+            f"bound={bound_reason!r} wait_attempts={wait_attempts} "
             f"abandoned={abandoned}"
+        )
+        self._alert_receipt_extension_expired(
+            schedule,
+            age=age,
+            bound_reason=bound_reason,
+            wait_attempts=wait_attempts,
         )
         if self._activity:
             try:
@@ -1431,11 +1622,53 @@ class AgentScheduler:
                     schedule.agent_name,
                     "schedule_receipt_abandoned",
                     f"Schedule '{schedule.name}' receipt wait exceeded its "
-                    "original-fire ceiling",
+                    f"{bound_reason}",
                 )
             except Exception:
                 pass
         return schedule_id, fired_at, abandoned
+
+    def _alert_receipt_extension_expired(
+        self,
+        schedule,
+        *,
+        age: float,
+        bound_reason: str,
+        wait_attempts: int | None,
+    ) -> None:
+        """Emit one durable-fire alert after its generous wait budget expires."""
+        schedule_id = self._schedule_id(schedule)
+        fired_at = self._schedule_fired_at(schedule)
+        alert_key = (schedule_id, fired_at)
+        if alert_key in self._receipt_extension_alerted:
+            _log(
+                "scheduler: RECEIPT_EXTENSION_EXPIRED owner already alerted "
+                f"for schedule '{schedule.name}' (#{schedule_id}) on agent "
+                f"'{schedule.agent_name}' fired_at={fired_at}"
+            )
+            return
+        self._receipt_extension_alerted.add(alert_key)
+        attempts = (
+            str(wait_attempts) if wait_attempts is not None else "persisted replay"
+        )
+        _log(
+            f"scheduler: RECEIPT_EXTENSION_EXPIRED schedule "
+            f"'{schedule.name}' (#{schedule_id}) for agent "
+            f"'{schedule.agent_name}' fired_at={fired_at} age_s={age:.1f} "
+            f"bound={bound_reason!r} wait_attempts={attempts}; owner alert queued"
+        )
+        self._queue_owner_alert(
+            schedule.agent_name,
+            (
+                "🚨 RECEIPT EXTENSION EXPIRED: schedule "
+                f"'{schedule.name}' (#{schedule_id}) on agent "
+                f"'{schedule.agent_name}' exhausted its {bound_reason} after "
+                f"{age:.1f}s and {attempts} confirmation wait(s). The exact "
+                "fire was moved to explicit abandonment to prevent replay; "
+                "an already-pasted delivery retains one late-receipt authority. "
+                "Inspect the transport and wake ledger before intervening."
+            ),
+        )
 
     def _abandon_inflight_replay(
         self,
@@ -1570,6 +1803,32 @@ class AgentScheduler:
             )
             return False
 
+    async def _agent_busy_for_drain(self, agent_name: str) -> bool:
+        """Re-read pane state without letting a hung probe hold the lane lock."""
+        probe = self._delivery_drain_busy_fn or self._delivery_busy_fn
+        if probe is None:
+            return False
+        try:
+            result = await asyncio.wait_for(
+                asyncio.to_thread(probe, agent_name),
+                timeout=self._outbox_drain_probe_timeout_sec,
+            )
+            return result is True
+        except asyncio.TimeoutError:
+            _log(
+                f"scheduler: drain-time transport recheck timed out for "
+                f"'{agent_name}' after "
+                f"{self._outbox_drain_probe_timeout_sec:.1f}s; "
+                "counting as busy and releasing the replay lock"
+            )
+            return True
+        except Exception as exc:
+            _log(
+                f"scheduler: drain-time transport recheck failed for "
+                f"'{agent_name}': {type(exc).__name__}: {exc}; deferring safely"
+            )
+            return True
+
     def _queue_owner_alert(self, agent_name: str, message: str) -> None:
         """Start one owner alert with a strong task reference and loud failure."""
         if self._owner_notify_callback is None:
@@ -1605,8 +1864,12 @@ class AgentScheduler:
         self._owner_alert_tasks.add(task)
         task.add_done_callback(self._owner_alert_tasks.discard)
 
-    def replay_pending_for_agent(self, agent_name: str) -> None:
+    def replay_pending_for_agent(
+        self, agent_name: str, *, drain_recheck: bool = False
+    ) -> None:
         """Coalesce triggers while guaranteeing one replay after the active pass."""
+        if drain_recheck:
+            self._pending_replay_drain_recheck.add(agent_name)
         existing = self._pending_replay_tasks.get(agent_name)
         if existing is not None and not existing.done():
             self._pending_replay_again.add(agent_name)
@@ -1642,7 +1905,14 @@ class AgentScheduler:
         """Deliver one agent's current owed wakes with exact receipts."""
         lock = self._schedule_delivery_locks.setdefault(agent_name, asyncio.Lock())
         async with lock:
-            await self._replay_pending_locked(agent_name)
+            drain_recheck = agent_name in self._pending_replay_drain_recheck
+            self._pending_replay_drain_recheck.discard(agent_name)
+            if drain_recheck:
+                await self._replay_pending_locked(
+                    agent_name, drain_recheck=True
+                )
+            else:
+                await self._replay_pending_locked(agent_name)
 
     def _park_pending_wake_if_capped(self, pending, attempts: int) -> bool:
         """Park one capped wake once and emit its single owner alert."""
@@ -1679,7 +1949,122 @@ class AgentScheduler:
         )
         return True
 
-    async def _replay_pending_locked(self, agent_name: str) -> None:
+    def _record_outbox_drain_extension(
+        self, agent_name: str, *, summary: dict, now: float
+    ) -> bool:
+        """Bound consecutive drain deferrals by count and oldest-fire age."""
+        oldest_fired_at = float(summary["oldest_fired_at"])
+        state = self._outbox_drain_extensions.get(agent_name)
+        if state is None or state.oldest_fired_at != oldest_fired_at:
+            state = _OutboxDrainExtensionState(oldest_fired_at)
+            self._outbox_drain_extensions[agent_name] = state
+        state.attempts += 1
+        oldest_age = max(0.0, now - oldest_fired_at)
+        wall_clock_expired = (
+            oldest_age >= self._outbox_drain_extension_max_age_sec
+        )
+        attempts_expired = (
+            state.attempts >= self._outbox_drain_extension_attempt_cap
+        )
+        if not (wall_clock_expired or attempts_expired):
+            _log(
+                f"scheduler: periodic outbox drain deferred for "
+                f"'{agent_name}': fresh transport recheck remains busy "
+                f"(attempt {state.attempts}/"
+                f"{self._outbox_drain_extension_attempt_cap}, "
+                f"oldest_age_s={oldest_age:.1f}/"
+                f"{self._outbox_drain_extension_max_age_sec:.1f})"
+            )
+            return False
+
+        bound_reason = (
+            "wall-clock cap" if wall_clock_expired else "attempt cap"
+        )
+        targeted, abandoned = self._abandon_outbox_drain_rows(
+            agent_name,
+            now=now,
+            bound_reason=bound_reason,
+            state=state,
+            oldest_age=oldest_age,
+        )
+        if state.alerted:
+            _log(
+                "scheduler: OUTBOX_DRAIN_EXTENSION_EXPIRED owner already "
+                f"alerted for '{agent_name}' oldest_fired_at={oldest_fired_at} "
+                f"bound={bound_reason!r}; transport recheck remains busy, "
+                f"terminalized={abandoned}/{targeted}"
+            )
+            return True
+        state.alerted = True
+        _log(
+            f"scheduler: OUTBOX_DRAIN_EXTENSION_EXPIRED agent='{agent_name}' "
+            f"oldest_fired_at={oldest_fired_at} oldest_age_s={oldest_age:.1f} "
+            f"attempts={state.attempts} bound={bound_reason!r} "
+            f"terminalized={abandoned}/{targeted}; owner alert queued"
+        )
+        self._queue_owner_alert(
+            agent_name,
+            (
+                "🚨 OUTBOX DRAIN EXTENSION EXPIRED: agent "
+                f"'{agent_name}' still reports busy at the fresh drain-time "
+                f"transport check after hitting its {bound_reason} "
+                f"({state.attempts} checks, oldest wake age "
+                f"{oldest_age:.1f}s). {abandoned}/{targeted} active wake row(s) "
+                "were moved to explicit OUTBOX_DRAIN_ABANDONED terminal state; "
+                "a late positive receipt can still supersede abandonment. "
+                "Inspect the transport and wake ledger before intervening."
+            ),
+        )
+        return True
+
+    def _abandon_outbox_drain_rows(
+        self,
+        agent_name: str,
+        *,
+        now: float,
+        bound_reason: str,
+        state: _OutboxDrainExtensionState,
+        oldest_age: float,
+    ) -> tuple[int, int]:
+        """Move every active row behind an expired drain to honest terminal state."""
+        try:
+            pending_wakes = self._registry.list_pending_schedule_wakes(
+                agent_name
+            )
+        except Exception as exc:
+            _log(
+                "scheduler: OUTBOX_DRAIN_ABANDON_FAILURE listing active rows "
+                f"for '{agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return 0, 0
+
+        reason = (
+            "OUTBOX_DRAIN_ABANDONED: drain-extension budget expired "
+            f"by {bound_reason} (oldest_fired_at={state.oldest_fired_at}, "
+            f"oldest_age={oldest_age:.1f}s, checks={state.attempts}, "
+            f"attempt_cap={self._outbox_drain_extension_attempt_cap}, "
+            f"max_age={self._outbox_drain_extension_max_age_sec:.1f}s)"
+        )
+        abandoned = 0
+        for pending in pending_wakes:
+            try:
+                if self._registry.abandon_pending_schedule_wake(
+                    pending.id,
+                    abandoned_at=now,
+                    reason=reason,
+                ):
+                    abandoned += 1
+            except Exception as exc:
+                _log(
+                    "scheduler: OUTBOX_DRAIN_ABANDON_FAILURE pending "
+                    f"#{pending.id} for '{agent_name}': "
+                    f"{type(exc).__name__}: {exc}"
+                )
+        return len(pending_wakes), abandoned
+
+    async def _replay_pending_locked(
+        self, agent_name: str, *, drain_recheck: bool = False
+    ) -> None:
         """Reap zombies, collapse recurrences, then replay under the agent lock."""
         replay_now = time.time()
         health = self._registry.get_pending_schedule_wake_health(
@@ -1694,12 +2079,31 @@ class AgentScheduler:
                 f"oldest_age_s={summary['oldest_age_seconds']:.1f} "
                 f"oldest_fired_at={summary['oldest_fired_at']}"
             )
-            if self._agent_busy_not_wedged(agent_name):
-                _log(
-                    f"scheduler: persisted wake replay deferred for "
-                    f"'{agent_name}' until the next turn-idle boundary"
-                )
+            busy = (
+                await self._agent_busy_for_drain(agent_name)
+                if drain_recheck
+                else self._agent_busy_not_wedged(agent_name)
+            )
+            if busy:
+                drain_expired = False
+                if drain_recheck:
+                    drain_expired = self._record_outbox_drain_extension(
+                        agent_name, summary=summary, now=replay_now
+                    )
+                if drain_expired:
+                    _log(
+                        "scheduler: persisted wake replay stopped for "
+                        f"'{agent_name}': drain-extension budget terminalized "
+                        "the active rows"
+                    )
+                else:
+                    _log(
+                        f"scheduler: persisted wake replay deferred for "
+                        f"'{agent_name}' until the next turn-idle boundary"
+                    )
                 return
+            if drain_recheck:
+                self._outbox_drain_extensions.pop(agent_name, None)
         all_pending_wakes = self._registry.list_pending_schedule_wakes(
             agent_name, include_parked=True
         )
@@ -2270,8 +2674,10 @@ class AgentScheduler:
         """Periodically drain live-daemon outboxes without heartbeat opt-in.
 
         Turn-idle remains the primary path.  This once-per-minute scan is the
-        bounded fallback for a lost idle callback; the positive busy gate is
-        checked both here and again under the per-agent replay lock.
+        bounded fallback for a lost idle callback. Each replay rechecks the
+        transport's current pane state under the per-agent delivery lock; it
+        does not trust the watchdog-wide liveness verdict sampled by a receipt
+        waiter. Busy rechecks have their own attempt and wall-clock budget.
         """
         last_drain = self._last_pending_wake_liveness_drain_at
         if last_drain is None:
@@ -2291,18 +2697,14 @@ class AgentScheduler:
                 f"{type(exc).__name__}: {exc}"
             )
             return
+        for settled_agent in self._outbox_drain_extensions.keys() - agent_names:
+            self._outbox_drain_extensions.pop(settled_agent, None)
         for agent_name in sorted(agent_names):
-            if self._agent_busy_not_wedged(agent_name):
-                _log(
-                    f"scheduler: periodic outbox drain deferred for "
-                    f"'{agent_name}': transport remains busy-not-wedged"
-                )
-                continue
             _log(
                 f"scheduler: periodic liveness drain found pending wakes "
-                f"for '{agent_name}'"
+                f"for '{agent_name}'; scheduling fresh transport recheck"
             )
-            self.replay_pending_for_agent(agent_name)
+            self.replay_pending_for_agent(agent_name, drain_recheck=True)
 
     # Resurrection cap: at most this many attempts per RESURRECTION_WINDOW_SECONDS
     # per agent. Prevents thrashing on a persistently-broken session while still

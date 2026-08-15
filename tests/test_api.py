@@ -8970,6 +8970,28 @@ class TestBuildStreamingWakeContextReasonGating:
 
             cancel.assert_awaited_once_with("exact wake")
 
+    def test_scheduler_drain_probe_is_distinct_from_wide_busy_signal(self):
+        """#1098: periodic drains re-read pane state through the transport."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            session = SimpleNamespace(
+                stats={
+                    "inflight_active": True,
+                    "inflight_busy_not_wedged": True,
+                },
+                scheduler_drain_busy=lambda: False,
+            )
+            with patch.object(
+                app.state.broker,
+                "_get_streaming_session",
+                return_value=session,
+            ):
+                assert app.state.scheduler._delivery_busy_fn("dymok") is True
+                assert (
+                    app.state.scheduler._delivery_drain_busy_fn("dymok")
+                    is False
+                )
+
     @pytest.mark.asyncio
     async def test_scheduler_owner_alert_uses_owner_destination(self):
         """The owner-notify callback (dead-letter alerts: PARKED / stale

@@ -49,7 +49,6 @@ import os
 import re
 import shlex
 import time
-from collections import deque
 from pathlib import Path
 
 from pinky_daemon.codex_home import (
@@ -465,21 +464,12 @@ class CodexTmuxSession(TmuxSession):
         if not stale:
             return 0
         stale_ids = {id(meta) for meta in stale}
-        stale_turn_ids = {id(meta.turn) for meta in stale}
         kept = [
             meta for meta in self._inflight_metas
             if id(meta) not in stale_ids
         ]
         self._inflight_metas.clear()
         self._inflight_metas.extend(kept)
-        self._pane_queue_operations = deque(
-            turn for turn in self._pane_queue_operations
-            if turn is None or id(turn) not in stale_turn_ids
-        )
-        self._pane_dequeued_turns = deque(
-            turn for turn in self._pane_dequeued_turns
-            if turn is None or id(turn) not in stale_turn_ids
-        )
         for meta in stale:
             event = meta.completion_event
             if event is not None and not event.is_set():

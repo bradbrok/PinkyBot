@@ -28,6 +28,8 @@ from unittest.mock import AsyncMock, MagicMock
 import pytest
 
 from pinky_daemon import tmux_session
+from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.scheduler import AgentScheduler, ScheduleWakeReceipt
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
@@ -3828,6 +3830,199 @@ async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
         "transport acceptance must not wait for turn completion"
     )
     await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_prompt_dequeue_matches_content_after_racing_turn_pop() -> None:
+    """#1098: an interleaved Stop must not erase queued acceptance evidence.
+
+    A near-simultaneous prompt can make the next Stop pop the scheduler wake's
+    local FIFO meta before Claude emits the queued prompt's dequeue row.  The
+    dequeue proves that exact content was consumed even though the turn object
+    was already retired under another turn boundary.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    receipt = asyncio.get_running_loop().create_future()
+    persisted: list[str] = []
+    turn = _QueuedTurn(
+        prompt="scheduled under a racing turn",
+        scheduler_delivery=receipt,
+        scheduler_accept=lambda: persisted.append("accepted") or True,
+        scheduler_serialized=True,
+    )
+    turn.pane_delivery_started = True
+    ss._scheduler_pending_turns.append(turn)
+    ss._finish_turn_delivery(turn)
+
+    ss._on_transcript_entry(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": turn.prompt,
+        }
+    )
+    assert not receipt.done()
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="racing turn completed", stop_reason="end_turn")
+    )
+    assert not receipt.done()
+    assert not ss._inflight_metas
+
+    ss._on_transcript_entry(
+        {"type": "queue-operation", "operation": "dequeue"}
+    )
+
+    assert receipt.done(), "content dequeue must settle the racing wake receipt"
+    assert receipt.result() is True
+    assert persisted == ["accepted"]
+    ss._on_transcript_entry(
+        {
+            "type": "user",
+            "message": {"role": "user", "content": turn.prompt},
+        }
+    )
+    assert not ss._pane_queue_operations
+    assert not ss._pane_dequeued_turns
+
+
+@pytest.mark.asyncio
+async def test_scheduler_acceptance_equal_prompts_consumes_one_fifo_ticket() -> None:
+    """Equal text is occurrence-counted; one dequeue cannot accept two wakes."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    prompt = "same scheduled work"
+    receipts = [
+        asyncio.get_running_loop().create_future(),
+        asyncio.get_running_loop().create_future(),
+    ]
+    accepted: list[int] = []
+    turns = [
+        _QueuedTurn(
+            prompt=prompt,
+            scheduler_delivery=receipt,
+            scheduler_accept=lambda index=index: accepted.append(index) or True,
+            scheduler_serialized=True,
+        )
+        for index, receipt in enumerate(receipts)
+    ]
+    for turn in turns:
+        turn.pane_delivery_started = True
+        ss._scheduler_pending_turns.append(turn)
+        ss._finish_turn_delivery(turn)
+        ss._on_transcript_entry(
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": prompt,
+            }
+        )
+
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert receipts[0].result() is True
+    assert not receipts[1].done()
+    assert accepted == [0]
+
+    ss._on_transcript_entry(
+        {"type": "user", "message": {"role": "user", "content": prompt}}
+    )
+    assert not receipts[1].done(), "the first user row must not accept occurrence 2"
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="first duplicate done", stop_reason="end_turn")
+    )
+    assert not receipts[1].done()
+
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert receipts[1].result() is True
+    assert accepted == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_racing_content_acceptance_persists_row_and_prevents_replay(
+    tmp_path,
+) -> None:
+    """#1098 specimen 3: consumed racing wake becomes durably un-replayable."""
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    try:
+        registry.register("dymok")
+        schedule = registry.add_schedule(
+            "dymok", "0 * * * *", name="weekly probe", prompt="probe once"
+        )
+        fired_at = _time.time()
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="dymok",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        durable_receipt = ScheduleWakeReceipt(registry, schedule.id, fired_at)
+        local_receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt=schedule.prompt,
+            scheduler_delivery=local_receipt,
+            scheduler_accept=durable_receipt.accept,
+            scheduler_serialized=True,
+        )
+        turn.pane_delivery_started = True
+        ss, _ = _make_session(agent_name="dymok", state=SessionState.CONNECTED)
+        ss._scheduler_pending_turns.append(turn)
+        ss._finish_turn_delivery(turn)
+        ss._on_transcript_entry(
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": schedule.prompt,
+            }
+        )
+        await ss._handle_turn_complete(
+            TurnResponse(text="racing turn", stop_reason="end_turn")
+        )
+        ss._on_transcript_entry(
+            {"type": "queue-operation", "operation": "dequeue"}
+        )
+
+        assert local_receipt.result() is True
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.ledger_state == "receipted-ran-once"
+
+        replays: list[str] = []
+
+        async def replay(agent_name, session_id, prompt):
+            del agent_name, session_id
+            replays.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=replay)
+        await scheduler._replay_pending_locked("dymok")
+        assert replays == []
+    finally:
+        registry.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_stop_discards_ordinary_queue_content_evidence() -> None:
+    """Content tickets stay bounded when no unresolved receipt owns them."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    turn = _QueuedTurn(prompt="ordinary prompt")
+    turn.pane_delivery_started = True
+    ss._finish_turn_delivery(turn)
+    ss._on_transcript_entry(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": turn.prompt,
+        }
+    )
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="done", stop_reason="end_turn")
+    )
+
+    assert not ss._pane_queue_operations
+    assert not ss._pane_dequeued_turns
 
 
 @pytest.mark.asyncio
@@ -11569,3 +11764,56 @@ def test_stats_inflight_inactive_when_idle(tmp_path) -> None:
     assert stats["inflight_active"] is False
     assert stats["inflight_busy_not_wedged"] is False
     assert stats["inflight_liveness_reason"] == "no_inflight_turn"
+
+
+def test_stats_monitor_writes_need_an_inflight_turn_to_report_busy(tmp_path) -> None:
+    """#1098 controlled hypothesis: monitors alone cannot pin idle as busy."""
+    ss, _ = _make_session()
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _age_file(main, 1000)
+    workflows = tmp_path / "session" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "monitor.jsonl").write_text("{}")
+    _point_transcript(ss, main)
+
+    idle_stats = ss.stats
+    assert idle_stats["inflight_active"] is False
+    assert idle_stats["inflight_busy_not_wedged"] is False
+    assert idle_stats["inflight_liveness_reason"] == "no_inflight_turn"
+
+    _seed_inflight(ss)
+    phantom_stats = ss.stats
+    assert phantom_stats["inflight_active"] is True
+    assert phantom_stats["inflight_busy_not_wedged"] is True
+    assert phantom_stats["inflight_liveness_reason"] == (
+        "background_transcript_recent"
+    )
+
+
+def test_scheduler_drain_busy_trusts_newer_explicit_idle_over_monitor(
+    tmp_path,
+) -> None:
+    """#1098: drain state is revalidated separately from watchdog liveness."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    _seed_inflight(ss)
+    main = tmp_path / "session.jsonl"
+    main.write_text("{}")
+    _age_file(main, 1000)
+    workflows = tmp_path / "session" / "workflows"
+    workflows.mkdir(parents=True)
+    (workflows / "monitor.jsonl").write_text("{}")
+    _point_transcript(ss, main)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time() + 1,
+    }
+
+    assert ss.stats["inflight_busy_not_wedged"] is True
+    assert ss.scheduler_drain_busy() is False
+
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": _time.time() + 2,
+    }
+    assert ss.scheduler_drain_busy() is True
