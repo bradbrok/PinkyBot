@@ -259,14 +259,14 @@ class TestStreamingSession:
         session._state_machine._state = SessionState.CONNECTED
 
         class OkClient:
-            async def query(self, prompt):
+            async def query(self, prompt, **kwargs):
                 pass
 
         session._client = OkClient()
         assert await session.send("hello", platform="web", chat_id="c1") is True
 
         class FailingClient:
-            async def query(self, prompt):
+            async def query(self, prompt, **kwargs):
                 raise RuntimeError("boom")
 
         session._client = FailingClient()
