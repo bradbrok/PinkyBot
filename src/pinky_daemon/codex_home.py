@@ -1,0 +1,1733 @@
+"""Flag-gated per-agent Codex home preparation and rollout migration."""
+
+from __future__ import annotations
+
+import errno
+import fcntl
+import hashlib
+import json
+import math
+import os
+import shutil
+import stat
+import subprocess
+import tempfile
+import time
+import uuid
+from collections.abc import Callable, Iterator
+from contextlib import contextmanager
+from dataclasses import dataclass
+from datetime import datetime, timezone
+from functools import cache
+from pathlib import Path
+from typing import BinaryIO
+
+PER_AGENT_CODEX_HOME_ENV = "PINKY_CODEX_PER_AGENT_HOME"
+MANAGED_CONFIG_SENTINEL = "# pinkybot-managed-codex-home-v1"
+ROLLOUT_MIGRATION_MARKER = ".pinkybot-rollout-migration-v1.json"
+MIGRATION_LOCK_TIMEOUT_ENV = "PINKY_CODEX_HOME_LOCK_TIMEOUT_SECONDS"
+
+_MIGRATION_TEMP_PREFIX = ".pinkybot-rollout-migration-"
+_MIGRATION_TEMP_SUFFIX = ".tmp"
+_MIGRATION_CLAIM_PREFIX = ".pinkybot-rollout-claim-"
+_MIGRATION_QUARANTINE_PREFIX = ".pinkybot-rollout-quarantine-"
+_MIGRATION_LOCK_NAME = ".pinkybot-rollout-migration.lock"
+_MIGRATION_LOCK_ASIDE_PREFIX = ".pinkybot-rollout-lock-aside-"
+_PRESERVATION_RESERVATION_SUFFIX = ".reserve"
+_PRESERVATION_RESERVATION_STALE_SECONDS = 60 * 60
+_RESERVATION_ACQUIRE_MAX_ATTEMPTS = 8
+_CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS = 2.0
+_LSOF_FALLBACK_PATHS = ("/usr/sbin/lsof", "/usr/bin/lsof")
+_CRASH_FROZEN_CLAIM_MODE = stat.S_IRUSR | stat.S_IWUSR
+_DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS = 10.0
+_MIGRATION_LOCK_RETRY_SECONDS = 0.05
+
+LogFn = Callable[[str], None]
+
+
+@dataclass(frozen=True)
+class _RolloutCandidate:
+    """A canonical rollout path and an optional crash-recovery claim."""
+
+    canonical: Path
+    claim: Path | None = None
+
+
+@dataclass(frozen=True)
+class _MoveResult:
+    moved: int
+    claimed_sources: frozenset[Path]
+
+
+def per_agent_codex_home_enabled() -> bool:
+    """Return whether per-agent Codex homes are explicitly enabled."""
+    return os.environ.get(PER_AGENT_CODEX_HOME_ENV, "").strip() == "1"
+
+
+def shared_codex_home() -> Path:
+    """Return the user-level Codex home used when isolation is disabled."""
+    return Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+
+
+def _agent_working_dir(agent: object | None) -> Path:
+    raw = (getattr(agent, "working_dir", "") or "").strip()
+    if not raw:
+        raise RuntimeError("per-agent Codex home requires an agent working directory")
+    return Path(raw).expanduser().resolve()
+
+
+def codex_home_for(agent: object | None = None) -> Path:
+    """Resolve the Codex home shared by every reader for an agent scope.
+
+    The feature is a strict production no-op while disabled: the daemon-level
+    ``CODEX_HOME`` (or Codex's normal user-home fallback) is returned exactly as
+    before. When enabled, an explicit agent override wins; otherwise the home
+    lives inside the resolved agent working directory.
+    """
+    if not per_agent_codex_home_enabled():
+        return shared_codex_home()
+
+    override = (getattr(agent, "codex_home", "") or "").strip()
+    if override:
+        return Path(override).expanduser().resolve()
+    return _agent_working_dir(agent) / ".codex"
+
+
+def _managed_config(working_dir: Path) -> str:
+    project_key = json.dumps(str(working_dir))
+    return (
+        f"{MANAGED_CONFIG_SENTINEL}\n"
+        "# Generated for an isolated agent session.\n\n"
+        "[features]\n"
+        "apps = false\n"
+        "plugins = false\n\n"
+        f"[projects.{project_key}]\n"
+        'trust_level = "trusted"\n'
+    )
+
+
+def _write_managed_config(codex_home: Path, working_dir: Path, log: LogFn) -> None:
+    config_path = codex_home / "config.toml"
+    expected = _managed_config(working_dir)
+    try:
+        config_stat = config_path.lstat()
+    except FileNotFoundError:
+        config_stat = None
+    if config_stat is not None:
+        # Check the directory entry itself before any target-following call.
+        # Path.exists() is false for a dangling symlink; checking it first
+        # would let write_text() follow the link and create/mutate its target.
+        if stat.S_ISLNK(config_stat.st_mode) or config_stat.st_nlink > 1:
+            log(
+                f"codex-home: preserving linked config at {config_path}; "
+                "per-agent safety settings were not rewritten"
+            )
+            return
+        if not stat.S_ISREG(config_stat.st_mode):
+            log(
+                f"codex-home: preserving non-regular config at {config_path}; "
+                "per-agent safety settings were not rewritten"
+            )
+            return
+        existing = config_path.read_text(encoding="utf-8")
+        if not existing.startswith(MANAGED_CONFIG_SENTINEL):
+            log(
+                f"codex-home: preserving unmanaged config at {config_path}; "
+                "per-agent safety settings were not rewritten"
+            )
+            return
+        if existing == expected:
+            return
+    config_path.write_text(expected, encoding="utf-8")
+    config_path.chmod(0o600)
+
+
+def _write_agent_soul(
+    codex_home: Path,
+    agent: object,
+    soul_version_store: object | None,
+) -> None:
+    """Atomically install the compiled agent soul in an isolated Codex home.
+
+    The caller has already proved that ``codex_home`` is not the shared home.
+    Replacing the directory entry from a same-directory temporary file also
+    prevents a linked ``AGENTS.md`` from redirecting the write outside the
+    isolated home. Existing content is versioned before replacement; the
+    installed content is versioned after publication.
+    """
+    publication = _validate_agent_soul_publication(
+        codex_home,
+        agent,
+        soul_version_store,
+    )
+    if publication is None:
+        return
+    content, agent_name, save_version, existing = publication
+    agents_path = codex_home / "AGENTS.md"
+    if existing is not None:
+        save_version(agent_name, existing, source="agent")
+
+    fd, temp_name = tempfile.mkstemp(
+        dir=codex_home,
+        prefix=".AGENTS.md-",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        os.fchmod(fd, 0o600)
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, agents_path)
+        _fsync_directory(codex_home)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+    save_version(agent_name, content, source="spawn")
+
+
+def _validate_agent_soul_publication(
+    codex_home: Path,
+    agent: object,
+    soul_version_store: object | None,
+) -> tuple[str, str, Callable[..., object], str | None] | None:
+    """Return validated publication inputs without changing persistent state."""
+    content = getattr(agent, "system_prompt", "")
+    if not isinstance(content, str) or not content:
+        return None
+
+    agent_name = (getattr(agent, "agent_name", "") or "").strip()
+    save_version = getattr(soul_version_store, "save_soul_version", None)
+    if not agent_name or not callable(save_version):
+        raise RuntimeError(
+            "refusing Codex spawn: compiled agent soul cannot be versioned"
+        )
+
+    agents_path = codex_home / "AGENTS.md"
+    try:
+        agents_stat = agents_path.lstat()
+    except FileNotFoundError:
+        agents_stat = None
+    existing: str | None = None
+    if agents_stat is not None and not stat.S_ISLNK(agents_stat.st_mode):
+        try:
+            existing = agents_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            raise RuntimeError(
+                f"refusing Codex spawn: existing agent soul cannot be read: {agents_path}"
+            ) from exc
+    return content, agent_name, save_version, existing
+
+
+def _ensure_auth_link(codex_home: Path, auth_source: Path) -> None:
+    auth_path = codex_home / "auth.json"
+    auth_target = auth_source.resolve(strict=True)
+    for _attempt in range(3):
+        try:
+            auth_stat = auth_path.lstat()
+        except FileNotFoundError:
+            try:
+                auth_path.symlink_to(auth_target)
+                return
+            except FileExistsError:
+                # A concurrent prepare created the entry; classify it again.
+                continue
+        if not stat.S_ISLNK(auth_stat.st_mode):
+            raise RuntimeError(
+                f"refusing Codex spawn: {auth_path} is not the managed auth symlink"
+            )
+        try:
+            if auth_path.resolve(strict=True) == auth_target:
+                return
+        except OSError:
+            pass
+        try:
+            auth_path.unlink()
+        except FileNotFoundError:
+            # A concurrent prepare already replaced the stale/dangling entry.
+            continue
+    raise RuntimeError(f"refusing Codex spawn: auth symlink at {auth_path} did not converge")
+
+
+def _rollout_cwd(path: Path) -> str:
+    try:
+        with path.open("r", encoding="utf-8") as handle:
+            for line in handle:
+                try:
+                    entry = json.loads(line)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                if not isinstance(entry, dict):
+                    continue
+                if entry.get("type") != "session_meta":
+                    continue
+                payload = entry.get("payload") or {}
+                cwd = payload.get("cwd")
+                return cwd if isinstance(cwd, str) else ""
+    except (OSError, UnicodeError):
+        return ""
+    return ""
+
+
+def _path_entry_exists(path: Path) -> bool:
+    """Return whether a directory entry exists without following symlinks."""
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def _file_signature(path: Path) -> tuple[int, str]:
+    """Return an exact size+digest signature for a regular rollout file."""
+    file_stat = path.lstat()
+    if not stat.S_ISREG(file_stat.st_mode):
+        raise OSError(f"rollout is not a regular file: {path}")
+    digest = hashlib.sha256()
+    size = 0
+    with path.open("rb") as handle:
+        while chunk := handle.read(1024 * 1024):
+            digest.update(chunk)
+            size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _file_signature_from_handle(handle: BinaryIO) -> tuple[int, str]:
+    """Return an exact size+digest signature through an already-open file."""
+    handle.seek(0)
+    digest = hashlib.sha256()
+    size = 0
+    while chunk := handle.read(1024 * 1024):
+        digest.update(chunk)
+        size += len(chunk)
+    return size, digest.hexdigest()
+
+
+def _rollout_is_valid(
+    path: Path,
+    target_cwd: str,
+    *,
+    expected_signature: tuple[int, str] | None = None,
+) -> bool:
+    """Validate a migration final without trusting its name alone."""
+    try:
+        rollout_cwd = _rollout_cwd(path)
+        if not rollout_cwd or os.path.realpath(rollout_cwd) != target_cwd:
+            return False
+        signature = _file_signature(path)
+    except OSError:
+        return False
+    return expected_signature is None or signature == expected_signature
+
+
+def _fsync_directory(path: Path) -> None:
+    """Persist directory-entry changes after replace/unlink operations."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _migration_lock_timeout_seconds() -> float:
+    """Return the bounded destination-lock acquisition window."""
+    raw = os.environ.get(MIGRATION_LOCK_TIMEOUT_ENV, "").strip()
+    if not raw:
+        return _DEFAULT_MIGRATION_LOCK_TIMEOUT_SECONDS
+    try:
+        timeout = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"invalid {MIGRATION_LOCK_TIMEOUT_ENV}: {raw!r}") from exc
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise RuntimeError(f"invalid {MIGRATION_LOCK_TIMEOUT_ENV}: {raw!r}")
+    return timeout
+
+
+def _migration_lock_entry_kind(entry_stat: os.stat_result) -> str:
+    if stat.S_ISLNK(entry_stat.st_mode) or entry_stat.st_nlink > 1:
+        return "linked"
+    if not stat.S_ISREG(entry_stat.st_mode):
+        return "non-regular"
+    return ""
+
+
+@contextmanager
+def _reserve_exclusive_destination(
+    destination_for_uuid: Callable[[str], Path],
+    *,
+    log: LogFn,
+) -> Iterator[Path]:
+    """Reserve a collision-free private name without replacing data.
+
+    Every attempt gets a fresh UUID and an adjacent O_EXCL reservation.  A
+    pre-existing artifact or reservation loses that attempt and forces a new
+    name.  The caller must still use a non-replacing operation when materializing
+    the reserved destination because an uncooperating process can create the
+    destination after the reservation's absence check.
+    """
+    nofollow = getattr(os, "O_NOFOLLOW", 0)
+    cloexec = getattr(os, "O_CLOEXEC", 0)
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | nofollow | cloexec
+    last_reservation: Path | None = None
+    for _attempt in range(_RESERVATION_ACQUIRE_MAX_ATTEMPTS):
+        destination = destination_for_uuid(uuid.uuid4().hex)
+        reservation = destination.with_name(
+            f".{destination.name}{_PRESERVATION_RESERVATION_SUFFIX}"
+        )
+        last_reservation = reservation
+        try:
+            reservation_fd = os.open(reservation, flags, 0o600)
+        except FileExistsError:
+            continue
+        locked = False
+        try:
+            try:
+                fcntl.flock(reservation_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise
+            locked = True
+            if not _path_matches_descriptor(reservation, reservation_fd):
+                continue
+            if _path_entry_exists(destination):
+                _unlink_locked_reservation(reservation, reservation_fd)
+                continue
+            try:
+                yield destination
+            finally:
+                _unlink_locked_reservation(reservation, reservation_fd)
+        finally:
+            if locked:
+                fcntl.flock(reservation_fd, fcntl.LOCK_UN)
+            os.close(reservation_fd)
+        return
+
+    message = (
+        "codex-home: exclusive migration reservation did not converge after "
+        f"{_RESERVATION_ACQUIRE_MAX_ATTEMPTS} attempts near {last_reservation}; "
+        "refusing non-replacing publication"
+    )
+    log(message)
+    raise RuntimeError(message)
+
+
+def _path_matches_descriptor(path: Path, descriptor: int) -> bool:
+    """Return whether a descriptor still owns a named directory entry."""
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        path_stat = path.lstat()
+    except OSError:
+        return False
+    return (descriptor_stat.st_dev, descriptor_stat.st_ino) == (
+        path_stat.st_dev,
+        path_stat.st_ino,
+    )
+
+
+def _unlink_locked_reservation(reservation: Path, reservation_fd: int) -> bool:
+    """Unlink a reservation only while its locked descriptor owns the name."""
+    if not _path_matches_descriptor(reservation, reservation_fd):
+        return False
+    try:
+        reservation.unlink()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+@contextmanager
+def _reserve_preservation_destination(
+    source: Path,
+    name_prefix: str,
+    *,
+    log: LogFn,
+) -> Iterator[Path]:
+    """Reserve a collision-free preservation name without replacing data."""
+    with _reserve_exclusive_destination(
+        lambda reservation_id: source.with_name(
+            f"{name_prefix}{source.name}-{reservation_id}"
+        ),
+        log=log,
+    ) as destination:
+        yield destination
+
+
+def _rename_migration_lock_aside(
+    lock_path: Path,
+    entry_stat: os.stat_result,
+    kind: str,
+    log: LogFn,
+) -> bool:
+    """Preserve a rejected lock entry without following it."""
+    try:
+        current_stat = lock_path.lstat()
+    except FileNotFoundError:
+        return False
+    if (current_stat.st_dev, current_stat.st_ino) != (
+        entry_stat.st_dev,
+        entry_stat.st_ino,
+    ):
+        return False
+    with _reserve_preservation_destination(
+        lock_path,
+        _MIGRATION_LOCK_ASIDE_PREFIX,
+        log=log,
+    ) as aside:
+        os.rename(lock_path, aside)
+    _fsync_directory(lock_path.parent)
+    log(f"codex-home: renamed {kind} migration lock entry {lock_path} aside as {aside}")
+    return True
+
+
+def _open_migration_lock(lock_path: Path, log: LogFn) -> BinaryIO:
+    """Open a stable regular lock entry without following links."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("migration lock path resolution requires O_NOFOLLOW")
+    flags = os.O_RDWR | os.O_CREAT | os.O_APPEND | os.O_NONBLOCK | nofollow
+    flags |= getattr(os, "O_CLOEXEC", 0)
+
+    for _attempt in range(8):
+        try:
+            entry_stat = lock_path.lstat()
+        except FileNotFoundError:
+            entry_stat = None
+        if entry_stat is not None:
+            kind = _migration_lock_entry_kind(entry_stat)
+            if kind:
+                _rename_migration_lock_aside(lock_path, entry_stat, kind, log)
+                continue
+
+        try:
+            fd = os.open(lock_path, flags, 0o600)
+        except OSError as exc:
+            if exc.errno in (errno.ELOOP, errno.EISDIR, errno.ENXIO):
+                continue
+            raise
+
+        try:
+            opened_stat = os.fstat(fd)
+            current_stat = lock_path.lstat()
+            kind = _migration_lock_entry_kind(opened_stat)
+            same_entry = (opened_stat.st_dev, opened_stat.st_ino) == (
+                current_stat.st_dev,
+                current_stat.st_ino,
+            )
+            if not kind and same_entry:
+                return os.fdopen(fd, "a+b")
+        except FileNotFoundError:
+            kind = ""
+            current_stat = None
+            same_entry = False
+        except BaseException:
+            os.close(fd)
+            raise
+
+        os.close(fd)
+        if kind and current_stat is not None and same_entry:
+            _rename_migration_lock_aside(lock_path, current_stat, kind, log)
+
+    raise RuntimeError(f"migration lock path resolution did not converge: {lock_path}")
+
+
+@contextmanager
+def _acquire_migration_lock(lock_path: Path, log: LogFn) -> Iterator[BinaryIO]:
+    """Acquire the destination writer lock within a fixed wall-clock bound."""
+    timeout = _migration_lock_timeout_seconds()
+    deadline = time.monotonic() + timeout
+    lock_handle = _open_migration_lock(lock_path, log)
+    acquired = False
+    try:
+        while True:
+            try:
+                fcntl.flock(
+                    lock_handle.fileno(),
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+                acquired = True
+                break
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EAGAIN):
+                    raise
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    message = (
+                        "codex-home: migration lock deadline exceeded after "
+                        f"{timeout:g}s at {lock_path}; refusing rollout migration"
+                    )
+                    log(message)
+                    raise RuntimeError(message)
+                time.sleep(min(_MIGRATION_LOCK_RETRY_SECONDS, remaining))
+        yield lock_handle
+    finally:
+        if acquired:
+            fcntl.flock(lock_handle.fileno(), fcntl.LOCK_UN)
+        lock_handle.close()
+
+
+def _sweep_migration_temps(destination_sessions: Path, log: LogFn) -> None:
+    """Remove private copy temps abandoned before an atomic install."""
+    if not destination_sessions.exists():
+        return
+    pattern = f"{_MIGRATION_TEMP_PREFIX}*{_MIGRATION_TEMP_SUFFIX}"
+    for abandoned in destination_sessions.glob(f"**/{pattern}"):
+        try:
+            abandoned.unlink()
+            log(f"codex-home: removed abandoned rollout migration temp {abandoned}")
+        except FileNotFoundError:
+            continue
+
+
+def _sweep_stale_reservations(root: Path, log: LogFn) -> None:
+    """Remove unlocked crash or stale migration reservation sidecars."""
+    if not root.exists():
+        return
+    stale_before = time.time() - _PRESERVATION_RESERVATION_STALE_SECONDS
+    for reservation in root.glob(
+        f"**/..pinkybot-rollout-*{_PRESERVATION_RESERVATION_SUFFIX}"
+    ):
+        try:
+            reservation_stat = reservation.lstat()
+        except FileNotFoundError:
+            continue
+        if (
+            not stat.S_ISREG(reservation_stat.st_mode)
+            or reservation_stat.st_nlink != 1
+            or reservation_stat.st_size != 0
+        ):
+            continue
+        destination = reservation.with_name(
+            reservation.name[1 : -len(_PRESERVATION_RESERVATION_SUFFIX)]
+        )
+        if _path_entry_exists(destination) and reservation_stat.st_mtime > stale_before:
+            continue
+        nofollow = getattr(os, "O_NOFOLLOW", 0)
+        try:
+            reservation_fd = os.open(
+                reservation,
+                os.O_RDWR | nofollow | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError:
+            continue
+        try:
+            opened_stat = os.fstat(reservation_fd)
+            if (opened_stat.st_dev, opened_stat.st_ino) != (
+                reservation_stat.st_dev,
+                reservation_stat.st_ino,
+            ):
+                continue
+            try:
+                fcntl.flock(
+                    reservation_fd,
+                    fcntl.LOCK_EX | fcntl.LOCK_NB,
+                )
+            except OSError as exc:
+                if exc.errno in (errno.EACCES, errno.EAGAIN):
+                    continue
+                raise
+            if not _unlink_locked_reservation(reservation, reservation_fd):
+                continue
+            kind = (
+                "stale"
+                if reservation_stat.st_mtime <= stale_before
+                else "orphaned"
+            )
+            log(
+                f"codex-home: removed {kind} migration reservation {reservation}"
+            )
+        finally:
+            os.close(reservation_fd)
+
+
+@cache
+def _resolve_lsof_binary() -> str | None:
+    """Resolve lsof across daemon and login-shell PATH differences."""
+    resolved = shutil.which("lsof")
+    if resolved is not None:
+        return resolved
+    for fallback in _LSOF_FALLBACK_PATHS:
+        resolved = shutil.which(fallback)
+        if resolved is not None:
+            return resolved
+    return None
+
+
+def _claim_has_open_descriptors(claim: Path, log: LogFn) -> bool | None:
+    """Return whether any descriptor holds a claim path.
+
+    This path scan is used only to distinguish a crashed mode-000 freeze from a
+    live retirement. It deliberately includes this process: another retirer in
+    the same process is still a live holder and must keep the freeze intact.
+    """
+    lsof_binary = _resolve_lsof_binary()
+    if lsof_binary is None:
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            "descriptor scan unavailable: lsof executable not found"
+        )
+        return None
+    try:
+        scan = subprocess.run(
+            [lsof_binary, "-Fn", "--", os.fspath(claim)],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            f"descriptor scan unavailable: {exc}"
+        )
+        return None
+
+    stderr = scan.stderr.strip()
+    stdout = scan.stdout.strip()
+    if stderr:
+        log(
+            f"codex-home: retained rollout claim {claim}; "
+            f"descriptor scan failed: {stderr}"
+        )
+        return None
+    if scan.returncode == 0 and stdout:
+        return True
+    if scan.returncode == 1 and not stdout:
+        return False
+    log(
+        f"codex-home: retained rollout claim {claim}; descriptor scan returned "
+        f"unexpected status {scan.returncode}"
+    )
+    return None
+
+
+def _parse_lsof_integer(raw: str) -> int | None:
+    """Parse a decimal or hexadecimal lsof identity field."""
+    try:
+        return int(raw, 16 if raw.lower().startswith("0x") else 10)
+    except ValueError:
+        return None
+
+
+def _inode_has_open_descriptors(
+    claim_handle: BinaryIO,
+    claim: Path,
+    log: LogFn,
+) -> bool | None:
+    """Scan a frozen claim by device and inode, excluding only this handle."""
+    lsof_binary = _resolve_lsof_binary()
+    if lsof_binary is None:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            "descriptor scan unavailable for frozen inode: "
+            "lsof executable not found"
+        )
+        return None
+    try:
+        scan = subprocess.run(
+            [lsof_binary, "-F", "pfDi"],
+            stdin=subprocess.DEVNULL,
+            capture_output=True,
+            text=True,
+            timeout=_CLAIM_DESCRIPTOR_SCAN_TIMEOUT_SECONDS,
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError) as exc:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            f"descriptor scan unavailable for frozen inode: {exc}"
+        )
+        return None
+
+    stderr = scan.stderr.strip()
+    stdout = scan.stdout.strip()
+    if stderr:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            f"descriptor scan failed for frozen inode: {stderr}"
+        )
+        return None
+    if scan.returncode != 0 or not stdout:
+        log(
+            f"codex-home: claim retirement boundary-condition check for {claim} "
+            f"received unexpected inode-scan status {scan.returncode}"
+        )
+        return None
+
+    records: list[tuple[int | None, str, int | None, int | None]] = []
+    current_pid: int | None = None
+    current_fd = ""
+    current_device: int | None = None
+    current_inode: int | None = None
+
+    def finish_record() -> None:
+        if current_fd:
+            records.append(
+                (current_pid, current_fd, current_device, current_inode)
+            )
+
+    for line in stdout.splitlines():
+        if not line:
+            continue
+        field, value = line[0], line[1:]
+        if field == "p":
+            finish_record()
+            current_pid = _parse_lsof_integer(value)
+            current_fd = ""
+            current_device = None
+            current_inode = None
+        elif field == "f":
+            finish_record()
+            current_fd = value
+            current_device = None
+            current_inode = None
+        elif field == "D" and current_fd:
+            current_device = _parse_lsof_integer(value)
+        elif field == "i" and current_fd:
+            current_inode = _parse_lsof_integer(value)
+    finish_record()
+
+    claim_stat = os.fstat(claim_handle.fileno())
+    target_identity = (claim_stat.st_dev, claim_stat.st_ino)
+    own_identity = (os.getpid(), claim_handle.fileno())
+    found_own_descriptor = False
+    uncertain_target_record = False
+    for process_id, descriptor, device, inode in records:
+        exact_target = (device, inode) == target_identity
+        partial_target = (
+            (inode == target_identity[1] and device is None)
+            or (device == target_identity[0] and inode is None)
+        )
+        if partial_target:
+            uncertain_target_record = True
+        if not exact_target:
+            continue
+        descriptor_number = ""
+        for character in descriptor:
+            if not character.isdigit():
+                break
+            descriptor_number += character
+        parsed_descriptor = (
+            int(descriptor_number) if descriptor_number else None
+        )
+        if (process_id, parsed_descriptor) == own_identity:
+            found_own_descriptor = True
+            continue
+        return True
+
+    if uncertain_target_record:
+        log(
+            f"codex-home: retained rollout claim {claim}; frozen inode scan "
+            "could not parse a device or inode field for a potential holder"
+        )
+        return None
+    if found_own_descriptor:
+        return False
+    log(
+        f"codex-home: claim retirement boundary-condition check for {claim} "
+        "did not find its own descriptor in the inode re-scan"
+    )
+    return None
+
+
+def _restore_rollout_claim_mode(
+    claim: Path,
+    claim_handle: BinaryIO,
+    original_mode: int,
+    log: LogFn,
+) -> bool:
+    """Restore a frozen named claim through its already-open descriptor."""
+    try:
+        os.fchmod(claim_handle.fileno(), original_mode)
+        os.fsync(claim_handle.fileno())
+    except OSError as exc:
+        log(
+            f"codex-home: retained rollout claim {claim}; could not restore "
+            f"mode after retirement freeze: {exc}"
+        )
+        return False
+    return True
+
+
+def _repair_frozen_rollout_claim(claim: Path, log: LogFn) -> bool:
+    """Repair a mode-000 claim left by a crashed retirement.
+
+    A live retirement always holds an open descriptor. Seeing any holder, or
+    being unable to prove holder absence, is therefore a transient retain and
+    must never thaw another retireer's stable boundary.
+    """
+    try:
+        frozen_stat = claim.lstat()
+    except FileNotFoundError:
+        return True
+    if (
+        not stat.S_ISREG(frozen_stat.st_mode)
+        or stat.S_IMODE(frozen_stat.st_mode) != 0
+    ):
+        return True
+
+    holders = _claim_has_open_descriptors(claim, log)
+    if holders is not False:
+        detail = (
+            "another retirement still holds the frozen claim"
+            if holders
+            else "live-retirement status could not be verified"
+        )
+        log(
+            f"codex-home: transiently retained mode-000 rollout claim {claim}; "
+            f"{detail}"
+        )
+        return False
+
+    try:
+        os.chmod(
+            claim,
+            _CRASH_FROZEN_CLAIM_MODE,
+            follow_symlinks=False,
+        )
+        repaired_stat = claim.lstat()
+    except (OSError, NotImplementedError) as exc:
+        log(
+            f"codex-home: retained crashed mode-000 rollout claim {claim}; "
+            f"pathname mode repair failed: {exc}"
+        )
+        return False
+    if (
+        not stat.S_ISREG(repaired_stat.st_mode)
+        or (repaired_stat.st_dev, repaired_stat.st_ino)
+        != (frozen_stat.st_dev, frozen_stat.st_ino)
+    ):
+        log(
+            f"codex-home: retained rollout claim {claim}; identity changed "
+            "during crashed-freeze repair"
+        )
+        return False
+    try:
+        _fsync_directory(claim.parent)
+    except OSError as exc:
+        log(
+            f"codex-home: repaired crashed mode-000 rollout claim {claim}, "
+            f"but its directory sync failed: {exc}"
+        )
+        return False
+    log(f"codex-home: repaired crashed mode-000 rollout claim {claim}")
+    return True
+
+
+def _publish_frozen_rollout_recovery(
+    claim: Path,
+    claim_handle: BinaryIO,
+    target_cwd: str,
+    expected_signature: tuple[int, str],
+    log: LogFn,
+) -> Path:
+    """Publish and verify a durable recovery claim before unlinking the old one."""
+    canonical = _claim_original_path(claim)
+    if canonical is None:
+        raise RuntimeError(f"cannot recover malformed rollout claim name: {claim}")
+
+    temp_fd, temp_name = tempfile.mkstemp(
+        dir=claim.parent,
+        prefix=f"{_MIGRATION_TEMP_PREFIX}recovery-",
+        suffix=_MIGRATION_TEMP_SUFFIX,
+    )
+    temp_path = Path(temp_name)
+    recovery: Path | None = None
+    try:
+        claim_handle.seek(0)
+        with os.fdopen(temp_fd, "wb") as temp_handle:
+            temp_fd = -1
+            while chunk := claim_handle.read(1024 * 1024):
+                temp_handle.write(chunk)
+            temp_handle.flush()
+            os.fsync(temp_handle.fileno())
+
+        while True:
+            with _reserve_exclusive_destination(
+                lambda recovery_id: claim.with_name(
+                    f"{_MIGRATION_CLAIM_PREFIX}{recovery_id}-{canonical.name}"
+                ),
+                log=log,
+            ) as candidate:
+                try:
+                    os.link(temp_path, candidate, follow_symlinks=False)
+                except FileExistsError:
+                    continue
+                recovery = candidate
+            break
+        temp_path.unlink()
+        _fsync_directory(claim.parent)
+        if recovery is None or not _rollout_is_valid(
+            recovery,
+            target_cwd,
+            expected_signature=expected_signature,
+        ):
+            raise RuntimeError(
+                f"published rollout recovery claim failed verification: {recovery}"
+            )
+    except Exception:
+        if recovery is not None:
+            try:
+                recovery.unlink()
+                _fsync_directory(claim.parent)
+            except FileNotFoundError:
+                pass
+        raise
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+    assert recovery is not None
+    log(f"codex-home: published verified rollout recovery claim {recovery}")
+    return recovery
+
+
+def _retire_rollout_claim(
+    claim: Path,
+    destination: Path,
+    target_cwd: str,
+    *,
+    log: LogFn,
+) -> bool:
+    """Retire a claim only after reaching a stable, recoverable byte boundary."""
+    nofollow = getattr(os, "O_NOFOLLOW", None)
+    if nofollow is None:
+        raise RuntimeError("rollout claim path resolution requires O_NOFOLLOW")
+    if not _repair_frozen_rollout_claim(claim, log):
+        return False
+    flags = os.O_RDONLY | nofollow | getattr(os, "O_CLOEXEC", 0)
+    try:
+        claim_fd = os.open(claim, flags)
+    except FileNotFoundError:
+        return True
+    except PermissionError as exc:
+        log(
+            f"codex-home: transiently retained rollout claim {claim}; "
+            f"pathname open was denied during a concurrent freeze: {exc}"
+        )
+        return False
+    with os.fdopen(claim_fd, "rb", buffering=0) as claim_handle:
+        opened_stat = os.fstat(claim_handle.fileno())
+        try:
+            current_stat = claim.lstat()
+        except FileNotFoundError:
+            current_stat = None
+        if (
+            current_stat is None
+            or not stat.S_ISREG(opened_stat.st_mode)
+            or (opened_stat.st_dev, opened_stat.st_ino)
+            != (current_stat.st_dev, current_stat.st_ino)
+        ):
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                "claim identity changed during verification"
+            )
+            return False
+
+        original_mode = stat.S_IMODE(opened_stat.st_mode)
+        try:
+            os.fchmod(claim_handle.fileno(), 0)
+            os.fsync(claim_handle.fileno())
+        except OSError as exc:
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                f"could not establish retirement freeze: {exc}"
+            )
+            _restore_rollout_claim_mode(
+                claim,
+                claim_handle,
+                original_mode,
+                log,
+            )
+            return False
+
+        holders = _inode_has_open_descriptors(claim_handle, claim, log)
+        if holders is not False:
+            if holders:
+                log(
+                    f"codex-home: retained rollout claim {claim}; "
+                    "open descriptor holder(s) remain at the frozen boundary"
+                )
+            _restore_rollout_claim_mode(
+                claim,
+                claim_handle,
+                original_mode,
+                log,
+            )
+            return False
+
+        claim_signature = _file_signature_from_handle(claim_handle)
+        destination_matches = _rollout_is_valid(
+            destination,
+            target_cwd,
+            expected_signature=claim_signature,
+        )
+        recovery: Path | None = None
+        if not destination_matches:
+            try:
+                recovery = _publish_frozen_rollout_recovery(
+                    claim,
+                    claim_handle,
+                    target_cwd,
+                    claim_signature,
+                    log,
+                )
+            except Exception as exc:
+                log(
+                    f"codex-home: retained rollout claim {claim}; recovery "
+                    f"publication failed before unlink: {exc}"
+                )
+                _restore_rollout_claim_mode(
+                    claim,
+                    claim_handle,
+                    original_mode,
+                    log,
+                )
+                return False
+
+        try:
+            current_stat = claim.lstat()
+        except FileNotFoundError:
+            current_stat = None
+        if current_stat is not None and (
+            opened_stat.st_dev,
+            opened_stat.st_ino,
+        ) != (current_stat.st_dev, current_stat.st_ino):
+            log(
+                f"codex-home: retained rollout claim {claim}; "
+                "claim identity changed before unlink"
+            )
+            _restore_rollout_claim_mode(
+                claim,
+                claim_handle,
+                original_mode,
+                log,
+            )
+            return False
+        if current_stat is not None:
+            try:
+                claim.unlink()
+            except FileNotFoundError:
+                pass
+            except OSError as exc:
+                log(
+                    f"codex-home: retained rollout claim {claim}; "
+                    f"unlink failed at the stable boundary: {exc}"
+                )
+                _restore_rollout_claim_mode(
+                    claim,
+                    claim_handle,
+                    original_mode,
+                    log,
+                )
+                return False
+        try:
+            _fsync_directory(claim.parent)
+        except OSError as exc:
+            log(
+                f"codex-home: claim retirement directory sync failed for "
+                f"{claim}: {exc}"
+            )
+            return False
+
+    if recovery is not None:
+        log(
+            f"codex-home: retained differing bytes as recovery claim {recovery}"
+        )
+        return False
+    log(f"codex-home: retired verified rollout claim {claim}")
+    return True
+
+
+def _quarantine_rollout(destination: Path, log: LogFn) -> Path:
+    """Atomically move an invalid final aside so it cannot shadow discovery."""
+    with _reserve_preservation_destination(
+        destination,
+        _MIGRATION_QUARANTINE_PREFIX,
+        log=log,
+    ) as quarantine:
+        os.rename(destination, quarantine)
+    _fsync_directory(destination.parent)
+    log(f"codex-home: quarantined invalid rollout migration final {destination} as {quarantine}")
+    return quarantine
+
+
+def _install_rollout(
+    claim: Path,
+    destination: Path,
+    target_cwd: str,
+    *,
+    log: LogFn,
+) -> bool:
+    """Install one rollout with crash recovery and concurrent convergence.
+
+    ``claim`` is a private hard-link name established before the canonical name
+    is unlinked.  All reads, verification, and
+    cleanup stay on that private name.  A path-based writer arriving after the
+    canonical unlink must create a fresh canonical file, which this migration
+    never removes and a later prepare can migrate independently.
+    """
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    if not _repair_frozen_rollout_claim(claim, log):
+        return False
+
+    if _path_entry_exists(destination):
+        try:
+            claim_signature = _file_signature(claim)
+        except FileNotFoundError:
+            if _rollout_is_valid(destination, target_cwd):
+                log(
+                    f"codex-home: rollout migration converged at {destination}; "
+                    "private claim was already consumed"
+                )
+                return True
+            raise
+        except PermissionError as exc:
+            log(
+                f"codex-home: transiently retained rollout claim {claim}; "
+                f"claim pathname access was denied during a concurrent freeze: {exc}"
+            )
+            return False
+        if _rollout_is_valid(
+            destination,
+            target_cwd,
+            expected_signature=claim_signature,
+        ):
+            _retire_rollout_claim(claim, destination, target_cwd, log=log)
+            log(f"codex-home: rollout migration converged at {destination}")
+            return True
+        _quarantine_rollout(destination, log)
+
+    temp_fd, temp_name = tempfile.mkstemp(
+        dir=destination.parent,
+        prefix=_MIGRATION_TEMP_PREFIX,
+        suffix=_MIGRATION_TEMP_SUFFIX,
+    )
+    temp_path = Path(temp_name)
+    try:
+        copied_digest = hashlib.sha256()
+        copied_size = 0
+        with claim.open("rb") as source_handle, os.fdopen(temp_fd, "wb") as temp_handle:
+            temp_fd = -1
+            while chunk := source_handle.read(1024 * 1024):
+                temp_handle.write(chunk)
+                copied_digest.update(chunk)
+                copied_size += len(chunk)
+            temp_handle.flush()
+            os.fsync(temp_handle.fileno())
+        copied_signature = (copied_size, copied_digest.hexdigest())
+
+        # A descriptor opened before the canonical unlink can still change the
+        # claimed inode.  Detect that shape before install and leave the claim
+        # intact for retry; name-based late writers use the fresh canonical path.
+        if _file_signature(claim) != copied_signature:
+            raise RuntimeError(f"rollout claim changed during migration: {claim}")
+        if not _rollout_is_valid(
+            temp_path,
+            target_cwd,
+            expected_signature=copied_signature,
+        ):
+            raise RuntimeError(f"rollout migration temp failed validation: {temp_path}")
+
+        os.replace(temp_path, destination)
+        _fsync_directory(destination.parent)
+        if not _rollout_is_valid(
+            destination,
+            target_cwd,
+            expected_signature=copied_signature,
+        ):
+            _quarantine_rollout(destination, log)
+            raise RuntimeError(f"rollout migration final failed validation: {destination}")
+
+        # Installation does not consume the private claim. Retirement is a
+        # separate verified-tombstone boundary: zero descriptor holders first,
+        # then a stable byte-identity check against the installed destination.
+        _retire_rollout_claim(claim, destination, target_cwd, log=log)
+        return True
+    except FileNotFoundError:
+        # A crash-recovery claim may already have been consumed by a concurrent
+        # process. Count a valid final as convergence instead of raising.
+        if _rollout_is_valid(destination, target_cwd):
+            log(
+                f"codex-home: rollout migration converged at {destination}; "
+                "private claim was already consumed"
+            )
+            return True
+        raise
+    except PermissionError as exc:
+        log(
+            f"codex-home: transiently retained rollout claim {claim}; "
+            f"claim pathname access was denied during a concurrent freeze: {exc}"
+        )
+        return False
+    finally:
+        if temp_fd >= 0:
+            os.close(temp_fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _claim_original_path(claim: Path) -> Path | None:
+    """Decode the canonical source path represented by a private claim."""
+    if not claim.name.startswith(_MIGRATION_CLAIM_PREFIX):
+        return None
+    encoded = claim.name[len(_MIGRATION_CLAIM_PREFIX) :]
+    claim_id, separator, original_name = encoded.partition("-")
+    if (
+        not separator
+        or len(claim_id) != 32
+        or any(character not in "0123456789abcdef" for character in claim_id)
+        or not original_name.startswith("rollout-")
+        or not original_name.endswith(".jsonl")
+    ):
+        return None
+    return claim.with_name(original_name)
+
+
+def _claim_rollout(source: Path, *, log: LogFn) -> Path | None:
+    """Claim a rollout without any replacing rename operation.
+
+    The hard link is a non-replacing atomic publication: EEXIST loses the UUID
+    attempt without touching the interleaved claim.  Only after the claim link
+    exists do we unlink the canonical writer name.  Descriptors opened before
+    that unlink remain attached to the claimed inode for verified retirement.
+    """
+    while True:
+        with _reserve_exclusive_destination(
+            lambda claim_id: source.with_name(
+                f"{_MIGRATION_CLAIM_PREFIX}{claim_id}-{source.name}"
+            ),
+            log=log,
+        ) as claim:
+            try:
+                os.link(source, claim, follow_symlinks=False)
+            except FileExistsError:
+                continue
+            except FileNotFoundError:
+                return None
+            try:
+                source.unlink()
+            except FileNotFoundError:
+                # A concurrent claimant may already have removed the canonical
+                # name. This private hard link still owns the original inode.
+                pass
+        _fsync_directory(source.parent)
+        return claim
+
+
+def _snapshot_rollout_candidates(source_sessions: Path) -> list[_RolloutCandidate]:
+    """Return recoverable claims first, then live canonical rollout names."""
+    claims: list[_RolloutCandidate] = []
+    claim_pattern = f"**/{_MIGRATION_CLAIM_PREFIX}*-rollout-*.jsonl"
+    for claim in sorted(source_sessions.glob(claim_pattern)):
+        canonical = _claim_original_path(claim)
+        if canonical is not None:
+            claims.append(_RolloutCandidate(canonical=canonical, claim=claim))
+    canonical = [
+        _RolloutCandidate(path)
+        for path in sorted(source_sessions.glob("**/rollout-*.jsonl"))
+    ]
+    return [*claims, *canonical]
+
+
+def _retry_rollout_candidates(
+    source_sessions: Path,
+    relative_sources: list[str],
+) -> list[_RolloutCandidate]:
+    """Resolve marker-pinned canonical paths and their private crash claims."""
+    candidates: list[_RolloutCandidate] = []
+    seen: set[tuple[Path, Path | None]] = set()
+    for raw_relative in relative_sources:
+        relative = Path(raw_relative)
+        if (
+            relative.is_absolute()
+            or ".." in relative.parts
+            or not relative.name.startswith("rollout-")
+            or not relative.name.endswith(".jsonl")
+        ):
+            continue
+        canonical = source_sessions / relative
+        claim_pattern = f"{_MIGRATION_CLAIM_PREFIX}*-{canonical.name}"
+        for claim in sorted(canonical.parent.glob(claim_pattern)):
+            if _claim_original_path(claim) == canonical:
+                key = (canonical, claim)
+                if key not in seen:
+                    candidates.append(_RolloutCandidate(canonical, claim))
+                    seen.add(key)
+        if _path_entry_exists(canonical):
+            key = (canonical, None)
+            if key not in seen:
+                candidates.append(_RolloutCandidate(canonical))
+                seen.add(key)
+    return candidates
+
+
+def move_matching_rollouts(
+    source_home: Path,
+    destination_home: Path,
+    working_dir: str | Path,
+    *,
+    log: LogFn,
+) -> int:
+    """Move rollouts for one resolved working directory between Codex homes."""
+    source_sessions = source_home / "sessions"
+    destination_sessions = destination_home / "sessions"
+    target_cwd = os.path.realpath(str(working_dir))
+    # Snapshot before locking so a contender that saw the same source before
+    # the winner claimed it can still converge on the installed final. Private
+    # crash claims lead the list so a newer canonical recreation wins last.
+    candidates = _snapshot_rollout_candidates(source_sessions)
+    destination_sessions.mkdir(parents=True, exist_ok=True)
+    lock_path = destination_sessions / _MIGRATION_LOCK_NAME
+    with _acquire_migration_lock(lock_path, log):
+        # Serializing destination writers makes temp cleanup race-free and
+        # works across daemon processes. The kernel releases flock on crash,
+        # after which the successor sweeps the abandoned private temp.
+        _sweep_migration_temps(destination_sessions, log)
+        _sweep_migration_temps(source_sessions, log)
+        _sweep_stale_reservations(source_sessions, log)
+        _sweep_stale_reservations(destination_sessions, log)
+        return _move_rollout_candidates(
+            candidates,
+            source_sessions,
+            destination_sessions,
+            target_cwd,
+            log=log,
+        ).moved
+
+
+def _move_rollout_candidates(
+    candidates: list[_RolloutCandidate],
+    source_sessions: Path,
+    destination_sessions: Path,
+    target_cwd: str,
+    *,
+    log: LogFn,
+) -> _MoveResult:
+    """Move a pre-lock snapshot while holding the destination writer lock."""
+    moved = 0
+    claimed_sources: set[Path] = set()
+    for candidate in candidates:
+        source = candidate.canonical
+        relative = source.relative_to(source_sessions)
+        destination = destination_sessions / relative
+        inspection_path = candidate.claim or source
+        if candidate.claim is not None and not _repair_frozen_rollout_claim(
+            candidate.claim,
+            log,
+        ):
+            continue
+        rollout_cwd = _rollout_cwd(inspection_path)
+        if not rollout_cwd:
+            if candidate.claim is not None:
+                try:
+                    claim_mode = stat.S_IMODE(candidate.claim.lstat().st_mode)
+                except FileNotFoundError:
+                    claim_mode = None
+                if claim_mode == 0:
+                    log(
+                        "codex-home: transiently retained rollout claim "
+                        f"{candidate.claim}; claim pathname is frozen by a "
+                        "concurrent retirement"
+                    )
+            if not _path_entry_exists(inspection_path) and _rollout_is_valid(
+                destination, target_cwd
+            ):
+                log(
+                    f"codex-home: rollout migration converged at {destination}; "
+                    "source was already claimed"
+                )
+                moved += 1
+            continue
+        if os.path.realpath(rollout_cwd) != target_cwd:
+            continue
+        claim = candidate.claim or _claim_rollout(source, log=log)
+        if claim is None:
+            if _rollout_is_valid(destination, target_cwd):
+                log(
+                    f"codex-home: rollout migration converged at {destination}; "
+                    "source was already claimed"
+                )
+                moved += 1
+            continue
+        claimed_sources.add(source)
+        if _install_rollout(claim, destination, target_cwd, log=log):
+            moved += 1
+    return _MoveResult(moved=moved, claimed_sources=frozenset(claimed_sources))
+
+
+def _write_migration_marker(
+    codex_home: Path,
+    moved: int,
+    *,
+    retry_sources: list[str],
+) -> None:
+    """Durably commit the one-time migration gate after a successful scan."""
+    marker = codex_home / ROLLOUT_MIGRATION_MARKER
+    payload = {
+        "completed_at": datetime.now(timezone.utc).isoformat(),
+        "moved_count": moved,
+        # Exact paths claimed during the one-time bridge remain eligible for a
+        # bounded retry. A writer recreating one of those canonical names after
+        # the atomic claim is therefore migrated on the next prepare without
+        # reopening the shared store to arbitrary late rollouts.
+        "retry_sources": retry_sources,
+    }
+    fd, temp_name = tempfile.mkstemp(
+        dir=codex_home,
+        prefix=f".{ROLLOUT_MIGRATION_MARKER}-",
+        suffix=".tmp",
+    )
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            fd = -1
+            json.dump(payload, handle, sort_keys=True)
+            handle.write("\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temp_path, marker)
+        _fsync_directory(codex_home)
+    finally:
+        if fd >= 0:
+            os.close(fd)
+        try:
+            temp_path.unlink()
+        except FileNotFoundError:
+            pass
+
+
+def _read_marker_retry_sources(marker: Path) -> list[str]:
+    """Read retry paths from a managed marker; malformed markers fail closed."""
+    try:
+        marker_stat = marker.lstat()
+        if not stat.S_ISREG(marker_stat.st_mode) or marker_stat.st_nlink > 1:
+            return []
+        payload = json.loads(marker.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError):
+        return []
+    if not isinstance(payload, dict):
+        return []
+    raw_sources = payload.get("retry_sources")
+    if not isinstance(raw_sources, list):
+        return []
+    return [source for source in raw_sources if isinstance(source, str)]
+
+
+def _run_initial_rollout_migration(
+    shared_home: Path,
+    resolved_home: Path,
+    working_dir: Path,
+    *,
+    log: LogFn,
+) -> int:
+    """Run and durably gate the shared-store import exactly once.
+
+    The fast marker check happens before the shared directory is scanned. A
+    contender that began during the first migration may have already captured
+    the same source list; the destination lock lets it observe the committed
+    marker and count the winner's validated finals without touching shared
+    storage again. The marker is written before the winner releases that lock,
+    closing the scan-to-marker race between concurrent spawns.
+    """
+    marker = resolved_home / ROLLOUT_MIGRATION_MARKER
+    source_sessions = shared_home / "sessions"
+    destination_sessions = resolved_home / "sessions"
+    # Reservations are private zero-byte coordination artifacts. Sweep old
+    # crash residue even when the durable marker lets migration return early.
+    _sweep_stale_reservations(source_sessions, log)
+    _sweep_stale_reservations(destination_sessions, log)
+    if _path_entry_exists(marker):
+        retry_sources = _read_marker_retry_sources(marker)
+        if not retry_sources:
+            log(
+                f"codex-home: migration marker present at {marker}; "
+                "shared rollout store not scanned"
+            )
+            return 0
+        candidates = _retry_rollout_candidates(source_sessions, retry_sources)
+        if not candidates:
+            log(
+                f"codex-home: migration marker present at {marker}; "
+                "no claimed source path requires retry"
+            )
+            return 0
+        target_cwd = os.path.realpath(str(working_dir))
+        lock_path = destination_sessions / _MIGRATION_LOCK_NAME
+        with _acquire_migration_lock(lock_path, log):
+            _sweep_migration_temps(destination_sessions, log)
+            result = _move_rollout_candidates(
+                candidates,
+                source_sessions,
+                destination_sessions,
+                target_cwd,
+                log=log,
+            )
+        log(
+            f"codex-home: migration marker retry converged on "
+            f"{result.moved} rollout(s)"
+        )
+        return result.moved
+
+    candidates = _snapshot_rollout_candidates(source_sessions)
+    target_cwd = os.path.realpath(str(working_dir))
+    lock_path = destination_sessions / _MIGRATION_LOCK_NAME
+    with _acquire_migration_lock(lock_path, log):
+        if _path_entry_exists(marker):
+            converged = sum(
+                _rollout_is_valid(
+                    destination_sessions
+                    / candidate.canonical.relative_to(source_sessions),
+                    target_cwd,
+                )
+                for candidate in candidates
+            )
+            log(
+                f"codex-home: concurrent rollout migration converged on "
+                f"{converged} installed rollout(s); marker already committed"
+            )
+            return converged
+        _sweep_migration_temps(destination_sessions, log)
+        result = _move_rollout_candidates(
+            candidates,
+            source_sessions,
+            destination_sessions,
+            target_cwd,
+            log=log,
+        )
+        retry_sources = sorted(
+            str(source.relative_to(source_sessions))
+            for source in result.claimed_sources
+        )
+        _write_migration_marker(
+            resolved_home,
+            result.moved,
+            retry_sources=retry_sources,
+        )
+        return result.moved
+
+
+def validate_agent_codex_home(
+    agent: object,
+    *,
+    soul_version_store: object | None = None,
+) -> Path:
+    """Validate an isolated home before teardown without changing the filesystem.
+
+    This is the retained-transport preflight seam. Publication deliberately
+    does not happen here: a later task may inherit async context from the
+    replacement operation, while every actual process spawn must snapshot and
+    publish the soul for the state that exists at that exact boundary.
+    """
+    codex_home = codex_home_for(agent)
+    if not per_agent_codex_home_enabled():
+        return codex_home
+
+    _agent_working_dir(agent)
+    shared_home = shared_codex_home().expanduser().resolve()
+    resolved_home = codex_home.expanduser().resolve()
+    if resolved_home == shared_home:
+        raise RuntimeError("refusing Codex spawn: per-agent CODEX_HOME resolves to the shared home")
+
+    auth_source = shared_home / "auth.json"
+    if not auth_source.is_file() or not os.access(auth_source, os.R_OK):
+        raise RuntimeError(
+            f"refusing Codex spawn: shared auth file is absent or unreadable: {auth_source}"
+        )
+
+    auth_path = resolved_home / "auth.json"
+    try:
+        auth_stat = auth_path.lstat()
+    except FileNotFoundError:
+        auth_stat = None
+    if auth_stat is not None and not stat.S_ISLNK(auth_stat.st_mode):
+        raise RuntimeError(
+            f"refusing Codex spawn: {auth_path} is not the managed auth symlink"
+        )
+
+    _validate_agent_soul_publication(
+        resolved_home,
+        agent,
+        soul_version_store,
+    )
+    _migration_lock_timeout_seconds()
+    return resolved_home
+
+
+def prepare_agent_codex_home(
+    agent: object,
+    *,
+    log: LogFn,
+    soul_version_store: object | None = None,
+) -> Path:
+    """Prepare the isolated home at the actual Codex process-spawn boundary.
+
+    With the flag disabled this function performs no filesystem work. With it
+    enabled, auth absence is a hard error before launch, config generation is
+    non-destructive, the compiled soul is installed with version snapshots,
+    and cwd-matched rollouts move into the isolated store.
+    """
+    resolved_home = validate_agent_codex_home(
+        agent,
+        soul_version_store=soul_version_store,
+    )
+    if not per_agent_codex_home_enabled():
+        return resolved_home
+
+    working_dir = _agent_working_dir(agent)
+    shared_home = shared_codex_home().expanduser().resolve()
+    auth_source = shared_home / "auth.json"
+    resolved_home.mkdir(parents=True, exist_ok=True)
+    resolved_home.chmod(0o700)
+    sessions = resolved_home / "sessions"
+    sessions.mkdir(parents=True, exist_ok=True)
+    sessions.chmod(0o700)
+    _write_managed_config(resolved_home, working_dir, log)
+    _ensure_auth_link(resolved_home, auth_source)
+    _write_agent_soul(resolved_home, agent, soul_version_store)
+
+    moved = _run_initial_rollout_migration(
+        shared_home,
+        resolved_home,
+        working_dir,
+        log=log,
+    )
+    log(f"codex-home: migrated {moved} cwd-matched rollout(s) into {resolved_home / 'sessions'}")
+    return resolved_home
+
+
+def rollback_agent_rollouts(
+    working_dir: str | Path,
+    agent_home: str | Path,
+    *,
+    shared_home: str | Path | None = None,
+    log: LogFn,
+) -> int:
+    """Move one agent's rollouts back to the user-level Codex store."""
+    source = Path(agent_home).expanduser().resolve()
+    destination = (
+        Path(shared_home).expanduser().resolve()
+        if shared_home is not None
+        else shared_codex_home().expanduser().resolve()
+    )
+    moved = move_matching_rollouts(
+        source,
+        destination,
+        working_dir,
+        log=log,
+    )
+    log(f"codex-home: rolled back {moved} cwd-matched rollout(s) into {destination / 'sessions'}")
+    return moved

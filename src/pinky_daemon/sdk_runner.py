@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import sys
 import time
+from collections.abc import Callable
 from dataclasses import dataclass, field
 
 from pinky_daemon.claude_runner import RunResult
@@ -32,8 +33,8 @@ class SDKRunnerConfig:
     # Model selection
     model: str | None = None
 
-    # MCP servers (dict of name -> config)
-    mcp_servers: dict = field(default_factory=dict)
+    # MCP servers (dict of name -> config, or an explicit --mcp-config path)
+    mcp_servers: dict | str = field(default_factory=dict)
 
     # Tool permissions (outreach removed — broker handles messaging)
     allowed_tools: list[str] = field(default_factory=lambda: [
@@ -87,10 +88,12 @@ class SDKRunner:
         *,
         hook_manager: HookManager | None = None,
         agent_name: str = "",
+        session_id_callback: Callable[[str], None] | None = None,
     ) -> None:
         self._config = config or SDKRunnerConfig()
         self._hook_manager = hook_manager
         self._agent_name = agent_name
+        self._session_id_callback = session_id_callback
         self._ensure_sdk()
 
     def _ensure_sdk(self) -> None:
@@ -122,9 +125,13 @@ class SDKRunner:
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
+            ConversationResetMessage,
+            RateLimitEvent,
             ResultMessage,
+            StreamEvent,
             SystemMessage,
             TextBlock,
+            UserMessage,
             query,
         )
 
@@ -206,22 +213,39 @@ class SDKRunner:
 
         try:
             got_result = False
+            invalidated_session_ids: set[str] = set()
+
+            def capture_session_id(candidate: object) -> None:
+                """Capture a non-empty ID not invalidated by a reset frame."""
+                nonlocal result_session_id
+                if not isinstance(candidate, str) or not candidate:
+                    return
+                if candidate in invalidated_session_ids:
+                    _log(
+                        "sdk-runner: WARNING refusing invalidated session_id "
+                        f"{candidate[:12]}"
+                    )
+                    return
+                if candidate == result_session_id:
+                    return
+                result_session_id = candidate
+                if self._session_id_callback:
+                    self._session_id_callback(result_session_id)
 
             async for message in query(prompt=prompt, options=options):
                 if isinstance(message, SystemMessage):
                     # Extract session ID from init
-                    result_session_id = getattr(message, "session_id", "") or ""
+                    capture_session_id(getattr(message, "session_id", ""))
                     _log(f"sdk-runner: session={result_session_id}")
 
                 elif isinstance(message, ResultMessage):
+                    capture_session_id(getattr(message, "session_id", None))
                     # Prefer ResultMessage over AssistantMessage to avoid duplicates
                     # Only suppress AssistantMessage if ResultMessage has actual content
                     if hasattr(message, "result") and message.result:
                         got_result = True
                         output_parts.clear()
                         output_parts.append(message.result)
-                    if hasattr(message, "session_id"):
-                        result_session_id = message.session_id or result_session_id
                     if hasattr(message, "total_cost_usd"):
                         cost_usd = message.total_cost_usd or 0.0
                     # Extended usage fields
@@ -232,6 +256,7 @@ class SDKRunner:
                     duration_api_ms = getattr(message, "duration_api_ms", 0) or 0
 
                 elif isinstance(message, AssistantMessage) and not got_result:
+                    capture_session_id(message.session_id)
                     # Collect text content + detect tool use
                     for block in message.content:
                         if isinstance(block, TextBlock):
@@ -245,6 +270,47 @@ class SDKRunner:
                                 session_id=result_session_id,
                                 data={"tool": {"tool_name": tool_name, "tool_input": tool_input}},
                             )
+
+                elif isinstance(message, AssistantMessage):
+                    # Result content already won the existing dedupe rule.
+                    capture_session_id(message.session_id)
+
+                elif isinstance(message, ConversationResetMessage):
+                    # /clear invalidates the outgoing ID immediately. Clear
+                    # both local and durable state synchronously, before the
+                    # iterator can advance to a fresh-session frame.
+                    if message.session_id:
+                        invalidated_session_ids.add(message.session_id)
+                    if result_session_id:
+                        invalidated_session_ids.add(result_session_id)
+                    result_session_id = ""
+                    if self._session_id_callback:
+                        self._session_id_callback("")
+
+                    _log(
+                        "sdk-runner: WARNING SDK conversation reset; transcript "
+                        "was discarded "
+                        f"new_conversation_id={message.new_conversation_id!r} "
+                        f"session_id={message.session_id!r}"
+                    )
+
+                elif isinstance(message, RateLimitEvent):
+                    _log(
+                        "sdk-runner: WARNING SDK rate-limit event "
+                        f"status={message.rate_limit_info.status!r}"
+                    )
+
+                elif isinstance(message, (UserMessage, StreamEvent)):
+                    # Known non-result frames are intentionally ignored.
+                    pass
+
+                else:
+                    # The SDK Message union is open across dependency bumps.
+                    # Never let a newly added frame disappear silently.
+                    _log(
+                        "sdk-runner: WARNING unhandled SDK message "
+                        f"type={type(message).__name__}; continuing"
+                    )
 
                 # Detect subagent activity
                 if isinstance(message, AssistantMessage):

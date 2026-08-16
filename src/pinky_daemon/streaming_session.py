@@ -18,8 +18,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import SessionState, StateMachine, Trigger
 from pinky_daemon.turn_response import TurnResponse
 from pinky_daemon.wake_prompt import (
@@ -80,6 +82,20 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _notify_turn_idle(config: "StreamingSessionConfig", agent_name: str) -> None:
+    """Report a real turn boundary without letting callback failures escape."""
+    callback = config.on_turn_idle
+    if callback is None:
+        return
+    try:
+        callback(agent_name)
+    except Exception as exc:
+        _log(
+            f"streaming[{agent_name}]: on_turn_idle callback failed: "
+            f"{type(exc).__name__}: {exc}"
+        )
+
+
 @dataclass
 class StreamingSessionConfig:
     """Configuration for a streaming session."""
@@ -104,6 +120,14 @@ class StreamingSessionConfig:
     # the boundary advances against a wake that never reached the model
     # → the directive would be eaten by a wedged paste.
     on_wake_delivered: object = None  # Callable(agent_name, WakeReason) -> None
+    # Fires when a completed turn leaves no queued transport work. Scheduler
+    # delivery uses this edge to drain durable wakes without timer polling.
+    on_turn_idle: object = None  # Callable(agent_name) -> None
+    # Tmux-only #984 recovery seam.  A verified-failed context-restart wake
+    # uses this to route a CONTEXT-RELOAD instruction through the broker's
+    # agent-message path.  The callback returns a positive handoff bool; the
+    # session escalates to transport recovery when it is absent or false.
+    wake_submission_recovery_injector: object = None
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
     live_status_fn: object = None  # Callable() -> dict|None; agent's live REPL status {"status","last_updated"} from Claude Code working/idle hooks. Tmux inflight watchdog uses it to avoid force-restarting an idle (not wedged) REPL (#118).
     watchdog_enabled_fn: object = None  # Callable() -> bool; whether this agent's watchdog_config.enabled is set. The tmux inflight watchdog reads it per tick so watchdog_config.enabled=false is an operator kill-switch for BOTH the daemon SessionWatchdog and per-session inflight recovery (#846). None → treated as enabled (default True).
@@ -115,6 +139,7 @@ class StreamingSessionConfig:
     subagents: dict = field(default_factory=dict)  # name -> AgentDefinition
     provider_url: str = ""   # ANTHROPIC_BASE_URL override (e.g. "http://localhost:11434" for Ollama)
     provider_key: str = ""   # ANTHROPIC_API_KEY override (empty = use env var)
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
     # effort drifts from thinking_effort. Default False (warn-only). See #429.
@@ -240,7 +265,7 @@ def _describe_tool_use(tool_name: str, tool_input: dict) -> str:
     return name
 
 
-class StreamingSession:
+class StreamingSession(TransportReplacementMixin):
     """Persistent bidirectional Claude Code session via SDK client.
 
     Unlike Session which blocks on each send(), StreamingSession:
@@ -335,7 +360,11 @@ class StreamingSession:
         self._activity_log: list[str] = []  # All tool activities this turn
         self._current_thinking = ""  # Latest thinking block (for UI streaming)
         self.account_info: dict = {}  # Populated from SDK init: email, subscriptionType, apiProvider
-        self._on_resume_handle = None  # async fn(agent_name, resume_handle) — called when SDK resume token is captured
+        self._on_resume_handle = None  # async fn(agent_name, resume_handle) — used by restart paths
+        # Reset frames invalidate the persisted handle synchronously: awaiting
+        # between observing /clear and clearing durable state leaves a window
+        # where a process death can resurrect the discarded transcript.
+        self._on_resume_handle_sync = None  # sync fn(agent_name, resume_handle)
         self._context_warned = False  # Track if we've already warned this session
         self._last_restart_block_notice_at = 0.0
         self._effort_override: str | None = None  # Session-level thinking effort override
@@ -630,10 +659,7 @@ class StreamingSession:
 
         async def _send_wake_prompt() -> None:
             try:
-                await self._client.query(wake_prompt)
-                # Keep ResultMessage pops 1:1 with queries: the wake turn
-                # has no routing target, so enqueue an unrouted sentinel.
-                self._pending_chats.append(("", "", ""))
+                await self._query_unrouted(wake_prompt)
                 _log(
                     f"streaming[{self.agent_name}]: sent wake prompt "
                     f"(reason={wake_reason.value})"
@@ -708,35 +734,73 @@ class StreamingSession:
             except Exception as e:
                 _log(f"streaming[{self.agent_name}]: conversation store append failed: {e}")
 
+        # Book the turn before ``query()`` can make its transport write
+        # observable to the reader.  The SDK awaits that write, so a fast
+        # ResultMessage can otherwise arrive before this coroutine resumes and
+        # manufacture a false idle boundary with the turn still unrepresented.
+        # One routing reservation is the single source of truth for both
+        # response correlation and turn-idle detection.
+        reservation = (platform, chat_id, message_id)
+        self._pending_chats.append(reservation)
         try:
             self._analytics_log_activity(
                 "prompt_submitted",
                 metadata={"platform": platform, "chat_id": chat_id},
             )
             await self._client.query(prompt + agent_hint)
-            # Always enqueue one routing entry per query -- even with no
-            # chat_id -- so ResultMessage pops stay 1:1 with queries and a
-            # system/internal turn can't consume a user turn's routing.
-            self._pending_chats.append((platform, chat_id, message_id))
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
             return True
         except Exception as e:
+            # Roll back only this submission.  A fast ResultMessage may have
+            # consumed it already, and concurrent reservations can contain
+            # equal routing values, so identity (not tuple equality) matters.
+            for index, pending in enumerate(self._pending_chats):
+                if pending is reservation:
+                    self._pending_chats.pop(index)
+                    break
             self._stats["errors"] += 1
             _log(f"streaming[{self.agent_name}]: send error: {e}")
             # Try to reconnect
             await self.attempt_reconnect()
             return False
 
+    async def _query_unrouted(self, prompt: str) -> None:
+        """Submit an internal prompt with boundary-safe bookkeeping.
+
+        The reservation must exist before ``query()`` makes its write visible
+        to the reader; otherwise a fast ResultMessage can complete first and
+        the subsequently appended sentinel becomes stale state for the next
+        turn. Failure removes only this exact reservation because concurrent
+        internal prompts have identical tuple values.
+        """
+        if not self._client:
+            raise RuntimeError("streaming client is unavailable")
+        reservation = ("", "", "")
+        self._pending_chats.append(reservation)
+        try:
+            await self._client.query(prompt)
+        except Exception:
+            for index, pending in enumerate(self._pending_chats):
+                if pending is reservation:
+                    self._pending_chats.pop(index)
+                    break
+            raise
+
     async def _reader_loop(self) -> None:
         """Background loop that reads responses and fires callbacks."""
         from claude_agent_sdk.types import (
             AssistantMessage,
             AssistantMessageError,
+            ConversationResetMessage,
+            RateLimitEvent,
             ResultMessage,
+            StreamEvent,
+            SystemMessage,
             TextBlock,
             ThinkingBlock,
             ToolResultBlock,
             ToolUseBlock,
+            UserMessage,
         )
 
         # Defensive invariant: ``_is_auth_error_assistant`` does an exact
@@ -763,6 +827,33 @@ class StreamingSession:
         # threshold early and skewing the multi-agent baseline. Reset at the
         # end of ResultMessage handling (turn boundary).
         auth_reported_this_turn = False
+        invalidated_resume_handles: set[str] = set()
+
+        async def _capture_resume_handle(candidate: object) -> None:
+            """Persist a non-empty SDK handle that was not invalidated by /clear."""
+            if not isinstance(candidate, str) or not candidate:
+                return
+            if candidate in invalidated_resume_handles:
+                _log(
+                    f"streaming[{self.agent_name}]: WARNING refusing invalidated "
+                    f"resume_handle {candidate[:12]}"
+                )
+                return
+            if candidate == self.resume_handle:
+                return
+
+            self.resume_handle = candidate
+            _log(
+                f"streaming[{self.agent_name}]: captured resume_handle "
+                f"{self.resume_handle[:12]}"
+            )
+            if self._on_resume_handle_sync:
+                self._on_resume_handle_sync(self.agent_name, self.resume_handle)
+            elif self._on_resume_handle:
+                try:
+                    await self._on_resume_handle(self.agent_name, self.resume_handle)
+                except Exception:
+                    pass
 
         try:
             async for msg in self._client.receive_messages():
@@ -868,26 +959,49 @@ class StreamingSession:
                         self.usage.input_tokens += msg.usage.get("input_tokens", 0)
                         self.usage.output_tokens += msg.usage.get("output_tokens", 0)
 
-                    # Capture SDK resume handle for persistence
-                    if msg.session_id and msg.session_id != self.resume_handle:
-                        self.resume_handle = msg.session_id
-                        _log(f"streaming[{self.agent_name}]: captured resume_handle {self.resume_handle[:12]}")
-                        if self._on_resume_handle:
-                            try:
-                                await self._on_resume_handle(self.agent_name, self.resume_handle)
-                            except Exception:
-                                pass
+                    # Capture SDK resume handle for persistence.
+                    await _capture_resume_handle(getattr(msg, "session_id", None))
 
                 elif isinstance(msg, ResultMessage):
+                    # A local slash command such as /clear may produce no
+                    # AssistantMessage for the fresh conversation. Result is
+                    # therefore an equally authoritative resume-handle frame.
+                    await _capture_resume_handle(getattr(msg, "session_id", None))
+
                     # Debug: log result message details
                     if msg.num_turns and msg.num_turns > 0:
                         _log(f"streaming[{self.agent_name}]: result — turns={msg.num_turns}, cost=${msg.total_cost_usd or 0:.4f}, model_usage={msg.model_usage}")
 
-                    # Get the routing info for this response
-                    if self._pending_chats:
-                        resp_platform, resp_chat_id, resp_message_id = self._pending_chats.pop(0)
+                    # Snapshot and drain every reservation visible when this
+                    # turn boundary starts. The SDK may coalesce several
+                    # queued prompts into one turn/ResultMessage; pop-one left
+                    # the surplus route at the head for an unrelated later
+                    # turn (#1074). There is no await between the high-water
+                    # capture and deletion, so a reservation submitted after
+                    # boundary processing begins survives for the next turn.
+                    boundary_high_water = len(self._pending_chats)
+                    boundary_routes = self._pending_chats[:boundary_high_water]
+                    del self._pending_chats[:boundary_high_water]
+                    routed_boundary_routes = [
+                        route for route in boundary_routes if route[1]
+                    ]
+                    stale_route_count = max(0, boundary_high_water - 1)
+                    if stale_route_count:
+                        _log(
+                            f"streaming[{self.agent_name}]: "
+                            "TURN_BOUNDARY_STALE_ROUTE_DRAIN "
+                            f"stale_entries={stale_route_count} "
+                            f"total_entries={boundary_high_water} "
+                            f"routed_entries={len(routed_boundary_routes)}"
+                        )
+
+                    # A single reservation is unambiguous conversation-source
+                    # metadata. A coalesced turn is not; persist it without a
+                    # platform/chat attribution rather than choosing a lie.
+                    if boundary_high_water == 1:
+                        resp_platform, resp_chat_id, _ = boundary_routes[0]
                     else:
-                        resp_platform, resp_chat_id, resp_message_id = ("", "", "")
+                        resp_platform, resp_chat_id = ("", "")
 
                     # If the SDK reports an error result, discard _last_response — it may
                     # contain raw API error JSON (e.g. content filter, rate limit) that must
@@ -963,25 +1077,30 @@ class StreamingSession:
                         # stop in broker.route_response) still runs. The
                         # suppressed content is never forwarded -- route_response
                         # no-ops on empty text.
-                        if self._response_callback and resp_chat_id:
-                            try:
-                                await self._response_callback(TurnResponse(
-                                    agent_name=self.agent_name,
-                                    session_id=self.id,
-                                    platform=resp_platform,
-                                    chat_id=resp_chat_id,
-                                    message_id=resp_message_id,
-                                    text="",
-                                    tool_uses=list(turn_tool_uses),
-                                    used_outreach_tools=any(
-                                        _is_outreach_tool(tool_use.get("tool", ""))
-                                        for tool_use in turn_tool_uses
-                                    ),
-                                    usage=msg.usage or {},
-                                    num_turns=msg.num_turns or 0,
-                                ))
-                            except Exception as e:
-                                _log(f"streaming[{self.agent_name}]: callback error: {e}")
+                        if self._response_callback:
+                            for (
+                                callback_platform,
+                                callback_chat_id,
+                                callback_message_id,
+                            ) in routed_boundary_routes:
+                                try:
+                                    await self._response_callback(TurnResponse(
+                                        agent_name=self.agent_name,
+                                        session_id=self.id,
+                                        platform=callback_platform,
+                                        chat_id=callback_chat_id,
+                                        message_id=callback_message_id,
+                                        text="",
+                                        tool_uses=list(turn_tool_uses),
+                                        used_outreach_tools=any(
+                                            _is_outreach_tool(tool_use.get("tool", ""))
+                                            for tool_use in turn_tool_uses
+                                        ),
+                                        usage=msg.usage or {},
+                                        num_turns=msg.num_turns or 0,
+                                    ))
+                                except Exception as e:
+                                    _log(f"streaming[{self.agent_name}]: callback error: {e}")
                         self._last_response = ""
                         self._current_activity = ""
                         self._activity_log = []
@@ -993,37 +1112,51 @@ class StreamingSession:
                         self._turn_done.set()
                         # Reset per-turn auth dedupe — turn boundary
                         auth_reported_this_turn = False
+                        if (
+                            self.state == SessionState.CONNECTED
+                            and not self._pending_chats
+                        ):
+                            _notify_turn_idle(self._config, self.agent_name)
                         continue
 
-                    # Turn complete — fire response callback
-                    turn_result = TurnResponse(
-                        agent_name=self.agent_name,
-                        session_id=self.id,
-                        platform=resp_platform,
-                        chat_id=resp_chat_id,
-                        message_id=resp_message_id,
-                        text=self._last_response,
-                        tool_uses=list(turn_tool_uses),
-                        used_outreach_tools=any(
-                            _is_outreach_tool(tool_use.get("tool", ""))
-                            for tool_use in turn_tool_uses
-                        ),
-                        usage=msg.usage or {},
-                        total_cost_usd=msg.total_cost_usd or 0.0,
-                        num_turns=msg.num_turns or 0,
-                        model_usage=msg.model_usage or {},
-                    )
-
-                    # Fire whenever there's content OR a routing target: a
-                    # routed turn with no text/tools must still reach
-                    # broker.route_response so the typing indicator stops.
-                    if self._response_callback and (
-                        turn_result.response_text or turn_result.tool_uses or resp_chat_id
-                    ):
-                        try:
-                            await self._response_callback(turn_result)
-                        except Exception as e:
-                            _log(f"streaming[{self.agent_name}]: callback error: {e}")
+                    # Fire once per routed reservation so every typing/voice
+                    # marker is retired. With no route, fire one web-only
+                    # result when the turn has content/tools. route_response is
+                    # delivery-suppressed; explicit outreach tools have already
+                    # performed any authorized delivery.
+                    callback_routes = routed_boundary_routes or [("", "", "")]
+                    if self._response_callback:
+                        for (
+                            callback_platform,
+                            callback_chat_id,
+                            callback_message_id,
+                        ) in callback_routes:
+                            turn_result = TurnResponse(
+                                agent_name=self.agent_name,
+                                session_id=self.id,
+                                platform=callback_platform,
+                                chat_id=callback_chat_id,
+                                message_id=callback_message_id,
+                                text=self._last_response,
+                                tool_uses=list(turn_tool_uses),
+                                used_outreach_tools=any(
+                                    _is_outreach_tool(tool_use.get("tool", ""))
+                                    for tool_use in turn_tool_uses
+                                ),
+                                usage=msg.usage or {},
+                                total_cost_usd=msg.total_cost_usd or 0.0,
+                                num_turns=msg.num_turns or 0,
+                                model_usage=msg.model_usage or {},
+                            )
+                            if (
+                                turn_result.response_text
+                                or turn_result.tool_uses
+                                or callback_chat_id
+                            ):
+                                try:
+                                    await self._response_callback(turn_result)
+                                except Exception as e:
+                                    _log(f"streaming[{self.agent_name}]: callback error: {e}")
 
                     # A successful (non-errored) turn proves Claude auth is
                     # working again — clear any auth-fail tracking for this
@@ -1160,6 +1293,56 @@ class StreamingSession:
 
                     # Check context usage for auto-restart
                     await self._check_context()
+                    if (
+                        self.state == SessionState.CONNECTED
+                        and not self._pending_chats
+                    ):
+                        _notify_turn_idle(self._config, self.agent_name)
+
+                elif isinstance(msg, ConversationResetMessage):
+                    # The reset frame names the outgoing session. Invalidate
+                    # both it and our current handle before doing any other
+                    # work, then synchronously clear durable state. There must
+                    # be no await gap here: death before the next fresh-session
+                    # frame must produce a clean start, never resume /clear's
+                    # discarded transcript.
+                    if msg.session_id:
+                        invalidated_resume_handles.add(msg.session_id)
+                    if self.resume_handle:
+                        invalidated_resume_handles.add(self.resume_handle)
+                    self.resume_handle = ""
+                    if self._on_resume_handle_sync:
+                        self._on_resume_handle_sync(self.agent_name, "")
+                    elif self._on_resume_handle:
+                        raise RuntimeError(
+                            "conversation reset requires synchronous "
+                            "resume-handle persistence"
+                        )
+
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING SDK conversation "
+                        "reset; transcript was discarded "
+                        f"new_conversation_id={msg.new_conversation_id!r} "
+                        f"session_id={msg.session_id!r}"
+                    )
+
+                elif isinstance(msg, RateLimitEvent):
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING SDK rate-limit "
+                        f"event status={msg.rate_limit_info.status!r}"
+                    )
+
+                elif isinstance(msg, (SystemMessage, UserMessage, StreamEvent)):
+                    # Known non-boundary frames are intentionally ignored.
+                    continue
+
+                else:
+                    # The SDK Message union is open across dependency bumps.
+                    # Never let a newly added frame disappear silently.
+                    _log(
+                        f"streaming[{self.agent_name}]: WARNING unhandled SDK "
+                        f"message type={type(msg).__name__}; continuing"
+                    )
 
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: reader loop error: {e}")
@@ -1180,10 +1363,11 @@ class StreamingSession:
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
 
-            # Fix: SDK reports 200k for 1M models — use actual window
-            max_t = reported_max
-            if is_1m_model(self._config.model or "") and reported_max <= 200_000:
-                max_t = 1_000_000
+            # Single source of truth for the window: trust the harness-reported
+            # cap (reported_max), falling back to the configurable per-model map.
+            max_t = resolve_context_window(
+                self._config.model or "", reported_max=reported_max
+            )
 
             pct = round(total / max_t * 100) if max_t > 0 else 0
 
@@ -1200,9 +1384,7 @@ class StreamingSession:
                     f"or call context_restart when ready."
                 )
                 try:
-                    await self._client.query(warn_msg)
-                    # Unrouted system turn -- keep ResultMessage pops 1:1
-                    self._pending_chats.append(("", "", ""))
+                    await self._query_unrouted(warn_msg)
                     self._context_warned = True
                     _log(f"streaming[{self.agent_name}]: warned agent at {pct}% context")
                 except Exception as e:
@@ -1242,9 +1424,7 @@ class StreamingSession:
             f"{detail} Use save_my_context() now, then retry once you've saved your latest work."
         )
         try:
-            await self._client.query(warn_msg)
-            # Unrouted system turn -- keep ResultMessage pops 1:1
-            self._pending_chats.append(("", "", ""))
+            await self._query_unrouted(warn_msg)
         except Exception:
             pass
 
@@ -1337,9 +1517,7 @@ class StreamingSession:
         sends_before = self._stats["messages_sent"]
         try:
             self._turn_done.clear()
-            await self._client.query(build_idle_sleep_prompt())
-            # Unrouted system turn -- keep ResultMessage pops 1:1
-            self._pending_chats.append(("", "", ""))
+            await self._query_unrouted(build_idle_sleep_prompt())
             _log(f"streaming[{self.agent_name}]: memory save prompt sent before idle sleep")
             # query() returns as soon as the prompt hits the transport; it
             # does NOT wait for the turn. Give the save turn a bounded

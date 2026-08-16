@@ -23,15 +23,19 @@ Hierarchy:
 from __future__ import annotations
 
 import json
+import math
+import os
 import re
 import secrets
 import shlex
 import sqlite3
 import sys
+import tempfile
 import threading
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
+from uuid import UUID
 
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
@@ -45,6 +49,42 @@ from pinky_daemon.effort import is_ultracode
 # the same guarantee the API layer enforces, and so CodeQL's taint analysis
 # sees an explicit sanitizer at the source-of-path-construction.
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+_BUZZ_HEX_64_RE = re.compile(r"^[0-9a-f]{64}$")
+_BARSIK_BUZZ_RELAY_SIGNING_PUBKEY = (
+    "12f6870117eff1a6318bd38c82a65d51dd19879b7489f57247114d0ee8a96de3"
+)
+BUZZ_OWNER_SILENCE_DAYS = 14
+BUZZ_INBOUND_CLAIM_LEASE_SECONDS = 5 * 60
+OUTBOX_REAPER_BATCH_SIZE = 10_000
+OUTBOX_REAPER_PAYLOAD_TRIMMED = "[payload trimmed by outbox reaper]"
+
+
+def _validate_buzz_pubkey(value: str, *, field_name: str = "pubkey") -> str:
+    pubkey = str(value or "")
+    if not _BUZZ_HEX_64_RE.fullmatch(pubkey):
+        raise ValueError(f"Buzz {field_name} must be exactly 64 lowercase hex characters")
+    return pubkey
+
+
+def _validate_buzz_channel_id(value: str) -> str:
+    try:
+        canonical = str(UUID(str(value)))
+    except (TypeError, ValueError, AttributeError) as exc:
+        raise ValueError("Buzz channel_id must be a UUID") from exc
+    if canonical != str(value):
+        raise ValueError("Buzz channel_id must be a canonical lowercase UUID")
+    return canonical
+
+
+def _validate_buzz_annotation(value: str, *, field_name: str, limit: int) -> str:
+    annotation = str(value or "").strip()
+    if len(annotation) > limit or any(
+        ord(ch) < 32 or ord(ch) == 127 for ch in annotation
+    ):
+        raise ValueError(
+            f"Buzz {field_name} must be at most {limit} printable characters"
+        )
+    return annotation
 
 
 def _validate_agent_name(name: str) -> str:
@@ -62,6 +102,60 @@ def _validate_agent_name(name: str) -> str:
             f"starts with letter or digit; up to 63 chars)"
         )
     return name
+
+
+class AgentPathContainmentError(ValueError):
+    """A requested agent path resolved outside its owning workspace."""
+
+
+def resolve_agent_path(
+    agent_name: str,
+    agent_dir: str | Path,
+    *parts: str | Path,
+) -> Path:
+    """Resolve an agent-owned path and refuse aliases outside its workspace.
+
+    ``agent_dir`` is the persisted owning workspace.  Resolution happens
+    before any caller reads or writes the result, so ``..`` components,
+    absolute children, symlinks, and case-normalized aliases cannot escape
+    the workspace.  The agent name is validated here as well so every path
+    boundary shares the registry's existing strict allowlist.
+    """
+    _validate_agent_name(agent_name)
+    if not agent_dir:
+        raise AgentPathContainmentError("agent workspace is not configured")
+    workspace_path = Path(agent_dir)
+    if not workspace_path.is_absolute():
+        raise AgentPathContainmentError("agent workspace is not an absolute path")
+    workspace = workspace_path.resolve()
+    candidate = workspace.joinpath(*parts) if parts else workspace
+    resolved = candidate.resolve()
+    if resolved != workspace and not resolved.is_relative_to(workspace):
+        raise AgentPathContainmentError("agent path is outside its workspace")
+    return resolved
+
+
+def replace_agent_text(
+    agent_name: str,
+    agent_dir: str | Path,
+    path: str | Path,
+    content: str,
+) -> Path:
+    """Atomically replace one contained agent file without following links."""
+    target = resolve_agent_path(agent_name, agent_dir, path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
+    temp_path = Path(temp_name)
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.replace(temp_path, target)
+    except Exception:
+        temp_path.unlink(missing_ok=True)
+        raise
+    return target
 
 
 def _log(msg: str) -> None:
@@ -461,6 +555,7 @@ class Agent:
     provider_key: str = ""   # API key override, empty = use ANTHROPIC_API_KEY env var
     provider_model: str = ""  # model name override (e.g. "llama3.2"), empty = use agent.model
     provider_ref: str = ""   # ID of a global provider from the providers table
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low, medium, high, xhigh, max, ultracode — default thinking depth
     # ``ultracode`` (#151): xhigh reasoning + standing workflow orchestration.
     # Resolves to xhigh for the actual effort knob (the CLI flag rejects the
@@ -470,6 +565,14 @@ class Agent:
     # effort drifts from thinking_effort. Default False (warn-only): drift is
     # surfaced to /agents/{name}/effort-drift + heartbeat but does not block.
     strict_effort_enforcement: bool = False
+    # When True AND the agent is LOCAL (isolation_mode local / non-container),
+    # the tmux session runs with its own CLAUDE_CONFIG_DIR
+    # (<working_dir>/.claude-local) and the shared CLAUDE_CODE_OAUTH_TOKEN is
+    # withheld — so the agent holds its OWN Claude subscription account
+    # (populated later by a manual `claude /login`) instead of sharing the
+    # daemon user's ~/.claude. No-op for container agents (they already get
+    # their own config dir). Default False = shared ~/.claude (current behavior).
+    dedicated_config_dir: bool = False
     watchdog_config: dict = field(default_factory=dict)  # Per-agent watchdog overrides (JSON blob)
     # watchdog_config schema: {
     #   "enabled": true,              # Enable/disable watchdog for this agent
@@ -533,8 +636,10 @@ class Agent:
             "provider_key_set": bool(self.provider_key),
             "provider_model": self.provider_model,
             "provider_ref": self.provider_ref,
+            "codex_home": self.codex_home,
             "thinking_effort": self.thinking_effort,
             "strict_effort_enforcement": self.strict_effort_enforcement,
+            "dedicated_config_dir": self.dedicated_config_dir,
             "watchdog_config": self.watchdog_config,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
@@ -657,8 +762,8 @@ class PendingScheduleWake:
     """One durable exact-fire scheduler ledger record.
 
     The historical class name is retained because active rows are also the
-    replay outbox.  ``accepted_at`` and ``parked_at`` make the terminal state
-    explicit without deleting the forensic receipt.
+    replay outbox.  ``accepted_at``, ``parked_at``, and ``abandoned_at`` make
+    terminal states explicit without deleting the forensic receipt.
     """
 
     id: int = 0
@@ -673,6 +778,7 @@ class PendingScheduleWake:
     accepted_at: float = 0.0
     failed_at: float = 0.0
     last_error: str = ""
+    abandoned_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -684,6 +790,8 @@ class PendingScheduleWake:
         """Return the exact operational outcome used by fleet health."""
         if self.accepted_at > 0:
             return "receipted-ran-once"
+        if self.abandoned_at > 0:
+            return "abandoned"
         if self.parked_at > 0:
             return "quarantined"
         return "pending"
@@ -702,12 +810,73 @@ class PendingScheduleWake:
             "accepted_at": self.accepted_at,
             "failed_at": self.failed_at,
             "last_error": self.last_error,
+            "abandoned_at": self.abandoned_at,
             "state": self.ledger_state,
         }
 
 
+@dataclass(frozen=True)
+class RecurringScheduleStaleDrop:
+    """Bounded aggregate of recurring fires dropped before delivery."""
+
+    schedule_id: int = 0
+    agent_name: str = ""
+    schedule_name: str = ""
+    drop_count: int = 0
+    first_dropped_at: float = 0.0
+    last_dropped_at: float = 0.0
+    max_row_age_s: float = 0.0
+    generation: int = 0
+
+
 class ScheduleNameConflictError(ValueError):
     """An enabled schedule already uses the requested agent/name pair."""
+
+
+class AgentAlreadyExistsError(ValueError):
+    """A create-only registration collided with an existing agent name."""
+
+
+class AgentRegistrationIncompleteError(RuntimeError):
+    """A create-only registration won its DB name but failed before completion."""
+
+    def __init__(self, name: str, *, row_committed: bool):
+        super().__init__(f"registration incomplete for {name}")
+        self.row_committed = row_committed
+
+
+class AgentWorkspacePathError(ValueError):
+    """An agent workspace could not be resolved to a usable absolute path."""
+
+
+class AgentWorkspaceOverlapError(ValueError):
+    """An agent workspace overlaps another registered agent's owner root."""
+
+
+@dataclass(frozen=True)
+class SoulMutationSummary:
+    """Content-free evidence explaining why a soul replacement is risky."""
+
+    old_length: int
+    new_length: int
+    shrink_percent: float
+    missing_anchors: tuple[str, ...]
+
+    def to_dict(self) -> dict:
+        return {
+            "old_length": self.old_length,
+            "new_length": self.new_length,
+            "shrink_percent": self.shrink_percent,
+            "missing_anchors": list(self.missing_anchors),
+        }
+
+
+class SoulMutationRejectedError(ValueError):
+    """A soul replacement needs an explicit force flag before it may run."""
+
+    def __init__(self, summary: SoulMutationSummary) -> None:
+        super().__init__("soul mutation rejected by shrink/identity guard")
+        self.summary = summary
 
 
 @dataclass
@@ -1213,12 +1382,22 @@ def _configure_agents_db_connection(
 class AgentRegistry:
     """SQLite-backed agent registry."""
 
-    def __init__(self, db_path: str = "data/agents.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/agents.db",
+        *,
+        buzz_device_key_path: str | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         # Absolute path retained so callers (e.g. _write_mcp_json) can hand
         # stdio MCP subprocesses an explicit DB location for request-time
         # signing-key lookup (#641) rather than relying on their cwd.
         self._db_path = str(Path(db_path).resolve())
+        self._buzz_device_key_path = str(
+            Path(buzz_device_key_path).resolve()
+            if buzz_device_key_path
+            else Path(self._db_path).parent / "identity" / ".device_key"
+        )
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         # #797/#220: the agents DB runs in ROLLBACK (TRUNCATE) journal mode, NOT
         # WAL. The WAL wal-index (-shm) is always mmap'd; under the long-lived
@@ -1258,6 +1437,7 @@ class AgentRegistry:
                 groups TEXT NOT NULL DEFAULT '[]',
                 max_sessions INTEGER NOT NULL DEFAULT 5,
                 enabled INTEGER NOT NULL DEFAULT 1,
+                registration_finalized INTEGER NOT NULL DEFAULT 1,
                 auto_start INTEGER NOT NULL DEFAULT 0,
                 heartbeat_interval INTEGER NOT NULL DEFAULT 0,
                 plain_text_fallback INTEGER NOT NULL DEFAULT 0,
@@ -1316,8 +1496,23 @@ class AgentRegistry:
                 accepted_at REAL NOT NULL DEFAULT 0,
                 failed_at REAL NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
+                abandoned_at REAL NOT NULL DEFAULT 0,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
+            );
+
+            CREATE TABLE IF NOT EXISTS recurring_schedule_stale_drops (
+                schedule_id INTEGER PRIMARY KEY,
+                agent_name TEXT NOT NULL,
+                schedule_name TEXT NOT NULL DEFAULT '',
+                drop_count INTEGER NOT NULL DEFAULT 1,
+                first_dropped_at REAL NOT NULL,
+                last_dropped_at REAL NOT NULL,
+                max_row_age_s REAL NOT NULL DEFAULT 0,
+                generation INTEGER NOT NULL DEFAULT 1,
+                FOREIGN KEY (schedule_id) REFERENCES agent_schedules(id)
+                    ON DELETE CASCADE,
+                FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
             CREATE TABLE IF NOT EXISTS agent_heartbeats (
@@ -1413,6 +1608,17 @@ class AgentRegistry:
                 UNIQUE(agent_name, chat_id)
             );
 
+            CREATE TABLE IF NOT EXISTS verified_contacts (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                agent_name TEXT NOT NULL,
+                platform TEXT NOT NULL,
+                principal TEXT NOT NULL,
+                name TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT '',
+                added_at REAL NOT NULL,
+                UNIQUE(agent_name, platform, principal)
+            );
+
             CREATE TABLE IF NOT EXISTS agent_costs (
                 agent_name TEXT NOT NULL,
                 cost_usd REAL NOT NULL DEFAULT 0,
@@ -1467,12 +1673,16 @@ class AgentRegistry:
                 ON agent_schedules(agent_name);
             CREATE INDEX IF NOT EXISTS idx_pending_schedule_wakes_agent
                 ON pending_schedule_wakes(agent_name, fired_at, id);
+            CREATE INDEX IF NOT EXISTS idx_recurring_stale_drops_agent
+                ON recurring_schedule_stale_drops(agent_name, schedule_id);
             CREATE INDEX IF NOT EXISTS idx_pending_messages_agent_chat
                 ON pending_messages(agent_name, chat_id, delivered);
             CREATE INDEX IF NOT EXISTS idx_approval_requests_retry
                 ON approval_requests(gate_state, notification_state, next_retry_at);
             CREATE INDEX IF NOT EXISTS idx_group_chats_agent
                 ON group_chats(agent_name);
+            CREATE INDEX IF NOT EXISTS idx_verified_contacts_agent
+                ON verified_contacts(agent_name);
             CREATE INDEX IF NOT EXISTS idx_streaming_session_labels_agent
                 ON streaming_session_labels(agent_name);
             CREATE INDEX IF NOT EXISTS idx_mcp_servers_agent
@@ -1548,6 +1758,112 @@ class AgentRegistry:
                 signing_key TEXT NOT NULL,
                 created_at REAL NOT NULL DEFAULT 0
             );
+
+            CREATE TABLE IF NOT EXISTS buzz_identities (
+                agent TEXT PRIMARY KEY NOT NULL,
+                pubkey TEXT NOT NULL
+                    CHECK(length(pubkey)=64 AND pubkey=lower(pubkey)
+                          AND pubkey NOT GLOB '*[^0-9a-f]*'),
+                wrap_version INTEGER NOT NULL,
+                nonce BLOB NOT NULL,
+                ciphertext BLOB NOT NULL,
+                relay_url TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                relay_signing_pubkey TEXT NOT NULL DEFAULT ''
+                    CHECK(
+                        relay_signing_pubkey='' OR (
+                            length(relay_signing_pubkey)=64
+                            AND relay_signing_pubkey=lower(relay_signing_pubkey)
+                            AND relay_signing_pubkey NOT GLOB '*[^0-9a-f]*'
+                        )
+                    ),
+                enabled INTEGER NOT NULL DEFAULT 0 CHECK(enabled IN (0, 1)),
+                status TEXT NOT NULL DEFAULT 'disabled',
+                last_error TEXT NOT NULL DEFAULT '',
+                tos_receipt TEXT NOT NULL,
+                tos_approved_by TEXT NOT NULL,
+                tos_approved_at REAL NOT NULL,
+                tos_approval_ref TEXT NOT NULL,
+                created_at REAL NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (agent) REFERENCES agents(name) ON DELETE CASCADE,
+                CHECK(
+                    enabled=0 OR (
+                        tos_receipt != '' AND tos_approved_by != ''
+                        AND tos_approved_at > 0 AND tos_approval_ref != ''
+                    )
+                )
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_policies (
+                agent TEXT PRIMARY KEY NOT NULL,
+                community_id TEXT NOT NULL,
+                relay_url TEXT NOT NULL,
+                owner_pubkey TEXT NOT NULL
+                    CHECK(length(owner_pubkey)=64 AND owner_pubkey=lower(owner_pubkey)
+                          AND owner_pubkey NOT GLOB '*[^0-9a-f]*'),
+                owner_configured_at REAL NOT NULL,
+                owner_last_seen_at REAL NOT NULL DEFAULT 0,
+                owner_silence_notified_at REAL NOT NULL DEFAULT 0,
+                status TEXT NOT NULL DEFAULT 'configured',
+                last_connect_at REAL NOT NULL DEFAULT 0,
+                last_liveness_at REAL NOT NULL DEFAULT 0,
+                last_event_at REAL NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                updated_by TEXT NOT NULL,
+                updated_at REAL NOT NULL,
+                FOREIGN KEY (agent) REFERENCES buzz_identities(agent) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_channels (
+                agent TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                relay_url TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at REAL NOT NULL,
+                FOREIGN KEY (agent) REFERENCES buzz_inbound_policies(agent) ON DELETE CASCADE,
+                PRIMARY KEY (agent, community_id, channel_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_principals (
+                agent TEXT NOT NULL,
+                community_id TEXT NOT NULL,
+                pubkey TEXT NOT NULL
+                    CHECK(length(pubkey)=64 AND pubkey=lower(pubkey)
+                          AND pubkey NOT GLOB '*[^0-9a-f]*'),
+                role TEXT NOT NULL CHECK(role IN ('owner', 'approved')),
+                display_name TEXT NOT NULL DEFAULT '',
+                approved_by TEXT NOT NULL,
+                approved_at REAL NOT NULL,
+                last_seen_at REAL NOT NULL DEFAULT 0,
+                FOREIGN KEY (agent) REFERENCES buzz_inbound_policies(agent) ON DELETE CASCADE,
+                PRIMARY KEY (agent, community_id, pubkey)
+            );
+
+            CREATE TABLE IF NOT EXISTS buzz_inbound_events (
+                agent TEXT NOT NULL,
+                event_id TEXT NOT NULL
+                    CHECK(length(event_id)=64 AND event_id=lower(event_id)
+                          AND event_id NOT GLOB '*[^0-9a-f]*'),
+                community_id TEXT NOT NULL,
+                channel_id TEXT NOT NULL,
+                author_pubkey TEXT NOT NULL,
+                kind INTEGER NOT NULL CHECK(kind=9),
+                event_created_at REAL NOT NULL,
+                event_json TEXT NOT NULL,
+                delivery_status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(delivery_status IN ('pending', 'delivered')),
+                claimed_at REAL NOT NULL DEFAULT 0,
+                delivered_at REAL NOT NULL DEFAULT 0,
+                attempts INTEGER NOT NULL DEFAULT 0,
+                last_error TEXT NOT NULL DEFAULT '',
+                FOREIGN KEY (agent) REFERENCES buzz_inbound_policies(agent) ON DELETE CASCADE,
+                PRIMARY KEY (agent, event_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_buzz_inbound_events_pending
+                ON buzz_inbound_events(agent, delivery_status, event_created_at);
         """)
         self._db.commit()
         self._migrate()
@@ -1559,6 +1875,11 @@ class AgentRegistry:
         }
         migrations = [
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
+            # HTTP create-only registration commits its ownership claim before
+            # fallible provisioning/MCP publication. Pre-upgrade rows are all
+            # completed registrations; new claim rows override this default to
+            # 0 until finalize_registration() publishes bootstrap state.
+            ("registration_finalized", "INTEGER NOT NULL DEFAULT 1"),
             ("heartbeat_interval", "INTEGER NOT NULL DEFAULT 0"),
             # Off by default — must match the dataclass + CREATE TABLE default (0).
             # A DEFAULT 1 here silently backfilled every pre-existing agent with
@@ -1593,6 +1914,9 @@ class AgentRegistry:
             # When 1, verify_effort CLI hook blocks tool calls on effort drift
             # (vs. warn-only default of 0). See #429.
             ("strict_effort_enforcement", "INTEGER NOT NULL DEFAULT 0"),
+            # Opt-in per-agent dedicated CLAUDE_CONFIG_DIR (own Claude account
+            # for a LOCAL agent). Default 0 = shared ~/.claude (unchanged).
+            ("dedicated_config_dir", "INTEGER NOT NULL DEFAULT 0"),
             ("watchdog_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("last_seen_at", "REAL NOT NULL DEFAULT 0"),
             ("runtime", "TEXT NOT NULL DEFAULT 'claude_sdk'"),
@@ -1621,11 +1945,20 @@ class AgentRegistry:
             # Operator-supplied container image for isolation_mode="container".
             # Empty for other modes; bring-your-own (Pinky never builds it).
             ("container_image", "TEXT NOT NULL DEFAULT ''"),
+            # Explicit per-agent CODEX_HOME. Inert unless the isolation flag is on.
+            ("codex_home", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in migrations:
             if col not in existing:
                 self._db.execute(f"ALTER TABLE agents ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added column {col}")
+        # Structural belt for the exact persisted-root case. Legacy placeholder
+        # values are excluded; resolved aliases and nested/enclosing roots still
+        # require the BEGIN IMMEDIATE overlap check in register().
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_agents_working_dir_owner_exact "
+            "ON agents(working_dir) WHERE working_dir NOT IN ('', '.')"
+        )
         self._db.commit()
         self._backfill_runtime_from_provider_url()
         self._warn_codex_runtime_mismatches()
@@ -1660,6 +1993,7 @@ class AgentRegistry:
             ("accepted_at", "REAL NOT NULL DEFAULT 0"),
             ("failed_at", "REAL NOT NULL DEFAULT 0"),
             ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in wake_migrations:
             if col not in wake_existing:
@@ -1674,6 +2008,12 @@ class AgentRegistry:
             """CREATE INDEX IF NOT EXISTS idx_schedule_wake_ledger_state
                ON pending_schedule_wakes(
                    agent_name, accepted_at, parked_at, fired_at
+               )"""
+        )
+        self._db.execute(
+            """CREATE INDEX IF NOT EXISTS idx_schedule_wake_reaper_state
+               ON pending_schedule_wakes(
+                   accepted_at, parked_at, abandoned_at, fired_at
                )"""
         )
         self._db.commit()
@@ -1789,6 +2129,64 @@ class AgentRegistry:
             )
             _log("agent_registry: migrated — added high_signal_alerted_at to approval_requests")
 
+        # Buzz identity storage is forward-migrated column-by-column rather
+        # than relying only on CREATE TABLE. This keeps fleet-local DBs safe if
+        # an increment adds lifecycle metadata after the first rollout.
+        buzz_existing = {
+            row[1] for row in self._db.execute("PRAGMA table_info(buzz_identities)").fetchall()
+        }
+        relay_signing_pubkey_added = "relay_signing_pubkey" not in buzz_existing
+        buzz_migrations = [
+            ("pubkey", "TEXT NOT NULL DEFAULT ''"),
+            ("wrap_version", "INTEGER NOT NULL DEFAULT 1"),
+            ("nonce", "BLOB NOT NULL DEFAULT X''"),
+            ("ciphertext", "BLOB NOT NULL DEFAULT X''"),
+            ("relay_url", "TEXT NOT NULL DEFAULT ''"),
+            ("community_id", "TEXT NOT NULL DEFAULT ''"),
+            ("relay_signing_pubkey", "TEXT NOT NULL DEFAULT ''"),
+            ("enabled", "INTEGER NOT NULL DEFAULT 0"),
+            ("status", "TEXT NOT NULL DEFAULT 'disabled'"),
+            ("last_error", "TEXT NOT NULL DEFAULT ''"),
+            ("tos_receipt", "TEXT NOT NULL DEFAULT ''"),
+            ("tos_approved_by", "TEXT NOT NULL DEFAULT ''"),
+            ("tos_approved_at", "REAL NOT NULL DEFAULT 0"),
+            ("tos_approval_ref", "TEXT NOT NULL DEFAULT ''"),
+            ("created_at", "REAL NOT NULL DEFAULT 0"),
+            ("updated_at", "REAL NOT NULL DEFAULT 0"),
+        ]
+        for col, typedef in buzz_migrations:
+            if col not in buzz_existing:
+                self._db.execute(f"ALTER TABLE buzz_identities ADD COLUMN {col} {typedef}")
+                _log(f"agent_registry: migrated — added {col} to buzz_identities")
+        if relay_signing_pubkey_added:
+            # One-time deployment migration for the operator-verified production
+            # authority. New/future identities receive their own explicit pin at
+            # provisioning; migrations never fetch NIP-11 or trust network data.
+            cursor = self._db.execute(
+                "UPDATE buzz_identities SET relay_signing_pubkey=? "
+                "WHERE agent='barsik' AND relay_signing_pubkey=''",
+                (_BARSIK_BUZZ_RELAY_SIGNING_PUBKEY,),
+            )
+            if cursor.rowcount:
+                _log("agent_registry: seeded barsik Buzz relay signing authority")
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_pubkey "
+            "ON buzz_identities(pubkey) WHERE pubkey != ''"
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_approval_ref "
+            "ON buzz_identities(tos_approval_ref) WHERE tos_approval_ref != ''"
+        )
+        self._db.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_buzz_identities_tos_receipt "
+            "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
+        )
+
+        # Deployment seed for the explicitly verified owner principal in #545.
+        # The registry and all runtime lookups remain agent-keyed; this is only
+        # the caller-specified bootstrap row and never auto-learns from traffic.
+        self._seed_verified_contacts()
+
         # Seed main_agent default: if unset, adopt the oldest enabled agent.
         # New installs get their main agent auto-assigned at create time (see
         # ``register``); this migration covers pre-existing installs whose
@@ -1807,6 +2205,61 @@ class AgentRegistry:
 
         # Seed default models
         self._seed_models()
+
+    def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
+        """Install caller-specified contacts for a finalized registration."""
+        marker = "migration:verified_contacts_brad_owner_seed_v1"
+        if self.get_setting(marker) == "1":
+            return
+        if self._db.execute(
+            "SELECT 1 FROM agents "
+            "WHERE name='barsik' AND registration_finalized=1"
+        ).fetchone() is None:
+            return
+        try:
+            cursor = self._db.execute(
+                """INSERT INTO verified_contacts
+                   (agent_name, platform, principal, name, role, added_at)
+                   VALUES ('barsik', 'buzz', ?, 'Brad', 'owner', ?)
+                   ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
+                     name='Brad', role='owner'""",
+                (
+                    "buzz:posspecialists:"
+                    "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b",
+                    time.time(),
+                ),
+            )
+            self._db.execute(
+                """INSERT INTO system_settings (key, value) VALUES (?, '1')
+                   ON CONFLICT(key) DO UPDATE SET value='1'""",
+                (marker,),
+            )
+            if _commit:
+                self._db.commit()
+        except Exception:
+            if _commit:
+                self._db.rollback()
+            raise
+        if cursor.rowcount:
+            _log("agent_registry: seeded barsik Buzz owner verified contact")
+
+    def finalize_registration(self, name: str) -> None:
+        """Atomically finalize registration and publish its bootstrap state."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                cursor = self._db.execute(
+                    "UPDATE agents SET registration_finalized=1 WHERE name=?",
+                    (name,),
+                )
+                if cursor.rowcount == 0:
+                    raise KeyError(f"Agent '{name}' not found")
+                self._seed_verified_contacts(_commit=False)
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
 
     def _backfill_runtime_from_provider_url(self) -> None:
         """One-shot migration from legacy provider_url runtime selection."""
@@ -1894,10 +2347,11 @@ class AgentRegistry:
         from #429) on agents whose workspace pre-dates them, without nuking
         any user customizations to existing scripts.
         """
+        agent_name = _validate_agent_name(agent_name)
         agent = self.get(agent_name)
         if not agent or not agent.working_dir:
             return
-        work_dir = Path(agent.working_dir)
+        work_dir = resolve_agent_path(agent_name, agent.working_dir)
         if not work_dir.exists():
             return
         try:
@@ -1916,11 +2370,21 @@ class AgentRegistry:
             ├── .claude/        # Claude Code hooks + settings
             └── CLAUDE.md       # Written by spawn, not here
         """
+        if agent_name:
+            work_dir = resolve_agent_path(agent_name, work_dir)
+            data_dir = resolve_agent_path(agent_name, work_dir, "data")
+            output_dir = resolve_agent_path(agent_name, work_dir, "output")
+            workspace_dir = resolve_agent_path(agent_name, work_dir, "workspace")
+        else:
+            work_dir = Path(work_dir).resolve()
+            data_dir = work_dir / "data"
+            output_dir = work_dir / "output"
+            workspace_dir = work_dir / "workspace"
         try:
             work_dir.mkdir(parents=True, exist_ok=True)
-            (work_dir / "data").mkdir(exist_ok=True)
-            (work_dir / "output").mkdir(exist_ok=True)
-            (work_dir / "workspace").mkdir(exist_ok=True)
+            data_dir.mkdir(exist_ok=True)
+            output_dir.mkdir(exist_ok=True)
+            workspace_dir.mkdir(exist_ok=True)
         except PermissionError:
             _log(f"agent_registry: workspace init skipped for {work_dir} (permission denied)")
             return
@@ -1932,6 +2396,7 @@ class AgentRegistry:
     @staticmethod
     def _write_hook_if_changed(
         *,
+        agent_dir: Path,
         hook_path: Path,
         new_source: str,
         hook_filename: str,
@@ -1951,11 +2416,11 @@ class AgentRegistry:
         ``_validate_agent_name``). The validation is cheap and raises
         ``ValueError`` on bad input rather than corrupting disk layout.
         """
-        _validate_agent_name(agent_name)
+        hook_path = resolve_agent_path(agent_name, agent_dir, hook_path)
         existing = hook_path.read_text() if hook_path.exists() else ""
         if existing == new_source:
             return
-        hook_path.write_text(new_source)
+        replace_agent_text(agent_name, agent_dir, hook_path, new_source)
         verb = "updated" if existing else "created"
         _log(f"agent_registry: {verb} {hook_filename} for {agent_name}")
 
@@ -1976,8 +2441,8 @@ class AgentRegistry:
         # the public entry point. Cheap re-check; raises ``ValueError`` on
         # bad input so the daemon crashes loudly rather than corrupting
         # filesystem layout.
-        _validate_agent_name(agent_name)
-        claude_dir = work_dir / ".claude"
+        work_dir = resolve_agent_path(agent_name, work_dir)
+        claude_dir = resolve_agent_path(agent_name, work_dir, ".claude")
         claude_dir.mkdir(exist_ok=True)
 
         hook_template = '''\
@@ -2045,14 +2510,26 @@ except Exception as exc:
         "%s: %s" % (type(exc).__name__, exc),
     )
 '''
-        working_path = claude_dir / "hook_working.py"
-        idle_path = claude_dir / "hook_idle.py"
-        verify_effort_path = claude_dir / "hook_verify_effort.py"
-        tmux_wake_path = claude_dir / "hook_tmux_wake.py"
-        tmux_session_start_path = claude_dir / "hook_tmux_session_start.py"
-        tmux_pre_tool_path = claude_dir / "hook_tmux_pre_tool.py"
-        tmux_post_tool_path = claude_dir / "hook_tmux_post_tool.py"
-        tmux_stop_failure_path = claude_dir / "hook_tmux_stop_failure.py"
+        working_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_working.py")
+        idle_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_idle.py")
+        verify_effort_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_verify_effort.py"
+        )
+        tmux_wake_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_wake.py"
+        )
+        tmux_session_start_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_session_start.py"
+        )
+        tmux_pre_tool_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_pre_tool.py"
+        )
+        tmux_post_tool_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_post_tool.py"
+        )
+        tmux_stop_failure_path = resolve_agent_path(
+            agent_name, work_dir, ".claude", "hook_tmux_stop_failure.py"
+        )
 
         # #638: these two were historically written once and left alone, which
         # stranded fleet agents on stale sources (e.g. the hardcoded
@@ -2060,12 +2537,14 @@ except Exception as exc:
         # are fully PinkyBot-managed, so keep them current like the five
         # always-rewritten hooks below.
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=working_path,
             new_source=hook_template.format(agent_name=agent_name, status="working"),
             hook_filename="hook_working.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=idle_path,
             new_source=hook_template.format(agent_name=agent_name, status="idle"),
             hook_filename="hook_idle.py",
@@ -2090,36 +2569,42 @@ except Exception as exc:
         # returns ``ok: True, session: None`` for non-tmux runtimes, so each
         # is a cheap no-op for SDK / codex agents (one extra POST per turn).
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=verify_effort_path,
             new_source=_verify_effort_hook_source(),
             hook_filename="hook_verify_effort.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_wake_path,
             new_source=_tmux_wake_hook_source(agent_name),
             hook_filename="hook_tmux_wake.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_session_start_path,
             new_source=_tmux_session_start_hook_source(agent_name),
             hook_filename="hook_tmux_session_start.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_pre_tool_path,
             new_source=_tmux_pre_tool_hook_source(agent_name),
             hook_filename="hook_tmux_pre_tool.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_post_tool_path,
             new_source=_tmux_post_tool_hook_source(agent_name),
             hook_filename="hook_tmux_post_tool.py",
             agent_name=agent_name,
         )
         AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir,
             hook_path=tmux_stop_failure_path,
             new_source=_tmux_stop_failure_hook_source(agent_name),
             hook_filename="hook_tmux_stop_failure.py",
@@ -2127,7 +2612,8 @@ except Exception as exc:
         )
 
         AgentRegistry._sync_hooks_settings(
-            claude_dir / "settings.json",
+            resolve_agent_path(agent_name, work_dir, ".claude", "settings.json"),
+            agent_dir=work_dir,
             working_path=working_path.resolve(),
             idle_path=idle_path.resolve(),
             verify_effort_path=verify_effort_path.resolve(),
@@ -2143,6 +2629,7 @@ except Exception as exc:
     def _sync_hooks_settings(
         settings_path: Path,
         *,
+        agent_dir: Path,
         working_path: Path,
         idle_path: Path,
         verify_effort_path: Path,
@@ -2163,6 +2650,36 @@ except Exception as exc:
           appearing in the command string.
         """
         import json as _json
+
+        settings_path = resolve_agent_path(agent_name, agent_dir, settings_path)
+        working_path = resolve_agent_path(agent_name, agent_dir, working_path)
+        idle_path = resolve_agent_path(agent_name, agent_dir, idle_path)
+        verify_effort_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            verify_effort_path,
+        )
+        tmux_wake_path = resolve_agent_path(agent_name, agent_dir, tmux_wake_path)
+        tmux_session_start_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_session_start_path,
+        )
+        tmux_pre_tool_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_pre_tool_path,
+        )
+        tmux_post_tool_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_post_tool_path,
+        )
+        tmux_stop_failure_path = resolve_agent_path(
+            agent_name,
+            agent_dir,
+            tmux_stop_failure_path,
+        )
 
         # Quote script paths: a working_dir containing spaces would otherwise
         # make python3 open a nonexistent file, and the trailing
@@ -2252,7 +2769,12 @@ except Exception as exc:
                     ],
                 }
             }
-            settings_path.write_text(_json.dumps(settings, indent=2) + "\n")
+            replace_agent_text(
+                agent_name,
+                agent_dir,
+                settings_path,
+                _json.dumps(settings, indent=2) + "\n",
+            )
             _log(f"agent_registry: created settings.json for {agent_name}")
             return
 
@@ -2330,7 +2852,12 @@ except Exception as exc:
         )
 
         if changed:
-            settings_path.write_text(_json.dumps(data, indent=2) + "\n")
+            replace_agent_text(
+                agent_name,
+                agent_dir,
+                settings_path,
+                _json.dumps(data, indent=2) + "\n",
+            )
             _log(
                 f"agent_registry: merged PinkyBot hooks into settings.json "
                 f"for {agent_name}"
@@ -2376,7 +2903,133 @@ except Exception as exc:
 
     # ── Agent CRUD ──────────────────────────────────────────
 
-    def update(self, name: str, **kwargs) -> Agent:
+    @staticmethod
+    def _markdown_heading_text(line: str, level: int) -> str | None:
+        """Parse one ATX heading in linear time, without regex backtracking."""
+        prefix = "#" * level
+        if not line.startswith(prefix):
+            return None
+        if len(line) == level or not line[level].isspace():
+            return None
+        body = line[level:].lstrip()
+        if not body:
+            return None
+        closing_start = len(body)
+        while closing_start and body[closing_start - 1] == "#":
+            closing_start -= 1
+        if closing_start < len(body) and body[closing_start - 1].isspace():
+            body = body[:closing_start].rstrip()
+        return body or None
+
+    @staticmethod
+    def _has_identity_label(line: str, label: str) -> bool:
+        """Recognize the legacy name/role label prefix in linear time."""
+        starts = [0]
+        if line[:1] in {"-", "*"}:
+            after_bullet = 1
+            while after_bullet < len(line) and line[after_bullet].isspace():
+                after_bullet += 1
+            starts.append(after_bullet)
+        for start in starts:
+            cursor = start
+            if line[cursor : cursor + 2] == "**":
+                cursor += 2
+            end = cursor + len(label)
+            if line[cursor:end].casefold() != label:
+                continue
+            cursor = end
+            while cursor < len(line) and line[cursor].isspace():
+                cursor += 1
+            if cursor < len(line) and line[cursor] == ":":
+                return True
+        return False
+
+    @staticmethod
+    def _soul_identity_anchors(
+        content: str,
+        *,
+        agent_name: str,
+        display_name: str = "",
+    ) -> set[str]:
+        """Return recognized identity structure without retaining its text."""
+        anchors: set[str] = set()
+        identities = {
+            value.strip().casefold()
+            for value in (agent_name, display_name)
+            if value and value.strip()
+        }
+        for raw_line in content.splitlines():
+            line = raw_line.strip()
+            heading = AgentRegistry._markdown_heading_text(line, 1)
+            if heading and heading.casefold() in identities:
+                anchors.add("agent_heading")
+            identity_heading = AgentRegistry._markdown_heading_text(line, 2)
+            if identity_heading and identity_heading.casefold() == "identity":
+                anchors.add("identity_heading")
+            if AgentRegistry._has_identity_label(line, "name"):
+                anchors.add("name_label")
+            if AgentRegistry._has_identity_label(line, "role"):
+                anchors.add("role_label")
+        return anchors
+
+    def assess_soul_mutation(
+        self,
+        name: str,
+        old_content: str,
+        new_content: str,
+        *,
+        display_name: str = "",
+    ) -> SoulMutationSummary:
+        """Describe a proposed soul replacement without exposing soul text."""
+        name = _validate_agent_name(name)
+        if not isinstance(old_content, str) or not isinstance(new_content, str):
+            raise TypeError("soul content must be text")
+        old_length = len(old_content)
+        new_length = len(new_content)
+        shrink_percent = (
+            round(max(0.0, (old_length - new_length) * 100.0 / old_length), 2)
+            if old_length
+            else 0.0
+        )
+        old_anchors = self._soul_identity_anchors(
+            old_content,
+            agent_name=name,
+            display_name=display_name,
+        )
+        new_anchors = self._soul_identity_anchors(
+            new_content,
+            agent_name=name,
+            display_name=display_name,
+        )
+        return SoulMutationSummary(
+            old_length=old_length,
+            new_length=new_length,
+            shrink_percent=shrink_percent,
+            missing_anchors=tuple(sorted(old_anchors - new_anchors)),
+        )
+
+    def guard_soul_mutation(
+        self,
+        name: str,
+        old_content: str,
+        new_content: str,
+        *,
+        display_name: str = "",
+        force_soul: bool = False,
+    ) -> SoulMutationSummary:
+        """Reject destructive soul replacement unless explicitly forced."""
+        summary = self.assess_soul_mutation(
+            name,
+            old_content,
+            new_content,
+            display_name=display_name,
+        )
+        shrinks_more_than_half = summary.new_length * 2 < summary.old_length
+        if not force_soul and (shrinks_more_than_half or summary.missing_anchors):
+            raise SoulMutationRejectedError(summary)
+        return summary
+
+    def update(self, name: str, *, _commit: bool = True, **kwargs) -> Agent:
         """Partially update an existing agent without creating one.
 
         Only explicitly supplied, allowlisted fields are changed.  This is
@@ -2385,66 +3038,255 @@ except Exception as exc:
         agent or reset fields omitted from a PATCH-like request.
         """
         name = _validate_agent_name(name)
-        existing = self.get(name)
-        if not existing:
-            raise KeyError(f"Agent '{name}' not found")
-        if "working_dir" in kwargs:
-            raise ValueError(
-                "working_dir is not supported by partial update; use register()"
-            )
+        force_soul = bool(kwargs.pop("force_soul", False))
+        soul_source = str(kwargs.pop("soul_source", "registry-update") or "registry-update")
+        with self._rmw_lock:
+            existing = self.get(name)
+            if not existing:
+                raise KeyError(f"Agent '{name}' not found")
+            if "working_dir" in kwargs:
+                raise ValueError(
+                    "working_dir is not supported by partial update; use register()"
+                )
 
-        updates = {}
-        for key in ("display_name", "model", "soul", "users", "boundaries",
-                    "system_prompt",
-                    "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
-                    "context_nudge_threshold_pct",
-                    "auto_restart", "parent", "max_sessions", "enabled",
-                    "auto_start", "heartbeat_interval", "wake_interval",
-                    "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
-                    "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
-                    "librarian_enabled", "librarian_schedule",
-                    "runtime", "transport", "provider_url", "provider_model", "provider_ref",
-                    "thinking_effort", "strict_effort_enforcement", "isolated",
-                    "isolation_mode", "container_image"):
-            if key in kwargs:
-                updates[key] = kwargs[key]
+            updates = {}
+            for key in ("display_name", "model", "soul", "users", "boundaries",
+                        "system_prompt",
+                        "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
+                        "context_nudge_threshold_pct",
+                        "auto_restart", "parent", "max_sessions", "enabled",
+                        "auto_start", "heartbeat_interval", "wake_interval",
+                        "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
+                        "dream_enabled", "dream_schedule", "dream_timezone", "dream_model", "dream_notify",
+                        "librarian_enabled", "librarian_schedule",
+                        "runtime", "transport", "provider_url", "provider_model", "provider_ref",
+                        "codex_home",
+                        "thinking_effort", "strict_effort_enforcement",
+                        "dedicated_config_dir", "isolated",
+                        "isolation_mode", "container_image"):
+                if key in kwargs:
+                    updates[key] = kwargs[key]
 
-        # Secret: empty/absent means "unchanged" so callers round-tripping
-        # the redacted to_dict() (provider_key_set) can't wipe the key.
-        # Wiping requires the explicit clear_provider_key flag.
-        if kwargs.get("provider_key"):
-            updates["provider_key"] = kwargs["provider_key"]
-        elif kwargs.get("clear_provider_key"):
-            updates["provider_key"] = ""
+            # Secret: empty/absent means "unchanged" so callers round-tripping
+            # the redacted to_dict() (provider_key_set) can't wipe the key.
+            # Wiping requires the explicit clear_provider_key flag.
+            if kwargs.get("provider_key"):
+                updates["provider_key"] = kwargs["provider_key"]
+            elif kwargs.get("clear_provider_key"):
+                updates["provider_key"] = ""
 
-        for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
-            if key in kwargs:
-                updates[key] = json.dumps(kwargs[key])
+            for key in ("watchdog_config", "allowed_tools", "disallowed_tools", "groups"):
+                if key in kwargs:
+                    updates[key] = json.dumps(kwargs[key])
 
-        for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
-                    "plain_text_fallback", "dream_enabled", "dream_notify",
-                    "librarian_enabled", "strict_effort_enforcement", "isolated"):
-            if key in updates:
-                updates[key] = int(updates[key])
-        if "voice_config" in updates and isinstance(updates["voice_config"], dict):
-            updates["voice_config"] = json.dumps(updates["voice_config"])
+            for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
+                        "plain_text_fallback", "dream_enabled", "dream_notify",
+                        "librarian_enabled", "strict_effort_enforcement",
+                        "dedicated_config_dir", "isolated"):
+                if key in updates:
+                    updates[key] = int(updates[key])
+            if "voice_config" in updates and isinstance(updates["voice_config"], dict):
+                updates["voice_config"] = json.dumps(updates["voice_config"])
 
-        if updates:
-            updates["updated_at"] = time.time()
-            set_clause = ", ".join(f"{key}=?" for key in updates)
-            self._db.execute(
-                f"UPDATE agents SET {set_clause} WHERE name=?",
-                list(updates.values()) + [name],
-            )
-            self._db.commit()
+            soul_changed = "soul" in updates and updates["soul"] != existing.soul
+            if "soul" in updates and not soul_changed:
+                updates.pop("soul")
+            if soul_changed:
+                self.guard_soul_mutation(
+                    name,
+                    existing.soul,
+                    updates["soul"],
+                    display_name=existing.display_name,
+                    force_soul=force_soul,
+                )
+
+            if updates:
+                updates["updated_at"] = time.time()
+                set_clause = ", ".join(f"{key}=?" for key in updates)
+                try:
+                    if soul_changed:
+                        self._insert_soul_version_uncommitted(
+                            name,
+                            existing.soul,
+                            source=f"{soul_source}:before",
+                        )
+                    self._db.execute(
+                        f"UPDATE agents SET {set_clause} WHERE name=?",
+                        list(updates.values()) + [name],
+                    )
+                    if _commit:
+                        self._db.commit()
+                except Exception:
+                    if _commit:
+                        self._db.rollback()
+                    raise
 
         updated = self.get(name)
         if not updated:  # Defensive against a concurrent delete.
             raise KeyError(f"Agent '{name}' not found")
         return updated
 
-    def register(self, name: str, **kwargs) -> Agent:
-        """Register a new agent or update an existing one."""
+    def _insert_agent_row(
+        self,
+        sql: str,
+        params: tuple,
+        *,
+        name: str,
+        create_only: bool,
+        work_dir: Path,
+    ) -> None:
+        """Atomically claim an owner root, insert, and initialize the winner."""
+        with self._rmw_lock:
+            insert_won = False
+            try:
+                # The advisory preflight in register() is intentionally repeated
+                # under SQLite's cross-connection writer lock. Different names do
+                # not contend on the agents.name PRIMARY KEY, so BEGIN IMMEDIATE is
+                # the authority that serializes overlap-check + INSERT across
+                # daemon processes. The second writer observes the first commit
+                # before it can evaluate owner-root equality or nesting.
+                self._db.execute("BEGIN IMMEDIATE")
+                self._refuse_workspace_overlap(name, work_dir)
+                self._db.execute(sql, params)
+                insert_won = True
+                # A losing create-only request must not reinitialize files in
+                # either the winner's workspace or an attacker-chosen path.
+                # Keep the insert transaction open so only the PRIMARY KEY
+                # winner reaches filesystem setup; rollback the row if setup
+                # itself fails.
+                self._init_workspace(work_dir, agent_name=name)
+                self._db.commit()
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                if create_only:
+                    # The exact-root belt may be evaluated before the name
+                    # PRIMARY KEY when a same-name loser also reuses the
+                    # winner's root. Classify from committed DB state after
+                    # rollback instead of depending on SQLite's index order.
+                    if self._db.execute(
+                        "SELECT 1 FROM agents WHERE name=?",
+                        (name,),
+                    ).fetchone():
+                        raise AgentAlreadyExistsError(
+                            f"Agent '{name}' already exists"
+                        ) from exc
+                    if "agents.working_dir" in str(exc):
+                        raise AgentWorkspaceOverlapError(
+                            "agent workspace overlaps another registered agent"
+                        ) from exc
+                raise
+            except Exception:
+                self._db.rollback()
+                if create_only and insert_won:
+                    raise AgentRegistrationIncompleteError(
+                        name,
+                        row_committed=False,
+                    )
+                raise
+
+    def _update_existing_registration(
+        self,
+        name: str,
+        *,
+        working_dir: str | Path,
+        update_kwargs: dict,
+    ) -> Agent:
+        """Serialize a legacy register-update workspace claim across connections."""
+        root = self._resolve_workspace_root(name, working_dir)
+        # Preserve the early, side-effect-free refusal while making the repeated
+        # check inside BEGIN IMMEDIATE authoritative for concurrent writers.
+        self._refuse_workspace_overlap(name, root)
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self.get(name)
+            if not existing:
+                raise KeyError(f"Agent '{name}' not found")
+            self._refuse_workspace_overlap(name, root)
+            if str(root) != existing.working_dir:
+                self._init_workspace(root, agent_name=name)
+
+            # update() owns soul-guard and snapshot semantics. Suppress its
+            # commit so those field mutations and the owner-root claim land in
+            # the same transaction, or all roll back on overlap/guard failure.
+            self.update(name, _commit=False, **update_kwargs)
+            self._db.execute(
+                "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
+                (str(root), time.time(), name),
+            )
+            self._db.commit()
+        except Exception:
+            self._db.rollback()
+            raise
+
+        refreshed = self.get(name)
+        if not refreshed:  # Defensive against a concurrent delete.
+            raise KeyError(f"Agent '{name}' not found")
+        return refreshed
+
+    @staticmethod
+    def _resolve_workspace_root(name: str, working_dir: str | Path) -> Path:
+        """Return a stable absolute owner root suitable for persistence."""
+        _validate_agent_name(name)
+        try:
+            root = Path(working_dir).resolve()
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise AgentWorkspacePathError("agent workspace path is invalid") from exc
+        if not root.is_absolute() or (root.exists() and not root.is_dir()):
+            raise AgentWorkspacePathError("agent workspace path is invalid")
+        return root
+
+    def _refuse_workspace_overlap(self, name: str, root: Path) -> None:
+        """Fail closed when ``root`` intersects another agent's owner root."""
+        _validate_agent_name(name)
+        rows = self._db.execute(
+            "SELECT name, working_dir FROM agents WHERE name<>?",
+            (name,),
+        ).fetchall()
+        for other_name, other_working_dir in rows:
+            try:
+                other_root = self._resolve_workspace_root(
+                    other_name,
+                    other_working_dir,
+                )
+            except (AgentWorkspacePathError, ValueError) as exc:
+                raise AgentWorkspacePathError(
+                    "registered agent workspace path is invalid"
+                ) from exc
+            if (
+                root == other_root
+                or root.is_relative_to(other_root)
+                or other_root.is_relative_to(root)
+            ):
+                raise AgentWorkspaceOverlapError(
+                    "agent workspace overlaps another registered agent"
+                )
+
+    def resolve_registration_workspace(
+        self,
+        name: str,
+        working_dir: str | Path,
+    ) -> Path:
+        """Resolve and preflight a proposed owner root without mutating state."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            root = self._resolve_workspace_root(name, working_dir)
+            self._refuse_workspace_overlap(name, root)
+            return root
+
+    def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
+        """Register atomically, including cross-agent workspace ownership."""
+        name = _validate_agent_name(name)
+        with self._rmw_lock:
+            return self._register_locked(name, create_only=create_only, **kwargs)
+
+    def _register_locked(
+        self,
+        name: str,
+        *,
+        create_only: bool = False,
+        **kwargs,
+    ) -> Agent:
+        """Register while ``_rmw_lock`` protects root checks and mutation."""
         # Sanitize before any path is constructed downstream. Same regex as
         # the API model — duplicated here so in-process callers (tests,
         # scripts, future routes) can't bypass it. ``_validate_agent_name``
@@ -2452,44 +3294,36 @@ except Exception as exc:
         # source-of-path-construction.
         name = _validate_agent_name(name)
         now = time.time()
-        existing = self.get(name)
+        # A create-only caller must reach INSERT OR ABORT without a read-side
+        # availability decision. The agents.name PRIMARY KEY is authoritative,
+        # including when multiple daemon processes race on the same DB.
+        existing = None if create_only else self.get(name)
 
         if existing:
             # Keep the legacy workspace mutation on register(), whose admin
             # callers and path-handling contract predate the partial update
             # API. AgentRegistry.update() is intentionally path-free.
-            updated_working_dir = ""
-            if kwargs.get("working_dir"):
-                upd_dir = Path(kwargs["working_dir"])
-                upd_dir_abs = upd_dir if upd_dir.is_absolute() else upd_dir.resolve()
-                if str(upd_dir_abs) != existing.working_dir:
-                    self._init_workspace(upd_dir_abs, agent_name=name)
-                updated_working_dir = str(upd_dir_abs)
-
             update_kwargs = dict(kwargs)
             update_kwargs.pop("working_dir", None)
-            updated = self.update(name, **update_kwargs)
-            if updated_working_dir:
-                self._db.execute(
-                    "UPDATE agents SET working_dir=?, updated_at=? WHERE name=?",
-                    (updated_working_dir, time.time(), name),
+            if kwargs.get("working_dir"):
+                updated = self._update_existing_registration(
+                    name,
+                    working_dir=kwargs["working_dir"],
+                    update_kwargs=update_kwargs,
                 )
-                self._db.commit()
-                refreshed = self.get(name)
-                if not refreshed:  # Defensive against a concurrent delete.
-                    raise KeyError(f"Agent '{name}' not found")
-                updated = refreshed
+            else:
+                updated = self.update(name, **update_kwargs)
             # Preserve register()'s historical signing-key backfill contract
             # for legacy rows even though the field mutation is delegated.
             self.get_or_create_signing_key(name)
+            self._seed_verified_contacts()
             return updated
         else:
             # Set up workspace — always store absolute path for portability.
             # Relative paths break when daemon CWD differs from install dir.
             raw_dir = kwargs.get("working_dir", "") or f"data/agents/{name}"
-            work_dir = Path(raw_dir)
-            work_dir_abs = work_dir if work_dir.is_absolute() else work_dir.resolve()
-            self._init_workspace(work_dir_abs, agent_name=name)
+            work_dir_abs = self._resolve_workspace_root(name, raw_dir)
+            self._refuse_workspace_overlap(name, work_dir_abs)
             agent = Agent(
                 name=name,
                 display_name=kwargs.get("display_name", ""),
@@ -2535,28 +3369,35 @@ except Exception as exc:
                 provider_key=kwargs.get("provider_key", ""),
                 provider_model=kwargs.get("provider_model", ""),
                 provider_ref=kwargs.get("provider_ref", ""),
+                codex_home=kwargs.get("codex_home", ""),
                 thinking_effort=kwargs.get("thinking_effort", "medium"),
                 strict_effort_enforcement=kwargs.get("strict_effort_enforcement", False),
+                dedicated_config_dir=kwargs.get("dedicated_config_dir", False),
                 watchdog_config=kwargs.get("watchdog_config", {}),
                 created_at=now,
                 updated_at=now,
             )
-            self._db.execute(
-                """INSERT INTO agents
+            insert_complete = False
+            try:
+                self._insert_agent_row(
+                    """INSERT OR ABORT INTO agents
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
                     restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
-                    max_sessions, enabled, auto_start, heartbeat_interval, plain_text_fallback,
+                    max_sessions, enabled, registration_finalized, auto_start,
+                    heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
                     isolation_mode, container_image,
                     dream_enabled, dream_schedule, dream_timezone, dream_model, dream_notify,
                     librarian_enabled, librarian_schedule,
                     runtime, transport, provider_url, provider_key, provider_model, provider_ref,
-                    thinking_effort, strict_effort_enforcement, watchdog_config,
+                    codex_home,
+                    thinking_effort, strict_effort_enforcement, dedicated_config_dir,
+                    watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (agent.name, agent.display_name, agent.model, agent.soul,
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), json.dumps(agent.disallowed_tools),
@@ -2564,7 +3405,8 @@ except Exception as exc:
                  agent.restart_threshold_pct, agent.context_nudge_threshold_pct,
                  int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
-                 int(agent.enabled), int(agent.auto_start), agent.heartbeat_interval, int(agent.plain_text_fallback),
+                 int(agent.enabled), int(not create_only), int(agent.auto_start),
+                 agent.heartbeat_interval, int(agent.plain_text_fallback),
                  agent.wake_interval, int(agent.clock_aligned), agent.auto_sleep_hours,
                  json.dumps(agent.voice_config), agent.role, int(agent.isolated),
                  agent.isolation_mode, agent.container_image,
@@ -2572,27 +3414,49 @@ except Exception as exc:
                  int(agent.librarian_enabled), agent.librarian_schedule,
                  agent.runtime, agent.transport, agent.provider_url, agent.provider_key,
                  agent.provider_model, agent.provider_ref,
+                 agent.codex_home,
                  agent.thinking_effort, int(agent.strict_effort_enforcement),
+                 int(agent.dedicated_config_dir),
                  json.dumps(agent.watchdog_config),
-                 agent.created_at, agent.updated_at),
-            )
-            self._db.commit()
-            _log(f"agents: registered {name}")
+                     agent.created_at, agent.updated_at),
+                    name=name,
+                    create_only=create_only,
+                    work_dir=work_dir_abs,
+                )
+                insert_complete = True
+                _log(f"agents: registered {name}")
 
-            # First-run convenience: if no main agent is designated yet, adopt
-            # this newly created agent. Without a main agent the daemon starts
-            # no autonomy loop and the agent never auto-wakes — a silent
-            # dead-end for fresh installs. Only fires on creation of an enabled
-            # agent when main is unset, so it never overrides an existing choice.
-            if agent.enabled and not self.get_setting("main_agent"):
-                self.set_setting("main_agent", name)
-                _log(f"agents: auto-assigned main_agent={name} (first agent)")
+                # First-run convenience: if no main agent is designated yet, adopt
+                # this newly created agent. Without a main agent the daemon starts
+                # no autonomy loop and the agent never auto-wakes — a silent
+                # dead-end for fresh installs. Only fires on creation of an enabled
+                # agent when main is unset, so it never overrides an existing choice.
+                if agent.enabled and not self.get_setting("main_agent"):
+                    self.set_setting("main_agent", name)
+                    _log(f"agents: auto-assigned main_agent={name} (first agent)")
 
-        # Ensure the agent has a per-agent signing key (#623). Idempotent —
-        # returns the existing key on re-registration / update.
-        self.get_or_create_signing_key(name)
+                # Ensure the agent has a per-agent signing key (#623). Idempotent —
+                # returns the existing key on re-registration / update.
+                self.get_or_create_signing_key(name)
+                # The HTTP create-only path has fallible provisioning and MCP
+                # publication stages after this registry commit. Defer its
+                # verified-contact bootstrap to finalize_registration() so a
+                # failed POST cannot leave the contact or migration marker.
+                # Direct legacy registrations have no later external stages and
+                # retain their historical bootstrap behavior.
+                if not create_only:
+                    self._seed_verified_contacts()
+            except (AgentAlreadyExistsError, AgentRegistrationIncompleteError):
+                raise
+            except Exception as exc:
+                if create_only and insert_complete:
+                    raise AgentRegistrationIncompleteError(
+                        name,
+                        row_committed=True,
+                    ) from exc
+                raise
 
-        return self.get(name)  # type: ignore
+            return self.get(name)  # type: ignore
 
     _AGENT_COLUMNS = (
         "name, display_name, model, soul, system_prompt, working_dir, "
@@ -2607,7 +3471,7 @@ except Exception as exc:
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
-        "isolation_mode, container_image"
+        "isolation_mode, container_image, dedicated_config_dir, codex_home"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -2674,6 +3538,875 @@ except Exception as exc:
                 _log(f"agent_registry: skipped signing-key backfill for {name!r}: {e}")
         if generated:
             _log(f"agent_registry: backfilled signing keys for {generated} agent(s)")
+
+    # ── Buzz identities (#541 inc1) ────────────────────────────────────
+
+    @staticmethod
+    def _buzz_identity_dict(row) -> dict:
+        """Public identity DTO. Secret envelope and receipt stay daemon-only."""
+        return {
+            "agent": row[0],
+            "pubkey": row[1],
+            "wrap_version": row[2],
+            "relay_url": row[3],
+            "community_id": row[4],
+            "relay_signing_pubkey": row[5],
+            "enabled": bool(row[6]),
+            "status": row[7],
+            "last_error": row[8],
+            "tos_approved": bool(row[9] and row[10] and row[11]),
+            "tos_approved_by": row[9],
+            "tos_approved_at": row[10],
+            "tos_approval_ref": row[11],
+            "created_at": row[12],
+            "updated_at": row[13],
+        }
+
+    def get_buzz_identity(self, agent_name: str) -> dict | None:
+        """Return public Buzz identity state without receipt or key envelope."""
+        row = self._db.execute(
+            "SELECT agent, pubkey, wrap_version, relay_url, community_id, "
+            "relay_signing_pubkey, enabled, status, last_error, "
+            "tos_approved_by, tos_approved_at, "
+            "tos_approval_ref, created_at, updated_at "
+            "FROM buzz_identities WHERE agent=?",
+            (agent_name,),
+        ).fetchone()
+        return self._buzz_identity_dict(row) if row else None
+
+    def list_buzz_identities(self, *, enabled_only: bool = False) -> list[dict]:
+        """List public Buzz identity state, never encrypted or raw secret fields."""
+        sql = (
+            "SELECT agent, pubkey, wrap_version, relay_url, community_id, "
+            "relay_signing_pubkey, enabled, status, last_error, "
+            "tos_approved_by, tos_approved_at, "
+            "tos_approval_ref, created_at, updated_at FROM buzz_identities"
+        )
+        if enabled_only:
+            sql += " WHERE enabled=1"
+        sql += " ORDER BY agent"
+        return [self._buzz_identity_dict(row) for row in self._db.execute(sql).fetchall()]
+
+    def bind_buzz_identity_owner_control(
+        self,
+        agent_name: str,
+        *,
+        private_key: str,
+        relay_url: str,
+        community_id: str,
+        relay_signing_pubkey: str,
+        enabled: bool,
+        owner_actor: str,
+        _commit: bool = True,
+    ) -> dict:
+        """Bind one identity from the authenticated owner-control route only.
+
+        The HTTP composition root derives only the authenticated owner actor.
+        Receipt, timestamp, and reference are generated here and bound to the
+        exact identity/policy/scope; callers cannot supply authority bytes.
+        """
+        from urllib.parse import urlsplit
+
+        from pinky_daemon.buzz_identity import (
+            issue_buzz_owner_approval,
+            validate_buzz_owner_actor,
+            validate_buzz_owner_approval,
+            wrap_buzz_private_key,
+        )
+        from pinky_identity.keystore import DeviceKey
+
+        agent = _validate_agent_name(agent_name)
+        if not self.get(agent):
+            raise KeyError(f"Agent '{agent}' not found")
+        relay = str(relay_url or "").strip()
+        parsed = urlsplit(relay)
+        if (
+            parsed.scheme not in {"ws", "wss"}
+            or not parsed.hostname
+            or parsed.username
+            or parsed.password
+            or parsed.query
+            or parsed.fragment
+        ):
+            raise ValueError("Buzz relay_url must be a plain ws:// or wss:// URL")
+        community = str(community_id or "").strip().lower()
+        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{0,62}", community):
+            raise ValueError("Buzz community_id is invalid")
+        relay_signer = _validate_buzz_pubkey(
+            relay_signing_pubkey,
+            field_name="relay_signing_pubkey",
+        )
+        approver = validate_buzz_owner_actor(owner_actor)
+
+        # Refuse accidental secret duplication into any durable text column.
+        secret_text = str(private_key or "").strip().lower()
+        if secret_text and any(
+            secret_text in value.lower()
+            for value in (relay, community, relay_signer, approver)
+        ):
+            raise ValueError("Buzz private key must not appear in identity metadata")
+
+        device_key = DeviceKey.load_or_create(self._buzz_device_key_path)
+        envelope = wrap_buzz_private_key(
+            private_key,
+            agent=agent,
+            device_key=device_key,
+        )
+        now = time.time()
+        status = "active" if enabled else "disabled"
+        with self._rmw_lock:
+            existing = self._db.execute(
+                "SELECT pubkey, relay_url, community_id, relay_signing_pubkey, tos_receipt, "
+                "tos_approved_by, tos_approved_at, tos_approval_ref "
+                "FROM buzz_identities WHERE agent=?",
+                (agent,),
+            ).fetchone()
+            if existing and (
+                not secrets.compare_digest(existing[0], envelope.pubkey)
+                or not secrets.compare_digest(existing[1], relay)
+                or not secrets.compare_digest(existing[2], community)
+            ):
+                raise ValueError(
+                    "Buzz identity or approval scope rotation requires an explicit rotation operation"
+                )
+            if existing and existing[3] and not secrets.compare_digest(
+                existing[3], relay_signer
+            ):
+                raise ValueError(
+                    "Buzz relay signing authority rotation requires an explicit rotation operation"
+                )
+            try:
+                if existing:
+                    validate_buzz_owner_approval(
+                        agent=agent,
+                        pubkey=existing[0],
+                        relay_url=existing[1],
+                        community_id=existing[2],
+                        receipt=existing[4],
+                        approved_by=existing[5],
+                        approved_at=existing[6],
+                        approval_ref=existing[7],
+                    )
+                    # Same identity + same immutable receipt: safe idempotent
+                    # re-bind. Preserve the original authority actor/timestamp/ref.
+                    self._db.execute(
+                        """UPDATE buzz_identities
+                           SET wrap_version=?, nonce=?, ciphertext=?, relay_url=?,
+                               community_id=?, relay_signing_pubkey=?, enabled=?, status=?, last_error='',
+                               updated_at=? WHERE agent=?""",
+                        (
+                            envelope.wrap_version,
+                            envelope.nonce,
+                            envelope.ciphertext,
+                            relay,
+                            community,
+                            relay_signer,
+                            int(enabled),
+                            status,
+                            now,
+                            agent,
+                        ),
+                    )
+                else:
+                    approval = issue_buzz_owner_approval(
+                        owner_actor=approver,
+                        agent=agent,
+                        pubkey=envelope.pubkey,
+                        relay_url=relay,
+                        community_id=community,
+                    )
+                    self._db.execute(
+                        """INSERT INTO buzz_identities (
+                               agent, pubkey, wrap_version, nonce, ciphertext,
+                               relay_url, community_id, relay_signing_pubkey,
+                               enabled, status, last_error,
+                               tos_receipt, tos_approved_by, tos_approved_at,
+                               tos_approval_ref, created_at, updated_at
+                           ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', ?, ?, ?, ?, ?, ?)""",
+                        (
+                            agent,
+                            envelope.pubkey,
+                            envelope.wrap_version,
+                            envelope.nonce,
+                            envelope.ciphertext,
+                            relay,
+                            community,
+                            relay_signer,
+                            int(enabled),
+                            status,
+                            approval.receipt,
+                            approval.approved_by,
+                            approval.approved_at,
+                            approval.approval_ref,
+                            now,
+                            now,
+                        ),
+                    )
+                if _commit:
+                    self._db.commit()
+            except sqlite3.IntegrityError as exc:
+                self._db.rollback()
+                raise ValueError("Buzz identity conflicts with an existing binding") from exc
+        result = self.get_buzz_identity(agent)
+        if result is None:  # pragma: no cover - defensive after successful write
+            raise RuntimeError("Buzz identity write did not persist")
+        return result
+
+    def get_buzz_signing_material(self, agent_name: str):
+        """Unwrap one active identity or disable it on any integrity failure."""
+        from pinky_daemon.buzz_identity import (
+            BuzzDependencyError,
+            BuzzIdentityUnhealthyError,
+            BuzzKeyEnvelope,
+            BuzzSigningMaterial,
+            unwrap_buzz_private_key,
+            validate_buzz_owner_approval,
+        )
+        from pinky_identity.keystore import DeviceKey
+
+        row = self._db.execute(
+            """SELECT agent, pubkey, wrap_version, nonce, ciphertext, relay_url,
+                      community_id, relay_signing_pubkey, enabled, status,
+                      tos_receipt, tos_approved_by, tos_approved_at, tos_approval_ref
+               FROM buzz_identities WHERE agent=?""",
+            (agent_name,),
+        ).fetchone()
+        if not row or not row[8] or row[9] != "active":
+            return None
+        try:
+            validate_buzz_owner_approval(
+                agent=row[0],
+                pubkey=row[1],
+                relay_url=row[5],
+                community_id=row[6],
+                receipt=row[10],
+                approved_by=row[11],
+                approved_at=row[12],
+                approval_ref=row[13],
+            )
+            envelope = BuzzKeyEnvelope(
+                agent=row[0],
+                pubkey=row[1],
+                wrap_version=row[2],
+                nonce=bytes(row[3]),
+                ciphertext=bytes(row[4]),
+            )
+            device_key = DeviceKey.load_or_create(self._buzz_device_key_path)
+            private_key = unwrap_buzz_private_key(envelope, device_key=device_key)
+        except BuzzDependencyError:
+            self.mark_buzz_dependency_refused(agent_name, "missing_runtime_dependency")
+            raise
+        except Exception as exc:
+            self.mark_buzz_identity_unhealthy(agent_name, type(exc).__name__)
+            raise BuzzIdentityUnhealthyError("Buzz identity is unhealthy and was disabled") from exc
+        return BuzzSigningMaterial(
+            agent=row[0],
+            pubkey=row[1],
+            private_key=private_key,
+            relay_url=row[5],
+            community_id=row[6],
+            relay_signing_pubkey=row[7],
+        )
+
+    def mark_buzz_identity_unhealthy(self, agent_name: str, reason: str) -> None:
+        """Disable an identity after AEAD/KEK/public-key integrity failure."""
+        self._db.execute(
+            "UPDATE buzz_identities SET enabled=0, status='unhealthy', "
+            "last_error=?, updated_at=? WHERE agent=?",
+            (str(reason or "integrity_failure")[:160], time.time(), agent_name),
+        )
+        self._db.commit()
+
+    def mark_buzz_dependency_refused(self, agent_name: str, reason: str) -> None:
+        """Refuse registration without destroying an otherwise valid identity."""
+        self._db.execute(
+            "UPDATE buzz_identities SET status='dependency_refused', "
+            "last_error=?, updated_at=? WHERE agent=? AND enabled=1",
+            (str(reason or "missing_runtime_dependency")[:160], time.time(), agent_name),
+        )
+        self._db.commit()
+
+    def mark_buzz_dependency_ready(self, agent_name: str) -> None:
+        """Restore an enabled dependency-refused identity after venv healing."""
+        self._db.execute(
+            "UPDATE buzz_identities SET status='active', last_error='', updated_at=? "
+            "WHERE agent=? AND enabled=1 AND status='dependency_refused'",
+            (time.time(), agent_name),
+        )
+        self._db.commit()
+
+    def disable_buzz_identity(self, agent_name: str) -> bool:
+        """Owner-control lifecycle operation; encrypted material remains recoverable."""
+        cursor = self._db.execute(
+            "UPDATE buzz_identities SET enabled=0, status='disabled', "
+            "last_error='', updated_at=? WHERE agent=?",
+            (time.time(), agent_name),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    # ── Buzz inbound authorization + durable delivery (#541 inc2) ─────
+
+    def configure_buzz_inbound_owner_control(
+        self,
+        agent_name: str,
+        *,
+        owner_pubkey: str,
+        channels: list[dict],
+        approved_users: list[dict],
+        owner_actor: str,
+        _commit: bool = True,
+    ) -> dict:
+        """Atomically replace one identity-scoped, default-deny inbound policy."""
+        from pinky_daemon.buzz_identity import validate_buzz_owner_actor
+
+        actor = validate_buzz_owner_actor(owner_actor)
+        owner = _validate_buzz_pubkey(owner_pubkey, field_name="owner_pubkey")
+        identity = self._db.execute(
+            "SELECT pubkey, relay_url, community_id FROM buzz_identities WHERE agent=?",
+            (agent_name,),
+        ).fetchone()
+        if not identity:
+            raise KeyError(f"Buzz identity not found for agent: {agent_name}")
+        if owner == identity[0]:
+            raise ValueError("Buzz owner_pubkey must not equal the agent identity pubkey")
+        if not channels:
+            raise ValueError("Buzz inbound channel allowlist must not be empty")
+        if len(channels) > 128 or len(approved_users) > 256:
+            raise ValueError("Buzz inbound policy exceeds configured bounds")
+
+        clean_channels: list[tuple[str, str]] = []
+        channel_ids: set[str] = set()
+        for item in channels:
+            channel = _validate_buzz_channel_id(item.get("channel_id", ""))
+            if channel in channel_ids:
+                raise ValueError("Buzz channel allowlist contains a duplicate channel_id")
+            channel_ids.add(channel)
+            label = _validate_buzz_annotation(
+                item.get("label", ""), field_name="channel label", limit=80
+            )
+            clean_channels.append((channel, label))
+
+        clean_users: list[tuple[str, str]] = []
+        user_pubkeys: set[str] = {owner}
+        for item in approved_users:
+            pubkey = _validate_buzz_pubkey(item.get("pubkey", ""))
+            if pubkey in user_pubkeys:
+                raise ValueError("Buzz approved principals contain a duplicate pubkey")
+            if pubkey == identity[0]:
+                raise ValueError("Buzz approved principal must not equal the agent identity")
+            user_pubkeys.add(pubkey)
+            display = _validate_buzz_annotation(
+                item.get("display_name", ""), field_name="display_name", limit=120
+            )
+            clean_users.append((pubkey, display))
+
+        relay_url = identity[1]
+        community_id = identity[2]
+        now = time.time()
+        with self._rmw_lock:
+            prior_policy = self._db.execute(
+                "SELECT owner_pubkey, owner_configured_at, owner_last_seen_at, "
+                "owner_silence_notified_at FROM buzz_inbound_policies WHERE agent=?",
+                (agent_name,),
+            ).fetchone()
+            prior_seen = {
+                row[0]: float(row[1])
+                for row in self._db.execute(
+                    "SELECT pubkey, last_seen_at FROM buzz_inbound_principals WHERE agent=?",
+                    (agent_name,),
+                ).fetchall()
+            }
+            same_owner = bool(prior_policy and prior_policy[0] == owner)
+            configured_at = float(prior_policy[1]) if same_owner else now
+            owner_seen = float(prior_policy[2]) if same_owner else 0.0
+            silence_notified = float(prior_policy[3]) if same_owner else 0.0
+            try:
+                self._db.execute(
+                    """INSERT INTO buzz_inbound_policies
+                       (agent, community_id, relay_url, owner_pubkey,
+                        owner_configured_at, owner_last_seen_at,
+                        owner_silence_notified_at, status, last_connect_at,
+                        last_liveness_at, last_event_at, last_error,
+                        updated_by, updated_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, 'configured', 0, 0, 0, '', ?, ?)
+                       ON CONFLICT(agent) DO UPDATE SET
+                         community_id=excluded.community_id,
+                         relay_url=excluded.relay_url,
+                         owner_pubkey=excluded.owner_pubkey,
+                         owner_configured_at=excluded.owner_configured_at,
+                         owner_last_seen_at=excluded.owner_last_seen_at,
+                         owner_silence_notified_at=excluded.owner_silence_notified_at,
+                         status='configured', last_error='',
+                         updated_by=excluded.updated_by, updated_at=excluded.updated_at""",
+                    (
+                        agent_name,
+                        community_id,
+                        relay_url,
+                        owner,
+                        configured_at,
+                        owner_seen,
+                        silence_notified,
+                        actor,
+                        now,
+                    ),
+                )
+                self._db.execute("DELETE FROM buzz_inbound_channels WHERE agent=?", (agent_name,))
+                self._db.execute("DELETE FROM buzz_inbound_principals WHERE agent=?", (agent_name,))
+                self._db.executemany(
+                    """INSERT INTO buzz_inbound_channels
+                       (agent, community_id, relay_url, channel_id, label, created_at)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    [
+                        (agent_name, community_id, relay_url, channel, label, now)
+                        for channel, label in clean_channels
+                    ],
+                )
+                principals = [(owner, "owner", "")] + [
+                    (pubkey, "approved", display) for pubkey, display in clean_users
+                ]
+                self._db.executemany(
+                    """INSERT INTO buzz_inbound_principals
+                       (agent, community_id, pubkey, role, display_name,
+                        approved_by, approved_at, last_seen_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+                    [
+                        (
+                            agent_name,
+                            community_id,
+                            pubkey,
+                            role,
+                            display,
+                            actor,
+                            now,
+                            prior_seen.get(pubkey, 0.0),
+                        )
+                        for pubkey, role, display in principals
+                    ],
+                )
+                # A policy replacement is an authorization-boundary change.
+                # Pending events whose channel or author was revoked must not
+                # become deliverable if that authority is added back later.
+                revoked_pending = [
+                    (agent_name, row[0])
+                    for row in self._db.execute(
+                        """SELECT event_id, channel_id, author_pubkey
+                           FROM buzz_inbound_events
+                           WHERE agent=? AND delivery_status='pending'""",
+                        (agent_name,),
+                    ).fetchall()
+                    if row[1] not in channel_ids or row[2] not in user_pubkeys
+                ]
+                self._db.executemany(
+                    "DELETE FROM buzz_inbound_events WHERE agent=? AND event_id=?",
+                    revoked_pending,
+                )
+                if _commit:
+                    self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        policy = self.get_buzz_inbound_policy(agent_name)
+        if policy is None:  # pragma: no cover - defensive after successful transaction
+            raise RuntimeError("Buzz inbound policy write did not persist")
+        return policy
+
+    def bind_buzz_identity_with_inbound_owner_control(
+        self,
+        agent_name: str,
+        *,
+        private_key: str,
+        relay_url: str,
+        community_id: str,
+        relay_signing_pubkey: str,
+        enabled: bool,
+        owner_pubkey: str,
+        channels: list[dict],
+        approved_users: list[dict],
+        owner_actor: str,
+    ) -> tuple[dict, dict]:
+        """Atomically bind an identity and its complete inbound policy."""
+        with self._rmw_lock:
+            try:
+                self._db.execute("BEGIN IMMEDIATE")
+                identity = self.bind_buzz_identity_owner_control(
+                    agent_name,
+                    private_key=private_key,
+                    relay_url=relay_url,
+                    community_id=community_id,
+                    relay_signing_pubkey=relay_signing_pubkey,
+                    enabled=enabled,
+                    owner_actor=owner_actor,
+                    _commit=False,
+                )
+                policy = self.configure_buzz_inbound_owner_control(
+                    agent_name,
+                    owner_pubkey=owner_pubkey,
+                    channels=channels,
+                    approved_users=approved_users,
+                    owner_actor=owner_actor,
+                    _commit=False,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return identity, policy
+
+    def get_buzz_inbound_policy(self, agent_name: str) -> dict | None:
+        row = self._db.execute(
+            """SELECT agent, community_id, relay_url, owner_pubkey,
+                      owner_configured_at, owner_last_seen_at,
+                      owner_silence_notified_at, status, last_connect_at,
+                      last_liveness_at, last_event_at, last_error,
+                      updated_by, updated_at
+               FROM buzz_inbound_policies WHERE agent=?""",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        channels = [
+            {"channel_id": item[0], "label": item[1]}
+            for item in self._db.execute(
+                "SELECT channel_id, label FROM buzz_inbound_channels "
+                "WHERE agent=? AND community_id=? AND relay_url=? ORDER BY channel_id",
+                (agent_name, row[1], row[2]),
+            ).fetchall()
+        ]
+        principal_rows = self._db.execute(
+            """SELECT pubkey, role, display_name, approved_by, approved_at, last_seen_at
+               FROM buzz_inbound_principals
+               WHERE agent=? AND community_id=? ORDER BY role DESC, pubkey""",
+            (agent_name, row[1]),
+        ).fetchall()
+        principals = [
+            {
+                "principal": f"buzz:{row[1]}:{item[0]}",
+                "pubkey": item[0],
+                "role": item[1],
+                "display_name": item[2],
+                "approved_by": item[3],
+                "approved_at": item[4],
+                "last_seen_at": item[5],
+            }
+            for item in principal_rows
+        ]
+        return {
+            "agent": row[0],
+            "community_id": row[1],
+            "relay_url": row[2],
+            "owner_pubkey": row[3],
+            "owner_principal": f"buzz:{row[1]}:{row[3]}",
+            "owner_configured_at": row[4],
+            "owner_last_seen_at": row[5],
+            "owner_silence_notified_at": row[6],
+            "owner_silence_days": BUZZ_OWNER_SILENCE_DAYS,
+            "channels": channels,
+            "approved_users": [item for item in principals if item["role"] == "approved"],
+            "principals": principals,
+            "status": row[7],
+            "last_connect_at": row[8],
+            "last_liveness_at": row[9],
+            "last_event_at": row[10],
+            "last_error": row[11],
+            "updated_by": row[12],
+            "updated_at": row[13],
+        }
+
+    def get_buzz_inbound_channel(
+        self, agent_name: str, community_id: str, relay_url: str, channel_id: str
+    ) -> dict | None:
+        row = self._db.execute(
+            """SELECT channel_id, label FROM buzz_inbound_channels
+               WHERE agent=? AND community_id=? AND relay_url=? AND channel_id=?""",
+            (agent_name, community_id, relay_url, channel_id),
+        ).fetchone()
+        return {"channel_id": row[0], "label": row[1]} if row else None
+
+    def upsert_buzz_inbound_channel_from_membership(
+        self,
+        agent_name: str,
+        community_id: str,
+        relay_url: str,
+        channel_id: str,
+        *,
+        label: str = "",
+    ) -> dict:
+        """Admit one relay-notified membership into the scoped inbound gate."""
+        channel = _validate_buzz_channel_id(channel_id)
+        clean_label = _validate_buzz_annotation(label, field_name="channel label", limit=80)
+        with self._rmw_lock:
+            policy = self._db.execute(
+                """SELECT 1 FROM buzz_inbound_policies
+                   WHERE agent=? AND community_id=? AND relay_url=?""",
+                (agent_name, community_id, relay_url),
+            ).fetchone()
+            if policy is None:
+                raise ValueError("Buzz membership notification is outside the inbound policy scope")
+            self._db.execute(
+                """INSERT INTO buzz_inbound_channels
+                   (agent, community_id, relay_url, channel_id, label, created_at)
+                   VALUES (?, ?, ?, ?, ?, ?)
+                   ON CONFLICT(agent, community_id, channel_id) DO UPDATE SET
+                     relay_url=excluded.relay_url,
+                     label=CASE WHEN excluded.label != '' THEN excluded.label
+                                ELSE buzz_inbound_channels.label END""",
+                (agent_name, community_id, relay_url, channel, clean_label, time.time()),
+            )
+            self._db.commit()
+        result = self.get_buzz_inbound_channel(
+            agent_name, community_id, relay_url, channel
+        )
+        if result is None:  # pragma: no cover - defensive after successful write
+            raise RuntimeError("Buzz membership channel write did not persist")
+        return result
+
+    def remove_buzz_inbound_channel_from_membership(
+        self,
+        agent_name: str,
+        community_id: str,
+        relay_url: str,
+        channel_id: str,
+    ) -> bool:
+        """Revoke a relay-notified membership and any undelivered channel rows."""
+        channel = _validate_buzz_channel_id(channel_id)
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """DELETE FROM buzz_inbound_channels
+                   WHERE agent=? AND community_id=? AND relay_url=? AND channel_id=?""",
+                (agent_name, community_id, relay_url, channel),
+            )
+            self._db.execute(
+                """DELETE FROM buzz_inbound_events
+                   WHERE agent=? AND community_id=? AND channel_id=?
+                     AND delivery_status='pending'""",
+                (agent_name, community_id, channel),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def get_buzz_inbound_principal(
+        self, agent_name: str, community_id: str, pubkey: str
+    ) -> dict | None:
+        row = self._db.execute(
+            """SELECT pubkey, role, display_name, approved_by, approved_at, last_seen_at
+               FROM buzz_inbound_principals
+               WHERE agent=? AND community_id=? AND pubkey=?""",
+            (agent_name, community_id, pubkey),
+        ).fetchone()
+        if not row:
+            return None
+        return {
+            "principal": f"buzz:{community_id}:{row[0]}",
+            "pubkey": row[0],
+            "role": row[1],
+            "display_name": row[2],
+            "approved_by": row[3],
+            "approved_at": row[4],
+            "last_seen_at": row[5],
+        }
+
+    def note_buzz_inbound_principal_seen(
+        self, agent_name: str, community_id: str, pubkey: str, seen_at: float
+    ) -> None:
+        with self._rmw_lock:
+            self._db.execute(
+                """UPDATE buzz_inbound_principals
+                   SET last_seen_at=MAX(last_seen_at, ?)
+                   WHERE agent=? AND community_id=? AND pubkey=?""",
+                (seen_at, agent_name, community_id, pubkey),
+            )
+            self._db.execute(
+                """UPDATE buzz_inbound_policies
+                   SET owner_last_seen_at=MAX(owner_last_seen_at, ?),
+                       owner_silence_notified_at=0
+                   WHERE agent=? AND community_id=? AND owner_pubkey=?""",
+                (seen_at, agent_name, community_id, pubkey),
+            )
+            self._db.commit()
+
+    def buzz_owner_silence_alert_due(
+        self, agent_name: str, *, now: float | None = None
+    ) -> dict | None:
+        row = self._db.execute(
+            """SELECT community_id, owner_pubkey, owner_configured_at,
+                      owner_last_seen_at, owner_silence_notified_at
+               FROM buzz_inbound_policies WHERE agent=?""",
+            (agent_name,),
+        ).fetchone()
+        if not row:
+            return None
+        current = time.time() if now is None else float(now)
+        basis = float(row[3] or row[2])
+        if basis <= 0 or current - basis < BUZZ_OWNER_SILENCE_DAYS * 86400:
+            return None
+        if float(row[4]) >= basis:
+            return None
+        return {
+            "agent": agent_name,
+            "community_id": row[0],
+            "owner_principal": f"buzz:{row[0]}:{row[1]}",
+            "last_seen_at": float(row[3]),
+            "configured_at": float(row[2]),
+            "days": BUZZ_OWNER_SILENCE_DAYS,
+        }
+
+    def mark_buzz_owner_silence_notified(
+        self, agent_name: str, *, notified_at: float | None = None
+    ) -> None:
+        self._db.execute(
+            "UPDATE buzz_inbound_policies SET owner_silence_notified_at=? WHERE agent=?",
+            (time.time() if notified_at is None else float(notified_at), agent_name),
+        )
+        self._db.commit()
+
+    def begin_buzz_inbound_event_delivery(
+        self,
+        agent_name: str,
+        event: dict,
+        *,
+        community_id: str,
+        channel_id: str,
+        replay: bool = False,
+    ) -> bool:
+        """Claim one verified durable kind-9; ephemeral events never enter this table."""
+        if event.get("kind") != 9:
+            raise ValueError("only durable Buzz kind-9 events may be claimed")
+        event_id = _validate_buzz_pubkey(event.get("id", ""), field_name="event id")
+        author = _validate_buzz_pubkey(event.get("pubkey", ""))
+        payload = json.dumps(event, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+        now = time.time()
+        with self._rmw_lock:
+            row = self._db.execute(
+                "SELECT delivery_status, claimed_at FROM buzz_inbound_events "
+                "WHERE agent=? AND event_id=?",
+                (agent_name, event_id),
+            ).fetchone()
+            if row:
+                if row[0] == "delivered" or not replay:
+                    return False
+                cursor = self._db.execute(
+                    """UPDATE buzz_inbound_events
+                       SET claimed_at=?, attempts=attempts+1, last_error=''
+                       WHERE agent=? AND event_id=? AND delivery_status='pending'
+                         AND (claimed_at=0 OR claimed_at<=?)""",
+                    (
+                        now,
+                        agent_name,
+                        event_id,
+                        now - BUZZ_INBOUND_CLAIM_LEASE_SECONDS,
+                    ),
+                )
+                self._db.commit()
+                return cursor.rowcount > 0
+            else:
+                self._db.execute(
+                    """INSERT INTO buzz_inbound_events
+                       (agent, event_id, community_id, channel_id, author_pubkey,
+                        kind, event_created_at, event_json, delivery_status,
+                        claimed_at, delivered_at, attempts, last_error)
+                       VALUES (?, ?, ?, ?, ?, 9, ?, ?, 'pending', ?, 0, 1, '')""",
+                    (
+                        agent_name,
+                        event_id,
+                        community_id,
+                        channel_id,
+                        author,
+                        float(event["created_at"]),
+                        payload,
+                        now,
+                    ),
+                )
+            self._db.commit()
+        return True
+
+    def list_pending_buzz_inbound_events(self, agent_name: str) -> list[dict]:
+        stale_before = time.time() - BUZZ_INBOUND_CLAIM_LEASE_SECONDS
+        rows = self._db.execute(
+            """SELECT event_json FROM buzz_inbound_events
+               WHERE agent=? AND delivery_status='pending'
+                 AND (claimed_at=0 OR claimed_at<=?)
+               ORDER BY event_created_at, event_id""",
+            (agent_name, stale_before),
+        ).fetchall()
+        result: list[dict] = []
+        for row in rows:
+            try:
+                event = json.loads(row[0])
+            except (TypeError, ValueError):
+                continue
+            if isinstance(event, dict):
+                result.append(event)
+        return result
+
+    def reset_buzz_inbound_event_claims_after_restart(self) -> int:
+        """Release claims whose owning daemon process can no longer exist."""
+        cursor = self._db.execute(
+            """UPDATE buzz_inbound_events SET claimed_at=0
+               WHERE delivery_status='pending' AND claimed_at!=0"""
+        )
+        self._db.commit()
+        return cursor.rowcount
+
+    def mark_buzz_inbound_event_delivered(self, agent_name: str, event_id: str) -> None:
+        now = time.time()
+        self._db.execute(
+            """UPDATE buzz_inbound_events
+               SET delivery_status='delivered', delivered_at=?, last_error='', event_json=''
+               WHERE agent=? AND event_id=? AND delivery_status='pending'""",
+            (now, agent_name, event_id),
+        )
+        self._db.commit()
+
+    def mark_buzz_inbound_event_retry(self, agent_name: str, event_id: str, reason: str) -> None:
+        self._db.execute(
+            """UPDATE buzz_inbound_events SET claimed_at=0, last_error=?
+               WHERE agent=? AND event_id=? AND delivery_status='pending'""",
+            (str(reason or "delivery_failed")[:160], agent_name, event_id),
+        )
+        self._db.commit()
+
+    def get_buzz_subscription_since(self, agent_name: str, *, now: float | None = None) -> int:
+        row = self._db.execute(
+            "SELECT MAX(event_created_at) FROM buzz_inbound_events WHERE agent=?",
+            (agent_name,),
+        ).fetchone()
+        if row and row[0]:
+            return max(0, int(float(row[0])) - 2)
+        current = time.time() if now is None else float(now)
+        return max(0, int(current) - 60)
+
+    def update_buzz_inbound_health(
+        self,
+        agent_name: str,
+        *,
+        status: str | None = None,
+        last_error: str = "",
+        connected_at: float | None = None,
+        liveness_at: float | None = None,
+        event_at: float | None = None,
+    ) -> None:
+        connected = float(connected_at) if connected_at is not None else None
+        liveness = float(liveness_at) if liveness_at is not None else None
+        event = float(event_at) if event_at is not None else None
+        status_value = str(status or "unknown")[:40] if status is not None else None
+        self._db.execute(
+            """UPDATE buzz_inbound_policies
+               SET status=COALESCE(?, status), last_error=?,
+                   last_connect_at=COALESCE(MAX(last_connect_at, ?), last_connect_at),
+                   last_liveness_at=COALESCE(MAX(last_liveness_at, ?), last_liveness_at),
+                   last_event_at=COALESCE(MAX(last_event_at, ?), last_event_at)
+               WHERE agent=?""",
+            (
+                status_value,
+                str(last_error or "")[:160],
+                connected,
+                liveness,
+                event,
+                agent_name,
+            ),
+        )
+        self._db.commit()
 
     def list(self, *, parent: str = "", group: str = "", enabled_only: bool = False,
              include_retired: bool = False) -> list[Agent]:
@@ -3002,28 +4735,76 @@ except Exception as exc:
 
     # ── Soul Versioning ─────────────────────────────────────
 
+    def _insert_soul_version_uncommitted(
+        self,
+        agent_name: str,
+        content: str,
+        *,
+        source: str,
+    ) -> int:
+        """Insert one version row; the caller owns commit/rollback."""
+        agent_name = _validate_agent_name(agent_name)
+        cursor = self._db.execute(
+            "INSERT INTO soul_versions (agent_name, content, source, created_at) "
+            "VALUES (?, ?, ?, ?)",
+            (agent_name, content, source, time.time()),
+        )
+        return int(cursor.lastrowid)
+
+    def snapshot_soul_before_mutation(
+        self,
+        agent_name: str,
+        content: str,
+        *,
+        source: str,
+    ) -> int:
+        """Durably snapshot replaced content before a non-DB mutation."""
+        agent_name = _validate_agent_name(agent_name)
+        with self._rmw_lock:
+            try:
+                version_id = self._insert_soul_version_uncommitted(
+                    agent_name,
+                    content,
+                    source=source,
+                )
+                self._db.commit()
+            except Exception:
+                self._db.rollback()
+                raise
+        return version_id
+
     def save_soul_version(self, agent_name: str, content: str, source: str = "unknown") -> int:
         """Archive a soul version. Returns the version ID.
 
         Sources: 'ui', 'agent', 'spawn', 'refresh', 'api'
         """
-        # Skip if content matches the latest version
-        latest = self.get_soul_versions(agent_name, limit=1)
-        if latest:
-            full = self.get_soul_version(agent_name, latest[0]["id"])
-            if full and full["content"] == content:
-                return latest[0]["id"]
+        agent_name = _validate_agent_name(agent_name)
+        with self._rmw_lock:
+            try:
+                # Spawn publication records the installed content after writing.
+                # Keep that historical deduplication contract; mutation snapshots
+                # use _insert_soul_version_uncommitted so every actual replacement
+                # gets an audit row even when the same content appeared previously.
+                latest = self.get_soul_versions(agent_name, limit=1)
+                if latest:
+                    full = self.get_soul_version(agent_name, latest[0]["id"])
+                    if full and full["content"] == content:
+                        return latest[0]["id"]
 
-        now = time.time()
-        cursor = self._db.execute(
-            "INSERT INTO soul_versions (agent_name, content, source, created_at) VALUES (?, ?, ?, ?)",
-            (agent_name, content, source, now),
-        )
-        self._db.commit()
-        return cursor.lastrowid
+                version_id = self._insert_soul_version_uncommitted(
+                    agent_name,
+                    content,
+                    source=source,
+                )
+                self._db.commit()
+                return version_id
+            except Exception:
+                self._db.rollback()
+                raise
 
     def get_soul_versions(self, agent_name: str, limit: int = 20) -> list[dict]:
         """List soul versions for an agent, newest first."""
+        agent_name = _validate_agent_name(agent_name)
         rows = self._db.execute(
             "SELECT id, agent_name, source, created_at, LENGTH(content) as size FROM soul_versions WHERE agent_name=? ORDER BY created_at DESC LIMIT ?",
             (agent_name, limit),
@@ -3035,6 +4816,7 @@ except Exception as exc:
 
     def get_soul_version(self, agent_name: str, version_id: int) -> dict | None:
         """Get a specific soul version by ID."""
+        agent_name = _validate_agent_name(agent_name)
         row = self._db.execute(
             "SELECT id, agent_name, content, source, created_at FROM soul_versions WHERE agent_name=? AND id=?",
             (agent_name, version_id),
@@ -3239,6 +5021,29 @@ except Exception as exc:
         return [self._row_to_schedule(r) for r in rows
         ]
 
+    def get_oversized_enabled_schedule_prompts(
+        self,
+        min_length: int,
+    ) -> list[tuple[int, str, str, int]]:
+        """Return enabled schedules whose prompts exceed ``min_length``.
+
+        Only prompt metadata is selected; the prompt content itself never
+        leaves SQLite or reaches the warning log.
+        """
+        if min_length < 0:
+            raise ValueError("min_length must be non-negative")
+        rows = self._db.execute(
+            """SELECT id, agent_name, name, LENGTH(prompt)
+               FROM agent_schedules
+               WHERE enabled=1 AND LENGTH(prompt) > ?
+               ORDER BY LENGTH(prompt) DESC""",
+            (min_length,),
+        ).fetchall()
+        return [
+            (int(row[0]), str(row[1]), str(row[2]), int(row[3]))
+            for row in rows
+        ]
+
     def get_schedule(self, schedule_id: int) -> AgentSchedule | None:
         """Return one schedule regardless of enabled state."""
         row = self._db.execute(
@@ -3378,6 +5183,135 @@ except Exception as exc:
         )
         self._db.commit()
 
+    def record_recurring_schedule_stale_drop(
+        self,
+        schedule_id: int,
+        *,
+        agent_name: str,
+        schedule_name: str,
+        dropped_at: float,
+        row_age_s: float,
+    ) -> RecurringScheduleStaleDrop:
+        """Aggregate one stale recurring fire into one bounded schedule row.
+
+        The table has exactly one row per live schedule and cascades on
+        schedule deletion. ``generation`` is a non-reusable revision: an
+        acknowledgement retains a zero-count tombstone, so a later drop can
+        never recycle the revision held by an older receipt observer.
+        """
+        if schedule_id <= 0:
+            raise ValueError("schedule_id must be positive")
+        if not agent_name:
+            raise ValueError("agent_name must not be empty")
+        if dropped_at <= 0:
+            raise ValueError("dropped_at must be positive")
+        bounded_name = str(schedule_name or "")[:256]
+        bounded_age = max(0.0, float(row_age_s))
+        with self._rmw_lock:
+            self._db.execute(
+                """INSERT INTO recurring_schedule_stale_drops (
+                       schedule_id, agent_name, schedule_name, drop_count,
+                       first_dropped_at, last_dropped_at, max_row_age_s,
+                       generation
+                   ) VALUES (?, ?, ?, 1, ?, ?, ?, 1)
+                   ON CONFLICT(schedule_id) DO UPDATE SET
+                       agent_name=excluded.agent_name,
+                       schedule_name=excluded.schedule_name,
+                       drop_count=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN 1
+                           ELSE recurring_schedule_stale_drops.drop_count + 1
+                       END,
+                       first_dropped_at=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN excluded.first_dropped_at
+                           ELSE MIN(
+                               recurring_schedule_stale_drops.first_dropped_at,
+                               excluded.first_dropped_at
+                           )
+                       END,
+                       last_dropped_at=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN excluded.last_dropped_at
+                           ELSE MAX(
+                               recurring_schedule_stale_drops.last_dropped_at,
+                               excluded.last_dropped_at
+                           )
+                       END,
+                       max_row_age_s=CASE
+                           WHEN recurring_schedule_stale_drops.drop_count = 0
+                           THEN excluded.max_row_age_s
+                           ELSE MAX(
+                               recurring_schedule_stale_drops.max_row_age_s,
+                               excluded.max_row_age_s
+                           )
+                       END,
+                       generation=recurring_schedule_stale_drops.generation + 1""",
+                (
+                    schedule_id,
+                    agent_name,
+                    bounded_name,
+                    dropped_at,
+                    dropped_at,
+                    bounded_age,
+                ),
+            )
+            row = self._db.execute(
+                """SELECT schedule_id, agent_name, schedule_name, drop_count,
+                          first_dropped_at, last_dropped_at, max_row_age_s,
+                          generation
+                   FROM recurring_schedule_stale_drops
+                   WHERE schedule_id=?""",
+                (schedule_id,),
+            ).fetchone()
+            self._db.commit()
+        return RecurringScheduleStaleDrop(*row)
+
+    def list_recurring_schedule_stale_drops(
+        self, agent_name: str
+    ) -> list[RecurringScheduleStaleDrop]:
+        """Return unsurfaced recurring-drop aggregates in stable order."""
+        rows = self._db.execute(
+            """SELECT schedule_id, agent_name, schedule_name, drop_count,
+                      first_dropped_at, last_dropped_at, max_row_age_s,
+                      generation
+               FROM recurring_schedule_stale_drops
+               WHERE agent_name=? AND drop_count > 0
+               ORDER BY schedule_id ASC""",
+            (agent_name,),
+        ).fetchall()
+        return [RecurringScheduleStaleDrop(*row) for row in rows]
+
+    def acknowledge_recurring_schedule_stale_drops(
+        self,
+        agent_name: str,
+        notices: list[RecurringScheduleStaleDrop],
+    ) -> int:
+        """Clear only versioned aggregates included in a confirmed delivery.
+
+        Clearing retains a zero-count revision tombstone.  Deleting the row
+        would let a later INSERT restart at generation 1, allowing a delayed
+        acknowledgement for an older generation-1 snapshot to erase the new
+        unsurfaced casualty (an ABA race).
+        """
+        if not notices:
+            return 0
+        cleared = 0
+        with self._rmw_lock:
+            for notice in notices:
+                if notice.agent_name != agent_name:
+                    continue
+                cursor = self._db.execute(
+                    """UPDATE recurring_schedule_stale_drops
+                       SET drop_count=0
+                       WHERE agent_name=? AND schedule_id=? AND generation=?
+                         AND drop_count > 0""",
+                    (agent_name, notice.schedule_id, notice.generation),
+                )
+                cleared += cursor.rowcount
+            self._db.commit()
+        return cleared
+
     def claim_schedule_fire(
         self,
         schedule_id: int,
@@ -3432,7 +5366,7 @@ except Exception as exc:
         return self._db.execute(
             """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                       fired_at, created_at, attempts, parked_at, accepted_at,
-                      failed_at, last_error
+                      failed_at, last_error, abandoned_at
                FROM pending_schedule_wakes
                WHERE schedule_id=? AND fired_at=?""",
             (schedule_id, fired_at),
@@ -3476,7 +5410,7 @@ except Exception as exc:
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                           fired_at, created_at, attempts, parked_at, accepted_at,
-                          failed_at, last_error
+                          failed_at, last_error, abandoned_at
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -3492,13 +5426,13 @@ except Exception as exc:
     ) -> list[PendingScheduleWake]:
         """Return pending scheduler wakes oldest-first.
 
-        Accepted receipts are always excluded. Quarantined rows are excluded
-        by default; pass ``include_parked=True`` to inspect those terminal
-        records alongside the active replay outbox.
+        Accepted receipts are always excluded. Quarantined and abandoned rows
+        are excluded by default; pass ``include_parked=True`` to inspect those
+        terminal records alongside the active replay outbox.
         """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error
+                        failed_at, last_error, abandoned_at
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -3507,12 +5441,58 @@ except Exception as exc:
             params.append(agent_name)
         conditions.append("accepted_at=0")
         if not include_parked:
-            conditions.append("parked_at=0")
+            conditions.extend(("parked_at=0", "abandoned_at=0"))
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at ASC, id ASC"
         rows = self._db.execute(sql, params).fetchall()
         return [PendingScheduleWake(*row) for row in rows]
+
+    def get_pending_schedule_wake_health(
+        self,
+        agent_name: str | None = None,
+        *,
+        now: float | None = None,
+    ) -> list[dict]:
+        """Return active outbox debt and abandoned history per agent.
+
+        Accepted receipts and quarantined rows are terminal ledger history and
+        remain excluded. Explicitly abandoned rows surface as their own count,
+        never as active replay debt.
+        """
+        sql = """SELECT agent_name,
+                        SUM(CASE WHEN abandoned_at=0 THEN 1 ELSE 0 END),
+                        MIN(CASE WHEN abandoned_at=0 THEN fired_at END),
+                        MAX(CASE WHEN abandoned_at=0 THEN fired_at END),
+                        SUM(CASE WHEN abandoned_at>0 THEN 1 ELSE 0 END)
+                 FROM pending_schedule_wakes
+                 WHERE accepted_at=0 AND parked_at=0"""
+        params: list = []
+        if agent_name is not None:
+            sql += " AND agent_name=?"
+            params.append(agent_name)
+        sql += " GROUP BY agent_name ORDER BY agent_name"
+        rows = self._db.execute(sql, params).fetchall()
+        observed_at = time.time() if now is None else float(now)
+        result = []
+        for row in rows:
+            oldest_fired_at = float(row[2]) if row[2] is not None else 0.0
+            newest_fired_at = float(row[3]) if row[3] is not None else 0.0
+            result.append(
+                {
+                    "agent_name": str(row[0]),
+                    "count": int(row[1]),
+                    "abandoned_count": int(row[4]),
+                    "oldest_fired_at": oldest_fired_at,
+                    "newest_fired_at": newest_fired_at,
+                    "oldest_age_seconds": (
+                        max(0.0, observed_at - oldest_fired_at)
+                        if oldest_fired_at > 0
+                        else 0.0
+                    ),
+                }
+            )
+        return result
 
     def list_schedule_wake_ledger(
         self,
@@ -3528,11 +5508,12 @@ except Exception as exc:
             "pending",
             "receipted-ran-once",
             "quarantined",
+            "abandoned",
         }:
             raise ValueError(f"invalid scheduler wake ledger state: {state}")
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error
+                        failed_at, last_error, abandoned_at
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -3543,11 +5524,19 @@ except Exception as exc:
             conditions.append("fired_at>=?")
             params.append(fired_after)
         if state == "pending":
-            conditions.extend(("accepted_at=0", "parked_at=0"))
+            conditions.extend(
+                ("accepted_at=0", "parked_at=0", "abandoned_at=0")
+            )
         elif state == "receipted-ran-once":
             conditions.append("accepted_at>0")
         elif state == "quarantined":
-            conditions.extend(("accepted_at=0", "parked_at>0"))
+            conditions.extend(
+                ("accepted_at=0", "parked_at>0", "abandoned_at=0")
+            )
+        elif state == "abandoned":
+            conditions.extend(
+                ("accepted_at=0", "parked_at=0", "abandoned_at>0")
+            )
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at DESC, id DESC LIMIT ?"
@@ -3576,14 +5565,19 @@ except Exception as exc:
             if row is None:
                 return None, False
             current = PendingScheduleWake(*row)
-            if current.accepted_at > 0 or current.parked_at > 0:
+            if (
+                current.accepted_at > 0
+                or current.parked_at > 0
+                or current.abandoned_at > 0
+            ):
                 return current, False
             first_failure = current.failed_at == 0
             self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
-                   WHERE id=? AND accepted_at=0 AND parked_at=0""",
+                   WHERE id=? AND accepted_at=0 AND parked_at=0
+                     AND abandoned_at=0""",
                 (timestamp, reason, current.id),
             )
             row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
@@ -3598,7 +5592,8 @@ except Exception as exc:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET attempts=attempts + 1
-                   WHERE id=? AND parked_at=0""",
+                   WHERE id=? AND accepted_at=0 AND parked_at=0
+                     AND abandoned_at=0""",
                 (pending_id,),
             )
             if cursor.rowcount == 0:
@@ -3626,7 +5621,61 @@ except Exception as exc:
                    SET parked_at=?,
                        failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
-                   WHERE id=? AND parked_at=0 AND accepted_at=0""",
+                   WHERE id=? AND parked_at=0 AND accepted_at=0
+                     AND abandoned_at=0""",
+                (timestamp, timestamp, reason, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def abandon_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        abandoned_at: float = 0.0,
+        reason: str = "receipt confirmation ceiling exceeded",
+    ) -> bool:
+        """Atomically move an active wake to explicit abandonment once.
+
+        Abandonment is distinct from delivery quarantine: it records the
+        ambiguous receipt-gap outcome without replaying or discarding the row.
+        A later positive receipt remains authoritative and clears this marker.
+        """
+        timestamp = abandoned_at or time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET abandoned_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND parked_at=0 AND accepted_at=0
+                     AND abandoned_at=0""",
+                (timestamp, timestamp, reason, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def collapse_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        superseded_by_fired_at: float,
+        collapsed_at: float = 0.0,
+    ) -> bool:
+        """Quarantine one recurrence superseded by a newer pending fire."""
+        timestamp = collapsed_at or time.time()
+        reason = (
+            "recurrence collapsed into newer pending fire "
+            f"fired_at={superseded_by_fired_at}"
+        )
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET parked_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND parked_at=0 AND accepted_at=0
+                     AND abandoned_at=0""",
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
@@ -3656,6 +5705,7 @@ except Exception as exc:
                    SET accepted_at=CASE
                            WHEN accepted_at=0 THEN ? ELSE accepted_at END,
                        parked_at=0,
+                       abandoned_at=0,
                        last_error=''
                    WHERE id=?""",
                 (timestamp, pending_id),
@@ -3691,6 +5741,7 @@ except Exception as exc:
                    SET accepted_at=CASE
                            WHEN accepted_at=0 THEN ? ELSE accepted_at END,
                        parked_at=0,
+                       abandoned_at=0,
                        last_error=''
                    WHERE schedule_id=? AND fired_at=?""",
                 (timestamp, schedule_id, fired_at),
@@ -3705,14 +5756,401 @@ except Exception as exc:
             )
         return True
 
-    def discard_pending_schedule_wake(self, pending_id: int) -> bool:
-        """Retire a pending wake without marking its schedule delivered."""
-        cursor = self._db.execute(
-            "DELETE FROM pending_schedule_wakes WHERE id=?",
-            (pending_id,),
+    def discard_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        agent_name: str | None = None,
+    ) -> bool:
+        """Retire an active pending wake by TOMBSTONING it (not deleting).
+
+        Sets ``parked_at`` so the row survives as a terminal marker instead of
+        being erased. This is load-bearing: a bare ``DELETE`` left no durable
+        "retired" record, so a later reconciliation — finding the schedule's
+        ``last_run`` advanced but no outbox row and no accepted receipt — would
+        re-create and re-fire an already-handled fire. Keeping the row preserves
+        the ``(schedule_id, fired_at)`` key (a re-persist's ``INSERT OR IGNORE``
+        then no-ops), and the parked row is excluded from the active replay
+        outbox (``list_pending_schedule_wakes`` default), so the fire is neither
+        re-created nor re-delivered.
+
+        ``agent_name`` scopes self-service callers to their own outbox. Rows that
+        are already accepted, parked, or abandoned are terminal evidence and
+        are left as-is.
+
+        Parked tombstones accumulate until a terminal-row reaper prunes them
+        (tracked separately; accepted rows already accumulate the same way).
+        """
+        sql = """UPDATE pending_schedule_wakes
+                 SET parked_at=?, last_error=?
+                 WHERE id=? AND accepted_at=0 AND parked_at=0
+                   AND abandoned_at=0"""
+        params: list = [time.time(), "retired via discard", pending_id]
+        if agent_name is not None:
+            sql += " AND agent_name=?"
+            params.append(agent_name)
+        with self._rmw_lock:
+            cursor = self._db.execute(sql, params)
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def delete_pending_schedule_wake(self, pending_id: int) -> bool:
+        """Hard-delete an active pending wake (no tombstone).
+
+        Used by the internal replay stale-drop pass, which fires at the cadence
+        of frequently-recurring schedules — tombstoning there would accumulate
+        rows unboundedly without a reaper. Deliberate/manual retirement uses
+        ``discard_pending_schedule_wake`` (which tombstones) so a retired fire
+        cannot be re-created by a later reconciliation. Accepted, parked, or
+        abandoned rows are terminal and are left as-is.
+        """
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """DELETE FROM pending_schedule_wakes
+                   WHERE id=? AND accepted_at=0 AND parked_at=0
+                     AND abandoned_at=0""",
+                (pending_id,),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def reap_pending_schedule_wakes(
+        self,
+        *,
+        now: float,
+        abandon_after: float,
+        retain_accepted: float,
+        retain_abandoned: float,
+        retain_parked: float,
+        payload_trim_after: float,
+        batch_size: int = OUTBOX_REAPER_BATCH_SIZE,
+    ) -> list[dict[str, int | str]]:
+        """Transition stranded wakes and prune bounded terminal history.
+
+        This maintenance pass never delivers or re-queues work. Active rows
+        cross into explicit abandonment only after the strict fired-at
+        ceiling. Legacy ``RECEIPT_ABANDONED`` quarantine markers are reclassified
+        into the same explicit state. Retention is measured from each transition,
+        so every newly backfilled abandonment survives its full forensic window.
+        Large populations are committed in bounded chunks while the registry's
+        mutation lock prevents in-process replay races.
+        """
+        observed_at = float(now)
+        windows = {
+            "abandon_after": float(abandon_after),
+            "retain_accepted": float(retain_accepted),
+            "retain_abandoned": float(retain_abandoned),
+            "retain_parked": float(retain_parked),
+            "payload_trim_after": float(payload_trim_after),
+        }
+        if not math.isfinite(observed_at) or observed_at <= 0:
+            raise ValueError("outbox reaper now must be positive")
+        if any(
+            not math.isfinite(value) or value <= 0
+            for value in windows.values()
+        ):
+            raise ValueError("outbox reaper windows must be positive")
+        if batch_size <= 0:
+            raise ValueError("outbox reaper batch_size must be positive")
+
+        metric_fields = (
+            "abandoned",
+            "accepted_reaped",
+            "abandoned_reaped",
+            "parked_reaped",
+            "payloads_trimmed",
+            "retained_active",
         )
-        self._db.commit()
-        return cursor.rowcount > 0
+        metrics: dict[str, dict[str, int | str]] = {}
+
+        def _agent_metrics(agent_name: str) -> dict[str, int | str]:
+            if agent_name not in metrics:
+                metrics[agent_name] = {
+                    "agent_name": agent_name,
+                    **{field: 0 for field in metric_fields},
+                }
+            return metrics[agent_name]
+
+        def _apply_batched(
+            sql: str,
+            params: tuple,
+            metric_field: str,
+        ) -> None:
+            while True:
+                rows = self._db.execute(
+                    sql,
+                    (*params, int(batch_size)),
+                ).fetchall()
+                self._db.commit()
+                for row in rows:
+                    agent_metrics = _agent_metrics(str(row[0]))
+                    agent_metrics[metric_field] = (
+                        int(agent_metrics[metric_field]) + 1
+                    )
+                if len(rows) < batch_size:
+                    return
+
+        def _refresh_retained_active() -> None:
+            for agent_metrics in metrics.values():
+                agent_metrics["retained_active"] = 0
+            active_rows = self._db.execute(
+                """SELECT agent_name, COUNT(*)
+                   FROM pending_schedule_wakes
+                   WHERE accepted_at=0 AND parked_at=0 AND abandoned_at=0
+                   GROUP BY agent_name"""
+            ).fetchall()
+            for agent_name, count in active_rows:
+                _agent_metrics(str(agent_name))["retained_active"] = int(count)
+
+        def _emit_log(
+            message: str,
+            *,
+            emission_errors: list[Exception] | None = None,
+        ) -> None:
+            if emission_errors is None:
+                _log(message)
+                return
+            try:
+                _log(message)
+            except Exception as exc:
+                emission_errors.append(exc)
+
+        def _emit_metrics(
+            *,
+            failed_phase: str | None = None,
+            emission_errors: list[Exception] | None = None,
+        ) -> list[dict[str, int | str]]:
+            result = [metrics[name] for name in sorted(metrics)]
+            for row in result:
+                _emit_log(
+                    f"outbox-reaper: agent={row['agent_name']} "
+                    f"abandoned=+{row['abandoned']} "
+                    f"accepted_reaped={row['accepted_reaped']} "
+                    f"abandoned_reaped={row['abandoned_reaped']} "
+                    f"parked_reaped={row['parked_reaped']} "
+                    f"payloads_trimmed={row['payloads_trimmed']} "
+                    f"retained_active={row['retained_active']}",
+                    emission_errors=emission_errors,
+                )
+            totals = {
+                field: sum(int(row[field]) for row in result)
+                for field in metric_fields
+            }
+            partial = (
+                f" PARTIAL failed_phase={failed_phase}"
+                if failed_phase is not None
+                else ""
+            )
+            _emit_log(
+                f"outbox-reaper: summary{partial} agents={len(result)} "
+                f"abandoned=+{totals['abandoned']} "
+                f"accepted_reaped={totals['accepted_reaped']} "
+                f"abandoned_reaped={totals['abandoned_reaped']} "
+                f"parked_reaped={totals['parked_reaped']} "
+                f"payloads_trimmed={totals['payloads_trimmed']} "
+                f"retained_active={totals['retained_active']}",
+                emission_errors=emission_errors,
+            )
+            return result
+
+        discard_reason = "retired via discard"
+        abandon_cutoff = observed_at - windows["abandon_after"]
+        accepted_cutoff = observed_at - windows["retain_accepted"]
+        abandoned_cutoff = observed_at - windows["retain_abandoned"]
+        parked_cutoff = observed_at - windows["retain_parked"]
+        trim_cutoff = observed_at - windows["payload_trim_after"]
+
+        failed_phase = "agent_scan"
+        with self._rmw_lock:
+            try:
+                for row in self._db.execute(
+                    "SELECT DISTINCT agent_name FROM pending_schedule_wakes"
+                ).fetchall():
+                    _agent_metrics(str(row[0]))
+
+                failed_phase = "abandon"
+                _apply_batched(
+                    """UPDATE pending_schedule_wakes
+                       SET abandoned_at=?, parked_at=0
+                       WHERE id IN (
+                           SELECT id FROM pending_schedule_wakes
+                           WHERE accepted_at=0 AND abandoned_at=0
+                             AND (
+                                 (parked_at=0 AND fired_at < ?)
+                                 OR (
+                                     parked_at>0
+                                     AND last_error LIKE 'RECEIPT_ABANDONED:%'
+                                 )
+                             )
+                           ORDER BY id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (observed_at, abandon_cutoff),
+                    "abandoned",
+                )
+                failed_phase = "accepted_reap"
+                _apply_batched(
+                    """DELETE FROM pending_schedule_wakes
+                       WHERE id IN (
+                           SELECT id FROM pending_schedule_wakes
+                           WHERE accepted_at>0 AND accepted_at < ?
+                           ORDER BY id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (accepted_cutoff,),
+                    "accepted_reaped",
+                )
+                failed_phase = "abandoned_reap"
+                _apply_batched(
+                    """DELETE FROM pending_schedule_wakes
+                       WHERE id IN (
+                           SELECT id FROM pending_schedule_wakes
+                           WHERE (
+                               accepted_at=0 AND parked_at=0
+                               AND abandoned_at>0 AND abandoned_at < ?
+                           ) OR (
+                               accepted_at=0 AND abandoned_at=0
+                               AND parked_at>0 AND parked_at < ?
+                               AND last_error=?
+                           )
+                           ORDER BY id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (abandoned_cutoff, abandoned_cutoff, discard_reason),
+                    "abandoned_reaped",
+                )
+                failed_phase = "parked_reap"
+                _apply_batched(
+                    """DELETE FROM pending_schedule_wakes AS parked
+                       WHERE parked.id IN (
+                           SELECT candidate.id
+                           FROM pending_schedule_wakes AS candidate
+                           WHERE candidate.accepted_at=0
+                             AND candidate.abandoned_at=0
+                             AND candidate.parked_at>0
+                             AND candidate.parked_at < ?
+                             AND candidate.last_error<>?
+                             AND EXISTS (
+                                 SELECT 1
+                                 FROM pending_schedule_wakes AS newer
+                                 WHERE newer.schedule_id=candidate.schedule_id
+                                   AND newer.accepted_at=0
+                                   AND newer.abandoned_at=0
+                                   AND newer.parked_at>0
+                                   AND newer.last_error<>?
+                                   AND (
+                                       newer.parked_at > candidate.parked_at
+                                       OR (
+                                           newer.parked_at=candidate.parked_at
+                                           AND newer.id > candidate.id
+                                       )
+                                   )
+                             )
+                           ORDER BY candidate.id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (parked_cutoff, discard_reason, discard_reason),
+                    "parked_reaped",
+                )
+                failed_phase = "payload_trim"
+                _apply_batched(
+                    """UPDATE pending_schedule_wakes AS terminal
+                       SET prompt=?
+                       WHERE terminal.id IN (
+                           SELECT candidate.id
+                           FROM pending_schedule_wakes AS candidate
+                           WHERE candidate.prompt<>?
+                             AND (
+                                 (
+                                     candidate.accepted_at>0
+                                     AND candidate.accepted_at < ?
+                                 ) OR (
+                                     candidate.accepted_at=0
+                                     AND candidate.parked_at=0
+                                     AND candidate.abandoned_at>0
+                                     AND candidate.abandoned_at < ?
+                                 ) OR (
+                                     candidate.accepted_at=0
+                                     AND candidate.abandoned_at=0
+                                     AND candidate.parked_at>0
+                                     AND candidate.parked_at < ?
+                                     AND candidate.last_error=?
+                                 ) OR (
+                                     candidate.accepted_at=0
+                                     AND candidate.abandoned_at=0
+                                     AND candidate.parked_at>0
+                                     AND candidate.parked_at < ?
+                                     AND candidate.last_error<>?
+                                     AND EXISTS (
+                                         SELECT 1
+                                         FROM pending_schedule_wakes AS newer
+                                         WHERE newer.schedule_id=candidate.schedule_id
+                                           AND newer.accepted_at=0
+                                           AND newer.abandoned_at=0
+                                           AND newer.parked_at>0
+                                           AND newer.last_error<>?
+                                           AND (
+                                               newer.parked_at > candidate.parked_at
+                                               OR (
+                                                   newer.parked_at=candidate.parked_at
+                                                   AND newer.id > candidate.id
+                                               )
+                                           )
+                                     )
+                                 )
+                             )
+                           ORDER BY candidate.id ASC LIMIT ?
+                       )
+                       RETURNING agent_name""",
+                    (
+                        OUTBOX_REAPER_PAYLOAD_TRIMMED,
+                        OUTBOX_REAPER_PAYLOAD_TRIMMED,
+                        trim_cutoff,
+                        trim_cutoff,
+                        trim_cutoff,
+                        discard_reason,
+                        trim_cutoff,
+                        discard_reason,
+                        discard_reason,
+                    ),
+                    "payloads_trimmed",
+                )
+
+                failed_phase = "retained_active"
+                _refresh_retained_active()
+            except Exception:
+                self._db.rollback()
+                try:
+                    _refresh_retained_active()
+                except Exception:
+                    # Preserve and report the maintenance failure even if the
+                    # diagnostic read is unavailable on a broken connection.
+                    pass
+                emission_errors: list[Exception] = []
+                try:
+                    _emit_metrics(
+                        failed_phase=failed_phase,
+                        emission_errors=emission_errors,
+                    )
+                except Exception as exc:
+                    emission_errors.append(exc)
+                _emit_log(
+                    "outbox-reaper: ERROR maintenance pass failed",
+                    emission_errors=emission_errors,
+                )
+                for emission_error in tuple(emission_errors):
+                    try:
+                        _log(
+                            "outbox-reaper: emission ERROR while reporting "
+                            "maintenance failure: "
+                            f"{type(emission_error).__name__}: "
+                            f"{emission_error}"
+                        )
+                    except Exception:
+                        pass
+                raise
+
+        return _emit_metrics()
 
     def increment_pending_wake_attempt(self, pending_id: int) -> int:
         """Increment attempt_count for a pending wake and return the new count.
@@ -4859,7 +7297,13 @@ except Exception as exc:
                (agent_name, platform, chat_id, chat_title, chat_type, member_count, joined_at)
                VALUES (?, ?, ?, ?, ?, ?, ?)
                ON CONFLICT (agent_name, chat_id)
-               DO UPDATE SET chat_title=excluded.chat_title,
+               DO UPDATE SET platform=CASE WHEN excluded.platform='buzz'
+                                            THEN excluded.platform
+                                            ELSE group_chats.platform END,
+                            chat_title=CASE WHEN excluded.platform='buzz'
+                                                 AND excluded.chat_title=''
+                                            THEN group_chats.chat_title
+                                            ELSE excluded.chat_title END,
                             chat_type=excluded.chat_type,
                             member_count=excluded.member_count,
                             active=1""",
@@ -4927,6 +7371,93 @@ except Exception as exc:
         cursor = self._db.execute(
             "UPDATE group_chats SET active=0 WHERE agent_name=? AND chat_id=?",
             (agent_name, chat_id),
+        )
+        self._db.commit()
+        return cursor.rowcount > 0
+
+    # ── Verified Contacts ────────────────────────────────────
+
+    @staticmethod
+    def _verified_contact_dict(row) -> dict:
+        return {
+            "id": row[0],
+            "agent_name": row[1],
+            "platform": row[2],
+            "principal": row[3],
+            "name": row[4],
+            "role": row[5],
+            "added_at": row[6],
+        }
+
+    def get_verified_contact(
+        self, agent_name: str, platform: str, principal: str
+    ) -> dict | None:
+        """Return one explicitly registered contact, never traffic-derived."""
+        row = self._db.execute(
+            """SELECT id, agent_name, platform, principal, name, role, added_at
+               FROM verified_contacts
+               WHERE agent_name=? AND platform=? AND principal=?""",
+            (agent_name, platform, principal),
+        ).fetchone()
+        return self._verified_contact_dict(row) if row else None
+
+    def upsert_verified_contact(
+        self,
+        agent_name: str,
+        platform: str,
+        principal: str,
+        name: str,
+        role: str = "",
+    ) -> dict:
+        """Create or replace an explicit principal-to-name trust decision."""
+        agent = _validate_agent_name(agent_name)
+        clean_platform = str(platform or "").strip().lower()
+        clean_principal = str(principal or "").strip()
+        clean_name = str(name or "").strip()
+        clean_role = str(role or "").strip().lower()
+        if not clean_platform or len(clean_platform) > 64:
+            raise ValueError("verified contact platform must be 1-64 characters")
+        if not clean_principal or len(clean_principal) > 512:
+            raise ValueError("verified contact principal must be 1-512 characters")
+        if not clean_name or len(clean_name) > 120 or any(
+            ord(ch) < 32 or ord(ch) == 127 for ch in clean_name
+        ):
+            raise ValueError("verified contact name must be 1-120 printable characters")
+        if clean_role not in {"", "owner", "agent"}:
+            raise ValueError("verified contact role must be owner, agent, or empty")
+        now = time.time()
+        self._db.execute(
+            """INSERT INTO verified_contacts
+               (agent_name, platform, principal, name, role, added_at)
+               VALUES (?, ?, ?, ?, ?, ?)
+               ON CONFLICT(agent_name, platform, principal) DO UPDATE SET
+                 name=excluded.name, role=excluded.role, added_at=excluded.added_at""",
+            (agent, clean_platform, clean_principal, clean_name, clean_role, now),
+        )
+        self._db.commit()
+        result = self.get_verified_contact(agent, clean_platform, clean_principal)
+        if result is None:  # pragma: no cover - defensive after successful write
+            raise RuntimeError("verified contact write did not persist")
+        return result
+
+    def list_verified_contacts(self, agent_name: str) -> list[dict]:
+        """List explicitly registered contacts for one agent."""
+        rows = self._db.execute(
+            """SELECT id, agent_name, platform, principal, name, role, added_at
+               FROM verified_contacts WHERE agent_name=?
+               ORDER BY platform, name COLLATE NOCASE, principal""",
+            (agent_name,),
+        ).fetchall()
+        return [self._verified_contact_dict(row) for row in rows]
+
+    def delete_verified_contact(
+        self, agent_name: str, platform: str, principal: str
+    ) -> bool:
+        """Delete one explicit verified-contact trust decision."""
+        cursor = self._db.execute(
+            """DELETE FROM verified_contacts
+               WHERE agent_name=? AND platform=? AND principal=?""",
+            (agent_name, str(platform or "").strip().lower(), str(principal or "").strip()),
         )
         self._db.commit()
         return cursor.rowcount > 0
@@ -5587,6 +8118,8 @@ except Exception as exc:
             isolated=bool(row[51]) if len(row) > 51 else False,
             isolation_mode=row[52] if len(row) > 52 and row[52] else "local",
             container_image=row[53] if len(row) > 53 and row[53] else "",
+            dedicated_config_dir=bool(row[54]) if len(row) > 54 else False,
+            codex_home=row[55] if len(row) > 55 and row[55] else "",
         )
 
     # ── Cost Tracking ──────────────────────────────────────

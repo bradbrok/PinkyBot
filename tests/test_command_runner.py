@@ -49,7 +49,7 @@ class TestLocalCommandRunner:
     async def test_feeds_stdin(self):
         r = await LocalCommandRunner().run(
             [sys.executable, "-c", "import sys; sys.stdout.write(sys.stdin.read())"],
-            stdin=b"piped",
+            stdin_data=b"piped",
         )
         assert r.stdout == b"piped"
 
@@ -68,8 +68,8 @@ class _RecordingRunner(LocalCommandRunner):
     def __init__(self):
         self.calls: list[tuple[list[str], float | None, bytes | None]] = []
 
-    async def run(self, argv, *, timeout=None, stdin=None):
-        self.calls.append((argv, timeout, stdin))
+    async def run(self, argv, *, timeout=None, stdin_data=None):
+        self.calls.append((argv, timeout, stdin_data))
         return CommandResult(0, b"", b"")
 
 
@@ -88,12 +88,12 @@ class TestRunuserCommandRunner:
     async def test_run_delegates_wrapped_argv_to_inner(self):
         inner = _RecordingRunner()
         r = RunuserCommandRunner("pinky-mora", inner=inner)
-        await r.run(["tmux", "kill-session"], timeout=5.0, stdin=b"x")
+        await r.run(["tmux", "kill-session"], timeout=5.0, stdin_data=b"x")
         assert len(inner.calls) == 1
-        argv, timeout, stdin = inner.calls[0]
+        argv, timeout, stdin_data = inner.calls[0]
         assert argv == ["runuser", "-u", "pinky-mora", "--", "tmux", "kill-session"]
-        assert timeout == 5.0  # timeout/stdin pass through unchanged
-        assert stdin == b"x"
+        assert timeout == 5.0  # timeout/stdin_data pass through unchanged
+        assert stdin_data == b"x"
 
     async def test_terminator_isolates_wrapped_options(self):
         # A wrapped arg that looks like a runuser option must sit AFTER ``--``.
@@ -136,12 +136,15 @@ class TestContainerCommandRunner:
     async def test_run_delegates_wrapped_argv_to_inner(self):
         inner = _RecordingRunner()
         r = ContainerCommandRunner("pinky-mora", user="agent", inner=inner)
-        await r.run(["tmux", "kill-session"], timeout=5.0, stdin=b"x")
+        await r.run(["tmux", "kill-session"], timeout=5.0, stdin_data=b"x")
         assert len(inner.calls) == 1
-        argv, timeout, stdin = inner.calls[0]
-        assert argv == ["podman", "exec", "-u", "agent", "--", "pinky-mora", "tmux", "kill-session"]
-        assert timeout == 5.0  # timeout/stdin pass through unchanged
-        assert stdin == b"x"
+        argv, timeout, stdin_data = inner.calls[0]
+        assert argv == [
+            "podman", "exec", "-i", "-u", "agent", "--", "pinky-mora",
+            "tmux", "kill-session",
+        ]
+        assert timeout == 5.0  # timeout/stdin_data pass through unchanged
+        assert stdin_data == b"x"
 
     async def test_empty_container_rejected(self):
         with pytest.raises(ValueError):

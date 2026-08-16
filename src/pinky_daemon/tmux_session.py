@@ -75,6 +75,7 @@ from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
     LocalCommandRunner,
+    RunuserCommandRunner,
 )
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
@@ -83,11 +84,13 @@ from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
     _is_outreach_tool,
     _log,
+    _notify_turn_idle,
 )
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
 )
+from pinky_daemon.transport import TransportReplacementMixin
 from pinky_daemon.transport_state import (
     SessionState,
     StateMachine,
@@ -456,6 +459,35 @@ _PASTE_ENTER_MAX_DELAY_MS = 2_000
 # used by the dashboard terminal transport.
 _WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC = 5.0
 _WAKE_SUBMISSION_ENTER_RETRY_LIMIT = 2
+# A context-restart wake that exhausts the ordinary verifier gets one final
+# receipt-only grace window.  The mechanical exactly-once contract is narrow:
+# the original wake text is never pasted a second time.  A distinct broker
+# continuation is protected by enqueue/drain late-row fences, with the
+# instruction's semantic guard covering the residual post-drain-check window.
+# An empty composer can mean Claude already accepted the original while
+# transcript/tailer evidence still lags, so pane state cannot authorize replay.
+_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC = 5.0
+_WAKE_SUBMISSION_BROKER_TIMEOUT_SEC = 5.0
+_WAKE_CONTEXT_RELOAD_INSTRUCTION = (
+    "CONTEXT-RELOAD: If an orientation wake for this session already appears "
+    "above and you have begun acting on it, reply exactly 'already oriented' "
+    "and take no other action. Otherwise, reload the saved continuation state "
+    "now with load_my_context, then resume from that durable artifact. This is "
+    "a distinct recovery instruction; never replay the failed orientation "
+    "wake text."
+)
+
+
+def _wake_submission_escalation_enabled() -> bool:
+    """Whether verified-failed context-restart wakes run the #984 ladder.
+
+    Default ON.  Read at verdict time so an operator can disable the ladder
+    without restarting the daemon while retaining the existing loud
+    UNVERIFIED terminal outcome.
+    """
+    return os.environ.get(
+        "PINKY_WAKE_SUBMISSION_ESCALATION", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
 
 
 def _adaptive_paste_enter_delay_ms(text: str) -> int:
@@ -504,6 +536,18 @@ class _SchedulerDeliveryCancelled(Exception):  # noqa: N818
     """A timed-out scheduler receipt cancelled this turn before paste."""
 
 
+class _WakeSubmissionFallbackQueued(Exception):  # noqa: N818
+    """The failed wake was replaced by a broker context-reload handoff."""
+
+
+class _WakeSubmissionLateDetected(Exception):  # noqa: N818
+    """A late original wake started, so remaining escalation was aborted."""
+
+
+class _WakeSubmissionRecoveryScheduled(Exception):  # noqa: N818
+    """The failed wake scheduled transport recovery; stop the old worker."""
+
+
 @dataclass
 class TmuxCommandResult:
     """Outcome of one ``tmux ...`` invocation."""
@@ -535,6 +579,7 @@ class _TmuxControl:
         *,
         tmux_binary: str = "tmux",
         socket_name: str = "",
+        socket_path: str = "",
         command_runner: CommandRunner | None = None,
     ) -> None:
         self.session_name = session_name
@@ -542,6 +587,10 @@ class _TmuxControl:
         # An explicit socket isolates Pinky's tmux sessions from the
         # operator's own. Empty = use tmux's default socket.
         self.socket_name = socket_name
+        # Cleanup-debt replay pins the exact local server path with ``-S`` so
+        # a daemon restart under a changed TMUX/TMUX_TMPDIR cannot silently
+        # target a different server. Ordinary controls leave this empty.
+        self.socket_path = socket_path
         # #149 phase-3 execution seam: who runs the tmux subprocess. Default
         # LocalCommandRunner reproduces the prior inline create_subprocess_exec
         # verbatim (daemon's own user). An isolation_mode='unix_user' tenant is
@@ -563,11 +612,18 @@ class _TmuxControl:
 
     def _base_cmd(self) -> list[str]:
         cmd = [self.tmux_binary]
-        if self.socket_name:
+        if self.socket_path:
+            cmd.extend(["-S", self.socket_path])
+        elif self.socket_name:
             cmd.extend(["-L", self.socket_name])
         return cmd
 
-    async def _run(self, *args: str, timeout: float = 5.0) -> TmuxCommandResult:
+    async def _run(
+        self,
+        *args: str,
+        timeout: float = 5.0,
+        stdin_data: bytes | None = None,
+    ) -> TmuxCommandResult:
         """Run ``tmux <args>`` and return its result.
 
         ``timeout`` defends against a hung tmux server. A timeout raises
@@ -589,7 +645,11 @@ class _TmuxControl:
         # argv in ``runuser -u pinky-<agent> --`` so tmux runs under the
         # agent's uid. Timeout/kill semantics live in the runner; a timeout
         # still raises asyncio.TimeoutError for the caller to handle.
-        result = await self._runner.run(cmd, timeout=timeout)
+        result = await self._runner.run(
+            cmd,
+            timeout=timeout,
+            stdin_data=stdin_data,
+        )
         return TmuxCommandResult(
             returncode=result.returncode,
             stdout=result.stdout.decode("utf-8", errors="replace"),
@@ -597,9 +657,93 @@ class _TmuxControl:
         )
 
     async def has_session(self) -> bool:
-        """Return True if a tmux session with our name exists."""
+        """Return presence, or False only after positively proving absence.
+
+        ``tmux has-session`` uses a non-zero status both for an absent target
+        and for transport/permission failures.  Collapsing those cases to
+        False lets spawn callers overwrite state while the owned session may
+        still be live.  Preserve that third, ambiguous state as an exception;
+        callers that merely observe liveness already treat probe exceptions as
+        diagnostic uncertainty.
+        """
         result = await self._run("has-session", "-t", self.session_name)
-        return result.ok
+        if result.ok:
+            return True
+        if await self._session_absence_is_verified(result):
+            return False
+        raise RuntimeError(
+            f"tmux has-session failed without verified absence: "
+            f"rc={result.returncode} stdout={result.stdout.strip()!r} "
+            f"stderr={result.stderr.strip()!r}"
+        )
+
+    def _local_socket_path(self) -> Path | None:
+        """Return the socket path used by a locally executed tmux command.
+
+        A missing socket is the one stderr-independent proof that a failed
+        command cannot have left a live server behind.  Wrapped runners may
+        execute in another filesystem namespace, so their socket cannot be
+        safely statted from the daemon process and deliberately returns
+        ``None``.
+        """
+        if not isinstance(self._runner, LocalCommandRunner):
+            return None
+        if self.socket_path:
+            return Path(self.socket_path)
+        if not self.socket_name:
+            inherited = os.environ.get("TMUX", "")
+            inherited_parts = inherited.rsplit(",", 2)
+            if len(inherited_parts) == 3 and inherited_parts[0]:
+                return Path(inherited_parts[0])
+        socket_dir = Path(os.environ.get("TMUX_TMPDIR") or "/tmp")
+        return socket_dir / f"tmux-{os.getuid()}" / (self.socket_name or "default")
+
+    def _server_socket_is_missing(self) -> bool:
+        """Return True only when local socket absence is positively known."""
+        socket_path = self._local_socket_path()
+        if socket_path is None:
+            return False
+        try:
+            os.lstat(socket_path)
+        except FileNotFoundError:
+            return True
+        except OSError:
+            # Permission, transport, and other stat errors are not absence.
+            return False
+        return False
+
+    @staticmethod
+    def _server_absence_is_reported(result: TmuxCommandResult) -> bool:
+        """Recognize only tmux's canonical, unambiguous no-server result."""
+        return (
+            result.returncode == 1
+            and result.stdout == ""
+            and re.fullmatch(
+                r"no server running on \S+",
+                result.stderr.strip(),
+            )
+            is not None
+        )
+
+    async def _session_absence_is_verified(
+        self,
+        failed_result: TmuxCommandResult,
+    ) -> bool:
+        """Prove the owned target absent from the failed command or server state."""
+        if self._server_absence_is_reported(failed_result):
+            return True
+        if self._server_socket_is_missing():
+            return True
+        listing = await self._run("list-sessions", "-F", "#{session_name}")
+        if not listing.ok:
+            return False
+        session_names = listing.stdout.splitlines()
+        # A live tmux server cannot successfully enumerate zero sessions.
+        # Treat empty/malformed output conservatively instead of inventing
+        # absence from an ambiguous result.
+        if not session_names or any(not name for name in session_names):
+            return False
+        return self.session_name not in session_names
 
     async def new_session(
         self,
@@ -628,9 +772,14 @@ class _TmuxControl:
         """Kill the tmux session. Idempotent — succeeds whether or not the
         session exists (callers shouldn't pre-check)."""
         result = await self._run("kill-session", "-t", self.session_name)
-        # tmux returns 1 if the session didn't exist; treat that as ok
-        # so callers can use this idempotently.
-        if not result.ok and "can't find session" in result.stderr:
+        if result.ok:
+            return result
+        # Positive absence is tmux's exact canonical no-server result, a missing
+        # local server socket, or an rc=0 session enumeration which omits the
+        # owned target. Non-ok probes, ambiguous output, stat errors, and a
+        # still-listed target all preserve the original failure so strict
+        # replacement callers fail closed. Probe exceptions still propagate.
+        if await self._session_absence_is_verified(result):
             return TmuxCommandResult(returncode=0, stdout="", stderr=result.stderr)
         return result
 
@@ -728,8 +877,8 @@ class _TmuxControl:
         a permanently wedged session.
 
         Args:
-            text: Prompt payload. Passed as a single tmux arg via
-                ``set-buffer``, so no shell-metachar interpretation.
+            text: Prompt payload. Fed to ``tmux load-buffer -`` over stdin,
+                avoiding tmux's command-argument length ceiling.
             enter: If True (default), send a submit Enter after
                 ``enter_delay_ms`` ms. If False, leaves the pasted text
                 in the input buffer unsubmitted.
@@ -746,7 +895,13 @@ class _TmuxControl:
         # sessions don't race on a shared buffer.
         buf_name = f"pinky-{self.session_name}"
 
-        set_result = await self._run("set-buffer", "-b", buf_name, text)
+        set_result = await self._run(
+            "load-buffer",
+            "-b",
+            buf_name,
+            "-",
+            stdin_data=text.encode("utf-8"),
+        )
         if not set_result.ok:
             return set_result
 
@@ -808,6 +963,349 @@ class _TmuxControl:
             args.append("-J")  # join wrapped lines (de-wrap long URLs)
         args.extend(["-S", str(-abs(lines))])
         return await self._run(*args)
+
+
+_TMUX_SPAWN_CLEANUP_DEBT_DIR = "tmux-spawn-cleanup-debt"
+_TMUX_SPAWN_CLEANUP_DEBT_VERSION = 1
+
+
+def _tmux_spawn_cleanup_identity_key(
+    *,
+    agent_name: str,
+    session_name: str,
+) -> str:
+    # One owned session name per agent. Keep the record location stable when
+    # daemon environment or execution mode changes; the JSON retains the full
+    # binary/socket/runner identity needed to reach the original child.
+    raw = "\0".join((agent_name, session_name))
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+@dataclass(frozen=True)
+class _TmuxSpawnCleanupDebt:
+    """Durable identity for an owned tmux child whose teardown is unresolved."""
+
+    agent_name: str
+    session_name: str
+    socket_name: str
+    socket_path: str
+    tmux_binary: str
+    runner: dict[str, object]
+    site: str
+    created_at: float
+
+    def identity_key(self) -> str:
+        return _tmux_spawn_cleanup_identity_key(
+            agent_name=self.agent_name,
+            session_name=self.session_name,
+        )
+
+    def to_json(self) -> str:
+        return json.dumps(
+            {
+                "version": _TMUX_SPAWN_CLEANUP_DEBT_VERSION,
+                "agent_name": self.agent_name,
+                "session_name": self.session_name,
+                "socket_name": self.socket_name,
+                "socket_path": self.socket_path,
+                "tmux_binary": self.tmux_binary,
+                "runner": self.runner,
+                "site": self.site,
+                "created_at": self.created_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ) + "\n"
+
+    @classmethod
+    def from_path(cls, path: Path) -> _TmuxSpawnCleanupDebt:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+        if not isinstance(raw, dict):
+            raise ValueError("record root is not an object")
+        if raw.get("version") != _TMUX_SPAWN_CLEANUP_DEBT_VERSION:
+            raise ValueError(f"unsupported record version {raw.get('version')!r}")
+        required_strings = (
+            "agent_name",
+            "session_name",
+            "socket_name",
+            "socket_path",
+            "tmux_binary",
+            "site",
+        )
+        if any(not isinstance(raw.get(key), str) for key in required_strings):
+            raise ValueError("record identity fields must be strings")
+        if not raw["agent_name"] or not raw["session_name"] or not raw["tmux_binary"]:
+            raise ValueError("record identity fields must be non-empty")
+        runner = raw.get("runner")
+        if not isinstance(runner, dict) or not isinstance(runner.get("kind"), str):
+            raise ValueError("record runner is invalid")
+        try:
+            created_at = float(raw["created_at"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise ValueError("record created_at is invalid") from exc
+        record = cls(
+            agent_name=raw["agent_name"],
+            session_name=raw["session_name"],
+            socket_name=raw["socket_name"],
+            socket_path=raw["socket_path"],
+            tmux_binary=raw["tmux_binary"],
+            runner=runner,
+            site=raw["site"],
+            created_at=created_at,
+        )
+        if path.name != f"{record.identity_key()}.json":
+            raise ValueError("record filename does not match owned identity")
+        return record
+
+
+def _tmux_cleanup_runner_spec(runner: CommandRunner) -> dict[str, object]:
+    if isinstance(runner, ContainerCommandRunner):
+        return {
+            "kind": "container",
+            "container": runner.container,
+            "user": runner.user,
+            "workdir": runner.workdir,
+            "container_binary": runner.container_binary,
+        }
+    if isinstance(runner, RunuserCommandRunner):
+        return {
+            "kind": "runuser",
+            "username": runner.username,
+            "runuser_binary": runner.runuser_binary,
+        }
+    if isinstance(runner, LocalCommandRunner):
+        return {"kind": "local"}
+    raise TypeError(
+        f"unsupported tmux cleanup runner {type(runner).__name__}; "
+        "cannot durably retain its execution identity"
+    )
+
+
+def _tmux_cleanup_runner_from_spec(spec: dict[str, object]) -> CommandRunner:
+    kind = spec.get("kind")
+    if kind == "local":
+        return LocalCommandRunner()
+    if kind == "runuser":
+        username = spec.get("username")
+        binary = spec.get("runuser_binary")
+        if not isinstance(username, str) or not username:
+            raise ValueError("runuser cleanup record has no username")
+        if not isinstance(binary, str) or not binary:
+            raise ValueError("runuser cleanup record has no binary")
+        return RunuserCommandRunner(username, runuser_binary=binary)
+    if kind == "container":
+        container = spec.get("container")
+        binary = spec.get("container_binary")
+        user = spec.get("user")
+        workdir = spec.get("workdir")
+        if not isinstance(container, str) or not container:
+            raise ValueError("container cleanup record has no container")
+        if not isinstance(binary, str) or not binary:
+            raise ValueError("container cleanup record has no binary")
+        if user is not None and not isinstance(user, str):
+            raise ValueError("container cleanup record user is invalid")
+        if workdir is not None and not isinstance(workdir, str):
+            raise ValueError("container cleanup record workdir is invalid")
+        return ContainerCommandRunner(
+            container,
+            user=user,
+            workdir=workdir,
+            container_binary=binary,
+        )
+    raise ValueError(f"unsupported cleanup runner kind {kind!r}")
+
+
+def _tmux_spawn_cleanup_debt_dir(state_dir: Path) -> Path:
+    return state_dir / _TMUX_SPAWN_CLEANUP_DEBT_DIR
+
+
+def _fsync_directory(path: Path) -> None:
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    fd = os.open(path, flags)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def _persist_tmux_spawn_cleanup_debt(
+    state_dir: Path,
+    debt: _TmuxSpawnCleanupDebt,
+) -> Path:
+    """Atomically retain cleanup debt before bounded teardown starts."""
+    debt_dir = _tmux_spawn_cleanup_debt_dir(state_dir)
+    debt_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    try:
+        debt_dir.chmod(0o700)
+    except OSError:
+        pass
+    path = debt_dir / f"{debt.identity_key()}.json"
+    tmp_path = debt_dir / f".{path.name}.{os.getpid()}.{time.time_ns()}.tmp"
+    fd = os.open(tmp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    try:
+        payload = debt.to_json().encode("utf-8")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+    try:
+        try:
+            # link() is the publish point: atomic and no-clobber, so two
+            # concurrent rollback owners cannot overwrite each other's debt.
+            os.link(tmp_path, path)
+        except FileExistsError:
+            existing = _TmuxSpawnCleanupDebt.from_path(path)
+            if existing.identity_key() != debt.identity_key():
+                raise RuntimeError("cleanup debt identity collision")
+            if (
+                existing.tmux_binary != debt.tmux_binary
+                or existing.socket_name != debt.socket_name
+                or existing.socket_path != debt.socket_path
+                or existing.runner != debt.runner
+            ):
+                raise RuntimeError(
+                    "cleanup debt already exists for this agent/session under "
+                    "a different tmux execution identity"
+                )
+        _fsync_directory(debt_dir)
+    finally:
+        try:
+            tmp_path.unlink()
+        except FileNotFoundError:
+            pass
+    return path
+
+
+def _clear_tmux_spawn_cleanup_debt(path: Path) -> None:
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    _fsync_directory(path.parent)
+
+
+async def _strict_owned_tmux_cleanup(
+    control: _TmuxControl,
+    *,
+    agent_name: str,
+    action: str,
+) -> str | None:
+    """Prove teardown under per-command limits and one hard outer deadline."""
+
+    async def _attempts() -> str | None:
+        diagnostics: list[str] = []
+        for attempt in range(1, _SPAWN_ROLLBACK_ATTEMPTS + 1):
+            try:
+                async with asyncio.timeout(_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC):
+                    kill_result = await control.kill_session()
+            except Exception as exc:
+                diagnostics.append(
+                    f"attempt {attempt} kill raised {type(exc).__name__}: {exc}"
+                )
+            else:
+                if kill_result.ok:
+                    _log(
+                        f"tmux[{agent_name}]: {action} proved teardown on "
+                        f"kill attempt {attempt}"
+                    )
+                    return None
+                diagnostics.append(
+                    f"attempt {attempt} kill returned rc={kill_result.returncode} "
+                    f"stderr={kill_result.stderr.strip()!r}"
+                )
+
+            try:
+                async with asyncio.timeout(_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC):
+                    live = await control.has_session()
+            except Exception as exc:
+                diagnostics.append(
+                    f"attempt {attempt} verify couldn't answer "
+                    f"({type(exc).__name__}: {exc})"
+                )
+            else:
+                if not live:
+                    _log(
+                        f"tmux[{agent_name}]: {action} verified absence after "
+                        f"failed kill attempt {attempt}"
+                    )
+                    return None
+                diagnostics.append(f"attempt {attempt} verify found session live")
+
+            if attempt < _SPAWN_ROLLBACK_ATTEMPTS:
+                await asyncio.sleep(_SPAWN_ROLLBACK_RETRY_DELAY_SEC)
+
+        message = (
+            f"tmux[{agent_name}]: {action} could not prove teardown after "
+            f"{_SPAWN_ROLLBACK_ATTEMPTS} attempts; owned session is possibly "
+            f"live: {'; '.join(diagnostics)}"
+        )
+        _log(f"ERROR {message}")
+        return message
+
+    try:
+        async with asyncio.timeout(_SPAWN_ROLLBACK_TIMEOUT_SEC):
+            return await _attempts()
+    except TimeoutError as exc:
+        message = (
+            f"tmux[{agent_name}]: {action} could not prove teardown within "
+            f"{_SPAWN_ROLLBACK_TIMEOUT_SEC}s; owned session is possibly live "
+            f"({type(exc).__name__}: {exc})"
+        )
+        _log(f"ERROR {message}")
+        return message
+
+
+async def reconcile_tmux_spawn_cleanup_debts(
+    state_dir: Path,
+    *,
+    _control_factory=None,
+) -> tuple[int, int]:
+    """Daemon-boot reaper for every durable, pre-registration tmux debt."""
+    debt_dir = _tmux_spawn_cleanup_debt_dir(Path(state_dir))
+    if not debt_dir.exists():
+        return (0, 0)
+
+    reaped = 0
+    outstanding = 0
+    for path in sorted(debt_dir.glob("*.json")):
+        try:
+            debt = _TmuxSpawnCleanupDebt.from_path(path)
+            _log(
+                f"ERROR tmux[{debt.agent_name}]: retained spawn cleanup debt "
+                f"is outstanding at daemon boot ({path})"
+            )
+            control = (
+                _control_factory(debt)
+                if _control_factory is not None
+                else _TmuxControl(
+                    debt.session_name,
+                    tmux_binary=debt.tmux_binary,
+                    socket_name=debt.socket_name,
+                    socket_path=debt.socket_path,
+                    command_runner=_tmux_cleanup_runner_from_spec(debt.runner),
+                )
+            )
+            failure = await _strict_owned_tmux_cleanup(
+                control,
+                agent_name=debt.agent_name,
+                action="daemon-boot retained spawn cleanup",
+            )
+            if failure is not None:
+                outstanding += 1
+                continue
+            _clear_tmux_spawn_cleanup_debt(path)
+            reaped += 1
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            outstanding += 1
+            _log(
+                f"ERROR tmux spawn cleanup debt reconciliation failed for "
+                f"{path}: {type(exc).__name__}: {exc}"
+            )
+    return (reaped, outstanding)
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -891,6 +1389,44 @@ class _QueuedTurn:
     # scheduler receipt because wake prompts remain ordinary worker-queued
     # internal turns rather than scheduler-serialized external turns.
     submission_receipt: asyncio.Future[bool] | None = None
+
+
+@dataclass(frozen=True)
+class _QueuedPromptEvidence:
+    """One native queue occurrence plus optional cleanup ownership.
+
+    ``retired`` is a tombstone, not permission to delete the occurrence. A
+    contentless dequeue must consume the same FIFO slot Claude recorded at
+    enqueue time even if a racing Stop has already retired that turn's meta.
+    """
+
+    content: str | None
+    turn: _QueuedTurn | None
+    retired: bool = False
+
+
+@dataclass(frozen=True)
+class _DequeuedPromptEvidence:
+    """Content proof carried from a native queue dequeue to its user row."""
+
+    content: str | None
+    accepted_at_dequeue: bool
+    turn: _QueuedTurn | None
+    retired: bool = False
+
+
+@dataclass
+class _WakeContextReloadGuard:
+    """Short-lived fence joining one failed wake to its broker fallback."""
+
+    original_turn: _QueuedTurn
+    instruction: str
+    original_seen: bool = False
+
+
+_TRANSCRIPT_MATERIALIZE_PROMPT = (
+    "[SYSTEM] Transport initialization probe. Reply with exactly: ready"
+)
 
 
 @dataclass
@@ -993,6 +1529,23 @@ _RECONNECT_BACKOFF = (2, 8, 30)
 # to authenticate / fetch first turn / load CLAUDE.md.
 _COLD_START_TIMEOUT_SEC = 60.0
 
+# Spawn rollback is deliberately tighter than the normal tmux command bound.
+# Local tmux IPC should complete in well under 100ms; two seconds per command
+# still leaves ample headroom while ensuring cancellation cannot park forever
+# behind cleanup. Two attempts let a transient permission/socket race clear,
+# and the outer ceiling is the hard guarantee that preserving the original
+# spawn exception remains bounded.
+_SPAWN_ROLLBACK_ATTEMPTS = 2
+_SPAWN_ROLLBACK_COMMAND_TIMEOUT_SEC = 2.0
+_SPAWN_ROLLBACK_RETRY_DELAY_SEC = 0.05
+_SPAWN_ROLLBACK_TIMEOUT_SEC = 9.0
+
+# A detached tmux session can reap itself just after ``new-session`` reports
+# success when the in-pane command exits immediately. Give that failure time
+# to surface, then verify the session still exists before starting the tailer
+# or declaring the transport connected (issue #513).
+_POST_SPAWN_LIVENESS_DELAY_SEC = 0.15
+
 # Per-turn timeout: how long ANY single in-flight turn can be at the
 # HEAD of ``_inflight_metas`` without its ``stop_hook_summary`` landing
 # before the watchdog considers it stuck and triggers ``force_restart``.
@@ -1070,6 +1623,47 @@ _FOREGROUND_TOOL_ACTIVE_CEILING_SEC = 1800.0
 # enough — the status/spinner line renders at the bottom.
 _PANE_LIVENESS_CAPTURE_LINES = 40
 _PANE_LIVENESS_SAMPLE_GAP_SEC = 1.5
+
+
+def _watchdog_frozen_liveness_trigger_enabled() -> bool:
+    """Whether frozen live-status vetoes may escalate to recovery (#984).
+
+    Default ON.  Read per watchdog tick so operators can disable both the
+    never-started signature and the general stale-veto age cap without a
+    daemon restart.
+    """
+    return os.environ.get(
+        "PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", "1"
+    ).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _watchdog_seconds_env(name: str, default: float) -> float:
+    """Read a non-negative watchdog duration, falling back safely."""
+    raw = os.environ.get(name, "").strip()
+    try:
+        value = float(raw) if raw else default
+    except (TypeError, ValueError):
+        value = default
+    return max(0.0, value)
+
+
+def _watchdog_never_started_grace_sec() -> float:
+    """Grace before a frozen at-or-before-launch status becomes actionable."""
+    return _watchdog_seconds_env(
+        "PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", 300.0
+    )
+
+
+def _watchdog_stale_veto_cap_sec() -> float:
+    """Maximum continuous age of one frozen stale-veto timestamp."""
+    return _watchdog_seconds_env("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", 1800.0)
+
+
+def _watchdog_frozen_restart_interval_sec() -> float:
+    """Minimum spacing between frozen-liveness restart attempts per session."""
+    return _watchdog_seconds_env(
+        "PINKY_WATCHDOG_FROZEN_RESTART_INTERVAL_SEC", 600.0
+    )
 
 
 def _pane_liveness_enabled() -> bool:
@@ -1178,7 +1772,7 @@ _MODEL_DIALOG_NEEDLES = ("change model", "switch model?")
 _MODEL_ERROR_NEEDLES = ("unknown model", "invalid model", "not a valid model")
 
 
-class TmuxSession:
+class TmuxSession(TransportReplacementMixin):
     """Agent session backed by an interactive ``claude`` REPL in tmux.
 
     Implements the ``Transport`` protocol (see ``transport.py``). Drop-in
@@ -1248,10 +1842,12 @@ class TmuxSession:
         self._scheduler_delivery_lock = asyncio.Lock()
         # Turns remain here after paste until their exact transcript receipt
         # resolves. Raw queue-operation dequeue rows carry no content, so the
-        # companion deque preserves enqueue ordering across all pane turns.
+        # companion deques preserve enqueue content ordering across all pane
+        # turns. Exact-content tickets survive a racing Stop that retires the local
+        # turn object before Claude emits its dequeue row (#1098).
         self._scheduler_pending_turns: list[_QueuedTurn] = []
-        self._pane_queue_operations: deque[_QueuedTurn | None] = deque()
-        self._pane_dequeued_turns: deque[_QueuedTurn | None] = deque()
+        self._pane_queue_operations: deque[_QueuedPromptEvidence] = deque()
+        self._pane_dequeued_turns: deque[_DequeuedPromptEvidence] = deque()
         # Dashboard terminal requests start immediately and may arrive out of
         # order. Serialize pane input and remember each client's acknowledged
         # sequence so cumulative retries never duplicate text or Enter.
@@ -1385,6 +1981,16 @@ class TmuxSession:
         # genuinely new head (deque advanced) auto-starts a fresh ceiling budget
         # without having to touch the out-of-loop head-start sites.
         self._inflight_pane_ext_anchor: tuple[object, float] | None = None
+        # #984 Defect 2 — continuous frozen-live-status observation.  One
+        # bounded tuple per TmuxSession: (last_updated value, first-seen wall
+        # clock, consecutive observations).  Any changed value starts a new
+        # observation window, so a fossilized reader that still ADVANCES can
+        # never match the never-started signature or stale-veto age cap.
+        self._watchdog_frozen_live_status: tuple[float, float, int] | None = None
+        # Pacing survives force_restart's retained-instance respawn.  If a
+        # restart does not cure the frozen signal, this prevents the new
+        # watchdog from immediately tearing the replacement pane down again.
+        self._watchdog_last_frozen_restart_at: float | None = None
         # Back-compat advisory signal. Pre-#560 this was the worker's
         # per-iteration gate (the bottleneck that broke steering).
         # Post-#560 the worker no longer awaits it between dispatches;
@@ -1442,6 +2048,9 @@ class TmuxSession:
         # so a torn-down session doesn't have a stray task firing
         # ``set_transcript_path`` against a stopped tailer.
         self._first_bind_recovery_task: asyncio.Task[None] | None = None
+        # #984: one short-lived enqueue task for the tailer's
+        # bound-path-never-materialized recovery signal.
+        self._transcript_materialize_task: asyncio.Task[None] | None = None
 
         # Issue #570 — wake-prompt readiness gate. Set when
         # ``set_transcript_path`` is called by the SessionStart hook
@@ -1486,6 +2095,14 @@ class TmuxSession:
         # Dedicated wake-prompt tests leave this False and provide the
         # tailer simulation explicitly.
         self._skip_wake_prompt_for_tests: bool = False
+
+        # #984 Defect 1 — one transport-recovery budget survives the retained
+        # session object's respawn.  A verified replacement wake re-arms it;
+        # without this latch, a pane that rejects every orientation wake could
+        # recurse through force_restart forever.
+        self._wake_submission_transport_recovery_used: bool = False
+        self._wake_submission_recovery_task: asyncio.Task[None] | None = None
+        self._wake_context_reload_guard: _WakeContextReloadGuard | None = None
 
     # ── Identity ────────────────────────────────────────────────────────
 
@@ -2729,6 +3346,174 @@ class TmuxSession:
                 f"(reason={reason.value}) — session remains CONNECTED"
             )
 
+    def _prepare_tmux_spawn(self) -> None:
+        """Publish transport-specific state at the final spawn boundary."""
+
+    def _spawn_cleanup_state_dir(self) -> Path:
+        registry_path = getattr(self._registry, "_db_path", "")
+        if isinstance(registry_path, str) and registry_path:
+            return Path(registry_path).resolve().parent
+        return Path(self._config.working_dir or ".").resolve() / "data"
+
+    def _spawn_cleanup_debt(self, *, site: str) -> _TmuxSpawnCleanupDebt:
+        local_socket_path = self._tmux._local_socket_path()
+        return _TmuxSpawnCleanupDebt(
+            agent_name=self.agent_name,
+            session_name=self._tmux.session_name,
+            socket_name=self._tmux.socket_name,
+            socket_path=str(local_socket_path) if local_socket_path is not None else "",
+            tmux_binary=self._tmux.tmux_binary,
+            runner=_tmux_cleanup_runner_spec(self._tmux._runner),
+            site=site,
+            created_at=time.time(),
+        )
+
+    def _spawn_cleanup_debt_path(self) -> Path:
+        session_name = getattr(self._tmux, "session_name", self._session_name)
+        if not isinstance(session_name, str):
+            session_name = self._session_name
+        identity_key = _tmux_spawn_cleanup_identity_key(
+            agent_name=self.agent_name,
+            session_name=session_name,
+        )
+        return (
+            _tmux_spawn_cleanup_debt_dir(self._spawn_cleanup_state_dir())
+            / f"{identity_key}.json"
+        )
+
+    async def _reap_retained_spawn_cleanup_debt(self) -> None:
+        """Next-spawn preflight: resolve this agent's retained child first."""
+        path = self._spawn_cleanup_debt_path()
+        if not path.exists():
+            return
+        debt = _TmuxSpawnCleanupDebt.from_path(path)
+        _log(
+            f"ERROR tmux[{self.agent_name}]: retained spawn cleanup debt is "
+            f"outstanding at next-spawn preflight ({path})"
+        )
+        current_runner = _tmux_cleanup_runner_spec(self._tmux._runner)
+        current_socket_path = self._tmux._local_socket_path()
+        if (
+            debt.session_name == self._tmux.session_name
+            and debt.socket_name == self._tmux.socket_name
+            and debt.socket_path
+            == (str(current_socket_path) if current_socket_path is not None else "")
+            and debt.tmux_binary == self._tmux.tmux_binary
+            and debt.runner == current_runner
+        ):
+            control = self._tmux
+        else:
+            control = _TmuxControl(
+                debt.session_name,
+                tmux_binary=debt.tmux_binary,
+                socket_name=debt.socket_name,
+                socket_path=debt.socket_path,
+                command_runner=_tmux_cleanup_runner_from_spec(debt.runner),
+            )
+        failure = await _strict_owned_tmux_cleanup(
+            control,
+            agent_name=debt.agent_name,
+            action="next-spawn retained spawn cleanup",
+        )
+        if failure is not None:
+            raise RuntimeError(f"{failure}; cleanup debt retained at {path}")
+        _clear_tmux_spawn_cleanup_debt(path)
+
+    async def _rollback_spawned_session(self, *, site: str) -> str | None:
+        """Strictly and boundedly roll back a possibly-created tmux session.
+
+        A returned non-ok kill enters the same verification path as a raise:
+        ``has_session() is False`` is the only clean fallback, while ``True``
+        or an exception remains possibly-live and is retried. A successful
+        kill is already positive proof because ``_TmuxControl.kill_session``
+        only reduces a failed raw command to success after verifying absence.
+
+        Cleanup runs in a shielded task so cancellation cannot strand the
+        just-created REPL. The per-command and outer ceilings keep waiting for
+        cleanup bounded while the caller preserves the original exception.
+        Returns ``None`` when teardown is proven, otherwise a loud diagnostic
+        that the caller must attach to the original exception.
+        """
+
+        debt_path: Path | None = None
+        debt_persist_error: Exception | None = None
+        try:
+            debt_path = _persist_tmux_spawn_cleanup_debt(
+                self._spawn_cleanup_state_dir(),
+                self._spawn_cleanup_debt(site=site),
+            )
+        except Exception as exc:
+            debt_persist_error = exc
+            _log(
+                f"ERROR tmux[{self.agent_name}]: could not persist spawn "
+                f"cleanup debt before {site} rollback: {type(exc).__name__}: {exc}"
+            )
+
+        async def _cleanup() -> str | None:
+            failure = await _strict_owned_tmux_cleanup(
+                self._tmux,
+                agent_name=self.agent_name,
+                action=f"spawn rollback at {site}",
+            )
+            if failure is None:
+                if debt_path is not None:
+                    try:
+                        _clear_tmux_spawn_cleanup_debt(debt_path)
+                    except Exception as exc:
+                        _log(
+                            f"ERROR tmux[{self.agent_name}]: teardown proved but "
+                            f"cleanup debt clear failed at {debt_path}: "
+                            f"{type(exc).__name__}: {exc}"
+                        )
+                return None
+            if debt_path is not None:
+                failure = f"{failure}; cleanup debt retained at {debt_path}"
+                _log(
+                    f"ERROR tmux[{self.agent_name}]: retained spawn cleanup "
+                    f"debt remains outstanding at {debt_path}"
+                )
+            elif debt_persist_error is not None:
+                failure = (
+                    f"{failure}; cleanup debt persistence failed "
+                    f"({type(debt_persist_error).__name__}: {debt_persist_error})"
+                )
+            return failure
+
+        cleanup_task = asyncio.create_task(
+            _cleanup(), name=f"tmux-spawn-rollback-{self.agent_name}"
+        )
+        while True:
+            try:
+                return await asyncio.shield(cleanup_task)
+            except asyncio.CancelledError:
+                # Preserve the exception that selected this rollback site.
+                # A second cancellation cannot strand bounded cleanup.
+                if cleanup_task.cancelled():
+                    message = (
+                        f"tmux[{self.agent_name}]: spawn rollback at {site} "
+                        "cleanup task was cancelled; owned session is possibly live"
+                    )
+                    if debt_path is not None:
+                        message = f"{message}; cleanup debt retained at {debt_path}"
+                    _log(f"ERROR {message}")
+                    return message
+                continue
+
+    @staticmethod
+    def _annotate_spawn_rollback_failure(
+        original: BaseException,
+        rollback_failure: str | None,
+    ) -> None:
+        """Surface rollback uncertainty without replacing ``original``."""
+        if rollback_failure is None:
+            return
+        original.add_note(rollback_failure)
+        # Notes render in tracebacks; keep ordinary stringification loud too.
+        if not original.args:
+            original.args = (rollback_failure,)
+        elif len(original.args) == 1 and isinstance(original.args[0], str):
+            original.args = (f"{original.args[0]}; {rollback_failure}",)
+
     async def _spawn_tmux_repl(self) -> None:
         """Spawn the tmux session and the in-pane claude REPL, then start
         the response tailer.
@@ -2769,6 +3554,32 @@ class TmuxSession:
         # umbrella below — this can include a multi-minute image pull and
         # runs under its own budget (see _ensure_container_started).
         await self._ensure_container_started(container_agent)
+
+        # A prior spawn may have exhausted bounded rollback while its owned
+        # child was still live or unobservable. That debt is durable precisely
+        # because this session was never registered with the broker/watchdog.
+        # Resolve it before the ordinary stale-session probe and before any new
+        # spawn side effects; an unresolved record fails this spawn closed.
+        await self._reap_retained_spawn_cleanup_debt()
+
+        # If a stale session is left over from a previous daemon run (e.g.
+        # crash without graceful disconnect), reap it. We're the cold-start
+        # owner; reclaiming the name is safe. Ambiguous ``has-session`` and
+        # non-ok kill results are failed preconditions: abort before env
+        # construction, trust seeding, or the transport's spawn hook can
+        # publish state for a child that will never launch.
+        if await self._tmux.has_session():
+            _log(
+                f"tmux[{self.agent_name}]: stale session {self._session_name} "
+                f"found, reaping before fresh spawn"
+            )
+            kill_result = await self._tmux.kill_session()
+            if not kill_result.ok:
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: stale kill-session failed before "
+                    f"spawn: rc={kill_result.returncode} "
+                    f"stderr={kill_result.stderr.strip()!r}"
+                )
 
         # Pre-seed Claude Code's first-run trust/bypass flags (#112) so a
         # FRESH REPL doesn't wedge on the "trust this folder?" / "Bypass
@@ -2813,15 +3624,11 @@ class TmuxSession:
         # typing into the new pane's splash phase would get eaten anyway.
         self._pending_live_effort = None
 
-        # If a stale session is left over from a previous daemon run (e.g.
-        # crash without graceful disconnect), reap it. We're the cold-start
-        # owner; reclaiming the name is safe.
-        if await self._tmux.has_session():
-            _log(
-                f"tmux[{self.agent_name}]: stale session {self._session_name} "
-                f"found, reaping before fresh spawn"
-            )
-            await self._tmux.kill_session()
+        # Transport-specific state publication belongs after every teardown
+        # precondition and immediately before command/env construction. The
+        # default is a no-op; Codex uses this exact boundary for AGENTS.md and
+        # soul-version publication.
+        self._prepare_tmux_spawn()
 
         # Build the in-pane command. ``claude --continue`` resumes the
         # most-recent transcript for ``cwd``; falls back to fresh session
@@ -2849,21 +3656,74 @@ class TmuxSession:
                     f"stderr={result.stderr.strip()!r}"
                 )
             self._current_session_started_at = session_started_at
+            # The frozen-value tracker is scoped to the CURRENT tmux process.
+            # Keep restart pacing on the retained TmuxSession instance, but
+            # never compare the replacement process against the old process's
+            # observation window.
+            self._watchdog_frozen_live_status = None
 
+        current_task = asyncio.current_task()
+        cancel_requests_before_spawn = (
+            current_task.cancelling() if current_task is not None else 0
+        )
         try:
-            await asyncio.wait_for(_spawn(), timeout=_COLD_START_TIMEOUT_SEC)
-        except asyncio.TimeoutError:
-            # Reap whatever partial state we may have left.
-            try:
-                await self._tmux.kill_session()
-            except Exception:
-                # Best-effort cleanup; ignore failure since we're already
-                # raising the cold-start timeout to the caller.
-                pass
-            raise RuntimeError(
+            # Python 3.11's wait_for() can consume an accepted caller
+            # cancellation when its inner task has completed but its waiter has
+            # not resumed yet (tasks.py's ``if fut.done(): return fut.result()``
+            # branch). A task-local timeout context removes that inner-task
+            # completion race. The residual cancel-count check also covers a
+            # cancellation requested synchronously at the final _spawn await,
+            # before the task has another suspension point at which to inject
+            # CancelledError.
+            async with asyncio.timeout(_COLD_START_TIMEOUT_SEC):
+                await _spawn()
+            if (
+                current_task is not None
+                and current_task.cancelling() > cancel_requests_before_spawn
+            ):
+                raise asyncio.CancelledError
+        except asyncio.TimeoutError as exc:
+            rollback_failure = await self._rollback_spawned_session(
+                site="cold-start timeout"
+            )
+            message = (
                 f"tmux[{self.agent_name}]: cold-start timed out after "
                 f"{_COLD_START_TIMEOUT_SEC}s"
-            ) from None
+            )
+            if rollback_failure is not None:
+                message = f"{message}; {rollback_failure}"
+            raise RuntimeError(message) from exc
+        except asyncio.CancelledError as exc:
+            rollback_failure = await self._rollback_spawned_session(
+                site="cold-start cancellation"
+            )
+            self._annotate_spawn_rollback_failure(exc, rollback_failure)
+            raise
+
+        # ``tmux new-session -d`` only proves that tmux launched the in-pane
+        # command. The command can then fail fast (bad CLI flag, auth error,
+        # rejected model, and so on), causing tmux to auto-reap the detached
+        # session after ``new-session`` has already returned 0. Without this
+        # delayed check the transport proceeds to CONNECTED against no REPL.
+        try:
+            await asyncio.sleep(_POST_SPAWN_LIVENESS_DELAY_SEC)
+            if not await self._tmux.has_session():
+                raise RuntimeError(
+                    f"tmux[{self.agent_name}]: session died immediately after "
+                    "spawn; the in-pane command exited before the REPL became "
+                    "available (inspect in-pane startup and authentication errors)"
+                )
+        except BaseException as exc:
+            # ``new-session`` already succeeded, so cancellation during the
+            # delay or an exception from the liveness probe can otherwise
+            # leave a live tmux REPL unmanaged while the caller transitions
+            # the Python state machine to DEAD. Strict rollback stays bounded
+            # and preserves the original failure (including CancelledError).
+            rollback_failure = await self._rollback_spawned_session(
+                site="post-spawn liveness"
+            )
+            self._annotate_spawn_rollback_failure(exc, rollback_failure)
+            raise
 
         # NOTE: ``force_fresh_context_once`` consumption is deferred to
         # the end of this method (after tailer startup also succeeds),
@@ -2879,7 +3739,7 @@ class TmuxSession:
         # symmetric "spawn raised → caller transitions DEAD" semantics.
         try:
             await self._start_tailer()
-        except Exception:
+        except BaseException as exc:
             # Murzik's PR #496 round-3 cleanup-hole fix: if _start_tailer
             # raises AFTER constructing self._tailer but before/during
             # the await on start(), we'd otherwise transition DEAD with
@@ -2888,15 +3748,13 @@ class TmuxSession:
             # clean state. Symmetric with the tmux kill below.
             try:
                 await self._stop_tailer()
-            except Exception:
+            except BaseException:
                 pass
             self._tailer = None
-            try:
-                await self._tmux.kill_session()
-            except Exception:
-                # Best-effort cleanup; ignore failure since we're already
-                # re-raising the tailer-start error to the caller.
-                pass
+            rollback_failure = await self._rollback_spawned_session(
+                site="tailer-start failure"
+            )
+            self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
 
         # REPL + tailer are both up as a unit — NOW it's safe to
@@ -3171,6 +4029,38 @@ class TmuxSession:
             return ""
         return os.environ.get("CLAUDE_CODE_OAUTH_TOKEN", "").strip()
 
+    def _dedicated_config_dir(self) -> str:
+        """The dedicated CLAUDE_CONFIG_DIR for a LOCAL agent that opted into
+        its own Claude account via ``dedicated_config_dir``, else ``""``.
+
+        Read from the REGISTRY (mirrors ``_container_agent``): isolation-
+        adjacent flags live on the Agent record, not the per-session
+        StreamingSessionConfig. A registry hiccup falls back to the shared
+        ~/.claude (fail-safe: a read-side error must not wedge a session).
+
+        LOCAL-only (#550/Picard): a container agent already runs with its own
+        CLAUDE_CONFIG_DIR (``container_config_dir``), so the flag is a no-op
+        there — we gate on ``isolation_mode`` being local/unset. Requires an
+        absolute working_dir (the path is ``<working_dir>/.claude-local``); a
+        relative/empty cwd can't anchor a stable config dir, so we withhold it
+        and fall back to the shared ~/.claude (current behavior)."""
+        if not self._registry or not self.agent_name:
+            return ""
+        try:
+            agent = self._registry.get(self.agent_name)
+        except Exception:
+            return ""
+        if not agent or not getattr(agent, "dedicated_config_dir", False):
+            return ""
+        if getattr(agent, "isolation_mode", "local") not in ("", "local"):
+            return ""
+        wd = (self._config.working_dir or "").strip()
+        if not wd or not Path(wd).is_absolute():
+            return ""
+        from pinky_daemon.provisioning import local_config_dir
+
+        return local_config_dir(wd)
+
     def _build_repl_env(self) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
@@ -3200,6 +4090,14 @@ class TmuxSession:
         if self._config.provider_key:
             env["ANTHROPIC_API_KEY"] = self._config.provider_key
             env["ANTHROPIC_AUTH_TOKEN"] = self._config.provider_key
+        # Per-agent dedicated Claude account (#550/Picard): a LOCAL agent that
+        # opted into ``dedicated_config_dir`` runs with its OWN CLAUDE_CONFIG_DIR
+        # (<working_dir>/.claude-local) so it holds its own OAuth login instead
+        # of sharing the daemon user's ~/.claude. Empty for every other agent
+        # (shared ~/.claude — unchanged). Guarded LOCAL-only inside the helper.
+        dedicated_config_dir = self._dedicated_config_dir()
+        if dedicated_config_dir:
+            env["CLAUDE_CONFIG_DIR"] = dedicated_config_dir
         # Static OAuth token forwarding (#780): inject a long-lived, never-
         # refreshed CLAUDE_CODE_OAUTH_TOKEN so claude authenticates with it
         # instead of the single-use refresh token in .credentials.json (no
@@ -3208,8 +4106,23 @@ class TmuxSession:
         # without this -e the token never reaches them; local tmux agents get
         # it via tmux-server inheritance, but forwarding makes it explicit and
         # uniform. Flag-gated + provider-guarded inside _static_oauth_token.
+        #
+        # SHADOWED-EMPTY for a dedicated_config_dir agent (#557/Picard, caught in
+        # Murzik review): injecting the SHARED fleet token would authenticate it
+        # as the shared account regardless of its private config dir, defeating
+        # the whole point of the flag. But simply OMITTING the key here is a
+        # NO-OP — tmux ``new-session`` inherits the tmux SERVER's global
+        # environment, which already carries the daemon user's shared
+        # CLAUDE_CODE_OAUTH_TOKEN, so the dedicated session would still see it
+        # via inheritance. We must instead pass ``-e CLAUDE_CODE_OAUTH_TOKEN=``
+        # (EMPTY) to SHADOW the inherited global with an empty value: empty ⇒
+        # claude does not authenticate with it and falls back to the login in
+        # this agent's CLAUDE_CONFIG_DIR (.claude-local, populated by a manual
+        # `claude /login`). Verified end-to-end on CC 2.1.226 + real tmux.
         oauth_token = self._static_oauth_token()
-        if oauth_token:
+        if dedicated_config_dir:
+            env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+        elif oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
@@ -3327,6 +4240,21 @@ class TmuxSession:
         intent (idle_sleep / force_restart / explicit DEAD) by driving
         the state machine BEFORE calling disconnect.
         """
+        # A wake-escalation recovery task may be between scheduling and its
+        # force_restart call.  An independent disconnect owns shutdown and
+        # must cancel that task so it cannot revive a deliberately stopped
+        # session.  When force_restart itself reaches this method, the
+        # recovery task is the current task and must not cancel/await itself.
+        recovery_task = self._wake_submission_recovery_task
+        if (
+            recovery_task is not None
+            and recovery_task is not asyncio.current_task()
+        ):
+            if not recovery_task.done():
+                recovery_task.cancel()
+                await asyncio.gather(recovery_task, return_exceptions=True)
+            self._wake_submission_recovery_task = None
+
         # Fail and cancel scheduler-only delivery tasks before tearing down the
         # ordinary worker/pane. A pane shutdown is a terminal non-receipt.
         for turn in list(self._scheduler_pending_turns):
@@ -3343,6 +4271,7 @@ class TmuxSession:
         self._scheduler_pending_turns.clear()
         self._pane_queue_operations.clear()
         self._pane_dequeued_turns.clear()
+        self._wake_context_reload_guard = None
 
         # Cancel worker.
         if self._worker_task and not self._worker_task.done():
@@ -3417,8 +4346,8 @@ class TmuxSession:
         # so stats/path persist; only the background task is cancelled.
         await self._stop_tailer()
 
-        # Kill tmux session. ``kill_session`` is idempotent (treats
-        # "can't find session" as ok).
+        # Kill tmux session. ``kill_session`` is idempotent after verifying
+        # that a failed kill left no owned session behind.
         try:
             await self._tmux.kill_session()
         except Exception as e:
@@ -3532,6 +4461,66 @@ class TmuxSession:
                 and _normalize_prompt(turn.prompt) == _normalize_prompt(prompt)
             ):
                 return True
+        return False
+
+    def _scheduler_wake_candidates(self) -> list[_QueuedTurn]:
+        """Return every known scheduler turn, including #943 queue replay."""
+        candidates = self._acceptance_candidates()
+        # The #943 unaccepted-head recovery deliberately removes its turn from
+        # ``_scheduler_pending_turns`` before disconnect, then preserves it in
+        # the ordinary worker queue across the replacement pane. There is a
+        # real queued-unpasted window before the new worker pulls that head.
+        # asyncio.Queue has no public snapshot API; this event-loop-local read
+        # is non-mutating and the only way to include that load-bearing shape.
+        candidates.extend(
+            turn
+            for turn in self._message_queue._queue  # type: ignore[attr-defined]
+            if turn.scheduler_serialized
+        )
+        unique: dict[int, _QueuedTurn] = {}
+        for turn in candidates:
+            unique.setdefault(id(turn), turn)
+        return sorted(unique.values(), key=lambda turn: turn.queued_at)
+
+    def scheduler_wake_queued(self, prompt: str) -> bool:
+        """True when this exact wake is live, queued-unpasted, and recallable."""
+        if self.state != SessionState.CONNECTED:
+            return False
+        for turn in self._scheduler_wake_candidates():
+            receipt = turn.scheduler_delivery
+            if (
+                turn.scheduler_serialized
+                and receipt is not None
+                and not receipt.done()
+                and not turn.pane_delivery_started
+                and turn.prompt == prompt
+            ):
+                return True
+        return False
+
+    async def cancel_scheduler_wake(self, prompt: str) -> bool:
+        """Recall one exact queued-unpasted wake before its pane paste.
+
+        The shared REPL-control lock makes the outcome authoritative. If this
+        coroutine wins the lock, cancelling the receipt fences both scheduler
+        and #943 ordinary-worker paste paths. If pane delivery won first,
+        ``pane_delivery_started`` is already true and False tells the
+        scheduler to fall back to its unrecallable pasted-state handling.
+        """
+        if self.state != SessionState.CONNECTED:
+            return False
+        async with self._repl_control_lock:
+            for turn in self._scheduler_wake_candidates():
+                receipt = turn.scheduler_delivery
+                if (
+                    turn.scheduler_serialized
+                    and receipt is not None
+                    and not receipt.done()
+                    and turn.prompt == prompt
+                ):
+                    if turn.pane_delivery_started:
+                        return False
+                    return receipt.cancel()
         return False
 
     async def _queue_external_turn(
@@ -4175,7 +5164,23 @@ class TmuxSession:
             big = is_1m_model(self._config.model or "")
         except Exception:
             big = False
-        return 1_000_000 if big else 200_000
+        if big:
+            return 1_000_000
+        # #531: non-1M models default to 200k UNLESS listed in
+        # MODEL_CONTEXT_SIZES (single source of truth, shared with the
+        # legacy Session gauge). Codex models have no harness-reported
+        # window here, so e.g. gpt-5.6-luna (real cap 272k) must be in
+        # that table or it under-counts headroom and restarts early.
+        # Substring match mirrors the Session lookup.
+        try:
+            from pinky_daemon.sessions import MODEL_CONTEXT_SIZES
+            model = (self._config.model or "").lower()
+            for key, size in MODEL_CONTEXT_SIZES.items():
+                if key != "default" and key in model:
+                    return size
+        except Exception:
+            pass
+        return 200_000
 
     def _max_tokens_for_model(self) -> int:
         """Return the model's **effective** context-window cap.
@@ -4825,19 +5830,18 @@ class TmuxSession:
                     "autonomous": True,
                 }
             )
+            self._notify_scheduler_idle_if_ready()
             return
 
         entry = self._inflight_metas.popleft()
-        self._pane_queue_operations = deque(
-            queued
-            for queued in self._pane_queue_operations
-            if queued is not entry.turn
-        )
-        self._pane_dequeued_turns = deque(
-            dequeued
-            for dequeued in self._pane_dequeued_turns
-            if dequeued is not entry.turn
-        )
+        # A racing prompt can make this Stop retire a turn's local FIFO meta
+        # before Claude emits that prompt's contentless dequeue row. Preserve
+        # every native occurrence until dequeue: unresolved receipt owners stay
+        # live, while ordinary/already-accepted owners become tombstones. Deleting
+        # either kind here shifts every later occurrence and can make an equal
+        # scheduler prompt consume the wrong ticket.
+        if not self._turn_has_unresolved_acceptance(entry.turn):
+            self._retire_acceptance_evidence(entry.turn)
         if (
             self._fresh_context_respawn_grace_until
             and self._fresh_context_respawn_epoch
@@ -5017,6 +6021,19 @@ class TmuxSession:
         # sleeps between sends, and this callback runs on the tailer's
         # read loop, which must not stall.
         self._schedule_pending_effort_if_idle()
+        self._notify_scheduler_idle_if_ready()
+
+    def _notify_scheduler_idle_if_ready(self) -> None:
+        """Report an idle pane after transport-specific reconciliation."""
+        if getattr(self, "_defer_scheduler_idle_notify", False):
+            return
+        if (
+            self.state == SessionState.CONNECTED
+            and not self._inflight_metas
+            and self._inflight_turn is None
+            and self._message_queue.empty()
+        ):
+            _notify_turn_idle(self._config, self.agent_name)
 
     async def handle_stop_failure(
         self,
@@ -5193,6 +6210,11 @@ class TmuxSession:
                 # Scheduler receipts require an exact user/dequeue transcript
                 # observation; successful external-pane keystrokes are weaker.
                 on_entry=self._on_transcript_entry,
+                # #984: a real bind that never appears on disk means Claude
+                # Code has never taken its first turn. Force one harmless
+                # internal turn instead of waiting unboundedly for a receipt
+                # source that cannot exist yet.
+                on_bound_path_wedge=self._on_bound_path_wedge,
             )
             await self._tailer.start()
             if guessed is None:
@@ -5270,6 +6292,51 @@ class TmuxSession:
         self._first_bind_recovery_task = asyncio.create_task(
             self._delayed_first_bind_recovery()
         )
+
+    def _on_bound_path_wedge(self, path: Path, bind_age: float) -> None:
+        """Force one harmless turn so Claude Code creates its bound JSONL."""
+        if self.state != SessionState.CONNECTED:
+            _log(
+                f"tmux[{self.agent_name}]: ignoring bound-path wedge while "
+                f"state={self.state.value} path={path}"
+            )
+            return
+        existing = self._transcript_materialize_task
+        if existing is not None and not existing.done():
+            return
+        _log(
+            f"tmux[{self.agent_name}]: forcing transcript-initialization "
+            f"turn after bound path stayed absent {bind_age:.1f}s"
+        )
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            _log(
+                f"tmux[{self.agent_name}]: cannot force transcript "
+                "initialization without a running event loop"
+            )
+            return
+        task = loop.create_task(
+            self._enqueue_internal_prompt(
+                _TRANSCRIPT_MATERIALIZE_PROMPT,
+                reason="wake_transcript_materialize",
+                front=True,
+                verify_submission=True,
+            )
+        )
+        self._transcript_materialize_task = task
+
+        def _done(done: asyncio.Task[None]) -> None:
+            if self._transcript_materialize_task is done:
+                self._transcript_materialize_task = None
+            if not done.cancelled() and done.exception() is not None:
+                error = done.exception()
+                _log(
+                    f"tmux[{self.agent_name}]: transcript-initialization "
+                    f"enqueue failed ({type(error).__name__}: {error})"
+                )
+
+        task.add_done_callback(_done)
 
     async def _delayed_first_bind_recovery(self) -> None:
         """Issue #565 — wait, then attempt first-bind recovery.
@@ -5390,6 +6457,12 @@ class TmuxSession:
         ):
             self._first_bind_recovery_task.cancel()
         self._first_bind_recovery_task = None
+        if (
+            self._transcript_materialize_task is not None
+            and not self._transcript_materialize_task.done()
+        ):
+            self._transcript_materialize_task.cancel()
+        self._transcript_materialize_task = None
         # Cancel any in-flight mid-turn context emit — it belongs to the
         # session that just ended; the next spawn re-emits fresh state.
         if (
@@ -5461,6 +6534,15 @@ class TmuxSession:
                 from pinky_daemon.provisioning import container_config_dir
 
                 return Path(container_config_dir(wd)) / "projects" / encoded
+        # Dedicated-config-dir LOCAL agent (#550/Picard): claude runs with
+        # CLAUDE_CONFIG_DIR=<working_dir>/.claude-local, so its transcripts live
+        # under that config dir's projects/, not the shared ~/.claude. Without
+        # this branch the tailer watches ~/.claude and never sees the agent's
+        # conversation. Helper returns "" for every non-dedicated/non-local
+        # agent, so the shared path below is unchanged for them.
+        dedicated_config_dir = self._dedicated_config_dir()
+        if dedicated_config_dir:
+            return Path(dedicated_config_dir) / "projects" / encoded
         return Path.home() / ".claude" / "projects" / encoded
 
     def _has_prior_transcript(self) -> bool:
@@ -5570,10 +6652,34 @@ class TmuxSession:
                     self._inflight_turn = await self._message_queue.get()
                     delivery_timeouts = 0
                 turn = self._inflight_turn
+                reload_guard = self._wake_context_reload_guard_for(turn)
+                if reload_guard is not None and reload_guard.original_seen:
+                    await self._emit_wake_submission_escalation(
+                        reload_guard.original_turn,
+                        rung="broker_context_reload_drain",
+                        outcome="LATE_SUBMISSION_DETECTED",
+                        detail="fallback_aborted_before_paste",
+                    )
+                    self._clear_wake_context_reload_guard(reload_guard)
+                    self._inflight_turn = None
+                    continue
                 try:
                     self._processing = True
                     await self._deliver_turn(turn)
                     self._stats["turns"] += 1
+                    if reload_guard is not None:
+                        detail = (
+                            "conditional_guard_covers_post_check_late_original"
+                            if reload_guard.original_seen
+                            else "conditional_context_reload_pasted"
+                        )
+                        await self._emit_wake_submission_escalation(
+                            reload_guard.original_turn,
+                            rung="broker_context_reload_drain",
+                            outcome="succeeded",
+                            detail=detail,
+                        )
+                        self._clear_wake_context_reload_guard(reload_guard)
                     # Success — paste landed, meta appended to the
                     # deque. ``_has_completed_turn`` advances when the
                     # first stop_hook_summary pops anything (see
@@ -5602,6 +6708,25 @@ class TmuxSession:
                     )
                     await asyncio.sleep(_TRANSIENT_RETRY_BACKOFF_SEC)
                     continue
+                except _WakeSubmissionFallbackQueued:
+                    # The original wake is terminal-False and its distinct
+                    # CONTEXT-RELOAD instruction now sits in the broker queue.
+                    # Do not count the failed wake as a turn or an error; clear
+                    # it so the worker advances to the fallback handoff.
+                    self._inflight_turn = None
+                    continue
+                except _WakeSubmissionLateDetected:
+                    # A transcript row proved the original wake started after
+                    # its receipt froze False.  Accounting remains negative,
+                    # but recovery must stop instead of adding a second
+                    # semantically equivalent continuation.
+                    self._inflight_turn = None
+                    continue
+                except _WakeSubmissionRecoveryScheduled:
+                    # The recovery task owns teardown/re-spawn.  Exit this old
+                    # worker immediately so no backlog can overtake recovery.
+                    self._inflight_turn = None
+                    return
                 except Exception as e:
                     # For an ordinary turn, a tmux command timeout (``_run``'s
                     # 5s subprocess ceiling) is transient: keep the turn in
@@ -5610,7 +6735,7 @@ class TmuxSession:
                     # wake's initial paste_text has timed out, no pane snapshot
                     # or pre-paste boolean can prove a retry safe: an exact row
                     # can arrive while the retry is suspended between
-                    # set-buffer and paste-buffer. Enter the wake's one-way
+                    # load-buffer and paste-buffer. Enter the wake's one-way
                     # receipt/Enter-only/fail-closed verifier instead. This
                     # branch can never return to worker re-paste.
                     if (
@@ -5666,6 +6791,22 @@ class TmuxSession:
                                 e = finish_e
                             else:
                                 self._stats["turns"] += 1
+                                if reload_guard is not None:
+                                    detail = (
+                                        "conditional_guard_covers_post_check_"
+                                        "late_original"
+                                        if reload_guard.original_seen
+                                        else "conditional_context_reload_pasted"
+                                    )
+                                    await self._emit_wake_submission_escalation(
+                                        reload_guard.original_turn,
+                                        rung="broker_context_reload_drain",
+                                        outcome="succeeded",
+                                        detail=detail,
+                                    )
+                                    self._clear_wake_context_reload_guard(
+                                        reload_guard
+                                    )
                                 self._inflight_turn = None
                                 continue
                         else:
@@ -5681,6 +6822,14 @@ class TmuxSession:
                     # dead-pane, tailer-state corruption, etc.). Drop
                     # the inflight turn so we don't redeliver into a
                     # broken pane on the next iteration.
+                    if reload_guard is not None:
+                        await self._emit_wake_submission_escalation(
+                            reload_guard.original_turn,
+                            rung="broker_context_reload_drain",
+                            outcome="failed",
+                            detail=f"fallback_delivery_raised_{type(e).__name__}",
+                        )
+                        self._clear_wake_context_reload_guard(reload_guard)
                     self._stats["errors"] += 1
                     _log(f"tmux[{self.agent_name}]: turn delivery raised: {e}")
                     # _deliver_turn already re-armed _turn_done and
@@ -6002,7 +7151,79 @@ class TmuxSession:
             }
         return {"active": False, "reason": "quiet", "age_s": None}
 
-    def _inflight_stall_verdict(self, now: float) -> str:
+    def _read_live_status(self) -> dict | None:
+        """Read the process-local live-status signal once, fail-closed."""
+        fn = getattr(self._config, "live_status_fn", None)
+        if fn is None:
+            return None
+        try:
+            live = fn()
+        except Exception:
+            return None
+        return live if isinstance(live, dict) else None
+
+    def _observe_frozen_live_status(
+        self, now: float, live: dict | None
+    ) -> tuple[float, float, int] | None:
+        """Track one unchanged numeric ``last_updated`` value (#984).
+
+        A changed value — including one that still predates the current tmux
+        process — starts a fresh window with a single observation.  Missing or
+        malformed evidence breaks continuity entirely.
+        """
+        last_updated = live.get("last_updated") if live else None
+        if (
+            not isinstance(last_updated, (int, float))
+            or isinstance(last_updated, bool)
+        ):
+            self._watchdog_frozen_live_status = None
+            return None
+        value = float(last_updated)
+        observed = self._watchdog_frozen_live_status
+        if observed is None or observed[0] != value:
+            observed = (value, now, 1)
+        else:
+            observed = (value, observed[1], observed[2] + 1)
+        self._watchdog_frozen_live_status = observed
+        return observed
+
+    def _frozen_liveness_restart_reason(
+        self, now: float, live: dict | None
+    ) -> str | None:
+        """Return the bounded recovery reason for a stale-veto sample."""
+        if not _watchdog_frozen_liveness_trigger_enabled():
+            return None
+        observed = self._watchdog_frozen_live_status
+        last_updated = live.get("last_updated") if live else None
+        if (
+            observed is None
+            or observed[2] < 2
+            or not isinstance(last_updated, (int, float))
+            or isinstance(last_updated, bool)
+            or observed[0] != float(last_updated)
+        ):
+            return None
+        session_started_at = self._current_session_started_at
+        if (
+            session_started_at > 0
+            and float(last_updated) <= session_started_at
+            and (now - session_started_at) > _watchdog_never_started_grace_sec()
+        ):
+            return "never_started_signature"
+        if (now - observed[1]) > _watchdog_stale_veto_cap_sec():
+            return "stale_live_status_age_cap"
+        return None
+
+    def _frozen_liveness_restart_is_paced(self, now: float) -> bool:
+        last_attempt = self._watchdog_last_frozen_restart_at
+        return (
+            last_attempt is not None
+            and (now - last_attempt) < _watchdog_frozen_restart_interval_sec()
+        )
+
+    def _inflight_stall_verdict(
+        self, now: float, live_status_sample: dict | None = None
+    ) -> str:
         """Classify a possibly-stalled inflight head for the watchdog (#118).
 
         Returns one of:
@@ -6020,8 +7241,10 @@ class TmuxSession:
                             input, so the lingering meta(s) are phantom (a
                             paste with no matching stop_hook). Reconcile, don't
                             restart.
-          - ``"unknown"`` — live_status predates this tmux process and cannot
-                            prove either idle or wedged; veto restart.
+          - ``"unknown"`` — live_status predates this tmux process or the
+                            current head and cannot yet prove either idle or
+                            wedged; veto restart pending bounded frozen-signal
+                            recovery.
           - ``"wedged"``  — aged out, transcript quiet, REPL not idle →
                             genuinely stuck; force_restart.
 
@@ -6063,21 +7286,11 @@ class TmuxSession:
         # REPL has nothing in flight. Require the idle to be at-least-as-recent
         # as when the CURRENT head was pasted — otherwise a turn was pasted
         # that the REPL never came alive for (hang-on-paste), which IS a wedge.
-        live = None
-        fn = getattr(self._config, "live_status_fn", None)
-        if fn is not None:
-            try:
-                live = fn()
-            except Exception:
-                live = None
+        live = live_status_sample
+        if live is None:
+            live = self._read_live_status()
         live_last_updated = live.get("last_updated") if live else None
-        if (
-            self._current_session_started_at > 0
-            and isinstance(live_last_updated, (int, float))
-            and not isinstance(live_last_updated, bool)
-            and live_last_updated < self._current_session_started_at
-        ):
-            return "unknown"
+        head = self._inflight_metas[0]
         if live and live.get("status") == "idle":
             last_updated = live.get("last_updated") or 0.0
             # Floor the idle-freshness check at when the current head was
@@ -6094,7 +7307,6 @@ class TmuxSession:
             # window: both timestamps come from the same daemon clock (no
             # skew), and a turn's own idle always postdates its own paste, so
             # an idle that predates the paste cannot belong to this turn.
-            head = self._inflight_metas[0]
             idle_floor = min(self._head_started_at, head.dispatched_at)
             if last_updated >= idle_floor:
                 return "idle"
@@ -6125,6 +7337,21 @@ class TmuxSession:
                             return "idle"
                     except OSError:
                         pass
+        # Positive idle evidence above is authoritative (#118/#592), even if
+        # the numeric live-status timestamp itself predates this head. Only a
+        # sample that failed both idle proofs may become an unknown/stale veto
+        # and accrue toward #984's bounded frozen-signal recovery.
+        live_floor = min(self._head_started_at, head.dispatched_at)
+        if (
+            self._current_session_started_at > 0
+            and isinstance(live_last_updated, (int, float))
+            and not isinstance(live_last_updated, bool)
+            and (
+                live_last_updated <= self._current_session_started_at
+                or live_last_updated < live_floor
+            )
+        ):
+            return "unknown"
         self._log_wedged_inputs(now, live)
         return "wedged"
 
@@ -6268,9 +7495,18 @@ class TmuxSession:
                 # takes effect live (no respawn). Checked at the TOP so nothing
                 # below (verdict, pane-liveness sampling, force_restart) runs.
                 if not self._watchdog_enabled():
+                    self._watchdog_frozen_live_status = None
                     continue
                 now = time.time()
-                verdict = self._inflight_stall_verdict(now)
+                live = self._read_live_status()
+                if _watchdog_frozen_liveness_trigger_enabled():
+                    self._observe_frozen_live_status(now, live)
+                else:
+                    # A live kill-switch flip starts a fresh continuity window
+                    # when re-enabled; time spent disabled never counts toward
+                    # either recovery threshold.
+                    self._watchdog_frozen_live_status = None
+                verdict = self._inflight_stall_verdict(now, live)
                 if verdict == "ok":
                     continue
                 age = now - (self._head_started_at or now)
@@ -6283,6 +7519,7 @@ class TmuxSession:
                 # (capture-pane + sample gap), during which a stop hook can pop or
                 # advance the head out from under us.
                 head_meta = self._inflight_metas[0]
+                restart_reason: str | None = None
                 if verdict == "growing":
                     # #118: head aged out BUT the transcript is still being
                     # written — a long/streaming turn, NOT a wedge. Extend
@@ -6336,37 +7573,93 @@ class TmuxSession:
                     )
                     continue
                 if verdict == "unknown":
-                    # #943: a process-local live-status reader can fossilize
-                    # across session recreation.  A value predating THIS tmux
-                    # process is not evidence that an idle/static pane is
-                    # wedged. Fail toward no-restart, extend the decision
-                    # window, and emit a distinctive release receipt once per
-                    # timeout window.
-                    self._head_started_at = now
+                    # #943 prevents one stale sample from proving a wedge.
+                    # #984 bounds that veto: an unchanged value at-or-before
+                    # launch becomes the never-started signature after grace;
+                    # any other unchanged stale value gets the general age
+                    # cap.  Both reuse the established replay-safe recovery
+                    # below and are paced across retained-instance respawns.
                     self._inflight_pane_ext_anchor = None
-                    live = None
-                    live_status_fn = getattr(self._config, "live_status_fn", None)
-                    if live_status_fn is not None:
-                        try:
-                            live = live_status_fn()
-                        except Exception:
-                            live = None
-                    _log(
-                        f"tmux[{self.agent_name}]: "
-                        f"WATCHDOG_STALE_LIVE_STATUS_VETO "
-                        f"live_last_updated="
-                        f"{live.get('last_updated') if live else None} "
-                        f"session_started_at={self._current_session_started_at} "
-                        f"— input unknown; NOT restarting "
-                        f"(deque depth={depth})"
-                    )
-                    log_watchdog_decision(
-                        watchdog="inflight", agent=self.agent_name,
-                        decision="skip", reason="stale_live_status_veto",
-                        state=self.state.value, progress_stale_s=age,
-                        inflight_turns=depth, inflight_active=False,
-                    )
-                    continue
+                    restart_reason = self._frozen_liveness_restart_reason(now, live)
+                    live_last_updated = live.get("last_updated") if live else None
+                    observed = self._watchdog_frozen_live_status
+                    frozen_for = (now - observed[1]) if observed else 0.0
+                    if restart_reason and self._frozen_liveness_restart_is_paced(now):
+                        last_attempt = self._watchdog_last_frozen_restart_at
+                        since_attempt = (
+                            now - last_attempt if last_attempt is not None else 0.0
+                        )
+                        self._head_started_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_FROZEN_LIVENESS_RESTART_PACED "
+                            f"reason={restart_reason} "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"since_attempt_s={since_attempt:.1f} — NOT restarting "
+                            f"(deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="skip", reason="frozen_liveness_restart_paced",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                        continue
+                    if restart_reason == "never_started_signature":
+                        self._watchdog_last_frozen_restart_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_NEVER_STARTED_RESTART "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"session_age_s="
+                            f"{now - self._current_session_started_at:.1f} "
+                            f"frozen_for_s={frozen_for:.1f} "
+                            f"— scheduling force_restart (deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="restart", reason="never_started_signature",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                    elif restart_reason == "stale_live_status_age_cap":
+                        self._watchdog_last_frozen_restart_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_STALE_LIVE_STATUS_CAP_RESTART "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"frozen_for_s={frozen_for:.1f} "
+                            f"— scheduling force_restart (deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="restart", reason="stale_live_status_age_cap",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                    else:
+                        # A changed/freshly-observed fossil is still unknown,
+                        # never restart proof. Preserve #943's veto while its
+                        # bounded continuity evidence accumulates.
+                        self._head_started_at = now
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"WATCHDOG_STALE_LIVE_STATUS_VETO "
+                            f"live_last_updated={live_last_updated} "
+                            f"session_started_at={self._current_session_started_at} "
+                            f"— input unknown; NOT restarting "
+                            f"(deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="skip", reason="stale_live_status_veto",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
+                        continue
                 # (#832) Last-chance liveness before tearing down a "wedged"
                 # head: a long pure-reasoning / slow-generation turn (common at
                 # ultracode/xhigh) writes nothing to the transcript and has no
@@ -6376,7 +7669,7 @@ class TmuxSession:
                 # like the "growing" branch. Bounded by an absolute ceiling so an
                 # animating-but-genuinely-stuck REPL is still recovered, and
                 # flag-gated (PINKY_WATCHDOG_PANE_LIVENESS=0) for a kill switch.
-                if _pane_liveness_enabled():
+                if restart_reason is None and _pane_liveness_enabled():
                     # Anchor the absolute ceiling to when THIS head FIRST reached
                     # the pane-liveness rescue, NOT to ``_head_started_at`` — the
                     # extend branch below resets ``_head_started_at = now`` on every
@@ -6427,20 +7720,21 @@ class TmuxSession:
                         f"restarting (#832; deque depth={len(self._inflight_metas)})"
                     )
                     continue
-                # verdict == "wedged": no output + REPL not idle → genuinely
-                # stuck. Fall through to the force_restart recovery path.
-                _log(
-                    f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
-                    f"> {_TURN_DONE_TIMEOUT_SEC}s, transcript quiet + REPL not "
-                    f"idle — REPL stuck; scheduling force_restart "
-                    f"(deque depth={depth})"
-                )
-                log_watchdog_decision(
-                    watchdog="inflight", agent=self.agent_name,
-                    decision="restart", reason="wedged", state=self.state.value,
-                    progress_stale_s=age, inflight_turns=depth,
-                    inflight_active=False,
-                )
+                if restart_reason is None:
+                    # verdict == "wedged": no output + REPL not idle → genuinely
+                    # stuck. Fall through to the force_restart recovery path.
+                    _log(
+                        f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
+                        f"> {_TURN_DONE_TIMEOUT_SEC}s, transcript quiet + REPL not "
+                        f"idle — REPL stuck; scheduling force_restart "
+                        f"(deque depth={depth})"
+                    )
+                    log_watchdog_decision(
+                        watchdog="inflight", agent=self.agent_name,
+                        decision="restart", reason="wedged", state=self.state.value,
+                        progress_stale_s=age, inflight_turns=depth,
+                        inflight_active=False,
+                    )
                 # Snapshot deque state before mutation so this critical
                 # section is atomic from the outside (no awaits between
                 # snapshot and mutation).
@@ -6726,6 +8020,13 @@ class TmuxSession:
             )
         ):
             return True
+        # An observed physical paste with an unresolved exact receipt is live
+        # state. It outranks a newer idle row: idle may clear stale accepted
+        # metas, but it cannot make an unreceipted paste safe to overlap or
+        # replay. Include occurrence tickets because a racing Stop can retire
+        # the turn from the ordinary inflight collections before dequeue.
+        if self._has_unresolved_pasted_acceptance():
+            return True
         live_status_fn = getattr(self._config, "live_status_fn", None)
         if live_status_fn is None:
             return True
@@ -6758,6 +8059,19 @@ class TmuxSession:
             ):
                 return True
         return False
+
+    def scheduler_drain_busy(self) -> bool:
+        """Fresh conservative pane verdict for the periodic wake drain.
+
+        Receipt waits deliberately use the wider watchdog liveness window.
+        The drain instead asks whether pane FIFO/tool state or a live status
+        newer than every paste still blocks a scheduler turn right now. This
+        lets an explicit idle boundary override monitor writes attached to a
+        stale inflight meta without weakening teardown protection (#1098).
+        """
+        if self.state != SessionState.CONNECTED:
+            return False
+        return self._scheduler_pane_busy()
 
     @staticmethod
     def _transcript_user_text(entry: dict) -> str | None:
@@ -6794,11 +8108,17 @@ class TmuxSession:
         self, prompt: str, *, for_enqueue: bool = False
     ) -> _QueuedTurn | None:
         """Match an exact transcript prompt to its oldest pending pane turn."""
+        return self._match_acceptance_content(prompt, for_enqueue=for_enqueue)
+
+    def _match_acceptance_content(
+        self, content: str, *, for_enqueue: bool = False
+    ) -> _QueuedTurn | None:
+        """Match exact content even when its original turn meta was retired."""
         for turn in self._acceptance_candidates():
             if (
                 not turn.pane_delivery_started
                 or turn.transport_accepted
-                or _normalize_prompt(turn.prompt) != _normalize_prompt(prompt)
+                or _normalize_prompt(turn.prompt) != _normalize_prompt(content)
                 or (
                     turn.submission_receipt is not None
                     and turn.submission_receipt.done()
@@ -6811,10 +8131,97 @@ class TmuxSession:
             return turn
         return None
 
-    def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> None:
-        """Resolve exact receipts only on observed pane acceptance."""
-        if turn is None or turn.transport_accepted:
+    @staticmethod
+    def _turn_has_unresolved_acceptance(turn: _QueuedTurn) -> bool:
+        """Whether a consumed-content ticket must survive a racing Stop."""
+        if turn.transport_accepted:
+            return False
+        return any(
+            receipt is not None and not receipt.done()
+            for receipt in (turn.scheduler_delivery, turn.submission_receipt)
+        )
+
+    def _has_unresolved_pasted_acceptance(self) -> bool:
+        """Whether any live pane occurrence owns an unresolved exact receipt."""
+        candidates = self._acceptance_candidates()
+        candidates.extend(
+            evidence.turn
+            for evidence in self._pane_queue_operations
+            if not evidence.retired and evidence.turn is not None
+        )
+        candidates.extend(
+            evidence.turn
+            for evidence in self._pane_dequeued_turns
+            if not evidence.retired and evidence.turn is not None
+        )
+        seen: set[int] = set()
+        for turn in candidates:
+            identity = id(turn)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            if (
+                turn.pane_delivery_started
+                and self._turn_has_unresolved_acceptance(turn)
+            ):
+                return True
+        return False
+
+    def _retire_acceptance_evidence(self, turn: _QueuedTurn) -> None:
+        """Tombstone this occurrence without shifting the native FIFO ledger."""
+        for index, evidence in enumerate(self._pane_queue_operations):
+            if evidence.turn is turn:
+                self._pane_queue_operations[index] = _QueuedPromptEvidence(
+                    evidence.content,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+        for index, evidence in enumerate(self._pane_dequeued_turns):
+            if evidence.turn is turn:
+                self._pane_dequeued_turns[index] = _DequeuedPromptEvidence(
+                    evidence.content,
+                    evidence.accepted_at_dequeue,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+        if turn.pane_queue_enqueued:
+            # A matched ticket no longer present was already consumed. Never
+            # tombstone a later equal-content occurrence owned by another turn.
             return
+        for index, evidence in enumerate(self._pane_queue_operations):
+            if (
+                not evidence.retired
+                and evidence.turn is None
+                and evidence.content == turn.prompt
+            ):
+                self._pane_queue_operations[index] = _QueuedPromptEvidence(
+                    evidence.content,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+        for index, evidence in enumerate(self._pane_dequeued_turns):
+            if (
+                not evidence.retired
+                and evidence.turn is None
+                and evidence.content == turn.prompt
+            ):
+                self._pane_dequeued_turns[index] = _DequeuedPromptEvidence(
+                    evidence.content,
+                    evidence.accepted_at_dequeue,
+                    evidence.turn,
+                    retired=True,
+                )
+                return
+
+    def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
+        """Resolve exact receipts only on observed pane acceptance."""
+        if turn is None:
+            return False
+        if turn.transport_accepted:
+            return True
         # A fast wake can write user+assistant+Stop rows before paste_text's
         # final tmux subprocess coroutine resumes. Reserve its FIFO metadata
         # synchronously on the exact user/dequeue row so the same-read Stop
@@ -6845,6 +8252,23 @@ class TmuxSession:
         for receipt in (turn.scheduler_delivery, turn.submission_receipt):
             if receipt is not None and not receipt.done():
                 receipt.set_result(True)
+        return True
+
+    def _wake_context_reload_guard_for(
+        self, turn: _QueuedTurn
+    ) -> _WakeContextReloadGuard | None:
+        """Return the active guard when ``turn`` is its wrapped fallback."""
+        guard = self._wake_context_reload_guard
+        if guard is None or not turn.prompt.endswith(guard.instruction):
+            return None
+        return guard
+
+    def _clear_wake_context_reload_guard(
+        self, guard: _WakeContextReloadGuard
+    ) -> None:
+        """Clear ``guard`` only if it is still the active escalation epoch."""
+        if self._wake_context_reload_guard is guard:
+            self._wake_context_reload_guard = None
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Consume transcript evidence strong enough for exact-turn receipts."""
@@ -6854,30 +8278,72 @@ class TmuxSession:
             if operation == "enqueue":
                 content = entry.get("content")
                 turn = (
-                    self._match_acceptance_turn(content, for_enqueue=True)
+                    self._match_acceptance_content(content, for_enqueue=True)
                     if isinstance(content, str)
                     else None
                 )
                 if turn is not None:
                     turn.pane_queue_enqueued = True
-                self._pane_queue_operations.append(turn)
+                self._pane_queue_operations.append(
+                    _QueuedPromptEvidence(
+                        content if isinstance(content, str) else None,
+                        turn,
+                    )
+                )
             elif operation == "dequeue" and self._pane_queue_operations:
-                turn = self._pane_queue_operations.popleft()
-                self._pane_dequeued_turns.append(turn)
-                self._mark_transport_accepted(turn)
+                queued_evidence = self._pane_queue_operations.popleft()
+                content = queued_evidence.content
+                # Dequeue rows are contentless. Their identity is the exact FIFO
+                # occurrence captured at enqueue, never a fresh content match:
+                # rematching after Stop can jump to a later equal scheduler row.
+                turn = (
+                    None if queued_evidence.retired else queued_evidence.turn
+                )
+                accepted = self._mark_transport_accepted(turn)
+                self._pane_dequeued_turns.append(
+                    _DequeuedPromptEvidence(
+                        content,
+                        accepted,
+                        queued_evidence.turn,
+                        queued_evidence.retired,
+                    )
+                )
             return
 
         if entry_type == "user":
             prompt = self._transcript_user_text(entry)
             if prompt is not None:
-                if self._pane_dequeued_turns:
-                    dequeued = self._pane_dequeued_turns[0]
-                    if dequeued is None or _normalize_prompt(dequeued.prompt) == _normalize_prompt(prompt):
-                        self._pane_dequeued_turns.popleft()
-                        self._mark_transport_accepted(dequeued)
-                        return
+                guard = self._wake_context_reload_guard
+                if (
+                    guard is not None
+                    and _normalize_prompt(prompt) == _normalize_prompt(guard.original_turn.prompt)
+                    and not guard.original_seen
+                ):
+                    guard.original_seen = True
+                    _log(
+                        f"tmux[{self.agent_name}]: LATE_SUBMISSION_DETECTED "
+                        "for original orientation wake; remaining broker "
+                        "escalation will be fenced"
+                    )
+                matching_dequeue = next(
+                    (
+                        index
+                        for index, evidence in enumerate(
+                            self._pane_dequeued_turns
+                        )
+                        if evidence.content is None
+                        or _normalize_prompt(evidence.content) == _normalize_prompt(prompt)
+                    ),
+                    None,
+                )
+                if matching_dequeue is not None:
+                    evidence = self._pane_dequeued_turns[matching_dequeue]
+                    del self._pane_dequeued_turns[matching_dequeue]
+                    if not evidence.accepted_at_dequeue and not evidence.retired:
+                        self._mark_transport_accepted(evidence.turn)
+                    return
                 self._mark_transport_accepted(
-                    self._match_acceptance_turn(prompt)
+                    self._match_acceptance_content(prompt)
                 )
 
     @staticmethod
@@ -6912,16 +8378,10 @@ class TmuxSession:
             if removed_index == 0:
                 self._inflight_pane_ext_anchor = None
                 self._head_started_at = time.time() if entries else None
-        self._pane_queue_operations = deque(
-            queued
-            for queued in self._pane_queue_operations
-            if queued is not turn
-        )
-        self._pane_dequeued_turns = deque(
-            dequeued
-            for dequeued in self._pane_dequeued_turns
-            if dequeued is not turn
-        )
+        # Receipt exhaustion retires ownership but cannot delete the physical
+        # occurrence: a late dequeue still has to consume this FIFO slot before
+        # any later equal-content turn can become eligible.
+        self._retire_acceptance_evidence(turn)
         turn.pane_delivery_recorded = False
 
     @staticmethod
@@ -6941,6 +8401,10 @@ class TmuxSession:
         submit_attempts: int,
     ) -> bool:
         """Emit one positive wake submission verdict."""
+        # A positive wake proves the replacement transport can accept turns,
+        # so a future independent context restart receives a fresh one-shot
+        # transport-recovery budget.
+        self._wake_submission_transport_recovery_used = False
         latency_ms = int((time.monotonic() - started) * 1000)
         _log(
             f"tmux[{self.agent_name}]: wake prompt submission VERIFIED "
@@ -6958,11 +8422,209 @@ class TmuxSession:
         )
         return True
 
-    async def _verify_wake_submission(self, turn: _QueuedTurn) -> bool:
+    async def _emit_wake_submission_escalation(
+        self,
+        turn: _QueuedTurn,
+        *,
+        rung: str,
+        outcome: str,
+        detail: str = "",
+    ) -> None:
+        """Emit one bounded-ladder decision without logging prompt content."""
+        suffix = f", detail={detail}" if detail else ""
+        _log(
+            f"tmux[{self.agent_name}]: WAKE SUBMISSION ESCALATION "
+            f"rung={rung}, outcome={outcome}, reason={turn.reason}{suffix}"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_submission_escalation",
+                "agent_name": self.agent_name,
+                "reason": turn.reason,
+                "rung": rung,
+                "outcome": outcome,
+                "detail": detail,
+            }
+        )
+
+    async def _report_wake_submission_escalation_terminal(
+        self, turn: _QueuedTurn, *, detail: str
+    ) -> None:
+        """Surface exhaustion as a terminal operator-visible outcome."""
+        _log(
+            f"tmux[{self.agent_name}]: WAKE SUBMISSION ESCALATION TERMINAL "
+            f"— all bounded recovery rungs failed (reason={turn.reason}, "
+            f"detail={detail})"
+        )
+        await self._emit_stream_event(
+            {
+                "type": "wake_prompt_submission_escalation_terminal",
+                "agent_name": self.agent_name,
+                "reason": turn.reason,
+                "detail": detail,
+            }
+        )
+
+    async def _wait_for_wake_submission_receipt_quiescence(
+        self,
+        turn: _QueuedTurn,
+        *,
+        started: float,
+        submit_attempts: int,
+    ) -> bool:
+        """Wait once for lagging exact evidence without replaying the wake."""
+        receipt = turn.submission_receipt
+        if receipt is None:
+            return False
+        try:
+            accepted = bool(
+                await asyncio.wait_for(
+                    asyncio.shield(receipt),
+                    timeout=_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC,
+                )
+            )
+        except asyncio.TimeoutError:
+            # Prefer an exact row that resolves on the timeout boundary.
+            accepted = self._receipt_accepted(receipt)
+        except Exception:
+            accepted = self._receipt_accepted(receipt)
+        if not accepted:
+            return False
+        await self._report_verified_wake_submission(
+            turn,
+            started=started,
+            submit_attempts=submit_attempts,
+        )
+        return True
+
+    async def _inject_wake_context_reload(self, turn: _QueuedTurn) -> str:
+        """Run the guarded broker-injection rung without replaying the wake."""
+        guard = self._wake_context_reload_guard
+        if guard is None or guard.original_turn is not turn:
+            guard = _WakeContextReloadGuard(
+                original_turn=turn,
+                instruction=_WAKE_CONTEXT_RELOAD_INSTRUCTION,
+            )
+            self._wake_context_reload_guard = guard
+        if guard.original_seen:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="broker_context_reload_enqueue",
+                outcome="LATE_SUBMISSION_DETECTED",
+                detail="fallback_aborted_before_enqueue",
+            )
+            self._clear_wake_context_reload_guard(guard)
+            return "late_submission_detected"
+        injector = self._config.wake_submission_recovery_injector
+        if injector is None:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="broker_context_reload",
+                outcome="failed",
+                detail="injector_unavailable",
+            )
+            self._clear_wake_context_reload_guard(guard)
+            return "failed"
+        try:
+            result = injector(
+                self.agent_name,
+                _WAKE_CONTEXT_RELOAD_INSTRUCTION,
+            )
+            if asyncio.iscoroutine(result):
+                result = await asyncio.wait_for(
+                    result,
+                    timeout=_WAKE_SUBMISSION_BROKER_TIMEOUT_SEC,
+                )
+            delivered = result is True
+        except Exception as exc:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="broker_context_reload",
+                outcome="failed",
+                detail=f"injector_raised_{type(exc).__name__}",
+            )
+            self._clear_wake_context_reload_guard(guard)
+            return "failed"
+        await self._emit_wake_submission_escalation(
+            turn,
+            rung="broker_context_reload",
+            outcome="succeeded" if delivered else "failed",
+            detail="context_reload_handoff" if delivered else "handoff_rejected",
+        )
+        if not delivered:
+            self._clear_wake_context_reload_guard(guard)
+            return "failed"
+        return "queued"
+
+    async def _run_wake_submission_transport_recovery(
+        self, turn: _QueuedTurn
+    ) -> None:
+        """Own the one-shot fresh force-restart rung outside the worker."""
+        # Let the old worker observe _WakeSubmissionRecoveryScheduled and exit
+        # before force_restart disconnects it.
+        await asyncio.sleep(0)
+        self._config.force_fresh_context_once = True
+        try:
+            restarted = await self.force_restart(bypass_guard=True)
+        except asyncio.CancelledError:
+            self._config.force_fresh_context_once = False
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="force_restart_cancelled"
+            )
+            raise
+        except Exception as exc:
+            self._config.force_fresh_context_once = False
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail=f"force_restart_raised_{type(exc).__name__}"
+            )
+            return
+        if restarted:
+            await self._emit_wake_submission_escalation(
+                turn,
+                rung="force_restart",
+                outcome="succeeded",
+                detail="fresh_transport_started",
+            )
+            return
+        self._config.force_fresh_context_once = False
+        await self._report_wake_submission_escalation_terminal(
+            turn, detail="force_restart_rejected_or_failed"
+        )
+
+    async def _schedule_wake_submission_transport_recovery(
+        self, turn: _QueuedTurn
+    ) -> bool:
+        """Schedule at most one force-restart until a wake verifies."""
+        task = self._wake_submission_recovery_task
+        if task is not None and not task.done():
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="force_restart_already_in_flight"
+            )
+            return False
+        if self._wake_submission_transport_recovery_used:
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="force_restart_budget_exhausted"
+            )
+            return False
+        self._wake_submission_transport_recovery_used = True
+        self._wake_submission_recovery_task = asyncio.create_task(
+            self._run_wake_submission_transport_recovery(turn)
+        )
+        await self._emit_wake_submission_escalation(
+            turn,
+            rung="force_restart",
+            outcome="scheduled",
+            detail="fresh_context_preserved",
+        )
+        return True
+
+    async def _verify_wake_submission(
+        self, turn: _QueuedTurn, *, allow_escalation: bool = True
+    ) -> str:
         """Require exact turn-start evidence, retrying only a parked Enter."""
         receipt = turn.submission_receipt
         if receipt is None:
-            return True
+            return "verified"
 
         started = time.monotonic()
         prompt_visible: bool | None = None
@@ -6985,11 +8647,12 @@ class TmuxSession:
                 accepted = self._receipt_accepted(receipt)
 
             if accepted:
-                return await self._report_verified_wake_submission(
+                await self._report_verified_wake_submission(
                     turn,
                     started=started,
                     submit_attempts=submit_attempts,
                 )
+                return "verified"
 
             # A terminal/cancelled False receipt cannot become True later.
             if receipt.done():
@@ -7001,11 +8664,12 @@ class TmuxSession:
             # Re-pasting here could duplicate a side-effecting wake turn.
             prompt_visible = await self._timed_out_turn_landed(turn)
             if self._receipt_accepted(receipt):
-                return await self._report_verified_wake_submission(
+                await self._report_verified_wake_submission(
                     turn,
                     started=started,
                     submit_attempts=submit_attempts,
                 )
+                return "verified"
             if not prompt_visible:
                 break
             try:
@@ -7036,30 +8700,72 @@ class TmuxSession:
         # The exact row can land while the final best-effort pane probe yields.
         # Positive transcript evidence wins that timeout boundary.
         if self._receipt_accepted(receipt):
-            return await self._report_verified_wake_submission(
+            await self._report_verified_wake_submission(
                 turn,
                 started=started,
                 submit_attempts=submit_attempts,
             )
+            return "verified"
         latency_ms = int((time.monotonic() - started) * 1000)
+        escalation_applies = bool(
+            allow_escalation
+            and turn.reason == f"wake_{WakeReason.CONTEXT_RESTART.value}"
+            and _wake_submission_escalation_enabled()
+        )
+        if (
+            escalation_applies
+            and await self._wait_for_wake_submission_receipt_quiescence(
+                turn,
+                started=started,
+                submit_attempts=submit_attempts,
+            )
+        ):
+            return "verified"
+
+        # Freeze the original wake before any diagnostic callback or fallback
+        # can yield.  A late exact row must not turn the terminal verdict True
+        # while a distinct broker CONTEXT-RELOAD handoff is already underway.
         self._resolve_submission_receipt(turn, False)
         _log(
             f"tmux[{self.agent_name}]: wake prompt submission UNVERIFIED "
             f"after bounded Enter retries (reason={turn.reason}, "
             f"submit_attempts={submit_attempts}, latency_ms={latency_ms}, "
             f"prompt_visible={prompt_visible}); not claiming delivery"
+            + ("; starting bounded escalation" if escalation_applies else "")
         )
-        await self._emit_stream_event(
-            {
-                "type": "wake_prompt_submission_unverified",
-                "agent_name": self.agent_name,
-                "reason": turn.reason,
-                "submit_attempts": submit_attempts,
-                "latency_ms": latency_ms,
-                "prompt_visible": prompt_visible,
-            }
+        unverified_event = {
+            "type": "wake_prompt_submission_unverified",
+            "agent_name": self.agent_name,
+            "reason": turn.reason,
+            "submit_attempts": submit_attempts,
+            "latency_ms": latency_ms,
+            "prompt_visible": prompt_visible,
+        }
+        if escalation_applies:
+            unverified_event["escalating"] = True
+            # Arm before the first escalation callback can yield. A late exact
+            # original-wake row remains terminal-False for receipt/accounting,
+            # but marks this epoch so the distinct fallback is fenced.
+            self._wake_context_reload_guard = _WakeContextReloadGuard(
+                original_turn=turn,
+                instruction=_WAKE_CONTEXT_RELOAD_INSTRUCTION,
+            )
+        await self._emit_stream_event(unverified_event)
+        if not escalation_applies:
+            return "unverified"
+
+        await self._emit_wake_submission_escalation(
+            turn,
+            rung="receipt_quiescence",
+            outcome="expired",
+            detail="late_receipt_not_observed",
         )
-        return False
+        injection = await self._inject_wake_context_reload(turn)
+        if injection == "queued":
+            return "fallback_queued"
+        if injection == "late_submission_detected":
+            return "late_submission_detected"
+        return "recovery_required"
 
     async def _finish_submitted_turn(self, turn: _QueuedTurn) -> None:
         """Record pane delivery and enforce any exact wake receipt."""
@@ -7073,12 +8779,26 @@ class TmuxSession:
         )
         if not verify_submission:
             return
-        if await self._verify_wake_submission(turn):
+        verdict = await self._verify_wake_submission(turn)
+        if verdict == "verified":
             self._fire_on_delivered(turn)
             return
 
         self._discard_unverified_turn_delivery(turn)
         self._turn_done.set()
+        if verdict == "fallback_queued":
+            raise _WakeSubmissionFallbackQueued(
+                "failed orientation wake replaced by broker context reload"
+            )
+        if verdict == "late_submission_detected":
+            raise _WakeSubmissionLateDetected(
+                "late original orientation wake stopped broker escalation"
+            )
+        if verdict == "recovery_required":
+            if await self._schedule_wake_submission_transport_recovery(turn):
+                raise _WakeSubmissionRecoveryScheduled(
+                    "failed orientation wake scheduled transport recovery"
+                )
         raise RuntimeError(
             "wake prompt paste/Enter was not confirmed by an exact "
             "transcript receipt after bounded Enter retries"
@@ -7497,6 +9217,7 @@ class TmuxSession:
         had to cancel the old worker to prevent the race window
         Murzik flagged on commit 2).
         """
+        self._preflight_transport_replacement()
         if (
             not bypass_guard
             and self._has_completed_turn
@@ -7531,17 +9252,19 @@ class TmuxSession:
             )
             return False
 
-        await self.disconnect()
-
-        # disconnect's default → DEAD path triggers ONLY from CONNECTED;
-        # we pre-set RECONNECTING above so it stays put. Now spawn fresh.
+        transition_open = True
         try:
+            await self.disconnect()
+
+            # disconnect's default → DEAD path triggers ONLY from CONNECTED;
+            # we pre-set RECONNECTING above so it stays put. Now spawn fresh.
             await self._spawn_tmux_repl()
             await self._state_machine.transition_complete(
                 token,
                 SessionState.CONNECTED,
                 trigger=Trigger.INTERNAL,
             )
+            transition_open = False
             # Re-prime the agent with an orientation wake prompt BEFORE the
             # worker can start draining. Without this, force_restart
             # respawned the REPL but — unlike connect() — left the agent on
@@ -7582,17 +9305,33 @@ class TmuxSession:
                 f"(wake_reason={wake_reason.value})"
             )
             return True
+        except asyncio.CancelledError:
+            # The transition owner must close its StateMachine lease even when
+            # an independent disconnect cancels this restart before spawn.  A
+            # fresh-context latch belongs to this abandoned recovery attempt;
+            # never leak it into a later unrelated lifecycle.
+            self._config.force_fresh_context_once = False
+            _log(f"tmux[{self.agent_name}]: force_restart cancelled")
+            raise
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: force_restart spawn failed: {e}")
-            try:
-                await self._state_machine.transition_complete(
-                    token,
-                    SessionState.DEAD,
-                    trigger=Trigger.INTERNAL,
-                )
-            except Exception:
-                pass
             return False
+        finally:
+            # Every owner exit before CONNECTED completion closes the lease.
+            # This covers exceptions and BaseException cancellation alike, so
+            # subscribers cannot remain stranded behind RECONNECTING.
+            if transition_open:
+                try:
+                    await self._state_machine.transition_complete(
+                        token,
+                        SessionState.DEAD,
+                        trigger=Trigger.INTERNAL,
+                    )
+                except Exception as cleanup_exc:
+                    _log(
+                        f"tmux[{self.agent_name}]: force_restart transition "
+                        f"cleanup failed: {cleanup_exc}"
+                    )
 
     async def idle_sleep(self) -> bool:
         """Disconnect but keep the tmux session name pinned for cheap
@@ -7708,6 +9447,7 @@ class TmuxSession:
                 ``SCHEDULER`` from cron-driven resurrect, ``API_ADMIN`` from
                 explicit operator action.
         """
+        self._preflight_transport_replacement()
         # Drive into RECONNECTING. If we're already there (e.g. force_restart
         # is mid-flight), let that owner finish.
         if self.state == SessionState.RECONNECTING:

@@ -49,16 +49,6 @@ _APPROVAL_NOTIFY_RETRY_MAX_SEC = 30 * 60
 _APPROVAL_NOTIFY_MAX_ATTEMPTS = 5
 _APPROVAL_NOTIFY_POLL_SEC = 5
 
-# #279: agent-to-agent reply auto-routing. ``inject_agent_message`` stamps an
-# injected turn with ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the
-# requester agent name; when that turn completes, ``route_agent_reply`` performs
-# a one-way live injection back to the requester. The return injection disables
-# reply routing so the exchange cannot ping-pong.
-AGENT_REPLY_PLATFORM = "agent"
-_AGENT_REPLY_ROUTING_ENABLED = os.environ.get(
-    "PINKY_AGENT_REPLY_ROUTING", "1"
-).strip().lower() not in ("0", "false", "no", "off")
-
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
@@ -889,7 +879,7 @@ class MessageBroker:
 
         text = message.content.strip()
         # Match the command prefix case-insensitively, but preserve the RAW case
-        # of the target id — Slack user ids are uppercase (e.g. U774M8XDE) and the
+        # of the target id — Slack user ids are uppercase (e.g. U0EXAMPLE1) and the
         # pending row is keyed under the exact id. Lowercasing the whole token
         # approved a phantom lowercased user, delivered 0 held messages, and left
         # the real user pending (so the channel reply never went out).
@@ -1371,7 +1361,7 @@ class MessageBroker:
 
     async def dispatch_pre_authorized(
         self, agent_name: str, message: BrokerMessage,
-    ) -> None:
+    ) -> bool:
         """Dispatch a message whose sender is already authorized upstream.
 
         Bypasses the human-platform onboarding flow that ``handle_inbound``
@@ -1394,7 +1384,7 @@ class MessageBroker:
         platforms (sender/preview formatting). If a future caller wants
         broker-side activity logs, expose that as a separate flag.
         """
-        await self._route_streaming(agent_name, message)
+        return await self._route_streaming(agent_name, message)
 
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
@@ -1417,7 +1407,71 @@ class MessageBroker:
             f" | thread_root_ts:{message.reply_to} | is_thread_reply:true"
             if message.reply_to else ""
         )
-        if message.is_group:
+        buzz_principal = message.metadata.get("buzz_verified_principal", "")
+        if message.platform == "buzz" and buzz_principal:
+            alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
+            display = alias or message.chat_title or message.chat_id
+            mentioned = "true" if message.metadata.get("buzz_mentioned_self") is True else "false"
+            contact = None
+            contact_lookup_failed = False
+            try:
+                contact = self._registry.get_verified_contact(
+                    message.agent_name, "buzz", buzz_principal
+                )
+            except Exception as exc:
+                # Fail closed on trust but open on rendering: an absent legacy
+                # table or lookup failure must preserve the full-principal
+                # untrusted header instead of crashing inbound delivery.
+                _log(
+                    "broker: WARNING verified-contact lookup failed for "
+                    f"{message.agent_name} ({type(exc).__name__}); rendering untrusted"
+                )
+                contact_lookup_failed = True
+            if contact is not None:
+                role = f" ({contact['role']})" if contact.get("role") else ""
+                fingerprint = buzz_principal.rsplit(":", 1)[-1][:12]
+                sender = f"from:{contact['name']}{role} principal:{fingerprint}…"
+            else:
+                collision = ""
+                if not contact_lookup_failed:
+                    try:
+                        collision = next(
+                            (
+                                item["name"]
+                                for item in self._registry.list_verified_contacts(
+                                    message.agent_name
+                                )
+                                if item["name"].casefold() == message.sender_name.casefold()
+                            ),
+                            "",
+                        )
+                    except Exception as exc:
+                        # Collision enrichment is optional. Preserve the explicit
+                        # untrusted/full-principal fallback, but make registry
+                        # degradation observable instead of silently hiding it.
+                        _log(
+                            "broker: WARNING verified-contact collision lookup failed for "
+                            f"{message.agent_name} ({type(exc).__name__}); "
+                            "rendering untrusted"
+                        )
+                trust_label = (
+                    f"untrusted+collides:{collision}" if collision else "untrusted"
+                )
+                sender = (
+                    f"display_name({trust_label}):{message.sender_name} | "
+                    f"principal:{buzz_principal}"
+                )
+            # When no name is available the full raw ID already occupies the
+            # display slot; do not print it a second time. Named channels keep
+            # the explicit chat_id field required by send()/thread().
+            chat_id = (
+                f" | chat_id:{message.chat_id}" if display != message.chat_id else ""
+            )
+            header = (
+                f"[buzz | {display} | {sender} | mentioned_self:{mentioned}"
+                f"{chat_id} | {ts}{msg_id}{thread_provenance}]"
+            )
+        elif message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
             header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
@@ -1750,10 +1804,8 @@ class MessageBroker:
         from_agent: str,
         to_agent: str,
         message: str,
-        *,
-        route_reply: bool = True,
     ) -> InjectResult:
-        """Inject a message from one agent into another's streaming session.
+        """Explicitly inject one agent message into another live session.
 
         Returns an :class:`InjectResult`. ``confirmed`` is computed HERE, on
         the exact session object that performed the inject, in the same call:
@@ -1762,11 +1814,13 @@ class MessageBroker:
         This closes both halves of Murzik's #853 P1: a transport-static
         capability can't overrule a failed handoff (e.g. StreamingSession's
         swallowed ``client.query`` exception now returns handoff=False), and
-        there is no second session lookup that could race a session swap.
-        ``route_reply=False`` makes the injection one-way by omitting the
-        agent-reply routing sentinel. A transport that doesn't advertise the
-        confirmation capability never confirms, but a truthy per-call handoff
-        still counts as live delivery.
+        there is no second session lookup that could race a session swap. A
+        transport that doesn't advertise the confirmation capability never
+        confirms, but a truthy per-call handoff still counts as live delivery.
+
+        #1074: this operation is deliberately one-way. The recipient must use
+        an explicit ``send_to_agent`` call to reply; turn-final console text is
+        web-render-only and never receives route-back metadata here.
         """
         streaming = self._get_streaming_session(to_agent)
         if not streaming or streaming.state != SessionState.CONNECTED:
@@ -1778,17 +1832,7 @@ class MessageBroker:
         from datetime import timezone as tz
         ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
-        if _AGENT_REPLY_ROUTING_ENABLED and route_reply:
-            # #279: encode the requester as the route-back target so the
-            # recipient's completed turn auto-delivers live to the requester
-            # (see ``route_agent_reply``). The ``platform="agent"`` sentinel is
-            # intercepted in the response callback before normal platform
-            # routing; ``chat_id`` carries the requester agent name.
-            handoff = await streaming.send(
-                prompt, platform=AGENT_REPLY_PLATFORM, chat_id=from_agent
-            )
-        else:
-            handoff = await streaming.send(prompt)
+        handoff = await streaming.send(prompt)
         confirmed = bool(handoff) and bool(
             getattr(streaming, "injection_confirms_consumption", False)
         )
@@ -1828,7 +1872,14 @@ class MessageBroker:
         used_outreach: bool = False,
         fallback_enabled: bool = False,
     ) -> None:
-        """Deliver plain-text fallback for a completed turn when appropriate."""
+        """Finish per-chat bookkeeping without delivering turn-final text.
+
+        #1074 full suppression: completed-turn console prose is persisted by
+        the session's conversation store and rendered by the web UI. External
+        and internal chat delivery both require an explicit outreach tool.
+        ``fallback_enabled`` remains accepted for configuration compatibility,
+        but it can no longer authorize delivery.
+        """
         stripped = response.strip()
         _log(
             f"broker: route_response for {agent_name} ({platform}/{chat_id}): "
@@ -1838,6 +1889,10 @@ class MessageBroker:
         # Always stop the typing indicator when a turn completes
         if chat_id:
             self._stop_typing(agent_name, chat_id)
+            # A voice-origin marker is scoped to this completed turn. With
+            # implicit voice/plain-text replies removed it must still be
+            # retired here so it cannot bleed into a later explicit action.
+            self._voice_pending.pop((agent_name, chat_id), None)
 
         if used_outreach:
             _log(f"broker: {agent_name} handled turn via outreach tools")
@@ -1855,95 +1910,11 @@ class MessageBroker:
 
         if not stripped or not fallback_enabled or not chat_id:
             return
-
-        # Plain-text fallback is for INTERNAL / owner surfaces only — the web UI,
-        # API, and console. Owner rule (Brad, 2026-06-22): never auto-deliver an
-        # agent's bare plain text to an outreach channel (telegram/discord/slack),
-        # not even a 1:1 owner DM. When an agent stays silent it often "thinks
-        # out loud" (emits reasoning text without calling an outreach tool);
-        # pushing that to a real channel leaks internal deliberation (the
-        # Chekov-on-Slack leak) and trains lazy non-tool replies. To reach any
-        # external channel the agent MUST call an explicit pinky-messaging tool
-        # (send/thread). Errors still surface — they route back on their own
-        # paths (API-error content is suppressed upstream so raw error JSON never
-        # reaches chat; auth failures fire the operator alert), not through this
-        # fallback. (Supersedes the #810 1:1-DM allowance with a stricter
-        # fail-closed rule; the group-leak guard is subsumed — groups are
-        # external, so they're suppressed here too.)
-        _internal_surfaces = {"web", "api", ""}
-        if platform not in _internal_surfaces:
-            _log(
-                f"broker: suppressed plain-text fallback for {agent_name} on "
-                f"{platform}/{chat_id} — outreach channels are tool-only "
-                f"(fallback delivers to web UI / internal surfaces only)"
-            )
-            return
-
-        voice_key = (agent_name, chat_id)
-        if self._voice_pending.pop(voice_key, False):
-            sent_voice = await self._try_voice_reply(agent_name, platform, chat_id, stripped)
-            if not sent_voice:
-                await self._send_message(agent_name, platform, chat_id, stripped)
-        else:
-            await self._send_message(agent_name, platform, chat_id, stripped)
-
-    async def route_agent_reply(self, comms, turn_result) -> bool:
-        """Auto-deliver a completed agent-to-agent turn live to the requester.
-
-        #279: ``inject_agent_message`` stamps injected turns with
-        ``platform == AGENT_REPLY_PLATFORM`` and ``chat_id`` = the requester
-        agent name. When such a turn finishes, the recipient's turn text is
-        delivered by a one-way live injection. The reply is also stored in the
-        comms messages table for audit/thread history, with only read recipient
-        bookkeeping and no unread inbox state. The return injection sets
-        ``route_reply=False``, so it cannot trigger another auto-routed reply
-        and the exchange terminates.
-
-        Returns True when the turn was an agent reply (handled here, caller
-        should stop); False for normal platform turns so the caller falls
-        through to ``route_response``.
-        """
-        if not turn_result or turn_result.platform != AGENT_REPLY_PLATFORM:
-            return False
-        requester = (turn_result.chat_id or "").strip()
-        responder = (turn_result.agent_name or "").strip()
-        text = (turn_result.response_text or "").strip()
-        if not requester or not responder:
-            _log(
-                "broker: agent reply missing requester/responder "
-                f"(requester={requester!r} responder={responder!r}); dropping"
-            )
-            return True
-        if not text:
-            # A pure tool-call turn with no final text — nothing to relay.
-            _log(f"broker: agent reply {responder} -> {requester} had no text")
-            return True
-        try:
-            comms.send(responder, requester, text, metadata={"auto_routed": True})
-            delivered, _confirmed = await self.inject_agent_message(
-                responder, requester, text, route_reply=False
-            )
-            if not delivered:
-                _log(
-                    f"broker: auto-route agent reply {responder} -> {requester} "
-                    "failed: requester has no accepting live session"
-                )
-                return True
-            _log(
-                f"broker: auto-routed agent reply {responder} -> {requester} "
-                f"live ({len(text)} chars)"
-            )
-        except Exception as e:
-            # Delivery failed — count it so dropped replies are monitorable
-            # (the whole point of #279 is that agent replies don't vanish
-            # silently). Still return True: this WAS an agent-reply turn, so it
-            # must not fall through to route_response / get re-injected.
-            self._stats["routed_failed"] += 1
-            _log(
-                f"broker: auto-route agent reply {responder} -> {requester} "
-                f"failed: {e}"
-            )
-        return True
+        _log(
+            f"broker: SUPPRESSED_TURN_FINAL_TEXT for {agent_name} on "
+            f"{platform}/{chat_id} ({len(stripped)} chars) — web render only; "
+            "use an explicit outreach tool for delivery"
+        )
 
     # "file" is what Slack and Discord tag every inbound attachment as; the
     # rest are Telegram's media kinds. (Voice is handled separately.)

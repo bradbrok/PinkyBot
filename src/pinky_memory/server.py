@@ -224,6 +224,20 @@ def create_server(
         Shared by ``reflect`` (own store) and ``reflect_for`` (target store)
         so the storage path is identical regardless of destination.
         """
+        # Dream receipts are a transport contract, not a model instruction.
+        # Shared HTTP/SSE requests receive the value from authenticated ASGI
+        # request context; per-run stdio servers receive the equivalent env
+        # override. Either one supersedes model-provided tool arguments.
+        from pinky_daemon.shared_mcp import (
+            get_current_agent,
+            get_current_dream_correlation,
+        )
+
+        enforced_source_session_id = get_current_dream_correlation()
+        if not enforced_source_session_id and not get_current_agent():
+            enforced_source_session_id = os.environ.get(
+                "PINKY_DREAM_CORRELATION", ""
+            ).strip()
         embedding = _safe_embed(embedder, input_data.content, "reflect")
         ref = Reflection(
             type=input_data.type,
@@ -233,7 +247,9 @@ def create_server(
             salience=input_data.salience,
             supersedes=input_data.supersedes,
             entities=input_data.entities,
-            source_session_id=input_data.source_session_id,
+            source_session_id=(
+                enforced_source_session_id or input_data.source_session_id
+            ),
             source_channel=input_data.source_channel,
             source_message_ids=input_data.source_message_ids,
             embedding=embedding,

@@ -341,6 +341,48 @@ class TestTmuxDreamRunner:
             assert elapsed < 5.0, "death must be detected long before timeout"
 
     @pytest.mark.asyncio
+    async def test_spawn_passes_project_mcp_config_when_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            mcp_config = os.path.join(tmp, ".mcp.json")
+            with open(mcp_config, "w") as f:
+                f.write("{}")
+            fake = _FakeTmux(new_session_rc=1)
+            runner = _runner(tmp, fake)
+
+            await runner.run("x")
+
+            spawn = fake.named("new-session")[0]
+            idx = spawn.index("--mcp-config")
+            assert spawn[idx + 1] == os.path.realpath(mcp_config)
+
+    @pytest.mark.asyncio
+    async def test_spawn_prefers_explicit_per_run_mcp_config(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            project_config = os.path.join(tmp, ".mcp.json")
+            per_run_config = os.path.join(tmp, "dream-mcp.json")
+            for path in (project_config, per_run_config):
+                with open(path, "w") as file:
+                    file.write("{}")
+            fake = _FakeTmux(new_session_rc=1)
+            runner = _runner(tmp, fake, mcp_config=per_run_config)
+
+            await runner.run("x")
+
+            spawn = fake.named("new-session")[0]
+            idx = spawn.index("--mcp-config")
+            assert spawn[idx + 1] == os.path.realpath(per_run_config)
+
+    @pytest.mark.asyncio
+    async def test_spawn_omits_project_mcp_config_when_absent(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            fake = _FakeTmux(new_session_rc=1)
+            runner = _runner(tmp, fake)
+
+            await runner.run("x")
+
+            assert "--mcp-config" not in fake.named("new-session")[0]
+
+    @pytest.mark.asyncio
     async def test_allowlist_is_the_primary_tool_boundary(self):
         """#708 review (Murzik): the dream prompt embeds raw conversation
         history, so the spawn must pin an explicit --allowedTools allowlist

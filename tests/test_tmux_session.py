@@ -21,12 +21,15 @@ import os
 import re
 import shlex
 import time as _time
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
 from pinky_daemon import tmux_session
+from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.scheduler import AgentScheduler, ScheduleWakeReceipt
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
@@ -37,6 +40,12 @@ from pinky_daemon.tmux_session import (
 )
 from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
+
+
+@pytest.fixture(autouse=True)
+def _skip_post_spawn_liveness_delay(monkeypatch) -> None:
+    """Keep unit tests fast while preserving the production 150 ms gate."""
+    monkeypatch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0)
 
 
 def _seed_inflight(
@@ -103,7 +112,16 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     """
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "pinky-test"
-    tmux.has_session = AsyncMock(return_value=has_session_initial)
+    # Every successful spawn now verifies that the detached session survived
+    # long enough to still exist. Alternate pre-spawn/post-spawn answers so
+    # the default mock models a healthy tmux lifecycle across reconnects.
+    async def _has_session() -> bool:
+        call_number = tmux.has_session.await_count
+        if call_number == 1:
+            return has_session_initial
+        return call_number % 2 == 0
+
+    tmux.has_session = AsyncMock(side_effect=_has_session)
     tmux.new_session = AsyncMock(return_value=_ok())
     tmux.kill_session = AsyncMock(return_value=_ok())
     tmux.rename_session = AsyncMock(return_value=_ok())
@@ -220,6 +238,87 @@ async def test_cold_start_failure_drives_to_dead_via_boot_failed() -> None:
     ss, _ = _make_session(tmux=tmux)
     with pytest.raises(RuntimeError, match="tmux new-session failed"):
         await ss.connect()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_verifies_spawned_session_before_connected() -> None:
+    """A surviving session passes the delayed post-spawn liveness gate."""
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+
+    await ss.connect()
+
+    assert tmux.has_session.await_count == 2
+    assert ss.state == SessionState.CONNECTED
+
+
+@pytest.mark.asyncio
+async def test_cold_start_self_reaped_session_fails_loudly_via_boot_failed() -> None:
+    """A successful spawn followed by self-reap must never look connected."""
+    tmux = _make_mock_tmux()
+    tmux.has_session = AsyncMock(side_effect=[False, False])
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    with pytest.raises(
+        RuntimeError,
+        match="session died immediately after spawn.*inspect in-pane startup",
+    ):
+        await ss.connect()
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_liveness_probe_error_reaps_spawned_session() -> None:
+    """A failed post-spawn probe must not leave the new tmux session live."""
+    tmux = _make_mock_tmux()
+    tmux.has_session = AsyncMock(
+        side_effect=[False, RuntimeError("liveness probe timed out")]
+    )
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    with pytest.raises(RuntimeError, match="liveness probe timed out"):
+        await ss.connect()
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
+    assert ss.state == SessionState.DEAD
+
+
+@pytest.mark.asyncio
+async def test_cold_start_cancellation_during_liveness_delay_reaps_session(
+    monkeypatch,
+) -> None:
+    """Cancellation after spawn success rolls back the unmanaged REPL."""
+    delay_started = asyncio.Event()
+    release_delay = asyncio.Event()
+
+    async def blocking_sleep(_delay: float) -> None:
+        delay_started.set()
+        await release_delay.wait()
+
+    monkeypatch.setattr(tmux_session.asyncio, "sleep", blocking_sleep)
+    tmux = _make_mock_tmux()
+    ss, _ = _make_session(tmux=tmux)
+    ss._start_tailer = AsyncMock()
+
+    connect_task = asyncio.create_task(ss.connect())
+    await delay_started.wait()
+    connect_task.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await connect_task
+
+    tmux.new_session.assert_awaited_once()
+    tmux.kill_session.assert_awaited_once()
+    ss._start_tailer.assert_not_awaited()
     assert ss.state == SessionState.DEAD
 
 
@@ -672,6 +771,20 @@ async def test_turn_complete_consumes_pending_live_effort(fast_settle) -> None:
 
 
 @pytest.mark.asyncio
+async def test_turn_complete_notifies_scheduler_at_idle_boundary() -> None:
+    ss, _ = _make_session(agent_name="test-agent", state=SessionState.CONNECTED)
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
+    _seed_inflight(ss)
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="done", stop_reason="stop_hook_summary")
+    )
+
+    assert idle_agents == [ss.agent_name]
+
+
+@pytest.mark.asyncio
 async def test_apply_model_live_idle_types_command(fast_settle) -> None:
     ss, tmux = _make_session(state=SessionState.CONNECTED)
     tmux.capture_pane = AsyncMock(return_value=_capture("> \n"))
@@ -856,19 +969,31 @@ async def test_run_delegates_built_argv_to_injected_runner() -> None:
         def __init__(self):
             self.argv = None
             self.timeout = None
+            self.stdin_data = None
 
-        async def run(self, argv, *, timeout=None, stdin=None):
+        async def run(self, argv, *, timeout=None, stdin_data=None):
             self.argv = argv
             self.timeout = timeout
+            self.stdin_data = stdin_data
             return CommandResult(0, b"out", b"err")
 
     rec = _Recording()
     tmux = _TmuxControl("pinky-test", socket_name="pinkysock", command_runner=rec)
-    result = await tmux._run("has-session", "-t", "pinky-test", timeout=5.0)
+    result = await tmux._run(
+        "load-buffer",
+        "-b",
+        "pinky-test",
+        "-",
+        timeout=5.0,
+        stdin_data=b"prompt bytes",
+    )
 
     # Built argv includes the base cmd (binary + socket flag) then the args.
-    assert rec.argv == ["tmux", "-L", "pinkysock", "has-session", "-t", "pinky-test"]
+    assert rec.argv == [
+        "tmux", "-L", "pinkysock", "load-buffer", "-b", "pinky-test", "-",
+    ]
     assert rec.timeout == 5.0
+    assert rec.stdin_data == b"prompt bytes"
     assert result.returncode == 0
     assert result.stdout == "out"  # bytes decoded
     assert result.stderr == "err"
@@ -881,7 +1006,7 @@ async def test_run_propagates_runner_timeout() -> None:
     from pinky_daemon.command_runner import CommandRunner
 
     class _TimingOut(CommandRunner):
-        async def run(self, argv, *, timeout=None, stdin=None):
+        async def run(self, argv, *, timeout=None, stdin_data=None):
             raise asyncio.TimeoutError
 
     tmux = _TmuxControl("pinky-test", command_runner=_TimingOut())
@@ -990,18 +1115,20 @@ async def test_resize_pane_swallows_subprocess_exceptions() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paste_text_sets_buffer_pastes_and_sends_enter() -> None:
+async def test_paste_text_loads_buffer_pastes_and_sends_enter() -> None:
     """``_TmuxControl.paste_text`` must invoke three tmux subcommands
-    in order: ``set-buffer``, ``paste-buffer -p`` (bracketed paste),
+    in order: ``load-buffer -`` (stdin), ``paste-buffer -p`` (bracketed paste),
     then ``send-keys Enter``. The bracketed-paste mode is what makes
     this reliable across the claude cold-start splash UI (#514).
     """
     tmux = _TmuxControl("pinky-test")
 
     calls: list[tuple[str, ...]] = []
+    stdin_payloads: list[bytes | None] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
+        stdin_payloads.append(stdin_data)
         return _ok()
 
     tmux._run = fake_run
@@ -1009,13 +1136,47 @@ async def test_paste_text_sets_buffer_pastes_and_sends_enter() -> None:
 
     # Expect three commands in order.
     assert len(calls) == 3
-    assert calls[0][:3] == ("set-buffer", "-b", "pinky-pinky-test")
-    assert calls[0][3] == "hello world"
+    assert calls[0] == ("load-buffer", "-b", "pinky-pinky-test", "-")
+    assert stdin_payloads == [b"hello world", None, None]
+    assert not any("set-buffer" in call for call in calls)
     assert "paste-buffer" in calls[1][0]
     assert "-p" in calls[1]  # bracketed paste mode
     assert "-d" in calls[1]  # delete buffer after paste
     assert calls[2] == ("send-keys", "-t", "pinky-test", "Enter")
     assert result.ok
+
+
+@pytest.mark.asyncio
+async def test_paste_text_large_prompt_avoids_tmux_argv_limit() -> None:
+    """Regression for #1029: a >20 KiB prompt must travel over stdin.
+
+    The recording runner models tmux's old argv ceiling by rejecting any
+    individual argument over 16 KiB. The complete paste path still succeeds
+    because ``load-buffer -`` keeps the prompt out of argv.
+    """
+    from pinky_daemon.command_runner import CommandResult, CommandRunner
+
+    class _ArgLimitedRunner(CommandRunner):
+        def __init__(self) -> None:
+            self.calls: list[tuple[list[str], bytes | None]] = []
+
+        async def run(self, argv, *, timeout=None, stdin_data=None):
+            self.calls.append((argv, stdin_data))
+            if any(len(arg.encode("utf-8")) > 16 * 1024 for arg in argv):
+                return CommandResult(1, b"", b"command too long")
+            return CommandResult(0, b"", b"")
+
+    runner = _ArgLimitedRunner()
+    tmux = _TmuxControl("pinky-test", command_runner=runner)
+    prompt = "x" * (20 * 1024 + 1)
+
+    result = await tmux.paste_text(prompt, enter=False, enter_delay_ms=0)
+
+    assert result.ok
+    load_argv, load_stdin = runner.calls[0]
+    assert load_argv[-4:] == ["load-buffer", "-b", "pinky-pinky-test", "-"]
+    assert load_stdin == prompt.encode("utf-8")
+    assert all(prompt not in arg for argv, _ in runner.calls for arg in argv)
 
 
 @pytest.mark.asyncio
@@ -1027,29 +1188,29 @@ async def test_paste_text_skips_enter_when_enter_false() -> None:
 
     calls: list[tuple[str, ...]] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
         return _ok()
 
     tmux._run = fake_run
     await tmux.paste_text("hello", enter=False, enter_delay_ms=0)
 
-    assert len(calls) == 2  # set-buffer + paste-buffer only
+    assert len(calls) == 2  # load-buffer + paste-buffer only
     assert not any("send-keys" in c[0] for c in calls)
 
 
 @pytest.mark.asyncio
-async def test_paste_text_short_circuits_on_set_buffer_failure() -> None:
-    """If ``set-buffer`` fails (tmux server down, bad session name),
+async def test_paste_text_short_circuits_on_load_buffer_failure() -> None:
+    """If ``load-buffer`` fails (tmux server down, bad session name),
     paste_text returns the failure immediately without trying paste
     or Enter."""
     tmux = _TmuxControl("pinky-test")
 
     calls: list[tuple[str, ...]] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
-        return _fail("set-buffer broke")
+        return _fail("load-buffer broke")
 
     tmux._run = fake_run
     result = await tmux.paste_text("hello", enter_delay_ms=0)
@@ -1060,7 +1221,7 @@ async def test_paste_text_short_circuits_on_set_buffer_failure() -> None:
 
 @pytest.mark.asyncio
 async def test_paste_text_short_circuits_on_paste_failure() -> None:
-    """If ``paste-buffer`` fails after a successful ``set-buffer``,
+    """If ``paste-buffer`` fails after a successful ``load-buffer``,
     paste_text returns the failure without trying Enter. Skipping the
     Enter avoids submitting stale buffer content from a previous turn.
     """
@@ -1068,7 +1229,7 @@ async def test_paste_text_short_circuits_on_paste_failure() -> None:
 
     calls: list[tuple[str, ...]] = []
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         calls.append(args)
         if args[0] == "paste-buffer":
             return _fail("paste broke")
@@ -1077,7 +1238,7 @@ async def test_paste_text_short_circuits_on_paste_failure() -> None:
     tmux._run = fake_run
     result = await tmux.paste_text("hello", enter_delay_ms=0)
 
-    assert len(calls) == 2  # set-buffer + paste-buffer; no send-keys
+    assert len(calls) == 2  # load-buffer + paste-buffer; no send-keys
     assert not result.ok
 
 
@@ -1098,7 +1259,7 @@ async def test_paste_text_waits_enter_delay_between_paste_and_enter() -> None:
         # No-op the actual sleep so the test runs fast.
         await original_sleep(0)
 
-    async def fake_run(*args, timeout=5.0):
+    async def fake_run(*args, timeout=5.0, stdin_data=None):
         return _ok()
 
     tmux._run = fake_run
@@ -3113,6 +3274,36 @@ async def test_start_tailer_schedules_recovery_task() -> None:
 
 
 @pytest.mark.asyncio
+async def test_bound_path_wedge_forces_one_internal_materialization_turn() -> None:
+    """#984: the tailer signal becomes a real no-op turn, not a passive log."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    calls: list[tuple[str, str, bool, bool]] = []
+
+    async def _record(
+        prompt, *, reason, front=False, verify_submission=False, **kwargs
+    ):
+        del kwargs
+        calls.append((prompt, reason, front, verify_submission))
+
+    ss._enqueue_internal_prompt = _record
+    missing = Path("/tmp/never-materialized-session.jsonl")
+
+    ss._on_bound_path_wedge(missing, 300.0)
+    # A duplicate signal while the first enqueue task is alive is coalesced.
+    ss._on_bound_path_wedge(missing, 301.0)
+    await asyncio.sleep(0)
+
+    assert calls == [
+        (
+            tmux_session._TRANSCRIPT_MATERIALIZE_PROMPT,
+            "wake_transcript_materialize",
+            True,
+            True,
+        )
+    ]
+
+
+@pytest.mark.asyncio
 async def test_stop_tailer_cancels_pending_recovery_task() -> None:
     """Issue #565 — ``_stop_tailer`` must cancel the pending recovery
     task so a torn-down session doesn't have a stray timer firing
@@ -3606,7 +3797,7 @@ async def test_disconnect_clears_inflight_meta() -> None:
 
 @pytest.mark.asyncio
 async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
-    """Successful pane keystrokes are not a scheduler delivery receipt."""
+    """#966: consumption receipts before the accepted turn completes."""
     ss, tmux = _make_session(state=SessionState.CONNECTED)
     ss._config.live_status_fn = lambda: {
         "status": "idle",
@@ -3634,7 +3825,337 @@ async def test_scheduler_prompt_receipt_waits_for_idle_pane() -> None:
         "operation": "dequeue",
     })
     assert await receipt is True
+    assert len(ss._inflight_metas) == 1
+    assert not ss._turn_done.is_set(), (
+        "transport acceptance must not wait for turn completion"
+    )
     await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_prompt_dequeue_matches_content_after_racing_turn_pop() -> None:
+    """#1098: an interleaved Stop must not erase queued acceptance evidence.
+
+    A near-simultaneous prompt can make the next Stop pop the scheduler wake's
+    local FIFO meta before Claude emits the queued prompt's dequeue row.  The
+    dequeue proves that exact content was consumed even though the turn object
+    was already retired under another turn boundary.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    receipt = asyncio.get_running_loop().create_future()
+    persisted: list[str] = []
+    turn = _QueuedTurn(
+        prompt="scheduled under a racing turn",
+        scheduler_delivery=receipt,
+        scheduler_accept=lambda: persisted.append("accepted") or True,
+        scheduler_serialized=True,
+    )
+    turn.pane_delivery_started = True
+    ss._scheduler_pending_turns.append(turn)
+    ss._finish_turn_delivery(turn)
+
+    ss._on_transcript_entry(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": turn.prompt,
+        }
+    )
+    assert not receipt.done()
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="racing turn completed", stop_reason="end_turn")
+    )
+    assert not receipt.done()
+    assert not ss._inflight_metas
+
+    ss._on_transcript_entry(
+        {"type": "queue-operation", "operation": "dequeue"}
+    )
+
+    assert receipt.done(), "content dequeue must settle the racing wake receipt"
+    assert receipt.result() is True
+    assert persisted == ["accepted"]
+    ss._on_transcript_entry(
+        {
+            "type": "user",
+            "message": {"role": "user", "content": turn.prompt},
+        }
+    )
+    assert not ss._pane_queue_operations
+    assert not ss._pane_dequeued_turns
+
+
+@pytest.mark.asyncio
+async def test_scheduler_acceptance_equal_prompts_consumes_one_fifo_ticket() -> None:
+    """Equal text is occurrence-counted; one dequeue cannot accept two wakes."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    prompt = "same scheduled work"
+    receipts = [
+        asyncio.get_running_loop().create_future(),
+        asyncio.get_running_loop().create_future(),
+    ]
+    accepted: list[int] = []
+    turns = [
+        _QueuedTurn(
+            prompt=prompt,
+            scheduler_delivery=receipt,
+            scheduler_accept=lambda index=index: accepted.append(index) or True,
+            scheduler_serialized=True,
+        )
+        for index, receipt in enumerate(receipts)
+    ]
+    for turn in turns:
+        turn.pane_delivery_started = True
+        ss._scheduler_pending_turns.append(turn)
+        ss._finish_turn_delivery(turn)
+        ss._on_transcript_entry(
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": prompt,
+            }
+        )
+
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert receipts[0].result() is True
+    assert not receipts[1].done()
+    assert accepted == [0]
+
+    ss._on_transcript_entry(
+        {"type": "user", "message": {"role": "user", "content": prompt}}
+    )
+    assert not receipts[1].done(), "the first user row must not accept occurrence 2"
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="first duplicate done", stop_reason="end_turn")
+    )
+    assert not receipts[1].done()
+
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert receipts[1].result() is True
+    assert accepted == [0, 1]
+
+
+@pytest.mark.asyncio
+async def test_stop_tombstone_absorbs_dequeue_before_equal_scheduler_turn() -> None:
+    """A racing Stop cannot shift an old native occurrence onto a later wake."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    prompt = "same ordinary and scheduled work"
+    ordinary = _QueuedTurn(prompt=prompt)
+    ordinary.pane_delivery_started = True
+    ss._finish_turn_delivery(ordinary)
+    ss._on_transcript_entry(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": prompt,
+        }
+    )
+
+    # The Stop races ahead of the ordinary prompt's contentless dequeue.
+    await ss._handle_turn_complete(
+        TurnResponse(text="prior turn stopped", stop_reason="end_turn")
+    )
+
+    receipt = asyncio.get_running_loop().create_future()
+    accepted: list[str] = []
+    scheduled = _QueuedTurn(
+        prompt=prompt,
+        scheduler_delivery=receipt,
+        scheduler_accept=lambda: accepted.append("scheduled") or True,
+        scheduler_serialized=True,
+    )
+    scheduled.pane_delivery_started = True
+    ss._scheduler_pending_turns.append(scheduled)
+    ss._finish_turn_delivery(scheduled)
+    ss._on_transcript_entry(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": prompt,
+        }
+    )
+
+    # This dequeue belongs to the retired ordinary occurrence. It must consume
+    # that tombstone, never rematch the equal-content scheduler occurrence.
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert not receipt.done()
+    assert accepted == []
+
+    ss._on_transcript_entry(
+        {"type": "user", "message": {"role": "user", "content": prompt}}
+    )
+    assert not receipt.done()
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert receipt.result() is True
+    assert accepted == ["scheduled"]
+
+
+@pytest.mark.asyncio
+async def test_racing_content_acceptance_persists_row_and_prevents_replay(
+    tmp_path,
+) -> None:
+    """#1098 specimen 3: consumed racing wake becomes durably un-replayable."""
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    try:
+        registry.register("dymok")
+        schedule = registry.add_schedule(
+            "dymok", "0 * * * *", name="weekly probe", prompt="probe once"
+        )
+        fired_at = _time.time()
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="dymok",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        durable_receipt = ScheduleWakeReceipt(registry, schedule.id, fired_at)
+        local_receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt=schedule.prompt,
+            scheduler_delivery=local_receipt,
+            scheduler_accept=durable_receipt.accept,
+            scheduler_serialized=True,
+        )
+        turn.pane_delivery_started = True
+        ss, _ = _make_session(agent_name="dymok", state=SessionState.CONNECTED)
+        ss._scheduler_pending_turns.append(turn)
+        ss._finish_turn_delivery(turn)
+        ss._on_transcript_entry(
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": schedule.prompt,
+            }
+        )
+        await ss._handle_turn_complete(
+            TurnResponse(text="racing turn", stop_reason="end_turn")
+        )
+        ss._on_transcript_entry(
+            {"type": "queue-operation", "operation": "dequeue"}
+        )
+
+        assert local_receipt.result() is True
+        ledger = registry.get_schedule_wake_by_fire(schedule.id, fired_at)
+        assert ledger is not None
+        assert ledger.id == pending.id
+        assert ledger.ledger_state == "receipted-ran-once"
+
+        replays: list[str] = []
+
+        async def replay(agent_name, session_id, prompt):
+            del agent_name, session_id
+            replays.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=replay)
+        await scheduler._replay_pending_locked("dymok")
+        assert replays == []
+    finally:
+        registry.close()
+
+
+@pytest.mark.asyncio
+async def test_turn_stop_tombstones_ordinary_queue_content_evidence() -> None:
+    """Stop retires an occurrence in place until dequeue and user consume it."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    turn = _QueuedTurn(prompt="ordinary prompt")
+    turn.pane_delivery_started = True
+    ss._finish_turn_delivery(turn)
+    ss._on_transcript_entry(
+        {
+            "type": "queue-operation",
+            "operation": "enqueue",
+            "content": turn.prompt,
+        }
+    )
+
+    await ss._handle_turn_complete(
+        TurnResponse(text="done", stop_reason="end_turn")
+    )
+
+    assert len(ss._pane_queue_operations) == 1
+    assert ss._pane_queue_operations[0].retired is True
+    ss._on_transcript_entry({"type": "queue-operation", "operation": "dequeue"})
+    assert not ss._pane_queue_operations
+    assert len(ss._pane_dequeued_turns) == 1
+    assert ss._pane_dequeued_turns[0].retired is True
+    ss._on_transcript_entry(
+        {
+            "type": "user",
+            "message": {"role": "user", "content": turn.prompt},
+        }
+    )
+    assert not ss._pane_dequeued_turns
+
+
+@pytest.mark.asyncio
+async def test_recorded_dequeue_persists_before_disconnect_and_prevents_replay(
+    tmp_path,
+) -> None:
+    """A #943 replay ticket is durable at dequeue, before its user row lands."""
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    try:
+        registry.register("dymok")
+        schedule = registry.add_schedule(
+            "dymok", "0 * * * *", name="disconnect probe", prompt="run once"
+        )
+        fired_at = _time.time()
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="dymok",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=fired_at,
+        )
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt=schedule.prompt,
+            scheduler_delivery=receipt,
+            scheduler_accept=ScheduleWakeReceipt(
+                registry, schedule.id, fired_at
+            ).accept,
+            scheduler_serialized=True,
+        )
+        turn.pane_delivery_started = True
+        ss, _ = _make_session(agent_name="dymok", state=SessionState.CONNECTED)
+
+        # A #943 replay is delivered by the ordinary worker and is no longer in
+        # _scheduler_pending_turns. A racing Stop can therefore retire its sole
+        # inflight meta before the contentless dequeue appears.
+        ss._finish_turn_delivery(turn)
+        ss._on_transcript_entry(
+            {
+                "type": "queue-operation",
+                "operation": "enqueue",
+                "content": schedule.prompt,
+            }
+        )
+        await ss._handle_turn_complete(
+            TurnResponse(text="racing turn", stop_reason="end_turn")
+        )
+        assert not ss._acceptance_candidates()
+
+        ss._on_transcript_entry(
+            {"type": "queue-operation", "operation": "dequeue"}
+        )
+        assert receipt.result() is True
+        await ss.disconnect()  # before the matching transcript user row
+
+        replays: list[str] = []
+
+        async def replay(agent_name, session_id, prompt):
+            del agent_name, session_id
+            replays.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=replay)
+        await scheduler._replay_pending_locked("dymok")
+        assert replays == []
+    finally:
+        registry.close()
 
 
 @pytest.mark.asyncio
@@ -3717,12 +4238,83 @@ async def test_scheduler_cancel_before_paste_never_pastes() -> None:
     await asyncio.sleep(0.02)
     assert tmux.paste_text.await_count == 0
     assert ss.scheduler_wake_inflight("scheduled") is False
+    assert ss.scheduler_wake_queued("scheduled") is True
+    assert ss.scheduler_wake_queued("some other prompt") is False
 
-    receipt.cancel()
+    assert await ss.cancel_scheduler_wake("scheduled") is True
+    assert receipt.cancelled()
+    assert ss.scheduler_wake_queued("scheduled") is False
     live["status"] = "idle"
     live["last_updated"] = _time.time()
     await asyncio.sleep(0.35)  # > slot-wait poll interval
     assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_wake_queued_tracks_943_requeued_head() -> None:
+    """#943's ordinary-worker replay queue remains visible and recallable."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    receipt = asyncio.get_running_loop().create_future()
+    replayed_head = _QueuedTurn(
+        prompt="requeued scheduler head",
+        scheduler_delivery=receipt,
+        scheduler_serialized=True,
+    )
+    ss._message_queue.put_nowait(replayed_head)
+
+    assert replayed_head not in ss._scheduler_pending_turns
+    assert ss.scheduler_wake_queued("requeued scheduler head") is True
+    assert await ss.cancel_scheduler_wake("requeued scheduler head") is True
+    assert receipt.cancelled()
+
+    ss._worker_task = asyncio.create_task(ss._message_worker())
+    for _ in range(100):
+        if ss._message_queue.empty():
+            break
+        await asyncio.sleep(0.001)
+    await asyncio.sleep(0)
+    assert tmux.paste_text.await_count == 0
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_scheduler_cancel_paste_race_reports_pasted() -> None:
+    """The REPL lock adjudicates a paste that starts during queued recall."""
+    ss, tmux = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+
+    await ss._repl_control_lock.acquire()
+    try:
+        receipt = await ss.send_scheduler_prompt("paste race")
+        # The delivery waiter enters the lock queue first; the cancellation
+        # waiter starts from a positive queued probe immediately behind it.
+        await asyncio.sleep(0.02)
+        assert ss.scheduler_wake_queued("paste race") is True
+        cancel = asyncio.create_task(
+            ss.cancel_scheduler_wake("paste race")
+        )
+        await asyncio.sleep(0)
+    finally:
+        ss._repl_control_lock.release()
+
+    assert await cancel is False
+    assert tmux.paste_text.await_count == 1
+    assert ss.scheduler_wake_inflight("paste race") is True
+    assert not receipt.cancelled()
+
+    ss._on_transcript_entry({
+        "type": "user",
+        "message": {"role": "user", "content": "paste race"},
+    })
+    assert await receipt is True
     await ss.disconnect()
 
 
@@ -4499,6 +5091,46 @@ def test_inflight_verdict_idle_via_transcript_mtime(tmp_path) -> None:
     import os
 
     mtime_with_response = head_t + 30.0  # well past _TRANSCRIPT_PASTE_SLACK
+    os.utime(f, (mtime_with_response, mtime_with_response))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = f
+
+    assert ss._inflight_stall_verdict(_time.time()) == "idle"
+
+
+def test_inflight_verdict_real_session_keeps_transcript_proven_idle(tmp_path) -> None:
+    """#118/#592/#984: positive transcript evidence wins before stale veto.
+
+    Production shape: the current tmux process started at S; this aged head was
+    pasted at H > S; live status is idle but fossilized at S < L < H; and the
+    transcript contains a real response at H+30, safely past paste slack. Base
+    classifies this phantom head as idle, so #984 must not turn it unknown and
+    eventually force-restart the healthy session.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    head_t = _time.time() - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    session_started_at = head_t - 100.0
+    live_updated_at = head_t - 50.0
+    assert session_started_at < live_updated_at < head_t
+
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    meta.transcript_mtime_at_paste = head_t
+    meta.paste_succeeded_at = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._current_session_started_at = session_started_at
+    ss._transcript_recently_grew = lambda now, window: False
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": live_updated_at,
+    }
+
+    f = tmp_path / "transcript.jsonl"
+    f.write_text("{}\n")
+    import os
+
+    mtime_with_response = head_t + 30.0
     os.utime(f, (mtime_with_response, mtime_with_response))
     ss._tailer = MagicMock()
     ss._tailer.transcript_path = f
@@ -7730,6 +8362,7 @@ class TestForceFreshContextOnceDeferredConsume:
         tmux = _make_mock_tmux()
         # First call fails, second call succeeds.
         tmux.new_session = AsyncMock(side_effect=[_fail("rc=1"), _ok()])
+        tmux.has_session = AsyncMock(side_effect=[False, False, True])
         ss, _ = _make_session(tmux=tmux)
 
         # Seed flag + prior transcript so suppression is meaningful.
@@ -8285,14 +8918,15 @@ class TestInflightDequeConcurrentDispatch:
         await ss.disconnect()
 
     @pytest.mark.asyncio
-    async def test_watchdog_vetoes_frozen_pre_session_live_status(
+    async def test_watchdog_vetoes_frozen_pre_session_live_status_within_grace(
         self, monkeypatch, capsys,
     ):
-        """#943: frozen live_last_updated + a static/idle pane is unknown
-        evidence and must never trigger force_restart."""
+        """#984 negative: the never-started shape still vetoes within grace."""
         from pinky_daemon import tmux_session as _ts
         monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.05)
         monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.02)
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "60")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "60")
 
         ss, _ = _make_session()
         await ss.connect()
@@ -8321,6 +8955,242 @@ class TestInflightDequeConcurrentDispatch:
         assert ss._head_started_at is not None and ss._head_started_at > 0
         assert ss._pane_is_animating.await_count == 0
         assert "WATCHDOG_STALE_LIVE_STATUS_VETO" in capsys.readouterr().err
+        await ss.disconnect()
+
+    def test_advancing_fossil_resets_frozen_tracker(self, monkeypatch):
+        """#943 negative: a pre-session value that advances is not frozen."""
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "0")
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        ss._current_session_started_at = 100.0
+
+        assert ss._observe_frozen_live_status(
+            400.0, {"status": "working", "last_updated": 80.0}
+        ) == (80.0, 400.0, 1)
+        advanced = {"status": "working", "last_updated": 90.0}
+        assert ss._observe_frozen_live_status(401.0, advanced) == (
+            90.0, 401.0, 1
+        )
+        assert ss._frozen_liveness_restart_reason(401.0, advanced) is None
+
+        # Only a subsequent identical observation may become actionable.
+        assert ss._observe_frozen_live_status(402.0, advanced) == (
+            90.0, 401.0, 2
+        )
+        assert (
+            ss._frozen_liveness_restart_reason(402.0, advanced)
+            == "never_started_signature"
+        )
+
+    def test_frozen_liveness_trigger_defaults_on_with_live_kill_switch(
+        self, monkeypatch,
+    ):
+        """#984's kill switch follows the existing pane-liveness pattern."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.delenv(
+            "PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", raising=False
+        )
+        assert _ts._watchdog_frozen_liveness_trigger_enabled() is True
+        for off in ("0", "false", "NO", " off "):
+            monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", off)
+            assert _ts._watchdog_frozen_liveness_trigger_enabled() is False
+        monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", "1")
+        assert _ts._watchdog_frozen_liveness_trigger_enabled() is True
+
+    def test_frozen_liveness_threshold_defaults_and_overrides(self, monkeypatch):
+        """Grace, cap, and pacing remain bounded and independently tunable."""
+        from pinky_daemon import tmux_session as _ts
+
+        names = (
+            "PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC",
+            "PINKY_WATCHDOG_STALE_VETO_CAP_SEC",
+            "PINKY_WATCHDOG_FROZEN_RESTART_INTERVAL_SEC",
+        )
+        for name in names:
+            monkeypatch.delenv(name, raising=False)
+        assert _ts._watchdog_never_started_grace_sec() == 300.0
+        assert _ts._watchdog_stale_veto_cap_sec() == 1800.0
+        assert _ts._watchdog_frozen_restart_interval_sec() == 600.0
+
+        for name, value in zip(names, ("7", "8", "9"), strict=True):
+            monkeypatch.setenv(name, value)
+        assert _ts._watchdog_never_started_grace_sec() == 7.0
+        assert _ts._watchdog_stale_veto_cap_sec() == 8.0
+        assert _ts._watchdog_frozen_restart_interval_sec() == 9.0
+
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "-1")
+        assert _ts._watchdog_never_started_grace_sec() == 0.0
+
+    @pytest.mark.asyncio
+    async def test_watchdog_never_started_signature_restarts_once_then_paces(
+        self, monkeypatch, capsys,
+    ):
+        """Frozen-at-launch past grace restarts once; a repeat cannot storm."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.02)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.01)
+        monkeypatch.delenv(
+            "PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", raising=False
+        )
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "60")
+        monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_RESTART_INTERVAL_SEC", "60")
+        decisions = MagicMock()
+        monkeypatch.setattr(_ts, "log_watchdog_decision", decisions)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        # Equality is intentionally part of the signature: a launch-time
+        # value that never advances proves no turn moved status past launch.
+        frozen_at = ss._current_session_started_at
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": frozen_at,
+        }
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+        ss._pane_is_animating = AsyncMock(return_value=False)
+
+        force_called = asyncio.Event()
+        force_calls: list[bool] = []
+
+        async def _stub_force_restart(*, bypass_guard: bool = False):
+            force_calls.append(bypass_guard)
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub_force_restart
+        _seed_inflight(ss, prompt="never-started wake")
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+        await asyncio.sleep(0)
+
+        assert force_calls == [True]
+        assert not ss._inflight_metas
+        assert ss._watchdog_last_frozen_restart_at is not None
+        first_logs = capsys.readouterr().err
+        assert "WATCHDOG_NEVER_STARTED_RESTART" in first_logs
+        assert f"live_last_updated={frozen_at}" in first_logs
+        assert f"session_started_at={ss._current_session_started_at}" in first_logs
+        assert any(
+            call.kwargs.get("decision") == "restart"
+            and call.kwargs.get("reason") == "never_started_signature"
+            for call in decisions.call_args_list
+        )
+
+        # Simulate another stuck head on the retained session object.  The
+        # frozen signature remains true, but the 60s attempt interval must
+        # leave the head intact and avoid a second force_restart.
+        _seed_inflight(ss, prompt="repeat wake")
+        ss._watchdog_task = asyncio.create_task(ss._inflight_watchdog())
+        await asyncio.sleep(0.12)
+
+        assert force_calls == [True]
+        assert len(ss._inflight_metas) == 1
+        assert "WATCHDOG_FROZEN_LIVENESS_RESTART_PACED" in capsys.readouterr().err
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_new_tmux_process_resets_frozen_window_but_preserves_pacing(self):
+        """Every respawn compares evidence only with its current launch."""
+        ss, _ = _make_session()
+        ss._watchdog_frozen_live_status = (10.0, 20.0, 30)
+        ss._watchdog_last_frozen_restart_at = 40.0
+
+        await ss.connect()
+
+        assert ss._current_session_started_at > 0
+        assert ss._watchdog_frozen_live_status is None
+        assert ss._watchdog_last_frozen_restart_at == 40.0
+        await ss.disconnect()
+
+    @pytest.mark.asyncio
+    async def test_watchdog_stale_veto_age_cap_restarts_frozen_after_start(
+        self, monkeypatch,
+    ):
+        """The general cap recovers a frozen value newer than launch."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.02)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.01)
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "60")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "0.03")
+        decisions = MagicMock()
+        monkeypatch.setattr(_ts, "log_watchdog_decision", decisions)
+
+        ss, _ = _make_session()
+        await ss.connect()
+        ss._current_session_started_at = _time.time() - 1.0
+        frozen_after_start = ss._current_session_started_at + 0.1
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": frozen_after_start,
+        }
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+
+        force_called = asyncio.Event()
+
+        async def _stub_force_restart(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _stub_force_restart
+        _seed_inflight(ss, prompt="stale-after-launch wake")
+
+        await asyncio.wait_for(force_called.wait(), timeout=2.0)
+
+        assert any(
+            call.kwargs.get("decision") == "restart"
+            and call.kwargs.get("reason") == "stale_live_status_age_cap"
+            for call in decisions.call_args_list
+        )
+        await ss.disconnect()
+
+    @pytest.mark.parametrize("last_updated_offset", (-1.0, 0.1))
+    @pytest.mark.asyncio
+    async def test_frozen_liveness_kill_switch_disables_both_trigger_paths(
+        self, monkeypatch, last_updated_offset,
+    ):
+        """The default-on feature flag can restore indefinite #943 vetoes."""
+        from pinky_daemon import tmux_session as _ts
+
+        monkeypatch.setattr(_ts, "_TURN_DONE_TIMEOUT_SEC", 0.02)
+        monkeypatch.setattr(_ts, "_WATCHDOG_TICK_SEC", 0.01)
+        monkeypatch.setenv("PINKY_WATCHDOG_FROZEN_LIVENESS_TRIGGER", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_NEVER_STARTED_GRACE_SEC", "0")
+        monkeypatch.setenv("PINKY_WATCHDOG_STALE_VETO_CAP_SEC", "0")
+
+        ss, _ = _make_session()
+        await ss.connect()
+        ss._current_session_started_at = _time.time() - 1.0
+        ss._config.live_status_fn = lambda: {
+            "status": "working",
+            "last_updated": (
+                ss._current_session_started_at + last_updated_offset
+            ),
+        }
+        ss._transcript_recently_grew = lambda *_args: False
+        ss._background_tasks_recently_active = lambda *_args: False
+        ss._foreground_tool_in_flight = lambda *_args: False
+
+        force_called = asyncio.Event()
+
+        async def _must_not_restart(*, bypass_guard: bool = False):
+            force_called.set()
+            return True
+
+        ss.force_restart = _must_not_restart
+        _seed_inflight(ss, prompt="kill-switch wake")
+        await asyncio.sleep(0.12)
+
+        assert not force_called.is_set()
+        assert len(ss._inflight_metas) == 1
+        assert ss._watchdog_frozen_live_status is None
         await ss.disconnect()
 
     @pytest.mark.asyncio
@@ -9226,6 +10096,14 @@ class TestHandleStopFailure:
 class TestWakeSubmissionVerification:
     """Issue #953 — wake Enter is receipt-confirmed, never fire-and-forget."""
 
+    def test_context_restart_escalation_kill_switch_defaults_on(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.delenv("PINKY_WAKE_SUBMISSION_ESCALATION", raising=False)
+        assert tmux_session._wake_submission_escalation_enabled() is True
+        monkeypatch.setenv("PINKY_WAKE_SUBMISSION_ESCALATION", "0")
+        assert tmux_session._wake_submission_escalation_enabled() is False
+
     @pytest.mark.asyncio
     async def test_verified_wake_enqueue_attaches_exact_receipt(self) -> None:
         ss, _ = _make_session(state=SessionState.CONNECTED)
@@ -9249,6 +10127,9 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        injector = AsyncMock(return_value=True)
+        ss._config.wake_submission_recovery_injector = injector
+        ss.force_restart = AsyncMock(return_value=True)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -9279,6 +10160,433 @@ class TestWakeSubmissionVerification:
         assert await receipt is True
         assert fires == ["delivered"]
         tmux.send_keys.assert_not_awaited()
+        injector.assert_not_awaited()
+        ss.force_restart.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_late_receipt_during_quiescence_stops_before_broker(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.2
+        )
+        tmux = _make_mock_tmux()
+        final_probe_done = asyncio.Event()
+
+        async def final_probe(*_args, **_kwargs):
+            final_probe_done.set()
+            return TmuxCommandResult(0, "previous output\n>", "")
+
+        tmux.capture_pane = AsyncMock(side_effect=final_probe)
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        injector = AsyncMock(return_value=True)
+        ss._config.wake_submission_recovery_injector = injector
+        ss.force_restart = AsyncMock(return_value=True)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        fires: list[str] = []
+        turn = _QueuedTurn(
+            prompt="exact context restart wake",
+            internal=True,
+            reason="wake_context_restart",
+            on_delivered=lambda: fires.append("delivered"),
+            submission_receipt=receipt,
+        )
+        delivery = asyncio.create_task(ss._deliver_turn(turn))
+        await final_probe_done.wait()
+        await asyncio.sleep(0)
+        ss._on_transcript_entry(
+            {
+                "type": "user",
+                "message": {
+                    "role": "user",
+                    "content": "exact context restart wake",
+                },
+            }
+        )
+        await delivery
+
+        assert tmux.paste_text.await_count == 1
+        assert await receipt is True
+        assert fires == ["delivered"]
+        injector.assert_not_awaited()
+        ss.force_restart.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_quiescence_expiry_queues_context_reload_without_repaste(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        tmux.capture_pane = AsyncMock(
+            return_value=TmuxCommandResult(0, "busy or typed composer", "")
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        injector = AsyncMock(return_value=True)
+        ss._config.wake_submission_recovery_injector = injector
+        ss.force_restart = AsyncMock(return_value=True)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt="original orientation wake text",
+            internal=True,
+            reason="wake_context_restart",
+            submission_receipt=receipt,
+        )
+
+        with pytest.raises(tmux_session._WakeSubmissionFallbackQueued):
+            await ss._deliver_turn(turn)
+
+        assert tmux.paste_text.await_count == 1
+        injector.assert_awaited_once()
+        target, instruction = injector.await_args.args
+        assert target == ss.agent_name
+        assert instruction.startswith("CONTEXT-RELOAD:")
+        assert "already oriented" in instruction
+        assert "take no other action" in instruction
+        assert "load_my_context" in instruction
+        assert turn.prompt not in instruction
+        assert await receipt is False
+        assert len(ss._inflight_metas) == 0
+        ss.force_restart.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_all_escalation_rungs_fail_loudly_and_terminally(
+        self, monkeypatch, capsys,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_BROKER_TIMEOUT_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        tmux.capture_pane = AsyncMock(
+            return_value=TmuxCommandResult(0, "composer state unknown", "")
+        )
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+
+        async def stalled_injector(*_args):
+            await asyncio.Event().wait()
+
+        injector = AsyncMock(side_effect=stalled_injector)
+        ss._config.wake_submission_recovery_injector = injector
+        ss.force_restart = AsyncMock(return_value=False)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt="unaccepted context restart wake",
+            internal=True,
+            reason="wake_context_restart",
+            submission_receipt=receipt,
+        )
+
+        with pytest.raises(tmux_session._WakeSubmissionRecoveryScheduled):
+            await ss._deliver_turn(turn)
+        recovery = ss._wake_submission_recovery_task
+        assert recovery is not None
+        await recovery
+
+        assert tmux.paste_text.await_count == 1
+        injector.assert_awaited_once()
+        ss.force_restart.assert_awaited_once_with(bypass_guard=True)
+        assert ss._config.force_fresh_context_once is False
+        assert await receipt is False
+        assert len(ss._inflight_metas) == 0
+        assert "WAKE SUBMISSION ESCALATION TERMINAL" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_late_original_before_enqueue_aborts_context_reload(
+        self, monkeypatch,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt="original receipt must stay false",
+            internal=True,
+            reason="wake_context_restart",
+            submission_receipt=receipt,
+        )
+        events: list[dict] = []
+
+        async def stream_event(event: dict) -> None:
+            events.append(event)
+            if event["type"] != "wake_prompt_submission_unverified":
+                return
+            assert receipt.done() and receipt.result() is False
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "original receipt must stay false",
+                    },
+                }
+            )
+            await asyncio.sleep(0)
+
+        ss._stream_event_callback = stream_event
+        injector = AsyncMock(return_value=True)
+        ss._config.wake_submission_recovery_injector = injector
+
+        with pytest.raises(tmux_session._WakeSubmissionLateDetected):
+            await ss._deliver_turn(turn)
+
+        injector.assert_not_awaited()
+        assert turn.transport_accepted is False
+        assert await receipt is False
+        assert tmux.paste_text.await_count == 1
+        assert ss._wake_context_reload_guard is None
+        assert any(
+            event.get("rung") == "broker_context_reload_enqueue"
+            and event.get("outcome") == "LATE_SUBMISSION_DETECTED"
+            and event.get("detail") == "fallback_aborted_before_enqueue"
+            for event in events
+        )
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("late_after_enqueue", [True, False])
+    async def test_worker_fences_or_drains_conditional_context_reload(
+        self, monkeypatch, late_after_enqueue: bool,
+    ) -> None:
+        """Exercise production-shaped broker enqueue through worker drain."""
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_QUIESCENCE_SEC", 0.001
+        )
+        tmux = _make_mock_tmux()
+        pasted: list[str] = []
+
+        async def paste_text(prompt: str, *, enter: bool = True):
+            assert enter is True
+            pasted.append(prompt)
+            return _ok()
+
+        tmux.paste_text = AsyncMock(side_effect=paste_text)
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        events: list[dict] = []
+
+        async def stream_event(event: dict) -> None:
+            events.append(event)
+
+        ss._stream_event_callback = stream_event
+        receipt = asyncio.get_running_loop().create_future()
+        original = _QueuedTurn(
+            prompt="worker-level original orientation wake",
+            internal=True,
+            reason="wake_context_restart",
+            submission_receipt=receipt,
+        )
+
+        async def injector(_target: str, instruction: str) -> bool:
+            wrapped = (
+                "[agent | transport-recovery | internal | test UTC]\n"
+                f"{instruction}"
+            )
+            assert await ss.send(wrapped) is True
+            if late_after_enqueue:
+                # This lands after the enqueue-time fence but before the same
+                # worker can drain the broker turn.
+                ss._on_transcript_entry(
+                    {
+                        "type": "user",
+                        "message": {
+                            "role": "user",
+                            "content": original.prompt,
+                        },
+                    }
+                )
+            return True
+
+        ss._config.wake_submission_recovery_injector = injector
+        ss.force_restart = AsyncMock(return_value=True)
+        ss._message_queue.put_nowait(original)
+
+        worker = asyncio.create_task(ss._message_worker())
+        try:
+            expected_outcome = (
+                "LATE_SUBMISSION_DETECTED" if late_after_enqueue else "succeeded"
+            )
+            for _ in range(500):
+                if any(
+                    event.get("rung") == "broker_context_reload_drain"
+                    and event.get("outcome") == expected_outcome
+                    for event in events
+                ):
+                    break
+                await asyncio.sleep(0.001)
+        finally:
+            worker.cancel()
+            await worker
+
+        assert await receipt is False
+        assert original.transport_accepted is False
+        assert pasted[0] == original.prompt
+        if late_after_enqueue:
+            assert pasted == [original.prompt]
+            assert any(
+                event.get("rung") == "broker_context_reload_drain"
+                and event.get("outcome") == "LATE_SUBMISSION_DETECTED"
+                and event.get("detail") == "fallback_aborted_before_paste"
+                for event in events
+            )
+        else:
+            assert len(pasted) == 2
+            assert pasted[1].startswith(
+                "[agent | transport-recovery | internal | test UTC]\n"
+                "CONTEXT-RELOAD:"
+            )
+            assert "already oriented" in pasted[1]
+            assert "take no other action" in pasted[1]
+            assert "load_my_context" in pasted[1]
+            assert any(
+                event.get("rung") == "broker_context_reload_drain"
+                and event.get("outcome") == "succeeded"
+                and event.get("detail") == "conditional_context_reload_pasted"
+                for event in events
+            )
+        assert ss._wake_context_reload_guard is None
+        ss.force_restart.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        ("reason", "disable_escalation"),
+        [
+            ("wake_context_restart", True),
+            ("wake_resume", False),
+        ],
+    )
+    async def test_non_escalating_receipt_is_frozen_before_legacy_event(
+        self, monkeypatch, reason: str, disable_escalation: bool,
+    ) -> None:
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001
+        )
+        monkeypatch.setattr(
+            tmux_session, "_WAKE_SUBMISSION_ENTER_RETRY_LIMIT", 0
+        )
+        if disable_escalation:
+            monkeypatch.setenv("PINKY_WAKE_SUBMISSION_ESCALATION", "0")
+        else:
+            monkeypatch.delenv("PINKY_WAKE_SUBMISSION_ESCALATION", raising=False)
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        ss._session_ready_event.set()
+        receipt = asyncio.get_running_loop().create_future()
+        turn = _QueuedTurn(
+            prompt="legacy unverified event contract",
+            internal=True,
+            reason=reason,
+            submission_receipt=receipt,
+        )
+        events: list[dict] = []
+
+        async def stream_event(event: dict) -> None:
+            if event["type"] != "wake_prompt_submission_unverified":
+                return
+            assert receipt.done() and receipt.result() is False
+            events.append(event)
+            ss._on_transcript_entry(
+                {
+                    "type": "user",
+                    "message": {
+                        "role": "user",
+                        "content": "legacy unverified event contract",
+                    },
+                }
+            )
+            await asyncio.sleep(0)
+
+        ss._stream_event_callback = stream_event
+
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            await ss._deliver_turn(turn)
+
+        assert receipt.result() is False
+        assert turn.transport_accepted is False
+        assert len(events) == 1
+        assert set(events[0]) == {
+            "type",
+            "agent_name",
+            "reason",
+            "submit_attempts",
+            "latency_ms",
+            "prompt_visible",
+        }
+
+    @pytest.mark.asyncio
+    async def test_external_disconnect_releases_real_restart_owner_and_latch(
+        self,
+    ) -> None:
+        tmux = _make_mock_tmux()
+        ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        recovery_disconnect_entered = asyncio.Event()
+
+        async def stalled_recovery_stop_tailer() -> None:
+            if asyncio.current_task() is ss._wake_submission_recovery_task:
+                recovery_disconnect_entered.set()
+                await asyncio.Event().wait()
+
+        ss._stop_tailer = AsyncMock(side_effect=stalled_recovery_stop_tailer)
+        turn = _QueuedTurn(
+            prompt="unaccepted context restart wake",
+            internal=True,
+            reason="wake_context_restart",
+        )
+        recovery = asyncio.create_task(
+            ss._run_wake_submission_transport_recovery(turn)
+        )
+        ss._wake_submission_recovery_task = recovery
+        await recovery_disconnect_entered.wait()
+
+        assert ss.state == SessionState.RECONNECTING
+        assert ss._state_machine._in_flight is not None
+        assert ss._config.force_fresh_context_once is True
+
+        await ss.disconnect()
+
+        assert recovery.cancelled()
+        assert ss._wake_submission_recovery_task is None
+        assert ss.state == SessionState.DEAD
+        assert ss._state_machine._in_flight is None
+        assert ss._config.force_fresh_context_once is False
 
     @pytest.mark.asyncio
     async def test_queue_dequeue_is_an_exact_submission_receipt(
@@ -9705,7 +11013,7 @@ class TestWakeSubmissionVerification:
     async def test_worker_wake_timeout_enters_one_way_no_repaste_verifier(
         self, monkeypatch,
     ) -> None:
-        """An exact row during retry set-buffer can never cause paste two."""
+        """An exact row during retry load-buffer can never cause paste two."""
         monkeypatch.setattr(
             tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.1
         )
@@ -9716,18 +11024,18 @@ class TestWakeSubmissionVerification:
             tmux_session, "_adaptive_paste_enter_delay_ms", lambda _text: 0
         )
         tmux = _TmuxControl("pinky-test")
-        set_buffers = 0
+        load_buffers = 0
         pane_pastes = 0
         first_enter_timed_out = asyncio.Event()
 
         async def run_command(*args, **_kwargs):
-            nonlocal set_buffers, pane_pastes
+            nonlocal load_buffers, pane_pastes
             command = args[0]
-            if command == "set-buffer":
-                set_buffers += 1
-                if set_buffers == 2:
+            if command == "load-buffer":
+                load_buffers += 1
+                if load_buffers == 2:
                     # Reproduce the rejected-head TOCTOU: retry passed its
-                    # last receipt check, then yielded inside set-buffer.
+                    # last receipt check, then yielded inside load-buffer.
                     await asyncio.sleep(0.02)
                 return _ok()
             if command == "paste-buffer":
@@ -9750,7 +11058,7 @@ class TestWakeSubmissionVerification:
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
         turn = _QueuedTurn(
-            prompt="receipt lands during forbidden retry set-buffer",
+            prompt="receipt lands during forbidden retry load-buffer",
             internal=True,
             reason="wake_context_restart",
             on_delivered=lambda: fires.append("delivered"),
@@ -9761,7 +11069,7 @@ class TestWakeSubmissionVerification:
         async def inject_exact_receipt() -> None:
             await first_enter_timed_out.wait()
             # On rejected a11de3cd, worker pane-probe/backoff reaches the
-            # second set-buffer before this row. The set-buffer then resumes
+            # second load-buffer before this row. The load-buffer then resumes
             # and executes a duplicate paste-buffer despite receipt=True.
             await asyncio.sleep(0.01)
             ss._on_transcript_entry(
@@ -9770,7 +11078,7 @@ class TestWakeSubmissionVerification:
                     "message": {
                         "role": "user",
                         "content": (
-                            "receipt lands during forbidden retry set-buffer"
+                            "receipt lands during forbidden retry load-buffer"
                         ),
                     },
                 }
@@ -9791,7 +11099,7 @@ class TestWakeSubmissionVerification:
         assert await receipt is True
         assert fires == ["delivered"]
         assert ss._stats["turns"] == 1
-        assert set_buffers == 1, "verified wake must never enter retry paste"
+        assert load_buffers == 1, "verified wake must never enter retry paste"
         assert pane_pastes == 1, "accepted wake must remain pane_pastes=1"
 
     @pytest.mark.asyncio

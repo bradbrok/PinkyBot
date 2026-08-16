@@ -8,8 +8,9 @@ from __future__ import annotations
 
 import re
 from typing import Literal
+from uuid import UUID
 
-from pydantic import BaseModel, Field, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character
@@ -17,6 +18,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 # alerts on PR #510 that surfaced agent_registry.py's path construction.
 # Lowercase + digits + underscore + hyphen, starts with [a-z0-9], 1-63 chars.
 _AGENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+_BUZZ_PUBKEY_RE = re.compile(r"^[0-9a-f]{64}$")
 
 # ── Session Models ───────────────────────────────────────────
 
@@ -49,6 +51,13 @@ class SendMessageRequest(BaseModel):
     """Send a message to a session."""
 
     content: str
+
+
+class WriteAgentFileRequest(BaseModel):
+    """Write an agent-owned file, with an explicit soul safety override."""
+
+    content: str
+    force_soul: bool = False
 
 
 class AuthSetupRequest(BaseModel):
@@ -301,20 +310,9 @@ class RegisterAgentRequest(BaseModel):
     @field_validator("name")
     @classmethod
     def _name_safe(cls, v: str) -> str:
-        """Reject agent names that don't match the safe-char allowlist.
-
-        The name becomes part of filesystem paths (working_dir, hook scripts,
-        settings.json) downstream. Blocking unsafe characters at request
-        parse time short-circuits any path-construction code in
-        agent_registry from ever seeing tainted input. See _AGENT_NAME_RE
-        for the allowed shape.
-        """
+        """Reject agent names that don't match the shared safe allowlist."""
         if not _AGENT_NAME_RE.fullmatch(v):
-            raise ValueError(
-                "agent name must match ^[a-z0-9][a-z0-9_-]{0,62}$ "
-                "(lowercase alphanumeric, underscore, hyphen; "
-                "starts with letter or digit; up to 63 chars)"
-            )
+            raise ValueError("invalid agent name")
         return v
 
     model: str = "opus"
@@ -340,8 +338,13 @@ class RegisterAgentRequest(BaseModel):
     provider_key: str = ""  # ANTHROPIC_API_KEY override
     provider_model: str = ""  # Model name override for this provider
     provider_ref: str = ""  # ID of a global provider from the providers table
+    codex_home: str = ""  # Explicit per-agent CODEX_HOME override (flag-gated)
     thinking_effort: str = "medium"  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool = False  # PR #429 — block tool calls when effort drifts
+    # #550/Picard — opt-in: a LOCAL agent runs its own Claude account via a
+    # dedicated CLAUDE_CONFIG_DIR (<working_dir>/.claude-local). Default False =
+    # shared ~/.claude (unchanged). No-op for container agents.
+    dedicated_config_dir: bool = False
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
     isolated: bool = False  # #149 — hard-isolated tenant (Counterpart); daemon denies cross-agent actions
     # #149 phase-3 — OS-level runtime sandbox for an isolated tenant.
@@ -420,8 +423,12 @@ class UpdateAgentRequest(BaseModel):
     provider_key: str | None = None  # ANTHROPIC_API_KEY override
     provider_model: str | None = None  # Model name override for this provider
     provider_ref: str | None = None  # ID of a global provider from the providers table
+    codex_home: str | None = None  # Explicit per-agent CODEX_HOME override
     thinking_effort: str | None = None  # low/medium/high/xhigh/max/ultracode
     strict_effort_enforcement: bool | None = None  # PR #429 — block tool calls when effort drifts
+    # #550/Picard — opt-in dedicated CLAUDE_CONFIG_DIR for a LOCAL agent;
+    # None = leave unchanged. See RegisterAgentRequest for semantics.
+    dedicated_config_dir: bool | None = None
     watchdog_config: dict | None = None  # Per-agent watchdog overrides
     # #149 — hard-isolation flag; None = leave unchanged. Settable so a
     # container→local round trip can explicitly lift the (auto-coerced)
@@ -432,6 +439,9 @@ class UpdateAgentRequest(BaseModel):
     # refuses to actually *run* a mode whose provisioner isn't implemented yet.
     isolation_mode: str | None = None
     container_image: str | None = None  # bring-your-own image for mode=container; None = leave unchanged
+    # Safety override for an explicitly supplied soul replacement. This is an
+    # API control only and is never persisted as agent configuration.
+    force_soul: bool = False
 
     @field_validator("isolation_mode")
     @classmethod
@@ -444,6 +454,12 @@ class UpdateAgentRequest(BaseModel):
                 f"isolation_mode must be one of {sorted(allowed)} (got {v!r})"
             )
         return v
+
+
+class RestoreSoulVersionRequest(BaseModel):
+    """Restore an archived soul, optionally accepting destructive shrink."""
+
+    force_soul: bool = False
 
 
 class ContainerizeRequest(BaseModel):
@@ -566,6 +582,115 @@ class SetAgentTokenRequest(BaseModel):
     token_ref: str = ""
     enabled: bool = True
     settings: dict = Field(default_factory=dict)
+
+
+class BuzzInboundChannelRequest(BaseModel):
+    """One exact Buzz channel admitted to an agent's persona session."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    channel_id: str
+    label: str = ""
+
+    @field_validator("channel_id")
+    @classmethod
+    def validate_channel_id(cls, value: str) -> str:
+        try:
+            canonical = str(UUID(str(value)))
+        except (TypeError, ValueError, AttributeError) as exc:
+            raise ValueError("Buzz channel_id must be a UUID") from exc
+        if canonical != str(value):
+            raise ValueError("Buzz channel_id must be a canonical lowercase UUID")
+        return canonical
+
+    @field_validator("label")
+    @classmethod
+    def validate_label(cls, value: str) -> str:
+        label = str(value or "").strip()
+        if len(label) > 80 or any(ord(ch) < 32 or ord(ch) == 127 for ch in label):
+            raise ValueError("Buzz channel label must be at most 80 printable characters")
+        return label
+
+
+class BuzzApprovedPrincipalRequest(BaseModel):
+    """One out-of-band approved Buzz author for one community."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    pubkey: str
+    display_name: str = ""
+
+    @field_validator("pubkey")
+    @classmethod
+    def validate_pubkey(cls, value: str) -> str:
+        pubkey = str(value or "")
+        if not _BUZZ_PUBKEY_RE.fullmatch(pubkey):
+            raise ValueError("Buzz pubkey must be exactly 64 lowercase hex characters")
+        return pubkey
+
+    @field_validator("display_name")
+    @classmethod
+    def validate_display_name(cls, value: str) -> str:
+        display = str(value or "").strip()
+        if len(display) > 120 or any(ord(ch) < 32 or ord(ch) == 127 for ch in display):
+            raise ValueError("Buzz display_name must be at most 120 printable characters")
+        return display
+
+
+class ConfigureBuzzInboundRequest(BaseModel):
+    """Owner-only default-deny Buzz persona-routing policy."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    owner_pubkey: str
+    channels: list[BuzzInboundChannelRequest] = Field(min_length=1, max_length=128)
+    approved_users: list[BuzzApprovedPrincipalRequest] = Field(
+        default_factory=list,
+        max_length=256,
+    )
+
+    @field_validator("owner_pubkey")
+    @classmethod
+    def validate_owner_pubkey(cls, value: str) -> str:
+        pubkey = str(value or "")
+        if not _BUZZ_PUBKEY_RE.fullmatch(pubkey):
+            raise ValueError("Buzz owner_pubkey must be exactly 64 lowercase hex characters")
+        return pubkey
+
+    @model_validator(mode="after")
+    def validate_uniqueness(self):
+        channel_ids = [item.channel_id for item in self.channels]
+        if len(channel_ids) != len(set(channel_ids)):
+            raise ValueError("Buzz channel allowlist contains a duplicate channel_id")
+        pubkeys = [item.pubkey for item in self.approved_users]
+        if self.owner_pubkey in pubkeys:
+            raise ValueError("Buzz owner_pubkey must not be repeated in approved_users")
+        if len(pubkeys) != len(set(pubkeys)):
+            raise ValueError("Buzz approved_users contains a duplicate pubkey")
+        return self
+
+
+class BindBuzzIdentityRequest(BaseModel):
+    """Owner-control request to bind one encrypted Buzz identity."""
+
+    model_config = ConfigDict(extra="forbid")
+
+    private_key: str
+    relay_url: str
+    community_id: str
+    relay_signing_pubkey: str
+    enabled: bool = True
+    inbound: ConfigureBuzzInboundRequest | None = None
+
+    @field_validator("relay_signing_pubkey")
+    @classmethod
+    def validate_relay_signing_pubkey(cls, value: str) -> str:
+        pubkey = str(value or "")
+        if not _BUZZ_PUBKEY_RE.fullmatch(pubkey):
+            raise ValueError(
+                "Buzz relay_signing_pubkey must be exactly 64 lowercase hex characters"
+            )
+        return pubkey
 
 
 class AddMcpServerRequest(BaseModel):

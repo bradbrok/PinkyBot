@@ -15,6 +15,9 @@ import pytest
 from pinky_daemon.streaming_session import StreamingSession, StreamingSessionConfig
 from pinky_daemon.transport_state import SessionState
 
+OLD_SESSION_ID = "11111111-1111-4111-8111-111111111111"
+NEW_SESSION_ID = "22222222-2222-4222-8222-222222222222"
+
 
 def _make_session(
     *,
@@ -231,6 +234,7 @@ def _make_result_message(
     is_error: bool = False,
     api_error_status: int | None = None,
     errors: list[str] | None = None,
+    session_id: str = "test-session",
 ):
     """Build a ResultMessage with the minimum fields the reader_loop reads."""
     from claude_agent_sdk.types import ResultMessage
@@ -241,10 +245,23 @@ def _make_result_message(
         duration_api_ms=5,
         is_error=is_error,
         num_turns=1,
-        session_id="test-session",
+        session_id=session_id,
         stop_reason="end_turn" if not is_error else "error",
         api_error_status=api_error_status,
         errors=errors,
+    )
+
+
+def _make_text_assistant_message(text: str):
+    """Build a successful AssistantMessage carrying visible console text."""
+    from claude_agent_sdk.types import AssistantMessage, TextBlock
+
+    return AssistantMessage(
+        content=[TextBlock(text=text)],
+        model="claude-opus-4-7",
+        error=None,
+        usage={"input_tokens": 0, "output_tokens": 1},
+        stop_reason="end_turn",
     )
 
 
@@ -258,6 +275,88 @@ async def _run_reader_against_stream(ss: StreamingSession, messages: list) -> No
 
     ss._client.receive_messages = _receive_messages
     await ss._reader_loop()
+
+
+@pytest.mark.asyncio
+async def test_reader_warns_on_conversation_reset_and_unknown_frame(capsys) -> None:
+    """A widened SDK Message union must never degrade to a silent drop."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    ss = _make_session()
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id="session-uuid",
+    )
+
+    await _run_reader_against_stream(ss, [reset, object()])
+
+    logs = capsys.readouterr().err
+    assert "WARNING SDK conversation reset" in logs
+    assert "new_conversation_id='new-conversation'" in logs
+    assert "WARNING unhandled SDK message type=object; continuing" in logs
+
+
+@pytest.mark.asyncio
+async def test_reset_replaces_old_resume_handle_from_result_message() -> None:
+    """Reset(old) + Result(new) persists empty first, then the fresh handle."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    persisted = OLD_SESSION_ID
+    writes: list[str] = []
+    ss = _make_session()
+    ss.resume_handle = OLD_SESSION_ID
+
+    def persist(_agent_name: str, resume_handle: str) -> None:
+        nonlocal persisted
+        persisted = resume_handle
+        writes.append(resume_handle)
+
+    ss._on_resume_handle_sync = persist
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id=OLD_SESSION_ID,
+    )
+
+    await _run_reader_against_stream(
+        ss,
+        [reset, _make_result_message(session_id=NEW_SESSION_ID)],
+    )
+
+    assert writes == ["", NEW_SESSION_ID]
+    assert persisted == NEW_SESSION_ID
+    assert ss.resume_handle == NEW_SESSION_ID
+
+
+@pytest.mark.asyncio
+async def test_reset_without_fresh_frame_clears_resume_handle_before_death() -> None:
+    """A reset-window death leaves durable and in-memory handles empty."""
+    from claude_agent_sdk.types import ConversationResetMessage
+
+    persisted = OLD_SESSION_ID
+    ss = _make_session()
+    ss.resume_handle = OLD_SESSION_ID
+
+    def persist(_agent_name: str, resume_handle: str) -> None:
+        nonlocal persisted
+        persisted = resume_handle
+
+    ss._on_resume_handle_sync = persist
+    reset = ConversationResetMessage(
+        new_conversation_id="new-conversation",
+        uuid="reset-uuid",
+        session_id=OLD_SESSION_ID,
+    )
+
+    await _run_reader_against_stream(ss, [reset])
+
+    assert persisted == ""
+    assert ss.resume_handle == ""
+    restarted = StreamingSession(
+        StreamingSessionConfig(agent_name="test", resume_handle=persisted)
+    )
+    assert restarted.resume_handle == ""
 
 
 @pytest.mark.asyncio
@@ -944,15 +1043,11 @@ async def test_billing_error_assistant_does_not_block_subsequent_auth_alert() ->
     assert args == (ss.agent_name, "authentication_failed")
 
 
-# -- _pending_chats routing-queue 1:1 invariant -------------------------------
+# -- _pending_chats turn-boundary drain invariant -----------------------------
 #
-# Response routing relies on FIFO correlation: one _pending_chats entry per
-# query, one pop per ResultMessage. System-initiated queries (wake prompt,
-# context warn, restart-blocked notice, idle-sleep save prompt) used to skip
-# the enqueue, so their ResultMessages consumed USER routing tuples and the
-# real user turn popped ("", "", "") -- silently dropping the reply (or
-# delivering a system turn's text to the user's chat). The queue also
-# survived disconnect(), leaking stale chat_ids into a resumed session.
+# The SDK may coalesce several submitted messages into one turn and emit one
+# ResultMessage. Every reservation visible at the start of that boundary must
+# be drained together; pop-one leaves stale route state for an unrelated turn.
 
 
 @pytest.mark.asyncio
@@ -965,6 +1060,112 @@ async def test_send_enqueues_routing_entry_even_without_chat_id() -> None:
 
     await ss.send("user prompt", platform="telegram", chat_id="123", message_id="9")
     assert ss._pending_chats == [("", "", ""), ("telegram", "123", "9")]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("is_error", [False, True])
+async def test_send_books_turn_before_fast_result_can_emit_idle(
+    is_error: bool,
+) -> None:
+    """A result visible before query() returns still consumes a booked turn."""
+    ss = _make_session()
+    write_visible = asyncio.Event()
+    release_query = asyncio.Event()
+    result_consumed = asyncio.Event()
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
+
+    async def held_query(prompt: str) -> None:
+        del prompt
+        write_visible.set()
+        await release_query.wait()
+
+    async def receive_messages():
+        await write_visible.wait()
+        yield _make_result_message(
+            is_error=is_error,
+            api_error_status=429 if is_error else None,
+        )
+        result_consumed.set()
+
+    ss._client.query = held_query
+    ss._client.receive_messages = receive_messages
+
+    send_task = asyncio.create_task(
+        ss.send(
+            "fast turn",
+            platform="telegram",
+            chat_id="123",
+            message_id="9",
+        )
+    )
+    reader_task = asyncio.create_task(ss._reader_loop())
+
+    await result_consumed.wait()
+    assert not send_task.done()
+    assert idle_agents == [ss.agent_name]
+    assert ss._pending_chats == []
+
+    release_query.set()
+    assert await send_task is True
+    await reader_task
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
+async def test_unrouted_query_books_before_fast_result_boundary() -> None:
+    """Notification/system queries use the same reserve-before-write rule as
+    send(), so a fast Result cannot leave a late sentinel behind."""
+    ss = _make_session()
+    write_visible = asyncio.Event()
+    release_query = asyncio.Event()
+    result_consumed = asyncio.Event()
+
+    async def held_query(prompt: str) -> None:
+        del prompt
+        write_visible.set()
+        await release_query.wait()
+
+    async def receive_messages():
+        await write_visible.wait()
+        yield _make_result_message()
+        result_consumed.set()
+
+    ss._client.query = held_query
+    ss._client.receive_messages = receive_messages
+
+    query_task = asyncio.create_task(ss._query_unrouted("notification prompt"))
+    reader_task = asyncio.create_task(ss._reader_loop())
+
+    await result_consumed.wait()
+    assert not query_task.done()
+    assert ss._pending_chats == []
+
+    release_query.set()
+    await query_task
+    await reader_task
+    assert ss._pending_chats == []
+
+
+@pytest.mark.asyncio
+async def test_send_query_failure_rolls_back_only_its_reservation() -> None:
+    ss = _make_session()
+    existing = ("telegram", "same", "same")
+    ss._pending_chats.append(existing)
+    ss._client.query = AsyncMock(side_effect=RuntimeError("write failed"))
+    ss.attempt_reconnect = AsyncMock(return_value=False)
+
+    assert (
+        await ss.send(
+            "fails",
+            platform="telegram",
+            chat_id="same",
+            message_id="same",
+        )
+        is False
+    )
+    assert len(ss._pending_chats) == 1
+    assert ss._pending_chats[0] is existing
 
 
 @pytest.mark.asyncio
@@ -1019,31 +1220,64 @@ async def test_disconnect_fires_empty_callback_for_routed_pending_entries() -> N
 
 
 @pytest.mark.asyncio
-async def test_system_turn_does_not_consume_user_routing() -> None:
-    """A system turn (sentinel entry) completing before a user turn must pop
-    its own sentinel, leaving the user tuple for the user turn."""
+async def test_coalesced_turn_boundary_drains_all_pending_routes_loudly(
+    capsys,
+) -> None:
+    """N>1 queued messages may share one SDK result; no reservation survives
+    and the stale count is operator-visible."""
     ss = _make_session()
-    routed: list[tuple[str, str]] = []
+    routed: list[tuple[str, str, str]] = []
 
     async def capture(turn_result):
-        routed.append((turn_result.platform, turn_result.chat_id))
+        routed.append(
+            (turn_result.platform, turn_result.chat_id, turn_result.response_text)
+        )
 
     ss._response_callback = capture
-    # System turn queued first (e.g. wake prompt), then a user message.
+    # Two explicit agent packets plus a notification-origin prompt coalesced
+    # into the same live SDK turn. Agent injects are deliberately unrouted.
     ss._pending_chats.append(("", "", ""))
-    ss._pending_chats.append(("telegram", "123", "9"))
+    ss._pending_chats.append(("", "", ""))
+    ss._pending_chats.append(("", "", ""))
 
     await _run_reader_against_stream(
         ss,
         [
-            _make_result_message(),  # system turn -- pops the sentinel
-            _make_result_message(),  # user turn -- pops the user tuple
+            _make_text_assistant_message("web-only turn-final narration"),
+            _make_result_message(),
         ],
     )
 
-    assert routed == [("telegram", "123")], (
-        f"user turn must route to the user's chat, got {routed}"
+    assert ss._pending_chats == []
+    assert routed == [("", "", "web-only turn-final narration")]
+    assert "TURN_BOUNDARY_STALE_ROUTE_DRAIN" in capsys.readouterr().err
+
+
+@pytest.mark.asyncio
+async def test_notification_after_agent_inbound_is_web_record_only(tmp_path) -> None:
+    """A notification-origin completion after an earlier agent inbound is
+    retained in the web conversation store without retaining either route."""
+    from pinky_daemon.conversation_store import ConversationStore
+
+    store = ConversationStore(db_path=str(tmp_path / "conversations.db"))
+    ss = _make_session()
+    ss._conversation_store = store
+    ss._pending_chats.append(("agent", "requester", "agent-message"))
+    ss._pending_chats.append(("", "", ""))
+
+    await _run_reader_against_stream(
+        ss,
+        [
+            _make_text_assistant_message("notification turn console text"),
+            _make_result_message(),
+        ],
     )
+
+    assert ss._pending_chats == []
+    assistant = [m for m in store.get_history(ss.id) if m.role == "assistant"]
+    assert len(assistant) == 1
+    assert assistant[0].content == "notification turn console text"
+    assert (assistant[0].platform, assistant[0].chat_id) == ("", "")
 
 
 # -- Typing-indicator leak: callback must fire for every routed turn ----------
@@ -1097,6 +1331,8 @@ async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
     """Sentinel turns with no content stay silent -- no routing target."""
     ss = _make_session()
     routed: list[str] = []
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
 
     async def capture(turn_result):
         routed.append(turn_result.chat_id)
@@ -1107,6 +1343,7 @@ async def test_unrouted_empty_turn_does_not_fire_callback() -> None:
     await _run_reader_against_stream(ss, [_make_result_message()])
 
     assert routed == []
+    assert idle_agents == [ss.agent_name]
 
 
 # -- idle_sleep must let the memory-save turn finish before teardown ----------

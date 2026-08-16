@@ -46,6 +46,11 @@ from pinky_daemon.codex_app_server import (
     NotificationHandler,
     ServerRequestHandler,
 )
+from pinky_daemon.codex_home import (
+    per_agent_codex_home_enabled,
+    prepare_agent_codex_home,
+    validate_agent_codex_home,
+)
 from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.streaming_session import _log
 from pinky_daemon.tmux_session import _TmuxControl
@@ -92,6 +97,13 @@ class _TmuxAppServerProc:
             self.returncode = -9
         return self.returncode
 
+    async def wait_strict(self) -> int:
+        """Wait for replacement cleanup, propagating any failed tmux kill."""
+        await self._sup.teardown(strict=True)
+        if self.returncode is None:
+            self.returncode = -9
+        return self.returncode
+
 
 class CodexAppServerSupervisor:
     """Owns the tmux session + socket lifecycle for one agent's app-server."""
@@ -102,11 +114,15 @@ class CodexAppServerSupervisor:
         *,
         working_dir: str,
         openai_api_key: str = "",
+        agent_config: object | None = None,
+        soul_version_store: object | None = None,
         log: Callable[[str], None] = _log,
     ) -> None:
         self.agent_name = agent_name
         self._log = log
         self._openai_api_key = openai_api_key
+        self._agent_config = agent_config
+        self._soul_version_store = soul_version_store
         self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
         self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
@@ -149,20 +165,30 @@ class CodexAppServerSupervisor:
         client plus its process adapter. Raises on tmux failure or readiness
         timeout. The caller (CodexSession) performs the single ``initialize``."""
         self._kill_requested = False
+        if per_agent_codex_home_enabled():
+            if self._agent_config is None:
+                raise RuntimeError(
+                    "per-agent Codex home requires app-server agent config"
+                )
+            validate_agent_codex_home(
+                self._agent_config,
+                soul_version_store=self._soul_version_store,
+            )
 
         # Idempotent pre-start cleanup: a crashed predecessor can leave a live
         # tmux session and/or a stale socket; either would wedge a fresh start.
-        await self._tmux.kill_session()
+        await self._kill_tmux_session(strict=True)
         self._unlink_sock()
 
         self._ensure_sock_dir_secure()
+        env = self._build_env()
 
         command = " ".join(
             shlex.quote(p)
             for p in [sys.executable, "-m", "pinky_daemon.codex_app_server_shim", self.sock_path]
         )
         result = await self._tmux.new_session(
-            cwd=self._sock_dir, command=command, env=self._build_env()
+            cwd=self._sock_dir, command=command, env=env
         )
         if not result.ok:
             raise RuntimeError(
@@ -219,6 +245,18 @@ class CodexAppServerSupervisor:
             env[key] = value
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
+        if per_agent_codex_home_enabled():
+            if self._agent_config is None:
+                raise RuntimeError(
+                    "per-agent Codex home requires app-server agent config"
+                )
+            env["CODEX_HOME"] = str(
+                prepare_agent_codex_home(
+                    self._agent_config,
+                    log=self._log,
+                    soul_version_store=self._soul_version_store,
+                )
+            )
         return env
 
     async def _await_accept(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
@@ -271,12 +309,38 @@ class CodexAppServerSupervisor:
     def request_kill(self) -> None:
         self._kill_requested = True
 
-    async def teardown(self) -> None:
-        """Idempotent: kill the tmux session and unlink the socket."""
+    async def _kill_tmux_session(self, *, strict: bool) -> bool:
+        """Kill the owned tmux session, optionally making failure terminal."""
         try:
-            await self._tmux.kill_session()
-        except Exception as exc:  # noqa: BLE001 — teardown is best-effort
-            self._log(f"codex[{self.agent_name}]: tmux app-server kill_session failed: {exc}")
+            result = await self._tmux.kill_session()
+        except Exception as exc:
+            message = (
+                f"codex app-server tmux kill-session failed for "
+                f"{self.agent_name}: {exc}"
+            )
+            self._log(message)
+            if strict:
+                raise RuntimeError(message) from exc
+            return False
+        if result.ok:
+            return True
+        message = (
+            f"codex app-server tmux kill-session failed for {self.agent_name}: "
+            f"rc={result.returncode} stderr={result.stderr.strip()!r}"
+        )
+        self._log(message)
+        if strict:
+            raise RuntimeError(message)
+        return False
+
+    async def teardown(self, *, strict: bool = False) -> None:
+        """Kill the tmux session and unlink its socket.
+
+        Terminal shutdown remains best-effort. Replacement cleanup passes
+        ``strict=True`` so a known failed kill aborts before any new child's
+        environment is prepared or published.
+        """
+        await self._kill_tmux_session(strict=strict)
         self._unlink_sock()
 
     def stats(self) -> dict:

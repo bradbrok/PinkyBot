@@ -10,6 +10,12 @@ from pinky_daemon.agent_registry import AgentRegistry
 from pinky_daemon.broker import BrokerMessage, MessageBroker
 from pinky_daemon.sessions import SessionManager
 
+BRAD_BUZZ_PRINCIPAL = (
+    "buzz:posspecialists:"
+    "90425c785cf23b60e57300658a7f4855938b3c2f661b3ef33acdb54831fcb44b"
+)
+BUZZ_CHANNEL = "00000000-0000-4000-8000-000000000001"
+
 
 class TestMessageBrokerRouting:
     def _make_broker(self):
@@ -125,6 +131,188 @@ class TestMessageBrokerRouting:
         finally:
             tmpdir.cleanup()
 
+    def test_buzz_known_contact_uses_registry_name_role_and_fingerprint(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            prompt = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="attacker-controlled name",
+                    sender_id=BRAD_BUZZ_PRINCIPAL,
+                    content="hello",
+                    agent_name="barsik",
+                    message_id="ab" * 32,
+                    timestamp=0,
+                    is_group=True,
+                    metadata={
+                        "buzz_verified_principal": BRAD_BUZZ_PRINCIPAL,
+                        "buzz_mentioned_self": False,
+                    },
+                )
+            )
+            assert prompt.splitlines()[0] == (
+                f"[buzz | #general | from:Brad (owner) principal:90425c785cf2… | "
+                f"mentioned_self:false | chat_id:{BUZZ_CHANNEL} | "
+                f"1970-01-01 00:00:00 UTC | msg_id:{'ab' * 32}]"
+            )
+            assert "display_name" not in prompt.splitlines()[0]
+            assert BRAD_BUZZ_PRINCIPAL not in prompt.splitlines()[0]
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_unknown_contact_keeps_untrusted_name_and_full_principal(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            principal = f"buzz:posspecialists:{'aa' * 32}"
+            header = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="Somebody",
+                    sender_id=principal,
+                    content="hello",
+                    agent_name="barsik",
+                    timestamp=0,
+                    is_group=True,
+                    metadata={"buzz_verified_principal": principal},
+                )
+            ).splitlines()[0]
+            assert header == (
+                f"[buzz | #general | display_name(untrusted):Somebody | "
+                f"principal:{principal} | mentioned_self:false | "
+                f"chat_id:{BUZZ_CHANNEL} | 1970-01-01 00:00:00 UTC]"
+            )
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_unknown_contact_flags_registered_name_collision(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            principal = f"buzz:posspecialists:{'bb' * 32}"
+            header = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="bRaD",
+                    sender_id=principal,
+                    content="hello",
+                    agent_name="barsik",
+                    timestamp=0,
+                    is_group=True,
+                    metadata={"buzz_verified_principal": principal},
+                )
+            ).splitlines()[0]
+            assert "display_name(untrusted+collides:Brad):bRaD" in header
+            assert f"principal:{principal}" in header
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_absent_verified_contacts_table_falls_back_without_exception(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            registry._db.execute("DROP TABLE verified_contacts")
+            registry._db.commit()
+            principal = f"buzz:posspecialists:{'cc' * 32}"
+            header = broker._format_prompt(
+                BrokerMessage(
+                    platform="buzz",
+                    chat_id=BUZZ_CHANNEL,
+                    chat_title="#general",
+                    sender_name="Somebody",
+                    sender_id=principal,
+                    content="hello",
+                    agent_name="barsik",
+                    timestamp=0,
+                    is_group=True,
+                    metadata={"buzz_verified_principal": principal},
+                )
+            ).splitlines()[0]
+            assert "display_name(untrusted):Somebody" in header
+            assert f"principal:{principal}" in header
+        finally:
+            tmpdir.cleanup()
+
+    def test_buzz_channel_id_is_rendered_exactly_once_with_or_without_alias(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            registry.upsert_group_chat(
+                "barsik", BUZZ_CHANNEL, chat_type="channel", platform="buzz"
+            )
+            principal = f"buzz:posspecialists:{'dd' * 32}"
+            message = BrokerMessage(
+                platform="buzz",
+                chat_id=BUZZ_CHANNEL,
+                sender_name="Somebody",
+                sender_id=principal,
+                content="hello",
+                agent_name="barsik",
+                timestamp=0,
+                is_group=True,
+                metadata={"buzz_verified_principal": principal},
+            )
+            raw_header = broker._format_prompt(message).splitlines()[0]
+            assert raw_header.startswith(f"[buzz | {BUZZ_CHANNEL} |")
+            assert raw_header.count(BUZZ_CHANNEL) == 1
+
+            assert registry.update_group_chat_alias("barsik", BUZZ_CHANNEL, "#general")
+            named_header = broker._format_prompt(message).splitlines()[0]
+            assert named_header.startswith("[buzz | #general |")
+            assert named_header.count(BUZZ_CHANNEL) == 1
+            assert f"chat_id:{BUZZ_CHANNEL}" in named_header
+        finally:
+            tmpdir.cleanup()
+
+    def test_non_buzz_group_and_dm_headers_remain_byte_identical(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            group = broker._format_prompt(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="-100123",
+                    chat_title="Ops",
+                    sender_name="Alex",
+                    sender_id="42",
+                    content="group body",
+                    agent_name="barsik",
+                    message_id="7",
+                    timestamp=0,
+                    is_group=True,
+                )
+            )
+            dm = broker._format_prompt(
+                BrokerMessage(
+                    platform="telegram",
+                    chat_id="42",
+                    sender_name="Alex",
+                    sender_id="42",
+                    content="dm body",
+                    agent_name="barsik",
+                    message_id="8",
+                    timestamp=0,
+                    is_group=False,
+                )
+            )
+            assert group == (
+                "[telegram | group | Ops | Alex | -100123 | "
+                "1970-01-01 00:00:00 UTC | msg_id:7]\ngroup body"
+            )
+            assert dm == (
+                "[telegram | dm | Alex | 42 | "
+                "1970-01-01 00:00:00 UTC | msg_id:8]\ndm body"
+            )
+        finally:
+            tmpdir.cleanup()
+
     @pytest.mark.asyncio
     async def test_route_response_suppresses_fallback_on_external_dm(self):
         # Owner rule (Brad, 2026-06-22): plain-text fallback NEVER auto-delivers
@@ -226,9 +414,9 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_response_allows_fallback_on_api_surface(self):
-        # Internal surfaces (web/api/console) keep the fallback convenience and
-        # need no message context — they're owner-only, never public channels.
+    async def test_route_response_suppresses_fallback_on_api_surface(self):
+        # #1074: turn-final console prose is already persisted for the web UI;
+        # route_response is bookkeeping-only even for internal/API surfaces.
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             await broker.route_response(
@@ -240,9 +428,7 @@ class TestMessageBrokerRouting:
                 fallback_enabled=True,
             )
 
-            assert sent_messages == [
-                ("barsik", "api", "api", "api console reply via fallback"),
-            ]
+            assert sent_messages == []
         finally:
             tmpdir.cleanup()
 
@@ -302,9 +488,9 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_response_allows_fallback_on_web_without_context(self):
-        # Owner-only surfaces (web/api/internal) are never public channels and
-        # carry no message context — the fallback convenience is preserved.
+    async def test_route_response_suppresses_fallback_on_web_without_context(self):
+        # #1074: the conversation store is the web render path. Sending the
+        # same console prose through the broker would create a second delivery.
         tmpdir, _, broker, sent_messages, _ = self._make_broker()
         try:
             await broker.route_response(
@@ -316,9 +502,41 @@ class TestMessageBrokerRouting:
                 fallback_enabled=True,
             )
 
-            assert sent_messages == [
-                ("barsik", "web", "web", "web console reply via fallback"),
-            ]
+            assert sent_messages == []
+        finally:
+            tmpdir.cleanup()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "platform",
+        ["telegram", "discord", "slack", "ferry", "agent", "api", "web", ""],
+    )
+    async def test_route_response_never_delivers_turn_final_console_text(
+        self, platform
+    ):
+        """#1074: explicit outreach tools are the only delivery path.
+
+        The turn-completion callback must still stop typing and retire voice
+        bookkeeping, but it must not send console prose on any surface.
+        """
+        tmpdir, _, broker, sent_messages, _ = self._make_broker()
+        try:
+            stopped: list[tuple[str, str]] = []
+            broker._stop_typing = lambda agent, chat: stopped.append((agent, chat))
+            broker._voice_pending[("barsik", "chat-1")] = True
+
+            await broker.route_response(
+                "barsik",
+                platform,
+                "chat-1",
+                "turn-final console narration",
+                used_outreach=False,
+                fallback_enabled=True,
+            )
+
+            assert sent_messages == []
+            assert stopped == [("barsik", "chat-1")]
+            assert ("barsik", "chat-1") not in broker._voice_pending
         finally:
             tmpdir.cleanup()
 
@@ -362,9 +580,9 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_inject_agent_message_stamps_reply_routing_metadata(self):
-        """#279: an injected agent message carries platform='agent' + chat_id=
-        the requester, so the recipient's completed turn can route back."""
+    async def test_inject_agent_message_is_explicit_one_way(self):
+        """#1074: explicit agent packets remain live, but never stamp a route
+        for the recipient's later console text to travel back on."""
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             from pinky_daemon.transport_state import SessionState
@@ -381,17 +599,15 @@ class TestMessageBrokerRouting:
             broker.register_streaming("barsik", _FakeStreaming(), label="main")
             delivered, _ = await broker.inject_agent_message("pushok", "barsik", "review please")
             assert delivered is True
-            assert recorded == [("agent", "pushok")]
+            assert recorded == [("", "")]
         finally:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_inject_agent_message_respects_routing_killswitch(self, monkeypatch):
-        """With PINKY_AGENT_REPLY_ROUTING off, no route-back metadata is stamped —
-        reverts to the legacy (drop-on-empty-chat_id) behavior."""
-        import pinky_daemon.broker as broker_mod
-
-        monkeypatch.setattr(broker_mod, "_AGENT_REPLY_ROUTING_ENABLED", False)
+    async def test_inject_agent_message_has_no_auto_route_opt_in(self, monkeypatch):
+        """Full suppression has no environment switch that can resurrect the
+        removed auto-route channel."""
+        monkeypatch.setenv("PINKY_AGENT_REPLY_ROUTING", "1")
         tmpdir, registry, broker, _, _ = self._make_broker()
         try:
             from pinky_daemon.transport_state import SessionState
@@ -534,151 +750,13 @@ class TestMessageBrokerRouting:
             tmpdir.cleanup()
 
     @pytest.mark.asyncio
-    async def test_route_agent_reply_is_one_way_live_injection(self):
-        """The return leg is live, audited, and cannot trigger another reply."""
-        from pinky_daemon.transport_state import SessionState
-        from pinky_daemon.turn_response import TurnResponse
-
-        tmpdir, registry, broker, _, _ = self._make_broker()
+    async def test_agent_reply_auto_route_channel_is_absent(self):
+        """#1074 removes the callable that could deliver turn-final text to a
+        peer. Agent-to-agent delivery remains available only via an explicit
+        send_to_agent/inject_agent_message call."""
+        tmpdir, _, broker, _, _ = self._make_broker()
         try:
-            sent: list = []
-            injected: list = []
-
-            class _FakeComms:
-                def send(self, frm, to, content, **kw):
-                    sent.append((frm, to, content, kw.get("metadata")))
-
-            class _FakeStreaming:
-                state = SessionState.CONNECTED
-                injection_confirms_consumption = True
-
-                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
-                    injected.append((prompt, platform, chat_id))
-                    return True
-
-            broker.register_streaming("barsik", _FakeStreaming(), label="main")
-            tr = TurnResponse(
-                agent_name="murzik",
-                platform="agent",
-                chat_id="barsik",
-                text="LGTM - ship it",
-            )
-            handled = await broker.route_agent_reply(_FakeComms(), tr)
-            assert handled is True
-            assert sent == [("murzik", "barsik", "LGTM - ship it", {"auto_routed": True})]
-            assert len(injected) == 1
-            assert "LGTM - ship it" in injected[0][0]
-            assert injected[0][1:] == ("", "")
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_agent_reply_ignores_normal_platform_turns(self):
-        """A telegram turn is not an agent reply: returns False (caller falls
-        through to normal routing) and nothing is agent-routed."""
-        from pinky_daemon.turn_response import TurnResponse
-
-        tmpdir, registry, broker, _, _ = self._make_broker()
-        try:
-            sent: list = []
-
-            class _FakeComms:
-                def send(self, *a, **k):
-                    sent.append((a, k))
-
-            tr = TurnResponse(
-                agent_name="barsik", platform="telegram", chat_id="123", text="hi"
-            )
-            handled = await broker.route_agent_reply(_FakeComms(), tr)
-            assert handled is False
-            assert sent == []
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_agent_reply_skips_empty_text(self):
-        """A pure tool-call agent turn (no final text) is consumed but nothing is
-        delivered."""
-        from pinky_daemon.turn_response import TurnResponse
-
-        tmpdir, registry, broker, _, _ = self._make_broker()
-        try:
-            sent: list = []
-
-            class _FakeComms:
-                def send(self, *a, **k):
-                    sent.append((a, k))
-
-            tr = TurnResponse(
-                agent_name="murzik", platform="agent", chat_id="barsik", text="   "
-            )
-            handled = await broker.route_agent_reply(_FakeComms(), tr)
-            assert handled is True
-            assert sent == []
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_agent_reply_counts_failed_delivery(self):
-        """If audit storage raises, the turn is still consumed (handled True, never
-        re-injected) and the failure is counted so dropped replies are visible."""
-        from pinky_daemon.turn_response import TurnResponse
-
-        tmpdir, registry, broker, _, _ = self._make_broker()
-        try:
-            class _BoomComms:
-                def send(self, *a, **k):
-                    raise RuntimeError("audit down")
-
-            tr = TurnResponse(
-                agent_name="murzik", platform="agent", chat_id="barsik", text="x"
-            )
-            before = broker._stats["routed_failed"]
-            handled = await broker.route_agent_reply(_BoomComms(), tr)
-            assert handled is True  # loop-safe: never falls through / re-injects
-            assert broker._stats["routed_failed"] == before + 1
-        finally:
-            tmpdir.cleanup()
-
-    @pytest.mark.asyncio
-    async def test_route_agent_reply_real_comms_is_audited_and_live(self):
-        """End-to-end return leg is live and retained only in audit history."""
-        from pinky_daemon.agent_comms import AgentComms
-        from pinky_daemon.transport_state import SessionState
-        from pinky_daemon.turn_response import TurnResponse
-
-        tmpdir, registry, broker, _, _ = self._make_broker()
-        try:
-            comms = AgentComms(db_path=f"{tmpdir.name}/comms.db")
-            injected: list = []
-
-            class _FakeStreaming:
-                state = SessionState.CONNECTED
-                injection_confirms_consumption = True
-
-                async def send(self, prompt, *, platform="", chat_id="", message_id=""):
-                    injected.append((prompt, platform, chat_id))
-                    return True
-
-            broker.register_streaming("barsik", _FakeStreaming(), label="main")
-            tr = TurnResponse(
-                agent_name="murzik",
-                platform="agent",
-                chat_id="barsik",
-                text="LGTM - ship it",
-            )
-            handled = await broker.route_agent_reply(comms, tr)
-            assert handled is True
-            assert comms.get_inbox("barsik") == []
-            assert comms.unread_count("barsik") == 0
-            messages, total = comms.get_all_messages()
-            assert total == 1
-            assert messages[0].from_session == "murzik"
-            assert messages[0].content == "LGTM - ship it"
-            assert messages[0].metadata.get("auto_routed") is True
-            assert len(injected) == 1
-            assert "LGTM - ship it" in injected[0][0]
-            assert injected[0][1:] == ("", "")
+            assert not hasattr(broker, "route_agent_reply")
         finally:
             tmpdir.cleanup()
 
@@ -772,13 +850,13 @@ class TestMessageBrokerRouting:
                 }
             ])
 
-            channel = "C0A8WUU743F"
-            user = "U774M8XDE"
+            channel = "C0EXAMPLE1"
+            user = "U0EXAMPLE1"
             await broker.handle_inbound(
                 BrokerMessage(
                     platform="slack",
                     chat_id=channel,
-                    sender_name="Alex Ugrin",
+                    sender_name="Alex Rivera",
                     sender_id=user,
                     content="Hi",
                     agent_name="barsik",
@@ -1104,14 +1182,14 @@ class TestMessageBrokerRouting:
             monkeypatch.setattr(broker, "_route_streaming", _fake_route)
             registry.set_primary_user("owner-1", display_name="Brad")
 
-            channel = "C0A8WUU743F"
+            channel = "C0EXAMPLE1"
             # Channel is approved once.
             registry.approve_user("barsik", channel, display_name=channel)
 
             # A brand-new, never-approved member messages in the channel.
             await broker.handle_inbound(
                 BrokerMessage(
-                    platform="slack", chat_id=channel, sender_name="Jake Hredzak",
+                    platform="slack", chat_id=channel, sender_name="Jordan Lee",
                     sender_id="U_NEVER_APPROVED", content="status?",
                     agent_name="barsik", is_group=True,
                 )
@@ -1190,7 +1268,7 @@ class TestMessageBrokerRouting:
     @pytest.mark.asyncio
     async def test_slash_approve_preserves_uppercase_channel_id(self, monkeypatch):
         """Regression: /approve_<id> must preserve the EXACT case of the target
-        id. Slack channel ids are uppercase (C0A8WUU743F); lowercasing the whole
+        id. Slack channel ids are uppercase (C0EXAMPLE1); lowercasing the whole
         command token approved a phantom lowercased id, delivered 0 held
         messages, and left the channel unapproved — so replies never went out.
         Exercises the real owner-notification flow end-to-end at channel scope."""
@@ -1217,12 +1295,12 @@ class TestMessageBrokerRouting:
                 }
             ])
 
-            channel = "C0A8WUU743F"
+            channel = "C0EXAMPLE1"
             # A message in the channel → held pending under the exact channel id.
             await broker.handle_inbound(
                 BrokerMessage(
-                    platform="slack", chat_id=channel, sender_name="Alex Ugrin",
-                    sender_id="U774M8XDE", content="Hi", agent_name="barsik",
+                    platform="slack", chat_id=channel, sender_name="Alex Rivera",
+                    sender_id="U0EXAMPLE1", content="Hi", agent_name="barsik",
                     is_group=True,
                 )
             )

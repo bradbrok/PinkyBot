@@ -20,6 +20,7 @@ import inspect
 import json
 import os
 import re
+import shutil
 import sys
 import tempfile
 import time
@@ -33,11 +34,14 @@ from typing import Any, Literal
 from fastapi import (
     FastAPI,
     HTTPException,
+    Query,
     Request,
     Response,
     UploadFile,
     WebSocket,
 )
+from fastapi.exception_handlers import request_validation_exception_handler
+from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
     FileResponse,
     HTMLResponse,
@@ -49,7 +53,19 @@ from fastapi.staticfiles import StaticFiles
 
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
-from pinky_daemon.agent_registry import AgentRegistry, ScheduleNameConflictError
+from pinky_daemon.agent_registry import (
+    AgentAlreadyExistsError,
+    AgentPathContainmentError,
+    AgentRegistrationIncompleteError,
+    AgentRegistry,
+    AgentWorkspaceOverlapError,
+    AgentWorkspacePathError,
+    ScheduleNameConflictError,
+    SoulMutationRejectedError,
+    _validate_agent_name,
+    replace_agent_text,
+    resolve_agent_path,
+)
 from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.api_models import (
     AddDirectiveRequest,
@@ -61,7 +77,9 @@ from pinky_daemon.api_models import (
     AssignSkillRequest,
     AuthLoginRequest,
     AuthSetupRequest,
+    BindBuzzIdentityRequest,
     CloneWorkerRequest,
+    ConfigureBuzzInboundRequest,
     ContainerizeRequest,
     ContextResponse,
     ConversationListResponse,
@@ -85,6 +103,7 @@ from pinky_daemon.api_models import (
     RecordHeartbeatRequest,
     RegisterAgentRequest,
     RestartResponse,
+    RestoreSoulVersionRequest,
     SearchResponse,
     SendAgentMessageRequest,
     SendMessageRequest,
@@ -106,6 +125,7 @@ from pinky_daemon.api_models import (
     UpdateMcpServerRequest,
     UpdatePasswordRequest,
     UpdateScheduleRequest,
+    WriteAgentFileRequest,
 )
 from pinky_daemon.app_store import AppStore
 from pinky_daemon.auth import (
@@ -123,6 +143,8 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.autonomy import AgentEvent, AutonomyEngine, EventType
 from pinky_daemon.broker import BrokerMessage, MessageBroker
+from pinky_daemon.codex_home import codex_home_for
+from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.dream_runner import DreamRunner
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS, resolve_cli_effort
@@ -903,6 +925,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "update_wake_schedule",
         "list_my_schedules",
         "remove_wake_schedule",
+        "discard_pending_schedule_wake",
     ],
     "tasks-admin": [
         "decompose_project", "bulk_create_tasks",
@@ -1181,6 +1204,7 @@ def _write_mcp_json(
     When PINKY_SHARED_MCP=1, all three core servers use SSE transport pointing
     at the shared MCP server. Memory uses a per-agent store pool for DB isolation.
     """
+    work_dir = resolve_agent_path(agent_name, work_dir)
     pinky_src = str(Path(__file__).resolve().parent.parent)
     mcp_config: dict = {"mcpServers": {}}
 
@@ -1277,9 +1301,9 @@ def _write_mcp_json(
         }
     else:
         # Memory: per-agent SQLite long-term memory with vector search (stdio)
-        data_dir = work_dir / "data"
+        data_dir = resolve_agent_path(agent_name, work_dir, "data")
         data_dir.mkdir(parents=True, exist_ok=True)
-        db_path = str(data_dir / "memory.db")
+        db_path = str(resolve_agent_path(agent_name, work_dir, "data", "memory.db"))
         mcp_config["mcpServers"]["pinky-memory"] = {
             "command": sys.executable,
             "args": ["-m", "pinky_memory", "--db", db_path],
@@ -1384,7 +1408,7 @@ def _write_mcp_json(
             mcp_config["mcpServers"][sname] = entry
 
     # Merge with existing .mcp.json if present
-    mcp_json = work_dir / ".mcp.json"
+    mcp_json = resolve_agent_path(agent_name, work_dir, ".mcp.json")
     if mcp_json.exists():
         try:
             existing = json.loads(mcp_json.read_text())
@@ -1394,7 +1418,12 @@ def _write_mcp_json(
             mcp_config = existing
         except Exception:
             pass
-    mcp_json.write_text(json.dumps(mcp_config, indent=2))
+    mcp_json = replace_agent_text(
+        agent_name,
+        work_dir,
+        mcp_json,
+        json.dumps(mcp_config, indent=2),
+    )
     # Contains the agent's PINKY_AGENT_KEY — restrict to owner-only (0600).
     try:
         os.chmod(mcp_json, 0o600)
@@ -1706,6 +1735,21 @@ def create_api(
     )
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
 
+    @app.exception_handler(RequestValidationError)
+    async def _request_validation_response(
+        request: Request,
+        error: RequestValidationError,
+    ):
+        if request.method == "POST" and request.url.path == "/agents" and any(
+            tuple(item.get("loc", ()))[:2] == ("body", "name")
+            for item in error.errors()
+        ):
+            return JSONResponse(
+                status_code=400,
+                content={"detail": {"code": "invalid_agent_name"}},
+            )
+        return await request_validation_exception_handler(request, error)
+
     @app.exception_handler(_IsolationDeniedError)
     async def _isolation_denied_response(
         _request: Request, error: _IsolationDeniedError
@@ -1816,6 +1860,27 @@ def create_api(
         if key in _platform_adapters:
             return _platform_adapters[key]
 
+        if platform == "buzz":
+            from pinky_outreach.buzz_dependency import missing_buzz_dependencies
+
+            missing = missing_buzz_dependencies()
+            if missing:
+                agents.mark_buzz_dependency_refused(agent_name, f"missing:{','.join(missing)}")
+                return None
+            agents.mark_buzz_dependency_ready(agent_name)
+            material = agents.get_buzz_signing_material(agent_name)
+            if material is None:
+                return None
+            from pinky_outreach.buzz import BuzzAdapter
+
+            adapter = BuzzAdapter(
+                material.private_key,
+                relay_url=material.relay_url,
+                community_id=material.community_id,
+            )
+            _platform_adapters[key] = adapter
+            return adapter
+
         token = (
             agents.get_raw_token_for_account(agent_name, platform, account_id)
             if account_id
@@ -1843,7 +1908,12 @@ def create_api(
         """Drop generic and account-bound adapters after token mutation."""
         for key in list(_platform_adapters):
             if len(key) >= 2 and key[0] == agent_name and key[1] == platform:
-                _platform_adapters.pop(key, None)
+                adapter = _platform_adapters.pop(key, None)
+                if platform == "buzz" and adapter is not None:
+                    try:
+                        adapter.close()
+                    except Exception:
+                        pass
 
     def _get_imessage_adapter(agent_name: str = ""):
         """Get or create the iMessage adapter for an agent."""
@@ -1900,6 +1970,23 @@ def create_api(
             raise HTTPException(404, f"Message context '{message_id}' not found for {agent_name}")
         return ctx
 
+    def _buzz_reply_metadata(ctx) -> dict | None:
+        """Copy only verified public routing fields from durable context."""
+        if ctx.platform != "buzz" or not isinstance(ctx.metadata, dict):
+            return None
+        candidate = ctx.metadata.get("buzz_verified_event")
+        if not isinstance(candidate, dict):
+            return None
+        return {
+            "buzz_verified_event": {
+                "verified": candidate.get("verified"),
+                "event_id": candidate.get("event_id"),
+                "kind": candidate.get("kind"),
+                "author_pubkey": candidate.get("author_pubkey"),
+                "channel_id": candidate.get("channel_id"),
+            }
+        }
+
     def _extract_message_id(result) -> str:
         """Extract a message ID from a platform adapter response."""
         if hasattr(result, "message_id"):
@@ -1936,6 +2023,7 @@ def create_api(
         link_preview_options: dict | None = None,
         quote: str = "",
         blocks: str = "",
+        reply_metadata: dict | None = None,
     ) -> SimpleNamespace:
         """Send a text message and return SimpleNamespace(message_id=...).
 
@@ -2083,6 +2171,15 @@ def create_api(
             )
             return SimpleNamespace(message_id=_extract_message_id(result))
 
+        if platform == "buzz":
+            result = adapter.send_message(
+                chat_id,
+                content,
+                reply_to=reply_to or None,
+                reply_metadata=reply_metadata,
+            )
+            return SimpleNamespace(message_id=_extract_message_id(result))
+
         raise HTTPException(400, f"Unsupported platform: {platform}")
 
     def _send_file_message(
@@ -2179,6 +2276,7 @@ def create_api(
         link_preview_options: dict | None = None,
         quote: str = "",
         blocks: str = "",
+        reply_metadata: dict | None = None,
     ) -> dict:
         """Send a message back to the platform on behalf of an agent."""
         # OpenClaw bridge: agent replies for the openclaw "platform" are not sent
@@ -2227,6 +2325,7 @@ def create_api(
                     link_preview_options=link_preview_options,
                     quote=quote,
                     blocks=blocks,
+                    reply_metadata=reply_metadata,
                 ),
             )
             # Once an outbound message lands, the typing indicator becomes noise —
@@ -2255,7 +2354,7 @@ def create_api(
         # Plain sends keep key_extra="" — their historical dedupe behaviour is
         # unchanged. The dict is serialized (never used raw) so the key stays
         # hashable.
-        if account_id or parse_mode or link_preview_options or quote or blocks:
+        if account_id or parse_mode or link_preview_options or quote or blocks or reply_metadata:
             key_extra = json.dumps(
                 {
                     "acct": account_id or "",
@@ -2263,6 +2362,7 @@ def create_api(
                     "lpo": link_preview_options or None,
                     "q": quote or "",
                     "blk": blocks or "",
+                    "reply_meta": reply_metadata or None,
                 },
                 sort_keys=True, separators=(",", ":"),
             )
@@ -2290,6 +2390,8 @@ def create_api(
                 if platform == "discord":
                     await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
                 elif platform == "slack":
+                    await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
+                elif platform == "buzz":
                     await loop.run_in_executor(None, lambda: adapter.add_reaction(chat_id, message_id, emoji))
                 return
             except Exception as e:
@@ -3154,6 +3256,20 @@ def create_api(
                 f"{agent_name} (reason={reason.value}): {e}"
             )
 
+    def _notify_scheduler_turn_idle(agent_name: str) -> None:
+        """Drain deferred scheduler work at a confirmed idle boundary."""
+        try:
+            scheduler_instance = _scheduler_holder.get("scheduler")
+            if scheduler_instance is not None:
+                scheduler_instance.notify_agent_idle(agent_name)
+        except Exception as e:
+            _log(
+                "api: SCHEDULER_IDLE_TRIGGER_FAILURE for "
+                f"{agent_name}: {type(e).__name__}: {e}"
+            )
+
+    app.state._notify_scheduler_turn_idle = _notify_scheduler_turn_idle
+
     # Exposed for unit-test reach-in (verifying centralized wake logging
     # advances the cycle-gate boundary). Not part of the public API.
     app.state._log_agent_wake_event = _log_agent_wake_event
@@ -3175,12 +3291,6 @@ def create_api(
     async def _make_streaming_response_callback():
         """Create a response callback that routes through the broker."""
         async def _on_response(turn_result):
-            # #279: agent-to-agent reply auto-routing. If this completed turn was
-            # an injected agent message (platform == "agent"), deliver its text to
-            # the requesting agent via a one-way live inject and stop. Must run
-            # BEFORE the empty-chat_id early-return.
-            if await broker.route_agent_reply(comms, turn_result):
-                return
             if not turn_result.chat_id:
                 return
             agent = agents.get(turn_result.agent_name)
@@ -3383,6 +3493,35 @@ def create_api(
             f"(reason={decision.get('reason')})"
         )
 
+    def _persist_streaming_resume_handle(
+        agent_name: str,
+        label: str,
+        resume_handle: str,
+        *,
+        log_context_restart: bool,
+    ) -> None:
+        """Synchronously persist one streaming SDK resume-handle update."""
+        agents.set_streaming_session_id(agent_name, resume_handle, label=label)
+        short_id = resume_handle[:12] if resume_handle else ""
+        _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
+        if not resume_handle and log_context_restart:
+            # Empty = auto context restart triggered internally by the session
+            try:
+                session_event_store.log(
+                    session_id=f"{agent_name}-{label}",
+                    agent_name=agent_name,
+                    event_type="context_restart",
+                    metadata={"label": label, "source": "auto"},
+                )
+                activity.log(
+                    agent_name=agent_name,
+                    event_type="context_restart",
+                    title=f"{agent_name} auto context restart",
+                    metadata={"label": label, "source": "auto"},
+                )
+            except Exception:
+                pass
+
     async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
         """Persist a streaming session's SDK resume handle when captured.
 
@@ -3395,27 +3534,25 @@ def create_api(
         deliberate follow-up to avoid bundling a migration into this PR.
         """
         async def _on_resume_handle(_agent_name: str, resume_handle: str):
-            agents.set_streaming_session_id(agent_name, resume_handle, label=label)
-            short_id = resume_handle[:12] if resume_handle else ""
-            _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
-            if not resume_handle:
-                # Empty = auto context restart triggered internally by the session
-                try:
-                    session_event_store.log(
-                        session_id=f"{agent_name}-{label}",
-                        agent_name=agent_name,
-                        event_type="context_restart",
-                        metadata={"label": label, "source": "auto"},
-                    )
-                    activity.log(
-                        agent_name=agent_name,
-                        event_type="context_restart",
-                        title=f"{agent_name} auto context restart",
-                        metadata={"label": label, "source": "auto"},
-                    )
-                except Exception:
-                    pass
+            _persist_streaming_resume_handle(
+                agent_name,
+                label,
+                resume_handle,
+                log_context_restart=True,
+            )
         return _on_resume_handle
+
+    def _make_streaming_resume_handle_sync_callback(agent_name: str, label: str):
+        """Build the no-await persistence path used by reset frames."""
+        def _on_resume_handle_sync(_agent_name: str, resume_handle: str) -> None:
+            _persist_streaming_resume_handle(
+                agent_name,
+                label,
+                resume_handle,
+                log_context_restart=False,
+            )
+
+        return _on_resume_handle_sync
 
     # Cache context usage per session to avoid blocking health checks
     _context_cache: dict[str, tuple[float, dict]] = {}  # session_id -> (timestamp, info)
@@ -3470,9 +3607,9 @@ def create_api(
             ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=3.0)
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
-            actual_max = reported_max
-            if is_1m_model(ss._config.model or "", _1M_MODELS) and reported_max <= 200_000:
-                actual_max = 1_000_000
+            actual_max = resolve_context_window(
+                ss._config.model or "", reported_max=reported_max
+            )
             # rawMaxTokens (SDK ≥ 0.1.x) is the raw model cap; maxTokens
             # is effective (autocompact buffer subtracted). Pass both
             # through so the frontend can show either; default to
@@ -3784,6 +3921,8 @@ def create_api(
             wake_context=_build_streaming_wake_context(agent_name, commit=False),
             wake_context_builder=_build_streaming_wake_context,
             on_wake_delivered=_log_agent_wake_event,
+            on_turn_idle=_notify_scheduler_turn_idle,
+            wake_submission_recovery_injector=_inject_wake_context_reload,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             # #943: verdict-time fresh read of the persisted field that the
             # working/idle hooks update.  The in-memory map is non-authoritative
@@ -3804,6 +3943,7 @@ def create_api(
             subagents=subagents,
             provider_url=resolved_provider_url,
             provider_key=resolved_provider_key,
+            codex_home=getattr(agent, "codex_home", "") or "",
             thinking_effort=agent.thinking_effort or "medium",
             strict_effort_enforcement=bool(
                 getattr(agent, "strict_effort_enforcement", False)
@@ -3844,6 +3984,11 @@ def create_api(
 
         ss = SessionClass(config, **init_kwargs)
         ss._on_resume_handle = sid_callback
+        if hasattr(ss, "_on_resume_handle_sync"):
+            ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
+                agent_name,
+                label,
+            )
         try:
             await _bounded_cold_start_connect(
                 ss,
@@ -4931,6 +5076,23 @@ def create_api(
         if not secret:
             return False
         return bool(verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, "")))
+
+    def _owner_control_actor(request: Request) -> str:
+        """Require a browser owner session and derive its authority principal.
+
+        Valid internal agent HMAC auth intentionally does not satisfy this
+        gate: Buzz ToS provenance is owner control, never minting/agent data.
+        """
+        secret = _session_secret()
+        session = (
+            verify_session_cookie(secret, request.cookies.get(SESSION_COOKIE_NAME, ""))
+            if secret
+            else None
+        )
+        if not session:
+            raise HTTPException(403, "authenticated owner session required")
+        user = re.sub(r"[^a-zA-Z0-9_.-]", "_", str(session.get("user") or "admin"))
+        return f"ui:{user[:120]}"
 
     def _needs_browser_api_auth(request: Request) -> bool:
         path = request.url.path
@@ -6359,16 +6521,285 @@ npm run build</pre>
 
     # ── Agent Registry Endpoints ────────────────────────────
 
+    def _agent_name_or_400(name: str) -> str:
+        """Validate request-derived names without echoing hostile content."""
+        try:
+            return _validate_agent_name(name)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(400, {"code": "invalid_agent_name"}) from exc
+
+    def _agent_path_or_400(agent, *parts: str | Path) -> Path:
+        """Resolve one path inside the persisted owner root or refuse it."""
+        try:
+            return resolve_agent_path(
+                agent.name,
+                agent.working_dir,
+                *parts,
+            )
+        except (AgentPathContainmentError, OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                400,
+                {"code": "agent_path_outside_workspace"},
+            ) from exc
+
+    def _write_agent_text(agent, path: Path, content: str) -> Path:
+        """Atomically replace an agent-owned text file without following links."""
+        try:
+            return replace_agent_text(
+                agent.name,
+                agent.working_dir,
+                path,
+                content,
+            )
+        except (AgentPathContainmentError, OSError, RuntimeError, ValueError) as exc:
+            raise HTTPException(
+                400,
+                {"code": "agent_path_outside_workspace"},
+            ) from exc
+
+    registration_managed_dirs = ("data", "output", "workspace", ".claude")
+    registration_managed_files = (
+        ".mcp.json",
+        ".claude/hook_working.py",
+        ".claude/hook_idle.py",
+        ".claude/hook_verify_effort.py",
+        ".claude/hook_tmux_wake.py",
+        ".claude/hook_tmux_session_start.py",
+        ".claude/hook_tmux_pre_tool.py",
+        ".claude/hook_tmux_post_tool.py",
+        ".claude/hook_tmux_stop_failure.py",
+        ".claude/settings.json",
+    )
+
+    def _path_node_exists(path: Path) -> bool:
+        """Return true for ordinary nodes and broken symlinks."""
+        return path.is_symlink() or path.exists()
+
+    def _remove_path_node(path: Path) -> None:
+        """Remove one explicit node without following directory symlinks."""
+        if path.is_symlink() or path.is_file():
+            path.unlink(missing_ok=True)
+        elif path.exists():
+            shutil.rmtree(path)
+
+    def _backup_path_node(source: Path, destination: Path) -> None:
+        """Back up one managed node, preserving symlink and inode semantics."""
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            destination.symlink_to(os.readlink(source))
+        elif source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except OSError:
+                shutil.copy2(source, destination, follow_symlinks=False)
+
+    def _restore_path_node(source: Path, destination: Path) -> None:
+        """Restore one managed node from a private registration backup."""
+        _remove_path_node(destination)
+        destination.parent.mkdir(parents=True, exist_ok=True)
+        if source.is_symlink():
+            destination.symlink_to(os.readlink(source))
+        elif source.is_dir():
+            shutil.copytree(source, destination, symlinks=True)
+        else:
+            try:
+                os.link(source, destination, follow_symlinks=False)
+            except OSError:
+                shutil.copy2(source, destination, follow_symlinks=False)
+
+    def _capture_registration_workspace(agent_name: str, work_dir: Path) -> dict:
+        """Capture only the files registration may create or rewrite."""
+        backup_dir = Path(tempfile.mkdtemp(prefix="pinky-agent-registration-"))
+        try:
+            root_existed = _path_node_exists(work_dir)
+            dirs_existed = {}
+            for rel in registration_managed_dirs:
+                resolve_agent_path(agent_name, work_dir, rel)
+                dirs_existed[rel] = _path_node_exists(work_dir / rel)
+            files_existed = {}
+            file_targets = {}
+            if root_existed:
+                for rel in registration_managed_files:
+                    source = resolve_agent_path(agent_name, work_dir, rel)
+                    file_targets[rel] = source
+                    existed = _path_node_exists(source)
+                    files_existed[rel] = existed
+                    if existed:
+                        _backup_path_node(source, backup_dir / rel)
+            else:
+                files_existed = {
+                    rel: False for rel in registration_managed_files
+                }
+                file_targets = {
+                    rel: resolve_agent_path(agent_name, work_dir, rel)
+                    for rel in registration_managed_files
+                }
+            return {
+                "root": work_dir,
+                "root_existed": root_existed,
+                "dirs_existed": dirs_existed,
+                "files_existed": files_existed,
+                "file_targets": file_targets,
+                "backup_dir": backup_dir,
+            }
+        except Exception:
+            shutil.rmtree(backup_dir, ignore_errors=True)
+            raise
+
+    def _discard_registration_workspace_capture(state: dict) -> None:
+        shutil.rmtree(state["backup_dir"], ignore_errors=True)
+
+    def _restore_registration_workspace(state: dict) -> None:
+        """Remove registration artifacts and restore pre-existing managed files."""
+        work_dir = state["root"]
+        try:
+            if not state["root_existed"]:
+                _remove_path_node(work_dir)
+                return
+
+            backup_dir = state["backup_dir"]
+            for rel, existed in state["files_existed"].items():
+                target = state["file_targets"][rel]
+                if existed:
+                    _restore_path_node(backup_dir / rel, target)
+                else:
+                    _remove_path_node(target)
+            for rel in reversed(registration_managed_dirs):
+                if not state["dirs_existed"][rel]:
+                    _remove_path_node(work_dir / rel)
+        finally:
+            _discard_registration_workspace_capture(state)
+
+    async def _rollback_agent_registration(
+        *,
+        name: str,
+        agent,
+        main_agent_before: str,
+        provisioner,
+        provision_attempted: bool,
+        delete_registration_row: bool,
+        workspace_state: dict,
+    ) -> None:
+        """Best-effort compensation for every post-winner registration stage."""
+        rollback_agent = agent or agents.get(name)
+        if provision_attempted and provisioner is not None and rollback_agent is not None:
+            try:
+                await asyncio.to_thread(provisioner.deprovision, rollback_agent)
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation deprovision failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+        if delete_registration_row:
+            try:
+                agents.delete(name)
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation DB delete failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+            try:
+                if agents.get_main_agent() == name:
+                    if main_agent_before:
+                        agents.set_main_agent(main_agent_before)
+                    else:
+                        agents.delete_setting("main_agent")
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation main-agent restore failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+        restore_workspace = True
+        if not delete_registration_row:
+            current = agents.get(name)
+            if current and current.working_dir:
+                try:
+                    restore_workspace = (
+                        Path(current.working_dir).resolve()
+                        != workspace_state["root"]
+                    )
+                except (OSError, RuntimeError, ValueError):
+                    restore_workspace = False
+        if restore_workspace:
+            try:
+                _restore_registration_workspace(workspace_state)
+            except Exception as exc:  # noqa: BLE001 - compensation must continue
+                _log(
+                    "api: registration compensation workspace restore failed for "
+                    f"{name}: {type(exc).__name__}"
+                )
+        else:
+            _discard_registration_workspace_capture(workspace_state)
+
+    def _guard_soul_or_400(
+        agent,
+        old_content: str,
+        new_content: str,
+        *,
+        force_soul: bool,
+    ) -> None:
+        try:
+            agents.guard_soul_mutation(
+                agent.name,
+                old_content,
+                new_content,
+                display_name=agent.display_name,
+                force_soul=force_soul,
+            )
+        except SoulMutationRejectedError as exc:
+            # Deliberately content-free: HTTP errors routinely land in client
+            # logs, MCP transcripts, and operator consoles.
+            raise HTTPException(
+                400,
+                {
+                    "code": "soul_mutation_requires_force",
+                    **exc.summary.to_dict(),
+                },
+            ) from exc
+
+    def _write_guarded_soul_file(
+        agent,
+        path: Path,
+        content: str,
+        *,
+        force_soul: bool,
+        source: str,
+    ) -> bool:
+        """Snapshot and replace a CLAUDE.md, returning whether it changed."""
+        path = _agent_path_or_400(agent, path)
+        path_existed = path.exists()
+        old_content = path.read_text() if path_existed else agent.soul
+        if path_existed and old_content == content:
+            return False
+        _guard_soul_or_400(
+            agent,
+            old_content,
+            content,
+            force_soul=force_soul,
+        )
+        agents.snapshot_soul_before_mutation(
+            agent.name,
+            old_content,
+            source=f"{source}:before-file",
+        )
+        _write_agent_text(agent, path, content)
+        return True
+
     @app.post("/agents")
     async def register_agent(req: RegisterAgentRequest, request: Request):
-        """Register a new agent or update an existing one."""
-        # #149: registering/upserting agents is an ADMIN capability. This is the
-        # agent-mint/upsert collection route — it has no target agent in the
+        """Register a new agent; existing names are updated only via PUT."""
+        name = _agent_name_or_400(req.name)
+        # #149: registering agents is an ADMIN capability. This is the
+        # agent-mint collection route — it has no target agent in the
         # PATH, so the middleware's path-based isolation guard can't see it
         # (target is None → flows through). An isolated tenant reaching here with
         # a valid signature could mint a new full-trust agent OR upsert an
-        # existing record (including dropping its OWN isolated flag — a direct
-        # escape). Deny the whole route for isolated callers; agents are minted
+        # existing record under the historical upsert contract (including
+        # dropping its OWN isolated flag — a direct escape). POST is now
+        # create-only, but minting still remains admin-only. Deny the whole
+        # route for isolated callers; agents are minted
         # by an operator/admin, never self-served by a tenant. (Murzik #635
         # re-review catch.) Operator/browser sessions carry no internal-agent
         # header → caller "" → not isolated → unaffected.
@@ -6376,94 +6807,171 @@ npm run build</pre>
         if _is_isolated_agent(caller):
             _log(
                 f"isolation: denied isolated agent '{caller}' from POST /agents "
-                f"(admin mint/upsert, body name='{req.name}')"
+                "(admin mint, body name validated)"
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
-        # POST /agents is an UPSERT — remember whether this name already
-        # existed so a provisioning failure below rolls back only a NEWLY
-        # created agent. Hard-deleting a pre-existing agent (row + signing
-        # key) over a transient podman error would destroy a live tenant.
-        agent_existed_before = agents.get(req.name) is not None
-        agent = agents.register(
-            req.name,
-            display_name=req.display_name,
-            model=req.model,
-            soul=req.soul,
-            users=req.users,
-            boundaries=req.boundaries,
-            system_prompt=req.system_prompt,
-            working_dir=req.working_dir,
-            permission_mode=req.permission_mode,
-            allowed_tools=req.allowed_tools,
-            max_turns=req.max_turns,
-            timeout=req.timeout,
-            max_sessions=req.max_sessions,
-            plain_text_fallback=req.plain_text_fallback,
-            groups=req.groups,
-            auto_start=req.auto_start,
-            role=req.role,
-            heartbeat_interval=req.heartbeat_interval,
-            runtime=req.runtime,
-            transport=req.transport,
-            provider_url=req.provider_url,
-            provider_key=req.provider_key,
-            provider_model=req.provider_model,
-            provider_ref=req.provider_ref,
-            thinking_effort=req.thinking_effort,
-            strict_effort_enforcement=req.strict_effort_enforcement,
-            watchdog_config=req.watchdog_config or {},
-            isolated=req.isolated,
-            isolation_mode=req.isolation_mode,
-            container_image=req.container_image,
-        )
+
+        raw_work_dir = req.working_dir or f"data/agents/{name}"
+        try:
+            registration_work_dir = agents.resolve_registration_workspace(
+                name,
+                raw_work_dir,
+            )
+        except AgentWorkspaceOverlapError as exc:
+            raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
+        except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
+            raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
+        main_agent_before = agents.get_main_agent()
+        try:
+            workspace_state = _capture_registration_workspace(
+                name,
+                registration_work_dir
+            )
+        except AgentPathContainmentError as exc:
+            raise HTTPException(
+                400,
+                {"code": "agent_path_outside_workspace"},
+            ) from exc
+        except Exception as exc:
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+        # No availability read: agents.name is a PRIMARY KEY and the registry
+        # executes INSERT OR ABORT. That database decision is authoritative
+        # when concurrent clients race on the same name.
+        try:
+            agent = agents.register(
+                name,
+                create_only=True,
+                display_name=req.display_name,
+                model=req.model,
+                soul=req.soul,
+                users=req.users,
+                boundaries=req.boundaries,
+                system_prompt=req.system_prompt,
+                working_dir=req.working_dir,
+                permission_mode=req.permission_mode,
+                allowed_tools=req.allowed_tools,
+                max_turns=req.max_turns,
+                timeout=req.timeout,
+                max_sessions=req.max_sessions,
+                plain_text_fallback=req.plain_text_fallback,
+                groups=req.groups,
+                auto_start=req.auto_start,
+                role=req.role,
+                heartbeat_interval=req.heartbeat_interval,
+                runtime=req.runtime,
+                transport=req.transport,
+                provider_url=req.provider_url,
+                provider_key=req.provider_key,
+                provider_model=req.provider_model,
+                provider_ref=req.provider_ref,
+                codex_home=req.codex_home,
+                thinking_effort=req.thinking_effort,
+                strict_effort_enforcement=req.strict_effort_enforcement,
+                dedicated_config_dir=req.dedicated_config_dir,
+                watchdog_config=req.watchdog_config or {},
+                isolated=req.isolated,
+                isolation_mode=req.isolation_mode,
+                container_image=req.container_image,
+            )
+        except AgentAlreadyExistsError as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(409, f"Agent '{name}' already exists") from exc
+        except AgentWorkspaceOverlapError as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
+        except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
+        except AgentRegistrationIncompleteError as exc:
+            await _rollback_agent_registration(
+                name=name,
+                agent=agents.get(name),
+                main_agent_before=main_agent_before,
+                provisioner=None,
+                provision_attempted=False,
+                delete_registration_row=exc.row_committed,
+                workspace_state=workspace_state,
+            )
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+        except Exception as exc:
+            _discard_registration_workspace_capture(workspace_state)
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+
         # Provision OS-level isolation resources. No-op for local (the default);
         # gated for container — when the runtime gate is OFF, get_provisioner
         # raises NotImplementedError and we skip (the start-time guard then
-        # blocks the agent until an operator opts in). On a real provision
-        # failure we roll back the just-registered agent so we never leave a
-        # half-provisioned tenant behind.
+        # blocks the agent until an operator opts in). Every failure after the
+        # INSERT winner is compensated across DB state, main-agent assignment,
+        # provisioning, MCP publication, and the managed workspace surface.
         from pinky_daemon.provisioning import ProvisionResult, get_provisioner
 
+        provisioner = None
+        provision_attempted = False
         try:
-            provisioner = get_provisioner(
-                agent.isolation_mode, signing_key_provider=agents.get_or_create_signing_key
-            )
-        except NotImplementedError:
-            provisioner = None  # dormant mode (e.g. container gate off)
-        if provisioner is not None:
-            # to_thread: provision drives blocking podman subprocesses (incl.
-            # a possible multi-minute image pull) — inline it would freeze the
-            # entire event loop (every poller + hook POST + UI request).
-            # provision() is an idempotent reconcile, so the (rare) overlap
-            # with a cold-start ensure_started in another thread converges:
-            # the loser errors on a name conflict and the next attempt heals.
             try:
-                result = await asyncio.to_thread(provisioner.provision, agent)
-            except Exception as e:  # belt-and-braces: the ABC contract is
-                # "return ok=False", but a provisioner that raises instead
-                # must hit the same rollback logic, not skip it.
-                result = ProvisionResult(
-                    ok=False, mode=agent.isolation_mode, message=str(e)
+                provisioner = get_provisioner(
+                    agent.isolation_mode,
+                    signing_key_provider=agents.get_or_create_signing_key,
                 )
-            if not result.ok:
-                if not agent_existed_before:
-                    agents.delete(agent.name)  # roll back the NEW registration
-                    raise HTTPException(
-                        500, f"provisioning failed for '{agent.name}': {result.message}"
+            except NotImplementedError:
+                provisioner = None  # dormant mode (e.g. container gate off)
+            if provisioner is not None:
+                # to_thread: provision drives blocking podman subprocesses
+                # (including a possible multi-minute image pull).
+                provision_attempted = True
+                try:
+                    result = await asyncio.to_thread(provisioner.provision, agent)
+                except Exception as exc:
+                    result = ProvisionResult(
+                        ok=False,
+                        mode=agent.isolation_mode,
+                        message=str(exc),
                     )
-                # Pre-existing agent: keep the (updated) record — the cold-start
-                # ensure_started path re-provisions lazily once the cause is
-                # fixed. Deleting here would destroy a live tenant over a
-                # transient runtime error.
-                raise HTTPException(
-                    500,
-                    f"provisioning failed for '{agent.name}': {result.message} "
-                    f"(existing agent kept; it will re-provision at next start)",
-                )
-        # Write .mcp.json so the agent gets default MCP servers (memory, self, messaging)
-        work_dir = Path(agent.working_dir) if agent.working_dir else None
-        if work_dir:
-            _write_mcp_json(work_dir, req.name, agent_registry=agents, skill_store=skills)
+                if not result.ok:
+                    raise HTTPException(
+                        500,
+                        f"provisioning failed for '{agent.name}': {result.message}",
+                    )
+
+            # Publish MCP config only after provisioning succeeds.
+            _write_mcp_json(
+                registration_work_dir,
+                name,
+                agent_registry=agents,
+                skill_store=skills,
+            )
+            # The verified-contact bootstrap and its migration marker are the
+            # final registration stage. AgentRegistry makes those two writes
+            # atomic; ordering them after provisioning and MCP publication means
+            # no durable bootstrap state exists for a failed POST winner.
+            agents.finalize_registration(name)
+        except Exception as exc:
+            await _rollback_agent_registration(
+                name=name,
+                agent=agent,
+                main_agent_before=main_agent_before,
+                provisioner=provisioner,
+                provision_attempted=provision_attempted,
+                delete_registration_row=True,
+                workspace_state=workspace_state,
+            )
+            if isinstance(exc, HTTPException):
+                raise
+            raise HTTPException(
+                500,
+                {"code": "agent_registration_failed"},
+            ) from exc
+
+        _discard_registration_workspace_capture(workspace_state)
         return agent.to_dict()
 
     @app.get("/agents")
@@ -6854,12 +7362,7 @@ npm run build</pre>
         allowed_roots = [(Path.home() / ".claude" / "projects").resolve()]
         # #215: codex tmux agents tail rollouts under the codex session store
         # (``$CODEX_HOME/sessions`` or ``~/.codex/sessions``), not ~/.claude.
-        _codex_home = os.environ.get("CODEX_HOME", "").strip()
-        allowed_roots.append(
-            (Path(_codex_home) / "sessions").resolve()
-            if _codex_home
-            else (Path.home() / ".codex" / "sessions").resolve()
-        )
+        allowed_roots.append((codex_home_for(agent) / "sessions").resolve())
         if getattr(agent, "isolation_mode", "local") == "container":
             wd = (agent.working_dir or "").strip()
             if wd and Path(wd).is_absolute():
@@ -6867,6 +7370,23 @@ npm run build</pre>
 
                 allowed_roots.append(
                     (Path(container_config_dir(str(Path(wd).resolve()))) / "projects")
+                    .resolve()
+                )
+        # Dedicated-config-dir LOCAL agent (#550/Picard): claude runs with
+        # CLAUDE_CONFIG_DIR=<working_dir>/.claude-local, so its SessionStart hook
+        # legitimately reports transcripts under <working_dir>/.claude-local/
+        # projects/... — without this root the report 403s and the tailer never
+        # repoints off its cold-start guess.
+        if (
+            getattr(agent, "dedicated_config_dir", False)
+            and getattr(agent, "isolation_mode", "local") in ("", "local")
+        ):
+            wd = (agent.working_dir or "").strip()
+            if wd and Path(wd).is_absolute():
+                from pinky_daemon.provisioning import local_config_dir
+
+                allowed_roots.append(
+                    (Path(local_config_dir(str(Path(wd).resolve()))) / "projects")
                     .resolve()
                 )
         try:
@@ -7152,11 +7672,13 @@ npm run build</pre>
     @app.put("/agents/{name}")
     async def update_agent(name: str, req: UpdateAgentRequest):
         """Update an agent's configuration."""
+        name = _agent_name_or_400(name)
         existing = agents.get(name)
         if not existing:
             raise HTTPException(404, f"Agent '{name}' not found")
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        force_soul = bool(kwargs.pop("force_soul", False))
         # #638: flipping an agent to a non-local isolation_mode implies
         # isolated=True (same coupling RegisterAgentRequest enforces) — without
         # it a container tenant updated via PUT would keep isolated=False and
@@ -7180,7 +7702,25 @@ npm run build</pre>
                 "(bring-your-own image, e.g. 'registry/image:tag')",
             )
         was_container = getattr(existing, "isolation_mode", "local") == "container"
-        agent = agents.register(name, **kwargs)
+        try:
+            agent = agents.register(
+                name,
+                **kwargs,
+                force_soul=force_soul,
+                soul_source="api-put-force" if force_soul else "api-put",
+            )
+        except SoulMutationRejectedError as exc:
+            raise HTTPException(
+                400,
+                {
+                    "code": "soul_mutation_requires_force",
+                    **exc.summary.to_dict(),
+                },
+            ) from exc
+        except AgentWorkspaceOverlapError as exc:
+            raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
+        except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
+            raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
 
         isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
         if isolation_touched:
@@ -7550,12 +8090,12 @@ npm run build</pre>
     @app.post("/agents/{name}/claude-md/rebuild")
     async def rebuild_claude_md(name: str):
         """Deprecated — CLAUDE.md is now agent-owned. Returns current file content."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
 
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
-        claude_md = work_dir / "CLAUDE.md"
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
         content = claude_md.read_text() if claude_md.exists() else agent.soul or ""
         return {"content": content, "size": len(content), "deprecated": True}
 
@@ -7591,6 +8131,7 @@ npm run build</pre>
     @app.get("/agents/{name}/soul/versions")
     async def list_soul_versions(name: str, limit: int = 20):
         """List archived soul versions for an agent."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -7600,24 +8141,78 @@ npm run build</pre>
     @app.get("/agents/{name}/soul/versions/{version_id}")
     async def get_soul_version(name: str, version_id: int):
         """Get a specific soul version content."""
+        name = _agent_name_or_400(name)
         version = agents.get_soul_version(name, version_id)
         if not version:
             raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
         return version
 
     @app.post("/agents/{name}/soul/versions/{version_id}/restore")
-    async def restore_soul_version(name: str, version_id: int):
+    async def restore_soul_version(
+        name: str,
+        version_id: int,
+        req: RestoreSoulVersionRequest | None = None,
+    ):
         """Restore an agent's soul from an archived version."""
+        name = _agent_name_or_400(name)
         version = agents.get_soul_version(name, version_id)
         if not version:
             raise HTTPException(404, f"Soul version {version_id} not found for '{name}'")
-        agent = agents.register(name, soul=version["content"])
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+        force_soul = bool(req and req.force_soul)
+        work_dir = _agent_path_or_400(agent)
         work_dir.mkdir(parents=True, exist_ok=True)
-        (work_dir / "CLAUDE.md").write_text(version["content"])
-        agents.save_soul_version(name, version["content"], source=f"restore-v{version_id}")
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
+
+        # Validate both durable representations before changing either. Inc 2
+        # will make the dedicated soul endpoint own cross-store consistency;
+        # this keeps the existing restore adapter from bypassing Inc 1 policy.
+        _guard_soul_or_400(
+            agent,
+            agent.soul,
+            version["content"],
+            force_soul=force_soul,
+        )
+        if claude_md.exists():
+            _guard_soul_or_400(
+                agent,
+                claude_md.read_text(),
+                version["content"],
+                force_soul=force_soul,
+            )
+
+        source = f"restore-v{version_id}" + ("-force" if force_soul else "")
+        try:
+            agents.register(
+                name,
+                soul=version["content"],
+                force_soul=force_soul,
+                soul_source=source,
+            )
+        except SoulMutationRejectedError as exc:  # defensive after preflight
+            raise HTTPException(
+                400,
+                {
+                    "code": "soul_mutation_requires_force",
+                    **exc.summary.to_dict(),
+                },
+            ) from exc
+        _write_guarded_soul_file(
+            agent,
+            claude_md,
+            version["content"],
+            force_soul=force_soul,
+            source=source,
+        )
         _log(f"api: restored soul version {version_id} for {name}")
-        return {"restored": True, "agent": name, "version_id": version_id}
+        return {
+            "restored": True,
+            "agent": name,
+            "version_id": version_id,
+            "force_soul": force_soul,
+        }
 
     @app.delete("/agents/{name}")
     async def retire_agent(name: str):
@@ -7650,6 +8245,7 @@ npm run build</pre>
     @app.post("/agents/{name}/restore")
     async def restore_agent(name: str):
         """Restore a retired agent back to active."""
+        name = _agent_name_or_400(name)
         restored = agents.restore(name)
         if not restored:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -7686,6 +8282,195 @@ npm run build</pre>
         if not agents.toggle_directive(directive_id, active):
             raise HTTPException(404, "Directive not found")
         return {"id": directive_id, "active": active}
+
+    # ── Buzz identity owner control (#541 inc1) ────────────
+
+    app.state.buzz_poller_tasks = set()
+
+    async def _restart_buzz_poller(name: str) -> bool:
+        """Apply one identity's current owner policy without restarting the daemon."""
+        from pinky_daemon.buzz_inbound import BrokerBuzzPoller
+
+        for poller in list(_broker_pollers):
+            if isinstance(poller, BrokerBuzzPoller) and poller.agent_name == name:
+                poller.stop()
+                _broker_pollers.remove(poller)
+        identity = agents.get_buzz_identity(name)
+        policy = agents.get_buzz_inbound_policy(name)
+        if (
+            not identity
+            or not identity["enabled"]
+            or identity["status"] != "active"
+            or not policy
+            or not policy["channels"]
+            or not policy["principals"]
+        ):
+            return False
+        material = agents.get_buzz_signing_material(name)
+        if material is None:
+            return False
+        poller = BrokerBuzzPoller(
+            material,
+            broker,
+            agents,
+            _notify_owner_alert,
+        )
+        _broker_pollers.append(poller)
+        task = asyncio.create_task(poller.start())
+        app.state.buzz_poller_tasks.add(task)
+
+        def _release_buzz_task(done: asyncio.Task) -> None:
+            app.state.buzz_poller_tasks.discard(done)
+            if done.cancelled():
+                return
+            try:
+                exc = done.exception()
+            except Exception:
+                return
+            if exc is not None:
+                _log(f"api: Buzz poller task failed for {name} ({type(exc).__name__})")
+
+        task.add_done_callback(_release_buzz_task)
+        _log(f"api: native Buzz inbound poller started for {name}")
+        return True
+
+    @app.get("/system/buzz-identities")
+    async def list_buzz_identities(request: Request):
+        """List redacted Buzz identities for the authenticated owner."""
+        _owner_control_actor(request)
+        identities = agents.list_buzz_identities()
+        return {"identities": identities, "count": len(identities)}
+
+    @app.get("/system/buzz-identities/{name}")
+    async def get_buzz_identity(name: str, request: Request):
+        """Read one redacted Buzz identity for the authenticated owner."""
+        _owner_control_actor(request)
+        identity = agents.get_buzz_identity(name)
+        if identity is None:
+            raise HTTPException(404, "Buzz identity not found")
+        return identity
+
+    @app.put("/system/buzz-identities/{name}")
+    async def bind_buzz_identity(
+        name: str,
+        req: BindBuzzIdentityRequest,
+        request: Request,
+    ):
+        """One-step owner-approved Buzz bind; raw key is immediately wrapped."""
+        actor = _owner_control_actor(request)
+        try:
+            if req.inbound is not None:
+                identity, inbound_policy = agents.bind_buzz_identity_with_inbound_owner_control(
+                    name,
+                    private_key=req.private_key,
+                    relay_url=req.relay_url,
+                    community_id=req.community_id,
+                    relay_signing_pubkey=req.relay_signing_pubkey,
+                    enabled=req.enabled,
+                    owner_pubkey=req.inbound.owner_pubkey,
+                    channels=[item.model_dump() for item in req.inbound.channels],
+                    approved_users=[item.model_dump() for item in req.inbound.approved_users],
+                    owner_actor=actor,
+                )
+            else:
+                identity = agents.bind_buzz_identity_owner_control(
+                    name,
+                    private_key=req.private_key,
+                    relay_url=req.relay_url,
+                    community_id=req.community_id,
+                    relay_signing_pubkey=req.relay_signing_pubkey,
+                    enabled=req.enabled,
+                    owner_actor=actor,
+                )
+                inbound_policy = None
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            status = 409 if "rotation" in str(exc) or "conflicts" in str(exc) else 400
+            raise HTTPException(status, str(exc)) from exc
+        _evict_platform_adapters(name, "buzz")
+        await _restart_buzz_poller(name)
+        audit.log(
+            "buzz_identity_bound",
+            agent_name=name,
+            tool_name="owner_control",
+            tool_input_summary=json.dumps(
+                {
+                    "agent": name,
+                    "pubkey": identity["pubkey"],
+                    "community_id": identity["community_id"],
+                    "enabled": identity["enabled"],
+                    "tos_approval_ref": identity["tos_approval_ref"],
+                },
+                separators=(",", ":"),
+            ),
+        )
+        if inbound_policy is not None:
+            return {**identity, "inbound": inbound_policy}
+        return identity
+
+    @app.get("/system/buzz-identities/{name}/inbound")
+    async def get_buzz_inbound_policy(name: str, request: Request):
+        """Read the exact community-scoped inbound authorization policy."""
+        _owner_control_actor(request)
+        policy = agents.get_buzz_inbound_policy(name)
+        if policy is None:
+            raise HTTPException(404, "Buzz inbound policy not configured")
+        return policy
+
+    @app.put("/system/buzz-identities/{name}/inbound")
+    async def configure_buzz_inbound_policy(
+        name: str,
+        req: ConfigureBuzzInboundRequest,
+        request: Request,
+    ):
+        """Owner-control replace of both load-bearing Buzz inbound gates."""
+        actor = _owner_control_actor(request)
+        try:
+            policy = agents.configure_buzz_inbound_owner_control(
+                name,
+                owner_pubkey=req.owner_pubkey,
+                channels=[item.model_dump() for item in req.channels],
+                approved_users=[item.model_dump() for item in req.approved_users],
+                owner_actor=actor,
+            )
+        except KeyError as exc:
+            raise HTTPException(404, str(exc)) from exc
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        started = await _restart_buzz_poller(name)
+        audit.log(
+            "buzz_inbound_policy_configured",
+            agent_name=name,
+            tool_name="owner_control",
+            tool_input_summary=json.dumps(
+                {
+                    "agent": name,
+                    "community_id": policy["community_id"],
+                    "channel_count": len(policy["channels"]),
+                    "approved_principal_count": len(policy["principals"]),
+                    "actor": actor,
+                },
+                separators=(",", ":"),
+            ),
+        )
+        return {**policy, "poller_started": started}
+
+    @app.post("/system/buzz-identities/{name}/disable")
+    async def disable_buzz_identity(name: str, request: Request):
+        """Disable outbound Buzz without deleting the encrypted authority row."""
+        actor = _owner_control_actor(request)
+        if not agents.disable_buzz_identity(name):
+            raise HTTPException(404, "Buzz identity not found")
+        _evict_platform_adapters(name, "buzz")
+        await _restart_buzz_poller(name)
+        audit.log(
+            "buzz_identity_disabled",
+            agent_name=name,
+            tool_name="owner_control",
+            tool_input_summary=json.dumps({"agent": name, "actor": actor}),
+        )
+        return agents.get_buzz_identity(name)
 
     # ── Agent Tokens ────────────────────────────────────────
 
@@ -8382,6 +9167,44 @@ npm run build</pre>
             raise HTTPException(404, "Group chat not found")
         return {"deactivated": True, "chat_id": chat_id}
 
+    # ── Verified Contacts ──────────────────────────────────
+
+    @app.get("/agents/{name}/verified-contacts")
+    async def list_verified_contacts(name: str):
+        """List explicit principal-to-name trust decisions for an agent."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        contacts = agents.list_verified_contacts(name)
+        return {"agent": name, "verified_contacts": contacts, "count": len(contacts)}
+
+    @app.put("/agents/{name}/verified-contacts")
+    async def upsert_verified_contact(
+        name: str,
+        platform: str,
+        principal: str,
+        contact_name: str = Query(..., alias="name"),
+        role: str = "",
+    ):
+        """Upsert one explicit verified contact."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        try:
+            contact = agents.upsert_verified_contact(
+                name, platform, principal, contact_name, role
+            )
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        return {"updated": True, "verified_contact": contact}
+
+    @app.delete("/agents/{name}/verified-contacts")
+    async def delete_verified_contact(name: str, platform: str, principal: str):
+        """Delete one explicit verified contact."""
+        if not agents.get(name):
+            raise HTTPException(404, f"Agent '{name}' not found")
+        if not agents.delete_verified_contact(name, platform, principal):
+            raise HTTPException(404, "Verified contact not found")
+        return {"deleted": True, "platform": platform, "principal": principal}
+
     # ── Channel → Session Assignment ──────────────────────
 
     @app.get("/agents/{name}/channel-sessions")
@@ -8483,6 +9306,11 @@ npm run build</pre>
         # session keeps persisting turns and resume handles under the old name.
         ss._config.label = new_label
         ss._on_resume_handle = await _make_streaming_resume_handle_callback(name, new_label)
+        if hasattr(ss, "_on_resume_handle_sync"):
+            ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
+                name,
+                new_label,
+            )
         # Update stored session ID mapping
         old_sid = agents.get_streaming_session_id(name, label=label)
         if old_sid:
@@ -8577,7 +9405,11 @@ npm run build</pre>
         _deny_isolated_cross_actor(request, agent_name)
 
         ctx = _resolve_message_context(agent_name, source_message_id)
-        effective_thread_root = ctx.reply_to or ctx.message_id
+        # Buzz/Nostr's reply marker targets the exact source event. Slack's
+        # thread_ts model instead collapses child replies to their stored root.
+        effective_thread_root = (
+            ctx.message_id if ctx.platform == "buzz" else ctx.reply_to or ctx.message_id
+        )
         voice_settings = _get_voice_reply_settings(agent_name, ctx.platform)
 
         if ctx.source_was_voice and voice_settings:
@@ -8618,6 +9450,7 @@ npm run build</pre>
             parse_mode=parse_mode,
             link_preview_options=link_preview_options,
             quote=quote,
+            reply_metadata=_buzz_reply_metadata(ctx),
         )
         _record_outbound_message(
             agent_name,
@@ -9136,32 +9969,29 @@ npm run build</pre>
                 pass
 
             try:
-                # Arm fresh-launch intent BEFORE disconnect.  If a
-                # broker/watchdog wake races the teardown's transient DEAD
-                # state, its launch must inherit the force-fresh contract
-                # rather than resume the old transcript.
-                _refresh_streaming_launch_config(name, ss)
-                ss._config.wake_context = _build_streaming_wake_context(
-                    name, commit=False
-                )
-                ss._config.resume_handle = ""
-                ss._config.restart_reason = "context_restart"
-                # PR for #543: explicit launch-behavior contract — the next
-                # transport spawn must NOT resume the prior conversation.
-                ss._config.force_fresh_context_once = True
-                ss.resume_handle = ""
-                # Codex sessions track thread_id separately on the session.
-                if hasattr(ss, "codex_session_id"):
-                    if ss.codex_session_id:
-                        _log(
-                            f"api: clearing stale codex thread "
-                            f"{ss.codex_session_id[:12]} for {name}"
-                        )
-                    ss.codex_session_id = ""
+                def _configure_context_restart() -> None:
+                    # This callback runs inside restart_transport only after its
+                    # replacement preflight succeeds, but before teardown. A
+                    # racing wake therefore inherits force-fresh intent without
+                    # a refusal corrupting the still-live transport.
+                    _refresh_streaming_launch_config(name, ss)
+                    ss._config.wake_context = _build_streaming_wake_context(
+                        name, commit=False
+                    )
+                    ss._config.resume_handle = ""
+                    ss._config.restart_reason = "context_restart"
+                    ss._config.force_fresh_context_once = True
+                    ss.resume_handle = ""
+                    if hasattr(ss, "codex_session_id"):
+                        if ss.codex_session_id:
+                            _log(
+                                f"api: clearing stale codex thread "
+                                f"{ss.codex_session_id[:12]} for {name}"
+                            )
+                        ss.codex_session_id = ""
+                    agents.set_streaming_session_id(name, "", label="main")
 
-                await ss.disconnect()
-                agents.set_streaming_session_id(name, "", label="main")
-                await ss.connect()
+                await ss.restart_transport(configure=_configure_context_restart)
                 _log(f"api: streaming session restarted for {name}")
                 activity.log(
                     name, "context_restart", f"{name} context restarted"
@@ -9311,10 +10141,6 @@ npm run build</pre>
             if not guard["restart_safe"]:
                 raise HTTPException(409, _guard_message("restart", guard))
 
-            # Persist only once the restart is actually going ahead, so a 409
-            # above leaves the DB matching the still-running session.
-            agents.register(name, model=req.model)
-
             # Ask agent to save state
             try:
                 await ss._client.query(
@@ -9327,21 +10153,27 @@ npm run build</pre>
             # Restart streaming session
             old_resume_handle = ss.resume_handle
             old_turns = ss._stats["turns"]
-            await ss.disconnect()
-            agents.set_streaming_session_id(name, "", label="main")
-            ss._config.resume_handle = ""
-            ss.resume_handle = ""
-            if hasattr(ss, "codex_session_id"):
-                if ss.codex_session_id:
-                    _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
-                ss.codex_session_id = ""
-            # This is a retained-object rebuild, so refresh every durable
-            # launch setting (not just the newly-persisted model). Provider,
-            # effort, and Codex's transport-level caches may have changed in
-            # the registry since the object was constructed.
-            _refresh_streaming_launch_config(name, ss)
+
+            def _configure_model_restart() -> None:
+                # Persist and mutate the retained object only after the common
+                # replacement preflight has protected the live transport.
+                agents.register(name, model=req.model)
+                agents.set_streaming_session_id(name, "", label="main")
+                ss._config.resume_handle = ""
+                ss.resume_handle = ""
+                if hasattr(ss, "codex_session_id"):
+                    if ss.codex_session_id:
+                        _log(
+                            f"api: clearing stale codex thread "
+                            f"{ss.codex_session_id[:12]} for {name}"
+                        )
+                    ss.codex_session_id = ""
+                # Refresh every durable launch setting, including provider,
+                # effort, and backend-specific transport caches.
+                _refresh_streaming_launch_config(name, ss)
+
             try:
-                await ss.connect()
+                await ss.restart_transport(configure=_configure_model_restart)
                 _log(f"api: restarted {name} with model {req.model}")
             except Exception as e:
                 broker.unregister_streaming(name)
@@ -9418,19 +10250,24 @@ npm run build</pre>
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
-        await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
+        def _configure_archive_restart() -> None:
+            agents.set_streaming_session_id(name, "", label="main")
+            ss._config.wake_context = _build_streaming_wake_context(
+                name, commit=False
+            )
+            _refresh_streaming_launch_config(name, ss)
+            ss._config.resume_handle = ""
+            ss.resume_handle = ""
+            if hasattr(ss, "codex_session_id"):
+                if ss.codex_session_id:
+                    _log(
+                        f"api: clearing stale codex thread "
+                        f"{ss.codex_session_id[:12]} for {name}"
+                    )
+                ss.codex_session_id = ""
 
-        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
-        _refresh_streaming_launch_config(name, ss)
-        ss._config.resume_handle = ""
-        ss.resume_handle = ""
-        if hasattr(ss, "codex_session_id"):
-            if ss.codex_session_id:
-                _log(f"api: clearing stale codex thread {ss.codex_session_id[:12]} for {name}")
-            ss.codex_session_id = ""
         try:
-            await ss.connect()
+            await ss.restart_transport(configure=_configure_archive_restart)
             _log(f"api: archived and restarted session for {name}")
         except Exception as e:
             broker.unregister_streaming(name)
@@ -10004,19 +10841,21 @@ npm run build</pre>
     @app.get("/agents/{name}/files")
     async def list_agent_files(name: str):
         """List heart files in the agent's working directory."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        work_dir = Path(agent.working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         if not work_dir.exists():
             return {"agent": name, "working_dir": str(work_dir), "files": [], "exists": False}
         # Heart file extensions — config, soul, and docs
         heart_exts = {".md", ".yaml", ".yml", ".toml", ".json", ".txt", ".cfg", ".ini"}
         files = []
-        for f in sorted(work_dir.iterdir()):
+        for entry in sorted(work_dir.iterdir()):
+            f = _agent_path_or_400(agent, entry.name)
             if f.is_file() and not f.name.startswith('.') and (f.suffix in heart_exts or f.name == "CLAUDE.md"):
                 files.append({
-                    "name": f.name,
+                    "name": entry.name,
                     "size": f.stat().st_size,
                     "modified": f.stat().st_mtime,
                     "is_claude_md": f.name == "CLAUDE.md",
@@ -10026,39 +10865,45 @@ npm run build</pre>
     @app.get("/agents/{name}/files/{filename}")
     async def read_agent_file(name: str, filename: str):
         """Read a heart file from the agent's working directory."""
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        work_dir = Path(agent.working_dir).resolve()
-        file_path = work_dir / filename
-        # Safety: don't serve files outside the working dir. Resolve first so
-        # a symlink inside the dir pointing elsewhere is rejected too, and
-        # check containment before existence so outside paths 403, not 404.
-        # is_relative_to avoids the '/dir' vs '/dir-evil' prefix pitfall.
-        if not file_path.resolve().is_relative_to(work_dir):
-            raise HTTPException(403, "Access denied")
+        file_path = _agent_path_or_400(agent, filename)
         if not file_path.exists() or not file_path.is_file():
             raise HTTPException(404, f"File '{filename}' not found")
         return {"name": filename, "content": file_path.read_text(errors="replace")}
 
     @app.put("/agents/{name}/files/{filename}")
-    async def write_agent_file(name: str, filename: str, req: SendMessageRequest):
+    async def write_agent_file(name: str, filename: str, req: WriteAgentFileRequest):
         """Write a heart file to the agent's working directory.
 
         Uses content field for file contents.
         """
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
-        work_dir = Path(agent.working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         work_dir.mkdir(parents=True, exist_ok=True)
-        file_path = work_dir / filename
-        # Safety check (resolve first; is_relative_to avoids prefix pitfalls)
-        if not file_path.resolve().is_relative_to(work_dir):
-            raise HTTPException(403, "Access denied")
-        file_path.write_text(req.content)
-        if filename == "CLAUDE.md":
-            agents.save_soul_version(name, req.content, source="api")
+        file_path = _agent_path_or_400(agent, filename)
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
+        is_soul_file = filename.casefold() == "claude.md"
+        if not is_soul_file and file_path.exists() and claude_md.exists():
+            # A symlink or case-insensitive alias must not turn the generic
+            # heart-file writer into a CLAUDE.md guard bypass.
+            is_soul_file = file_path.samefile(claude_md)
+        if is_soul_file:
+            file_path = claude_md
+            _write_guarded_soul_file(
+                agent,
+                file_path,
+                req.content,
+                force_soul=req.force_soul,
+                source="api-file-force" if req.force_soul else "api-file",
+            )
+        else:
+            _write_agent_text(agent, file_path, req.content)
         _log(f"api: wrote {filename} to {work_dir} for agent {name}")
         return {"written": True, "name": filename, "size": len(req.content)}
 
@@ -10072,6 +10917,7 @@ npm run build</pre>
         tools, permissions, and active directives. Writes CLAUDE.md to
         the agent's working directory before spawning.
         """
+        name = _agent_name_or_400(name)
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
@@ -10082,13 +10928,18 @@ npm run build</pre>
         system_prompt = agents.build_system_prompt(name, skill_store=skills)
 
         # Ensure working directory exists and write CLAUDE.md
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+        work_dir = _agent_path_or_400(agent)
         work_dir.mkdir(parents=True, exist_ok=True)
-        claude_md = work_dir / "CLAUDE.md"
-        # Snapshot on-disk content before overwriting (catches agent self-edits)
+        claude_md = _agent_path_or_400(agent, "CLAUDE.md")
+        # Accepted-by-design publication semantics: CLAUDE.md is a compiled
+        # artifact from the DB-authoritative soul plus current directives and
+        # skills. Spawn intentionally overwrites it without the shrink/anchor
+        # guard, while the common writer still enforces owner-root containment
+        # and atomically replaces links instead of writing through their inode.
+        # Snapshot on-disk content before overwriting (catches agent self-edits).
         if claude_md.exists():
             agents.save_soul_version(name, claude_md.read_text(), source="agent")
-        claude_md.write_text(system_prompt)
+        _write_agent_text(agent, claude_md, system_prompt)
         agents.save_soul_version(name, system_prompt, source="spawn")
         _log(f"api: wrote CLAUDE.md ({len(system_prompt)} chars) to {work_dir}")
 
@@ -10224,6 +11075,48 @@ npm run build</pre>
         if not agents.remove_schedule(schedule_id):
             raise HTTPException(404, f"Schedule {schedule_id} not found")
         return {"deleted": True}
+
+    @app.delete(
+        "/agents/{agent_name}/pending-schedule-wakes/{pending_id}"
+    )
+    async def discard_pending_schedule_wake(
+        agent_name: str, pending_id: int, request: Request
+    ):
+        """Discard one active stranded wake owned by ``agent_name``."""
+        # Browser sessions carry operator authority across agents. Internal
+        # HMAC callers do not: repeat the destructive self-scope at the route
+        # even though the middleware already authenticated the signature.
+        if not _has_valid_session(request):
+            caller_name = request.headers.get(INTERNAL_AGENT_HEADER, "").strip()
+            if (
+                not caller_name
+                or not _has_valid_internal_auth(request)
+                or caller_name != agent_name
+            ):
+                raise HTTPException(
+                    403,
+                    "internal caller may only discard its own pending "
+                    "schedule wakes",
+                )
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not agents.discard_pending_schedule_wake(
+            pending_id, agent_name=agent_name
+        ):
+            raise HTTPException(
+                404,
+                f"Active pending schedule wake {pending_id} not found "
+                f"for agent '{agent_name}'",
+            )
+        _log(
+            f"scheduler: PERSISTED_WAKE_DISCARDED pending #{pending_id} "
+            f"by agent '{agent_name}'"
+        )
+        return {
+            "discarded": True,
+            "pending_id": pending_id,
+            "agent": agent_name,
+        }
 
     @app.post("/agents/{agent_name}/schedules/{schedule_id}/toggle")
     async def toggle_schedule(agent_name: str, schedule_id: int, enabled: bool = True):
@@ -10715,6 +11608,16 @@ npm run build</pre>
             or stats.get("inflight_active") is True
         )
 
+    def _scheduler_drain_busy(agent_name: str) -> bool:
+        """Recheck current pane state for the periodic durable-outbox drain."""
+        ss = broker._get_streaming_session(agent_name)
+        if ss is None:
+            return False
+        probe = getattr(ss, "scheduler_drain_busy", None)
+        if not callable(probe):
+            return _scheduler_delivery_busy(agent_name)
+        return probe() is True
+
     def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
         """Per-turn execution state: is this wake pasted with an open receipt?
 
@@ -10727,7 +11630,26 @@ npm run build</pre>
             return False
         return probe(prompt) is True
 
-    async def _notify_owner_undelivered(
+    def _scheduler_wake_queued(agent_name: str, prompt: str) -> bool:
+        """Per-turn queue state: is this wake live and still recallable?"""
+        ss = broker._get_streaming_session(agent_name)
+        probe = getattr(ss, "scheduler_wake_queued", None) if ss else None
+        if not callable(probe):
+            return False
+        return probe(prompt) is True
+
+    async def _cancel_scheduler_wake(agent_name: str, prompt: str) -> bool:
+        """Recall an exact queued wake and preserve the transport outcome."""
+        ss = broker._get_streaming_session(agent_name)
+        cancel = getattr(ss, "cancel_scheduler_wake", None) if ss else None
+        if not callable(cancel):
+            return False
+        result = cancel(prompt)
+        if inspect.isawaitable(result):
+            result = await result
+        return result is True
+
+    async def _notify_owner_alert(
         agent_name: str, message: str
     ) -> bool:
         """Send scheduler failures through canonical and host-local fallbacks."""
@@ -10871,6 +11793,8 @@ npm run build</pre>
         )
         return False
 
+    dream_runner.set_owner_notify_callback(_notify_owner_alert)
+
     scheduler = AgentScheduler(
         agents,
         wake_callback=_wake_callback,
@@ -10882,8 +11806,11 @@ npm run build</pre>
         streaming_sessions_fn=lambda: broker._streaming,
         comms_cleanup_fn=comms.cleanup_expired,
         delivery_busy_fn=_scheduler_delivery_busy,
+        delivery_drain_busy_fn=_scheduler_drain_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
-        owner_notify_callback=_notify_owner_undelivered,
+        delivery_queued_fn=_scheduler_wake_queued,
+        delivery_cancel_queued_fn=_cancel_scheduler_wake,
+        owner_notify_callback=_notify_owner_alert,
         trigger_store=trigger_store,
         activity=activity,
     )
@@ -10919,14 +11846,19 @@ npm run build</pre>
             sessions = broker._streaming.get(agent_name, {})
             ss = sessions.get(label)
             if ss:
-                try:
-                    await ss.disconnect()
-                except Exception:
-                    pass
-                agents.set_streaming_session_id(agent_name, "", label=label)
-                broker.unregister_streaming(agent_name, label=label)
-            await asyncio.sleep(2)
-            await _ensure_streaming_session(agent_name, label=label)
+                async def _rebuild_watchdog_transport() -> None:
+                    agents.set_streaming_session_id(agent_name, "", label=label)
+                    broker.unregister_streaming(agent_name, label=label)
+                    await asyncio.sleep(2)
+                    await _ensure_streaming_session(agent_name, label=label)
+
+                await ss.restart_transport(
+                    bring_up=_rebuild_watchdog_transport,
+                    suppress_teardown_errors=True,
+                )
+            else:
+                await asyncio.sleep(2)
+                await _ensure_streaming_session(agent_name, label=label)
             _log(f"watchdog: {agent_name}/{label} recovered successfully")
         except Exception as exc:
             _log(f"watchdog: recovery failed for {agent_name}/{label}: {exc}")
@@ -11194,32 +12126,38 @@ npm run build</pre>
             title=f"Watchdog MCP-recover ({label}): {reason}",
             metadata=audit_meta,
         )
-        try:
-            await ss.disconnect()
-        except Exception:
-            pass
-        agents.set_streaming_session_id(agent_name, "", label=label)
-        # The agent couldn't refresh save_my_context (its MCP was dead) — bump
-        # so any context-staleness gate is satisfied; preserve saved state.
-        try:
-            agents.bump_context_updated_at(agent_name)
-        except Exception:
-            pass
-        ss._config.wake_context = _build_streaming_wake_context(agent_name, commit=False)
-        _refresh_streaming_launch_config(agent_name, ss)
-        ss._config.resume_handle = ""
-        ss._config.restart_reason = "mcp_epoch_unbound"
-        ss._config.force_fresh_context_once = True
-        ss.resume_handle = ""
-        if hasattr(ss, "codex_session_id"):
-            ss.codex_session_id = ""
-        try:
+
+        def _configure_mcp_recovery() -> None:
+            agents.set_streaming_session_id(agent_name, "", label=label)
+            # The agent couldn't refresh save_my_context (its MCP was dead) —
+            # bump so any context-staleness gate is satisfied; preserve state.
+            try:
+                agents.bump_context_updated_at(agent_name)
+            except Exception:
+                pass
+            ss._config.wake_context = _build_streaming_wake_context(
+                agent_name, commit=False
+            )
+            _refresh_streaming_launch_config(agent_name, ss)
+            ss._config.resume_handle = ""
+            ss._config.restart_reason = "mcp_epoch_unbound"
+            ss._config.force_fresh_context_once = True
+            ss.resume_handle = ""
+            if hasattr(ss, "codex_session_id"):
+                ss.codex_session_id = ""
+
+        async def _connect_mcp_recovery(connect) -> None:
             # #202: a force-fresh MCP recovery boots a brand-new `claude`, so
-            # serialize it behind the cold-start gate too — it's globally
-            # rate-limited, but can still overlap a daemon cold boot / manual
-            # cold start and race the shared single-use OAuth refresh token.
+            # serialize it behind the cold-start gate too.
             async with _coldstart_gate(agent_name, label):
-                await ss.connect()
+                await connect()
+
+        try:
+            await ss.restart_transport(
+                configure=_configure_mcp_recovery,
+                connect_wrapper=_connect_mcp_recovery,
+                suppress_teardown_errors=True,
+            )
             session_event_store.log(
                 session_id=ss.id,
                 agent_name=agent_name,
@@ -11300,6 +12238,38 @@ npm run build</pre>
             sweep_db_permissions(Path(db_path).resolve().parent)
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
+
+        # R10/#580: a spawn that failed before broker registration may have
+        # retained a durable, possibly-live tmux child. Reconcile every record
+        # at daemon boot, including debts for dormant/disabled agents that the
+        # normal streaming-session loop below would never instantiate.
+        try:
+            from pinky_daemon.tmux_session import (
+                reconcile_tmux_spawn_cleanup_debts,
+            )
+
+            reaped_debts, outstanding_debts = (
+                await reconcile_tmux_spawn_cleanup_debts(
+                    Path(db_path).resolve().parent
+                )
+            )
+            if reaped_debts:
+                _log(
+                    f"startup: reaped {reaped_debts} retained tmux spawn "
+                    "cleanup debt(s)"
+                )
+            if outstanding_debts:
+                _log(
+                    f"ERROR startup: {outstanding_debts} retained tmux spawn "
+                    "cleanup debt(s) remain outstanding"
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            _log(
+                f"ERROR startup: tmux spawn cleanup debt reconciliation "
+                f"failed ({type(exc).__name__}: {exc})"
+            )
 
         # #863: resume durable owner-approval notification retries before
         # pollers can accept more inbound messages.
@@ -11563,6 +12533,18 @@ npm run build</pre>
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
 
+            # Buzz poller — native NIP-42 relay subscription. The helper is
+            # default-deny unless the encrypted identity AND both inbound
+            # authorization-gate tables are fully configured.
+            try:
+                if await _restart_buzz_poller(agent.name):
+                    _log(f"startup: Buzz inbound poller started for {agent.name}")
+            except Exception as e:
+                _log(
+                    f"startup: Buzz inbound poller refused for {agent.name}: "
+                    f"{type(e).__name__}"
+                )
+
             # iMessage poller — check if agent has imessage enabled in DB
             if agents.get_raw_token(agent.name, "imessage"):
                 try:
@@ -11731,6 +12713,11 @@ npm run build</pre>
         for poller in _broker_pollers:
             poller.stop()
         _broker_pollers.clear()
+        for task in list(app.state.buzz_poller_tasks):
+            task.cancel()
+        if app.state.buzz_poller_tasks:
+            await asyncio.gather(*app.state.buzz_poller_tasks, return_exceptions=True)
+        app.state.buzz_poller_tasks.clear()
         await autonomy.stop()
         await scheduler.stop()
         await watchdog.stop()
@@ -12452,22 +13439,23 @@ npm run build</pre>
         old_resume_handle = ss.resume_handle
         old_turns = ss._stats["turns"]
 
-        await ss.disconnect()
-        agents.set_streaming_session_id(name, "", label="main")
-
-        ss._config.wake_context = _build_streaming_wake_context(name, commit=False)
-        _refresh_streaming_launch_config(name, ss)
-        ss._config.resume_handle = ""
-        ss._config.restart_reason = "force_restart"
-        ss._config.force_fresh_context_once = True
-        ss.resume_handle = ""
-        if hasattr(ss, "codex_session_id"):
-            if ss.codex_session_id:
-                _log(
-                    f"api: clearing stale codex thread {ss.codex_session_id[:12]} "
-                    f"for {name} (force-restart)"
-                )
-            ss.codex_session_id = ""
+        def _configure_forced_restart() -> None:
+            agents.set_streaming_session_id(name, "", label="main")
+            ss._config.wake_context = _build_streaming_wake_context(
+                name, commit=False
+            )
+            _refresh_streaming_launch_config(name, ss)
+            ss._config.resume_handle = ""
+            ss._config.restart_reason = "force_restart"
+            ss._config.force_fresh_context_once = True
+            ss.resume_handle = ""
+            if hasattr(ss, "codex_session_id"):
+                if ss.codex_session_id:
+                    _log(
+                        f"api: clearing stale codex thread "
+                        f"{ss.codex_session_id[:12]} for {name} (force-restart)"
+                    )
+                ss.codex_session_id = ""
 
         audit_meta = {
             "label": "main",
@@ -12479,7 +13467,7 @@ npm run build</pre>
             "source": "force_restart_endpoint",
         }
         try:
-            await ss.connect()
+            await ss.restart_transport(configure=_configure_forced_restart)
             _log(
                 f"api: FORCE-restarted streaming session for {name} "
                 f"(heartbeat_age={heartbeat_age_sec}s, "
@@ -12520,11 +13508,16 @@ npm run build</pre>
         """Get scheduler status."""
         all_schedules = agents.get_all_schedules(enabled_only=False)
         auto_start = agents.list_auto_start_agents()
+        pending_health = agents.get_pending_schedule_wake_health()
         return {
             "running": scheduler.running,
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
+            "pending_schedule_wakes": pending_health,
+            "pending_schedule_wake_count": sum(
+                row["count"] for row in pending_health
+            ),
         }
 
     @app.get("/settings/heartbeat")
@@ -12925,9 +13918,37 @@ npm run build</pre>
             agent_name,
         )
         approval_backlog_health = agents.get_approval_backlog_health(agent_name)
+        buzz_poller = next(
+            (
+                poller
+                for poller in _broker_pollers
+                if getattr(poller, "agent_name", "") == agent_name
+                and getattr(poller, "health", {}).get("platform") == "buzz"
+            ),
+            None,
+        )
+        buzz_policy = agents.get_buzz_inbound_policy(agent_name)
+        buzz_identity = (
+            agents.get_buzz_identity(agent_name) if buzz_policy is not None else None
+        )
+        buzz_health = None
+        if buzz_poller is not None:
+            buzz_health = {**buzz_poller.health, "enabled": True}
+        elif buzz_policy is not None:
+            buzz_health = {
+                "platform": "buzz",
+                "agent": agent_name,
+                "enabled": bool(buzz_identity and buzz_identity["enabled"]),
+                "status": buzz_policy["status"],
+                "running": False,
+                "last_error": buzz_policy["last_error"],
+                "last_liveness_at": buzz_policy["last_liveness_at"],
+                "last_event_at": buzz_policy["last_event_at"],
+            }
         checks = {
             "approval_notifications": approval_notification_health,
             "approval_backlog": approval_backlog_health,
+            "buzz_inbound": buzz_health,
         }
 
         return {
@@ -12965,6 +13986,7 @@ npm run build</pre>
             issues.append("high_error_rate")
         approval_check = (checks or {}).get("approval_notifications", {})
         backlog_check = (checks or {}).get("approval_backlog", {})
+        buzz_check = (checks or {}).get("buzz_inbound") or {}
         if approval_check.get("failed"):
             issues.append("owner_notification_failed")
         elif approval_check.get("retrying"):
@@ -12975,6 +13997,10 @@ npm run build</pre>
             issues.append("approved_principal_blocked")
         elif backlog_check.get("pending_chats"):
             issues.append("approval_pending")
+        if buzz_check and buzz_check.get("enabled", True) and (
+            not buzz_check.get("running") or buzz_check.get("status") != "connected"
+        ):
+            issues.append("buzz_inbound_unhealthy")
 
         if not issues:
             return "healthy"

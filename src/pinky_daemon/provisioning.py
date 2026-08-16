@@ -123,6 +123,11 @@ CONTAINER_HOME = "/home/agent"
 # the existing same-path workdir mount — no extra mount, no path translation.
 # The home VOLUME still backs ~/.config etc. for any other CLIs in the image.
 CONTAINER_CONFIG_DIRNAME = ".claude-container"
+# The CLAUDE_CONFIG_DIR used by a LOCAL (non-container) agent that opted into
+# its own Claude subscription account via ``dedicated_config_dir`` — a
+# working-dir-scoped config dir so the agent holds its own OAuth login instead
+# of sharing the daemon user's ``~/.claude``. Mirrors CONTAINER_CONFIG_DIRNAME.
+LOCAL_CONFIG_DIRNAME = ".claude-local"
 # Conservative default resource caps for container tenants (the Pi 5 shares
 # 8GB with a POS stack). Operator-overridable per host; set to "0" to disable.
 CONTAINER_MEMORY_ENV = "PINKY_CONTAINER_MEMORY"
@@ -148,6 +153,14 @@ def container_config_dir(working_dir: str) -> str:
     """The CLAUDE_CONFIG_DIR used inside a container agent's runtime — a
     host-visible path inside the (same-path bind-mounted) working_dir."""
     return str(Path(working_dir) / CONTAINER_CONFIG_DIRNAME)
+
+
+def local_config_dir(working_dir: str) -> str:
+    """The CLAUDE_CONFIG_DIR for a LOCAL agent with ``dedicated_config_dir`` —
+    a working-dir-scoped config dir (``<working_dir>/.claude-local``) holding
+    that agent's own Claude account/login, instead of the shared ~/.claude.
+    Mirrors ``container_config_dir`` for the non-container case."""
+    return str(Path(working_dir) / LOCAL_CONFIG_DIRNAME)
 
 
 @dataclass

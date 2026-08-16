@@ -6,6 +6,9 @@ data/
 .claude/
 logs/
 .env
+# .env backups carry live credentials — the bare `.env` rule does NOT match
+# these, so ignore the whole backup family (operator account-switch rollbacks).
+.env.bak*
 __pycache__/
 *.pyc
 *.egg-info/

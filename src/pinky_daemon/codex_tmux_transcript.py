@@ -49,6 +49,7 @@ import sys
 from pathlib import Path
 from typing import Awaitable, Callable
 
+from pinky_daemon.codex_home import codex_home_for
 from pinky_daemon.turn_response import TurnResponse
 
 
@@ -206,7 +207,11 @@ class _CodexTurnBuffer:
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def _discover_codex_rollout(working_dir: str | Path) -> Path | None:
+def _discover_codex_rollout(
+    working_dir: str | Path,
+    *,
+    agent: object | None = None,
+) -> Path | None:
     """Scan ``~/.codex/sessions/**/rollout-*.jsonl`` and return the
     newest file whose ``session_meta.payload.cwd`` equals
     ``os.path.realpath(working_dir)``.
@@ -220,11 +225,10 @@ def _discover_codex_rollout(working_dir: str | Path) -> Path | None:
     """
     target_cwd = os.path.realpath(str(working_dir))
 
-    # Honor CODEX_HOME (the fleet sets it; #792 hardened its propagation to
-    # codex under tmux) — else fall back to ~/.codex. Discovery MUST scan the
-    # same session store the codex process actually writes to, or an agent
-    # launched with a fleet CODEX_HOME would never bind its transcript.
-    codex_home = Path(os.environ.get("CODEX_HOME") or (Path.home() / ".codex"))
+    # Discovery MUST scan the same store the Codex process writes to. An
+    # agent-scoped caller supplies its config so the helper applies the same
+    # flag, explicit override, and fallback as every launch transport.
+    codex_home = codex_home_for(agent)
     sessions_root = codex_home / "sessions"
     if not sessions_root.exists():
         return None

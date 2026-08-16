@@ -19,7 +19,7 @@ import inspect
 
 import pytest
 
-from pinky_daemon.transport import Transport
+from pinky_daemon.transport import Transport, TransportReplacementMixin
 from pinky_daemon.transport_state import SessionState
 
 
@@ -49,6 +49,7 @@ class _StubTransport:
 
     async def connect(self) -> None: ...
     async def disconnect(self) -> None: ...
+    async def restart_transport(self, **kwargs) -> None: ...
 
     async def send(
         self,
@@ -125,6 +126,50 @@ class TestRuntimeCheckable:
         assert not isinstance(_MissingState(), Transport)
 
 
+class TestTransportReplacementMixin:
+    class _ReplacementTransport(TransportReplacementMixin):
+        def __init__(self, *, refuse: bool = False):
+            self.refuse = refuse
+            self.events: list[str] = []
+
+        def _preflight_transport_replacement(self) -> None:
+            self.events.append("preflight")
+            if self.refuse:
+                raise RuntimeError("replacement refused")
+
+        async def disconnect(self) -> None:
+            self.events.append("disconnect")
+
+        async def connect(self) -> None:
+            self.events.append("connect")
+
+    @pytest.mark.asyncio
+    async def test_preflight_configure_teardown_bring_up_order(self):
+        transport = self._ReplacementTransport()
+
+        await transport.restart_transport(
+            configure=lambda: transport.events.append("configure")
+        )
+
+        assert transport.events == [
+            "preflight",
+            "configure",
+            "disconnect",
+            "connect",
+        ]
+
+    @pytest.mark.asyncio
+    async def test_preflight_refusal_preserves_live_transport_and_config(self):
+        transport = self._ReplacementTransport(refuse=True)
+
+        with pytest.raises(RuntimeError, match="replacement refused"):
+            await transport.restart_transport(
+                configure=lambda: transport.events.append("configure")
+            )
+
+        assert transport.events == ["preflight"]
+
+
 class TestSurfaceShape:
     """Lock in the public surface so silent name drift fails a test.
 
@@ -145,6 +190,7 @@ class TestSurfaceShape:
     REQUIRED_ASYNC_METHODS = {
         "connect",
         "disconnect",
+        "restart_transport",
         "send",
         "force_restart",
         "idle_sleep",

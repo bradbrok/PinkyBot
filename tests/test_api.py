@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import asyncio
+import inspect
 import json
 import logging
 import os
@@ -142,7 +144,11 @@ class TestSession:
     async def test_send_resumes_after_first(self):
         session = Session(session_id="test")
         session._runner.run = AsyncMock(
-            return_value=RunResult(output="ok", exit_code=0)
+            return_value=RunResult(
+                output="ok",
+                exit_code=0,
+                session_id="11111111-1111-4111-8111-111111111111",
+            )
         )
 
         await session.send("First message")
@@ -157,7 +163,11 @@ class TestSession:
     async def test_send_system_prompt_first_only(self):
         session = Session(session_id="test", system_prompt="Be helpful")
         session._runner.run = AsyncMock(
-            return_value=RunResult(output="ok", exit_code=0)
+            return_value=RunResult(
+                output="ok",
+                exit_code=0,
+                session_id="11111111-1111-4111-8111-111111111111",
+            )
         )
 
         await session.send("First")
@@ -322,6 +332,14 @@ class TestStreamingSession:
         fake_types.ToolResultBlock = ToolResultBlock
         fake_types.AssistantMessage = AssistantMessage
         fake_types.ResultMessage = ResultMessage
+        for message_type in (
+            "ConversationResetMessage",
+            "RateLimitEvent",
+            "StreamEvent",
+            "SystemMessage",
+            "UserMessage",
+        ):
+            setattr(fake_types, message_type, type(message_type, (), {}))
         # Stub for the SDK Literal — reader_loop's import-time invariant
         # check (PR #404) reads __args__ to defend against SDK rename.
         from typing import Literal as _Literal
@@ -958,6 +976,7 @@ class TestAPI:
             self.sent: list[tuple[str, str, str]] = []
             self.disconnect_calls = 0
             self.connect_calls = 0
+            self.restart_transport_calls = 0
 
         @property
         def state(self):
@@ -983,6 +1002,66 @@ class TestAPI:
         async def connect(self):
             self.connect_calls += 1
             self._state = self._TS.CONNECTED
+
+        async def restart_transport(
+            self,
+            *,
+            configure=None,
+            bring_up=None,
+            connect_wrapper=None,
+            suppress_teardown_errors=False,
+        ):
+            self.restart_transport_calls += 1
+            if configure is not None:
+                result = configure()
+                if inspect.isawaitable(result):
+                    await result
+            try:
+                await self.disconnect()
+            except Exception:
+                if not suppress_teardown_errors:
+                    raise
+            if bring_up is not None:
+                result = bring_up()
+                if inspect.isawaitable(result):
+                    await result
+            elif connect_wrapper is not None:
+                await connect_wrapper(self.connect)
+            else:
+                await self.connect()
+
+    def test_replacement_routes_use_one_transport_chokepoint(self):
+        """R3 P1-2: API replacement routes cannot recompose raw teardown/start."""
+        api_path = Path(__file__).parents[1] / "src" / "pinky_daemon" / "api.py"
+        module = ast.parse(api_path.read_text(encoding="utf-8"))
+        replacement_routes = {
+            "_restart_streaming_session_after_response",
+            "set_streaming_model",
+            "archive_streaming_session",
+            "_watchdog_recover",
+            "_watchdog_mcp_recover",
+            "admin_force_restart_agent",
+        }
+        functions = {
+            node.name: node
+            for node in ast.walk(module)
+            if isinstance(node, (ast.AsyncFunctionDef, ast.FunctionDef))
+            and node.name in replacement_routes
+        }
+
+        assert functions.keys() == replacement_routes
+        for name, function in functions.items():
+            session_calls = [
+                node.func.attr
+                for node in ast.walk(function)
+                if isinstance(node, ast.Call)
+                and isinstance(node.func, ast.Attribute)
+                and isinstance(node.func.value, ast.Name)
+                and node.func.value.id == "ss"
+            ]
+            assert "restart_transport" in session_calls, name
+            assert "disconnect" not in session_calls, name
+            assert "connect" not in session_calls, name
 
     def test_root(self):
         client = self._make_client()
@@ -1393,17 +1472,16 @@ class TestAPI:
                 assert "boom" in r.text
                 assert client.get("/agents/tenant").status_code == 404  # rolled back
 
-    def test_register_upsert_keeps_existing_agent_on_provision_failure(self, monkeypatch):
-        """#638: POST /agents is an UPSERT — a provision failure must only roll
-        back a NEWLY created agent. A pre-existing agent re-POSTed through a
-        failing provisioner is KEPT (500 says so explicitly): hard-deleting it
-        over a transient podman error would destroy a live tenant."""
+    def test_register_collision_never_reprovisions_existing_agent(self, monkeypatch):
+        """Create rollback remains, while collisions stop before provisioning."""
         from pinky_daemon import provisioning
 
         fail = {"on": False}
+        provision_calls = []
 
         class _TogglableProv:
             def provision(self, agent):
+                provision_calls.append(agent.name)
                 if fail["on"]:
                     return provisioning.ProvisionResult(
                         ok=False, mode="container", message="podman flaked"
@@ -1428,18 +1506,20 @@ class TestAPI:
                 assert "existing agent kept" not in r.text  # new-agent branch
                 assert client.get("/agents/newbie").status_code == 404
 
-                # Case B: agent exists (provision succeeded), then a re-POST
-                # hits a failing provisioner -> 500 but the agent SURVIVES.
+                # Case B: once the agent exists, re-POST is a DB collision.
+                # It never reaches the now-failing provisioner and the winner
+                # remains unchanged.
                 fail["on"] = False
                 r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
                 assert r.status_code == 200
+                calls_before_collision = list(provision_calls)
 
                 fail["on"] = True
-                r = client.post("/agents", json={"name": "tenant", "model": "sonnet"})
-                assert r.status_code == 500
-                assert "podman flaked" in r.text
-                assert "existing agent kept" in r.text
+                r = client.post("/agents", json={"name": "tenant", "model": "haiku"})
+                assert r.status_code == 409
+                assert provision_calls == calls_before_collision
                 assert client.get("/agents/tenant").status_code == 200  # NOT deleted
+                assert client.get("/agents/tenant").json()["model"] == "sonnet"
 
     def test_container_agent_mcp_json_carries_bearer_auth(self, monkeypatch):
         """#638/#623: a container agent's .mcp.json points every pinky-* server
@@ -1765,6 +1845,75 @@ class TestAPI:
                 assert resp.status_code == 403
                 assert "projects" in resp.json()["detail"].lower()
 
+    def test_transcript_path_uses_agent_codex_home_when_enabled(
+        self, monkeypatch
+    ):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            shared_home = os.path.join(tmpdir, "shared-codex")
+            work_dir = os.path.join(tmpdir, "agents", "codex-test")
+            monkeypatch.setenv("CODEX_HOME", shared_home)
+            monkeypatch.setenv("PINKY_CODEX_PER_AGENT_HOME", "1")
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                registered = client.post(
+                    "/agents",
+                    json={
+                        "name": "codex-test",
+                        "model": "gpt-test",
+                        "runtime": "codex_cli",
+                        "working_dir": work_dir,
+                    },
+                )
+                assert registered.status_code == 200
+
+                isolated = os.path.join(
+                    work_dir, ".codex", "sessions", "2026", "rollout.jsonl"
+                )
+                accepted = client.post(
+                    "/agents/codex-test/transport/transcript-path",
+                    json={"transcript_path": isolated},
+                )
+                assert accepted.status_code == 200
+
+                shared = os.path.join(
+                    shared_home, "sessions", "2026", "rollout.jsonl"
+                )
+                denied = client.post(
+                    "/agents/codex-test/transport/transcript-path",
+                    json={"transcript_path": shared},
+                )
+                assert denied.status_code == 403
+
+    def test_transcript_path_flag_off_keeps_shared_codex_root(self, monkeypatch):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = os.path.join(tmpdir, "test.db")
+            shared_home = os.path.join(tmpdir, "shared-codex")
+            work_dir = os.path.join(tmpdir, "agents", "codex-test")
+            monkeypatch.setenv("CODEX_HOME", shared_home)
+            monkeypatch.delenv("PINKY_CODEX_PER_AGENT_HOME", raising=False)
+            app = self._make_app(db_path)
+            with TestClient(app) as client:
+                registered = client.post(
+                    "/agents",
+                    json={
+                        "name": "codex-test",
+                        "model": "gpt-test",
+                        "runtime": "codex_cli",
+                        "working_dir": work_dir,
+                    },
+                )
+                assert registered.status_code == 200
+
+                shared = os.path.join(
+                    shared_home, "sessions", "2026", "rollout.jsonl"
+                )
+                accepted = client.post(
+                    "/agents/codex-test/transport/transcript-path",
+                    json={"transcript_path": shared},
+                )
+                assert accepted.status_code == 200
+
     def test_unix_user_agent_cannot_start_before_provisioner(self):
         """#149 phase-3 (Murzik #642 P1): an agent labeled isolation_mode=
         'unix_user' is accepted at registration but REFUSES to start (501)
@@ -2017,6 +2166,9 @@ class TestAPI:
                 assert session.__class__.__name__ == "TmuxSession"
                 assert session._config.model == "sonnet"
                 assert session.resume_handle == "pinky-tmux-agent"
+                assert callable(
+                    session._config.wake_submission_recovery_injector
+                )
 
     def test_wake_uses_codex_tmux_session_for_codex_tmux_transport(self):
         # #215 PR2: codex_cli + transport=tmux is now a VALID combo (it was
@@ -4633,7 +4785,11 @@ class TestAPI:
 
         with tempfile.TemporaryDirectory() as tmpdir, \
                 patch("pinky_daemon.dream_runner.SDKRunner._ensure_sdk", return_value=None), \
-                patch("pinky_daemon.dream_runner.SDKRunner.run", new=fake_run):
+                patch("pinky_daemon.dream_runner.SDKRunner.run", new=fake_run), \
+                patch(
+                    "pinky_daemon.dream_runner.TmuxDreamRunner",
+                    side_effect=AssertionError("real dream transport selected"),
+                ) as tmux_runner:
             db_path = os.path.join(tmpdir, "test.db")
             app = self._make_app(db_path)
             with TestClient(app) as client:
@@ -4645,6 +4801,7 @@ class TestAPI:
                 assert resp.status_code == 200
                 assert resp.json()["summary"] == "Dreamed successfully"
 
+        assert not tmux_runner.called
         assert captured_prompts
         assert "<conversation_history>" in captured_prompts[0]
         assert long_message in captured_prompts[0]
@@ -5374,6 +5531,121 @@ class TestAgentScheduleEndpoints:
         assert body["records"][0]["state"] == "receipted-ran-once"
         assert body["records"][0]["fired_at"] == 100.0
 
+        abandoned, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="Ambiguous receipt",
+            fired_at=200.0,
+        )
+        assert registry.abandon_pending_schedule_wake(
+            abandoned.id, abandoned_at=210.0
+        )
+        response = client.get(
+            "/scheduler/wake-ledger",
+            params={"agent_name": "alice", "state": "abandoned"},
+        )
+        assert response.status_code == 200
+        assert response.json()["records"][0]["state"] == "abandoned"
+        assert response.json()["records"][0]["abandoned_at"] == 210.0
+
+    def test_scheduler_status_surfaces_pending_count_and_age(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+        registry = client.app.state.agents
+        active, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="frozen",
+            fired_at=time.time() - 120.0,
+        )
+        abandoned, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="ambiguous",
+            fired_at=active.fired_at - 120.0,
+        )
+        assert registry.abandon_pending_schedule_wake(abandoned.id)
+
+        response = client.get("/scheduler/status")
+
+        assert response.status_code == 200
+        body = response.json()
+        assert body["pending_schedule_wake_count"] == 1
+        assert body["pending_schedule_wakes"][0]["agent_name"] == "alice"
+        assert body["pending_schedule_wakes"][0]["count"] == 1
+        assert body["pending_schedule_wakes"][0]["abandoned_count"] == 1
+        assert body["pending_schedule_wakes"][0]["oldest_age_seconds"] >= 119
+
+    def test_discard_pending_wake_is_agent_scoped(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        self._register(client, "bob")
+        created = self._create_schedule(
+            client, agent_name="alice", name="alice-morning"
+        ).json()
+        registry = client.app.state.agents
+        pending, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="alice-morning",
+            prompt="frozen",
+            fired_at=time.time(),
+        )
+
+        wrong_agent = client.delete(
+            f"/agents/bob/pending-schedule-wakes/{pending.id}"
+        )
+        assert wrong_agent.status_code == 404
+        assert registry.get_schedule_wake_by_fire(
+            created["id"], pending.fired_at
+        ) is not None
+
+        response = client.delete(
+            f"/agents/alice/pending-schedule-wakes/{pending.id}"
+        )
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "discarded": True,
+            "pending_id": pending.id,
+            "agent": "alice",
+        }
+        # Discard tombstones (parks) the row rather than deleting it, so a
+        # later reconciliation cannot re-create the retired fire.
+        tomb = registry.get_schedule_wake_by_fire(
+            created["id"], pending.fired_at
+        )
+        assert tomb is not None and tomb.parked_at > 0
+
+    def test_discard_pending_wake_preserves_terminal_ledger_row(self):
+        client = self._make_client()
+        self._register(client, "alice")
+        created = self._create_schedule(client).json()
+        registry = client.app.state.agents
+        pending, _ = registry.persist_schedule_wake(
+            created["id"],
+            agent_name="alice",
+            schedule_name="morning",
+            prompt="frozen",
+            fired_at=100.0,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            pending.id, delivered_at=110.0
+        )
+
+        response = client.delete(
+            f"/agents/alice/pending-schedule-wakes/{pending.id}"
+        )
+
+        assert response.status_code == 404
+        assert registry.get_schedule_wake_by_fire(
+            created["id"], pending.fired_at
+        ) is not None
+
 
 # ── Agent CRUD ───────────────────────────────────────────────
 
@@ -5385,6 +5657,280 @@ class TestAgentCRUD:
         os.close(fd)
         app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
         return TestClient(app)
+
+    @staticmethod
+    def _assert_failed_registration_left_no_state(
+        client,
+        name,
+        work_dir,
+        main_agent_before,
+    ):
+        registry = client.app.state.agents
+        assert registry.get(name) is None
+        assert registry.get_signing_key(name) is None
+        assert registry.get_main_agent() == main_agent_before
+        assert not work_dir.exists()
+
+    def test_register_signing_key_failure_compensates_every_winner_side_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "signing-failure"
+        main_agent_before = registry.get_main_agent()
+
+        def fail_signing_key(_name):
+            raise RuntimeError("injected signing-key failure")
+
+        monkeypatch.setattr(registry, "get_or_create_signing_key", fail_signing_key)
+
+        response = client.post(
+            "/agents",
+            json={"name": "signing-failure", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {"code": "agent_registration_failed"}
+        self._assert_failed_registration_left_no_state(
+            client,
+            "signing-failure",
+            work_dir,
+            main_agent_before,
+        )
+
+    def test_register_mcp_failure_compensates_every_winner_side_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import pinky_daemon.api as api_module
+
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "mcp-failure"
+        main_agent_before = registry.get_main_agent()
+
+        def fail_mcp(*_args, **_kwargs):
+            raise RuntimeError("injected MCP publication failure")
+
+        monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
+
+        response = client.post(
+            "/agents",
+            json={"name": "mcp-failure", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert response.json()["detail"] == {"code": "agent_registration_failed"}
+        self._assert_failed_registration_left_no_state(
+            client,
+            "mcp-failure",
+            work_dir,
+            main_agent_before,
+        )
+
+    def test_register_mcp_failure_leaves_no_barsik_bootstrap_state(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import pinky_daemon.api as api_module
+        from pinky_daemon import provisioning
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        provisioned = []
+        deprovisioned = []
+        observed_at_mcp_gap = {}
+
+        class SuccessfulProvisioner:
+            def provision(self, agent):
+                provisioned.append(agent.name)
+                return provisioning.ProvisionResult(ok=True, mode="local")
+
+            def deprovision(self, agent):
+                deprovisioned.append(agent.name)
+                return provisioning.ProvisionResult(ok=True, mode="local")
+
+        monkeypatch.setattr(
+            provisioning,
+            "get_provisioner",
+            lambda _mode, **_kwargs: SuccessfulProvisioner(),
+        )
+
+        def fail_mcp(*_args, **_kwargs):
+            # Reproduce the migration race: a second registry starts after the
+            # HTTP claim committed and provisioning succeeded, but before MCP
+            # publication fails and compensation removes the claim row.
+            concurrent_registry = AgentRegistry(db_path=registry._db_path)
+            try:
+                observed_at_mcp_gap.update(
+                    agent_exists=concurrent_registry.get("barsik") is not None,
+                    finalized=concurrent_registry._db.execute(
+                        "SELECT registration_finalized FROM agents "
+                        "WHERE name='barsik'"
+                    ).fetchone()[0],
+                    contacts=concurrent_registry.list_verified_contacts("barsik"),
+                    marker=concurrent_registry.get_setting(
+                        "migration:verified_contacts_brad_owner_seed_v1"
+                    ),
+                )
+            finally:
+                concurrent_registry.close()
+            raise RuntimeError("injected MCP publication failure")
+
+        monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "barsik"
+
+        response = client.post(
+            "/agents",
+            json={"name": "barsik", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert provisioned == ["barsik"]
+        assert deprovisioned == ["barsik"]
+        assert observed_at_mcp_gap == {
+            "agent_exists": True,
+            "finalized": 0,
+            "contacts": [],
+            "marker": "",
+        }
+        self._assert_failed_registration_left_no_state(
+            client,
+            "barsik",
+            work_dir,
+            "",
+        )
+        assert registry.list_verified_contacts("barsik") == []
+        assert registry.get_setting(
+            "migration:verified_contacts_brad_owner_seed_v1"
+        ) == ""
+
+    def test_successful_barsik_registration_finalizes_bootstrap_state(self, tmp_path):
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        client = self._make_client()
+        registry = client.app.state.agents
+
+        response = client.post(
+            "/agents",
+            json={"name": "barsik", "working_dir": str(tmp_path / "barsik")},
+        )
+
+        assert response.status_code == 200
+        contacts = registry.list_verified_contacts("barsik")
+        assert len(contacts) == 1
+        assert contacts[0]["platform"] == "buzz"
+        assert contacts[0]["name"] == "Brad"
+        assert contacts[0]["role"] == "owner"
+        assert registry.get_setting(
+            "migration:verified_contacts_brad_owner_seed_v1"
+        ) == "1"
+        finalized = registry._db.execute(
+            "SELECT registration_finalized FROM agents WHERE name='barsik'"
+        ).fetchone()[0]
+        assert finalized == 1
+
+        # A post-success registry startup runs migration seeding again. The
+        # marker/unique key make that pass idempotent, as is a repeat finalize.
+        concurrent_registry = AgentRegistry(db_path=registry._db_path)
+        try:
+            concurrent_registry.finalize_registration("barsik")
+            assert len(concurrent_registry.list_verified_contacts("barsik")) == 1
+            assert concurrent_registry.get_setting(
+                "migration:verified_contacts_brad_owner_seed_v1"
+            ) == "1"
+        finally:
+            concurrent_registry.close()
+
+    def test_register_failure_restores_preexisting_workspace_files(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import pinky_daemon.api as api_module
+
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "preexisting"
+        claude_dir = work_dir / ".claude"
+        claude_dir.mkdir(parents=True)
+        marker = work_dir / "operator-marker"
+        marker.write_text("operator-private")
+        settings = claude_dir / "settings.json"
+        settings.write_text('{"operator": true}\n')
+
+        def fail_mcp(*_args, **_kwargs):
+            raise RuntimeError("injected MCP publication failure")
+
+        monkeypatch.setattr(api_module, "_write_mcp_json", fail_mcp)
+
+        response = client.post(
+            "/agents",
+            json={"name": "preexisting", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert registry.get("preexisting") is None
+        assert registry.get_signing_key("preexisting") is None
+        assert registry.get_main_agent() == ""
+        assert marker.read_text() == "operator-private"
+        assert settings.read_text() == '{"operator": true}\n'
+        assert sorted(path.name for path in claude_dir.iterdir()) == ["settings.json"]
+        assert not (work_dir / ".mcp.json").exists()
+        assert not (work_dir / "data").exists()
+        assert not (work_dir / "output").exists()
+        assert not (work_dir / "workspace").exists()
+
+    def test_register_provision_failure_compensates_every_winner_side_effect(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        from pinky_daemon import provisioning
+
+        deprovisioned = []
+
+        class FailingProvisioner:
+            def provision(self, agent):
+                return provisioning.ProvisionResult(
+                    ok=False,
+                    mode="container",
+                    message="injected provision failure",
+                )
+
+            def deprovision(self, agent):
+                deprovisioned.append(agent.name)
+                return provisioning.ProvisionResult(ok=True, mode="container")
+
+        monkeypatch.setattr(
+            provisioning,
+            "get_provisioner",
+            lambda _mode, **_kwargs: FailingProvisioner(),
+        )
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "provision-failure"
+        main_agent_before = registry.get_main_agent()
+
+        response = client.post(
+            "/agents",
+            json={"name": "provision-failure", "working_dir": str(work_dir)},
+        )
+
+        assert response.status_code == 500
+        assert "injected provision failure" in response.text
+        assert deprovisioned == ["provision-failure"]
+        self._assert_failed_registration_left_no_state(
+            client,
+            "provision-failure",
+            work_dir,
+            main_agent_before,
+        )
 
     def test_register_agent(self):
         client = self._make_client()
@@ -5403,6 +5949,100 @@ class TestAgentCRUD:
         assert data["transport"] == "sdk"
         assert data["provider_url"] == "codex_cli"
         assert data["provider_model"] == "gpt-5-codex"
+
+    def test_invalid_agent_name_is_content_free_400_at_every_mutation_surface(self):
+        client = self._make_client()
+        responses = [
+            client.post("/agents", json={"name": "../victim"}),
+            client.put("/agents/BAD", json={"model": "haiku"}),
+            client.post("/agents/BAD/soul/versions/1/restore"),
+            client.put(
+                "/agents/BAD/files/CLAUDE.md",
+                json={"content": "must-not-land", "force_soul": True},
+            ),
+        ]
+
+        for response in responses:
+            assert response.status_code == 400
+            assert response.json()["detail"] == {"code": "invalid_agent_name"}
+            assert "victim" not in response.text
+            assert "BAD" not in response.text
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_register_refuses_cross_agent_workspace_overlap_without_side_effects(
+        self,
+        tmp_path,
+        relation,
+    ):
+        client = self._make_client()
+        victim_root = tmp_path / "victim"
+        assert client.post(
+            "/agents",
+            json={"name": "victim", "working_dir": str(victim_root)},
+        ).status_code == 200
+        marker = victim_root / "identity-marker"
+        marker.write_text("victim-private")
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-attacker",
+            "enclosing": tmp_path,
+        }[relation]
+
+        refused = client.post(
+            "/agents",
+            json={
+                "name": "attacker",
+                "working_dir": str(candidate),
+                "soul": "must-not-land",
+            },
+        )
+
+        assert refused.status_code == 409
+        assert refused.json()["detail"] == {"code": "agent_workspace_overlap"}
+        assert client.app.state.agents.get("attacker") is None
+        assert marker.read_text() == "victim-private"
+        if relation == "nested":
+            assert not candidate.exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_update_refuses_cross_agent_workspace_overlap_before_config_mutation(
+        self,
+        tmp_path,
+        relation,
+    ):
+        client = self._make_client()
+        victim_root = tmp_path / "victim"
+        mover_root = tmp_path / "mover"
+        assert client.post(
+            "/agents",
+            json={"name": "victim", "working_dir": str(victim_root)},
+        ).status_code == 200
+        assert client.post(
+            "/agents",
+            json={
+                "name": "mover",
+                "working_dir": str(mover_root),
+                "model": "opus",
+            },
+        ).status_code == 200
+        candidate = {
+            "equal": victim_root,
+            "nested": victim_root / "nested-mover",
+            "enclosing": tmp_path,
+        }[relation]
+
+        refused = client.put(
+            "/agents/mover",
+            json={"working_dir": str(candidate), "model": "haiku"},
+        )
+
+        assert refused.status_code == 409
+        assert refused.json()["detail"] == {"code": "agent_workspace_overlap"}
+        mover = client.app.state.agents.get("mover")
+        assert mover.working_dir == str(mover_root)
+        assert mover.model == "opus"
+        if relation == "nested":
+            assert not candidate.exists()
 
     def test_update_agent_runtime(self):
         client = self._make_client()
@@ -5432,6 +6072,468 @@ class TestAgentCRUD:
         data = resp.json()
         assert data["display_name"] == "Bob"
         assert data["soul"] == "You are Bob, a helpful assistant."
+
+    def test_post_existing_returns_409_without_mutation(self, tmp_path):
+        client = self._make_client()
+        original = "winner-private-soul"
+        payload = {
+            "name": "alice",
+            "model": "opus",
+            "soul": original,
+            "working_dir": str(tmp_path / "alice"),
+        }
+        assert client.post("/agents", json=payload).status_code == 200
+
+        collision = client.post(
+            "/agents",
+            json={
+                **payload,
+                "model": "haiku",
+                "soul": "loser-must-not-land",
+                "working_dir": str(tmp_path / "loser"),
+            },
+        )
+
+        assert collision.status_code == 409
+        current = client.get("/agents/alice").json()
+        assert current["model"] == "opus"
+        assert current["soul"] == original
+        assert current["working_dir"] == str(tmp_path / "alice")
+        assert not (tmp_path / "loser").exists()
+
+    def test_concurrent_double_post_has_one_db_winner(self, tmp_path):
+        from pinky_daemon.api import create_api
+
+        db_path = str(tmp_path / "agents.db")
+        app_a = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        app_b = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        barrier = threading.Barrier(2)
+        responses = []
+        payloads = [
+            {
+                "name": "race",
+                "display_name": "First",
+                "model": "opus",
+                "soul": "first-private-soul",
+                "working_dir": str(tmp_path / "first"),
+            },
+            {
+                "name": "race",
+                "display_name": "Second",
+                "model": "haiku",
+                "soul": "second-private-soul",
+                "working_dir": str(tmp_path / "second"),
+            },
+        ]
+
+        def post(client, payload):
+            barrier.wait(timeout=5)
+            responses.append((payload, client.post("/agents", json=payload)))
+
+        with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+            threads = [
+                threading.Thread(target=post, args=(client_a, payloads[0])),
+                threading.Thread(target=post, args=(client_b, payloads[1])),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+            assert all(not thread.is_alive() for thread in threads)
+
+            assert sorted(response.status_code for _, response in responses) == [200, 409]
+            winning_payload, winning_response = next(
+                pair for pair in responses if pair[1].status_code == 200
+            )
+            losing_payload, _ = next(
+                pair for pair in responses if pair[1].status_code == 409
+            )
+            current = client_a.get("/agents/race").json()
+            assert winning_response.json()["soul"] == winning_payload["soul"]
+            assert current["display_name"] == winning_payload["display_name"]
+            assert current["model"] == winning_payload["model"]
+            assert current["soul"] == winning_payload["soul"]
+            assert current["working_dir"] == winning_payload["working_dir"]
+            assert not Path(losing_payload["working_dir"]).exists()
+
+    @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
+    def test_concurrent_different_names_same_workspace_has_one_owner(
+        self,
+        tmp_path,
+        relation,
+    ):
+        from pinky_daemon.api import create_api
+
+        db_path = str(tmp_path / "agents.db")
+        shared_root = tmp_path / "shared"
+        alice_root, bob_root = {
+            "equal": (shared_root, shared_root),
+            "nested": (shared_root, shared_root / "sub"),
+            "enclosing": (shared_root / "sub", shared_root),
+        }[relation]
+        app_a = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        app_b = create_api(
+            max_sessions=10,
+            default_working_dir=str(tmp_path),
+            db_path=db_path,
+        )
+        phase_barrier = threading.Barrier(2)
+        alice_done = threading.Event()
+
+        def gate_advisory_checks(registry, *, wait_for_alice):
+            original = registry._refuse_workspace_overlap
+            call_count = 0
+
+            def wrapped(name, root):
+                nonlocal call_count
+                original(name, root)
+                call_count += 1
+                # Both route and registry pre-insert checks must observe the
+                # empty DB before either request reaches BEGIN IMMEDIATE. The
+                # third call is the authoritative in-transaction recheck.
+                if call_count <= 2:
+                    phase_barrier.wait(timeout=5)
+                if call_count == 2 and wait_for_alice:
+                    assert alice_done.wait(timeout=10)
+
+            registry._refuse_workspace_overlap = wrapped
+
+        gate_advisory_checks(app_a.state.agents, wait_for_alice=False)
+        gate_advisory_checks(app_b.state.agents, wait_for_alice=True)
+        payloads = [
+            {
+                "name": "alice",
+                "display_name": "Alice",
+                "model": "opus",
+                "soul": "alice-private-soul",
+                "working_dir": str(alice_root),
+            },
+            {
+                "name": "bob",
+                "display_name": "Bob",
+                "model": "haiku",
+                "soul": "bob-private-soul",
+                "working_dir": str(bob_root),
+            },
+        ]
+        responses = {}
+
+        def post(client, payload):
+            try:
+                responses[payload["name"]] = client.post("/agents", json=payload)
+            finally:
+                if payload["name"] == "alice":
+                    alice_done.set()
+
+        with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
+            threads = [
+                threading.Thread(target=post, args=(client_a, payloads[0])),
+                threading.Thread(target=post, args=(client_b, payloads[1])),
+            ]
+            for thread in threads:
+                thread.start()
+            for thread in threads:
+                thread.join(timeout=10)
+
+            assert all(not thread.is_alive() for thread in threads)
+            assert sorted(response.status_code for response in responses.values()) == [200, 409]
+            winner_name = next(
+                name for name, response in responses.items()
+                if response.status_code == 200
+            )
+            loser_name = next(
+                name for name, response in responses.items()
+                if response.status_code == 409
+            )
+            assert responses[loser_name].json() == {
+                "detail": {"code": "agent_workspace_overlap"}
+            }
+
+            registry = app_a.state.agents
+            assert [agent.name for agent in registry.list()] == [winner_name]
+            winner_root = alice_root if winner_name == "alice" else bob_root
+            assert registry.get(winner_name).working_dir == str(winner_root)
+            assert registry.get(loser_name) is None
+            assert registry.get_signing_key(winner_name)
+            assert registry.get_signing_key(loser_name) is None
+            assert registry.get_main_agent() == winner_name
+            assert registry.get_soul_versions(loser_name) == []
+            assert registry.list_tokens(loser_name) == []
+            assert (winner_root / ".mcp.json").is_file()
+
+    def test_absent_soul_is_noop_empty_rejects_and_force_snapshots(self, tmp_path):
+        client = self._make_client()
+        original = (
+            "# Alice\n\n## IDENTITY\n- **Name:** Alice\n- **Role:** Lead\n\n"
+            + "private-old-soul-" * 12
+        )
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "display_name": "Alice",
+                "soul": original,
+                "working_dir": str(tmp_path / "alice"),
+            },
+        ).status_code == 200
+        registry = client.app.state.agents
+        assert registry.get_soul_versions("alice") == []
+
+        absent = client.put("/agents/alice", json={"model": "sonnet"})
+        assert absent.status_code == 200
+        assert absent.json()["soul"] == original
+        assert registry.get_soul_versions("alice") == []
+
+        rejected = client.put("/agents/alice", json={"soul": ""})
+        assert rejected.status_code == 400
+        detail = rejected.json()["detail"]
+        assert detail == {
+            "code": "soul_mutation_requires_force",
+            "old_length": len(original),
+            "new_length": 0,
+            "shrink_percent": 100.0,
+            "missing_anchors": [
+                "agent_heading",
+                "identity_heading",
+                "name_label",
+                "role_label",
+            ],
+        }
+        assert "private-old-soul" not in rejected.text
+        assert registry.get("alice").soul == original
+        assert registry.get_soul_versions("alice") == []
+
+        forced = client.put(
+            "/agents/alice",
+            json={"soul": "", "force_soul": True},
+        )
+        assert forced.status_code == 200
+        assert forced.json()["soul"] == ""
+        versions = registry.get_soul_versions("alice")
+        assert len(versions) == 1
+        assert versions[0]["source"] == "api-put-force:before"
+        assert registry.get_soul_version("alice", versions[0]["id"])["content"] == original
+
+    def test_direct_claude_md_write_uses_guard_and_force_snapshot(self, tmp_path):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        original = "private-file-soul-" * 10
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": original,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        claude_md = work_dir / "CLAUDE.md"
+        assert not claude_md.exists()
+
+        rejected = client.put(
+            "/agents/alice/files/CLAUDE.md",
+            json={"content": "short"},
+        )
+        assert rejected.status_code == 400
+        assert "private-file-soul" not in rejected.text
+        assert not claude_md.exists()
+        assert client.app.state.agents.get_soul_versions("alice") == []
+
+        forced = client.put(
+            "/agents/alice/files/CLAUDE.md",
+            json={"content": "short", "force_soul": True},
+        )
+        assert forced.status_code == 200
+        assert claude_md.read_text() == "short"
+        versions = client.app.state.agents.get_soul_versions("alice")
+        assert len(versions) == 1
+        assert versions[0]["source"] == "api-file-force:before-file"
+        assert client.app.state.agents.get_soul_version(
+            "alice", versions[0]["id"]
+        )["content"] == original
+
+        alias = work_dir / "soul-link"
+        alias.symlink_to(claude_md.name)
+        alias_rejected = client.put(
+            "/agents/alice/files/soul-link",
+            json={"content": ""},
+        )
+        assert alias_rejected.status_code == 400
+        assert claude_md.read_text() == "short"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+        hardlink = work_dir / "soul-hardlink"
+        os.link(claude_md, hardlink)
+        hardlink_rejected = client.put(
+            "/agents/alice/files/soul-hardlink",
+            json={"content": ""},
+        )
+        assert hardlink_rejected.status_code == 400
+        assert claude_md.read_text() == "short"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+        lowercase_rejected = client.put(
+            "/agents/alice/files/claude.md",
+            json={"content": ""},
+        )
+        assert lowercase_rejected.status_code == 400
+        assert claude_md.read_text() == "short"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+        outside_soul = tmp_path / "outside-soul"
+        outside_soul.write_text("outside-private")
+        outside_alias = work_dir / "outside-link"
+        outside_alias.symlink_to(outside_soul)
+        outside_rejected = client.put(
+            "/agents/alice/files/outside-link",
+            json={"content": "must-not-land", "force_soul": True},
+        )
+        assert outside_rejected.status_code == 400
+        assert outside_rejected.json()["detail"] == {
+            "code": "agent_path_outside_workspace"
+        }
+        assert outside_soul.read_text() == "outside-private"
+        assert len(client.app.state.agents.get_soul_versions("alice")) == 1
+
+    def test_guarded_write_replaces_hardlink_without_mutating_external_inode(
+        self,
+        tmp_path,
+    ):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        original = "external-private-soul-" * 8
+        replacement = "compiled-safe-replacement"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": original,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        outside = tmp_path / "external-claude"
+        outside.write_text(original)
+        claude_md = work_dir / "CLAUDE.md"
+        os.link(outside, claude_md)
+        shared_inode = outside.stat().st_ino
+        assert claude_md.stat().st_ino == shared_inode
+
+        written = client.put(
+            "/agents/alice/files/CLAUDE.md",
+            json={"content": replacement, "force_soul": True},
+        )
+
+        assert written.status_code == 200
+        assert claude_md.read_text() == replacement
+        assert outside.read_text() == original
+        assert outside.stat().st_ino == shared_inode
+        assert claude_md.stat().st_ino != shared_inode
+
+    def test_restore_refuses_outside_claude_symlink_before_db_or_file_mutation(
+        self,
+        tmp_path,
+    ):
+        client = self._make_client()
+        registry = client.app.state.agents
+        work_dir = tmp_path / "alice"
+        current = "current-private-soul-" * 8
+        target = "archived-target-soul"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": current,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        version_id = registry.save_soul_version("alice", target, source="test")
+        outside = tmp_path / "outside-restore-target"
+        outside.write_text("outside-byte-identical")
+        (work_dir / "CLAUDE.md").symlink_to(outside)
+
+        restored = client.post(
+            f"/agents/alice/soul/versions/{version_id}/restore",
+            json={"force_soul": True},
+        )
+
+        assert restored.status_code == 400
+        assert restored.json()["detail"] == {
+            "code": "agent_path_outside_workspace"
+        }
+        assert registry.get("alice").soul == current
+        assert outside.read_text() == "outside-byte-identical"
+
+    def test_spawn_publication_refuses_outside_claude_symlink(self, tmp_path):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": "db-authoritative-soul",
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        outside = tmp_path / "outside-spawn-target"
+        outside.write_text("outside-byte-identical")
+        (work_dir / "CLAUDE.md").symlink_to(outside)
+
+        spawned = client.post("/agents/alice/sessions", json={})
+
+        assert spawned.status_code == 400
+        assert spawned.json()["detail"] == {
+            "code": "agent_path_outside_workspace"
+        }
+        assert outside.read_text() == "outside-byte-identical"
+
+    def test_restore_shorter_soul_requires_explicit_force(self, tmp_path):
+        client = self._make_client()
+        work_dir = tmp_path / "alice"
+        original = "private-current-soul-" * 12
+        target = "old-short-soul"
+        assert client.post(
+            "/agents",
+            json={
+                "name": "alice",
+                "soul": original,
+                "working_dir": str(work_dir),
+            },
+        ).status_code == 200
+        work_dir.mkdir(parents=True, exist_ok=True)
+        claude_md = work_dir / "CLAUDE.md"
+        claude_md.write_text(original)
+        registry = client.app.state.agents
+        version_id = registry.save_soul_version("alice", target, source="fixture")
+
+        rejected = client.post(f"/agents/alice/soul/versions/{version_id}/restore")
+        assert rejected.status_code == 400
+        assert "private-current-soul" not in rejected.text
+        assert registry.get("alice").soul == original
+        assert claude_md.read_text() == original
+        assert len(registry.get_soul_versions("alice")) == 1
+
+        restored = client.post(
+            f"/agents/alice/soul/versions/{version_id}/restore",
+            json={"force_soul": True},
+        )
+        assert restored.status_code == 200
+        assert restored.json()["force_soul"] is True
+        assert registry.get("alice").soul == target
+        assert claude_md.read_text() == target
+        sources = [row["source"] for row in registry.get_soul_versions("alice")]
+        assert "restore-v%d-force:before" % version_id in sources
+        assert "restore-v%d-force:before-file" % version_id in sources
 
     def test_list_agents_empty(self):
         client = self._make_client()
@@ -7831,11 +8933,75 @@ class TestBuildStreamingWakeContextReasonGating:
 
             assert replayed == ["dymok"]
 
-    @pytest.mark.asyncio
-    async def test_scheduler_undelivered_alert_uses_owner_destination(self):
-        """#949 alerting uses the durable #863 owner-notify configuration."""
+    def test_turn_idle_triggers_scheduler_outbox_drain(self):
+        """A transport turn boundary is the scheduler's dequeue signal."""
         with tempfile.TemporaryDirectory() as tmpdir:
             app = self._make_app(os.path.join(tmpdir, "test.db"))
+            idle_agents: list[str] = []
+            app.state.scheduler.notify_agent_idle = idle_agents.append
+
+            app.state._notify_scheduler_turn_idle("test-agent")
+
+            assert idle_agents == ["test-agent"]
+
+    @pytest.mark.asyncio
+    async def test_scheduler_queued_probe_and_recall_are_wired_to_transport(
+        self,
+    ):
+        """The production scheduler preserves exact tmux queue outcomes."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            cancel = AsyncMock(return_value=True)
+            session = SimpleNamespace(
+                scheduler_wake_queued=lambda prompt: prompt == "exact wake",
+                cancel_scheduler_wake=cancel,
+            )
+            with patch.object(
+                app.state.broker,
+                "_get_streaming_session",
+                return_value=session,
+            ):
+                assert app.state.scheduler._delivery_queued_fn(
+                    "dymok", "exact wake"
+                ) is True
+                assert await app.state.scheduler._delivery_cancel_queued_fn(
+                    "dymok", "exact wake"
+                ) is True
+
+            cancel.assert_awaited_once_with("exact wake")
+
+    def test_scheduler_drain_probe_is_distinct_from_wide_busy_signal(self):
+        """#1098: periodic drains re-read pane state through the transport."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            session = SimpleNamespace(
+                stats={
+                    "inflight_active": True,
+                    "inflight_busy_not_wedged": True,
+                },
+                scheduler_drain_busy=lambda: False,
+            )
+            with patch.object(
+                app.state.broker,
+                "_get_streaming_session",
+                return_value=session,
+            ):
+                assert app.state.scheduler._delivery_busy_fn("dymok") is True
+                assert (
+                    app.state.scheduler._delivery_drain_busy_fn("dymok")
+                    is False
+                )
+
+    @pytest.mark.asyncio
+    async def test_scheduler_owner_alert_uses_owner_destination(self):
+        """The owner-notify callback (dead-letter alerts: PARKED / stale
+        one-shot drop) routes to the durable #863 owner destination."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            app = self._make_app(os.path.join(tmpdir, "test.db"))
+            assert (
+                app.state.dream_runner._owner_notify_callback
+                is app.state.scheduler._owner_notify_callback
+            )
             app.state.agents.register("dymok", model="sonnet")
             app.state.agents.set_token(
                 "dymok", "telegram", "token", settings={"account_id": "acct-1"},
@@ -7852,7 +9018,7 @@ class TestBuildStreamingWakeContextReasonGating:
             app.state.broker._send_callback = send
 
             delivered = await app.state.scheduler._owner_notify_callback(
-                "dymok", "FIRED BUT UNDELIVERED test"
+                "dymok", "scheduler owner-alert test"
             )
 
             assert delivered is True
@@ -7860,7 +9026,7 @@ class TestBuildStreamingWakeContextReasonGating:
                 "dymok",
                 "telegram",
                 "owner-dm",
-                "FIRED BUT UNDELIVERED test",
+                "scheduler owner-alert test",
                 account_id="acct-1",
             )
 
@@ -7895,7 +9061,7 @@ class TestBuildStreamingWakeContextReasonGating:
             monkeypatch.setattr(api_mod, "_log", logs.append)
 
             delivered = await app.state.scheduler._owner_notify_callback(
-                "geordi", "FIRED BUT UNDELIVERED test"
+                "geordi", "scheduler owner-alert test"
             )
 
             assert delivered is True
@@ -7903,7 +9069,7 @@ class TestBuildStreamingWakeContextReasonGating:
                 "local-notifier",
                 "telegram",
                 "owner-dm",
-                "FIRED BUT UNDELIVERED test",
+                "scheduler owner-alert test",
                 account_id="brad-telegram",
             )
             assert any("OWNER_NOTIFY_DELIVERY_FAILURE" in line for line in logs)
@@ -7941,7 +9107,7 @@ class TestBuildStreamingWakeContextReasonGating:
             monkeypatch.setattr(api_mod, "_log", logs.append)
 
             delivered = await app.state.scheduler._owner_notify_callback(
-                "geordi", "FIRED BUT UNDELIVERED test"
+                "geordi", "scheduler owner-alert test"
             )
 
             assert delivered is True
@@ -7949,7 +9115,7 @@ class TestBuildStreamingWakeContextReasonGating:
                 "geordi",
                 "slack",
                 "D_OWNER",
-                "FIRED BUT UNDELIVERED test",
+                "scheduler owner-alert test",
                 account_id="T_PI",
             )
             assert any(

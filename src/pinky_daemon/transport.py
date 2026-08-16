@@ -71,9 +71,70 @@ Brad's Dymok test agent).
 
 from __future__ import annotations
 
+import inspect
+from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
 
 from pinky_daemon.transport_state import SessionState
+
+ReplacementStep = Callable[[], Awaitable[None] | None]
+ReplacementConnectWrapper = Callable[[ReplacementStep], Awaitable[None]]
+
+
+class TransportReplacementMixin:
+    """One guarded teardown-and-bring-up chokepoint for retained sessions.
+
+    Backends may override ``_preflight_transport_replacement`` to prove any
+    spawn prerequisites while the current transport is still intact. API code
+    supplies only configuration and bring-up callbacks; it cannot accidentally
+    move the prerequisite check behind teardown by composing ``disconnect`` and
+    ``connect`` itself.
+    """
+
+    def _preflight_transport_replacement(self) -> None:
+        """Prove that a replacement may be started without mutating transport."""
+
+    @staticmethod
+    async def _run_replacement_step(step: ReplacementStep | None) -> None:
+        if step is None:
+            return
+        result = step()
+        if inspect.isawaitable(result):
+            await result
+
+    async def restart_transport(
+        self,
+        *,
+        configure: ReplacementStep | None = None,
+        bring_up: ReplacementStep | None = None,
+        connect_wrapper: ReplacementConnectWrapper | None = None,
+        suppress_teardown_errors: bool = False,
+    ) -> None:
+        """Preflight, configure, tear down, then bring the replacement up.
+
+        ``configure`` runs only after a successful preflight and immediately
+        before teardown, allowing force-fresh latches to be armed without
+        corrupting a live session on refusal. ``bring_up`` defaults to this
+        retained object's ``connect`` method but may rebuild via a registry
+        callback when the route intentionally replaces the object as well.
+        """
+        if bring_up is not None and connect_wrapper is not None:
+            raise ValueError("connect_wrapper and bring_up are mutually exclusive")
+        self._preflight_transport_replacement()
+        await self._run_replacement_step(configure)
+        try:
+            await self.disconnect()  # type: ignore[attr-defined]
+        except Exception:
+            if not suppress_teardown_errors:
+                raise
+        if bring_up is None:
+            connect = self.connect  # type: ignore[attr-defined]
+            if connect_wrapper is None:
+                await connect()
+            else:
+                await connect_wrapper(connect)
+        else:
+            await self._run_replacement_step(bring_up)
 
 
 @runtime_checkable
@@ -218,6 +279,17 @@ class Transport(Protocol):
         ``disconnect`` itself becomes the side-effect runner, not the
         intent declarer.
         """
+        ...
+
+    async def restart_transport(
+        self,
+        *,
+        configure: ReplacementStep | None = None,
+        bring_up: ReplacementStep | None = None,
+        connect_wrapper: ReplacementConnectWrapper | None = None,
+        suppress_teardown_errors: bool = False,
+    ) -> None:
+        """Run the guarded preflight → teardown → bring-up sequence."""
         ...
 
     async def send(

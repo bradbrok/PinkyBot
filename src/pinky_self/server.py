@@ -241,6 +241,24 @@ def create_server(
                 return f"Schedule #{schedule_id} removed."
             return f"Failed to remove schedule: {result.get('error', 'not found')}"
 
+        @mcp.tool()
+        def discard_pending_schedule_wake(pending_id: int) -> str:
+            """Discard one stranded wake from your own durable outbox by row ID.
+
+            This removes the frozen pending prompt without marking its schedule
+            delivered. It cannot erase another agent's or a terminal ledger row.
+            """
+            result = _api(
+                "DELETE",
+                f"/agents/{agent_name}/pending-schedule-wakes/{pending_id}",
+            )
+            if result.get("discarded"):
+                return f"Pending schedule wake #{pending_id} discarded."
+            return (
+                f"Failed to discard pending schedule wake #{pending_id}: "
+                f"{result.get('error', 'not found')}"
+            )
+
 
     # ── MCP transport probe (issue #663) ──────────────────────
 
@@ -2198,28 +2216,10 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                     f"grants cross-agent memory read+write over the entire fleet "
                     f"— pass confirm_privileged_role=True to proceed deliberately."
                 )
-            # Create-only guard. POST /agents is an UPSERT — register() merges
-            # the provided fields and UPDATEs when the name already exists. Since
-            # this tool always sends soul/model/role/groups/transport, calling it
-            # with an existing name would silently overwrite that agent (blank its
-            # soul, reset role, empty groups) and still return 200. Refuse on
-            # collision instead; existing agents are modified via the dashboard /
-            # update path, which keeps the upsert semantics intact there.
-            existing = _api("GET", f"/agents/{name}")
-            if isinstance(existing, dict) and "error" not in existing:
-                return (
-                    f"Refusing to register '{name}': an agent with that name "
-                    f"already exists. register_agent is create-only — to change "
-                    f"an existing agent, use the dashboard or update path (POST "
-                    f"/agents is an upsert and would overwrite its soul, model, "
-                    f"role, and groups)."
-                )
-            if isinstance(existing, dict) and existing.get("status") != 404:
-                return (
-                    f"Refusing to register '{name}': couldn't verify name availability "
-                    f"(GET /agents/{name} returned unexpected error: "
-                    f"{existing.get('error', 'unknown')}) — try again."
-                )
+            # POST /agents is now create-only at the database boundary. Do not
+            # reintroduce a GET availability precheck: it is advisory and races
+            # another creator. The authoritative INSERT-or-abort result below
+            # decides which caller won.
             caller = str(agent_name)
             create = _api("POST", "/agents", {
                 "name": name,
@@ -2233,7 +2233,18 @@ description: Auto-generated from task completion. {task_description[:120].rstrip
                 "isolation_mode": isolation_mode,
             })
             if isinstance(create, dict) and "error" in create:
-                return f"Failed to register agent '{name}': {create['error']}"
+                if create.get("status") == 400 and "invalid_agent_name" in str(
+                    create.get("error", "")
+                ):
+                    return "Failed to register agent (HTTP 400): invalid_agent_name"
+                if create.get("status") == 409:
+                    return (
+                        f"Refusing to register '{name}': HTTP 409 — an agent with "
+                        f"that name already exists. register_agent is create-only; "
+                        f"use PUT /agents/{name} for updates."
+                    )
+                status = f" (HTTP {create['status']})" if create.get("status") else ""
+                return f"Failed to register agent '{name}'{status}: {create['error']}"
 
             assigned, failed = [], []
             for sk in (skills or []):

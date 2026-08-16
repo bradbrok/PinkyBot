@@ -226,3 +226,26 @@ def test_non_1m_model_with_tier_suffix_stays_200k() -> None:
     ss = _make_session(model="gpt-5.5[1m]")
     assert ss._raw_max_tokens_for_model() == 200_000
     assert ss._effective_restart_threshold_pct() == pytest.approx(80.0)
+
+
+def test_gpt56_luna_uses_272k_window() -> None:
+    """#531: gpt-5.6-luna's real context window is 272k, not the 200k
+    default. Codex tmux sessions have no harness-reported window, so the
+    gauge must read it from MODEL_CONTEXT_SIZES or it under-counts headroom
+    and triggers a restart prematurely."""
+    ss = _make_session(model="gpt-5.6-luna")
+    assert ss._raw_max_tokens_for_model() == 272_000
+
+
+def test_gpt56_luna_variant_suffix_also_272k() -> None:
+    """Substring match: a tier/variant suffix on luna still resolves 272k."""
+    ss = _make_session(model="gpt-5.6-luna-max-fast")
+    assert ss._raw_max_tokens_for_model() == 272_000
+
+
+def test_unlisted_codex_model_stays_200k() -> None:
+    """Blast-radius guard: codex models NOT in MODEL_CONTEXT_SIZES (e.g.
+    gpt-5.6-terra) still fall to the 200k default until their real window
+    is verified — the fix must not silently move every codex model's gauge."""
+    ss = _make_session(model="gpt-5.6-terra")
+    assert ss._raw_max_tokens_for_model() == 200_000
