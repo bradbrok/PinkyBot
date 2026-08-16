@@ -791,7 +791,6 @@ class StreamingSession(TransportReplacementMixin):
         from claude_agent_sdk.types import (
             AssistantMessage,
             AssistantMessageError,
-            ConversationResetMessage,
             RateLimitEvent,
             ResultMessage,
             StreamEvent,
@@ -1298,33 +1297,6 @@ class StreamingSession(TransportReplacementMixin):
                         and not self._pending_chats
                     ):
                         _notify_turn_idle(self._config, self.agent_name)
-
-                elif isinstance(msg, ConversationResetMessage):
-                    # The reset frame names the outgoing session. Invalidate
-                    # both it and our current handle before doing any other
-                    # work, then synchronously clear durable state. There must
-                    # be no await gap here: death before the next fresh-session
-                    # frame must produce a clean start, never resume /clear's
-                    # discarded transcript.
-                    if msg.session_id:
-                        invalidated_resume_handles.add(msg.session_id)
-                    if self.resume_handle:
-                        invalidated_resume_handles.add(self.resume_handle)
-                    self.resume_handle = ""
-                    if self._on_resume_handle_sync:
-                        self._on_resume_handle_sync(self.agent_name, "")
-                    elif self._on_resume_handle:
-                        raise RuntimeError(
-                            "conversation reset requires synchronous "
-                            "resume-handle persistence"
-                        )
-
-                    _log(
-                        f"streaming[{self.agent_name}]: WARNING SDK conversation "
-                        "reset; transcript was discarded "
-                        f"new_conversation_id={msg.new_conversation_id!r} "
-                        f"session_id={msg.session_id!r}"
-                    )
 
                 elif isinstance(msg, RateLimitEvent):
                     _log(

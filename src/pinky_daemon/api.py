@@ -3268,6 +3268,18 @@ def create_api(
                 f"{agent_name}: {type(e).__name__}: {e}"
             )
 
+    async def _inject_wake_context_reload(agent_name: str, instruction: str) -> bool:
+        """Inject a context-reload instruction into a streaming session.
+
+        Called by streaming_session.connect() to recover from failed wake
+        submissions. Returns True if the injection succeeded, False otherwise.
+        """
+        streaming = broker._get_streaming_session(agent_name)
+        if not streaming:
+            return False
+        # send() returns bool indicating success
+        return await streaming.send(instruction)
+
     app.state._notify_scheduler_turn_idle = _notify_scheduler_turn_idle
 
     # Exposed for unit-test reach-in (verifying centralized wake logging

@@ -885,7 +885,7 @@ class TestAgentCommsNewFeatures:
             async def get_context_usage(self):
                 return {"totalTokens": 0, "maxTokens": 200_000}
 
-            async def query(self, prompt):
+            async def query(self, prompt, session_id="default"):
                 is_agent_message = "Hello offline agent" in prompt
                 consumed = asyncio.Event()
                 await self.results.put((
