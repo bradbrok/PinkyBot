@@ -172,6 +172,23 @@ def _isolate_test_env(request, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _isolate_db_paths(tmp_path, monkeypatch):
+    """Redirect relative DB paths away from production (#484).
+
+    Every SQLite store in the daemon defaults to a relative path under
+    ``data/`` (e.g. ``data/conversations.db``, ``data/agents.db``).  Tests
+    that forget to pass an explicit ``db_path=`` to a temp location would
+    silently read/write the production database when ``pytest`` runs from
+    the live checkout.
+
+    This fixture changes the working directory to a per-test ``tmp_path``
+    so that any relative ``data/…`` open resolves inside the disposable
+    directory.  The original cwd is restored after the test.
+    """
+    monkeypatch.chdir(tmp_path)
+
+
+@pytest.fixture(autouse=True)
 def _guard_real_sdk_transport(monkeypatch, _isolate_test_env):
     """Fail before any test can spawn the real bundled Claude CLI.
 
