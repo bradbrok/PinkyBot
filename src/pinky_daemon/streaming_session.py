@@ -747,7 +747,7 @@ class StreamingSession(TransportReplacementMixin):
                 "prompt_submitted",
                 metadata={"platform": platform, "chat_id": chat_id},
             )
-            await self._client.query(prompt + agent_hint)
+            await self._client.query(prompt + agent_hint, session_id=self.id)
             _log(f"streaming[{self.agent_name}]: sent message (chat={chat_id})")
             return True
         except Exception as e:
@@ -778,7 +778,7 @@ class StreamingSession(TransportReplacementMixin):
         reservation = ("", "", "")
         self._pending_chats.append(reservation)
         try:
-            await self._client.query(prompt)
+            await self._client.query(prompt, session_id=self.id)
         except Exception:
             for index, pending in enumerate(self._pending_chats):
                 if pending is reservation:
