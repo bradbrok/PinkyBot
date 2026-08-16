@@ -3987,7 +3987,7 @@ class TestScheduler:
         assert [wake.prompt for wake in pending] == ["probe breaks"]
 
     @pytest.mark.asyncio
-    async def test_undelivered_does_not_alert_owner_and_replays_on_next_boot(
+    async def test_undelivered_alerts_owner_once_and_replays_on_next_boot(
         self, registry
     ):
         registry.register("oleg")
@@ -4018,10 +4018,13 @@ class TestScheduler:
 
         pending = registry.list_pending_schedule_wakes("oleg")
         assert len(pending) == 1
-        # Delivery-receipt failures are NOT owner-notified: they are frequently
-        # false positives (the wake persists + replays), so the owner sees
-        # nothing — only the FIRED BUT UNDELIVERED operator log line.
-        assert alerts == []
+        # The FIRST unconfirmed delivery pages the owner as an early warning
+        # (#420). Only the intermediate retry attempts 1..CAP-1 are suppressed
+        # as likely false positives; the terminal attempt at CAP alerts again.
+        assert len(alerts) == 1
+        assert alerts[0][0] == "oleg"
+        assert "FIRED BUT UNDELIVERED" in alerts[0][1]
+        assert "persisted for the agent's next session" in alerts[0][1]
 
         attempts: list[str] = []
 
@@ -4220,10 +4223,23 @@ class TestScheduler:
                     len(alerts) == 0
                 ), f"Attempt {attempt} should not alert but got: {alerts}"
             else:
+                # Due gate indipendenti sparano al raggiungimento del CAP e sono
+                # complementari (retry esauriti + primo fallimento di questo fire):
+                # il doppio alert è voluto, cfr. _record_schedule_undelivered.
                 assert (
-                    len(alerts) == 1
-                ), f"Attempt {attempt} should alert, got {len(alerts)} alerts"
-                assert "FIRED BUT UNDELIVERED" in alerts[0][1]
+                    len(alerts) == 2
+                ), f"Attempt {attempt} should alert twice, got {len(alerts)}: {alerts}"
+                assert all("FIRED BUT UNDELIVERED" in msg for _agent, msg in alerts)
+                bodies = [msg for _agent, msg in alerts]
+                assert any(
+                    f"reached {attempt} unconfirmed delivery attempts" in msg
+                    for msg in bodies
+                ), f"manca l'alert 'retry esauriti': {bodies}"
+                assert any(
+                    "was not confirmed" in msg
+                    and "persisted for the agent's next session" in msg
+                    for msg in bodies
+                ), f"manca l'alert 'primo fallimento del fire': {bodies}"
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["alive", "ok", "busy", "finishing"])
@@ -4410,8 +4426,17 @@ class TestScheduler:
     @pytest.mark.asyncio
     async def test_transient_oldest_replay_failure_halts_fifo(self, registry):
         registry.register("oleg")
+        # Cron sparso: vedi nota sulla finestra di replay per-schedule sopra.
         schedule = registry.add_schedule(
-            "oleg", "* * * * *", name="fifo", prompt="unused"
+            "oleg", "0 3 * * *", name="fifo", prompt="unused"
+        )
+        # Ripristinata da c1f2244a (#1065): la definizione era andata persa in
+        # un merge, lasciando il test con un NameError su newer_schedule.
+        newer_schedule = registry.add_schedule(
+            schedule.agent_name,
+            "0 3 * * *",
+            name="fifo-newer",
+            prompt="unused",
         )
         # Use recent timestamps (within 24h) to avoid stale-wake discard
         current = time.time()
@@ -4420,14 +4445,16 @@ class TestScheduler:
             agent_name="oleg",
             schedule_name="fifo",
             prompt="oldest",
-            fired_at=current - 3600,  # 1 hour ago
+            # 30 min: dentro la finestra di replay (il tetto è 3600s, quindi
+            # 3600 esatti cadeva proprio sul confine e veniva scartato).
+            fired_at=current - 1800,
         )
         registry.persist_schedule_wake(
             newer_schedule.id,
             agent_name="oleg",
             schedule_name="fifo-newer",
             prompt="newer",
-            fired_at=current - 1800,  # 30 min ago
+            fired_at=current - 900,  # 15 min fa
         )
         attempts: list[str] = []
 
@@ -4451,8 +4478,12 @@ class TestScheduler:
         self, registry, monkeypatch, capsys
     ):
         registry.register("oleg")
+        # Cron sparso di proposito: la finestra di replay è
+        # min(tetto, intervallo alla prossima accensione della stessa schedule),
+        # quindi con "* * * * *" sarebbe 60s e i wake qui sotto verrebbero
+        # scartati come stali prima della logica sotto test.
         schedule = registry.add_schedule(
-            "oleg", "* * * * *", name="storm-head", prompt="retry me"
+            "oleg", "0 3 * * *", name="storm-head", prompt="retry me"
         )
         registry.persist_schedule_wake(
             schedule.id,
@@ -4509,8 +4540,9 @@ class TestScheduler:
         self, registry
     ):
         registry.register("oleg")
+        # Cron sparso: vedi nota sulla finestra di replay per-schedule sopra.
         schedule = registry.add_schedule(
-            "oleg", "* * * * *", name="eventual", prompt="confirm me"
+            "oleg", "0 3 * * *", name="eventual", prompt="confirm me"
         )
         pending, _ = registry.persist_schedule_wake(
             schedule.id,
@@ -4545,11 +4577,12 @@ class TestScheduler:
         self, registry, capsys
     ):
         registry.register("oleg")
+        # Cron sparso: vedi nota sulla finestra di replay per-schedule sopra.
         stuck = registry.add_schedule(
-            "oleg", "* * * * *", name="stuck", prompt="stuck head"
+            "oleg", "0 3 * * *", name="stuck", prompt="stuck head"
         )
         zombie = registry.add_schedule(
-            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+            "oleg", "0 3 * * *", name="zombie", prompt="never deliver"
         )
         now = time.time()
         registry.persist_schedule_wake(
@@ -4597,14 +4630,18 @@ class TestScheduler:
     ):
         registry.register("oleg")
         schedule = registry.add_schedule(
-            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+            "oleg", "0 3 * * *", name="zombie", prompt="never deliver"
         )
+        # fired_at recente di proposito: con un epoch arbitrario (era 100.0) la
+        # riga viene scartata come stale PRIMA di arrivare alla logica zombie,
+        # che è ciò che questo test deve coprire.
+        zombie_fired_at = time.time() - 30
         pending, _ = registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="zombie",
             prompt="never deliver",
-            fired_at=100.0,
+            fired_at=zombie_fired_at,
         )
         registry.remove_schedule(schedule.id)
         park_calls: list[int] = []
@@ -4627,7 +4664,7 @@ class TestScheduler:
         first_boot = AgentScheduler(registry, wake_callback=confirmed)
         await first_boot._replay_pending_locked("oleg")
         first_terminal_state = registry.get_schedule_wake_by_fire(
-            schedule.id, 100.0
+            schedule.id, zombie_fired_at
         ).to_dict()
 
         for _ in range(5):
@@ -4637,7 +4674,7 @@ class TestScheduler:
         assert attempts == []
         assert park_calls == [pending.id]
         assert registry.get_schedule_wake_by_fire(
-            schedule.id, 100.0
+            schedule.id, zombie_fired_at
         ).to_dict() == first_terminal_state
         assert first_terminal_state["state"] == "quarantined"
         assert first_terminal_state["last_error"].endswith(
@@ -4656,14 +4693,16 @@ class TestScheduler:
     ):
         registry.register("oleg")
         schedule = registry.add_schedule(
-            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+            "oleg", "0 3 * * *", name="zombie", prompt="never deliver"
         )
+        # fired_at recente: vedi nota nel test precedente (stale prima di zombie).
+        zombie_fired_at = time.time() - 30
         pending, _ = registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
             schedule_name="zombie",
             prompt="never deliver",
-            fired_at=100.0,
+            fired_at=zombie_fired_at,
         )
         registry.remove_schedule(schedule.id)
         monkeypatch.setattr(
@@ -4675,7 +4714,7 @@ class TestScheduler:
         scheduler = AgentScheduler(registry)
         await scheduler._replay_pending_locked("oleg")
 
-        stored = registry.get_schedule_wake_by_fire(schedule.id, 100.0)
+        stored = registry.get_schedule_wake_by_fire(schedule.id, zombie_fired_at)
         assert stored is not None
         assert stored.to_dict() == pending.to_dict()
         error_log = capsys.readouterr().err
@@ -4688,11 +4727,20 @@ class TestScheduler:
         self, registry, capsys
     ):
         registry.register("oleg")
+        # Cron sparso: vedi nota sulla finestra di replay per-schedule sopra.
         zombie = registry.add_schedule(
-            "oleg", "* * * * *", name="zombie", prompt="never deliver"
+            "oleg", "0 3 * * *", name="zombie", prompt="never deliver"
         )
         live = registry.add_schedule(
-            "oleg", "* * * * *", name="live", prompt="unused"
+            "oleg", "0 3 * * *", name="live", prompt="unused"
+        )
+        # Ripristinata da c1f2244a (#1065): la definizione era andata persa in
+        # un merge, lasciando il test con un NameError su live_two.
+        live_two = registry.add_schedule(
+            live.agent_name,
+            "0 3 * * *",
+            name="live-two",
+            prompt="unused",
         )
         # Use recent timestamps (within 24h) to avoid stale-wake discard
         current = time.time()
@@ -4998,18 +5046,29 @@ class TestScheduler:
         assert "FIRED BUT UNDELIVERED" in capsys.readouterr().err
 
     @pytest.mark.asyncio
-    async def test_stale_persisted_wakes_older_than_24h_are_discarded(
+    async def test_persisted_wakes_older_than_replay_window_are_discarded(
         self, registry, capsys
     ):
-        """Persisted wakes older than 24 hours should be discarded on replay,
-        preventing phantom fires of stale prompts from old deleted/changed schedules."""
+        """Un wake persistito più vecchio della finestra di replay va scartato,
+        così un prompt vecchio non riaccende un turno fantasma.
+
+        Le soglie sono DUE, in cascata:
+        1. il filtro grezzo a 24h in _replay_pending_locked, che marca la riga
+           come zombie stale (PERSISTED_WAKE_STALE_DROPPED);
+        2. la finestra di replay vera e propria, più stretta:
+           min(_PERSISTED_WAKE_MAX_AGE_SEC, intervallo alla prossima accensione
+           della stessa schedule), pavimento 60s (_pending_wake_replay_max_age).
+        Il cron qui è sparso apposta, così la finestra (2) è il tetto pieno:
+        il wake a 25h cade per (1), quello a 10 minuti supera entrambe.
+        Con un cron al minuto la finestra (2) varrebbe 60s e cadrebbero tutti e due.
+        """
         registry.register("oleg")
         schedule = registry.add_schedule(
-            "oleg", "* * * * *", name="durable", prompt="current prompt"
+            "oleg", "0 3 * * *", name="durable", prompt="current prompt"
         )
 
-        # Create a stale persisted wake (>24h old)
-        stale_fired_at = time.time() - (25 * 3600)  # 25 hours ago
+        # Oltre la finestra: da scartare
+        stale_fired_at = time.time() - (25 * 3600)  # 25 ore fa
         stale_wake_id = registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",
@@ -5018,8 +5077,8 @@ class TestScheduler:
             fired_at=stale_fired_at,
         )
 
-        # Create a fresh persisted wake (<24h old)
-        fresh_fired_at = time.time() - (1 * 3600)  # 1 hour ago
+        # Dentro la finestra: da consegnare
+        fresh_fired_at = time.time() - 600  # 10 minuti fa
         fresh_wake_id = registry.persist_schedule_wake(
             schedule.id,
             agent_name="oleg",

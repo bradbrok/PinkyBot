@@ -1160,8 +1160,12 @@ class AgentScheduler:
     ) -> None:
         """Persist and loudly log one unconfirmed fired schedule.
 
-        Operator log only — the owner is NOT notified for routine receipt
-        failures (they are frequently false positives; #1043).
+        Owner-alert policy (#420, 082c6d0a): the FIRST unconfirmed delivery
+        alerts the owner as an early warning, the intermediate retry attempts
+        1..CAP-1 are suppressed (they are frequently false positives — the wake
+        persists and replays on its own; #1043), and the terminal attempt at
+        CAP alerts again. So: alert at the first failure and at the final park,
+        silence in between.
         """
         persisted = False
         alert_this_failure = True
@@ -1987,6 +1991,22 @@ class AgentScheduler:
                         f"agent '{pending.agent_name}': {zombie_reason}; "
                         "park returned no state change"
                     )
+                continue
+            if pending.parked_at != 0:
+                # `include_parked=True` fa entrare anche le righe terminali.
+                # Una riga parcheggiata il cui schedule è ancora vivo non
+                # produce `zombie_reason`, quindi senza questa guardia arriva
+                # in `pending_wakes`, diventa `newest_recurring` e collassa la
+                # riga viva più vecchia — che poi non viene consegnata perché
+                # l'UPDATE degli attempts filtra su parked_at=0. Il turno
+                # sparisce del tutto.
+                continue
+            if pending.schedule_id in abandoned_schedule_ids:
+                _log(
+                    f"scheduler: persisted wake #{pending.id}, schedule "
+                    f"#{pending.schedule_id} for agent '{pending.agent_name}' "
+                    "remains pending behind an older abandoned pasted fire"
+                )
                 continue
             replay_max_age = self._pending_wake_replay_max_age(
                 current_schedule, pending.fired_at
