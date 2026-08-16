@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.db_journal import configure_rollback_journal
+
 
 def _fts5_phrase(query: str) -> str:
     """Escape a user query as quoted FTS5 phrase tokens (no operator syntax)."""
@@ -94,8 +96,11 @@ class ConversationStore:
         if connection is None:
             connection = sqlite3.connect(self._db_path)
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=30000")
+            # #889: rollback (TRUNCATE) journal mode, NOT WAL — so an external
+            # sqlite client opening this live DB and closing cannot unlink the
+            # -wal/-shm out from under the daemon's connection. Sets busy_timeout
+            # internally. See pinky_daemon.db_journal.
+            configure_rollback_journal(connection, busy_ms=30000)
             self._thread_local.connection = connection
         return connection
 
