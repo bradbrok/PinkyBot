@@ -1964,17 +1964,29 @@ class AgentScheduler:
                     pending.id,
                     reason=f"terminal replay policy: {zombie_reason}",
                 )
-                log_tag = (
-                    "PERSISTED_WAKE_STALE_DROPPED"
-                    if "stale" in zombie_reason
-                    else "PERSISTED_WAKE_ZOMBIE_QUARANTINED"
-                )
-                _log(
-                    f"scheduler: {log_tag} pending "
-                    f"#{pending.id}, schedule #{pending.schedule_id} for "
-                    f"agent '{pending.agent_name}': {zombie_reason}; "
-                    f"quarantined={quarantined}"
-                )
+                if quarantined:
+                    log_tag = (
+                        "PERSISTED_WAKE_STALE_DROPPED"
+                        if "stale" in zombie_reason
+                        else "PERSISTED_WAKE_ZOMBIE_QUARANTINED"
+                    )
+                    _log(
+                        f"scheduler: {log_tag} pending "
+                        f"#{pending.id}, schedule #{pending.schedule_id} for "
+                        f"agent '{pending.agent_name}': {zombie_reason}; "
+                        "quarantined=True"
+                    )
+                else:
+                    # Ripristinato da b28c7367 (#1020), scartato in tre merge
+                    # successivi: un park che non cambia stato deve avere un
+                    # marcatore proprio, altrimenti è indistinguibile da una
+                    # quarantena vera nei log e negli alert per stringa.
+                    _log(
+                        f"scheduler: PERSISTED_WAKE_ZOMBIE_PARK_NOOP pending "
+                        f"#{pending.id}, schedule #{pending.schedule_id} for "
+                        f"agent '{pending.agent_name}': {zombie_reason}; "
+                        "park returned no state change"
+                    )
                 continue
             replay_max_age = self._pending_wake_replay_max_age(
                 current_schedule, pending.fired_at
