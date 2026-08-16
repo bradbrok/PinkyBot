@@ -240,6 +240,32 @@ async def search_agent_chat_history(
     }
 
 
+@router.patch("/agents/{agent_name}/chat-history/{message_id}")
+async def edit_chat_message(agent_name: str, message_id: int, req: Request):
+    """Edit a chat message's content."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+    body = await req.json()
+    content = body.get("content", "")
+    if not content.strip():
+        raise HTTPException(400, "Content cannot be empty")
+    if not _store.edit_message(message_id, content):
+        raise HTTPException(404, f"Message {message_id} not found")
+    return {"ok": True}
+
+
+@router.delete("/agents/{agent_name}/chat-history/{message_id}")
+async def delete_chat_message(agent_name: str, message_id: int):
+    """Delete a chat message."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+    if not _store.delete_message(message_id):
+        raise HTTPException(404, f"Message {message_id} not found")
+    return {"ok": True}
+
+
 @router.get("/agents/{agent_name}/memories/stats")
 async def memory_stats(agent_name: str, timeframe: str = "all"):
     """Get memory statistics for an agent."""

@@ -91,6 +91,89 @@
     let deleteHardStep = false;   // second confirmation, only for the hard delete
     let deleteBusy = false;
 
+    // Dream edit / delete
+    let dreamEditOpen = false;
+    let dreamEditAgent = '';
+    let dreamEditContent = '';
+    let dreamEditSaving = false;
+    let dreamDeleteOpen = false;
+    let dreamDeleteAgent = '';
+    let dreamDeleteBusy = false;
+
+    function openDreamEdit(ds) {
+        dreamEditAgent = ds.agent_name;
+        dreamEditContent = ds.last_summary || '';
+        dreamEditOpen = true;
+    }
+    async function saveDreamEdit() {
+        if (!dreamEditContent.trim() || !dreamEditAgent) return;
+        dreamEditSaving = true;
+        try {
+            await api('PATCH', `/agents/${dreamEditAgent}/dream`, { summary: dreamEditContent });
+            const idx = dreamStates.findIndex(d => d.agent_name === dreamEditAgent);
+            if (idx >= 0) dreamStates[idx].last_summary = dreamEditContent;
+            dreamStates = dreamStates;
+            dreamEditOpen = false;
+            toast($_('memories.dream_edit_saved') || 'Dream updated');
+        } catch (e) { toast(`Edit failed: ${e.message}`, 'error'); }
+        finally { dreamEditSaving = false; }
+    }
+    function openDreamDelete(ds) {
+        dreamDeleteAgent = ds.agent_name;
+        dreamDeleteOpen = true;
+    }
+    async function confirmDreamDelete() {
+        dreamDeleteBusy = true;
+        try {
+            await api('DELETE', `/agents/${dreamDeleteAgent}/dream`);
+            dreamStates = dreamStates.filter(d => d.agent_name !== dreamDeleteAgent);
+            dreamDeleteOpen = false;
+            toast($_('memories.dream_deleted') || 'Dream deleted');
+        } catch (e) { toast(`Delete failed: ${e.message}`, 'error'); }
+        finally { dreamDeleteBusy = false; }
+    }
+
+    // Chat message edit / delete
+    let chatEditOpen = false;
+    let chatEditMsg = null;
+    let chatEditContent = '';
+    let chatEditSaving = false;
+    let chatDeleteOpen = false;
+    let chatDeleteMsg = null;
+    let chatDeleteBusy = false;
+
+    function openChatEdit(msg) {
+        chatEditMsg = msg;
+        chatEditContent = msg.content || '';
+        chatEditOpen = true;
+    }
+    async function saveChatEdit() {
+        if (!chatEditContent.trim() || !chatEditMsg) return;
+        chatEditSaving = true;
+        try {
+            await api('PATCH', `/agents/${currentAgent}/chat-history/${chatEditMsg.id}`, { content: chatEditContent });
+            chatEditMsg.content = chatEditContent;
+            chatMessages = chatMessages;
+            chatEditOpen = false;
+            toast('Message updated');
+        } catch (e) { toast(`Edit failed: ${e.message}`, 'error'); }
+        finally { chatEditSaving = false; }
+    }
+    function openChatDelete(msg) {
+        chatDeleteMsg = msg;
+        chatDeleteOpen = true;
+    }
+    async function confirmChatDelete() {
+        chatDeleteBusy = true;
+        try {
+            await api('DELETE', `/agents/${currentAgent}/chat-history/${chatDeleteMsg.id}`);
+            chatMessages = chatMessages.filter(m => m.id !== chatDeleteMsg.id);
+            chatDeleteOpen = false;
+            toast('Message deleted');
+        } catch (e) { toast(`Delete failed: ${e.message}`, 'error'); }
+        finally { chatDeleteBusy = false; }
+    }
+
     function memId(m) { return m.id || m._id; }
 
     function openEdit(m) {
@@ -929,6 +1012,10 @@
                         {#if msg.duration_ms}
                             <span class="chat-duration">{(msg.duration_ms / 1000).toFixed(1)}s</span>
                         {/if}
+                        <span style="margin-left:auto;display:flex;gap:0.3rem">
+                            <button class="card-action" title="Edit" on:click={() => openChatEdit(msg)}>✎</button>
+                            <button class="card-action danger" title="Delete" on:click={() => openChatDelete(msg)}>✕</button>
+                        </span>
                     </div>
                     <div class="chat-item-content">{msg.content}</div>
                 </div>
@@ -952,6 +1039,8 @@
                             <span style="font-family:var(--font-grotesk);font-size:0.7rem;color:var(--gray-mid)">
                                 {ds.last_dream_at ? new Date(ds.last_dream_at * 1000).toLocaleString() : 'Never'}
                             </span>
+                            <button class="card-action" title="Edit" on:click={() => openDreamEdit(ds)}>✎</button>
+                            <button class="card-action danger" title="Delete" on:click={() => openDreamDelete(ds)}>✕</button>
                             <button class="btn btn-sm btn-primary" disabled={dreamingAgent !== null} on:click={() => triggerDream(ds.agent_name)}>{dreamingAgent === ds.agent_name ? $_('agents.dreaming') : $_('memories.dream_now')}</button>
                         </div>
                     </div>
@@ -997,6 +1086,49 @@
         {:else}
             <button class="btn btn-danger" on:click={() => confirmDelete(true)} disabled={deleteBusy}>{$_('memories.delete_hard')}</button>
         {/if}
+    </svelte:fragment>
+</Modal>
+
+<!-- Edit chat message -->
+<Modal bind:show={chatEditOpen} title="Edit Message" width="640px" maxWidth="640px">
+    <textarea class="edit-textarea" bind:value={chatEditContent} rows="8" placeholder="Message content..."></textarea>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => chatEditOpen = false} disabled={chatEditSaving}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveChatEdit} disabled={chatEditSaving || !chatEditContent.trim()}>
+            {chatEditSaving ? $_('common.saving') : $_('common.save')}
+        </button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Delete chat message -->
+<Modal bind:show={chatDeleteOpen} title="Delete Message" width="560px" maxWidth="560px">
+    {#if chatDeleteMsg}
+        <div class="delete-preview">{(chatDeleteMsg.content || '').substring(0, 300)}</div>
+    {/if}
+    <div class="edit-hint">This will permanently delete this message from chat history.</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => chatDeleteOpen = false} disabled={chatDeleteBusy}>{$_('common.cancel')}</button>
+        <button class="btn btn-danger" on:click={confirmChatDelete} disabled={chatDeleteBusy}>Delete</button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Edit dream summary -->
+<Modal bind:show={dreamEditOpen} title="Edit Dream Summary" width="640px" maxWidth="640px">
+    <textarea class="edit-textarea" bind:value={dreamEditContent} rows="10" placeholder="Dream summary..."></textarea>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => dreamEditOpen = false} disabled={dreamEditSaving}>{$_('common.cancel')}</button>
+        <button class="btn btn-primary" on:click={saveDreamEdit} disabled={dreamEditSaving || !dreamEditContent.trim()}>
+            {dreamEditSaving ? $_('common.saving') : $_('common.save')}
+        </button>
+    </svelte:fragment>
+</Modal>
+
+<!-- Delete dream -->
+<Modal bind:show={dreamDeleteOpen} title="Delete Dream" width="560px" maxWidth="560px">
+    <div class="edit-hint">This will permanently delete the dream state for <strong>{dreamDeleteAgent}</strong>. The agent can dream again to create a new one.</div>
+    <svelte:fragment slot="footer">
+        <button class="btn" on:click={() => dreamDeleteOpen = false} disabled={dreamDeleteBusy}>{$_('common.cancel')}</button>
+        <button class="btn btn-danger" on:click={confirmDreamDelete} disabled={dreamDeleteBusy}>Delete</button>
     </svelte:fragment>
 </Modal>
 

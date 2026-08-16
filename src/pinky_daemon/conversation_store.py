@@ -407,6 +407,24 @@ class ConversationStore:
             # Space is reclaimed gradually by SQLite's automatic checkpointing.
         return deleted
 
+    def edit_message(self, message_id: int, content: str) -> bool:
+        """Update the content of a message by its integer ID.  Returns True if updated."""
+        with self._conn:
+            cur = self._conn.execute(
+                "UPDATE messages SET content = ? WHERE id = ?",
+                (content, message_id),
+            )
+            return cur.rowcount > 0
+
+    def delete_message(self, message_id: int) -> bool:
+        """Delete a message by its integer ID.  Returns True if deleted."""
+        with self._conn:
+            cur = self._conn.execute(
+                "DELETE FROM messages WHERE id = ?",
+                (message_id,),
+            )
+            return cur.rowcount > 0
+
     def close(self) -> None:
         """Close the calling thread's connection, if it has opened one.
 
