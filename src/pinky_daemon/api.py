@@ -5150,12 +5150,17 @@ def create_api(
                     status_code=403,
                     content=content,
                 )
+            # #463: record WHO authenticated. Routes that are owner-only (memory
+            # edit/delete) read this to tell a signed agent from a UI session.
+            request.state.auth_actor = "agent"
+            request.state.auth_agent = caller
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
         #    branches below so a logged-in browser session passes the same
         #    way regardless of which protected surface is being hit.
         if _has_valid_session(request):
+            request.state.auth_actor = "owner"
             return await call_next(request)
 
         # 4. Protected HTML pages: unauth → 307 redirect to /login (or

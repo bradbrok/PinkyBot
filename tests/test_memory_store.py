@@ -1229,3 +1229,107 @@ class TestConsolidateBatch:
         assert store.get(ref.id).superseded_by == winner.id
         # ...and must not have gone on to archive the weaker active memory
         assert store.get(weak.id).active is True
+
+
+class TestEditAndDelete:
+    """#463 — edit + delete surfaced to the UI.
+
+    Editing content must not leave the row's vector pointing at the OLD text:
+    FTS5 is kept in sync by a trigger, but the embedding is not, so semantic
+    ``recall`` would keep matching what the user just rewrote away.
+    """
+
+    def test_update_content_invalidates_embedding(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("original content", embedding=_emb()))
+        assert store.get(r.id).embedding  # embedded at insert
+
+        store.update_content(r.id, "rewritten content")
+
+        fetched = store.get(r.id)
+        assert fetched.content == "rewritten content"
+        assert fetched.embedding == []
+
+    def test_update_content_requeues_for_heal(self, tmp_path):
+        """The stale row must show up in the heal-on-write backlog (#630),
+        which is what actually re-embeds it on the next reflect()."""
+        store = _store(tmp_path)
+        r = store.insert(_fact("original content", embedding=_emb()))
+        assert store.get_unembedded() == []
+
+        store.update_content(r.id, "rewritten content")
+
+        assert [i for i, _ in store.get_unembedded()] == [r.id]
+
+    def test_update_content_drops_stale_vec_row(self, tmp_path):
+        store = _store(tmp_path)
+        if not ReflectionStore(str(tmp_path / "probe.db"))._vec_available:
+            pytest.skip("sqlite-vec not available")
+        r = store.insert(_fact("original content", embedding=_emb()))
+        store.update_content(r.id, "rewritten content")
+        rowid = store._conn.execute(
+            "SELECT rowid FROM reflections WHERE id = ?", (r.id,)
+        ).fetchone()[0]
+        remaining = store._conn.execute(
+            "SELECT count(*) FROM reflections_vec WHERE rowid = ?", (rowid,)
+        ).fetchone()[0]
+        assert remaining == 0
+
+    def test_update_content_keyword_search_follows(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("pineapple pizza"))
+        store.update_content(r.id, "anchovy pizza")
+        assert [x.id for x in store.search_by_keyword("anchovy")] == [r.id]
+        assert store.search_by_keyword("pineapple") == []
+
+    def test_delete_reflection_removes_row(self, tmp_path):
+        store = _store(tmp_path)
+        r = store.insert(_fact("delete me"))
+        assert store.delete_reflection(r.id) is True
+        assert store.get(r.id) is None
+
+    def test_delete_reflection_unknown_id_is_false(self, tmp_path):
+        store = _store(tmp_path)
+        assert store.delete_reflection("does-not-exist") is False
+
+    def test_delete_reflection_removes_links_both_ways(self, tmp_path):
+        store = _store(tmp_path)
+        a = store.insert(_fact("alpha"))
+        b = store.insert(_fact("beta"))
+        store.create_link(a.id, b.id, 0.9)  # bidirectional
+
+        store.delete_reflection(a.id)
+
+        rows = store._conn.execute(
+            "SELECT count(*) FROM reflection_links WHERE source_id = ? OR target_id = ?",
+            (a.id, a.id),
+        ).fetchone()[0]
+        assert rows == 0
+
+    def test_delete_reflection_removes_vec_row(self, tmp_path):
+        store = _store(tmp_path)
+        if not store._vec_available:
+            pytest.skip("sqlite-vec not available")
+        r = store.insert(_fact("delete me", embedding=_emb()))
+        rowid = store._conn.execute(
+            "SELECT rowid FROM reflections WHERE id = ?", (r.id,)
+        ).fetchone()[0]
+        store.delete_reflection(r.id)
+        remaining = store._conn.execute(
+            "SELECT count(*) FROM reflections_vec WHERE rowid = ?", (rowid,)
+        ).fetchone()[0]
+        assert remaining == 0
+
+    def test_soft_delete_is_reversible(self, tmp_path):
+        """archive_reflection is the DEFAULT delete: it must stay undoable."""
+        store = _store(tmp_path)
+        r = store.insert(_fact("archive me"))
+        store.archive_reflection(r.id, reason="ui-delete")
+        assert store.get(r.id).active is False
+
+        event_id = store._conn.execute(
+            "SELECT id FROM memory_events WHERE event_type = 'archive' "
+            "ORDER BY id DESC LIMIT 1"
+        ).fetchone()[0]
+        assert store.revert_memory_event(event_id) is True
+        assert store.get(r.id).active is True

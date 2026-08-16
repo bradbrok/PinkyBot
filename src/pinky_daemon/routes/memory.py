@@ -17,7 +17,8 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
+from pydantic import BaseModel
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -275,6 +276,73 @@ async def get_memory_links(agent_name: str, memory_id: str):
             })
     store.close()
     return {"links": linked_memories, "count": len(linked_memories)}
+
+
+# ── Memory Editing ────────────────────────────────────────────────────────────
+
+
+class MemoryContentUpdate(BaseModel):
+    content: str
+
+
+def _require_owner(request: Request) -> None:
+    """Refuse anything but a web-UI owner session (#463).
+
+    Memories are rewritten and deleted only by the owner, from the UI. An agent
+    holding a valid internal signature is authenticated but is NOT the owner —
+    no agent may mutate memories, its own included. Reading stays open.
+    """
+    if getattr(request.state, "auth_actor", None) != "owner":
+        raise HTTPException(403, "Only the owner may edit or delete memories")
+
+
+@router.patch("/agents/{agent_name}/memories/{memory_id}")
+async def update_memory(
+    agent_name: str, memory_id: str, body: MemoryContentUpdate, request: Request
+):
+    """Rewrite a memory's content.
+
+    The store invalidates the stale embedding, so the reflection re-enters the
+    heal-on-write backlog and semantic recall stops matching the old wording.
+    """
+    _require_owner(request)
+    content = body.content.strip()
+    if not content:
+        raise HTTPException(400, "Content cannot be empty")
+    store = _get_memory_store(agent_name)
+    if not store.get(memory_id):
+        store.close()
+        raise HTTPException(404, f"Memory '{memory_id}' not found")
+    store.update_content(memory_id, content)
+    updated = store.get(memory_id)
+    store.close()
+    return _reflection_to_dict(updated)
+
+
+@router.delete("/agents/{agent_name}/memories/{memory_id}")
+async def delete_memory(
+    agent_name: str, memory_id: str, request: Request, hard: bool = False
+):
+    """Delete a memory. Soft (reversible) by default.
+
+    The default archives the reflection and logs a `memory_events` row, so the
+    deletion can be undone with `revert_memory_event`. `hard=true` removes the
+    row, its vector and its links outright — there is nothing left to revert.
+    """
+    _require_owner(request)
+    store = _get_memory_store(agent_name)
+    reflection = store.get(memory_id)
+    if not reflection:
+        store.close()
+        raise HTTPException(404, f"Memory '{memory_id}' not found")
+    if hard:
+        store.delete_reflection(memory_id)
+    elif reflection.active:
+        store.archive_reflection(memory_id, reason="ui-delete")
+    # An already-archived reflection is left alone: re-archiving would stack a
+    # second event and bury the undo of the first.
+    store.close()
+    return {"id": memory_id, "deleted": True, "hard": hard}
 
 
 # ── Knowledge Graph ───────────────────────────────────────────────────────────
