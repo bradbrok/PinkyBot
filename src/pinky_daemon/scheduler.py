@@ -52,6 +52,48 @@ _UNDELIVERED_ALERT_LIVENESS_WINDOW = 120.0
 # injection below keeps fleet policy configurable and tests deterministic.
 _PERSISTED_WAKE_MAX_AGE_SEC = 60 * 60
 
+# Throttle warnings about oversized schedule prompts to avoid log spam.
+# These warnings happen when a schedule's prompt exceeds the gRPC message
+# size limit; throttling prevents re-warning on every delivery attempt.
+_SCHEDULE_PROMPT_WARN_INTERVAL_SEC = 15 * 60
+
+_RECEIPT_EXTENSION_MAX_AGE_ENV = "PINKY_SCHEDULE_RECEIPT_EXTENSION_MAX_AGE_SEC"
+_RECEIPT_EXTENSION_MAX_AGE_SEC = 60 * 60
+_RECEIPT_EXTENSION_ATTEMPT_CAP_ENV = (
+    "PINKY_SCHEDULE_RECEIPT_EXTENSION_ATTEMPT_CAP"
+)
+_RECEIPT_EXTENSION_ATTEMPT_CAP = 3
+_ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC = 1.0
+_PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC = 60
+_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP_ENV = (
+    "PINKY_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP"
+)
+_OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP = 30
+_OUTBOX_DRAIN_EXTENSION_MAX_AGE_ENV = (
+    "PINKY_OUTBOX_DRAIN_EXTENSION_MAX_AGE_SEC"
+)
+_OUTBOX_DRAIN_EXTENSION_MAX_AGE_SEC = 30 * 60
+_OUTBOX_DRAIN_PROBE_TIMEOUT_ENV = "PINKY_OUTBOX_DRAIN_PROBE_TIMEOUT_SEC"
+_OUTBOX_DRAIN_PROBE_TIMEOUT_SEC = 5.0
+_OUTBOX_REAPER_RETAIN_ACCEPTED_ENV = (
+    "PINKY_OUTBOX_REAPER_RETAIN_ACCEPTED_SEC"
+)
+_OUTBOX_REAPER_RETAIN_ABANDONED_ENV = (
+    "PINKY_OUTBOX_REAPER_RETAIN_ABANDONED_SEC"
+)
+_OUTBOX_REAPER_RETAIN_PARKED_ENV = "PINKY_OUTBOX_REAPER_RETAIN_PARKED_SEC"
+_OUTBOX_REAPER_PAYLOAD_TRIM_ENV = (
+    "PINKY_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC"
+)
+_OUTBOX_REAPER_FAILURE_BACKOFF_ENV = (
+    "PINKY_OUTBOX_REAPER_FAILURE_BACKOFF_SEC"
+)
+_OUTBOX_REAPER_RETAIN_ACCEPTED_SEC = 7 * 24 * 60 * 60
+_OUTBOX_REAPER_RETAIN_ABANDONED_SEC = 14 * 24 * 60 * 60
+_OUTBOX_REAPER_RETAIN_PARKED_SEC = 30 * 24 * 60 * 60
+_OUTBOX_REAPER_PAYLOAD_TRIM_AFTER_SEC = 48 * 60 * 60
+_OUTBOX_REAPER_FAILURE_BACKOFF_SEC = 60 * 60
+
 
 # ── Rate Limit Gating ───────────────────────────────────────
 
@@ -60,6 +102,50 @@ _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
 
 # Il limite di retry sui wake persistiti vive ora in
 # AgentScheduler.PERSISTED_WAKE_ATTEMPT_CAP (parcheggio, non discard).
+
+
+class _ReceiptAbandonedError(RuntimeError):
+    """An unconfirmed wake exhausted its receipt-extension budget."""
+
+
+@dataclass
+class _OutboxDrainExtensionState:
+    """One oldest pending fire's consecutive busy-drain evidence."""
+
+    oldest_fired_at: float
+    attempts: int = 0
+    alerted: bool = False
+
+
+def _positive_env_seconds(name: str, default: float) -> float:
+    """Read one finite positive duration, falling back loudly."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = float(raw_value)
+        if not math.isfinite(value) or value <= 0:
+            raise ValueError("duration must be finite and positive")
+    except (TypeError, ValueError):
+        _log(
+            f"scheduler: invalid {name} duration {raw_value!r}; "
+            f"using {default:g}s"
+        )
+        return default
+    return value
+
+
+def _positive_env_int(name: str, default: int) -> int:
+    """Read one positive integer, falling back loudly."""
+    raw_value = os.environ.get(name, str(default))
+    try:
+        value = int(raw_value)
+        if str(value) != raw_value.strip() or value <= 0:
+            raise ValueError("value must be a positive integer")
+    except (TypeError, ValueError):
+        _log(
+            f"scheduler: invalid {name} value {raw_value!r}; using {default}"
+        )
+        return default
+    return value
 
 
 def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
