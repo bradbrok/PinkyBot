@@ -75,3 +75,4 @@ templates/aiena_article_template.html
 
 # Deploy guard-rail (#425) — must never become a tracked file a deploy can remove
 .pinky-deploy-lock
+scripts/claude_account.py  # OAuth token management — credentials
