@@ -9,6 +9,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_MAX_PER_AGENT = 1000
 
@@ -22,6 +24,7 @@ class MessageContextStore:
         *,
         retention_days: int = DEFAULT_RETENTION_DAYS,
         max_per_agent: int = DEFAULT_MAX_PER_AGENT,
+        catalog: StoreCatalog | None = None,
     ) -> None:
         self.db_path = db_path
         self.retention_days = max(1, retention_days)
@@ -30,8 +33,17 @@ class MessageContextStore:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         self._db.row_factory = sqlite3.Row
-        self._db.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(
+            self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        ).lower()
         self._db.execute("PRAGMA busy_timeout=5000")
+        if catalog is not None:
+            catalog.register(
+                "message_context",
+                db_path,
+                journal_mode=journal_mode,
+                owner=type(self).__name__,
+            )
         self._create_schema()
         self._ensure_columns()
         self._ensure_identity_key()

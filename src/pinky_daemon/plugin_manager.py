@@ -38,6 +38,8 @@ from typing import Any, Callable
 
 import yaml
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -116,12 +118,14 @@ class PluginContext:
         db_path: str = "",
         api_url: str = "http://localhost:8888",
         working_dir: str = ".",
+        catalog: StoreCatalog | None = None,
     ):
         self.plugin_name = plugin_name
         self._api_url = api_url
         self._working_dir = Path(working_dir)
         self._db: sqlite3.Connection | None = None
         self._db_path = db_path
+        self._catalog = catalog
         self._tools: dict[str, Callable] = {}
         self._hooks: dict[str, list[Callable]] = {}
 
@@ -139,7 +143,16 @@ class PluginContext:
                 data_dir.mkdir(parents=True, exist_ok=True)
                 self._db_path = str(data_dir / "plugins.db")
             self._db = sqlite3.connect(self._db_path, check_same_thread=False)
-            self._db.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
+            if self._catalog is not None:
+                self._catalog.register(
+                    "plugins",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner="PluginManager",
+                )
         return self._db
 
     def create_table(self, table_name: str, schema: str) -> None:
@@ -281,12 +294,14 @@ class PluginManager:
         db_path: str = "data/plugins.db",
         api_url: str = "http://localhost:8888",
         working_dir: str = ".",
+        catalog: StoreCatalog | None = None,
     ):
         self._plugins: dict[str, PluginInfo] = {}
         self._contexts: dict[str, PluginContext] = {}
         self._db_path = db_path
         self._api_url = api_url
         self._working_dir = working_dir
+        self._catalog = catalog
 
         # State persistence
         self._state_db_path = db_path
@@ -296,7 +311,14 @@ class PluginManager:
         """Initialize the plugin state tracking table."""
         Path(self._state_db_path).parent.mkdir(parents=True, exist_ok=True)
         db = sqlite3.connect(self._state_db_path, check_same_thread=False)
-        db.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(db.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
+        if self._catalog is not None:
+            self._catalog.register(
+                "plugins",
+                self._state_db_path,
+                journal_mode=journal_mode,
+                owner="PluginManager",
+            )
         db.execute("""
             CREATE TABLE IF NOT EXISTS plugin_state (
                 name TEXT PRIMARY KEY,
@@ -435,6 +457,7 @@ class PluginManager:
             db_path=self._db_path,
             api_url=self._api_url,
             working_dir=self._working_dir,
+            catalog=self._catalog,
         )
 
         # Load the plugin module

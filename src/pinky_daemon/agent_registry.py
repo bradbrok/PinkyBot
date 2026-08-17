@@ -39,6 +39,7 @@ from uuid import UUID
 
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
+from pinky_daemon.store_catalog import StoreCatalog
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts
 # under .claude/, settings.json, .mcp.json) and database queries. Restrict
@@ -1387,6 +1388,7 @@ class AgentRegistry:
         db_path: str = "data/agents.db",
         *,
         buzz_device_key_path: str | None = None,
+        catalog: StoreCatalog | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         # Absolute path retained so callers (e.g. _write_mcp_json) can hand
@@ -1406,8 +1408,15 @@ class AgentRegistry:
         # (si_addr confirmed inside conversations_agents.db-shm). Rollback mode
         # has no -shm, so the daemon never maps it. Runs before _init_tables and
         # before any MCP/session resume spawns stdio children. Agents DB only.
-        _configure_agents_db_connection(self._db)
+        journal_mode = _configure_agents_db_connection(self._db)
         self._db.execute("PRAGMA foreign_keys=ON")
+        if catalog is not None:
+            catalog.register(
+                "agents",
+                self._db_path,
+                journal_mode=journal_mode,
+                owner=type(self).__name__,
+            )
         # Guard read-modify-write sequences (e.g. peer_fleet_acl mutation)
         # from concurrent admin-API requests. SQLite connection is shared
         # across threads (check_same_thread=False) and Python's default

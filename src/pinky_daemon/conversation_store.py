@@ -19,6 +19,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
+from pinky_daemon.store_catalog import StoreCatalog
 
 
 def _fts5_phrase(query: str) -> str:
@@ -83,8 +84,14 @@ class ConversationStore:
     Uses FTS5 for fast keyword search across all conversations.
     """
 
-    def __init__(self, db_path: str = "data/conversations.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/conversations.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._catalog = catalog
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._thread_local = threading.local()
         self._init_schema()
@@ -100,7 +107,14 @@ class ConversationStore:
             # sqlite client opening this live DB and closing cannot unlink the
             # -wal/-shm out from under the daemon's connection. Sets busy_timeout
             # internally. See pinky_daemon.db_journal.
-            configure_rollback_journal(connection, busy_ms=30000)
+            journal_mode = configure_rollback_journal(connection, busy_ms=30000)
+            if self._catalog is not None:
+                self._catalog.register(
+                    "conversations",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 

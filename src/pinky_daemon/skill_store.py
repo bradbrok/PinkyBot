@@ -29,6 +29,8 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -141,9 +143,15 @@ def _row_to_skill(row: tuple) -> Skill:
 class SkillStore:
     """SQLite-backed skill registry with per-agent assignment."""
 
-    def __init__(self, db_path: str = "data/skills.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/skills.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_tables()
 
@@ -153,9 +161,18 @@ class SkillStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA foreign_keys=ON")
+            if self._catalog is not None:
+                self._catalog.register(
+                    "skills",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 

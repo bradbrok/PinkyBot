@@ -20,6 +20,10 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.store_catalog import StoreCatalog
+
+SESSION_DB_OWNER = "SessionStore+SessionEventStore"
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -59,9 +63,15 @@ class SessionRecord:
 class SessionStore:
     """SQLite-backed session persistence."""
 
-    def __init__(self, db_path: str = "data/sessions.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/sessions.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_tables()
 
@@ -71,8 +81,17 @@ class SessionStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
+            if self._catalog is not None:
+                self._catalog.register(
+                    "sessions",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=SESSION_DB_OWNER,
+                )
             self._thread_local.connection = connection
         return connection
 
@@ -302,9 +321,15 @@ class SessionStore:
 class SessionEventStore:
     """SQLite-backed store for session lifecycle events."""
 
-    def __init__(self, db_path: str = "data/sessions.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/sessions.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_tables()
 
@@ -314,8 +339,17 @@ class SessionEventStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
+            if self._catalog is not None:
+                self._catalog.register(
+                    "session_events",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=SESSION_DB_OWNER,
+                )
             self._thread_local.connection = connection
         return connection
 

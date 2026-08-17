@@ -29,6 +29,8 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 # -- Records -------------------------------------------------------------------
 
 
@@ -99,11 +101,25 @@ class MeshStore:
     own concurrency story.
     """
 
-    def __init__(self, db_path: str = "data/mesh.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/mesh.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(
+            self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        ).lower()
         self._db.execute("PRAGMA foreign_keys=ON")
+        if catalog is not None:
+            catalog.register(
+                "mesh",
+                db_path,
+                journal_mode=journal_mode,
+                owner=type(self).__name__,
+            )
         self._lock = threading.RLock()
         self._init_tables()
 

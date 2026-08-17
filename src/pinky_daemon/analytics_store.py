@@ -6,6 +6,8 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 # Providers to include in analytics dashboards.
 # Only Anthropic/Claude usage — excludes Codex CLI (OpenAI) and other non-Anthropic providers.
 _ANTHROPIC_PROVIDERS = {"firstParty", "default", "anthropic", "bedrock", "vertex"}
@@ -60,8 +62,14 @@ def _prev_range_bounds(range_name: str) -> tuple[str, str]:
 
 
 class AnalyticsStore:
-    def __init__(self, db_path: str) -> None:
+    def __init__(
+        self,
+        db_path: str,
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         self.db_path = db_path
+        self._catalog = catalog
         self._pricing_cache: dict[tuple[str, str], list[dict]] | None = None
         self._init_db()
 
@@ -251,6 +259,16 @@ class AnalyticsStore:
                 "CREATE INDEX IF NOT EXISTS idx_atc_status_started "
                 "ON analytics_tool_calls(status, started_at)"
             )
+            if self._catalog is not None:
+                journal_mode = str(
+                    conn.execute("PRAGMA journal_mode").fetchone()[0]
+                ).lower()
+                self._catalog.register(
+                    "analytics",
+                    self.db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
 
     # Pricing rows added AFTER the original seed batch. _seed_default_pricing
     # only fires on an empty table, so these reach already-seeded production

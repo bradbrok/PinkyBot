@@ -39,6 +39,7 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
+from pinky_daemon.store_catalog import StoreCatalog
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 
 
@@ -138,10 +139,12 @@ class DreamRunner:
         setting_provider: Callable[[str], str] | None = None,
         signing_key_provider: Callable[[str], str | None] | None = None,
         owner_notify_callback: Callable[[str, str], object] | None = None,
+        catalog: StoreCatalog | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._thread_local = threading.local()
+        self._catalog = catalog
         self._history_provider = history_provider
         # Optional () -> owner-profile dict, used to derive high-value entity
         # names for KG proactive-surfacing materiality. May be None.
@@ -167,8 +170,17 @@ class DreamRunner:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
+            if self._catalog is not None:
+                self._catalog.register(
+                    "dream_state",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 

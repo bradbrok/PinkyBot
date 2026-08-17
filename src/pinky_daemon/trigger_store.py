@@ -20,6 +20,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
+from pinky_daemon.store_catalog import StoreCatalog
 
 
 def _log(msg: str) -> None:
@@ -76,9 +77,15 @@ class Trigger:
 class TriggerStore:
     """SQLite-backed store for triggers."""
 
-    def __init__(self, db_path: str = "data/triggers.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/triggers.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_table()
         self._migrate()
@@ -92,9 +99,16 @@ class TriggerStore:
             # #889: rollback (TRUNCATE) journal mode, NOT WAL — an external sqlite
             # client's open/close can't unlink -wal/-shm out from under the daemon.
             # Sets busy_timeout internally. See pinky_daemon.db_journal.
-            configure_rollback_journal(connection, busy_ms=30000)
+            journal_mode = configure_rollback_journal(connection, busy_ms=30000)
             connection.execute("PRAGMA foreign_keys=ON")
             connection.row_factory = sqlite3.Row
+            if self._catalog is not None:
+                self._catalog.register(
+                    "triggers",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 
