@@ -426,6 +426,40 @@ def test_reconcile_quiets_snapshot_orphan_reached_first_through_normal_symlink(
     assert catalog.validate() == []
 
 
+def test_reconcile_skips_dangling_config_symlink(tmp_path: Path) -> None:
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    agent_home = tmp_path / "agent" / ".codex"
+    agent_home.mkdir(parents=True)
+    (agent_home / "config.toml").symlink_to(shared_home / "config.toml")
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    assert catalog.validate() == []
+
+
+def test_reconcile_skips_dangling_database_symlink(tmp_path: Path) -> None:
+    (tmp_path / "foo.db").symlink_to(tmp_path / "missing.db")
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    assert catalog.validate() == []
+
+
+def test_create_api_boots_with_dangling_config_symlink_below_data_root(tmp_path: Path) -> None:
+    from pinky_daemon.api import create_api
+
+    shared_home = tmp_path / "shared"
+    shared_home.mkdir()
+    agent_home = tmp_path / "agent" / ".codex"
+    agent_home.mkdir(parents=True)
+    config_link = agent_home / "config.toml"
+    config_link.symlink_to(shared_home / "config.toml")
+
+    app = create_api(db_path=str(tmp_path / "conversations.db"))
+
+    assert app.state.store_catalog is not None
+    assert config_link.is_symlink()
+
+
 def test_reconcile_rejects_alias_behind_symlinked_directory(tmp_path: Path) -> None:
     expected_root = tmp_path / "data"
     expected_root.mkdir()
