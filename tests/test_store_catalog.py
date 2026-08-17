@@ -332,7 +332,7 @@ def test_reconcile_rejects_unregistered_hardlink_to_registered_store(tmp_path: P
     _register(catalog, "tasks", registered, owner="TaskStore")
 
     with pytest.raises(StoreCatalogError, match="unregistered path aliases registered store inode"):
-        catalog.reconcile_filesystem()
+        catalog.validate()
 
 
 def test_reconcile_warns_for_unclaimed_file_without_failing(
@@ -342,7 +342,7 @@ def test_reconcile_warns_for_unclaimed_file_without_failing(
     orphan.touch()
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
 
-    warnings = catalog.reconcile_filesystem()
+    warnings = catalog.validate()
 
     assert len(warnings) == 1
     assert "unclaimed database file" in warnings[0]
@@ -387,7 +387,7 @@ def test_reconcile_excludes_sidecars_and_temp_snapshot_directories(tmp_path: Pat
     registered.touch()
     for suffix in ("-wal", "-shm", "-journal"):
         (tmp_path / f"tasks.db{suffix}").touch()
-    for directory_name in ("tmp", "snapshots"):
+    for directory_name in ("tmp", "snapshots", "pre-migration-snapshot"):
         ignored_dir = tmp_path / directory_name
         ignored_dir.mkdir()
         (ignored_dir / "ignored.db").touch()

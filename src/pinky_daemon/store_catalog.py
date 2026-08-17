@@ -2,10 +2,31 @@
 
 from __future__ import annotations
 
+import fnmatch
+import logging
 import os
+import re
+import stat
 import threading
+from collections.abc import Mapping
 from dataclasses import dataclass
 from urllib.parse import parse_qsl
+
+logger = logging.getLogger("pinky.store_catalog")
+
+
+DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST: dict[str, str] = {
+    "hub.db": "pinky_hub component store; not owned by the API daemon",
+    "pinky.db": "poll-mode --mode daemon base; unused in API mode",
+    "pinkybot.db": "legacy daemon base; not owned by the current API daemon",
+    "daemon.db": "zero-byte legacy daemon orphan; pending operator cleanup",
+    "messages.db": "zero-byte legacy message-store orphan; pending operator cleanup",
+    "pinky_daemon.db": "zero-byte legacy API-daemon orphan; pending operator cleanup",
+    "scheduler.db": "zero-byte legacy scheduler orphan; pending operator cleanup",
+}
+
+_SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
+_IGNORED_DIRECTORY_KINDS = frozenset({"snapshot", "snapshots", "temp", "temporary", "tmp"})
 
 
 @dataclass(frozen=True, slots=True)
@@ -31,12 +52,28 @@ class _CatalogEntry:
     used_relative_path: bool
 
 
+@dataclass(frozen=True, slots=True)
+class _FilesystemDatabase:
+    relative_path: str
+    resolved_path: str
+    dev_ino: tuple[int, int]
+
+
 class StoreCatalog:
     """Observe store connection policy and reject an incoherent boot layout."""
 
-    def __init__(self, expected_root: str | os.PathLike[str] | None = None) -> None:
+    def __init__(
+        self,
+        expected_root: str | os.PathLike[str] | None = None,
+        *,
+        silence_allowlist: Mapping[str, str] | None = None,
+    ) -> None:
         root = os.getcwd() if expected_root is None else os.fspath(expected_root)
         self._expected_root = os.path.realpath(root)
+        configured_allowlist = (
+            DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST if silence_allowlist is None else silence_allowlist
+        )
+        self._silence_allowlist = dict(configured_allowlist)
         self._entries: list[_CatalogEntry] = []
         self._lock = threading.RLock()
 
@@ -90,8 +127,8 @@ class StoreCatalog:
                 )
             )
 
-    def validate(self) -> None:
-        """Raise when registered stores do not form one coherent layout."""
+    def validate(self) -> list[str]:
+        """Raise for an unsafe layout and return filesystem hygiene warnings."""
         with self._lock:
             self._refresh_identities()
             entries = list(self._entries)
@@ -149,6 +186,76 @@ class StoreCatalog:
                 "Store catalog validation failed:\n- " + "\n- ".join(violations)
             )
 
+        return self.reconcile_filesystem()
+
+    def reconcile_filesystem(self) -> list[str]:
+        """Reconcile registered stores with SQLite files found below the data root.
+
+        A distinct path sharing a registered store's inode is unsafe and fails
+        closed. Standalone unclaimed databases and stale warning suppressions are
+        surfaced as warnings so inventory drift cannot remain invisible or brick
+        an otherwise safe boot.
+        """
+        with self._lock:
+            self._refresh_identities()
+            records = [entry.record for entry in self._entries if not entry.record.is_memory]
+
+        registered_realpaths = {record.resolved_path for record in records}
+        registered_paths_by_inode: dict[tuple[int, int], set[str]] = {}
+        for record in records:
+            if record.dev_ino is not None:
+                registered_paths_by_inode.setdefault(record.dev_ino, set()).add(
+                    record.resolved_path
+                )
+
+        databases, warnings = self._enumerate_database_files()
+        alias_violations: list[str] = []
+        matched_allowlist_patterns: set[str] = set()
+
+        for database in databases:
+            matching_patterns = {
+                pattern
+                for pattern in self._silence_allowlist
+                if self._allowlist_pattern_matches(pattern, database.relative_path)
+            }
+            matched_allowlist_patterns.update(matching_patterns)
+
+            registered_inode_paths = registered_paths_by_inode.get(database.dev_ino, set())
+            if registered_inode_paths and database.resolved_path not in registered_inode_paths:
+                alias_violations.append(
+                    "unregistered path aliases registered store inode: "
+                    f"path={database.relative_path!r} resolved_path={database.resolved_path!r} "
+                    f"dev_ino={database.dev_ino!r} "
+                    f"registered_realpaths={sorted(registered_inode_paths)!r}"
+                )
+                continue
+
+            if database.resolved_path in registered_realpaths or matching_patterns:
+                continue
+
+            warnings.append(
+                "unclaimed database file: "
+                f"path={database.relative_path!r} resolved_path={database.resolved_path!r} "
+                f"dev_ino={database.dev_ino!r}"
+            )
+
+        if alias_violations:
+            raise StoreCatalogError(
+                "Store catalog filesystem reconciliation failed:\n- "
+                + "\n- ".join(alias_violations)
+            )
+
+        for pattern, reason in self._silence_allowlist.items():
+            if pattern not in matched_allowlist_patterns:
+                warnings.append(
+                    f"dead silence-allowlist entry {pattern!r} matched no database files "
+                    f"(reason: {reason})"
+                )
+
+        for warning in warnings:
+            logger.warning("STORE CATALOG WARNING: %s", warning)
+        return warnings
+
     def snapshot(self) -> list[StoreRecord]:
         """Return the current canonical records in registration order."""
         with self._lock:
@@ -177,6 +284,62 @@ class StoreCatalog:
                     dev_ino=dev_ino,
                     is_memory=record.is_memory,
                 )
+
+    def _enumerate_database_files(self) -> tuple[list[_FilesystemDatabase], list[str]]:
+        databases: list[_FilesystemDatabase] = []
+        warnings: list[str] = []
+
+        def record_walk_error(exc: OSError) -> None:
+            warnings.append(
+                "could not inspect database directory: "
+                f"path={exc.filename!r} error={type(exc).__name__}: {exc}"
+            )
+
+        for directory, subdirectories, filenames in os.walk(
+            self._expected_root,
+            followlinks=False,
+            onerror=record_walk_error,
+        ):
+            subdirectories[:] = sorted(
+                name for name in subdirectories if not self._is_ignored_directory(name)
+            )
+            for filename in sorted(filenames):
+                if not filename.endswith(".db") or filename.endswith(_SQLITE_SIDECAR_SUFFIXES):
+                    continue
+                discovered_path = os.path.join(directory, filename)
+                relative_path = os.path.relpath(discovered_path, self._expected_root).replace(
+                    os.sep, "/"
+                )
+                resolved_path = os.path.realpath(discovered_path)
+                try:
+                    file_stat = os.stat(resolved_path)
+                except OSError as exc:
+                    warnings.append(
+                        "could not inspect database file: "
+                        f"path={relative_path!r} error={type(exc).__name__}: {exc}"
+                    )
+                    continue
+                if not stat.S_ISREG(file_stat.st_mode):
+                    continue
+                databases.append(
+                    _FilesystemDatabase(
+                        relative_path=relative_path,
+                        resolved_path=resolved_path,
+                        dev_ino=(file_stat.st_dev, file_stat.st_ino),
+                    )
+                )
+        return databases, warnings
+
+    @staticmethod
+    def _is_ignored_directory(name: str) -> bool:
+        tokens = [token for token in re.split(r"[._-]+", name.casefold()) if token]
+        return any(token in _IGNORED_DIRECTORY_KINDS for token in tokens)
+
+    @staticmethod
+    def _allowlist_pattern_matches(pattern: str, relative_path: str) -> bool:
+        normalized_pattern = pattern.replace(os.sep, "/")
+        candidate = relative_path if "/" in normalized_pattern else os.path.basename(relative_path)
+        return fnmatch.fnmatchcase(candidate, normalized_pattern)
 
     @staticmethod
     def _is_memory_path(raw_path: str) -> bool:
