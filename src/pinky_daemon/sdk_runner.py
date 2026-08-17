@@ -125,7 +125,6 @@ class SDKRunner:
         from claude_agent_sdk import (
             AssistantMessage,
             ClaudeAgentOptions,
-            ConversationResetMessage,
             RateLimitEvent,
             ResultMessage,
             StreamEvent,
@@ -233,8 +232,35 @@ class SDKRunner:
                     self._session_id_callback(result_session_id)
 
             async for message in query(prompt=prompt, options=options):
-                if isinstance(message, SystemMessage):
-                    # Extract session ID from init
+                if (
+                    isinstance(message, SystemMessage)
+                    and getattr(message, "subtype", "") == "conversation_reset"
+                ):
+                    # /clear invalidates the outgoing ID immediately. Clear
+                    # both local and durable state synchronously, before the
+                    # iterator can advance to a fresh-session frame.
+                    # ConversationResetMessage was removed from the SDK;
+                    # the CLI now sends this as a SystemMessage with
+                    # subtype="conversation_reset".
+                    reset_data = getattr(message, "data", {}) or {}
+                    old_sid = reset_data.get("session_id", "")
+                    if old_sid:
+                        invalidated_session_ids.add(old_sid)
+                    if result_session_id:
+                        invalidated_session_ids.add(result_session_id)
+                    result_session_id = ""
+                    if self._session_id_callback:
+                        self._session_id_callback("")
+
+                    _log(
+                        "sdk-runner: WARNING SDK conversation reset; transcript "
+                        "was discarded "
+                        f"new_conversation_id={reset_data.get('new_conversation_id', '')!r} "
+                        f"session_id={old_sid!r}"
+                    )
+
+                elif isinstance(message, SystemMessage):
+                    # Extract session ID from init (non-reset SystemMessages)
                     capture_session_id(getattr(message, "session_id", ""))
                     _log(f"sdk-runner: session={result_session_id}")
 
@@ -274,25 +300,6 @@ class SDKRunner:
                 elif isinstance(message, AssistantMessage):
                     # Result content already won the existing dedupe rule.
                     capture_session_id(message.session_id)
-
-                elif isinstance(message, ConversationResetMessage):
-                    # /clear invalidates the outgoing ID immediately. Clear
-                    # both local and durable state synchronously, before the
-                    # iterator can advance to a fresh-session frame.
-                    if message.session_id:
-                        invalidated_session_ids.add(message.session_id)
-                    if result_session_id:
-                        invalidated_session_ids.add(result_session_id)
-                    result_session_id = ""
-                    if self._session_id_callback:
-                        self._session_id_callback("")
-
-                    _log(
-                        "sdk-runner: WARNING SDK conversation reset; transcript "
-                        "was discarded "
-                        f"new_conversation_id={message.new_conversation_id!r} "
-                        f"session_id={message.session_id!r}"
-                    )
 
                 elif isinstance(message, RateLimitEvent):
                     _log(
