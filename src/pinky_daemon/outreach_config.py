@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
+from pinky_daemon.store_catalog import StoreCatalog
 
 
 def _log(msg: str) -> None:
@@ -52,13 +53,25 @@ class PlatformConfig:
 class OutreachConfigStore:
     """SQLite-backed outreach platform configuration."""
 
-    def __init__(self, db_path: str = "data/outreach_config.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/outreach_config.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(db_path, check_same_thread=False)
         # #889: rollback (TRUNCATE) journal mode, NOT WAL — an external sqlite
         # client's open/close can't unlink -wal/-shm out from under the daemon.
         # See pinky_daemon.db_journal.
-        configure_rollback_journal(self._db)
+        journal_mode = configure_rollback_journal(self._db)
+        if catalog is not None:
+            catalog.register(
+                "outreach_config",
+                db_path,
+                journal_mode=journal_mode,
+                owner=type(self).__name__,
+            )
         self._init_tables()
 
     def _init_tables(self) -> None:

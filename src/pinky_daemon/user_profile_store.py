@@ -19,6 +19,7 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
+from pinky_daemon.store_catalog import StoreCatalog
 
 
 @dataclass
@@ -80,9 +81,15 @@ class Relationship:
 class UserProfileStore:
     """SQLite-backed store for structured user profiles."""
 
-    def __init__(self, db_path: str = "data/user_profiles.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/user_profiles.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_tables()
 
@@ -98,7 +105,14 @@ class UserProfileStore:
             # coordination for fresh readers → SQLITE_IOERR across all reader connections (2026-08-17
             # dream failures). Rollback mode has no -wal/-shm to orphan; the busy_timeout
             # absorbs the whole-file-lock serialization. See pinky_daemon.db_journal.
-            configure_rollback_journal(connection, busy_ms=30000)
+            journal_mode = configure_rollback_journal(connection, busy_ms=30000)
+            if self._catalog is not None:
+                self._catalog.register(
+                    "user_profiles",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 

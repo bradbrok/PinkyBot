@@ -18,6 +18,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -74,12 +76,26 @@ class App:
 class AppStore:
     """SQLite-backed app storage."""
 
-    def __init__(self, db_path: str = "data/apps.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/apps.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
         self._db = sqlite3.connect(db_path, check_same_thread=False)
-        self._db.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(
+            self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        ).lower()
         self._db.execute("PRAGMA foreign_keys=ON")
+        if catalog is not None:
+            catalog.register(
+                "apps",
+                db_path,
+                journal_mode=journal_mode,
+                owner=type(self).__name__,
+            )
         self._init_tables()
 
     def _init_tables(self) -> None:

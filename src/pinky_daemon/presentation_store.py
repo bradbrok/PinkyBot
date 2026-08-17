@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -125,9 +127,15 @@ class PresentationVersion:
 class PresentationStore:
     """SQLite-backed presentation storage with versioning."""
 
-    def __init__(self, db_path: str = "data/presentations.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/presentations.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_tables()
 
@@ -137,9 +145,18 @@ class PresentationStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA foreign_keys=ON")
+            if self._catalog is not None:
+                self._catalog.register(
+                    "presentations",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 

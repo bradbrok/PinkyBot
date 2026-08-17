@@ -193,6 +193,7 @@ from pinky_daemon.shared_mcp import (
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.store_catalog import StoreCatalog, StoreCatalogError
 from pinky_daemon.streaming_session import _1M_MODELS, is_1m_model
 from pinky_daemon.task_store import TaskStore
 
@@ -1692,6 +1693,10 @@ def create_api(
 ) -> FastAPI:
     """Create the FastAPI application."""
 
+    db_path = os.path.realpath(db_path)
+    _data_dir = Path(db_path).parent
+    store_catalog = StoreCatalog(expected_root=_data_dir)
+
     app = FastAPI(
         title="Pinky",
         description="Stateful Claude Code session API",
@@ -1755,14 +1760,24 @@ def create_api(
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
 
-    session_store = SessionStore(db_path=db_path.replace(".db", "_sessions.db"))
-    session_event_store = SessionEventStore(db_path=db_path.replace(".db", "_sessions.db"))
-    store = ConversationStore(db_path=db_path)
-    analytics = AnalyticsStore(db_path=db_path.replace(".db", "_analytics.db"))
-    agents = AgentRegistry(db_path=db_path.replace(".db", "_agents.db"))
+    session_store = SessionStore(
+        db_path=db_path.replace(".db", "_sessions.db"), catalog=store_catalog
+    )
+    session_event_store = SessionEventStore(
+        db_path=db_path.replace(".db", "_sessions.db"), catalog=store_catalog
+    )
+    store = ConversationStore(db_path=db_path, catalog=store_catalog)
+    analytics = AnalyticsStore(
+        db_path=db_path.replace(".db", "_analytics.db"), catalog=store_catalog
+    )
+    agents = AgentRegistry(
+        db_path=db_path.replace(".db", "_agents.db"), catalog=store_catalog
+    )
     _run_grandfather_approved_users_migration(store, agents)
     _refresh_1m_models(agents)
-    audit = AuditStore(db_path=db_path.replace(".db", "_audit.db"))
+    audit = AuditStore(
+        db_path=db_path.replace(".db", "_audit.db"), catalog=store_catalog
+    )
     hooks = HookManager(audit_store=audit)
 
     # In-memory live status for agents (updated by POST /agents/{name}/status).
@@ -2551,9 +2566,12 @@ def create_api(
         )
         return result
 
-    activity = ActivityStore(db_path=db_path.replace(".db", "_activity.db"))
+    activity = ActivityStore(
+        db_path=db_path.replace(".db", "_activity.db"), catalog=store_catalog
+    )
     message_context_store = MessageContextStore(
-        db_path=db_path.replace(".db", "_message_context.db")
+        db_path=db_path.replace(".db", "_message_context.db"),
+        catalog=store_catalog,
     )
     app.state.activity = activity
     app.state.message_context_store = message_context_store
@@ -2711,6 +2729,7 @@ def create_api(
         owner_provider=lambda: agents.get_owner_profile(),
         setting_provider=lambda key: agents.get_setting(key, ""),
         signing_key_provider=agents.get_signing_key,
+        catalog=store_catalog,
     )
     app.state.dream_runner = dream_runner
     app.state.agent_history_resolver = _resolve_agent_history
@@ -4126,7 +4145,9 @@ def create_api(
 
         return closed
 
-    skills = SkillStore(db_path=db_path.replace(".db", "_skills.db"))
+    skills = SkillStore(
+        db_path=db_path.replace(".db", "_skills.db"), catalog=store_catalog
+    )
     _seed_core_skills(skills)
 
     # Discover SKILL.md files from filesystem and register them
@@ -4149,13 +4170,27 @@ def create_api(
             plugins.enable(pname)
             plugins.register_in_skill_store(skills, pname)
 
-    outreach_config = OutreachConfigStore(db_path=db_path.replace(".db", "_outreach.db"))
-    tasks = TaskStore(db_path=db_path.replace(".db", "_tasks.db"))
-    research = ResearchStore(db_path=db_path.replace(".db", "_research.db"))
-    presentations = PresentationStore(db_path=db_path.replace(".db", "_presentations.db"))
-    app_store = AppStore(db_path=db_path.replace(".db", "_apps.db"))
-    trigger_store = TriggerStore(db_path=db_path.replace(".db", "_triggers.db"))
-    mesh_store = MeshStore(db_path=db_path.replace(".db", "_mesh.db"))
+    outreach_config = OutreachConfigStore(
+        db_path=db_path.replace(".db", "_outreach.db"), catalog=store_catalog
+    )
+    tasks = TaskStore(
+        db_path=db_path.replace(".db", "_tasks.db"), catalog=store_catalog
+    )
+    research = ResearchStore(
+        db_path=db_path.replace(".db", "_research.db"), catalog=store_catalog
+    )
+    presentations = PresentationStore(
+        db_path=db_path.replace(".db", "_presentations.db"), catalog=store_catalog
+    )
+    app_store = AppStore(
+        db_path=db_path.replace(".db", "_apps.db"), catalog=store_catalog
+    )
+    trigger_store = TriggerStore(
+        db_path=db_path.replace(".db", "_triggers.db"), catalog=store_catalog
+    )
+    mesh_store = MeshStore(
+        db_path=db_path.replace(".db", "_mesh.db"), catalog=store_catalog
+    )
 
     # Ferry host-callback (cross-fleet inbound). Constructed here so it shares
     # the live registry + broker + mesh_store; stashed on app.state for the
@@ -4173,8 +4208,7 @@ def create_api(
     )
 
     # Knowledge Base — project-level, all agents share
-    _data_dir = Path(db_path).parent
-    kb = KBStore(data_dir=_data_dir)
+    kb = KBStore(data_dir=_data_dir, catalog=store_catalog)
 
     # KB Librarian runner — curates wiki pages from raw sources
     librarian_runner = LibrarianRunner(
@@ -4452,7 +4486,9 @@ def create_api(
         from pinky_daemon.voice_routes import set_dependencies as _voice_set_deps
         from pinky_daemon.voice_store import VoiceStore
 
-        _voice_store = VoiceStore(db_path="data/voice_calls.db")
+        _voice_store = VoiceStore(
+            db_path=str(_data_dir / "voice_calls.db"), catalog=store_catalog
+        )
         _voice_base_url = (
             agents.get_setting("PINKY_BASE_URL")
             or os.environ.get("PINKY_BASE_URL", "")
@@ -13318,7 +13354,9 @@ npm run build</pre>
 
     from pinky_daemon.user_profile_store import UserProfileStore
 
-    user_profiles = UserProfileStore()
+    user_profiles = UserProfileStore(
+        db_path=str(_data_dir / "user_profiles.db"), catalog=store_catalog
+    )
 
     from pinky_daemon.routes.user_profiles import router as _user_profiles_router
     from pinky_daemon.routes.user_profiles import set_dependencies as _user_profiles_set_deps
@@ -13867,5 +13905,14 @@ npm run build</pre>
     # registered above.  Its final-body ``send`` return is the deterministic
     # response-delivery barrier used by context_restart.
     app.add_middleware(_ResponseSentHandoffMiddleware)
+
+    # Every authoritative store has opened by this point. Validate once before
+    # returning the application so an incoherent physical layout cannot serve.
+    app.state.store_catalog = store_catalog
+    try:
+        store_catalog.validate()
+    except StoreCatalogError as exc:
+        _log(f"ERROR startup: store catalog validation failed: {exc}")
+        raise
 
     return app

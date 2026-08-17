@@ -34,6 +34,8 @@ from pathlib import Path
 
 import yaml
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -161,8 +163,14 @@ class KBStats:
 class KBStore:
     """Knowledge Base store — flat files + SQLite FTS5 index."""
 
-    def __init__(self, data_dir: str | Path) -> None:
+    def __init__(
+        self,
+        data_dir: str | Path,
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         self.data_dir = Path(data_dir)
+        self._catalog = catalog
         self.kb_dir = self.data_dir / "kb"
         self.raw_dir = self.kb_dir / "raw"
         self.wiki_dir = self.kb_dir / "wiki"
@@ -177,9 +185,18 @@ class KBStore:
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self.db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(
+            conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+        ).lower()
         conn.execute("PRAGMA foreign_keys=ON")
         conn.row_factory = sqlite3.Row
+        if self._catalog is not None:
+            self._catalog.register(
+                "kb",
+                self.db_path,
+                journal_mode=journal_mode,
+                owner=type(self).__name__,
+            )
         return conn
 
     def _init_db(self) -> None:

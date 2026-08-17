@@ -21,6 +21,8 @@ import uuid
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -216,9 +218,15 @@ _MIGRATIONS: dict[str, list[tuple[str, str]]] = {
 class VoiceStore:
     """SQLite-backed store for voice call state."""
 
-    def __init__(self, db_path: str = "data/voice_calls.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/voice_calls.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
+        self._catalog = catalog
         self._thread_local = threading.local()
         self._init_tables()
         self._migrate()
@@ -229,10 +237,19 @@ class VoiceStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
             connection.execute("PRAGMA foreign_keys=ON")
             connection.row_factory = sqlite3.Row
+            if self._catalog is not None:
+                self._catalog.register(
+                    "voice",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner=type(self).__name__,
+                )
             self._thread_local.connection = connection
         return connection
 
