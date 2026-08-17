@@ -19,6 +19,8 @@ import time
 from dataclasses import dataclass
 from pathlib import Path
 
+from pinky_daemon.db_journal import configure_rollback_journal
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -87,8 +89,10 @@ class TriggerStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=30000")
+            # #889: rollback (TRUNCATE) journal mode, NOT WAL — an external sqlite
+            # client's open/close can't unlink -wal/-shm out from under the daemon.
+            # Sets busy_timeout internally. See pinky_daemon.db_journal.
+            configure_rollback_journal(connection, busy_ms=30000)
             connection.execute("PRAGMA foreign_keys=ON")
             connection.row_factory = sqlite3.Row
             self._thread_local.connection = connection

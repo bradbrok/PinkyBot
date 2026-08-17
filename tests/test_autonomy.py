@@ -23,14 +23,34 @@ from pinky_daemon.task_store import TaskStore
 
 @pytest.fixture
 def stores():
-    fd, path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
-    reg = AgentRegistry(db_path=path)
-    tasks = TaskStore(db_path=path)
-    convos = ConversationStore(db_path=path)
+    # Each store gets its OWN db file, matching production (agents.db / tasks.db /
+    # conversations.db are distinct files). A single shared file is incoherent
+    # after #889: AgentRegistry and ConversationStore run the file in rollback
+    # (TRUNCATE) journal mode while TaskStore sets WAL, and the stores' concurrent
+    # open connections block ConversationStore's WAL->TRUNCATE switch (which then
+    # fails loud). Separate files remove the artificial journal-mode tug-of-war.
+    paths = []
+    for _ in range(3):
+        fd, p = tempfile.mkstemp(suffix=".db")
+        os.close(fd)
+        paths.append(p)
+    reg = AgentRegistry(db_path=paths[0])
+    tasks = TaskStore(db_path=paths[1])
+    convos = ConversationStore(db_path=paths[2])
     yield reg, tasks, convos
+    # Close ALL store connections before unlinking their files. Closing only
+    # AgentRegistry left TaskStore/ConversationStore fds open across the unlink —
+    # tolerated on POSIX, but leaky teardown that can fail where open files
+    # refuse unlink.
     reg.close()
-    os.unlink(path)
+    tasks.close()
+    convos.close()
+    for p in paths:
+        for suffix in ("", "-wal", "-shm", "-journal"):
+            try:
+                os.unlink(p + suffix)
+            except OSError:
+                pass
 
 
 def _build_engine(registry, tasks, convos):
