@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import fnmatch
 import logging
 import os
@@ -298,7 +299,12 @@ class StoreCatalog:
 
         while pending_directories:
             directory = pending_directories.pop()
-            resolved_directory = os.path.realpath(directory)
+            try:
+                resolved_directory = os.path.realpath(directory)
+            except OSError as exc:
+                if self._is_missing_path_error(exc):
+                    continue
+                self._raise_inspection_error("directory", directory, exc)
             if not self._is_under_expected_root(resolved_directory):
                 raise StoreCatalogError(
                     "Store catalog filesystem alias coverage failed:\n- "
@@ -308,6 +314,8 @@ class StoreCatalog:
             try:
                 directory_stat = os.stat(resolved_directory)
             except OSError as exc:
+                if self._is_missing_path_error(exc):
+                    continue
                 self._raise_inspection_error("directory", directory, exc)
             if not stat.S_ISDIR(directory_stat.st_mode):
                 raise StoreCatalogError(
@@ -323,15 +331,24 @@ class StoreCatalog:
                 with os.scandir(resolved_directory) as iterator:
                     entries = sorted(iterator, key=lambda entry: entry.name)
             except OSError as exc:
+                if self._is_missing_path_error(exc):
+                    continue
                 self._raise_inspection_error("directory", directory, exc)
 
             child_directories: list[str] = []
             for entry in entries:
                 discovered_path = entry.path
-                resolved_path = os.path.realpath(discovered_path)
+                try:
+                    resolved_path = os.path.realpath(discovered_path)
+                except OSError as exc:
+                    if self._is_missing_path_error(exc):
+                        continue
+                    self._raise_inspection_error("file or directory", discovered_path, exc)
                 try:
                     entry_stat = os.stat(resolved_path)
                 except OSError as exc:
+                    if self._is_missing_path_error(exc):
+                        continue
                     self._raise_inspection_error("file or directory", discovered_path, exc)
 
                 if stat.S_ISDIR(entry_stat.st_mode):
@@ -374,6 +391,10 @@ class StoreCatalog:
             f"could not inspect database {kind}: path={path!r} "
             f"error={type(exc).__name__}: {exc}"
         ) from exc
+
+    @staticmethod
+    def _is_missing_path_error(exc: OSError) -> bool:
+        return isinstance(exc, FileNotFoundError) or exc.errno == errno.ENOENT
 
     @staticmethod
     def _is_ignored_directory(name: str) -> bool:
