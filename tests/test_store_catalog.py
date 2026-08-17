@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import os
+import stat
 from pathlib import Path
 
 import pytest
@@ -489,27 +490,119 @@ def test_reconcile_rejects_alias_in_snapshot_directory(tmp_path: Path) -> None:
         catalog.validate()
 
 
-def test_reconcile_fails_closed_when_directory_cannot_be_inspected(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def test_unreadable_unrelated_dir_warns_not_fails(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
 ) -> None:
     registered = tmp_path / "tasks.db"
     registered.touch()
     unreadable = tmp_path / "unreadable"
     unreadable.mkdir()
-    os.link(registered, unreadable / "alias.db")
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
     _register(catalog, "tasks", registered, owner="TaskStore")
-    original_scandir = os.scandir
 
-    def deny_unreadable(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
-        if os.path.realpath(path) == os.path.realpath(unreadable):
-            raise PermissionError("test directory is unreadable")
-        return original_scandir(path)
+    unreadable.chmod(0o000)
+    try:
+        warnings = catalog.validate()
+    finally:
+        unreadable.chmod(0o755)
 
-    monkeypatch.setattr(os, "scandir", deny_unreadable)
+    assert len(warnings) == 1
+    assert "could not inspect database directory" in warnings[0]
+    assert "outside registered store footprint" in warnings[0]
+    assert os.fspath(unreadable) in warnings[0]
+    assert warnings[0] in caplog.text
+
+
+def test_unreadable_store_footprint_dir_fails_closed(tmp_path: Path) -> None:
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    registered = unreadable / "tasks.db"
+    registered.touch()
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    unreadable.chmod(0o000)
+    try:
+        with pytest.raises(StoreCatalogError, match="could not inspect database directory"):
+            catalog.validate()
+    finally:
+        unreadable.chmod(0o755)
+
+
+def test_traversal_non_directory_entry_skipped(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    raced_file = tmp_path / "raced.db"
+    raced_file.touch()
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+    original_stat = os.stat
+    raced_file_stat_calls = 0
+
+    def directory_then_file(
+        path: str | os.PathLike[str], *args: object, **kwargs: object
+    ) -> os.stat_result:
+        nonlocal raced_file_stat_calls
+        result = original_stat(path, *args, **kwargs)
+        if os.path.abspath(path) != os.path.abspath(raced_file):
+            return result
+        raced_file_stat_calls += 1
+        if raced_file_stat_calls == 1:
+            values = list(result)
+            values[0] = stat.S_IFDIR | 0o755
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(os, "stat", directory_then_file)
+
+    warnings = catalog.validate()
+
+    assert raced_file_stat_calls == 2
+    assert len(warnings) == 1
+    assert "unclaimed database file" in warnings[0]
+    assert os.path.realpath(raced_file) in warnings[0]
+
+
+def test_create_api_boots_with_unreadable_unrelated_sibling(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    from pinky_daemon.api import create_api
+
+    unreadable = tmp_path / "snap-private-tmp"
+    unreadable.mkdir()
+    unreadable.chmod(0o000)
+    try:
+        app = create_api(db_path=str(tmp_path / "conversations.db"))
+    finally:
+        unreadable.chmod(0o755)
+
+    assert app.state.store_catalog is not None
+    assert "could not inspect database directory" in caplog.text
+    assert "outside registered store footprint" in caplog.text
+    assert os.fspath(unreadable) in caplog.text
+
+
+def test_create_api_fails_closed_with_unreadable_store_footprint(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from pinky_daemon.api import create_api
+
+    kb_dir = tmp_path / "kb"
+    original_validate = StoreCatalog.validate
+
+    def validate_with_unreadable_kb(catalog: StoreCatalog) -> list[str]:
+        kb_dir.chmod(0o000)
+        try:
+            return original_validate(catalog)
+        finally:
+            kb_dir.chmod(0o755)
+
+    monkeypatch.setattr(StoreCatalog, "validate", validate_with_unreadable_kb)
 
     with pytest.raises(StoreCatalogError, match="could not inspect database directory"):
-        catalog.validate()
+        create_api(db_path=str(tmp_path / "conversations.db"))
 
 
 def test_reconcile_symlink_cycle_terminates_cleanly(tmp_path: Path) -> None:
