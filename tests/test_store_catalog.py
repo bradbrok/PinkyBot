@@ -397,6 +397,35 @@ def test_reconcile_excludes_sidecars_and_temp_snapshot_directories(tmp_path: Pat
     assert catalog.reconcile_filesystem() == []
 
 
+def test_reconcile_warns_for_normal_orphan_reached_first_through_snapshot_symlink(
+    tmp_path: Path,
+) -> None:
+    normal_dir = tmp_path / "zzz-data"
+    normal_dir.mkdir()
+    orphan = normal_dir / "orphan.db"
+    orphan.touch()
+    (tmp_path / "snapshots").symlink_to(normal_dir, target_is_directory=True)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    warnings = catalog.validate()
+
+    assert len(warnings) == 1
+    assert "path='zzz-data/orphan.db'" in warnings[0]
+    assert os.path.realpath(orphan) in warnings[0]
+
+
+def test_reconcile_quiets_snapshot_orphan_reached_first_through_normal_symlink(
+    tmp_path: Path,
+) -> None:
+    snapshot_dir = tmp_path / "snapshots"
+    snapshot_dir.mkdir()
+    (snapshot_dir / "orphan.db").touch()
+    (tmp_path / "aaa-link").symlink_to(snapshot_dir, target_is_directory=True)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    assert catalog.validate() == []
+
+
 def test_reconcile_rejects_alias_behind_symlinked_directory(tmp_path: Path) -> None:
     expected_root = tmp_path / "data"
     expected_root.mkdir()
