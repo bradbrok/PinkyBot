@@ -18,6 +18,8 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
+from pinky_daemon.db_journal import configure_rollback_journal
+
 
 @dataclass
 class ProfileEntry:
@@ -90,8 +92,13 @@ class UserProfileStore:
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
             connection = sqlite3.connect(self._db_path)
-            connection.execute("PRAGMA journal_mode=WAL")
-            connection.execute("PRAGMA busy_timeout=30000")
+            # #889: rollback (TRUNCATE) journal mode, NOT WAL. user_profiles.db is
+            # cross-process/-thread concurrent-read (every agent's dream run opens a
+            # fresh connection). With WAL, its deleted -wal/-shm broke WAL-index
+            # coordination for fresh readers → SQLITE_IOERR across all reader connections (2026-08-17
+            # dream failures). Rollback mode has no -wal/-shm to orphan; the busy_timeout
+            # absorbs the whole-file-lock serialization. See pinky_daemon.db_journal.
+            configure_rollback_journal(connection, busy_ms=30000)
             self._thread_local.connection = connection
         return connection
 
