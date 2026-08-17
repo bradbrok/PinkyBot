@@ -38,7 +38,13 @@ def stores():
     tasks = TaskStore(db_path=paths[1])
     convos = ConversationStore(db_path=paths[2])
     yield reg, tasks, convos
+    # Close ALL store connections before unlinking their files. Closing only
+    # AgentRegistry left TaskStore/ConversationStore fds open across the unlink —
+    # tolerated on POSIX, but leaky teardown that can fail where open files
+    # refuse unlink.
     reg.close()
+    tasks.close()
+    convos.close()
     for p in paths:
         for suffix in ("", "-wal", "-shm", "-journal"):
             try:
