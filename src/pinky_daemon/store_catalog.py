@@ -5,6 +5,7 @@ from __future__ import annotations
 import os
 import threading
 from dataclasses import dataclass
+from urllib.parse import parse_qsl
 
 
 @dataclass(frozen=True, slots=True)
@@ -17,6 +18,7 @@ class StoreRecord:
     owner: str
     criticality: str
     dev_ino: tuple[int, int] | None
+    is_memory: bool
 
 
 class StoreCatalogError(RuntimeError):
@@ -54,6 +56,7 @@ class StoreCatalog:
         so :meth:`validate` can report the complete conflict at the boot gate.
         """
         raw_path = os.fspath(path)
+        is_memory = self._is_memory_path(raw_path)
         resolved_path = os.path.realpath(raw_path)
         record = StoreRecord(
             logical_name=logical_name,
@@ -61,7 +64,8 @@ class StoreCatalog:
             journal_mode=journal_mode.lower(),
             owner=owner,
             criticality=criticality,
-            dev_ino=self._stat_identity(resolved_path),
+            dev_ino=None if is_memory else self._stat_identity(resolved_path),
+            is_memory=is_memory,
         )
         used_relative_path = not os.path.isabs(raw_path)
 
@@ -74,6 +78,7 @@ class StoreCatalog:
                     and current.resolved_path == record.resolved_path
                     and current.journal_mode == record.journal_mode
                     and current.criticality == record.criticality
+                    and current.is_memory == record.is_memory
                 ):
                     entry.record = record
                     entry.used_relative_path = entry.used_relative_path or used_relative_path
@@ -96,7 +101,7 @@ class StoreCatalog:
 
         for entry in entries:
             record = entry.record
-            if record.journal_mode == "memory":
+            if record.is_memory:
                 continue
             if entry.used_relative_path:
                 violations.append("relative path input for " + self._format_record(record))
@@ -120,7 +125,7 @@ class StoreCatalog:
 
         for index, left in enumerate(records):
             for right in records[index + 1 :]:
-                if "memory" in {left.journal_mode, right.journal_mode}:
+                if left.is_memory or right.is_memory:
                     continue
                 same_realpath = left.resolved_path == right.resolved_path
                 same_inode = (
@@ -161,7 +166,7 @@ class StoreCatalog:
     def _refresh_identities(self) -> None:
         for entry in self._entries:
             record = entry.record
-            dev_ino = self._stat_identity(record.resolved_path)
+            dev_ino = None if record.is_memory else self._stat_identity(record.resolved_path)
             if dev_ino != record.dev_ino:
                 entry.record = StoreRecord(
                     logical_name=record.logical_name,
@@ -170,7 +175,24 @@ class StoreCatalog:
                     owner=record.owner,
                     criticality=record.criticality,
                     dev_ino=dev_ino,
+                    is_memory=record.is_memory,
                 )
+
+    @staticmethod
+    def _is_memory_path(raw_path: str) -> bool:
+        if raw_path == ":memory:":
+            return True
+        if not raw_path.startswith("file:"):
+            return False
+        uri_path, separator, query = raw_path.partition("?")
+        if uri_path == "file::memory:":
+            return True
+        if not separator:
+            return False
+        return any(
+            key.lower() == "mode" and value.lower() == "memory"
+            for key, value in parse_qsl(query, keep_blank_values=True)
+        )
 
     def _is_under_expected_root(self, path: str) -> bool:
         try:
@@ -183,5 +205,5 @@ class StoreCatalog:
         return (
             f"{record.logical_name!r} owner={record.owner!r} "
             f"path={record.resolved_path!r} journal_mode={record.journal_mode!r} "
-            f"dev_ino={record.dev_ino!r}"
+            f"dev_ino={record.dev_ino!r} is_memory={record.is_memory!r}"
         )

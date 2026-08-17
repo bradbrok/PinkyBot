@@ -23,6 +23,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.store_catalog import StoreCatalog
+
 
 @dataclass
 class AgentMessage:
@@ -66,8 +68,14 @@ class AgentComms:
     and broadcast to all sessions.
     """
 
-    def __init__(self, db_path: str = "data/agent_comms.db") -> None:
+    def __init__(
+        self,
+        db_path: str = "data/agent_comms.db",
+        *,
+        catalog: StoreCatalog | None = None,
+    ) -> None:
         self._db_path = db_path
+        self._catalog = catalog
         # Anchor file transfers next to the DB so the destination does not
         # depend on the caller's cwd at send time.
         self._transfers_root = Path(db_path).resolve().parent / "transfers"
@@ -83,8 +91,17 @@ class AgentComms:
         if connection is None:
             connection = sqlite3.connect(self._db_path)
             connection.row_factory = sqlite3.Row
-            connection.execute("PRAGMA journal_mode=WAL")
+            journal_mode = str(
+                connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
+            ).lower()
             connection.execute("PRAGMA busy_timeout=30000")
+            if self._catalog is not None:
+                self._catalog.register(
+                    "agent_comms",
+                    self._db_path,
+                    journal_mode=journal_mode,
+                    owner="AgentComms",
+                )
             self._thread_local.connection = connection
         return connection
 

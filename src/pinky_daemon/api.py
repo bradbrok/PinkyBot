@@ -1801,7 +1801,7 @@ def create_api(
         hook_manager=hooks,
     )
     _comms_db = db_path.replace(".db", "_agent_comms.db")
-    comms = AgentComms(db_path=_comms_db)
+    comms = AgentComms(db_path=_comms_db, catalog=store_catalog)
 
     # Auth-failure tracker — counts SDK auth errors across all streaming
     # sessions on this host and decides when to alert the operator. The
@@ -4161,6 +4161,7 @@ def create_api(
         db_path=db_path.replace(".db", "_plugins.db"),
         api_url="http://localhost:8888",
         working_dir=default_working_dir,
+        catalog=store_catalog,
     )
     plugins.discover_all(project_root=str(_pinky_root))
     # Re-enable previously enabled plugins
@@ -4214,6 +4215,7 @@ def create_api(
     librarian_runner = LibrarianRunner(
         kb_store=kb,
         db_path=db_path.replace(".db", "_librarian_state.db"),
+        catalog=store_catalog,
     )
     app.state.librarian_runner = librarian_runner
 

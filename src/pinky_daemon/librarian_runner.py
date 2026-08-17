@@ -22,6 +22,7 @@ from pathlib import Path
 from pinky_daemon.kb_store import _FRONTMATTER_RE, KBStore, _content_hash
 from pinky_daemon.librarian_prompt import LIBRARIAN_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
+from pinky_daemon.store_catalog import StoreCatalog
 
 
 def _log(msg: str) -> None:
@@ -58,16 +59,27 @@ class LibrarianRunner:
         self,
         kb_store: KBStore,
         db_path: str | Path = "data/librarian_state.db",
+        *,
+        catalog: StoreCatalog | None = None,
     ) -> None:
         self._kb = kb_store
         self._db_path = Path(db_path)
+        self._catalog = catalog
         self._db_path.parent.mkdir(parents=True, exist_ok=True)
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
         conn = sqlite3.connect(str(self._db_path))
-        conn.execute("PRAGMA journal_mode=WAL")
+        journal_mode = str(conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
         conn.row_factory = sqlite3.Row
+        if self._catalog is not None:
+            self._catalog.register(
+                "librarian_state",
+                self._db_path,
+                journal_mode=journal_mode,
+                owner="LibrarianRunner",
+                criticality="derived",
+            )
         return conn
 
     def _init_db(self) -> None:
