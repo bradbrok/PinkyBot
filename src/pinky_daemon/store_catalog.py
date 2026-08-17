@@ -184,15 +184,17 @@ class StoreCatalog:
             return True
         if not raw_path.startswith("file:"):
             return False
-        uri_path, separator, query = raw_path.partition("?")
+        uri, _, _fragment = raw_path.partition("#")
+        uri_path, separator, query = uri.partition("?")
         if uri_path == "file::memory:":
             return True
         if not separator:
             return False
-        return any(
-            key.lower() == "mode" and value.lower() == "memory"
-            for key, value in parse_qsl(query, keep_blank_values=True)
-        )
+        effective_mode: str | None = None
+        for key, value in parse_qsl(query, keep_blank_values=True):
+            if key == "mode":
+                effective_mode = value
+        return effective_mode == "memory"
 
     def _is_under_expected_root(self, path: str) -> bool:
         try:

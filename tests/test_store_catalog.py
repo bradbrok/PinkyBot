@@ -135,7 +135,10 @@ def test_in_memory_connections_do_not_false_alias(tmp_path: Path) -> None:
         ":memory:",
         "file::memory:",
         "file::memory:?cache=shared",
+        "file::memory:?cache=shared#frag",
         "file:shared-cache?mode=memory&cache=shared",
+        "file:shared-cache?mode=memory#frag",
+        "file:shared-cache?mode=rwc&mode=memory",
     ],
 )
 def test_in_memory_identity_comes_from_raw_path(tmp_path: Path, path: str) -> None:
@@ -144,6 +147,27 @@ def test_in_memory_identity_comes_from_raw_path(tmp_path: Path, path: str) -> No
 
     assert catalog.snapshot()[0].is_memory is True
     catalog.validate()
+
+
+@pytest.mark.parametrize(
+    "query",
+    [
+        "MODE=memory",
+        "mode=memory&mode=rwc",
+    ],
+)
+def test_non_effective_memory_uri_mode_is_not_exempted(tmp_path: Path, query: str) -> None:
+    expected_root = tmp_path / "data"
+    expected_root.mkdir()
+    outside = tmp_path / "outside.db"
+    outside.touch()
+    catalog = StoreCatalog(expected_root=expected_root)
+    uri = f"file:{outside}?{query}"
+    _register(catalog, "tasks", uri, journal_mode="memory", owner="TaskStore")
+
+    assert catalog.snapshot()[0].is_memory is False
+    with pytest.raises(StoreCatalogError):
+        catalog.validate()
 
 
 def test_on_disk_memory_mode_alias_is_not_exempt(tmp_path: Path) -> None:
