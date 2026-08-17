@@ -397,6 +397,70 @@ def test_reconcile_excludes_sidecars_and_temp_snapshot_directories(tmp_path: Pat
     assert catalog.reconcile_filesystem() == []
 
 
+def test_reconcile_rejects_alias_behind_symlinked_directory(tmp_path: Path) -> None:
+    expected_root = tmp_path / "data"
+    expected_root.mkdir()
+    registered = expected_root / "tasks.db"
+    registered.touch()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    os.link(registered, outside / "alias.db")
+    (expected_root / "linked").symlink_to(outside, target_is_directory=True)
+    catalog = StoreCatalog(expected_root=expected_root, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    with pytest.raises(StoreCatalogError):
+        catalog.validate()
+
+
+def test_reconcile_rejects_alias_in_snapshot_directory(tmp_path: Path) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    snapshot_dir = tmp_path / "snapshots"
+    snapshot_dir.mkdir()
+    os.link(registered, snapshot_dir / "alias.db")
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    with pytest.raises(StoreCatalogError, match="unregistered path aliases registered store inode"):
+        catalog.validate()
+
+
+def test_reconcile_fails_closed_when_directory_cannot_be_inspected(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    unreadable = tmp_path / "unreadable"
+    unreadable.mkdir()
+    os.link(registered, unreadable / "alias.db")
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+    original_scandir = os.scandir
+
+    def deny_unreadable(path: str | os.PathLike[str]) -> os.ScandirIterator[str]:
+        if os.path.realpath(path) == os.path.realpath(unreadable):
+            raise PermissionError("test directory is unreadable")
+        return original_scandir(path)
+
+    monkeypatch.setattr(os, "scandir", deny_unreadable)
+
+    with pytest.raises(StoreCatalogError, match="could not inspect database directory"):
+        catalog.validate()
+
+
+def test_reconcile_symlink_cycle_terminates_cleanly(tmp_path: Path) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    nested = tmp_path / "nested"
+    nested.mkdir()
+    (nested / "loop").symlink_to(tmp_path, target_is_directory=True)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    assert catalog.validate() == []
+
+
 def test_reconcile_recognizes_nested_kb_store_as_claimed(tmp_path: Path) -> None:
     kb_dir = tmp_path / "kb"
     kb_dir.mkdir()
