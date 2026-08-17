@@ -254,7 +254,6 @@ def test_clean_production_shaped_layout_passes(tmp_path: Path) -> None:
         "voice": ("wal", "VoiceStore"),
         "audit": ("wal", "AuditStore"),
         "message_context": ("wal", "MessageContextStore"),
-        "kb": ("wal", "KBStore"),
         "dream_state": ("wal", "DreamRunner"),
     }
     for logical_name, (journal_mode, owner) in stores.items():
@@ -268,13 +267,29 @@ def test_clean_production_shaped_layout_passes(tmp_path: Path) -> None:
             owner=owner,
         )
 
+    kb_path = tmp_path / "kb" / "kb.db"
+    kb_path.parent.mkdir()
+    kb_path.touch()
+    _register(catalog, "kb", kb_path, owner="KBStore")
+
     sessions_path = tmp_path / "sessions.db"
     sessions_path.touch()
     session_owner = "SessionStore+SessionEventStore"
     _register(catalog, "sessions", sessions_path, owner=session_owner)
     _register(catalog, "session_events", sessions_path, owner=session_owner)
 
-    catalog.validate()
+    for allowlisted_name in (
+        "hub.db",
+        "pinky.db",
+        "pinkybot.db",
+        "daemon.db",
+        "messages.db",
+        "pinky_daemon.db",
+        "scheduler.db",
+    ):
+        (tmp_path / allowlisted_name).touch()
+
+    assert catalog.validate() == []
 
 
 def test_symlink_and_target_are_detected_as_same_inode(tmp_path: Path) -> None:
@@ -306,6 +321,100 @@ def test_hardlinks_are_detected_as_same_inode(tmp_path: Path) -> None:
     assert records[0].dev_ino == records[1].dev_ino
     with pytest.raises(StoreCatalogError, match="same physical file"):
         catalog.validate()
+
+
+def test_reconcile_rejects_unregistered_hardlink_to_registered_store(tmp_path: Path) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    allowlisted_alias = tmp_path / "hub.db"
+    os.link(registered, allowlisted_alias)
+    catalog = StoreCatalog(expected_root=tmp_path)
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    with pytest.raises(StoreCatalogError, match="unregistered path aliases registered store inode"):
+        catalog.reconcile_filesystem()
+
+
+def test_reconcile_warns_for_unclaimed_file_without_failing(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    orphan = tmp_path / "orphan.db"
+    orphan.touch()
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    warnings = catalog.reconcile_filesystem()
+
+    assert len(warnings) == 1
+    assert "unclaimed database file" in warnings[0]
+    assert os.path.realpath(orphan) in warnings[0]
+    assert warnings[0] in caplog.text
+
+
+def test_reconcile_silences_allowlisted_unclaimed_file(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    nested = tmp_path / "component"
+    nested.mkdir()
+    (nested / "known-benign.db").touch()
+    catalog = StoreCatalog(
+        expected_root=tmp_path,
+        silence_allowlist={"known-*.db": "fixture owned by another component"},
+    )
+
+    assert catalog.reconcile_filesystem() == []
+    assert "STORE CATALOG WARNING" not in caplog.text
+
+
+def test_reconcile_warns_for_dead_silence_allowlist_entry(
+    tmp_path: Path, caplog: pytest.LogCaptureFixture
+) -> None:
+    catalog = StoreCatalog(
+        expected_root=tmp_path,
+        silence_allowlist={"missing-*.db": "obsolete fixture"},
+    )
+
+    warnings = catalog.reconcile_filesystem()
+
+    assert len(warnings) == 1
+    assert "dead silence-allowlist entry" in warnings[0]
+    assert "missing-*.db" in warnings[0]
+    assert "obsolete fixture" in warnings[0]
+    assert warnings[0] in caplog.text
+
+
+def test_reconcile_excludes_sidecars_and_temp_snapshot_directories(tmp_path: Path) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    for suffix in ("-wal", "-shm", "-journal"):
+        (tmp_path / f"tasks.db{suffix}").touch()
+    for directory_name in ("tmp", "snapshots"):
+        ignored_dir = tmp_path / directory_name
+        ignored_dir.mkdir()
+        (ignored_dir / "ignored.db").touch()
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    assert catalog.reconcile_filesystem() == []
+
+
+def test_reconcile_recognizes_nested_kb_store_as_claimed(tmp_path: Path) -> None:
+    kb_dir = tmp_path / "kb"
+    kb_dir.mkdir()
+    kb_path = kb_dir / "kb.db"
+    kb_path.touch()
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "kb", kb_path, owner="KBStore")
+
+    assert catalog.reconcile_filesystem() == []
+
+
+def test_reconcile_does_not_flag_registered_store_file(tmp_path: Path) -> None:
+    registered = tmp_path / "tasks.db"
+    registered.touch()
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    _register(catalog, "tasks", registered, owner="TaskStore")
+
+    assert catalog.reconcile_filesystem() == []
 
 
 def test_agent_comms_participates_in_alias_validation(tmp_path: Path) -> None:
