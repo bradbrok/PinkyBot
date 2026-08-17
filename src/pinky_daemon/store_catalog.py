@@ -57,7 +57,6 @@ class _FilesystemDatabase:
     relative_path: str
     resolved_path: str
     dev_ino: tuple[int, int]
-    warning_eligible: bool
 
 
 class StoreCatalog:
@@ -225,7 +224,9 @@ class StoreCatalog:
                 )
                 continue
 
-            if database.resolved_path in registered_realpaths or not database.warning_eligible:
+            if database.resolved_path in registered_realpaths or self._is_in_ignored_directory(
+                database.resolved_path
+            ):
                 continue
 
             matching_patterns = {
@@ -291,11 +292,12 @@ class StoreCatalog:
 
     def _enumerate_database_files(self) -> list[_FilesystemDatabase]:
         databases: list[_FilesystemDatabase] = []
-        pending_directories = [(self._expected_root, True)]
+        pending_directories = [self._expected_root]
+        # Alias-coverage cycle guard only; warning policy is derived from each file realpath.
         visited_directories: set[tuple[int, int]] = set()
 
         while pending_directories:
-            directory, warning_eligible = pending_directories.pop()
+            directory = pending_directories.pop()
             resolved_directory = os.path.realpath(directory)
             if not self._is_under_expected_root(resolved_directory):
                 raise StoreCatalogError(
@@ -323,7 +325,7 @@ class StoreCatalog:
             except OSError as exc:
                 self._raise_inspection_error("directory", directory, exc)
 
-            child_directories: list[tuple[str, bool]] = []
+            child_directories: list[str] = []
             for entry in entries:
                 discovered_path = entry.path
                 resolved_path = os.path.realpath(discovered_path)
@@ -339,12 +341,7 @@ class StoreCatalog:
                             f"directory symlink escapes expected root {self._expected_root!r}: "
                             f"path={discovered_path!r} resolved_path={resolved_path!r}"
                         )
-                    child_directories.append(
-                        (
-                            discovered_path,
-                            warning_eligible and not self._is_ignored_directory(entry.name),
-                        )
-                    )
+                    child_directories.append(discovered_path)
                     continue
 
                 if not entry.name.endswith(".db") or entry.name.endswith(_SQLITE_SIDECAR_SUFFIXES):
@@ -357,7 +354,7 @@ class StoreCatalog:
                     )
                 if not stat.S_ISREG(entry_stat.st_mode):
                     continue
-                relative_path = os.path.relpath(discovered_path, self._expected_root).replace(
+                relative_path = os.path.relpath(resolved_path, self._expected_root).replace(
                     os.sep, "/"
                 )
                 databases.append(
@@ -365,7 +362,6 @@ class StoreCatalog:
                         relative_path=relative_path,
                         resolved_path=resolved_path,
                         dev_ino=(entry_stat.st_dev, entry_stat.st_ino),
-                        warning_eligible=warning_eligible,
                     )
                 )
             pending_directories.extend(reversed(child_directories))
@@ -383,6 +379,11 @@ class StoreCatalog:
     def _is_ignored_directory(name: str) -> bool:
         tokens = [token for token in re.split(r"[._-]+", name.casefold()) if token]
         return any(token in _IGNORED_DIRECTORY_KINDS for token in tokens)
+
+    def _is_in_ignored_directory(self, resolved_path: str) -> bool:
+        relative_path = os.path.relpath(resolved_path, self._expected_root)
+        directory_names = relative_path.split(os.sep)[:-1]
+        return any(self._is_ignored_directory(name) for name in directory_names)
 
     @staticmethod
     def _allowlist_pattern_matches(pattern: str, relative_path: str) -> bool:
