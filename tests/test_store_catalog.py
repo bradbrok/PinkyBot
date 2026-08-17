@@ -409,7 +409,7 @@ def test_reconcile_rejects_alias_behind_symlinked_directory(tmp_path: Path) -> N
     catalog = StoreCatalog(expected_root=expected_root, silence_allowlist={})
     _register(catalog, "tasks", registered, owner="TaskStore")
 
-    with pytest.raises(StoreCatalogError):
+    with pytest.raises(StoreCatalogError, match="directory symlink escapes expected root"):
         catalog.validate()
 
 

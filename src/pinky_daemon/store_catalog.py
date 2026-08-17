@@ -57,6 +57,7 @@ class _FilesystemDatabase:
     relative_path: str
     resolved_path: str
     dev_ino: tuple[int, int]
+    warning_eligible: bool
 
 
 class StoreCatalog:
@@ -208,18 +209,12 @@ class StoreCatalog:
                     record.resolved_path
                 )
 
-        databases, warnings = self._enumerate_database_files()
+        databases = self._enumerate_database_files()
+        warnings: list[str] = []
         alias_violations: list[str] = []
         matched_allowlist_patterns: set[str] = set()
 
         for database in databases:
-            matching_patterns = {
-                pattern
-                for pattern in self._silence_allowlist
-                if self._allowlist_pattern_matches(pattern, database.relative_path)
-            }
-            matched_allowlist_patterns.update(matching_patterns)
-
             registered_inode_paths = registered_paths_by_inode.get(database.dev_ino, set())
             if registered_inode_paths and database.resolved_path not in registered_inode_paths:
                 alias_violations.append(
@@ -230,7 +225,16 @@ class StoreCatalog:
                 )
                 continue
 
-            if database.resolved_path in registered_realpaths or matching_patterns:
+            if database.resolved_path in registered_realpaths or not database.warning_eligible:
+                continue
+
+            matching_patterns = {
+                pattern
+                for pattern in self._silence_allowlist
+                if self._allowlist_pattern_matches(pattern, database.relative_path)
+            }
+            matched_allowlist_patterns.update(matching_patterns)
+            if matching_patterns:
                 continue
 
             warnings.append(
@@ -285,50 +289,95 @@ class StoreCatalog:
                     is_memory=record.is_memory,
                 )
 
-    def _enumerate_database_files(self) -> tuple[list[_FilesystemDatabase], list[str]]:
+    def _enumerate_database_files(self) -> list[_FilesystemDatabase]:
         databases: list[_FilesystemDatabase] = []
-        warnings: list[str] = []
+        pending_directories = [(self._expected_root, True)]
+        visited_directories: set[tuple[int, int]] = set()
 
-        def record_walk_error(exc: OSError) -> None:
-            warnings.append(
-                "could not inspect database directory: "
-                f"path={exc.filename!r} error={type(exc).__name__}: {exc}"
-            )
+        while pending_directories:
+            directory, warning_eligible = pending_directories.pop()
+            resolved_directory = os.path.realpath(directory)
+            if not self._is_under_expected_root(resolved_directory):
+                raise StoreCatalogError(
+                    "Store catalog filesystem alias coverage failed:\n- "
+                    f"directory symlink escapes expected root {self._expected_root!r}: "
+                    f"path={directory!r} resolved_path={resolved_directory!r}"
+                )
+            try:
+                directory_stat = os.stat(resolved_directory)
+            except OSError as exc:
+                self._raise_inspection_error("directory", directory, exc)
+            if not stat.S_ISDIR(directory_stat.st_mode):
+                raise StoreCatalogError(
+                    "Store catalog filesystem alias coverage failed:\n- "
+                    f"database traversal path is not a directory: path={directory!r}"
+                )
+            directory_identity = (directory_stat.st_dev, directory_stat.st_ino)
+            if directory_identity in visited_directories:
+                continue
+            visited_directories.add(directory_identity)
 
-        for directory, subdirectories, filenames in os.walk(
-            self._expected_root,
-            followlinks=False,
-            onerror=record_walk_error,
-        ):
-            subdirectories[:] = sorted(
-                name for name in subdirectories if not self._is_ignored_directory(name)
-            )
-            for filename in sorted(filenames):
-                if not filename.endswith(".db") or filename.endswith(_SQLITE_SIDECAR_SUFFIXES):
+            try:
+                with os.scandir(resolved_directory) as iterator:
+                    entries = sorted(iterator, key=lambda entry: entry.name)
+            except OSError as exc:
+                self._raise_inspection_error("directory", directory, exc)
+
+            child_directories: list[tuple[str, bool]] = []
+            for entry in entries:
+                discovered_path = entry.path
+                resolved_path = os.path.realpath(discovered_path)
+                try:
+                    entry_stat = os.stat(resolved_path)
+                except OSError as exc:
+                    self._raise_inspection_error("file or directory", discovered_path, exc)
+
+                if stat.S_ISDIR(entry_stat.st_mode):
+                    if not self._is_under_expected_root(resolved_path):
+                        raise StoreCatalogError(
+                            "Store catalog filesystem alias coverage failed:\n- "
+                            f"directory symlink escapes expected root {self._expected_root!r}: "
+                            f"path={discovered_path!r} resolved_path={resolved_path!r}"
+                        )
+                    child_directories.append(
+                        (
+                            discovered_path,
+                            warning_eligible and not self._is_ignored_directory(entry.name),
+                        )
+                    )
                     continue
-                discovered_path = os.path.join(directory, filename)
+
+                if not entry.name.endswith(".db") or entry.name.endswith(_SQLITE_SIDECAR_SUFFIXES):
+                    continue
+                if not self._is_under_expected_root(resolved_path):
+                    raise StoreCatalogError(
+                        "Store catalog filesystem alias coverage failed:\n- "
+                        f"database symlink escapes expected root {self._expected_root!r}: "
+                        f"path={discovered_path!r} resolved_path={resolved_path!r}"
+                    )
+                if not stat.S_ISREG(entry_stat.st_mode):
+                    continue
                 relative_path = os.path.relpath(discovered_path, self._expected_root).replace(
                     os.sep, "/"
                 )
-                resolved_path = os.path.realpath(discovered_path)
-                try:
-                    file_stat = os.stat(resolved_path)
-                except OSError as exc:
-                    warnings.append(
-                        "could not inspect database file: "
-                        f"path={relative_path!r} error={type(exc).__name__}: {exc}"
-                    )
-                    continue
-                if not stat.S_ISREG(file_stat.st_mode):
-                    continue
                 databases.append(
                     _FilesystemDatabase(
                         relative_path=relative_path,
                         resolved_path=resolved_path,
-                        dev_ino=(file_stat.st_dev, file_stat.st_ino),
+                        dev_ino=(entry_stat.st_dev, entry_stat.st_ino),
+                        warning_eligible=warning_eligible,
                     )
                 )
-        return databases, warnings
+            pending_directories.extend(reversed(child_directories))
+        return databases
+
+    @staticmethod
+    def _raise_inspection_error(kind: str, path: str, exc: OSError) -> None:
+        raise StoreCatalogError(
+            "Store catalog filesystem alias coverage failed:\n- "
+            f"could not inspect database {kind}: path={path!r} "
+            f"error={type(exc).__name__}: {exc}"
+        ) from exc
 
     @staticmethod
     def _is_ignored_directory(name: str) -> bool:
