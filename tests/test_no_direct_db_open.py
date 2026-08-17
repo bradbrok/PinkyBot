@@ -1,4 +1,9 @@
-"""Keep direct daemon SQLite opens behind an explicit storage authority."""
+"""Keep direct daemon SQLite opens behind an explicit storage authority.
+
+This is a syntactic guard, not semantic or data-flow analysis. Assigned aliases such as
+``open_db = sqlite3.connect``, ``getattr`` calls, star imports, and
+``sqlite3.dbapi2.connect`` are intentionally out of scope.
+"""
 
 from __future__ import annotations
 
@@ -201,10 +206,48 @@ def test_planted_unapproved_direct_open_is_rejected() -> None:
         )
 
 
+def test_new_direct_open_in_allowlisted_module_is_rejected() -> None:
+    source = """\
+import sqlite3
+
+def make_db_signing_key_resolver():
+    def _resolve():
+        sqlite3.connect("sanctioned.db")
+    return _resolve
+
+def newly_added_probe():
+    sqlite3.connect("unexpected.db")
+"""
+    sites = _find_direct_opens(source, relpath="src/pinky_daemon/auth.py")
+
+    with pytest.raises(AssertionError, match="newly_added_probe"):
+        _assert_direct_opens_allowed(
+            sites,
+            owner_modules=APPROVED_STORAGE_OWNER_MODULES,
+            allowlist={
+                "src/pinky_daemon/auth.py": DIRECT_OPEN_ALLOWLIST["src/pinky_daemon/auth.py"]
+            },
+        )
+
+
 def test_dead_allowlist_entry_is_rejected() -> None:
     with pytest.raises(AssertionError, match="Dead DIRECT_OPEN_ALLOWLIST entries"):
         _assert_direct_opens_allowed(
             [],
             owner_modules=APPROVED_STORAGE_OWNER_MODULES,
             allowlist={"src/pinky_daemon/removed_connector.py": "Remove me."},
+        )
+
+
+def test_blank_allowlist_reason_is_rejected() -> None:
+    sites = _find_direct_opens(
+        'import sqlite3\nsqlite3.connect("legacy.db")\n',
+        relpath="src/pinky_daemon/legacy_connector.py",
+    )
+
+    with pytest.raises(AssertionError, match="without reasons"):
+        _assert_direct_opens_allowed(
+            sites,
+            owner_modules=APPROVED_STORAGE_OWNER_MODULES,
+            allowlist={"src/pinky_daemon/legacy_connector.py": "   "},
         )
