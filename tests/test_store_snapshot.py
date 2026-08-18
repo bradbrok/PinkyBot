@@ -517,3 +517,69 @@ def test_cli_is_endpoint_only_and_requires_explicit_signing_identity() -> None:
     assert "PINKY_AGENT_NAME" in source
     assert source.index("PINKY_AGENT_KEY") < source.index("PINKY_SESSION_SECRET")
     assert not os.path.exists(script.with_name("safe_db_read.py"))
+
+
+def test_cli_signs_endpoint_request_and_prints_only_returned_copy_path(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    script = Path(__file__).resolve().parents[1] / "scripts" / "store_snapshot.py"
+    spec = importlib.util.spec_from_file_location("store_snapshot_cli", script)
+    assert spec is not None and spec.loader is not None
+    cli = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(cli)
+    captured_requests = []
+
+    class Response:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_args) -> None:
+            return None
+
+        def read(self) -> bytes:
+            return json.dumps(
+                {
+                    "snapshots": [
+                        {
+                            "logical_names": ["conversations"],
+                            "snapshot_path": "/data/snapshots/conversations-copy.db",
+                            "verification": "ok",
+                            "error": None,
+                        }
+                    ]
+                }
+            ).encode()
+
+    def _urlopen(request, *, timeout: float):
+        captured_requests.append((request, timeout))
+        return Response()
+
+    monkeypatch.setenv("PINKY_AGENT_KEY", "agent-specific-secret")
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-must-not-win")
+    monkeypatch.setattr(cli.urllib.request, "urlopen", _urlopen)
+
+    assert (
+        cli.main(
+            [
+                "--as-agent",
+                "operator",
+                "--logical-name",
+                "conversations",
+                "--api-url",
+                "http://127.0.0.1:9999",
+            ]
+        )
+        == 0
+    )
+
+    output = capsys.readouterr()
+    assert output.out == "/data/snapshots/conversations-copy.db\n"
+    assert output.err == ""
+    [(request, timeout)] = captured_requests
+    assert request.full_url == "http://127.0.0.1:9999/internal/stores/snapshot"
+    assert request.get_method() == "POST"
+    assert json.loads(request.data) == {"logical_name": "conversations"}
+    assert request.headers["X-pinky-agent"] == "operator"
+    assert request.headers["X-pinky-signature"]
+    assert timeout == 300.0
