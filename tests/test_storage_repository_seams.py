@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import ast
+import errno
 import importlib
 import importlib.util
 import inspect
@@ -194,23 +195,25 @@ def test_provisioned_signing_store_is_reserved_before_open_and_committed_atomica
     module = _signing_store_module()
     store_type = module.AgentSigningKeyStore
     target = tmp_path / "agent_keys.db"
+    staging_root = tmp_path / "daemon-staging"
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
-    real_open = module.os.open
+    real_link = module.os.link
     boundary_records: list[Any] = []
 
-    def observing_open(path: str, flags: int, mode: int = 0o777) -> int:
-        if os.fspath(path) == os.fspath(target) and flags & os.O_CREAT:
+    def observing_link(source: Any, destination: Any, **kwargs: Any) -> None:
+        if os.fspath(destination) == target.name:
             boundary_records.extend(catalog.snapshot())
             assert not target.exists()
-        return real_open(path, flags, mode)
+        real_link(source, destination, **kwargs)
 
-    monkeypatch.setattr(module.os, "open", observing_open)
+    monkeypatch.setattr(module.os, "link", observing_link)
 
     store_type.provision_single_agent(
         os.fspath(target),
         "tenant",
         "tenant-secret",
         catalog=catalog,
+        staging_root=staging_root,
     )
 
     assert [record.logical_name for record in boundary_records] == ["agent_signing_keys"]
@@ -230,17 +233,18 @@ def test_provisioned_signing_store_is_reserved_before_open_and_committed_atomica
     assert not Path(os.fspath(target) + "-shm").exists()
 
 
-def test_provisioned_signing_store_failure_removes_db_sidecars_and_reservation(
+def test_provisioned_signing_store_failure_cleans_staging_and_reservation(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     module = _signing_store_module()
     target = tmp_path / "agent_keys.db"
+    staging_root = tmp_path / "daemon-staging"
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    opened: list[str] = []
 
-    def fail_after_create(*_args: Any, **_kwargs: Any) -> Any:
-        Path(os.fspath(target) + "-wal").write_bytes(b"failed-wal")
-        Path(os.fspath(target) + "-shm").write_bytes(b"failed-shm")
+    def fail_after_create(database: Any, *_args: Any, **_kwargs: Any) -> Any:
+        opened.append(os.fspath(database))
         raise sqlite3.OperationalError("injected create failure")
 
     monkeypatch.setattr(module.sqlite3, "connect", fail_after_create)
@@ -251,13 +255,13 @@ def test_provisioned_signing_store_failure_removes_db_sidecars_and_reservation(
             "tenant",
             "tenant-secret",
             catalog=catalog,
+            staging_root=staging_root,
         )
 
+    assert opened and all(os.fspath(target) not in database for database in opened)
     assert catalog.snapshot() == []
     assert not target.exists()
-    assert not Path(os.fspath(target) + "-wal").exists()
-    assert not Path(os.fspath(target) + "-shm").exists()
-    assert not Path(os.fspath(target) + "-journal").exists()
+    assert list(staging_root.iterdir()) == []
 
 
 def test_provisioned_signing_store_never_follows_a_dangling_symlink(
@@ -275,6 +279,7 @@ def test_provisioned_signing_store_never_follows_a_dangling_symlink(
             "tenant",
             "tenant-secret",
             catalog=catalog,
+            staging_root=tmp_path / "daemon-staging",
         )
 
     assert target.is_symlink()
@@ -282,7 +287,7 @@ def test_provisioned_signing_store_never_follows_a_dangling_symlink(
     assert catalog.snapshot() == []
 
 
-def test_provision_aborts_before_secret_write_when_connect_path_swaps_to_victim(
+def test_provision_never_opens_sqlite_through_tenant_target_path(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -294,23 +299,27 @@ def test_provision_aborts_before_secret_write_when_connect_path_swaps_to_victim(
         connection.execute("CREATE TABLE victim_sentinel (value TEXT)")
         connection.execute("INSERT INTO victim_sentinel VALUES ('keep')")
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    attack_reached_target = False
 
     def swap_to_victim(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
-        assert os.fspath(database) == os.fspath(target)
-        target.unlink()
+        nonlocal attack_reached_target
+        if os.fspath(database) != os.fspath(target):
+            return real_connect(database, *args, **kwargs)
+        attack_reached_target = True
         target.symlink_to(victim)
         return real_connect(database, *args, **kwargs)
 
     monkeypatch.setattr(module.sqlite3, "connect", swap_to_victim)
 
-    with pytest.raises(OSError, match="identity"):
-        module.AgentSigningKeyStore.provision_single_agent(
-            os.fspath(target),
-            "tenant",
-            "must-not-escape",
-            catalog=catalog,
-        )
+    module.AgentSigningKeyStore.provision_single_agent(
+        os.fspath(target),
+        "tenant",
+        "must-not-escape",
+        catalog=catalog,
+        staging_root=tmp_path / "daemon-staging",
+    )
 
+    assert not attack_reached_target
     with real_connect(victim) as connection:
         assert connection.execute("SELECT value FROM victim_sentinel").fetchall() == [("keep",)]
         assert (
@@ -319,8 +328,10 @@ def test_provision_aborts_before_secret_write_when_connect_path_swaps_to_victim(
             ).fetchall()
             == []
         )
-    assert target.is_symlink(), "cleanup must not unlink a replacement path"
-    assert catalog.snapshot() == []
+    with real_connect(target) as connection:
+        assert connection.execute(
+            "SELECT signing_key FROM agent_signing_keys WHERE agent_name='tenant'"
+        ).fetchone() == ("must-not-escape",)
 
 
 def test_provision_sqlite_open_cannot_be_redirected_by_swap_open_restore(
@@ -354,6 +365,7 @@ def test_provision_sqlite_open_cannot_be_redirected_by_swap_open_restore(
         "tenant",
         "must-not-escape",
         catalog=catalog,
+        staging_root=tmp_path / "daemon-staging",
     )
 
     with real_connect(victim) as connection:
@@ -399,6 +411,7 @@ def test_provision_preserves_every_preexisting_sidecar_identity(
             "tenant",
             "tenant-secret",
             catalog=catalog,
+            staging_root=tmp_path / "daemon-staging",
         )
 
     assert connect_calls == 0
@@ -418,30 +431,32 @@ def test_provision_cleanup_preserves_inode_swapped_in_after_create(
     created_moved_aside = tmp_path / "created-moved-aside.db"
     replacement_content = b"replacement inode must survive"
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
-    real_fsync_file = module._fsync_file
+    real_fsync = module.os.fsync
+    replacement_written = False
 
-    def swap_before_final_identity_check(
-        path: Path,
-        *,
-        expected_identity: tuple[int, int] | None = None,
-    ) -> None:
-        assert expected_identity is not None
-        path.rename(created_moved_aside)
-        path.write_bytes(replacement_content)
-        real_fsync_file(path)
+    def swap_during_file_fsync(descriptor: int) -> None:
+        nonlocal replacement_written
+        descriptor_stat = os.fstat(descriptor)
+        if stat.S_ISREG(descriptor_stat.st_mode) and not replacement_written:
+            if target.exists():
+                target.rename(created_moved_aside)
+            target.write_bytes(replacement_content)
+            replacement_written = True
+        real_fsync(descriptor)
 
-    monkeypatch.setattr(module, "_fsync_file", swap_before_final_identity_check)
+    monkeypatch.setattr(module.os, "fsync", swap_during_file_fsync)
 
-    with pytest.raises(OSError, match="identity"):
+    with pytest.raises(OSError):
         module.AgentSigningKeyStore.provision_single_agent(
             os.fspath(target),
             "tenant",
             "tenant-secret",
             catalog=catalog,
+            staging_root=tmp_path / "daemon-staging",
         )
 
+    assert replacement_written
     assert target.read_bytes() == replacement_content
-    assert created_moved_aside.exists()
     assert catalog.snapshot() == []
 
 
@@ -493,6 +508,7 @@ def test_provision_cleanup_never_trusts_linux_reused_dev_inode(
             "tenant",
             "tenant-secret",
             catalog=catalog,
+            staging_root=tmp_path / "daemon-staging",
         )
 
     assert replacement_written
@@ -514,6 +530,7 @@ def test_provision_requires_a_private_parent_directory(tmp_path: Path) -> None:
             "tenant",
             "tenant-secret",
             catalog=catalog,
+            staging_root=tmp_path / "daemon-staging",
         )
 
     assert not target.exists()
@@ -528,7 +545,7 @@ def test_system_provision_ops_delegates_with_a_scoped_catalog(
 
     target = tmp_path / "tenant" / "data" / "agent_keys.db"
     target.parent.mkdir(parents=True)
-    observations: list[tuple[str, str, str, StoreCatalog]] = []
+    observations: list[tuple[str, str, str, StoreCatalog, Path]] = []
 
     class FakeSigningKeyStore:
         @classmethod
@@ -539,8 +556,9 @@ def test_system_provision_ops_delegates_with_a_scoped_catalog(
             signing_key: str,
             *,
             catalog: StoreCatalog,
+            staging_root: str | os.PathLike[str],
         ) -> None:
-            observations.append((path, agent_name, signing_key, catalog))
+            observations.append((path, agent_name, signing_key, catalog, Path(staging_root)))
 
     monkeypatch.setattr(
         provisioning,
@@ -549,20 +567,22 @@ def test_system_provision_ops_delegates_with_a_scoped_catalog(
         raising=False,
     )
 
-    provisioning.SystemProvisionOps().write_keystore(
+    staging_root = tmp_path / "daemon-staging"
+    provisioning.SystemProvisionOps(staging_root=staging_root).write_keystore(
         os.fspath(target),
         "tenant",
         "tenant-secret",
     )
 
     assert len(observations) == 1
-    path, agent_name, signing_key, catalog = observations[0]
+    path, agent_name, signing_key, catalog, observed_staging_root = observations[0]
     assert (path, agent_name, signing_key) == (
         os.fspath(target),
         "tenant",
         "tenant-secret",
     )
     assert catalog.expected_root == os.path.realpath(target.parent)
+    assert observed_staging_root == staging_root
 
 
 def test_reflection_store_read_only_correlation_accessor_preserves_absence_and_schema(
@@ -870,6 +890,53 @@ def test_boot_fails_closed_on_corrupt_scoped_tenant_keystore(
         api_module.create_api(db_path=os.fspath(base))
 
 
+def test_boot_loudly_rejects_cross_device_signing_key_staging(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pinky_daemon import api as api_module
+
+    base = tmp_path / "fleet" / "conversations.db"
+    _seed_unix_user_registry(base, tmp_path / "tenant-work")
+    tenant_db = tmp_path / "homes" / "pinky-tenant" / "data" / "agent_keys.db"
+    monkeypatch.setattr(
+        api_module,
+        "_derive_standalone_tenant_store_manifest",
+        lambda _agent_name: {
+            "agent_signing_keys": StoreIntegrityTarget(
+                logical_name="agent_signing_keys",
+                path=os.fspath(tenant_db),
+                journal_mode="delete",
+            )
+        },
+        raising=False,
+    )
+
+    def reject_cross_device(*_args: Any, **_kwargs: Any) -> None:
+        raise OSError(
+            errno.EXDEV,
+            "configure PINKY_SIGNING_KEY_STAGING_ROOT on the tenant filesystem",
+        )
+
+    monkeypatch.setattr(api_module, "validate_signing_key_staging_root", reject_cross_device)
+    closed_roots: list[str] = []
+    real_close = StoreCatalog.close
+
+    def close_spy(catalog: StoreCatalog) -> None:
+        closed_roots.append(catalog.expected_root)
+        real_close(catalog)
+
+    monkeypatch.setattr(StoreCatalog, "close", close_spy)
+
+    with pytest.raises(
+        StoreCatalogError,
+        match="staging configuration.*PINKY_SIGNING_KEY_STAGING_ROOT",
+    ):
+        api_module.create_api(db_path=os.fspath(base))
+
+    assert os.path.realpath(base.parent) in closed_roots
+
+
 def test_boot_never_attaches_preflight_mode_to_replacement_inode(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -949,6 +1016,7 @@ def test_all_externally_read_signing_databases_are_rollback_journal(
         "tenant",
         "tenant-secret",
         catalog=catalog,
+        staging_root=tmp_path / "daemon-staging",
     )
     with sqlite3.connect(tenant_path) as connection:
         assert connection.execute("PRAGMA journal_mode").fetchone()[0].lower() == "delete"
@@ -975,7 +1043,6 @@ def test_persistent_wal_keystore_preflight_fails_before_sidecar_recreation(
     with pytest.raises(StoreCatalogError, match="WAL|rollback"):
         catalog.preflight_integrity([target])
 
-    assert catalog.observed_journal_mode(tenant_path) == "wal"
     assert catalog.snapshot() == [], "preflight must not falsely register DELETE"
     assert not Path(os.fspath(tenant_path) + "-wal").exists()
     assert not Path(os.fspath(tenant_path) + "-shm").exists()

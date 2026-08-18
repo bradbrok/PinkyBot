@@ -10,13 +10,26 @@ exceptions.
 The only residual cross-process read is a stdio agent's typed, `mode=ro`
 signing-key lookup. Every database reachable through that reader is
 rollback-journal: the fleet `_agents.db` is `TRUNCATE`, and standalone tenant
-keystores are `DELETE`. Boot preflight and the fail-soft reader inspect the raw
-SQLite header before any `mode=ro` open and reject persistent-WAL drift without
-recreating `-wal`/`-shm`; the scoped catalog records the observed mode rather
-than assuming `DELETE`. Provisioning also requires a stable, owner-only `0700`
-parent and verifies the exclusive-create inode before writing the secret. Those
-boundaries keep external reads safe from the #889 checkpoint/unlink corruption
-class and keep path substitution from redirecting a signing key.
+keystores are `DELETE`. Boot preflight and the fail-soft reader bind one
+`O_NOFOLLOW` file descriptor, inspect the raw SQLite header through that
+descriptor, and keep it as the sole physical identity through the read and
+catalog lifetime. Tenant-capable preflight is descriptor-only and rejects
+persistent-WAL drift before SQLite can resolve or recreate `-wal`/`-shm`.
+
+Fleet WAL preflight is a distinct daemon-only catalog path because SQLite must
+derive live WAL/SHM names from a filename. It is permitted only after every
+component in the resolved data-directory chain is owner/mode checked against the
+daemon trust boundary. That namespace check is the load-bearing swap defense;
+an open-descriptor inventory corroborates the pinned main-file identity but is
+only defense in depth because SQLite may reuse a prior same-inode descriptor.
+Path comparisons are reject-only and never refresh or rebind an observation.
+
+Standalone provisioning builds SQLite only in a daemon-owned `0700` staging
+directory on the tenant home's filesystem, sets ownership and mode through file
+descriptors, and publishes with an atomic dirfd-relative no-overwrite link. It
+never opens SQLite or cleans up through a tenant-controlled target pathname.
+These boundaries keep external reads safe from the #889 checkpoint/unlink
+corruption class and keep path substitution from redirecting a signing key.
 
 Eliminating every external process file descriptor would be a stronger
 isolation boundary. It would require a new authenticated secret/signing service

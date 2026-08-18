@@ -61,7 +61,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
 
-from pinky_daemon.agent_signing_key_store import AgentSigningKeyStore
+from pinky_daemon.agent_signing_key_store import (
+    AgentSigningKeyStore,
+    configured_signing_key_staging_root,
+)
 from pinky_daemon.store_catalog import StoreCatalog
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a runtime import cycle
@@ -325,6 +328,17 @@ class SystemProvisionOps:
     inspection, while the provisioner *logic* is covered via a recording double.
     """
 
+    def __init__(
+        self,
+        *,
+        staging_root: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self._staging_root = (
+            configured_signing_key_staging_root()
+            if staging_root is None
+            else Path(os.path.abspath(os.fspath(staging_root)))
+        )
+
     def run(self, argv: list[str]) -> None:
         proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -352,12 +366,16 @@ class SystemProvisionOps:
 
     def write_keystore(self, path: str, agent_name: str, signing_key: str) -> None:
         catalog = StoreCatalog(expected_root=Path(path).parent, silence_allowlist={})
-        AgentSigningKeyStore.provision_single_agent(
-            path,
-            agent_name,
-            signing_key,
-            catalog=catalog,
-        )
+        try:
+            AgentSigningKeyStore.provision_single_agent(
+                path,
+                agent_name,
+                signing_key,
+                catalog=catalog,
+                staging_root=self._staging_root,
+            )
+        finally:
+            catalog.close()
 
 
 class UnixUserProvisioner(AgentProvisioner):
@@ -472,7 +490,6 @@ class UnixUserProvisioner(AgentProvisioner):
                 if not key:
                     raise ProvisionError(f"no signing key available for {agent.name!r}")
                 self._ops.write_keystore(p.keystore, agent.name, key)
-                self._ops.run(["chown", f"{p.username}:{p.username}", p.keystore])
                 created.append(f"path:{p.keystore}")
 
             # 4. The agent's .mcp.json (0600).

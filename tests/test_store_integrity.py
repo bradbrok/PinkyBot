@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import tempfile
 from pathlib import Path
 from typing import Any
 
@@ -11,7 +12,7 @@ import pytest
 
 from pinky_daemon import api as api_module
 from pinky_daemon import store_catalog as store_catalog_module
-from pinky_daemon.store_catalog import StoreCatalog, StoreCatalogError
+from pinky_daemon.store_catalog import DaemonStoreCatalog, StoreCatalog, StoreCatalogError
 
 
 def _target(
@@ -20,6 +21,7 @@ def _target(
     *,
     criticality: str = "authoritative",
     recovery: str = "snapshot",
+    journal_mode: str | None = None,
 ) -> Any:
     target_type = getattr(store_catalog_module, "StoreIntegrityTarget", None)
     assert target_type is not None, "StoreIntegrityTarget is not implemented"
@@ -28,6 +30,7 @@ def _target(
         path=os.fspath(path),
         criticality=criticality,
         recovery=recovery,
+        journal_mode=journal_mode,
     )
 
 
@@ -66,6 +69,13 @@ def _sidecar_identities(path: Path) -> dict[str, tuple[int, int]]:
             continue
         identities[suffix] = (sidecar_stat.st_dev, sidecar_stat.st_ino)
     return identities
+
+
+@pytest.fixture
+def daemon_store_root() -> Any:
+    """Create a daemon-owned root outside world-writable pytest temp ancestors."""
+    with tempfile.TemporaryDirectory(prefix=".pinky-daemon-store-", dir=Path.cwd()) as root:
+        yield Path(root)
 
 
 class _RecordingConnection:
@@ -132,7 +142,9 @@ def test_non_ok_quick_check_fails_closed_and_names_all_logical_stores(
     assert connection.statements == ["PRAGMA quick_check"]
     assert connection.closed is True
     assert len(connect_calls) == 1
-    assert connect_calls[0][0][0] == source.resolve().as_uri() + "?mode=ro"
+    database = str(connect_calls[0][0][0])
+    assert database.startswith(("file:///dev/fd/", "file:///proc/self/fd/"))
+    assert database.endswith("?mode=ro")
     assert connect_calls[0][1]["uri"] is True
 
 
@@ -158,6 +170,22 @@ def test_absent_store_is_skipped_without_opening(
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
 
     _preflight(catalog, [_target("not_created", source)])
+
+
+def test_preflight_absence_can_only_reconcile_toward_reject(
+    tmp_path: Path,
+) -> None:
+    source = tmp_path / "appeared-after-bind.db"
+    target = _target("tenant", source, journal_mode="delete")
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    observations = catalog.preflight_integrity([target])
+    catalog.register_observed(target, observations["tenant"], owner="AgentSigningKeyStore")
+
+    connection = _create_database(source)
+    connection.close()
+
+    with pytest.raises(StoreCatalogError, match="preflight-absent|appeared"):
+        catalog.validate()
 
 
 def test_store_disappearing_during_connect_is_treated_as_absent(
@@ -225,10 +253,12 @@ def test_memory_store_is_skipped_without_opening(
 )
 def test_preflight_preserves_sidecar_inodes_and_persisted_journal_mode(
     tmp_path: Path,
+    daemon_store_root: Path,
     requested_mode: str,
     expected_reopen_mode: str,
 ) -> None:
-    source = tmp_path / f"{requested_mode}.db"
+    store_root = daemon_store_root if requested_mode == "wal" else tmp_path
+    source = store_root / f"{requested_mode}.db"
     authority = _create_database(source, journal_mode=requested_mode)
     try:
         if requested_mode == "wal":
@@ -244,8 +274,10 @@ def test_preflight_preserves_sidecar_inodes_and_persisted_journal_mode(
         else:
             assert "-journal" in sidecars_before
 
-        catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+        catalog_type = DaemonStoreCatalog if requested_mode == "wal" else StoreCatalog
+        catalog = catalog_type(expected_root=store_root, silence_allowlist={})
         _preflight(catalog, [_target("primary", source)])
+        catalog.close()
 
         mode_after_live = str(authority.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         sidecars_after = _sidecar_identities(source)
@@ -265,6 +297,102 @@ def test_preflight_preserves_sidecar_inodes_and_persisted_journal_mode(
     # reopens as DELETE. The probe must preserve that WAL/rollback boundary.
     assert mode_after_reopen == expected_reopen_mode
     assert sidecars_after == sidecars_before
+
+
+def test_tenant_capable_catalog_cannot_reach_wal_pathname_branch(tmp_path: Path) -> None:
+    source = tmp_path / "tenant-mislabeled-wal.db"
+    authority = _create_database(source, journal_mode="wal")
+    authority.close()
+    sidecars_before = _sidecar_identities(source)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    with pytest.raises(StoreCatalogError, match="descriptor-only"):
+        _preflight(catalog, [_target("tenant", source, journal_mode="wal")])
+
+    assert _sidecar_identities(source) == sidecars_before
+
+
+@pytest.mark.parametrize("unsafe_kind", ["writable", "tenant-owned"])
+def test_daemon_wal_pathname_branch_requires_trusted_directory_chain(
+    daemon_store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    unsafe_kind: str,
+) -> None:
+    source = daemon_store_root / "fleet-wal.db"
+    authority = _create_database(source, journal_mode="wal")
+    authority.close()
+    original_mode = daemon_store_root.stat().st_mode & 0o777
+    if unsafe_kind == "writable":
+        daemon_store_root.chmod(original_mode | 0o020)
+    else:
+        real_stat = os.stat
+
+        def stat_with_tenant_owned_component(
+            path: str | os.PathLike[str],
+            *args: Any,
+            **kwargs: Any,
+        ) -> os.stat_result:
+            result = real_stat(path, *args, **kwargs)
+            if os.path.abspath(os.fspath(path)) == os.path.abspath(daemon_store_root):
+                values = list(result)
+                values[4] = os.geteuid() + 1
+                return os.stat_result(values)
+            return result
+
+        monkeypatch.setattr(store_catalog_module.os, "stat", stat_with_tenant_owned_component)
+
+    sqlite_opened = False
+
+    def forbidden_connect(*_args: Any, **_kwargs: Any) -> sqlite3.Connection:
+        nonlocal sqlite_opened
+        sqlite_opened = True
+        raise AssertionError("ownership fence must reject before SQLite pathname open")
+
+    monkeypatch.setattr(store_catalog_module.sqlite3, "connect", forbidden_connect)
+    catalog = DaemonStoreCatalog(expected_root=daemon_store_root, silence_allowlist={})
+    try:
+        with pytest.raises(StoreCatalogError, match="writable|owner"):
+            _preflight(catalog, [_target("fleet", source)])
+        assert sqlite_opened is False
+    finally:
+        if unsafe_kind == "writable":
+            daemon_store_root.chmod(original_mode)
+
+
+def test_daemon_wal_pathname_open_requires_pinned_identity_corroboration(
+    daemon_store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = daemon_store_root / "fleet-wal.db"
+    original = daemon_store_root / "fleet-wal-original.db"
+    victim = daemon_store_root / "fleet-wal-victim.db"
+    victim_hold = daemon_store_root / "fleet-wal-victim-opened.db"
+    for path, value in ((source, "source"), (victim, "victim")):
+        connection = _create_database(path, journal_mode="wal")
+        connection.execute("UPDATE inventory SET value = ? WHERE id = 1", (value,))
+        connection.commit()
+        connection.close()
+
+    real_connect = sqlite3.connect
+
+    def swap_open_restore(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        source.replace(original)
+        victim.replace(source)
+        try:
+            connection = real_connect(database, *args, **kwargs)
+        finally:
+            source.replace(victim_hold)
+            original.replace(source)
+        return connection
+
+    monkeypatch.setattr(store_catalog_module.sqlite3, "connect", swap_open_restore)
+    catalog = DaemonStoreCatalog(expected_root=daemon_store_root, silence_allowlist={})
+
+    with pytest.raises(StoreCatalogError, match="does not match.*pinned"):
+        _preflight(catalog, [_target("fleet", source)])
+
+    assert source.exists()
+    assert victim_hold.exists()
 
 
 @pytest.mark.parametrize(

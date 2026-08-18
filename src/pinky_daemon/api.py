@@ -67,6 +67,10 @@ from pinky_daemon.agent_registry import (
     replace_agent_text,
     resolve_agent_path,
 )
+from pinky_daemon.agent_signing_key_store import (
+    configured_signing_key_staging_root,
+    validate_signing_key_staging_root,
+)
 from pinky_daemon.analytics_store import AnalyticsStore
 from pinky_daemon.api_models import (
     AddDirectiveRequest,
@@ -197,6 +201,7 @@ from pinky_daemon.skill_loader import discover_all_skills, register_discovered_s
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.storage_observability import StorageObservability
 from pinky_daemon.store_catalog import (
+    DaemonStoreCatalog,
     StoreCatalog,
     StoreCatalogError,
     StoreIntegrityTarget,
@@ -1726,7 +1731,7 @@ def create_api(
 
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
-    store_catalog = StoreCatalog(expected_root=_data_dir)
+    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
     store_manifest = _derive_api_store_manifest(db_path)
     storage_observability = StorageObservability(store_manifest)
     try:
@@ -1735,6 +1740,7 @@ def create_api(
             on_outcome=storage_observability.record_preflight,
         )
     except StoreCatalogError:
+        store_catalog.close()
         storage_observability.record_boot_failure()
         raise
     store_snapshot_service = StoreSnapshotService(store_catalog)
@@ -1812,6 +1818,7 @@ def create_api(
     analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
     agents = AgentRegistry(db_path=store_manifest["agents"].path, catalog=store_catalog)
     tenant_store_catalogs: dict[str, StoreCatalog] = {}
+    tenant_catalog: StoreCatalog | None = None
     try:
         for agent in agents.list():
             if (agent.isolation_mode or "local") != "unix_user":
@@ -1825,32 +1832,40 @@ def create_api(
                 raise StoreCatalogError(
                     "standalone tenant manifest spans multiple storage roots"
                 )
+            tenant_root = tenant_roots.pop()
+            staging_root = configured_signing_key_staging_root(_data_dir)
+            try:
+                validate_signing_key_staging_root(staging_root, (tenant_root,))
+            except OSError as exc:
+                raise StoreCatalogError(
+                    "Signing-key staging configuration is unsafe: "
+                    f"staging={os.fspath(staging_root)!r} "
+                    f"tenant_root={tenant_root!r} error={type(exc).__name__}: {exc}"
+                ) from exc
             tenant_catalog = StoreCatalog(
-                expected_root=tenant_roots.pop(),
+                expected_root=tenant_root,
                 silence_allowlist={},
             )
-            tenant_catalog.preflight_integrity(tenant_manifest.values())
+            observations = tenant_catalog.preflight_integrity(tenant_manifest.values())
             for target in tenant_manifest.values():
-                observed_journal_mode = tenant_catalog.observed_journal_mode(
-                    target.path
-                )
-                tenant_catalog.register(
-                    target.logical_name,
-                    target.path,
-                    journal_mode=(
-                        observed_journal_mode
-                        or target.journal_mode
-                        or "delete"
-                    ),
+                tenant_catalog.register_observed(
+                    target,
+                    observations[target.logical_name],
                     owner="AgentSigningKeyStore",
-                    criticality=target.criticality,
                 )
             tenant_catalog.validate()
             tenant_store_catalogs[agent.name] = tenant_catalog
+            tenant_catalog = None
     except StoreCatalogError:
+        if tenant_catalog is not None:
+            tenant_catalog.close()
+        for registered_tenant_catalog in tenant_store_catalogs.values():
+            registered_tenant_catalog.close()
+        store_catalog.close()
         storage_observability.record_boot_failure()
         raise
     app.state.tenant_store_catalogs = tenant_store_catalogs
+    app.state.store_catalog = store_catalog
     _run_grandfather_approved_users_migration(store, agents)
     _refresh_1m_models(agents)
     audit = AuditStore(db_path=store_manifest["audit"].path, catalog=store_catalog)
@@ -12852,6 +12867,9 @@ npm run build</pre>
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
         message_context_store.close()
+        for tenant_catalog in tenant_store_catalogs.values():
+            tenant_catalog.close()
+        store_catalog.close()
 
     # ── Admin: Session Watchdog ─────────────────────────
 
