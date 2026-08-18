@@ -508,6 +508,70 @@ def test_successful_snapshot_request_is_audited_with_caller_selection_and_paths(
     summary = json.loads(entry.tool_input_summary)
     assert summary["requested"] == ["conversations"]
     assert summary["path"] == paths[0]
+    assert summary["verification"] == "ok"
+
+
+@pytest.mark.parametrize("denial", ["unregistered", "outside-root"])
+def test_snapshot_selection_denial_is_audited(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    denial: str,
+) -> None:
+    client = _snapshot_api_client(monkeypatch, tmp_path)
+    service = client.app.state.store_snapshot_service
+    logical_name = "round3_unknown"
+    if denial == "outside-root":
+        logical_name = "round3_outside"
+        outside = tmp_path / "outside-root.db"
+        connection, mode = _create_store(outside)
+        connection.close()
+        service._catalog.register(
+            logical_name,
+            outside,
+            journal_mode=mode,
+            owner="test-owner",
+        )
+
+    response = client.post(
+        "/internal/stores/snapshot",
+        headers=_signed_snapshot_headers(client, "operator"),
+        json={"logical_name": logical_name},
+    )
+
+    assert response.status_code == 400
+    entries = client.app.state.audit.get_log(event="store_snapshot", limit=5)
+    assert len(entries) == 1
+    summary = json.loads(entries[0].tool_input_summary)
+    assert summary == {
+        "requested": [logical_name],
+        "logical_names": [],
+        "status": "denied",
+        "path": None,
+        "verification": "not_run",
+        "error": response.json()["detail"],
+    }
+
+
+def test_unexpected_per_store_exception_reaches_controlled_500(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _snapshot_api_client(monkeypatch, tmp_path)
+    service = client.app.state.store_snapshot_service
+
+    def _raise_programming_bug(_selected) -> None:
+        raise TypeError("programming bug")
+
+    monkeypatch.setattr(service, "_snapshot_selected", _raise_programming_bug)
+
+    response = client.post(
+        "/internal/stores/snapshot",
+        headers=_signed_snapshot_headers(client, "operator"),
+        json={"logical_name": "conversations"},
+    )
+
+    assert response.status_code == 500
+    assert response.json() == {"detail": "store snapshot failed"}
 
 
 def test_missing_registered_store_is_reported_without_sinking_batch(tmp_path: Path) -> None:
@@ -648,7 +712,7 @@ def test_published_artifact_is_removed_if_its_outcome_audit_fails(tmp_path: Path
     assert not Path(published_path).exists()
 
 
-def test_corrupt_store_returns_audited_partial_success_after_good_publish(
+def test_good_corrupt_and_missing_stores_return_audited_partial_success(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -657,6 +721,7 @@ def test_corrupt_store_returns_audited_partial_success_after_good_publish(
     data_root = Path(service._catalog.expected_root)
     good = data_root / "round2-good.db"
     corrupt = data_root / "round2-corrupt.db"
+    missing = data_root / "round3-missing.db"
     good_connection, good_mode = _create_store(good)
     good_connection.close()
     corrupt.write_bytes(b"this is not a sqlite database")
@@ -669,6 +734,12 @@ def test_corrupt_store_returns_audited_partial_success_after_good_publish(
     service._catalog.register(
         "round2_corrupt",
         corrupt,
+        journal_mode="delete",
+        owner="test-owner",
+    )
+    service._catalog.register(
+        "round3_missing",
+        missing,
         journal_mode="delete",
         owner="test-owner",
     )
@@ -685,21 +756,30 @@ def test_corrupt_store_returns_audited_partial_success_after_good_publish(
     by_name = {item["logical_name"]: item for item in payload["snapshots"]}
     published = by_name["round2_good"]
     failed = by_name["round2_corrupt"]
+    skipped = by_name["round3_missing"]
     assert published["status"] == "published"
     assert set(published) >= {"logical_name", "status", "path"}
     assert Path(published["path"]).is_file()
     assert failed["status"] == "failed"
     assert set(failed) >= {"logical_name", "status", "error"}
     assert "DatabaseError" in failed["error"]
+    assert skipped["status"] == "failed"
+    assert skipped["error"] == "source_missing"
 
     entries = client.app.state.audit.get_log(event="store_snapshot", limit=500)
     summaries = [json.loads(entry.tool_input_summary) for entry in entries]
     published_audit = next(item for item in summaries if "round2_good" in item["logical_names"])
     failed_audit = next(item for item in summaries if "round2_corrupt" in item["logical_names"])
+    skipped_audit = next(item for item in summaries if "round3_missing" in item["logical_names"])
     assert published_audit["status"] == "published"
     assert published_audit["path"] == published["path"]
+    assert published_audit["verification"] == "ok"
     assert failed_audit["status"] == "failed"
+    assert failed_audit["verification"] == "failed"
     assert "DatabaseError" in failed_audit["error"]
+    assert skipped_audit["status"] == "failed"
+    assert skipped_audit["verification"] == "skipped"
+    assert skipped_audit["error"] == "source_missing"
 
 
 def test_snapshot_endpoint_rate_limits_before_third_request_does_work(
