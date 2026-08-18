@@ -175,10 +175,14 @@ def test_memory_store_is_skipped_without_opening(
     _preflight(catalog, [_target("memory", ":memory:")])
 
 
-@pytest.mark.parametrize("requested_mode", ["delete", "truncate", "wal"])
+@pytest.mark.parametrize(
+    ("requested_mode", "expected_reopen_mode"),
+    [("delete", "delete"), ("truncate", "delete"), ("wal", "wal")],
+)
 def test_preflight_preserves_sidecar_inodes_and_persisted_journal_mode(
     tmp_path: Path,
     requested_mode: str,
+    expected_reopen_mode: str,
 ) -> None:
     source = tmp_path / f"{requested_mode}.db"
     authority = _create_database(source, journal_mode=requested_mode)
@@ -213,7 +217,9 @@ def test_preflight_preserves_sidecar_inodes_and_persisted_journal_mode(
 
     assert mode_before == requested_mode
     assert mode_after_live == mode_before
-    assert mode_after_reopen == mode_before
+    # SQLite persists only WAL-vs-rollback in the header; TRUNCATE therefore
+    # reopens as DELETE. The probe must preserve that WAL/rollback boundary.
+    assert mode_after_reopen == expected_reopen_mode
     assert sidecars_after == sidecars_before
 
 
