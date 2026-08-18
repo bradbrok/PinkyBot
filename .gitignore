@@ -75,3 +75,7 @@ scripts/*
 
 # Token in chiaro nella root
 openclaw_token.txt
+
+# Artefatto orfano da 0 byte nella root (creato il 22/07, mai tracciato,
+# 0 tabelle). Ignorato per non farlo rientrare con un `git add -A`.
+db.sqlite3
