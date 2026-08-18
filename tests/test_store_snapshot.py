@@ -74,6 +74,14 @@ def _live_sidecar_inodes(path: Path) -> dict[str, tuple[int, int]]:
     return identities
 
 
+def _read_journal_mode(path: Path) -> str:
+    connection = sqlite3.connect(path)
+    try:
+        return str(connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+    finally:
+        connection.close()
+
+
 def test_consistent_copy_reproduces_inventory_and_passes_quick_check(tmp_path: Path) -> None:
     snapshot = _snapshot_module()
     source = tmp_path / "primary.db"
@@ -96,12 +104,14 @@ def test_consistent_copy_reproduces_inventory_and_passes_quick_check(tmp_path: P
         copy.close()
 
 
-@pytest.mark.parametrize("requested_mode", ["delete", "wal"])
-def test_snapshot_preserves_live_sidecar_set_inodes_and_journal_mode(
+@pytest.mark.parametrize("requested_mode", ["delete", "truncate", "wal"])
+@pytest.mark.parametrize("authority_open", [True, False], ids=["authority-open", "dormant"])
+def test_snapshot_preserves_preexisting_sidecar_inodes_and_journal_mode(
     tmp_path: Path,
     requested_mode: str,
+    authority_open: bool,
 ) -> None:
-    """Keep sidecar existence/inodes stable; WAL read-mark bytes may change in place."""
+    """Never replace preexisting sidecars; WAL coordination files may be created."""
     snapshot = _snapshot_module()
     source = tmp_path / f"{requested_mode}.db"
     authority_connection, observed_mode = _create_store(
@@ -109,29 +119,59 @@ def test_snapshot_preserves_live_sidecar_set_inodes_and_journal_mode(
         journal_mode=requested_mode,
     )
     catalog = _catalog_for(tmp_path, source, journal_mode=observed_mode)
+    if not authority_open:
+        authority_connection.close()
+        authority_connection = None
+
     try:
-        mode_before = str(authority_connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
-        sidecars_before = _live_sidecar_inodes(source)
-        if observed_mode == "wal":
-            assert {"-wal", "-shm"}.issubset(sidecars_before)
+        if authority_connection is None:
+            mode_before = _read_journal_mode(source)
         else:
-            assert "-shm" not in sidecars_before
+            mode_before = str(
+                authority_connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower()
+            if observed_mode != "wal":
+                # Keep a real rollback journal live so the inode assertion is
+                # load-bearing for DELETE/TRUNCATE as well as WAL sidecars.
+                authority_connection.execute("BEGIN IMMEDIATE")
+                authority_connection.execute(
+                    "UPDATE inventory SET value = value || '-pending' WHERE id = 1"
+                )
+        sidecars_before = _live_sidecar_inodes(source)
+        if observed_mode == "wal" and authority_connection is not None:
+            assert {"-wal", "-shm"}.issubset(sidecars_before)
+        if observed_mode == "wal" and authority_connection is None:
+            assert not {"-wal", "-shm"}.intersection(sidecars_before)
+        if observed_mode != "wal" and authority_connection is not None:
+            assert "-journal" in sidecars_before
 
         [result] = snapshot.StoreSnapshotService(catalog).create_snapshots("primary")
 
-        mode_after = str(authority_connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
         sidecars_after = _live_sidecar_inodes(source)
+        if authority_connection is None:
+            mode_after = _read_journal_mode(source)
+        else:
+            mode_after = str(
+                authority_connection.execute("PRAGMA journal_mode").fetchone()[0]
+            ).lower()
     finally:
-        authority_connection.close()
+        if authority_connection is not None:
+            authority_connection.rollback()
+            authority_connection.close()
 
     assert result.verification == "ok"
-    assert set(sidecars_after) == set(sidecars_before)
-    assert sidecars_after == sidecars_before
-    assert mode_before == observed_mode
-    assert mode_after == observed_mode
-    # Deliberately do not compare sidecar bytes or mtimes. A WAL reader's
-    # read-mark bookkeeping may legitimately update -shm bytes in place; inode
-    # stability is what proves there was no unlink-and-recreate cycle.
+    for suffix, identity in sidecars_before.items():
+        assert sidecars_after.get(suffix) == identity
+    if observed_mode == "wal" and authority_connection is None:
+        assert set(sidecars_after) - set(sidecars_before) <= {"-wal", "-shm"}
+    if observed_mode != "wal":
+        assert not {"-wal", "-shm"}.intersection(sidecars_after)
+        assert set(sidecars_after) <= set(sidecars_before)
+    assert mode_after == mode_before
+    # Deliberately do not compare sidecar bytes or mtimes. The daemon-owned
+    # WAL reader may create -wal/-shm for a dormant store and legitimately
+    # update -shm read marks in place. Preserving each preexisting (dev, ino)
+    # is what excludes the #889 unlink-and-recreate orphan vector.
 
 
 @pytest.mark.parametrize("requested_mode", ["delete", "truncate", "wal"])
@@ -493,6 +533,150 @@ def test_missing_registered_store_is_reported_without_sinking_batch(tmp_path: Pa
     assert missing.snapshot_path is None
     assert missing.verification == "skipped"
     assert missing.error == "source_missing"
+
+
+def test_raw_per_store_database_and_os_errors_are_wrapped_and_batch_continues(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot_module()
+    first = tmp_path / "first.db"
+    second = tmp_path / "second.db"
+    first_connection, first_mode = _create_store(first)
+    second_connection, second_mode = _create_store(second)
+    first_connection.close()
+    second_connection.close()
+    catalog = _catalog_for(
+        tmp_path,
+        first,
+        logical_name="first",
+        journal_mode=first_mode,
+    )
+    catalog.register(
+        "second",
+        second,
+        journal_mode=second_mode,
+        owner="test-owner",
+    )
+    service = snapshot.StoreSnapshotService(catalog)
+    raw_errors = {
+        "first": sqlite3.DatabaseError("file is not a database"),
+        "second": OSError("simulated I/O failure"),
+    }
+
+    def _fail(selected) -> None:
+        raise raw_errors[selected.logical_names[0]]
+
+    monkeypatch.setattr(service, "_snapshot_selected", _fail)
+
+    results = service.create_snapshots()
+
+    assert [result.status for result in results] == ["failed", "failed"]
+    for result in results:
+        assert isinstance(result.error, snapshot.StoreSnapshotError)
+        assert result.error.__cause__ is raw_errors[result.logical_names[0]]
+
+
+def test_snapshot_outcome_is_reported_before_the_next_store_starts(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot_module()
+    first = tmp_path / "first.db"
+    second = tmp_path / "second.db"
+    first_connection, first_mode = _create_store(first)
+    second_connection, second_mode = _create_store(second)
+    first_connection.close()
+    second_connection.close()
+    catalog = _catalog_for(
+        tmp_path,
+        first,
+        logical_name="first",
+        journal_mode=first_mode,
+    )
+    catalog.register(
+        "second",
+        second,
+        journal_mode=second_mode,
+        owner="test-owner",
+    )
+    service = snapshot.StoreSnapshotService(catalog)
+    snapshot_selected = service._snapshot_selected
+    outcomes = []
+    calls = 0
+
+    def _snapshot_in_order(selected):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            assert [outcome.logical_names for outcome in outcomes] == [("first",)]
+            raise sqlite3.DatabaseError("file is not a database")
+        return snapshot_selected(selected)
+
+    monkeypatch.setattr(service, "_snapshot_selected", _snapshot_in_order)
+
+    results = service.create_snapshots(on_outcome=outcomes.append)
+
+    assert [result.status for result in results] == ["published", "failed"]
+    assert outcomes == results
+
+
+def test_corrupt_store_returns_audited_partial_success_after_good_publish(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    client = _snapshot_api_client(monkeypatch, tmp_path)
+    service = client.app.state.store_snapshot_service
+    data_root = Path(service._catalog.expected_root)
+    good = data_root / "round2-good.db"
+    corrupt = data_root / "round2-corrupt.db"
+    good_connection, good_mode = _create_store(good)
+    good_connection.close()
+    corrupt.write_bytes(b"this is not a sqlite database")
+    service._catalog.register(
+        "round2_good",
+        good,
+        journal_mode=good_mode,
+        owner="test-owner",
+    )
+    service._catalog.register(
+        "round2_corrupt",
+        corrupt,
+        journal_mode="delete",
+        owner="test-owner",
+    )
+
+    response = client.post(
+        "/internal/stores/snapshot",
+        headers=_signed_snapshot_headers(client, "operator"),
+        json={},
+    )
+
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["status"] == "partial_success"
+    by_name = {item["logical_name"]: item for item in payload["snapshots"]}
+    published = by_name["round2_good"]
+    failed = by_name["round2_corrupt"]
+    assert published["status"] == "published"
+    assert set(published) >= {"logical_name", "status", "path"}
+    assert Path(published["path"]).is_file()
+    assert failed["status"] == "failed"
+    assert set(failed) >= {"logical_name", "status", "error"}
+    assert "DatabaseError" in failed["error"]
+
+    entries = client.app.state.audit.get_log(event="store_snapshot", limit=500)
+    summaries = [json.loads(entry.tool_input_summary) for entry in entries]
+    published_audit = next(
+        item for item in summaries if "round2_good" in item["result_logical_names"]
+    )
+    failed_audit = next(
+        item for item in summaries if "round2_corrupt" in item["result_logical_names"]
+    )
+    assert published_audit["status"] == "published"
+    assert published_audit["path"] == published["path"]
+    assert failed_audit["status"] == "failed"
+    assert "DatabaseError" in failed_audit["error"]
 
 
 def test_snapshot_endpoint_rate_limits_before_third_request_does_work(
