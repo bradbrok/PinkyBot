@@ -59,6 +59,30 @@ def _seed_signing_key_db(path: Path) -> None:
         connection.close()
 
 
+def _seed_persistent_wal_signing_key_db(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    connection = sqlite3.connect(path)
+    try:
+        assert connection.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+        connection.execute(
+            "CREATE TABLE agent_signing_keys ("
+            "agent_name TEXT PRIMARY KEY, signing_key TEXT NOT NULL, created_at REAL)"
+        )
+        connection.execute(
+            "INSERT INTO agent_signing_keys VALUES (?, ?, ?)",
+            ("tenant", "tenant-secret", 1.0),
+        )
+        connection.commit()
+        connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+    finally:
+        connection.close()
+    for suffix in ("-wal", "-shm"):
+        sidecar = Path(os.fspath(path) + suffix)
+        if sidecar.exists():
+            sidecar.unlink()
+    assert path.read_bytes()[18:20] == b"\x02\x02"
+
+
 def _seed_unix_user_registry(base: Path, work_dir: Path) -> None:
     from pinky_daemon import api as api_module
 
@@ -249,6 +273,142 @@ def test_provisioned_signing_store_never_follows_a_dangling_symlink(
     assert catalog.snapshot() == []
 
 
+def test_provision_aborts_before_secret_write_when_connect_path_swaps_to_victim(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _signing_store_module()
+    target = tmp_path / "agent_keys.db"
+    victim = tmp_path / "victim.db"
+    real_connect = module.sqlite3.connect
+    with real_connect(victim) as connection:
+        connection.execute("CREATE TABLE victim_sentinel (value TEXT)")
+        connection.execute("INSERT INTO victim_sentinel VALUES ('keep')")
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    def swap_to_victim(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        assert os.fspath(database) == os.fspath(target)
+        target.unlink()
+        target.symlink_to(victim)
+        return real_connect(database, *args, **kwargs)
+
+    monkeypatch.setattr(module.sqlite3, "connect", swap_to_victim)
+
+    with pytest.raises(OSError, match="identity"):
+        module.AgentSigningKeyStore.provision_single_agent(
+            os.fspath(target),
+            "tenant",
+            "must-not-escape",
+            catalog=catalog,
+        )
+
+    with real_connect(victim) as connection:
+        assert connection.execute("SELECT value FROM victim_sentinel").fetchall() == [("keep",)]
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name='agent_signing_keys'"
+            ).fetchall()
+            == []
+        )
+    assert target.is_symlink(), "cleanup must not unlink a replacement path"
+    assert catalog.snapshot() == []
+
+
+def test_provision_preserves_every_preexisting_sidecar_identity(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _signing_store_module()
+    target = tmp_path / "agent_keys.db"
+    sidecars = {
+        Path(os.fspath(target) + suffix): f"sentinel:{suffix}".encode()
+        for suffix in ("-wal", "-shm", "-journal")
+    }
+    for path, content in sidecars.items():
+        path.write_bytes(content)
+    identities = {path: (path.stat().st_dev, path.stat().st_ino) for path in sidecars}
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    connect_calls = 0
+
+    def forbidden_connect(*_args: Any, **_kwargs: Any) -> Any:
+        nonlocal connect_calls
+        connect_calls += 1
+        raise AssertionError("pre-existing sidecars must fail before SQLite open")
+
+    monkeypatch.setattr(module.sqlite3, "connect", forbidden_connect)
+
+    with pytest.raises(FileExistsError, match="sidecar"):
+        module.AgentSigningKeyStore.provision_single_agent(
+            os.fspath(target),
+            "tenant",
+            "tenant-secret",
+            catalog=catalog,
+        )
+
+    assert connect_calls == 0
+    assert not target.exists()
+    for path, content in sidecars.items():
+        assert path.read_bytes() == content
+        assert (path.stat().st_dev, path.stat().st_ino) == identities[path]
+    assert catalog.snapshot() == []
+
+
+def test_provision_cleanup_preserves_inode_swapped_in_after_create(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _signing_store_module()
+    target = tmp_path / "agent_keys.db"
+    created_moved_aside = tmp_path / "created-moved-aside.db"
+    replacement_content = b"replacement inode must survive"
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    real_fsync_file = module._fsync_file
+
+    def swap_before_final_identity_check(
+        path: Path,
+        *,
+        expected_identity: tuple[int, int] | None = None,
+    ) -> None:
+        assert expected_identity is not None
+        path.rename(created_moved_aside)
+        path.write_bytes(replacement_content)
+        real_fsync_file(path)
+
+    monkeypatch.setattr(module, "_fsync_file", swap_before_final_identity_check)
+
+    with pytest.raises(OSError, match="identity"):
+        module.AgentSigningKeyStore.provision_single_agent(
+            os.fspath(target),
+            "tenant",
+            "tenant-secret",
+            catalog=catalog,
+        )
+
+    assert target.read_bytes() == replacement_content
+    assert created_moved_aside.exists()
+    assert catalog.snapshot() == []
+
+
+def test_provision_requires_a_private_parent_directory(tmp_path: Path) -> None:
+    module = _signing_store_module()
+    parent = tmp_path / "tenant-data"
+    parent.mkdir(mode=0o755)
+    parent.chmod(0o755)
+    target = parent / "agent_keys.db"
+    catalog = StoreCatalog(expected_root=parent, silence_allowlist={})
+
+    with pytest.raises(PermissionError, match="0700"):
+        module.AgentSigningKeyStore.provision_single_agent(
+            os.fspath(target),
+            "tenant",
+            "tenant-secret",
+            catalog=catalog,
+        )
+
+    assert not target.exists()
+    assert catalog.snapshot() == []
+
+
 def test_system_provision_ops_delegates_with_a_scoped_catalog(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -430,6 +590,7 @@ def test_fleet_and_standalone_manifest_providers_are_explicit_and_non_guessing(
             path=os.fspath(keystore),
             criticality="authoritative",
             recovery="snapshot",
+            journal_mode="delete",
         )
     }
     with pytest.raises(ValueError, match="manifest kind"):
@@ -617,6 +778,7 @@ def test_all_externally_read_signing_databases_are_rollback_journal(
 
     tenant_path = tmp_path / "tenant" / "agent_keys.db"
     tenant_path.parent.mkdir()
+    tenant_path.parent.chmod(0o700)
     catalog = StoreCatalog(expected_root=tenant_path.parent, silence_allowlist={})
     module.AgentSigningKeyStore.provision_single_agent(
         os.fspath(tenant_path),
@@ -632,3 +794,37 @@ def test_all_externally_read_signing_databases_are_rollback_journal(
     )
     assert not Path(os.fspath(tenant_path) + "-wal").exists()
     assert not Path(os.fspath(tenant_path) + "-shm").exists()
+
+
+def test_persistent_wal_keystore_preflight_fails_before_sidecar_recreation(
+    tmp_path: Path,
+) -> None:
+    tenant_path = tmp_path / "tenant" / "agent_keys.db"
+    _seed_persistent_wal_signing_key_db(tenant_path)
+    catalog = StoreCatalog(expected_root=tenant_path.parent, silence_allowlist={})
+    target = StoreIntegrityTarget(
+        logical_name="agent_signing_keys",
+        path=os.fspath(tenant_path),
+        journal_mode="delete",
+    )
+
+    with pytest.raises(StoreCatalogError, match="WAL|rollback"):
+        catalog.preflight_integrity([target])
+
+    assert catalog.observed_journal_mode(tenant_path) == "wal"
+    assert catalog.snapshot() == [], "preflight must not falsely register DELETE"
+    assert not Path(os.fspath(tenant_path) + "-wal").exists()
+    assert not Path(os.fspath(tenant_path) + "-shm").exists()
+
+
+def test_persistent_wal_keystore_reader_fails_soft_without_creating_sidecars(
+    tmp_path: Path,
+) -> None:
+    module = _signing_store_module()
+    tenant_path = tmp_path / "tenant" / "agent_keys.db"
+    _seed_persistent_wal_signing_key_db(tenant_path)
+
+    result = module.AgentSigningKeyStore.read_only(os.fspath(tenant_path)).get_signing_key("tenant")
+    assert not Path(os.fspath(tenant_path) + "-wal").exists()
+    assert not Path(os.fspath(tenant_path) + "-shm").exists()
+    assert result is None

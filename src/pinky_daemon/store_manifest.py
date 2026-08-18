@@ -14,12 +14,18 @@ StoreManifest = dict[str, StoreIntegrityTarget]
 StoreManifestProvider = Callable[[str | os.PathLike[str]], StoreManifest]
 
 
-def _authoritative(logical_name: str, path: str) -> StoreIntegrityTarget:
+def _authoritative(
+    logical_name: str,
+    path: str,
+    *,
+    journal_mode: str | None = None,
+) -> StoreIntegrityTarget:
     return StoreIntegrityTarget(
         logical_name=logical_name,
         path=path,
         criticality="authoritative",
         recovery="snapshot",
+        journal_mode=journal_mode,
     )
 
 
@@ -35,8 +41,12 @@ def derive_fleet_store_manifest(
         "session_events": _authoritative("session_events", base.replace(".db", "_sessions.db")),
         "conversations": _authoritative("conversations", base),
         "analytics": _authoritative("analytics", base.replace(".db", "_analytics.db")),
-        "agents": _authoritative("agents", agents_path),
-        "agent_signing_keys": _authoritative("agent_signing_keys", agents_path),
+        "agents": _authoritative("agents", agents_path, journal_mode="truncate"),
+        "agent_signing_keys": _authoritative(
+            "agent_signing_keys",
+            agents_path,
+            journal_mode="truncate",
+        ),
         "audit": _authoritative("audit", base.replace(".db", "_audit.db")),
         "agent_comms": _authoritative("agent_comms", base.replace(".db", "_agent_comms.db")),
         "activity": _authoritative("activity", base.replace(".db", "_activity.db")),
@@ -71,7 +81,11 @@ def derive_standalone_tenant_store_manifest(
     """Return the explicit one-store manifest for a tenant-owned keystore."""
     path = os.path.realpath(os.fspath(db_path))
     return {
-        "agent_signing_keys": _authoritative("agent_signing_keys", path),
+        "agent_signing_keys": _authoritative(
+            "agent_signing_keys",
+            path,
+            journal_mode="delete",
+        ),
     }
 
 

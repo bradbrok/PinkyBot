@@ -30,6 +30,38 @@ DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST: dict[str, str] = {
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _IGNORED_DIRECTORY_KINDS = frozenset({"snapshot", "snapshots", "temp", "temporary", "tmp"})
+_SQLITE_HEADER_PREFIX = b"SQLite format 3\x00"
+_SQLITE_HEADER_JOURNAL_BYTES = slice(18, 20)
+
+
+def sqlite_header_journal_mode(path: str | os.PathLike[str]) -> str | None:
+    """Inspect persistent WAL/rollback state without asking SQLite to open.
+
+    SQLite stores the database read/write format at header offsets 18 and 19.
+    Reading those bytes through a no-follow file descriptor cannot create
+    journal sidecars, unlike opening a persistent-WAL database with mode=ro.
+    """
+    flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0)
+    descriptor = os.open(os.fspath(path), flags)
+    try:
+        descriptor_stat = os.fstat(descriptor)
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            raise OSError("SQLite path is not a regular file")
+        if hasattr(os, "pread"):
+            header = os.pread(descriptor, 20, 0)
+        else:  # pragma: no cover - Python 3.11 Unix hosts expose pread
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            header = os.read(descriptor, 20)
+    finally:
+        os.close(descriptor)
+    if len(header) < 20 or not header.startswith(_SQLITE_HEADER_PREFIX):
+        return None
+    journal_bytes = header[_SQLITE_HEADER_JOURNAL_BYTES]
+    if b"\x02" in journal_bytes:
+        return "wal"
+    if journal_bytes == b"\x01\x01":
+        return "rollback"
+    return None
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +85,7 @@ class StoreIntegrityTarget:
     path: str
     criticality: str = "authoritative"
     recovery: str = "snapshot"
+    journal_mode: str | None = None
 
 
 class StoreCatalogError(RuntimeError):
@@ -118,12 +151,22 @@ class StoreCatalog:
         )
         self._silence_allowlist = dict(configured_allowlist)
         self._entries: list[_CatalogEntry] = []
+        self._observed_journal_modes: dict[str, str] = {}
         self._lock = threading.RLock()
 
     @property
     def expected_root(self) -> str:
         """Return the canonical filesystem root this catalog governs."""
         return self._expected_root
+
+    def observed_journal_mode(
+        self,
+        path: str | os.PathLike[str],
+    ) -> str | None:
+        """Return the mode observed during the latest integrity preflight."""
+        resolved_path = os.path.realpath(os.fspath(path))
+        with self._lock:
+            return self._observed_journal_modes.get(resolved_path)
 
     def register(
         self,
@@ -335,6 +378,8 @@ class StoreCatalog:
             targets_by_path.setdefault(resolved_path, []).append(target)
 
         for resolved_path, matching_targets in targets_by_path.items():
+            with self._lock:
+                self._observed_journal_modes.pop(resolved_path, None)
             try:
                 os.stat(resolved_path)
             except OSError as exc:
@@ -355,11 +400,39 @@ class StoreCatalog:
                 self._raise_integrity_error(matching_targets, resolved_path, exc)
 
             try:
+                header_journal_mode = sqlite_header_journal_mode(resolved_path)
+                if header_journal_mode is not None:
+                    with self._lock:
+                        self._observed_journal_modes[resolved_path] = header_journal_mode
+                rollback_required = any(
+                    target.journal_mode is not None and target.journal_mode.lower() != "wal"
+                    for target in matching_targets
+                )
+                if header_journal_mode == "wal" and rollback_required:
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "failed-corrupt",
+                        outcomes,
+                        on_outcome,
+                    )
+                    self._raise_integrity_error(
+                        matching_targets,
+                        resolved_path,
+                        "persistent WAL journal conflicts with the required rollback-journal "
+                        "policy; refused before a mode=ro open could create WAL/SHM sidecars",
+                    )
                 connection = sqlite3.connect(
                     Path(resolved_path).as_uri() + "?mode=ro",
                     uri=True,
                 )
                 try:
+                    if any(target.journal_mode is not None for target in matching_targets):
+                        journal_row = connection.execute("PRAGMA journal_mode").fetchone()
+                        if journal_row and journal_row[0]:
+                            with self._lock:
+                                self._observed_journal_modes[resolved_path] = str(
+                                    journal_row[0]
+                                ).lower()
                     rows = connection.execute("PRAGMA quick_check").fetchall()
                 finally:
                     connection.close()

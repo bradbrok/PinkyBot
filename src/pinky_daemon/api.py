@@ -1831,10 +1831,17 @@ def create_api(
             )
             tenant_catalog.preflight_integrity(tenant_manifest.values())
             for target in tenant_manifest.values():
+                observed_journal_mode = tenant_catalog.observed_journal_mode(
+                    target.path
+                )
                 tenant_catalog.register(
                     target.logical_name,
                     target.path,
-                    journal_mode="delete",
+                    journal_mode=(
+                        observed_journal_mode
+                        or target.journal_mode
+                        or "delete"
+                    ),
                     owner="AgentSigningKeyStore",
                     criticality=target.criticality,
                 )
