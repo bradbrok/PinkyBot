@@ -77,6 +77,12 @@ class _PathIdentity:
     mode: int
 
 
+@dataclass(frozen=True, slots=True)
+class _SelectedStore:
+    target: Path
+    logical_names: tuple[str, ...]
+
+
 def restore_store(
     *,
     db_path: str | os.PathLike[str],
@@ -140,7 +146,8 @@ def _restore_under_authority(
     logical_name: str,
     snapshot_path: str | os.PathLike[str],
 ) -> StoreRestoreResult:
-    target = _select_target(db_path, logical_name)
+    selected = _select_target(db_path, logical_name)
+    target = selected.target
     target_paths = _target_and_sidecars(target)
     target_identities = _capture_identities(target_paths)
 
@@ -150,13 +157,7 @@ def _restore_under_authority(
         (identity.dev, identity.ino) for identity in target_identities.values()
     }:
         raise StoreRestoreSelectionError("snapshot aliases the selected target")
-    _verify_static_store(snapshot, logical_name)
-
-    try:
-        assert_no_open_store_descriptors(target_paths)
-    except StoreAuthorityError as exc:
-        raise StoreRestoreSafetyError("store descriptor safety proof failed") from exc
-    _assert_unchanged(target, target_identities)
+    _verify_static_store(snapshot, selected.logical_names)
 
     descriptor, temp_name = tempfile.mkstemp(
         dir=target.parent,
@@ -171,10 +172,14 @@ def _restore_under_authority(
         _fsync_file(temp_path)
         if _identity(snapshot) != snapshot_identity:
             raise StoreRestoreSafetyError("snapshot identity changed during restore")
-        _verify_static_store(temp_path, logical_name)
-        _assert_unchanged(target, target_identities)
+        _verify_static_store(temp_path, selected.logical_names)
 
         corrupt_path = _next_corrupt_path(target)
+        try:
+            assert_no_open_store_descriptors(target_paths)
+        except StoreAuthorityError as exc:
+            raise StoreRestoreSafetyError("store descriptor safety proof failed") from exc
+        _assert_unchanged(target, target_identities)
         os.replace(target, corrupt_path)
         for suffix in _SQLITE_SIDECAR_SUFFIXES:
             sidecar = Path(os.fspath(target) + suffix)
@@ -182,9 +187,9 @@ def _restore_under_authority(
                 os.replace(sidecar, Path(os.fspath(corrupt_path) + suffix))
         os.replace(temp_path, target)
         _fsync_directory(target.parent)
-        _verify_static_store(target, logical_name)
+        _verify_static_store(target, selected.logical_names)
         return StoreRestoreResult(
-            logical_names=(logical_name,),
+            logical_names=selected.logical_names,
             corrupt_path=os.fspath(corrupt_path),
             verification="ok",
         )
@@ -198,13 +203,21 @@ def _restore_under_authority(
 def _select_target(
     db_path: str | os.PathLike[str],
     logical_name: str,
-) -> Path:
+) -> _SelectedStore:
     from pinky_daemon.api import _derive_api_store_manifest
 
     manifest = _derive_api_store_manifest(db_path)
     if logical_name not in manifest or logical_name not in STORE_SCHEMA_SENTINELS:
         raise StoreRestoreSelectionError("logical store is not registered")
     target = Path(manifest[logical_name].path)
+    canonical_target = os.path.realpath(target)
+    logical_names = tuple(
+        candidate_name
+        for candidate_name, candidate in manifest.items()
+        if os.path.realpath(candidate.path) == canonical_target
+    )
+    if not logical_names or any(name not in STORE_SCHEMA_SENTINELS for name in logical_names):
+        raise StoreRestoreSelectionError("manifest store cohort has no schema sentinel")
     root = Path(os.path.realpath(os.fspath(db_path))).parent
     if not _is_under_root(root, target):
         raise StoreRestoreSelectionError("manifest target is outside the daemon store root")
@@ -216,7 +229,7 @@ def _select_target(
         raise StoreRestoreSelectionError("manifest target is not a regular file")
     if os.path.realpath(target) != os.fspath(target):
         raise StoreRestoreSelectionError("manifest target does not retain its canonical identity")
-    return target
+    return _SelectedStore(target=target, logical_names=logical_names)
 
 
 def _select_snapshot(snapshot: Path) -> Path:
@@ -262,7 +275,7 @@ def _identity(path: Path) -> _PathIdentity:
     return _PathIdentity(path_stat.st_dev, path_stat.st_ino, path_stat.st_mode)
 
 
-def _verify_static_store(path: Path, logical_name: str) -> None:
+def _verify_static_store(path: Path, logical_names: tuple[str, ...]) -> None:
     uri = path.resolve().as_uri() + "?mode=ro&immutable=1"
     try:
         connection = sqlite3.connect(uri, uri=True)
@@ -280,7 +293,9 @@ def _verify_static_store(path: Path, logical_name: str) -> None:
             connection.close()
     except (sqlite3.Error, OSError) as exc:
         raise StoreRestoreVerificationError("snapshot SQLite verification failed") from exc
-    required = set(STORE_SCHEMA_SENTINELS[logical_name])
+    required = {
+        table for logical_name in logical_names for table in STORE_SCHEMA_SENTINELS[logical_name]
+    }
     if not required <= available:
         raise StoreRestoreVerificationError("snapshot does not match the selected store schema")
 

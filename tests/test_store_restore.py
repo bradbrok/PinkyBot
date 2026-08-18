@@ -21,6 +21,7 @@ from pinky_daemon import api as api_module
 from pinky_daemon import store_snapshot
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.conversation_store import ConversationStore
+from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.store_catalog import StoreCatalog
 from pinky_daemon.task_store import TaskStore
 
@@ -329,6 +330,78 @@ def test_restore_refuses_foreign_descriptor_on_target_or_sidecar_inode(
     assert _corrupt_artifacts(base) == []
 
 
+@pytest.mark.parametrize("held_suffix", ["", "-wal"], ids=["main", "wal-sidecar"])
+def test_restore_boundary_scan_refuses_descriptor_opened_after_candidate_verification(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    held_suffix: str,
+) -> None:
+    authority = _authority_module()
+    restore = _restore_module()
+    safety_error = getattr(restore, "StoreRestoreSafetyError", None)
+    assert safety_error is not None
+    base = tmp_path / "data" / "conversations.db"
+    snapshot_path = _snapshot_conversations(base)
+    corrupt_bytes = _write_corrupt_target(base)
+    before_identity = (base.stat().st_dev, base.stat().st_ino)
+    held_path = Path(os.fspath(base) + held_suffix)
+    held_bytes = corrupt_bytes
+    if held_suffix:
+        held_bytes = b"late legacy wal holder"
+        held_path.write_bytes(held_bytes)
+
+    resolver = getattr(authority, "_resolve_lsof_binary", None)
+    assert resolver is not None
+    monkeypatch.setattr(authority, "_resolve_lsof_binary", lambda: "/fake/lsof")
+    holder: Any | None = None
+    descriptor_scans = 0
+
+    def dynamic_lsof(*_args: Any, **_kwargs: Any) -> SimpleNamespace:
+        nonlocal descriptor_scans
+        descriptor_scans += 1
+        if holder is None:
+            stdout = "p999999\nf7\nD0x7fffffff\ni9223372036854775806\n"
+        else:
+            held_stat = held_path.stat()
+            stdout = (
+                f"p{os.getpid()}\n"
+                f"f{holder.fileno()}\n"
+                f"D0x{held_stat.st_dev:x}\n"
+                f"i{held_stat.st_ino}\n"
+            )
+        return SimpleNamespace(stdout=stdout, stderr="", returncode=0)
+
+    monkeypatch.setattr(authority.subprocess, "run", dynamic_lsof)
+    real_verify = restore._verify_static_store
+    verification_count = 0
+
+    def verify_then_open(
+        path: Path,
+        logical_names: tuple[str, ...],
+    ) -> None:
+        nonlocal holder, verification_count
+        real_verify(path, logical_names)
+        verification_count += 1
+        if verification_count == 2:
+            holder = held_path.open("rb")
+
+    monkeypatch.setattr(restore, "_verify_static_store", verify_then_open)
+    try:
+        with pytest.raises(safety_error):
+            _restore(base, "conversations", snapshot_path)
+    finally:
+        if holder is not None:
+            holder.close()
+
+    assert verification_count == 2
+    assert descriptor_scans == 1
+    assert base.read_bytes() == corrupt_bytes
+    assert (base.stat().st_dev, base.stat().st_ino) == before_identity
+    if held_suffix:
+        assert held_path.read_bytes() == held_bytes
+    assert _corrupt_artifacts(base) == []
+
+
 @pytest.mark.parametrize("race", ["target-identity", "sidecar-set"])
 def test_restore_refuses_identity_or_sidecar_change_after_descriptor_scan(
     monkeypatch: pytest.MonkeyPatch,
@@ -475,6 +548,48 @@ def test_restore_rejects_quick_check_ok_snapshot_of_wrong_store_schema(
 
     assert base.read_bytes() == corrupt_bytes
     assert _corrupt_artifacts(base) == []
+
+
+def test_restore_shared_physical_cohort_requires_union_schema_and_reports_all_names(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    restore = _restore_module()
+    verification_error = getattr(restore, "StoreRestoreVerificationError", None)
+    assert verification_error is not None
+    base = tmp_path / "target" / "conversations.db"
+    target = Path(api_module._derive_api_store_manifest(base)["sessions"].path)
+    target.parent.mkdir(parents=True)
+    target_store = SessionStore(db_path=os.fspath(target))
+    target_events = SessionEventStore(db_path=os.fspath(target))
+    target_store.close()
+    target_events.close()
+    corrupt_bytes = _write_corrupt_target(target)
+    before_identity = (target.stat().st_dev, target.stat().st_ino)
+
+    incomplete_snapshot = tmp_path / "snapshot-only-sessions.db"
+    incomplete_store = SessionStore(db_path=os.fspath(incomplete_snapshot))
+    incomplete_store.close()
+    assert _quick_check(incomplete_snapshot) == [("ok",)]
+    _configure_lsof(monkeypatch)
+
+    with pytest.raises(verification_error, match="store|schema|table"):
+        _restore(base, "sessions", incomplete_snapshot)
+
+    assert target.read_bytes() == corrupt_bytes
+    assert (target.stat().st_dev, target.stat().st_ino) == before_identity
+    assert _corrupt_artifacts(target) == []
+
+    complete_snapshot = tmp_path / "snapshot-session-cohort.db"
+    complete_store = SessionStore(db_path=os.fspath(complete_snapshot))
+    complete_events = SessionEventStore(db_path=os.fspath(complete_snapshot))
+    complete_store.close()
+    complete_events.close()
+
+    result = _restore(base, "sessions", complete_snapshot)
+
+    assert result.logical_names == ("sessions", "session_events")
+    assert _quick_check(target) == [("ok",)]
 
 
 def test_schema_sentinel_inventory_is_complete_for_every_manifest_logical_store(
