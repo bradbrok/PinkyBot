@@ -114,6 +114,16 @@ DIRECT_OPEN_ALLOWLIST = {
             "Creates per-agent signing-key DBs during provisioning; P1 routes behind the seam."
         ),
     ),
+    DirectOpenIdentity(
+        "src/pinky_daemon/store_snapshot.py",
+        "StoreSnapshotService._backup_and_verify",
+    ): AllowlistEntry(
+        expected_count=2,
+        reason=(
+            "Daemon-internal storage authority opens one catalog-selected source and one "
+            "fresh destination for SQLite Online Backup API snapshots (#1112)."
+        ),
+    ),
 }
 
 

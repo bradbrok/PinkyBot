@@ -78,6 +78,11 @@ class StoreCatalog:
         self._entries: list[_CatalogEntry] = []
         self._lock = threading.RLock()
 
+    @property
+    def expected_root(self) -> str:
+        """Return the canonical filesystem root this catalog governs."""
+        return self._expected_root
+
     def register(
         self,
         logical_name: str,

@@ -161,6 +161,101 @@ def test_snapshot_directory_stays_clean_under_catalog_reconciliation(tmp_path: P
     assert catalog.reconcile_filesystem() == []
 
 
+def test_explicit_selection_returns_all_logical_names_for_shared_physical_store(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot_module()
+    source = tmp_path / "shared.db"
+    connection, mode = _create_store(source)
+    connection.close()
+    catalog = _catalog_for(
+        tmp_path,
+        source,
+        logical_name="sessions",
+        journal_mode=mode,
+    )
+    catalog.register(
+        "session_events",
+        source,
+        journal_mode=mode,
+        owner="test-owner",
+    )
+
+    [result] = snapshot.StoreSnapshotService(catalog).create_snapshots("sessions")
+
+    assert result.logical_names == ("sessions", "session_events")
+
+
+def test_path_retargeted_after_selection_is_rejected_before_sqlite_open(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot_module()
+    root = tmp_path / "data"
+    source = root / "primary.db"
+    source_connection, mode = _create_store(source)
+    source_connection.close()
+    outside = tmp_path / "outside.db"
+    outside_connection, _outside_mode = _create_store(outside)
+    outside_connection.close()
+    catalog = _catalog_for(root, source, journal_mode=mode)
+
+    class RetargetingSnapshotService(snapshot.StoreSnapshotService):
+        def _backup_and_verify(self, source_path: str, destination_path: Path, *args) -> None:
+            Path(source_path).unlink()
+            Path(source_path).symlink_to(outside)
+            return super()._backup_and_verify(source_path, destination_path, *args)
+
+    service = RetargetingSnapshotService(catalog)
+
+    with pytest.raises(snapshot.StoreSnapshotSelectionError, match="identity"):
+        service.create_snapshots("primary")
+
+
+def test_source_and_destination_connections_close_when_verification_fails(
+    tmp_path: Path,
+) -> None:
+    snapshot = _snapshot_module()
+    source_path = tmp_path / "source.db"
+    source_path.touch()
+    source_stat = source_path.stat()
+    identity = (source_stat.st_dev, source_stat.st_ino)
+
+    class SourceConnection:
+        closed = False
+
+        def backup(self, _destination, **_kwargs) -> None:
+            return None
+
+        def close(self) -> None:
+            self.closed = True
+
+    class DestinationConnection:
+        closed = False
+
+        def execute(self, statement: str):
+            assert statement == "PRAGMA quick_check"
+            return self
+
+        def fetchall(self) -> list[tuple[str]]:
+            return [("corrupt",)]
+
+        def close(self) -> None:
+            self.closed = True
+
+    source = SourceConnection()
+    destination = DestinationConnection()
+    service = snapshot.StoreSnapshotService(StoreCatalog(expected_root=tmp_path))
+
+    with (
+        patch.object(snapshot.sqlite3, "connect", side_effect=[source, destination]),
+        pytest.raises(snapshot.StoreSnapshotVerificationError, match="quick_check"),
+    ):
+        service._backup_and_verify(source_path.as_posix(), tmp_path / "copy.tmp", identity)
+
+    assert source.closed is True
+    assert destination.closed is True
+
+
 def test_snapshot_is_consistent_when_source_commit_lands_mid_backup(tmp_path: Path) -> None:
     snapshot = _snapshot_module()
     source = tmp_path / "busy.db"

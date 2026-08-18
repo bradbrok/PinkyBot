@@ -23,6 +23,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import urllib.parse
 import urllib.request
@@ -114,6 +115,7 @@ from pinky_daemon.api_models import (
     SetMainAgentRequest,
     SetModelRequest,
     SpawnSessionRequest,
+    StoreSnapshotRequest,
     TmuxPaneKeysRequest,
     TransportStopFailureRequest,
     TransportToolResultRequest,
@@ -194,6 +196,11 @@ from pinky_daemon.shared_mcp import (
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.store_catalog import StoreCatalog, StoreCatalogError
+from pinky_daemon.store_snapshot import (
+    StoreSnapshotError,
+    StoreSnapshotSelectionError,
+    StoreSnapshotService,
+)
 from pinky_daemon.streaming_session import _1M_MODELS, is_1m_model
 from pinky_daemon.task_store import TaskStore
 
@@ -1696,12 +1703,14 @@ def create_api(
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
     store_catalog = StoreCatalog(expected_root=_data_dir)
+    store_snapshot_service = StoreSnapshotService(store_catalog)
 
     app = FastAPI(
         title="Pinky",
         description="Stateful Claude Code session API",
         version="0.1.0",
     )
+    app.state.store_snapshot_service = store_snapshot_service
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
 
     @app.exception_handler(RequestValidationError)
@@ -1778,6 +1787,7 @@ def create_api(
     audit = AuditStore(
         db_path=db_path.replace(".db", "_audit.db"), catalog=store_catalog
     )
+    app.state.audit = audit
     hooks = HookManager(audit_store=audit)
 
     # In-memory live status for agents (updated by POST /agents/{name}/status).
@@ -4614,6 +4624,7 @@ def create_api(
         "/skills",
         "/outreach",
         "/system",
+        "/internal",
         "/settings",
         "/scheduler",
         "/activity",
@@ -5116,6 +5127,114 @@ def create_api(
         if _auth_deny_mode == "shadow":
             _log(f"auth: would-deny (shadow) {request.method} {path}")
         return await call_next(request)
+
+    # Store snapshots expose authoritative data, so this surface is both
+    # signature-only and intentionally low-rate. The middleware authenticates
+    # HMAC requests, while the handler repeats that exact check to exclude a UI
+    # session cookie and explicitly excludes isolated tenants from fleet-wide
+    # storage access.
+    _STORE_SNAPSHOT_RATE_LIMIT = 2  # noqa: N806 - create_api-local policy constant
+    _STORE_SNAPSHOT_RATE_WINDOW = 60.0  # noqa: N806
+    _store_snapshot_attempts: dict[str, list[float]] = {}
+    _store_snapshot_rate_lock = threading.Lock()
+
+    def _check_store_snapshot_rate_limit(caller: str) -> None:
+        now = time.monotonic()
+        with _store_snapshot_rate_lock:
+            active = [
+                attempt
+                for attempt in _store_snapshot_attempts.get(caller, [])
+                if now - attempt < _STORE_SNAPSHOT_RATE_WINDOW
+            ]
+            if len(active) >= _STORE_SNAPSHOT_RATE_LIMIT:
+                retry_after = max(
+                    1,
+                    int(_STORE_SNAPSHOT_RATE_WINDOW - (now - active[0])) + 1,
+                )
+                _store_snapshot_attempts[caller] = active
+                raise HTTPException(
+                    status_code=429,
+                    detail="store snapshot rate limit exceeded",
+                    headers={"Retry-After": str(retry_after)},
+                )
+            active.append(now)
+            _store_snapshot_attempts[caller] = active
+
+    def _audit_store_snapshot(
+        caller: str,
+        logical_name: str | None,
+        results,
+    ) -> None:
+        requested_names = [logical_name] if logical_name is not None else ["*authoritative*"]
+        if not results:
+            audit.log(
+                "store_snapshot",
+                agent_name=caller,
+                tool_name="store_snapshot",
+                tool_input_summary=json.dumps(
+                    {
+                        "logical_name": logical_name,
+                        "requested_logical_names": requested_names,
+                        "result_logical_names": [],
+                        "snapshot_paths": [],
+                        "verification": "no_matching_authoritative_stores",
+                    },
+                    separators=(",", ":"),
+                ),
+            )
+            return
+        for result in results:
+            paths = [result.snapshot_path] if result.snapshot_path is not None else []
+            audit.log(
+                "store_snapshot",
+                agent_name=caller,
+                tool_name="store_snapshot",
+                tool_input_summary=json.dumps(
+                    {
+                        "logical_name": logical_name,
+                        "requested_logical_names": requested_names,
+                        "result_logical_names": list(result.logical_names),
+                        "snapshot_paths": paths,
+                        "verification": result.verification,
+                        "error": result.error,
+                    },
+                    separators=(",", ":"),
+                ),
+                success=result.error is None,
+            )
+
+    @app.post("/internal/stores/snapshot")
+    async def create_store_snapshot(req: StoreSnapshotRequest, request: Request):
+        if not _has_valid_internal_auth(request):
+            raise HTTPException(403, "valid signed internal HMAC required")
+        caller = request.headers.get(INTERNAL_AGENT_HEADER, "").strip()
+        try:
+            caller_record = agents.get(caller)
+        except Exception as exc:
+            _log(
+                f"store-snapshot: caller lookup failed for {caller!r}: "
+                f"{type(exc).__name__} — denying"
+            )
+            caller_record = None
+        if caller_record is None:
+            raise HTTPException(403, "registered operator agent required")
+        if getattr(caller_record, "isolated", False):
+            raise HTTPException(403, "isolated agents may not snapshot daemon stores")
+
+        _check_store_snapshot_rate_limit(caller)
+        try:
+            results = await asyncio.to_thread(
+                store_snapshot_service.create_snapshots,
+                req.logical_name,
+            )
+        except StoreSnapshotSelectionError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        except StoreSnapshotError as exc:
+            _log(f"store-snapshot: failed for caller={caller!r}: {type(exc).__name__}")
+            raise HTTPException(500, "store snapshot failed") from exc
+
+        _audit_store_snapshot(caller, req.logical_name, results)
+        return {"snapshots": [result.to_dict() for result in results]}
 
     # ── Request Timing Middleware ──────────────────────────────
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.
