@@ -12,6 +12,7 @@ import uuid
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
+from typing import Callable, Literal
 
 from pinky_daemon.store_catalog import StoreCatalog, StoreRecord
 
@@ -40,15 +41,29 @@ class SnapshotResult:
     logical_names: tuple[str, ...]
     snapshot_path: str | None
     verification: str
-    error: str | None = None
+    error: StoreSnapshotError | None = None
+
+    @property
+    def logical_name(self) -> str:
+        return self.logical_names[0]
+
+    @property
+    def status(self) -> Literal["published", "failed"]:
+        if self.snapshot_path is not None and self.error is None:
+            return "published"
+        return "failed"
 
     def to_dict(self) -> dict[str, object]:
-        return {
+        payload: dict[str, object] = {
+            "logical_name": self.logical_name,
             "logical_names": list(self.logical_names),
-            "snapshot_path": self.snapshot_path,
-            "verification": self.verification,
-            "error": self.error,
+            "status": self.status,
         }
+        if self.status == "published":
+            payload["path"] = self.snapshot_path
+        else:
+            payload["error"] = str(self.error or "snapshot failed")
+        return payload
 
 
 @dataclass(frozen=True, slots=True)
@@ -74,7 +89,12 @@ class StoreSnapshotService:
     def __init__(self, catalog: StoreCatalog) -> None:
         self._catalog = catalog
 
-    def create_snapshots(self, logical_name: str | None = None) -> list[SnapshotResult]:
+    def create_snapshots(
+        self,
+        logical_name: str | None = None,
+        *,
+        on_outcome: Callable[[SnapshotResult], None] | None = None,
+    ) -> list[SnapshotResult]:
         """Snapshot one named store or every authoritative filesystem store.
 
         The global lock serializes backup work across all service instances. A
@@ -84,7 +104,61 @@ class StoreSnapshotService:
         """
         with _SNAPSHOT_LOCK:
             selected = self._select(logical_name)
-            return [self._snapshot_selected(store) for store in selected]
+            results = []
+            for store in selected:
+                result = self._snapshot_outcome(store)
+                if on_outcome is not None:
+                    self._report_outcome(result, on_outcome)
+                results.append(result)
+            return results
+
+    def _snapshot_outcome(self, store: _SelectedStore) -> SnapshotResult:
+        try:
+            return self._snapshot_selected(store)
+        except Exception as exc:
+            error = self._as_snapshot_error(store, exc)
+            return SnapshotResult(
+                logical_names=store.logical_names,
+                snapshot_path=None,
+                verification="failed",
+                error=error,
+            )
+
+    @staticmethod
+    def _as_snapshot_error(
+        store: _SelectedStore,
+        exc: Exception,
+    ) -> StoreSnapshotError:
+        if isinstance(exc, StoreSnapshotError):
+            return exc
+        error = StoreSnapshotError(
+            f"{type(exc).__name__} while snapshotting {store.logical_names[0]!r}: {exc}"
+        )
+        error.__cause__ = exc
+        return error
+
+    @staticmethod
+    def _report_outcome(
+        result: SnapshotResult,
+        on_outcome: Callable[[SnapshotResult], None],
+    ) -> None:
+        try:
+            on_outcome(result)
+        except Exception as exc:
+            # A published path is not allowed to outlive a failed audit write.
+            # This cleanup is only for audit infrastructure failure; a sibling
+            # store's corruption never removes an already-audited good copy.
+            if result.status == "published" and result.snapshot_path is not None:
+                try:
+                    Path(result.snapshot_path).unlink()
+                except OSError as cleanup_exc:
+                    raise StoreSnapshotError(
+                        "snapshot audit failed and the unaudited artifact "
+                        f"could not be removed: {result.snapshot_path!r}"
+                    ) from cleanup_exc
+            raise StoreSnapshotError(
+                f"snapshot outcome audit failed for {result.logical_name!r}"
+            ) from exc
 
     def _select(self, logical_name: str | None) -> list[_SelectedStore]:
         records = self._catalog.snapshot()
@@ -164,7 +238,7 @@ class StoreSnapshotService:
                 logical_names=store.logical_names,
                 snapshot_path=None,
                 verification="skipped",
-                error="source_missing",
+                error=StoreSnapshotError("source_missing"),
             )
         if not stat.S_ISREG(source_stat.st_mode):
             raise StoreSnapshotSelectionError(
@@ -198,7 +272,7 @@ class StoreSnapshotService:
                         logical_names=store.logical_names,
                         snapshot_path=None,
                         verification="skipped",
-                        error="source_missing",
+                        error=StoreSnapshotError("source_missing"),
                     )
                 raise
             temp_stat = temp_path.stat()

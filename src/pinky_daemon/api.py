@@ -197,6 +197,7 @@ from pinky_daemon.skill_loader import discover_all_skills, register_discovered_s
 from pinky_daemon.skill_store import SkillStore
 from pinky_daemon.store_catalog import StoreCatalog, StoreCatalogError
 from pinky_daemon.store_snapshot import (
+    SnapshotResult,
     StoreSnapshotError,
     StoreSnapshotSelectionError,
     StoreSnapshotService,
@@ -5163,45 +5164,50 @@ def create_api(
     def _audit_store_snapshot(
         caller: str,
         logical_name: str | None,
-        results,
+        result: SnapshotResult | None,
     ) -> None:
         requested_names = [logical_name] if logical_name is not None else ["*authoritative*"]
-        if not results:
+        if result is None:
             audit.log(
                 "store_snapshot",
                 agent_name=caller,
                 tool_name="store_snapshot",
                 tool_input_summary=json.dumps(
                     {
-                        "logical_name": logical_name,
-                        "requested_logical_names": requested_names,
-                        "result_logical_names": [],
-                        "snapshot_paths": [],
-                        "verification": "no_matching_authoritative_stores",
+                        "requested": requested_names,
+                        "logical_names": [],
+                        "status": "success",
+                        "path": None,
+                        "error": None,
                     },
                     separators=(",", ":"),
                 ),
             )
             return
-        for result in results:
-            paths = [result.snapshot_path] if result.snapshot_path is not None else []
-            audit.log(
-                "store_snapshot",
-                agent_name=caller,
-                tool_name="store_snapshot",
-                tool_input_summary=json.dumps(
-                    {
-                        "logical_name": logical_name,
-                        "requested_logical_names": requested_names,
-                        "result_logical_names": list(result.logical_names),
-                        "snapshot_paths": paths,
-                        "verification": result.verification,
-                        "error": result.error,
-                    },
-                    separators=(",", ":"),
-                ),
-                success=result.error is None,
-            )
+        audit.log(
+            "store_snapshot",
+            agent_name=caller,
+            tool_name="store_snapshot",
+            tool_input_summary=json.dumps(
+                {
+                    "requested": requested_names,
+                    "logical_names": list(result.logical_names),
+                    "status": result.status,
+                    "path": result.snapshot_path,
+                    "error": str(result.error) if result.error is not None else None,
+                },
+                separators=(",", ":"),
+            ),
+            success=result.status == "published",
+        )
+
+    def _store_snapshot_batch_status(results: list[SnapshotResult]) -> str:
+        published = sum(result.status == "published" for result in results)
+        if published == len(results):
+            return "success"
+        if published == 0:
+            return "failed"
+        return "partial_success"
 
     @app.post("/internal/stores/snapshot")
     async def create_store_snapshot(req: StoreSnapshotRequest, request: Request):
@@ -5226,15 +5232,30 @@ def create_api(
             results = await asyncio.to_thread(
                 store_snapshot_service.create_snapshots,
                 req.logical_name,
+                on_outcome=lambda result: _audit_store_snapshot(
+                    caller,
+                    req.logical_name,
+                    result,
+                ),
             )
         except StoreSnapshotSelectionError as exc:
             raise HTTPException(400, str(exc)) from exc
         except StoreSnapshotError as exc:
             _log(f"store-snapshot: failed for caller={caller!r}: {type(exc).__name__}")
             raise HTTPException(500, "store snapshot failed") from exc
+        except Exception as exc:
+            error = StoreSnapshotError(
+                f"unexpected snapshot batch failure: {type(exc).__name__}: {exc}"
+            )
+            _log(f"store-snapshot: failed for caller={caller!r}: {type(exc).__name__}")
+            raise HTTPException(500, "store snapshot failed") from error
 
-        _audit_store_snapshot(caller, req.logical_name, results)
-        return {"snapshots": [result.to_dict() for result in results]}
+        if not results:
+            _audit_store_snapshot(caller, req.logical_name, None)
+        return {
+            "status": _store_snapshot_batch_status(results),
+            "snapshots": [result.to_dict() for result in results],
+        }
 
     # ── Request Timing Middleware ──────────────────────────────
     # Logs slow requests and adds Server-Timing header for frontend diagnostics.

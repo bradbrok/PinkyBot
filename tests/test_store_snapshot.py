@@ -271,8 +271,11 @@ def test_path_retargeted_after_selection_is_rejected_before_sqlite_open(
 
     service = RetargetingSnapshotService(catalog)
 
-    with pytest.raises(snapshot.StoreSnapshotSelectionError, match="identity"):
-        service.create_snapshots("primary")
+    [result] = service.create_snapshots("primary")
+
+    assert result.status == "failed"
+    assert isinstance(result.error, snapshot.StoreSnapshotSelectionError)
+    assert "identity" in str(result.error)
 
 
 def test_source_and_destination_connections_close_when_verification_fails(
@@ -495,15 +498,16 @@ def test_successful_snapshot_request_is_audited_with_caller_selection_and_paths(
     )
 
     assert response.status_code == 200
-    paths = [item["snapshot_path"] for item in response.json()["snapshots"]]
+    assert response.json()["status"] == "success"
+    paths = [item["path"] for item in response.json()["snapshots"]]
     entries = client.app.state.audit.get_log(event="store_snapshot", limit=5)
     assert len(entries) == 1
     entry = entries[0]
     assert entry.agent_name == "operator"
     assert entry.timestamp > 0
     summary = json.loads(entry.tool_input_summary)
-    assert summary["logical_name"] == "conversations"
-    assert summary["snapshot_paths"] == paths
+    assert summary["requested"] == ["conversations"]
+    assert summary["path"] == paths[0]
 
 
 def test_missing_registered_store_is_reported_without_sinking_batch(tmp_path: Path) -> None:
@@ -532,7 +536,8 @@ def test_missing_registered_store_is_reported_without_sinking_batch(tmp_path: Pa
     missing = by_name[("missing",)]
     assert missing.snapshot_path is None
     assert missing.verification == "skipped"
-    assert missing.error == "source_missing"
+    assert isinstance(missing.error, snapshot.StoreSnapshotError)
+    assert str(missing.error) == "source_missing"
 
 
 def test_raw_per_store_database_and_os_errors_are_wrapped_and_batch_continues(
@@ -621,6 +626,28 @@ def test_snapshot_outcome_is_reported_before_the_next_store_starts(
     assert outcomes == results
 
 
+def test_published_artifact_is_removed_if_its_outcome_audit_fails(tmp_path: Path) -> None:
+    snapshot = _snapshot_module()
+    source = tmp_path / "primary.db"
+    connection, mode = _create_store(source)
+    connection.close()
+    service = snapshot.StoreSnapshotService(_catalog_for(tmp_path, source, journal_mode=mode))
+    published_path = None
+
+    def _fail_audit(result) -> None:
+        nonlocal published_path
+        published_path = result.snapshot_path
+        assert published_path is not None
+        assert Path(published_path).is_file()
+        raise OSError("audit database unavailable")
+
+    with pytest.raises(snapshot.StoreSnapshotError, match="outcome audit failed"):
+        service.create_snapshots("primary", on_outcome=_fail_audit)
+
+    assert published_path is not None
+    assert not Path(published_path).exists()
+
+
 def test_corrupt_store_returns_audited_partial_success_after_good_publish(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -667,12 +694,8 @@ def test_corrupt_store_returns_audited_partial_success_after_good_publish(
 
     entries = client.app.state.audit.get_log(event="store_snapshot", limit=500)
     summaries = [json.loads(entry.tool_input_summary) for entry in entries]
-    published_audit = next(
-        item for item in summaries if "round2_good" in item["result_logical_names"]
-    )
-    failed_audit = next(
-        item for item in summaries if "round2_corrupt" in item["result_logical_names"]
-    )
+    published_audit = next(item for item in summaries if "round2_good" in item["logical_names"])
+    failed_audit = next(item for item in summaries if "round2_corrupt" in item["logical_names"])
     assert published_audit["status"] == "published"
     assert published_audit["path"] == published["path"]
     assert failed_audit["status"] == "failed"
@@ -748,14 +771,15 @@ def test_cli_signs_endpoint_request_and_prints_only_returned_copy_path(
         def read(self) -> bytes:
             return json.dumps(
                 {
+                    "status": "success",
                     "snapshots": [
                         {
+                            "logical_name": "conversations",
                             "logical_names": ["conversations"],
-                            "snapshot_path": "/data/snapshots/conversations-copy.db",
-                            "verification": "ok",
-                            "error": None,
+                            "status": "published",
+                            "path": "/data/snapshots/conversations-copy.db",
                         }
-                    ]
+                    ],
                 }
             ).encode()
 

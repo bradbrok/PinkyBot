@@ -89,16 +89,17 @@ def main(argv: list[str] | None = None) -> int:
         print(f"snapshot request failed: {exc}", file=sys.stderr)
         return 1
 
-    had_error = False
+    had_error = payload.get("status") in {"partial_success", "failed"}
     for result in payload.get("snapshots", []):
-        snapshot_path = result.get("snapshot_path")
-        if snapshot_path:
-            print(snapshot_path)
+        if result.get("status") == "published" and result.get("path"):
+            print(result["path"])
             continue
         had_error = True
-        names = ",".join(result.get("logical_names", [])) or "unknown"
+        names = ",".join(result.get("logical_names", []))
+        if not names:
+            names = result.get("logical_name") or "unknown"
         print(
-            f"{names}: {result.get('error') or result.get('verification') or 'snapshot failed'}",
+            f"{names}: {result.get('error') or 'snapshot failed'}",
             file=sys.stderr,
         )
     return 1 if had_error else 0
