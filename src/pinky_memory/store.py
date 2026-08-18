@@ -1401,30 +1401,42 @@ class ReflectionStore:
         query_blob = self._embedding_to_blob(embedding)
         max_distance = 1.0 - threshold  # cosine distance threshold
 
-        try:
-            # Fetch top-5 candidates — we just need the best match above threshold
-            vec_rows = self._conn.execute(
-                "SELECT rowid, distance FROM reflections_vec "
-                "WHERE embedding MATCH ? AND k = 5 ORDER BY distance",
-                (query_blob,),
-            ).fetchall()
-        except sqlite3.OperationalError as e:
-            # vec query failed — fall back to numpy near-duplicate scan. #295
-            logger.debug("vec near-dup query failed, using numpy: %s", e)
-            return self._find_near_duplicate_numpy(embedding, threshold, active_only)
+        where_sql = "rowid = ? AND active = 1" if active_only else "rowid = ?"
 
-        for rowid, distance in vec_rows:
-            if distance > max_distance:
-                break  # results are ordered by distance — no more matches
-            where_sql = "rowid = ? AND active = 1" if active_only else "rowid = ?"
-            row = self._conn.execute(
-                f"SELECT * FROM reflections WHERE {where_sql}", (rowid,)
-            ).fetchone()
-            if row is not None:
-                similarity = 1.0 - distance
-                return (similarity, self._row_to_reflection(row))
+        # The kNN window is filtered by `active` only AFTER the search, so a
+        # fixed k can be filled entirely by superseded versions of this very
+        # reflection — its nearest neighbours in absolute terms — and hide the
+        # active duplicate behind them. Widen the window until it reaches past
+        # the distance threshold (or the whole table), so every candidate that
+        # could match is examined. #486
+        k = 16
+        while True:
+            try:
+                vec_rows = self._conn.execute(
+                    "SELECT rowid, distance FROM reflections_vec "
+                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (query_blob, k),
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                # vec query failed — fall back to numpy near-duplicate scan. #295
+                logger.debug("vec near-dup query failed, using numpy: %s", e)
+                return self._find_near_duplicate_numpy(embedding, threshold, active_only)
 
-        return None
+            for rowid, distance in vec_rows:
+                if distance > max_distance:
+                    return None  # ordered by distance — nothing else can match
+                row = self._conn.execute(
+                    f"SELECT * FROM reflections WHERE {where_sql}", (rowid,)
+                ).fetchone()
+                if row is not None:
+                    similarity = 1.0 - distance
+                    return (similarity, self._row_to_reflection(row))
+
+            # Window exhausted without crossing the threshold: if it was not
+            # full, we have already seen every indexed row.
+            if len(vec_rows) < k:
+                return None
+            k *= 4
 
     def _find_near_duplicate_numpy(
         self,
