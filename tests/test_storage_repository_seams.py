@@ -8,6 +8,7 @@ import importlib.util
 import inspect
 import os
 import sqlite3
+import stat
 from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
@@ -42,7 +43,11 @@ def _manifest_module() -> Any:
     )
 
 
-def _seed_signing_key_db(path: Path) -> None:
+def _seed_signing_key_db(
+    path: Path,
+    *,
+    signing_key: str = "tenant-secret",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     try:
@@ -52,14 +57,18 @@ def _seed_signing_key_db(path: Path) -> None:
         )
         connection.execute(
             "INSERT INTO agent_signing_keys VALUES (?, ?, ?)",
-            ("tenant", "tenant-secret", 1.0),
+            ("tenant", signing_key, 1.0),
         )
         connection.commit()
     finally:
         connection.close()
 
 
-def _seed_persistent_wal_signing_key_db(path: Path) -> None:
+def _seed_persistent_wal_signing_key_db(
+    path: Path,
+    *,
+    signing_key: str = "tenant-secret",
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
     try:
@@ -70,7 +79,7 @@ def _seed_persistent_wal_signing_key_db(path: Path) -> None:
         )
         connection.execute(
             "INSERT INTO agent_signing_keys VALUES (?, ?, ?)",
-            ("tenant", "tenant-secret", 1.0),
+            ("tenant", signing_key, 1.0),
         )
         connection.commit()
         connection.execute("PRAGMA wal_checkpoint(TRUNCATE)")
@@ -314,6 +323,53 @@ def test_provision_aborts_before_secret_write_when_connect_path_swaps_to_victim(
     assert catalog.snapshot() == []
 
 
+def test_provision_sqlite_open_cannot_be_redirected_by_swap_open_restore(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _signing_store_module()
+    target = tmp_path / "agent_keys.db"
+    exclusive_create = tmp_path / "exclusive-create-moved-aside.db"
+    victim = tmp_path / "victim.db"
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    real_connect = module.sqlite3.connect
+    with real_connect(victim) as connection:
+        connection.execute("CREATE TABLE victim_sentinel (value TEXT)")
+        connection.execute("INSERT INTO victim_sentinel VALUES ('keep')")
+
+    def swap_open_restore(database: Any, *args: Any, **kwargs: Any) -> sqlite3.Connection:
+        if os.fspath(database) != os.fspath(target):
+            return real_connect(database, *args, **kwargs)
+        target.rename(exclusive_create)
+        target.symlink_to(victim)
+        connection = real_connect(database, *args, **kwargs)
+        target.unlink()
+        exclusive_create.rename(target)
+        return connection
+
+    monkeypatch.setattr(module.sqlite3, "connect", swap_open_restore)
+
+    module.AgentSigningKeyStore.provision_single_agent(
+        os.fspath(target),
+        "tenant",
+        "must-not-escape",
+        catalog=catalog,
+    )
+
+    with real_connect(victim) as connection:
+        assert connection.execute("SELECT value FROM victim_sentinel").fetchall() == [("keep",)]
+        assert (
+            connection.execute(
+                "SELECT name FROM sqlite_master WHERE name='agent_signing_keys'"
+            ).fetchall()
+            == []
+        )
+    with real_connect(target) as connection:
+        assert connection.execute(
+            "SELECT signing_key FROM agent_signing_keys WHERE agent_name='tenant'"
+        ).fetchone() == ("must-not-escape",)
+
+
 def test_provision_preserves_every_preexisting_sidecar_identity(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -386,6 +442,61 @@ def test_provision_cleanup_preserves_inode_swapped_in_after_create(
 
     assert target.read_bytes() == replacement_content
     assert created_moved_aside.exists()
+    assert catalog.snapshot() == []
+
+
+def test_provision_cleanup_never_trusts_linux_reused_dev_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _signing_store_module()
+    target = tmp_path / "agent_keys.db"
+    created_moved_aside = tmp_path / "created-moved-aside.db"
+    replacement_content = b"replacement with simulated reused Linux inode"
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+    real_fsync = module.os.fsync
+    real_lstat = module.os.lstat
+    created_identity: tuple[int, int] | None = None
+    replacement_written = False
+
+    def swap_during_file_fsync(descriptor: int) -> None:
+        nonlocal created_identity, replacement_written
+        descriptor_stat = os.fstat(descriptor)
+        if stat.S_ISREG(descriptor_stat.st_mode) and not replacement_written:
+            created_identity = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+            if target.exists():
+                target.rename(created_moved_aside)
+            target.write_bytes(replacement_content)
+            replacement_written = True
+        real_fsync(descriptor)
+
+    def report_linux_reused_inode(path: Any) -> Any:
+        observed = real_lstat(path)
+        if (
+            replacement_written
+            and created_identity is not None
+            and os.fspath(path) == os.fspath(target)
+        ):
+            return SimpleNamespace(
+                st_dev=created_identity[0],
+                st_ino=created_identity[1],
+                st_mode=observed.st_mode,
+            )
+        return observed
+
+    monkeypatch.setattr(module.os, "fsync", swap_during_file_fsync)
+    monkeypatch.setattr(module.os, "lstat", report_linux_reused_inode)
+
+    with pytest.raises(OSError):
+        module.AgentSigningKeyStore.provision_single_agent(
+            os.fspath(target),
+            "tenant",
+            "tenant-secret",
+            catalog=catalog,
+        )
+
+    assert replacement_written
+    assert target.read_bytes() == replacement_content
     assert catalog.snapshot() == []
 
 
@@ -759,6 +870,59 @@ def test_boot_fails_closed_on_corrupt_scoped_tenant_keystore(
         api_module.create_api(db_path=os.fspath(base))
 
 
+def test_boot_never_attaches_preflight_mode_to_replacement_inode(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from pinky_daemon import api as api_module
+
+    base = tmp_path / "fleet" / "conversations.db"
+    _seed_unix_user_registry(base, tmp_path / "tenant-work")
+    tenant_db = tmp_path / "homes" / "pinky-tenant" / "data" / "agent_keys.db"
+    replacement = tmp_path / "replacement-wal.db"
+    preflight_original = tmp_path / "preflight-original.db"
+    _seed_signing_key_db(tenant_db, signing_key="preflight-secret")
+    _seed_persistent_wal_signing_key_db(replacement, signing_key="replacement-secret")
+    swapped = False
+
+    monkeypatch.setattr(
+        api_module,
+        "_derive_standalone_tenant_store_manifest",
+        lambda _agent_name: {
+            "agent_signing_keys": StoreIntegrityTarget(
+                logical_name="agent_signing_keys",
+                path=os.fspath(tenant_db),
+                journal_mode="delete",
+            )
+        },
+        raising=False,
+    )
+    real_preflight = StoreCatalog.preflight_integrity
+
+    def swap_after_tenant_preflight(
+        catalog: StoreCatalog,
+        targets: Any,
+        **kwargs: Any,
+    ) -> dict[str, str]:
+        nonlocal swapped
+        target_list = list(targets)
+        outcomes = real_preflight(catalog, target_list, **kwargs)
+        if catalog.expected_root == os.path.realpath(tenant_db.parent):
+            tenant_db.replace(preflight_original)
+            replacement.replace(tenant_db)
+            swapped = True
+        return outcomes
+
+    monkeypatch.setattr(StoreCatalog, "preflight_integrity", swap_after_tenant_preflight)
+
+    with pytest.raises(StoreCatalogError, match="changed|identity|observation"):
+        api_module.create_api(db_path=os.fspath(base))
+
+    assert swapped
+    assert not Path(os.fspath(tenant_db) + "-wal").exists()
+    assert not Path(os.fspath(tenant_db) + "-shm").exists()
+
+
 def test_all_externally_read_signing_databases_are_rollback_journal(
     tmp_path: Path,
 ) -> None:
@@ -828,3 +992,74 @@ def test_persistent_wal_keystore_reader_fails_soft_without_creating_sidecars(
     assert not Path(os.fspath(tenant_path) + "-wal").exists()
     assert not Path(os.fspath(tenant_path) + "-shm").exists()
     assert result is None
+
+
+def test_reader_and_preflight_pin_one_fd_across_header_path_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _signing_store_module()
+    reader_path = tmp_path / "reader" / "agent_keys.db"
+    reader_victim = tmp_path / "reader-victim-wal.db"
+    reader_original = tmp_path / "reader-original.db"
+    preflight_path = tmp_path / "preflight" / "agent_keys.db"
+    preflight_victim = tmp_path / "preflight-victim-wal.db"
+    preflight_original = tmp_path / "preflight-original.db"
+    _seed_signing_key_db(reader_path, signing_key="reader-original-secret")
+    _seed_persistent_wal_signing_key_db(
+        reader_victim,
+        signing_key="reader-victim-secret",
+    )
+    _seed_signing_key_db(preflight_path, signing_key="preflight-original-secret")
+    _seed_persistent_wal_signing_key_db(
+        preflight_victim,
+        signing_key="preflight-victim-secret",
+    )
+    races = {
+        (reader_path.stat().st_dev, reader_path.stat().st_ino): (
+            reader_path,
+            reader_original,
+            reader_victim,
+        ),
+        (preflight_path.stat().st_dev, preflight_path.stat().st_ino): (
+            preflight_path,
+            preflight_original,
+            preflight_victim,
+        ),
+    }
+    real_pread = os.pread
+
+    def swap_after_header_read(descriptor: int, length: int, offset: int) -> bytes:
+        header = real_pread(descriptor, length, offset)
+        descriptor_stat = os.fstat(descriptor)
+        race = races.pop((descriptor_stat.st_dev, descriptor_stat.st_ino), None)
+        if race is not None:
+            target, original, victim = race
+            target.replace(original)
+            target.symlink_to(victim)
+        return header
+
+    monkeypatch.setattr(module.os, "pread", swap_after_header_read)
+
+    reader_result = module.AgentSigningKeyStore.read_only(os.fspath(reader_path)).get_signing_key(
+        "tenant"
+    )
+    catalog = StoreCatalog(expected_root=preflight_path.parent, silence_allowlist={})
+    target = StoreIntegrityTarget(
+        logical_name="agent_signing_keys",
+        path=os.fspath(preflight_path),
+        journal_mode="delete",
+    )
+    preflight_error: StoreCatalogError | None = None
+    try:
+        catalog.preflight_integrity([target])
+    except StoreCatalogError as exc:
+        preflight_error = exc
+
+    assert races == {}
+    assert reader_result is None
+    assert preflight_error is not None
+    assert "changed" in str(preflight_error).lower() or "identity" in str(preflight_error).lower()
+    for path in (reader_path, reader_victim, preflight_path, preflight_victim):
+        assert not Path(os.fspath(path) + "-wal").exists()
+        assert not Path(os.fspath(path) + "-shm").exists()
