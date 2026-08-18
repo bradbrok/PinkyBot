@@ -10,7 +10,7 @@ import re
 import sqlite3
 import stat
 import threading
-from collections.abc import Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import parse_qsl
@@ -206,13 +206,19 @@ class StoreCatalog:
 
         return self.reconcile_filesystem()
 
-    def preflight_integrity(self, targets: Iterable[StoreIntegrityTarget]) -> None:
+    def preflight_integrity(
+        self,
+        targets: Iterable[StoreIntegrityTarget],
+        *,
+        on_outcome: Callable[[str, str], None] | None = None,
+    ) -> dict[str, str]:
         """Fail closed when an existing API-owned SQLite file is corrupt.
 
         Targets that share a physical path are checked once and reported together.
         Missing and in-memory stores are left for their constructors to create.
         """
         targets_by_path: dict[str, list[StoreIntegrityTarget]] = {}
+        outcomes: dict[str, str] = {}
         for target in targets:
             raw_path = os.fspath(target.path)
             if self._is_memory_path(raw_path):
@@ -225,7 +231,19 @@ class StoreCatalog:
                 os.stat(resolved_path)
             except OSError as exc:
                 if self._is_missing_path_error(exc):
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "skipped-absent",
+                        outcomes,
+                        on_outcome,
+                    )
                     continue
+                self._record_integrity_outcomes(
+                    matching_targets,
+                    "failed-corrupt",
+                    outcomes,
+                    on_outcome,
+                )
                 self._raise_integrity_error(matching_targets, resolved_path, exc)
 
             try:
@@ -239,15 +257,53 @@ class StoreCatalog:
                     connection.close()
             except (sqlite3.Error, OSError) as exc:
                 if self._path_is_absent(resolved_path):
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "skipped-absent",
+                        outcomes,
+                        on_outcome,
+                    )
                     continue
+                self._record_integrity_outcomes(
+                    matching_targets,
+                    "failed-corrupt",
+                    outcomes,
+                    on_outcome,
+                )
                 self._raise_integrity_error(matching_targets, resolved_path, exc)
 
             if rows != [("ok",)]:
+                self._record_integrity_outcomes(
+                    matching_targets,
+                    "failed-corrupt",
+                    outcomes,
+                    on_outcome,
+                )
                 self._raise_integrity_error(
                     matching_targets,
                     resolved_path,
                     f"PRAGMA quick_check returned {rows!r}",
                 )
+            self._record_integrity_outcomes(
+                matching_targets,
+                "ok",
+                outcomes,
+                on_outcome,
+            )
+
+        return outcomes
+
+    @staticmethod
+    def _record_integrity_outcomes(
+        targets: list[StoreIntegrityTarget],
+        outcome: str,
+        outcomes: dict[str, str],
+        on_outcome: Callable[[str, str], None] | None,
+    ) -> None:
+        for target in targets:
+            outcomes[target.logical_name] = outcome
+            if on_outcome is not None:
+                on_outcome(target.logical_name, outcome)
 
     @staticmethod
     def _raise_integrity_error(

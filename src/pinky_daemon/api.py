@@ -195,6 +195,7 @@ from pinky_daemon.shared_mcp import (
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.storage_observability import StorageObservability
 from pinky_daemon.store_catalog import (
     StoreCatalog,
     StoreCatalogError,
@@ -1759,7 +1760,15 @@ def create_api(
     _data_dir = Path(db_path).parent
     store_catalog = StoreCatalog(expected_root=_data_dir)
     store_manifest = _derive_api_store_manifest(db_path)
-    store_catalog.preflight_integrity(store_manifest.values())
+    storage_observability = StorageObservability(store_manifest)
+    try:
+        store_catalog.preflight_integrity(
+            store_manifest.values(),
+            on_outcome=storage_observability.record_preflight,
+        )
+    except StoreCatalogError:
+        storage_observability.record_boot_failure()
+        raise
     store_snapshot_service = StoreSnapshotService(store_catalog)
 
     app = FastAPI(
@@ -1768,6 +1777,7 @@ def create_api(
         version="0.1.0",
     )
     app.state.store_snapshot_service = store_snapshot_service
+    app.state.storage_observability = storage_observability
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
 
     @app.exception_handler(RequestValidationError)
@@ -5267,6 +5277,14 @@ def create_api(
             return "failed"
         return "partial_success"
 
+    def _record_store_snapshot_outcome(
+        caller: str,
+        logical_name: str | None,
+        result: SnapshotResult,
+    ) -> None:
+        _audit_store_snapshot(caller, logical_name, result)
+        storage_observability.record_snapshot(result)
+
     @app.post("/internal/stores/snapshot")
     async def create_store_snapshot(req: StoreSnapshotRequest, request: Request):
         if not _has_valid_internal_auth(request):
@@ -5290,7 +5308,7 @@ def create_api(
             results = await asyncio.to_thread(
                 store_snapshot_service.create_snapshots,
                 req.logical_name,
-                on_outcome=lambda result: _audit_store_snapshot(
+                on_outcome=lambda result: _record_store_snapshot_outcome(
                     caller,
                     req.logical_name,
                     result,
@@ -12855,6 +12873,7 @@ npm run build</pre>
                 _log(f"admin/watchdog: {et} tracker.status raised: {e}")
                 transport_status[et] = {"status": "unknown", "error": str(e)}
         out["transport_alert_status"] = transport_status
+        out["storage"] = storage_observability.snapshot()
         return out
 
     # ── Admin: Shared MCP Status ─────────────────────────
@@ -14122,9 +14141,11 @@ npm run build</pre>
     # returning the application so an incoherent physical layout cannot serve.
     app.state.store_catalog = store_catalog
     try:
-        store_catalog.validate()
+        warnings = store_catalog.validate() or []
     except StoreCatalogError as exc:
+        storage_observability.record_boot_failure()
         _log(f"ERROR startup: store catalog validation failed: {exc}")
         raise
+    storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
 
     return app
