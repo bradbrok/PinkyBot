@@ -80,6 +80,12 @@ class UpdatePasswordRequest(BaseModel):
     password: str
 
 
+class StoreSnapshotRequest(BaseModel):
+    """Select one catalog store, or omit the name for all authoritative stores."""
+
+    logical_name: str | None = Field(default=None, min_length=1, max_length=200)
+
+
 class SessionResponse(BaseModel):
     """Session info returned by API."""
 
