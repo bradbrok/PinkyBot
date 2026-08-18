@@ -55,13 +55,17 @@ Design constraints (why this exists now, before activation):
 from __future__ import annotations
 
 import os
-import sqlite3
 import subprocess
-import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Callable, Protocol, runtime_checkable
+
+from pinky_daemon.agent_signing_key_store import (
+    AgentSigningKeyStore,
+    configured_signing_key_staging_root,
+)
+from pinky_daemon.store_catalog import StoreCatalog
 
 if TYPE_CHECKING:  # pragma: no cover — typing only, avoids a runtime import cycle
     from .agent_registry import Agent
@@ -324,6 +328,17 @@ class SystemProvisionOps:
     inspection, while the provisioner *logic* is covered via a recording double.
     """
 
+    def __init__(
+        self,
+        *,
+        staging_root: str | os.PathLike[str] | None = None,
+    ) -> None:
+        self._staging_root = (
+            configured_signing_key_staging_root()
+            if staging_root is None
+            else Path(os.path.abspath(os.fspath(staging_root)))
+        )
+
     def run(self, argv: list[str]) -> None:
         proc = subprocess.run(argv, capture_output=True, text=True)
         if proc.returncode != 0:
@@ -350,26 +365,17 @@ class SystemProvisionOps:
         os.chmod(path, SECRET_MODE)
 
     def write_keystore(self, path: str, agent_name: str, signing_key: str) -> None:
-        # Create the file 0600 BEFORE sqlite opens it, so the DB (which holds a
-        # signing secret) is never briefly group/world-readable. O_EXCL+O_NOFOLLOW:
-        # fail closed on a pre-existing file or planted symlink.
-        fd = os.open(path, _SECRET_OPEN_FLAGS, SECRET_MODE)
-        os.close(fd)
-        conn = sqlite3.connect(path)
+        catalog = StoreCatalog(expected_root=Path(path).parent, silence_allowlist={})
         try:
-            conn.execute(
-                "CREATE TABLE IF NOT EXISTS agent_signing_keys ("
-                "agent_name TEXT PRIMARY KEY, signing_key TEXT NOT NULL, created_at REAL)"
+            AgentSigningKeyStore.provision_single_agent(
+                path,
+                agent_name,
+                signing_key,
+                catalog=catalog,
+                staging_root=self._staging_root,
             )
-            conn.execute(
-                "INSERT OR REPLACE INTO agent_signing_keys "
-                "(agent_name, signing_key, created_at) VALUES (?, ?, ?)",
-                (agent_name, signing_key, time.time()),
-            )
-            conn.commit()
         finally:
-            conn.close()
-        os.chmod(path, SECRET_MODE)
+            catalog.close()
 
 
 class UnixUserProvisioner(AgentProvisioner):
@@ -484,7 +490,6 @@ class UnixUserProvisioner(AgentProvisioner):
                 if not key:
                     raise ProvisionError(f"no signing key available for {agent.name!r}")
                 self._ops.write_keystore(p.keystore, agent.name, key)
-                self._ops.run(["chown", f"{p.username}:{p.username}", p.keystore])
                 created.append(f"path:{p.keystore}")
 
             # 4. The agent's .mcp.json (0600).

@@ -26,9 +26,12 @@ APPROVED_STORAGE_OWNER_MODULES = frozenset(
         "src/pinky_daemon/activity_store.py",
         "src/pinky_daemon/agent_comms.py",
         "src/pinky_daemon/agent_registry.py",
+        "src/pinky_daemon/agent_signing_key_store.py",
         "src/pinky_daemon/analytics_store.py",
         "src/pinky_daemon/app_store.py",
+        "src/pinky_daemon/audit_store.py",
         "src/pinky_daemon/conversation_store.py",
+        "src/pinky_daemon/dream_runner.py",
         "src/pinky_daemon/kb_store.py",
         "src/pinky_daemon/librarian_runner.py",
         "src/pinky_daemon/mesh_store.py",
@@ -43,6 +46,17 @@ APPROVED_STORAGE_OWNER_MODULES = frozenset(
         "src/pinky_daemon/trigger_store.py",
         "src/pinky_daemon/user_profile_store.py",
         "src/pinky_daemon/voice_store.py",
+    }
+)
+
+# These modules are the storage authority itself, not connector exceptions. Keep
+# the set separately named so a future connector cannot inherit authority merely
+# by being added to the ordinary direct-open exception mapping.
+APPROVED_STORAGE_AUTHORITY_MODULES = frozenset(
+    {
+        "src/pinky_daemon/store_catalog.py",
+        "src/pinky_daemon/store_restore.py",
+        "src/pinky_daemon/store_snapshot.py",
     }
 )
 
@@ -71,81 +85,8 @@ class DirectOpenSite:
         return DirectOpenIdentity(relpath=self.relpath, qualname=self.qualname)
 
 
-# Existing non-owner connector sites only. Identity prevents a new function in an
-# allowlisted module from inheriting approval; count catches another call in the same function.
-DIRECT_OPEN_ALLOWLIST = {
-    DirectOpenIdentity(
-        "src/pinky_daemon/auth.py",
-        "make_db_signing_key_resolver._resolve",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason=(
-            "Reads signing keys from the authoritative agent registry DB; "
-            "P1 routes behind the seam."
-        ),
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/dream_runner.py",
-        "DreamRunner._db",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason="Owns dream state; P1 routes behind the seam.",
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/dream_runner.py",
-        "DreamRunner._reflection_ids_for_attempt",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason=("Verifies writes in per-agent memory DBs; P1 routes behind the seam."),
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/hooks.py",
-        "AuditStore._db",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason="Opens the legacy hook audit store; P1 routes behind the seam.",
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/provisioning.py",
-        "SystemProvisionOps.write_keystore",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason=(
-            "Creates per-agent signing-key DBs during provisioning; P1 routes behind the seam."
-        ),
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/store_catalog.py",
-        "StoreCatalog.preflight_integrity",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason=(
-            "Daemon-internal storage authority opens each manifest-selected existing store "
-            "read-only for boot-time PRAGMA quick_check (#1114)."
-        ),
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/store_snapshot.py",
-        "StoreSnapshotService._backup_and_verify",
-    ): AllowlistEntry(
-        expected_count=2,
-        reason=(
-            "Daemon-internal storage authority opens one catalog-selected source and one "
-            "fresh destination for SQLite Online Backup API snapshots (#1112)."
-        ),
-    ),
-    DirectOpenIdentity(
-        "src/pinky_daemon/store_restore.py",
-        "_verify_static_store",
-    ): AllowlistEntry(
-        expected_count=1,
-        reason=(
-            "Attended daemon-down restore opens only static snapshot, temp, and installed "
-            "files read-only with immutable=1 for quick_check and schema verification (#1116); "
-            "it never opens a live P0.4 preflight store."
-        ),
-    ),
-}
+# Load-bearing program-end invariant: there are no connector exceptions.
+DIRECT_OPEN_ALLOWLIST = {}
 
 
 class _DirectOpenVisitor(ast.NodeVisitor):
@@ -272,8 +213,8 @@ def _assert_direct_opens_allowed(
         failures.append(
             "Unapproved direct SQLite opens:\n"
             f"{rendered_sites}\n"
-            "Route each call through a registered storage owner or add its exact "
-            "(relpath, qualname) identity to DIRECT_OPEN_ALLOWLIST with a count and reason."
+            "Route each call through a registered storage owner; connector exceptions "
+            "are not permitted."
         )
     if dead_entries:
         failures.append(
@@ -302,8 +243,24 @@ def _assert_direct_opens_allowed(
 def test_daemon_direct_sqlite_opens_are_owned_or_allowlisted() -> None:
     _assert_direct_opens_allowed(
         _scan_daemon_sources(),
-        owner_modules=APPROVED_STORAGE_OWNER_MODULES,
+        owner_modules=(
+            APPROVED_STORAGE_OWNER_MODULES | APPROVED_STORAGE_AUTHORITY_MODULES
+        ),
         allowlist=DIRECT_OPEN_ALLOWLIST,
+    )
+
+
+def test_connector_exception_mapping_is_exactly_empty_and_authority_is_separate() -> None:
+    assert DIRECT_OPEN_ALLOWLIST == {}
+    assert APPROVED_STORAGE_AUTHORITY_MODULES == frozenset(
+        {
+            "src/pinky_daemon/store_catalog.py",
+            "src/pinky_daemon/store_restore.py",
+            "src/pinky_daemon/store_snapshot.py",
+        }
+    )
+    assert APPROVED_STORAGE_OWNER_MODULES.isdisjoint(
+        APPROVED_STORAGE_AUTHORITY_MODULES
     )
 
 
@@ -373,7 +330,12 @@ def newly_added_probe():
         _assert_direct_opens_allowed(
             sites,
             owner_modules=APPROVED_STORAGE_OWNER_MODULES,
-            allowlist={identity: DIRECT_OPEN_ALLOWLIST[identity]},
+            allowlist={
+                identity: AllowlistEntry(
+                    expected_count=1,
+                    reason="Synthetic scanner regression fixture.",
+                )
+            },
         )
 
 
@@ -397,7 +359,12 @@ def make_db_signing_key_resolver():
         _assert_direct_opens_allowed(
             sites,
             owner_modules=APPROVED_STORAGE_OWNER_MODULES,
-            allowlist={identity: DIRECT_OPEN_ALLOWLIST[identity]},
+            allowlist={
+                identity: AllowlistEntry(
+                    expected_count=1,
+                    reason="Synthetic scanner regression fixture.",
+                )
+            },
         )
 
 

@@ -103,7 +103,7 @@ def test_admin_watchdog_exposes_bounded_boot_preflight_inventory_and_reconcile_m
     data_root = tmp_path / "data"
     base = data_root / "conversations.db"
     manifest_names = _manifest_names(base)
-    assert len(manifest_names) == 23
+    assert len(manifest_names) == 24
 
     app = api_module.create_api(
         max_sessions=10,
@@ -132,12 +132,12 @@ def test_admin_watchdog_exposes_bounded_boot_preflight_inventory_and_reconcile_m
     assert storage["reconcile_warning_count"] == expected_warning_count
 
     # The preflight runs before constructors: a brand-new data root is absent,
-    # then constructors create all 23 logical / 22 physical stores.
+    # then constructors create all 24 logical / 22 physical stores.
     assert storage["preflight"] == {
         logical_name: "skipped-absent" for logical_name in manifest_names
     }
     inventory = storage["inventory"]
-    assert inventory["logical_count"] == 23
+    assert inventory["logical_count"] == 24
     assert inventory["physical_count"] == 22
     assert set(inventory["stores"]) == manifest_names
     assert {details["criticality"] for details in inventory["stores"].values()} == {
@@ -168,11 +168,11 @@ def test_clean_existing_store_records_preflight_ok_and_warning_free_boot_pass(
     store = api_module.ConversationStore(db_path=os.fspath(base))
     store.close()
 
-    class QuietStoreCatalog(StoreCatalog):
+    class QuietStoreCatalog(api_module.DaemonStoreCatalog):
         def __init__(self, expected_root: str | os.PathLike[str]) -> None:
             super().__init__(expected_root, silence_allowlist={})
 
-    monkeypatch.setattr(api_module, "StoreCatalog", QuietStoreCatalog)
+    monkeypatch.setattr(api_module, "DaemonStoreCatalog", QuietStoreCatalog)
     app = api_module.create_api(
         max_sessions=10,
         default_working_dir=str(tmp_path),

@@ -260,8 +260,9 @@ class TestUnixUserProvision:
         # every chown targets pinky-tenant:pinky-tenant
         assert all(c[1] == "pinky-tenant:pinky-tenant" for c in chowns)
         targets = {c[2] for c in chowns}
-        # home, 3 dirs, keystore, mcp.json
-        assert "/home/pinky-tenant/data/agent_keys.db" in targets
+        # Home, private dirs, and mcp.json use the command seam. The real
+        # keystore path is fchown'd while still in daemon staging, before publish.
+        assert "/home/pinky-tenant/data/agent_keys.db" not in targets
         assert "/home/pinky-tenant/workdir/.mcp.json" in targets
 
     def test_single_agent_keystore_written(self, unix_agent):
@@ -440,14 +441,18 @@ class TestSystemProvisionOps:
         target = tmp_path / "agent_keys.db"
         target.write_text("not a db")
         with pytest.raises(FileExistsError):
-            SystemProvisionOps().write_keystore(str(target), "tenant", "sekret")
+            SystemProvisionOps(staging_root=tmp_path / "staging").write_keystore(
+                str(target), "tenant", "sekret"
+            )
         assert target.read_text() == "not a db"
 
     def test_write_keystore_single_row_0600(self, tmp_path):
         import sqlite3
 
         target = tmp_path / "agent_keys.db"
-        SystemProvisionOps().write_keystore(str(target), "tenant", "sekret")
+        SystemProvisionOps(staging_root=tmp_path / "staging").write_keystore(
+            str(target), "tenant", "sekret"
+        )
         assert (target.stat().st_mode & 0o777) == SECRET_MODE
         conn = sqlite3.connect(str(target))
         try:
@@ -464,7 +469,9 @@ class TestSystemProvisionOps:
         from pinky_daemon.auth import make_db_signing_key_resolver
 
         target = tmp_path / "agent_keys.db"
-        SystemProvisionOps().write_keystore(str(target), "tenant", "sekret")
+        SystemProvisionOps(staging_root=tmp_path / "staging").write_keystore(
+            str(target), "tenant", "sekret"
+        )
         resolve = make_db_signing_key_resolver(str(target))
         assert resolve("tenant") == "sekret"
         assert resolve("someone-else") is None

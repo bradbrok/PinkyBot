@@ -9,6 +9,7 @@ import os
 import re
 import sqlite3
 import stat
+import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
@@ -30,6 +31,192 @@ DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST: dict[str, str] = {
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _IGNORED_DIRECTORY_KINDS = frozenset({"snapshot", "snapshots", "temp", "temporary", "tmp"})
+_SQLITE_HEADER_PREFIX = b"SQLite format 3\x00"
+_SQLITE_HEADER_JOURNAL_BYTES = slice(18, 20)
+
+
+def _sqlite_header_journal_mode(header: bytes) -> str | None:
+    if len(header) < 20 or not header.startswith(_SQLITE_HEADER_PREFIX):
+        return None
+    journal_bytes = header[_SQLITE_HEADER_JOURNAL_BYTES]
+    if b"\x02" in journal_bytes:
+        return "wal"
+    if journal_bytes == b"\x01\x01":
+        return "rollback"
+    return None
+
+
+class BoundSQLiteFile:
+    """One immutable, no-follow file descriptor used for SQLite inspection.
+
+    The descriptor is the sole physical identity. Path reconciliation is a
+    reject-only detector: it can report that the directory entry disappeared or
+    changed, but it can never refresh this handle to a replacement inode.
+    """
+
+    def __init__(self, path: str | os.PathLike[str], descriptor: int) -> None:
+        self.path = os.path.abspath(os.fspath(path))
+        self._descriptor = descriptor
+        try:
+            descriptor_stat = os.fstat(descriptor)
+        except BaseException:
+            os.close(descriptor)
+            self._descriptor = -1
+            raise
+        if not stat.S_ISREG(descriptor_stat.st_mode):
+            os.close(descriptor)
+            self._descriptor = -1
+            raise OSError("SQLite path is not a regular file")
+        self.dev_ino = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+
+    @classmethod
+    def open(cls, path: str | os.PathLike[str]) -> "BoundSQLiteFile":
+        flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+        descriptor = os.open(os.path.abspath(os.fspath(path)), flags)
+        return cls(path, descriptor)
+
+    @classmethod
+    def from_descriptor(
+        cls,
+        path: str | os.PathLike[str],
+        descriptor: int,
+    ) -> "BoundSQLiteFile":
+        """Take ownership of an already-open regular-file descriptor."""
+        return cls(path, descriptor)
+
+    @property
+    def descriptor(self) -> int:
+        if self._descriptor < 0:
+            raise OSError("bound SQLite descriptor is closed")
+        return self._descriptor
+
+    def header_journal_mode(self) -> str | None:
+        if hasattr(os, "pread"):
+            header = os.pread(self.descriptor, 20, 0)
+        else:  # pragma: no cover - Python 3.11 Unix hosts expose pread
+            os.lseek(self.descriptor, 0, os.SEEK_SET)
+            header = os.read(self.descriptor, 20)
+        return _sqlite_header_journal_mode(header)
+
+    def connect_read_only(self, *, timeout: float = 5) -> sqlite3.Connection:
+        if sys.platform == "linux":
+            descriptor_path = Path(f"/proc/self/fd/{self.descriptor}")
+        elif sys.platform == "darwin":
+            descriptor_path = Path(f"/dev/fd/{self.descriptor}")
+        else:  # pragma: no cover - Pinky daemon supports Linux and macOS
+            raise OSError(f"no descriptor-backed SQLite adapter for {sys.platform!r}")
+        return sqlite3.connect(
+            descriptor_path.as_uri() + "?mode=ro",
+            uri=True,
+            timeout=timeout,
+        )
+
+    def path_state(self) -> str:
+        """Return ``same``, ``absent``, or ``changed`` without opening SQLite."""
+        try:
+            path_stat = os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            if StoreCatalog._is_missing_path_error(exc):
+                return "absent"
+            raise
+        observed_identity = (path_stat.st_dev, path_stat.st_ino)
+        if not stat.S_ISREG(path_stat.st_mode) or observed_identity != self.dev_ino:
+            return "changed"
+        return "same"
+
+    def require_path_unchanged(self) -> None:
+        state = self.path_state()
+        if state == "absent":
+            raise FileNotFoundError(f"bound SQLite path disappeared: {self.path!r}")
+        if state != "same":
+            raise OSError(f"bound SQLite path changed physical identity: {self.path!r}")
+
+    def close(self) -> None:
+        if self._descriptor >= 0:
+            os.close(self._descriptor)
+            self._descriptor = -1
+
+    def __enter__(self) -> "BoundSQLiteFile":
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        self.close()
+
+
+@dataclass(slots=True)
+class StoreObservation:
+    """A preflight result whose physical identity stays pinned by a live fd."""
+
+    logical_names: tuple[str, ...]
+    path: str
+    outcome: str
+    journal_mode: str | None
+    _bound_file: BoundSQLiteFile | None
+    _claimed: bool = False
+
+    @classmethod
+    def absent(
+        cls,
+        logical_names: tuple[str, ...],
+        path: str | os.PathLike[str],
+    ) -> "StoreObservation":
+        return cls(
+            logical_names=logical_names,
+            path=os.path.abspath(os.fspath(path)),
+            outcome="skipped-absent",
+            journal_mode=None,
+            _bound_file=None,
+        )
+
+    @classmethod
+    def from_descriptor(
+        cls,
+        logical_name: str,
+        path: str | os.PathLike[str],
+        *,
+        journal_mode: str,
+        descriptor: int,
+    ) -> "StoreObservation":
+        return cls(
+            logical_names=(logical_name,),
+            path=os.path.abspath(os.fspath(path)),
+            outcome="ok",
+            journal_mode=journal_mode.lower(),
+            _bound_file=BoundSQLiteFile.from_descriptor(path, descriptor),
+        )
+
+    @property
+    def dev_ino(self) -> tuple[int, int] | None:
+        return None if self._bound_file is None else self._bound_file.dev_ino
+
+    def require_path_unchanged(self) -> None:
+        if self._bound_file is not None:
+            self._bound_file.require_path_unchanged()
+            return
+        try:
+            os.stat(self.path, follow_symlinks=False)
+        except OSError as exc:
+            if StoreCatalog._is_missing_path_error(exc):
+                return
+            raise
+        raise OSError(f"preflight-absent SQLite path appeared: {self.path!r}")
+
+    def close(self) -> None:
+        if self._bound_file is not None:
+            self._bound_file.close()
+
+
+def sqlite_header_journal_mode(path: str | os.PathLike[str]) -> str | None:
+    """Inspect persistent WAL/rollback state through one pinned descriptor.
+
+    SQLite stores the database read/write format at header offsets 18 and 19.
+    Reading those bytes through a no-follow file descriptor cannot create
+    journal sidecars, unlike opening a persistent-WAL database with mode=ro.
+    """
+    with BoundSQLiteFile.open(path) as bound_file:
+        journal_mode = bound_file.header_journal_mode()
+        bound_file.require_path_unchanged()
+        return journal_mode
 
 
 @dataclass(frozen=True, slots=True)
@@ -53,6 +240,7 @@ class StoreIntegrityTarget:
     path: str
     criticality: str = "authoritative"
     recovery: str = "snapshot"
+    journal_mode: str | None = None
 
 
 class StoreCatalogError(RuntimeError):
@@ -63,6 +251,7 @@ class StoreCatalogError(RuntimeError):
 class _CatalogEntry:
     record: StoreRecord
     used_relative_path: bool
+    observation: StoreObservation | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -70,6 +259,41 @@ class _FilesystemDatabase:
     relative_path: str
     resolved_path: str
     dev_ino: tuple[int, int]
+
+
+class StoreReservation:
+    """One catalog record reserved before its SQLite file is created.
+
+    The entry is visible immediately. Call :meth:`commit` only after creation,
+    durable commit/fsync, binding or refreshing physical identity, and catalog
+    validation succeed. Leaving the context without committing removes the exact
+    reserved entry.
+    """
+
+    def __init__(self, catalog: "StoreCatalog", entry: _CatalogEntry) -> None:
+        self._catalog = catalog
+        self._entry = entry
+        self._committed = False
+
+    def __enter__(self) -> "StoreReservation":
+        return self
+
+    def refresh(self) -> StoreRecord:
+        """Refresh and return the reserved file's current physical identity."""
+        return self._catalog._refresh_reservation(self._entry)
+
+    def bind_observation(self, observation: StoreObservation) -> StoreRecord:
+        """Bind the reservation to a live descriptor without reopening its path."""
+        return self._catalog._bind_reservation_observation(self._entry, observation)
+
+    def commit(self) -> None:
+        """Retain the reservation as a permanent catalog record."""
+        self._catalog._commit_reservation(self._entry)
+        self._committed = True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if not self._committed:
+            self._catalog._rollback_reservation(self._entry)
 
 
 class StoreCatalog:
@@ -88,6 +312,7 @@ class StoreCatalog:
         )
         self._silence_allowlist = dict(configured_allowlist)
         self._entries: list[_CatalogEntry] = []
+        self._observations: list[StoreObservation] = []
         self._lock = threading.RLock()
 
     @property
@@ -145,9 +370,197 @@ class StoreCatalog:
                 )
             )
 
+    def register_observed(
+        self,
+        target: StoreIntegrityTarget,
+        observation: StoreObservation,
+        *,
+        owner: str,
+    ) -> None:
+        """Consume a live preflight handle as the record's sole physical truth."""
+        raw_path = os.fspath(target.path)
+        absolute_path = os.path.abspath(raw_path)
+        with self._lock:
+            if not any(current is observation for current in self._observations):
+                raise StoreCatalogError("preflight observation is not owned by this catalog")
+            if observation._claimed:
+                raise StoreCatalogError("preflight observation was already consumed")
+            if target.logical_name not in observation.logical_names:
+                raise StoreCatalogError(
+                    f"preflight observation does not cover logical store {target.logical_name!r}"
+                )
+            if absolute_path != observation.path:
+                raise StoreCatalogError("preflight observation path does not match registration")
+            try:
+                observation.require_path_unchanged()
+            except OSError as exc:
+                raise StoreCatalogError(
+                    "preflight observation path changed before registration: "
+                    f"logical_store={target.logical_name!r} path={absolute_path!r}"
+                ) from exc
+
+            journal_mode = (observation.journal_mode or target.journal_mode or "delete").lower()
+            record = StoreRecord(
+                logical_name=target.logical_name,
+                resolved_path=absolute_path,
+                journal_mode=journal_mode,
+                owner=owner,
+                criticality=target.criticality,
+                dev_ino=observation.dev_ino,
+                is_memory=False,
+            )
+            if any(
+                entry.record.logical_name == record.logical_name
+                and entry.record.resolved_path == record.resolved_path
+                and entry.record.owner == record.owner
+                for entry in self._entries
+            ):
+                raise StoreCatalogError(
+                    "observed store registration duplicates an existing catalog record: "
+                    + self._format_record(record)
+                )
+            observation._claimed = True
+            self._entries.append(
+                _CatalogEntry(
+                    record=record,
+                    used_relative_path=not os.path.isabs(raw_path),
+                    observation=(observation if observation.dev_ino is not None else None),
+                )
+            )
+
+    def reserve(
+        self,
+        logical_name: str,
+        path: str | os.PathLike[str],
+        *,
+        journal_mode: str,
+        owner: str,
+        criticality: str = "authoritative",
+    ) -> StoreReservation:
+        """Publish an absent store in the catalog before its exclusive create.
+
+        Reservations never coalesce with existing records: a caller trying to
+        reserve an already-declared logical/path/owner tuple is an ownership
+        error, not an idempotent reopen. This keeps rollback scoped to the exact
+        entry created by this call.
+        """
+        raw_path = os.fspath(path)
+        is_memory = self._is_memory_path(raw_path)
+        if is_memory:
+            raise StoreCatalogError("cannot reserve an in-memory store")
+        absolute_path = os.path.abspath(raw_path)
+        record = StoreRecord(
+            logical_name=logical_name,
+            resolved_path=absolute_path,
+            journal_mode=journal_mode.lower(),
+            owner=owner,
+            criticality=criticality,
+            dev_ino=self._stat_identity(absolute_path),
+            is_memory=False,
+        )
+        entry = _CatalogEntry(
+            record=record,
+            used_relative_path=not os.path.isabs(raw_path),
+        )
+        with self._lock:
+            if any(
+                current.record.logical_name == record.logical_name
+                and current.record.resolved_path == record.resolved_path
+                and current.record.owner == record.owner
+                for current in self._entries
+            ):
+                raise StoreCatalogError(
+                    "store reservation duplicates an existing catalog record: "
+                    + self._format_record(record)
+                )
+            self._entries.append(entry)
+        return StoreReservation(self, entry)
+
+    def _refresh_reservation(self, entry: _CatalogEntry) -> StoreRecord:
+        with self._lock:
+            if entry not in self._entries:
+                raise StoreCatalogError("store reservation is no longer active")
+            if entry.observation is not None:
+                raise StoreCatalogError(
+                    "descriptor-bound store reservation cannot refresh from a pathname"
+                )
+            record = entry.record
+            dev_ino = self._stat_identity(record.resolved_path)
+            entry.record = StoreRecord(
+                logical_name=record.logical_name,
+                resolved_path=record.resolved_path,
+                journal_mode=record.journal_mode,
+                owner=record.owner,
+                criticality=record.criticality,
+                dev_ino=dev_ino,
+                is_memory=False,
+            )
+            return entry.record
+
+    def _bind_reservation_observation(
+        self,
+        entry: _CatalogEntry,
+        observation: StoreObservation,
+    ) -> StoreRecord:
+        with self._lock:
+            if entry not in self._entries:
+                raise StoreCatalogError("store reservation is no longer active")
+            if entry.observation is not None:
+                raise StoreCatalogError("store reservation already has a bound observation")
+            record = entry.record
+            if observation.logical_names != (record.logical_name,):
+                raise StoreCatalogError("store observation does not match reservation logical name")
+            if observation.path != record.resolved_path:
+                raise StoreCatalogError("store observation path does not match reservation")
+            if observation.journal_mode != record.journal_mode:
+                raise StoreCatalogError("store observation mode does not match reservation")
+            try:
+                observation.require_path_unchanged()
+            except OSError as exc:
+                raise StoreCatalogError(
+                    "published store path changed before reservation bind"
+                ) from exc
+            if observation.dev_ino is None:
+                raise StoreCatalogError("published store observation has no physical identity")
+            observation._claimed = True
+            entry.observation = observation
+            entry.record = StoreRecord(
+                logical_name=record.logical_name,
+                resolved_path=record.resolved_path,
+                journal_mode=record.journal_mode,
+                owner=record.owner,
+                criticality=record.criticality,
+                dev_ino=observation.dev_ino,
+                is_memory=False,
+            )
+            self._observations.append(observation)
+            return entry.record
+
+    def _commit_reservation(self, entry: _CatalogEntry) -> None:
+        with self._lock:
+            if entry not in self._entries:
+                raise StoreCatalogError("store reservation is no longer active")
+            if entry.record.dev_ino is None:
+                raise StoreCatalogError("reserved store has no physical identity")
+
+    def _rollback_reservation(self, entry: _CatalogEntry) -> None:
+        with self._lock:
+            try:
+                self._entries.remove(entry)
+            except ValueError:
+                pass
+            if entry.observation is not None:
+                entry.observation.close()
+                self._observations = [
+                    observation
+                    for observation in self._observations
+                    if observation is not entry.observation
+                ]
+
     def validate(self) -> list[str]:
         """Raise for an unsafe layout and return filesystem hygiene warnings."""
         with self._lock:
+            self._require_observations_unchanged()
             self._refresh_identities()
             entries = list(self._entries)
 
@@ -211,7 +624,7 @@ class StoreCatalog:
         targets: Iterable[StoreIntegrityTarget],
         *,
         on_outcome: Callable[[str, str], None] | None = None,
-    ) -> dict[str, str]:
+    ) -> dict[str, StoreObservation]:
         """Fail closed when an existing API-owned SQLite file is corrupt.
 
         Targets that share a physical path are checked once and reported together.
@@ -219,18 +632,25 @@ class StoreCatalog:
         """
         targets_by_path: dict[str, list[StoreIntegrityTarget]] = {}
         outcomes: dict[str, str] = {}
+        observations: dict[str, StoreObservation] = {}
         for target in targets:
             raw_path = os.fspath(target.path)
             if self._is_memory_path(raw_path):
                 continue
-            resolved_path = os.path.realpath(raw_path)
-            targets_by_path.setdefault(resolved_path, []).append(target)
+            absolute_path = os.path.abspath(raw_path)
+            targets_by_path.setdefault(absolute_path, []).append(target)
 
-        for resolved_path, matching_targets in targets_by_path.items():
+        for absolute_path, matching_targets in targets_by_path.items():
+            logical_names = tuple(target.logical_name for target in matching_targets)
             try:
-                os.stat(resolved_path)
+                bound_file = BoundSQLiteFile.open(absolute_path)
             except OSError as exc:
                 if self._is_missing_path_error(exc):
+                    observation = StoreObservation.absent(logical_names, absolute_path)
+                    with self._lock:
+                        self._observations.append(observation)
+                    for target in matching_targets:
+                        observations[target.logical_name] = observation
                     self._record_integrity_outcomes(
                         matching_targets,
                         "skipped-absent",
@@ -244,19 +664,95 @@ class StoreCatalog:
                     outcomes,
                     on_outcome,
                 )
-                self._raise_integrity_error(matching_targets, resolved_path, exc)
+                self._raise_integrity_error(matching_targets, absolute_path, exc)
 
+            retain_bound_file = False
             try:
-                connection = sqlite3.connect(
-                    Path(resolved_path).as_uri() + "?mode=ro",
-                    uri=True,
+                header_journal_mode = bound_file.header_journal_mode()
+                rollback_required = any(
+                    target.journal_mode is not None and target.journal_mode.lower() != "wal"
+                    for target in matching_targets
                 )
+                if header_journal_mode == "wal" and rollback_required:
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "failed-corrupt",
+                        outcomes,
+                        on_outcome,
+                    )
+                    self._raise_integrity_error(
+                        matching_targets,
+                        absolute_path,
+                        "persistent WAL journal conflicts with the required rollback-journal "
+                        "policy; refused before a mode=ro open could create WAL/SHM sidecars",
+                    )
+                observed_journal_mode = header_journal_mode
+                if header_journal_mode == "wal":
+                    connection = self._connect_wal_for_preflight(
+                        bound_file,
+                        absolute_path,
+                    )
+                else:
+                    connection = bound_file.connect_read_only()
                 try:
+                    if any(target.journal_mode is not None for target in matching_targets):
+                        journal_row = connection.execute("PRAGMA journal_mode").fetchone()
+                        if journal_row and journal_row[0]:
+                            observed_journal_mode = str(journal_row[0]).lower()
                     rows = connection.execute("PRAGMA quick_check").fetchall()
                 finally:
                     connection.close()
+
+                path_state = bound_file.path_state()
+                if path_state == "absent":
+                    observation = StoreObservation.absent(logical_names, absolute_path)
+                    with self._lock:
+                        self._observations.append(observation)
+                    for target in matching_targets:
+                        observations[target.logical_name] = observation
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "skipped-absent",
+                        outcomes,
+                        on_outcome,
+                    )
+                    continue
+                if path_state != "same":
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "failed-corrupt",
+                        outcomes,
+                        on_outcome,
+                    )
+                    self._raise_integrity_error(
+                        matching_targets,
+                        absolute_path,
+                        "SQLite path changed physical identity while its preflight fd was held",
+                    )
             except (sqlite3.Error, OSError) as exc:
-                if self._path_is_absent(resolved_path):
+                try:
+                    failure_path_state = bound_file.path_state()
+                except OSError as reconciliation_error:
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "failed-corrupt",
+                        outcomes,
+                        on_outcome,
+                    )
+                    self._raise_integrity_error(
+                        matching_targets,
+                        absolute_path,
+                        "SQLite preflight failed and its reject-only path reconciliation "
+                        f"was unperformable: preflight={type(exc).__name__}: {exc}; "
+                        "reconciliation="
+                        f"{type(reconciliation_error).__name__}: {reconciliation_error}",
+                    )
+                if failure_path_state == "absent":
+                    observation = StoreObservation.absent(logical_names, absolute_path)
+                    with self._lock:
+                        self._observations.append(observation)
+                    for target in matching_targets:
+                        observations[target.logical_name] = observation
                     self._record_integrity_outcomes(
                         matching_targets,
                         "skipped-absent",
@@ -270,28 +766,54 @@ class StoreCatalog:
                     outcomes,
                     on_outcome,
                 )
-                self._raise_integrity_error(matching_targets, resolved_path, exc)
-
-            if rows != [("ok",)]:
+                self._raise_integrity_error(matching_targets, absolute_path, exc)
+            else:
+                if rows != [("ok",)]:
+                    self._record_integrity_outcomes(
+                        matching_targets,
+                        "failed-corrupt",
+                        outcomes,
+                        on_outcome,
+                    )
+                    self._raise_integrity_error(
+                        matching_targets,
+                        absolute_path,
+                        f"PRAGMA quick_check returned {rows!r}",
+                    )
+                observation = StoreObservation(
+                    logical_names=logical_names,
+                    path=absolute_path,
+                    outcome="ok",
+                    journal_mode=observed_journal_mode,
+                    _bound_file=bound_file,
+                )
+                retain_bound_file = True
+                with self._lock:
+                    self._observations.append(observation)
+                for target in matching_targets:
+                    observations[target.logical_name] = observation
                 self._record_integrity_outcomes(
                     matching_targets,
-                    "failed-corrupt",
+                    "ok",
                     outcomes,
                     on_outcome,
                 )
-                self._raise_integrity_error(
-                    matching_targets,
-                    resolved_path,
-                    f"PRAGMA quick_check returned {rows!r}",
-                )
-            self._record_integrity_outcomes(
-                matching_targets,
-                "ok",
-                outcomes,
-                on_outcome,
-            )
+            finally:
+                if not retain_bound_file:
+                    bound_file.close()
 
-        return outcomes
+        return observations
+
+    def _connect_wal_for_preflight(
+        self,
+        bound_file: BoundSQLiteFile,
+        absolute_path: str,
+    ) -> sqlite3.Connection:
+        """Keep tenant-capable catalogs structurally descriptor-only."""
+        raise PermissionError(
+            "descriptor-only store catalog refuses pathname resolution for persistent WAL: "
+            f"{absolute_path!r}"
+        )
 
     @staticmethod
     def _record_integrity_outcomes(
@@ -347,6 +869,7 @@ class StoreCatalog:
         safe boot.
         """
         with self._lock:
+            self._require_observations_unchanged()
             self._refresh_identities()
             records = [entry.record for entry in self._entries if not entry.record.is_memory]
 
@@ -413,8 +936,45 @@ class StoreCatalog:
     def snapshot(self) -> list[StoreRecord]:
         """Return the current canonical records in registration order."""
         with self._lock:
+            self._require_observations_unchanged()
             self._refresh_identities()
             return [entry.record for entry in self._entries]
+
+    def close(self) -> None:
+        """Release every descriptor retained by live preflight observations."""
+        with self._lock:
+            observations = self._observations
+            self._observations = []
+            for entry in self._entries:
+                entry.observation = None
+        closed: set[int] = set()
+        for observation in observations:
+            identity = id(observation)
+            if identity in closed:
+                continue
+            observation.close()
+            closed.add(identity)
+
+    def _require_observations_unchanged(self) -> None:
+        violations: list[str] = []
+        checked: set[int] = set()
+        for observation in self._observations:
+            identity = id(observation)
+            if identity in checked:
+                continue
+            checked.add(identity)
+            try:
+                observation.require_path_unchanged()
+            except OSError as exc:
+                violations.append(
+                    "pinned preflight path changed; refusing replacement: "
+                    f"logical_stores={list(observation.logical_names)!r} "
+                    f"path={observation.path!r} error={type(exc).__name__}: {exc}"
+                )
+        if violations:
+            raise StoreCatalogError(
+                "Store catalog pinned-path reconciliation failed:\n- " + "\n- ".join(violations)
+            )
 
     @staticmethod
     def _stat_identity(path: str) -> tuple[int, int] | None:
@@ -424,16 +984,10 @@ class StoreCatalog:
             return None
         return (stat.st_dev, stat.st_ino)
 
-    @classmethod
-    def _path_is_absent(cls, path: str) -> bool:
-        try:
-            os.stat(path)
-        except OSError as exc:
-            return cls._is_missing_path_error(exc)
-        return False
-
     def _refresh_identities(self) -> None:
         for entry in self._entries:
+            if entry.observation is not None:
+                continue
             record = entry.record
             dev_ino = None if record.is_memory else self._stat_identity(record.resolved_path)
             if dev_ino != record.dev_ino:
@@ -681,3 +1235,140 @@ class StoreCatalog:
             f"path={record.resolved_path!r} journal_mode={record.journal_mode!r} "
             f"dev_ino={record.dev_ino!r} is_memory={record.is_memory!r}"
         )
+
+
+class DaemonStoreCatalog(StoreCatalog):
+    """Fleet catalog allowed to inspect WAL in a verified daemon-only namespace."""
+
+    def register(
+        self,
+        logical_name: str,
+        path: str | os.PathLike[str],
+        *,
+        journal_mode: str,
+        owner: str,
+        criticality: str = "authoritative",
+    ) -> None:
+        """Allow a fleet authority constructor to fulfill a preflight absence."""
+        raw_path = os.fspath(path)
+        absolute_path = os.path.abspath(raw_path)
+        with self._lock:
+            fulfilled_absences = [
+                observation
+                for observation in self._observations
+                if observation.outcome == "skipped-absent"
+                and observation.path == absolute_path
+                and logical_name in observation.logical_names
+            ]
+        super().register(
+            logical_name,
+            path,
+            journal_mode=journal_mode,
+            owner=owner,
+            criticality=criticality,
+        )
+        if fulfilled_absences:
+            with self._lock:
+                self._observations = [
+                    observation
+                    for observation in self._observations
+                    if observation not in fulfilled_absences
+                ]
+
+    def _connect_wal_for_preflight(
+        self,
+        bound_file: BoundSQLiteFile,
+        absolute_path: str,
+    ) -> sqlite3.Connection:
+        """Open fleet WAL only after the namespace itself is proven non-tenant-writable.
+
+        The ownership/mode check is the load-bearing swap defense.  The descriptor
+        inventory below is only corroboration: SQLite may reuse a legitimate prior
+        descriptor for this inode, so finding a matching non-pinned descriptor cannot
+        independently prove which pathname SQLite opened.
+        """
+        resolved_path = self._verified_daemon_owned_path(absolute_path)
+        bound_file.require_path_unchanged()
+        descriptors_before = self._open_descriptor_identities()
+        connection = sqlite3.connect(
+            Path(resolved_path).as_uri() + "?mode=ro",
+            uri=True,
+        )
+        try:
+            descriptors_after = self._open_descriptor_identities()
+            matching_descriptors = {
+                descriptor
+                for descriptor, identity in descriptors_after.items()
+                if descriptor != bound_file.descriptor and identity == bound_file.dev_ino
+            }
+            # Defense in depth only: a pre-existing descriptor can be SQLite's valid
+            # same-inode reuse, but it could also mask a divergent pathname open if the
+            # verified daemon-only namespace fence above were ever bypassed.
+            newly_opened = matching_descriptors.difference(descriptors_before)
+            sqlite_reused = matching_descriptors.intersection(descriptors_before)
+            if not newly_opened and not sqlite_reused:
+                raise OSError(
+                    "pathname-opened WAL database does not match its pinned preflight fd"
+                )
+            bound_file.require_path_unchanged()
+        except BaseException:
+            connection.close()
+            raise
+        return connection
+
+    def _verified_daemon_owned_path(self, absolute_path: str) -> str:
+        """Return a canonical path only when its full directory chain is trusted."""
+        resolved_path = os.path.realpath(absolute_path)
+        resolved_parent = os.path.dirname(resolved_path)
+        if not self._is_under_expected_root(resolved_path):
+            raise PermissionError(
+                "WAL preflight path escapes the daemon-owned catalog root: "
+                f"{resolved_path!r}"
+            )
+
+        daemon_uid = os.geteuid()
+        expected_root = self.expected_root
+        directory = Path(resolved_parent)
+        directories = [directory, *directory.parents]
+        for current in reversed(directories):
+            current_path = os.fspath(current)
+            current_stat = os.stat(current_path, follow_symlinks=False)
+            if not stat.S_ISDIR(current_stat.st_mode):
+                raise PermissionError(
+                    f"WAL preflight path component is not a directory: {current_path!r}"
+                )
+            mode = stat.S_IMODE(current_stat.st_mode)
+            if mode & 0o022:
+                raise PermissionError(
+                    "WAL preflight path component is writable by a non-daemon uid: "
+                    f"path={current_path!r} mode={mode:04o}"
+                )
+            inside_catalog = self._path_at_or_below(current_path, expected_root)
+            allowed_uids = {daemon_uid} if inside_catalog else {0, daemon_uid}
+            if current_stat.st_uid not in allowed_uids:
+                raise PermissionError(
+                    "WAL preflight path component has a non-daemon owner: "
+                    f"path={current_path!r} uid={current_stat.st_uid} "
+                    f"daemon_uid={daemon_uid}"
+                )
+        return resolved_path
+
+    @staticmethod
+    def _path_at_or_below(path: str, root: str) -> bool:
+        try:
+            return os.path.commonpath((root, path)) == root
+        except ValueError:
+            return False
+
+    @staticmethod
+    def _open_descriptor_identities() -> dict[int, tuple[int, int]]:
+        descriptor_root = "/proc/self/fd" if sys.platform == "linux" else "/dev/fd"
+        identities: dict[int, tuple[int, int]] = {}
+        for name in os.listdir(descriptor_root):
+            try:
+                descriptor = int(name)
+                descriptor_stat = os.fstat(descriptor)
+            except (OSError, ValueError):
+                continue
+            identities[descriptor] = (descriptor_stat.st_dev, descriptor_stat.st_ino)
+        return identities

@@ -49,7 +49,9 @@ jobs:
         run: pip install -e ".[dev,acp]"
 
       - name: Run tests
-        run: pytest
+        run: |
+          install -d -m 700 "$RUNNER_TEMP/pinky-pytest"
+          TMPDIR="$RUNNER_TEMP/pinky-pytest" pytest
 
   frontend:
     name: Frontend (build + i18n)
