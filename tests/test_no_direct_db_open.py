@@ -134,6 +134,17 @@ DIRECT_OPEN_ALLOWLIST = {
             "fresh destination for SQLite Online Backup API snapshots (#1112)."
         ),
     ),
+    DirectOpenIdentity(
+        "src/pinky_daemon/store_restore.py",
+        "_verify_static_store",
+    ): AllowlistEntry(
+        expected_count=1,
+        reason=(
+            "Attended daemon-down restore opens only static snapshot, temp, and installed "
+            "files read-only with immutable=1 for quick_check and schema verification (#1116); "
+            "it never opens a live P0.4 preflight store."
+        ),
+    ),
 }
 
 

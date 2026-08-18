@@ -109,6 +109,11 @@ def main() -> None:
         default=50,
         help="Max concurrent sessions (api mode)",
     )
+    parser.add_argument(
+        "--db-path",
+        default="data/conversations.db",
+        help="Canonical conversations DB path (api mode)",
+    )
     args = parser.parse_args()
 
     if args.mode == "api":
@@ -118,7 +123,15 @@ def main() -> None:
 
 
 def _run_api(args) -> None:
-    """Start the stateful API server."""
+    """Start the stateful API server under the lifetime store-authority lock."""
+    from pinky_daemon.store_authority import store_authority_lock
+
+    with store_authority_lock(args.db_path):
+        _run_api_with_authority(args)
+
+
+def _run_api_with_authority(args) -> None:
+    """Construct and serve the API while the caller holds store authority."""
     import uvicorn
 
     from pinky_daemon.api import create_api
@@ -136,6 +149,7 @@ def _run_api(args) -> None:
     app = create_api(
         max_sessions=args.max_sessions,
         default_working_dir=working_dir,
+        db_path=args.db_path,
     )
 
     from pinky_daemon.ferry.config import FerryConfig
