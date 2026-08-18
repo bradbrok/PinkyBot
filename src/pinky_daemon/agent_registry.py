@@ -37,6 +37,10 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from uuid import UUID
 
+from pinky_daemon.agent_signing_key_store import (
+    FLEET_SIGNING_KEY_OWNER,
+    AgentSigningKeyStore,
+)
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
 from pinky_daemon.store_catalog import StoreCatalog
@@ -1415,8 +1419,13 @@ class AgentRegistry:
                 "agents",
                 self._db_path,
                 journal_mode=journal_mode,
-                owner=type(self).__name__,
+                owner=FLEET_SIGNING_KEY_OWNER,
             )
+        self._signing_keys = AgentSigningKeyStore.for_connection(
+            self._db_path,
+            self._db,
+            catalog=catalog,
+        )
         # Guard read-modify-write sequences (e.g. peer_fleet_acl mutation)
         # from concurrent admin-API requests. SQLite connection is shared
         # across threads (check_same_thread=False) and Python's default
@@ -1762,12 +1771,6 @@ class AgentRegistry:
                 UNIQUE(provider, model_id)
             );
 
-            CREATE TABLE IF NOT EXISTS agent_signing_keys (
-                agent_name TEXT PRIMARY KEY,
-                signing_key TEXT NOT NULL,
-                created_at REAL NOT NULL DEFAULT 0
-            );
-
             CREATE TABLE IF NOT EXISTS buzz_identities (
                 agent TEXT PRIMARY KEY NOT NULL,
                 pubkey TEXT NOT NULL
@@ -1875,6 +1878,7 @@ class AgentRegistry:
                 ON buzz_inbound_events(agent, delivery_status, event_created_at);
         """)
         self._db.commit()
+        self._signing_keys.ensure_schema()
         self._migrate()
 
     def _migrate(self) -> None:
@@ -3459,28 +3463,11 @@ except Exception as exc:
 
     def get_or_create_signing_key(self, agent_name: str) -> str:
         """Return the agent's per-agent signing key, generating one on first use."""
-        name = _validate_agent_name(agent_name)
-        row = self._db.execute(
-            "SELECT signing_key FROM agent_signing_keys WHERE agent_name=?", (name,)
-        ).fetchone()
-        if row and row[0]:
-            return row[0]
-        key = secrets.token_urlsafe(32)
-        self._db.execute(
-            "INSERT OR REPLACE INTO agent_signing_keys "
-            "(agent_name, signing_key, created_at) VALUES (?, ?, ?)",
-            (name, key, time.time()),
-        )
-        self._db.commit()
-        return key
+        return self._signing_keys.get_or_create_signing_key(agent_name)
 
     def get_signing_key(self, agent_name: str) -> str | None:
         """Return the agent's signing key if one exists (no generation)."""
-        row = self._db.execute(
-            "SELECT signing_key FROM agent_signing_keys WHERE agent_name=?",
-            (agent_name,),
-        ).fetchone()
-        return row[0] if row and row[0] else None
+        return self._signing_keys.get_signing_key(agent_name)
 
     def _backfill_signing_keys(self) -> None:
         """Generate a signing key for any existing agent that lacks one (#623)."""
@@ -4453,7 +4440,7 @@ except Exception as exc:
         # accept, but once the per-agent key is the sole credential (increment
         # 4) a recreated agent must mint a fresh identity, not resurrect the
         # old one. No FK/cascade on the table, so delete explicitly.
-        self._db.execute("DELETE FROM agent_signing_keys WHERE agent_name=?", (name,))
+        self._signing_keys.delete_signing_key(name)
         self._db.commit()
         if cursor.rowcount > 0:
             _log(f"agents: deleted {name}")

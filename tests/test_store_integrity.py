@@ -356,6 +356,7 @@ def test_manifest_preserves_every_legacy_inline_path_byte_for_byte(tmp_path: Pat
         "conversations": base,
         "analytics": base.replace(".db", "_analytics.db"),
         "agents": base.replace(".db", "_agents.db"),
+        "agent_signing_keys": base.replace(".db", "_agents.db"),
         "audit": base.replace(".db", "_audit.db"),
         "agent_comms": base.replace(".db", "_agent_comms.db"),
         "activity": base.replace(".db", "_activity.db"),

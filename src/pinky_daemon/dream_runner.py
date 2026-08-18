@@ -41,6 +41,7 @@ from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
 from pinky_daemon.store_catalog import StoreCatalog
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
+from pinky_memory.store import ReflectionStore
 
 
 def _log(msg: str) -> None:
@@ -522,28 +523,11 @@ class DreamRunner:
     ) -> set[str]:
         """Return only writes carrying this receipt's enforced correlation tag."""
         db_path = self._memory_db_path(agent_config)
-        if not db_path.exists():
-            return set()
-
-        connection = sqlite3.connect(str(db_path))
-        try:
-            columns = {
-                row[1]
-                for row in connection.execute("PRAGMA table_info(reflections)").fetchall()
-            }
-            embedded_clause = " AND active=1 AND embedding != '[]'" if embedded_only else ""
-            if "source_session_id" not in columns:
-                return set()
-            rows = connection.execute(
-                "SELECT id FROM reflections WHERE source_session_id=?"
-                + embedded_clause,
-                (attempt.correlation_id,),
-            ).fetchall()
-            return {row[0] for row in rows}
-        except sqlite3.OperationalError:
-            return set()
-        finally:
-            connection.close()
+        return ReflectionStore.reflection_ids_for_source_session(
+            os.fspath(db_path),
+            attempt.correlation_id,
+            embedded_only=embedded_only,
+        )
 
     def _begin_reflection_attempt(
         self,

@@ -130,6 +130,7 @@ from pinky_daemon.api_models import (
     WriteAgentFileRequest,
 )
 from pinky_daemon.app_store import AppStore
+from pinky_daemon.audit_store import AuditStore
 from pinky_daemon.auth import (
     INTERNAL_AGENT_HEADER,
     INTERNAL_SIGNATURE_HEADER,
@@ -153,7 +154,6 @@ from pinky_daemon.effort import CLI_EFFORT_LEVELS, EFFORT_LEVELS, resolve_cli_ef
 from pinky_daemon.ferry.config import FerryConfig
 from pinky_daemon.ferry.listener import FerryListenerState
 from pinky_daemon.hooks import (
-    AuditStore,
     HookEvent,
     HookManager,
     create_context_save_hook,
@@ -200,6 +200,10 @@ from pinky_daemon.store_catalog import (
     StoreCatalog,
     StoreCatalogError,
     StoreIntegrityTarget,
+)
+from pinky_daemon.store_manifest import (
+    derive_fleet_store_manifest,
+    derive_standalone_tenant_store_manifest_for_agent,
 )
 from pinky_daemon.store_snapshot import (
     SnapshotResult,
@@ -1702,50 +1706,14 @@ def _derive_api_store_manifest(
     db_path: str | os.PathLike[str],
 ) -> dict[str, StoreIntegrityTarget]:
     """Return the single path and recovery manifest for API boot-opened stores."""
-    base = os.path.realpath(os.fspath(db_path))
-    data_dir = Path(base).parent
+    return derive_fleet_store_manifest(db_path)
 
-    def authoritative(logical_name: str, path: str) -> StoreIntegrityTarget:
-        return StoreIntegrityTarget(
-            logical_name=logical_name,
-            path=path,
-            criticality="authoritative",
-            recovery="snapshot",
-        )
 
-    manifest = {
-        "sessions": authoritative("sessions", base.replace(".db", "_sessions.db")),
-        "session_events": authoritative("session_events", base.replace(".db", "_sessions.db")),
-        "conversations": authoritative("conversations", base),
-        "analytics": authoritative("analytics", base.replace(".db", "_analytics.db")),
-        "agents": authoritative("agents", base.replace(".db", "_agents.db")),
-        "audit": authoritative("audit", base.replace(".db", "_audit.db")),
-        "agent_comms": authoritative("agent_comms", base.replace(".db", "_agent_comms.db")),
-        "activity": authoritative("activity", base.replace(".db", "_activity.db")),
-        "message_context": authoritative(
-            "message_context", base.replace(".db", "_message_context.db")
-        ),
-        "dream_state": authoritative("dream_state", base.replace(".db", "_dream_state.db")),
-        "skills": authoritative("skills", base.replace(".db", "_skills.db")),
-        "plugins": authoritative("plugins", base.replace(".db", "_plugins.db")),
-        "outreach_config": authoritative("outreach_config", base.replace(".db", "_outreach.db")),
-        "tasks": authoritative("tasks", base.replace(".db", "_tasks.db")),
-        "research": authoritative("research", base.replace(".db", "_research.db")),
-        "presentations": authoritative("presentations", base.replace(".db", "_presentations.db")),
-        "apps": authoritative("apps", base.replace(".db", "_apps.db")),
-        "triggers": authoritative("triggers", base.replace(".db", "_triggers.db")),
-        "mesh": authoritative("mesh", base.replace(".db", "_mesh.db")),
-        "kb": authoritative("kb", os.fspath(data_dir / "kb" / "kb.db")),
-        "librarian_state": StoreIntegrityTarget(
-            logical_name="librarian_state",
-            path=base.replace(".db", "_librarian_state.db"),
-            criticality="derived",
-            recovery="rebuild",
-        ),
-        "voice": authoritative("voice", os.fspath(data_dir / "voice_calls.db")),
-        "user_profiles": authoritative("user_profiles", os.fspath(data_dir / "user_profiles.db")),
-    }
-    return manifest
+def _derive_standalone_tenant_store_manifest(
+    agent_name: str,
+) -> dict[str, StoreIntegrityTarget]:
+    """Return the canonical scoped manifest for one Unix-user tenant."""
+    return derive_standalone_tenant_store_manifest_for_agent(agent_name)
 
 
 def create_api(
@@ -1843,6 +1811,39 @@ def create_api(
     store = ConversationStore(db_path=store_manifest["conversations"].path, catalog=store_catalog)
     analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
     agents = AgentRegistry(db_path=store_manifest["agents"].path, catalog=store_catalog)
+    tenant_store_catalogs: dict[str, StoreCatalog] = {}
+    try:
+        for agent in agents.list():
+            if (agent.isolation_mode or "local") != "unix_user":
+                continue
+            tenant_manifest = _derive_standalone_tenant_store_manifest(agent.name)
+            tenant_roots = {
+                os.path.realpath(Path(target.path).parent)
+                for target in tenant_manifest.values()
+            }
+            if len(tenant_roots) != 1:
+                raise StoreCatalogError(
+                    "standalone tenant manifest spans multiple storage roots"
+                )
+            tenant_catalog = StoreCatalog(
+                expected_root=tenant_roots.pop(),
+                silence_allowlist={},
+            )
+            tenant_catalog.preflight_integrity(tenant_manifest.values())
+            for target in tenant_manifest.values():
+                tenant_catalog.register(
+                    target.logical_name,
+                    target.path,
+                    journal_mode="delete",
+                    owner="AgentSigningKeyStore",
+                    criticality=target.criticality,
+                )
+            tenant_catalog.validate()
+            tenant_store_catalogs[agent.name] = tenant_catalog
+    except StoreCatalogError:
+        storage_observability.record_boot_failure()
+        raise
+    app.state.tenant_store_catalogs = tenant_store_catalogs
     _run_grandfather_approved_users_migration(store, agents)
     _refresh_1m_models(agents)
     audit = AuditStore(db_path=store_manifest["audit"].path, catalog=store_catalog)

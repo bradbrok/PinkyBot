@@ -163,6 +163,51 @@ class ReflectionStore:
         self._conn.execute("PRAGMA busy_timeout=5000")
         self._init_schema()
 
+    @staticmethod
+    def reflection_ids_for_source_session(
+        db_path: str,
+        source_session_id: str,
+        *,
+        embedded_only: bool = False,
+    ) -> set[str]:
+        """Read IDs carrying one source-session receipt without migrating.
+
+        This is the narrow repository entry used by DreamRunner's cross-store
+        receipt check. It opens an existing DB read-only, never creates or
+        migrates one, and preserves the historical fail-soft behavior for an
+        absent DB, a pre-source-column schema, or an OperationalError.
+        """
+        path = Path(db_path)
+        if not path.exists():
+            return set()
+        try:
+            connection = sqlite3.connect(
+                path.resolve().as_uri() + "?mode=ro",
+                uri=True,
+            )
+            try:
+                columns = {
+                    row[1]
+                    for row in connection.execute(
+                        "PRAGMA table_info(reflections)"
+                    ).fetchall()
+                }
+                if "source_session_id" not in columns:
+                    return set()
+                embedded_clause = (
+                    " AND active=1 AND embedding != '[]'" if embedded_only else ""
+                )
+                rows = connection.execute(
+                    "SELECT id FROM reflections WHERE source_session_id=?"
+                    + embedded_clause,
+                    (source_session_id,),
+                ).fetchall()
+                return {str(row[0]) for row in rows}
+            finally:
+                connection.close()
+        except (OSError, sqlite3.OperationalError):
+            return set()
+
     def _init_schema(self) -> None:
         self._conn.executescript(SCHEMA)
         self._conn.commit()

@@ -17,6 +17,7 @@ from pinky_daemon.store_authority import (
     assert_no_open_store_descriptors,
     store_authority_lock,
 )
+from pinky_daemon.store_manifest import StoreManifestProvider
 
 _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 
@@ -26,6 +27,7 @@ STORE_SCHEMA_SENTINELS: dict[str, tuple[str, ...]] = {
     "conversations": ("messages", "messages_fts"),
     "analytics": ("analytics_session_facts",),
     "agents": ("agents",),
+    "agent_signing_keys": ("agent_signing_keys",),
     "audit": ("audit_log",),
     "agent_comms": ("messages", "inbox"),
     "activity": ("activity_log",),
@@ -88,6 +90,7 @@ def restore_store(
     db_path: str | os.PathLike[str],
     logical_name: str,
     snapshot_path: str | os.PathLike[str],
+    manifest_provider: StoreManifestProvider,
 ) -> StoreRestoreResult:
     """Preserve one corrupt manifest target and atomically install a snapshot."""
     bounded_name = logical_name if logical_name in STORE_SCHEMA_SENTINELS else "unregistered"
@@ -97,6 +100,7 @@ def restore_store(
                 db_path=db_path,
                 logical_name=logical_name,
                 snapshot_path=snapshot_path,
+                manifest_provider=manifest_provider,
             )
     except (StoreRestoreSelectionError, StoreRestoreSafetyError):
         emit_storage_event(
@@ -145,8 +149,13 @@ def _restore_under_authority(
     db_path: str | os.PathLike[str],
     logical_name: str,
     snapshot_path: str | os.PathLike[str],
+    manifest_provider: StoreManifestProvider,
 ) -> StoreRestoreResult:
-    selected = _select_target(db_path, logical_name)
+    selected = _select_target(
+        db_path,
+        logical_name,
+        manifest_provider=manifest_provider,
+    )
     target = selected.target
     target_paths = _target_and_sidecars(target)
     target_identities = _capture_identities(target_paths)
@@ -203,10 +212,10 @@ def _restore_under_authority(
 def _select_target(
     db_path: str | os.PathLike[str],
     logical_name: str,
+    *,
+    manifest_provider: StoreManifestProvider,
 ) -> _SelectedStore:
-    from pinky_daemon.api import _derive_api_store_manifest
-
-    manifest = _derive_api_store_manifest(db_path)
+    manifest = manifest_provider(db_path)
     if logical_name not in manifest or logical_name not in STORE_SCHEMA_SENTINELS:
         raise StoreRestoreSelectionError("logical store is not registered")
     target = Path(manifest[logical_name].path)

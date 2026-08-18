@@ -736,6 +736,7 @@ def test_create_api_registers_all_authoritative_stores_and_validates_once(
         "outreach_config",
         "user_profiles",
         "agents",
+        "agent_signing_keys",
         "sessions",
         "session_events",
         "activity",
@@ -753,7 +754,7 @@ def test_create_api_registers_all_authoritative_stores_and_validates_once(
         "librarian_state",
         "dream_state",
     }
-    assert len(records) == 23
+    assert len(records) == 24
     assert len({record.resolved_path for record in records}) == 22
     assert {record.journal_mode for record in records} == {"truncate", "wal"}
     assert (

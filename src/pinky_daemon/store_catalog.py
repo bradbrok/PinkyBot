@@ -72,6 +72,36 @@ class _FilesystemDatabase:
     dev_ino: tuple[int, int]
 
 
+class StoreReservation:
+    """One catalog record reserved before its SQLite file is created.
+
+    The entry is visible immediately. Call :meth:`commit` only after creation,
+    durable commit/fsync, identity refresh, and catalog validation succeed.
+    Leaving the context without committing removes the exact reserved entry.
+    """
+
+    def __init__(self, catalog: "StoreCatalog", entry: _CatalogEntry) -> None:
+        self._catalog = catalog
+        self._entry = entry
+        self._committed = False
+
+    def __enter__(self) -> "StoreReservation":
+        return self
+
+    def refresh(self) -> StoreRecord:
+        """Refresh and return the reserved file's current physical identity."""
+        return self._catalog._refresh_reservation(self._entry)
+
+    def commit(self) -> None:
+        """Retain the reservation as a permanent catalog record."""
+        self._catalog._commit_reservation(self._entry)
+        self._committed = True
+
+    def __exit__(self, exc_type, exc, traceback) -> None:
+        if not self._committed:
+            self._catalog._rollback_reservation(self._entry)
+
+
 class StoreCatalog:
     """Observe store connection policy and reject an incoherent boot layout."""
 
@@ -144,6 +174,84 @@ class StoreCatalog:
                     used_relative_path=used_relative_path,
                 )
             )
+
+    def reserve(
+        self,
+        logical_name: str,
+        path: str | os.PathLike[str],
+        *,
+        journal_mode: str,
+        owner: str,
+        criticality: str = "authoritative",
+    ) -> StoreReservation:
+        """Publish an absent store in the catalog before its exclusive create.
+
+        Reservations never coalesce with existing records: a caller trying to
+        reserve an already-declared logical/path/owner tuple is an ownership
+        error, not an idempotent reopen. This keeps rollback scoped to the exact
+        entry created by this call.
+        """
+        raw_path = os.fspath(path)
+        is_memory = self._is_memory_path(raw_path)
+        if is_memory:
+            raise StoreCatalogError("cannot reserve an in-memory store")
+        record = StoreRecord(
+            logical_name=logical_name,
+            resolved_path=os.path.realpath(raw_path),
+            journal_mode=journal_mode.lower(),
+            owner=owner,
+            criticality=criticality,
+            dev_ino=self._stat_identity(os.path.realpath(raw_path)),
+            is_memory=False,
+        )
+        entry = _CatalogEntry(
+            record=record,
+            used_relative_path=not os.path.isabs(raw_path),
+        )
+        with self._lock:
+            if any(
+                current.record.logical_name == record.logical_name
+                and current.record.resolved_path == record.resolved_path
+                and current.record.owner == record.owner
+                for current in self._entries
+            ):
+                raise StoreCatalogError(
+                    "store reservation duplicates an existing catalog record: "
+                    + self._format_record(record)
+                )
+            self._entries.append(entry)
+        return StoreReservation(self, entry)
+
+    def _refresh_reservation(self, entry: _CatalogEntry) -> StoreRecord:
+        with self._lock:
+            if entry not in self._entries:
+                raise StoreCatalogError("store reservation is no longer active")
+            record = entry.record
+            dev_ino = self._stat_identity(record.resolved_path)
+            entry.record = StoreRecord(
+                logical_name=record.logical_name,
+                resolved_path=record.resolved_path,
+                journal_mode=record.journal_mode,
+                owner=record.owner,
+                criticality=record.criticality,
+                dev_ino=dev_ino,
+                is_memory=False,
+            )
+            return entry.record
+
+    def _commit_reservation(self, entry: _CatalogEntry) -> None:
+        with self._lock:
+            if entry not in self._entries:
+                raise StoreCatalogError("store reservation is no longer active")
+            if entry.record.dev_ino is None:
+                raise StoreCatalogError("reserved store has no physical identity")
+
+    def _rollback_reservation(self, entry: _CatalogEntry) -> None:
+        with self._lock:
+            try:
+                self._entries.remove(entry)
+            except ValueError:
+                pass
 
     def validate(self) -> list[str]:
         """Raise for an unsafe layout and return filesystem hygiene warnings."""

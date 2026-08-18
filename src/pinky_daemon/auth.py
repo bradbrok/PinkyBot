@@ -10,6 +10,8 @@ import os
 import time
 from typing import Any
 
+from pinky_daemon.agent_signing_key_store import AgentSigningKeyStore
+
 SESSION_COOKIE_NAME = "pinky_session"
 INTERNAL_AGENT_HEADER = "x-pinky-agent"
 INTERNAL_TIMESTAMP_HEADER = "x-pinky-timestamp"
@@ -179,37 +181,10 @@ def make_db_signing_key_resolver(db_path: str):
     local-mode repair only; an isolated tenant gets a single-agent,
     provisioner-placed key source swapped in behind this same resolver seam.
     """
-    import re
-    import sqlite3
-
-    # Same allowlist the registry/API enforce on agent names. Parameter binding
-    # already neutralizes SQL injection, but validating here keeps the resolver
-    # inside the agent-name trust boundary (@murzik #644 hardening): a malformed
-    # name can never reach the query and simply resolves to None → global fallback.
-    _name_re = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
+    reader = AgentSigningKeyStore.read_only(db_path)
 
     def _resolve(agent_name: str) -> str | None:
-        if not agent_name or not db_path or not _name_re.fullmatch(agent_name):
-            return None
-        try:
-            # #797/#220: the agents DB is now rollback-journal (no WAL), so a
-            # read-only reader can hit SQLITE_BUSY while a writer holds the lock
-            # (WAL allowed concurrent read+write; rollback does not). timeout=5 is
-            # the busy_timeout (Python maps the connect timeout -> busy_timeout),
-            # so the SELECT waits up to 5s; on timeout the except below keeps the
-            # resolver fail-soft (None -> global-secret fallback), never raising
-            # into the request path.
-            conn = sqlite3.connect(f"file:{db_path}?mode=ro", uri=True, timeout=5)
-            try:
-                row = conn.execute(
-                    "SELECT signing_key FROM agent_signing_keys WHERE agent_name=?",
-                    (agent_name,),
-                ).fetchone()
-            finally:
-                conn.close()
-            return row[0] if row and row[0] else None
-        except Exception:
-            return None
+        return reader.get_signing_key(agent_name)
 
     return _resolve
 

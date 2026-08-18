@@ -23,6 +23,7 @@ from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.conversation_store import ConversationStore
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_manifest import manifest_provider_for_kind
 from pinky_daemon.task_store import TaskStore
 
 
@@ -50,6 +51,7 @@ def _restore(
         db_path=os.fspath(base),
         logical_name=logical_name,
         snapshot_path=os.fspath(snapshot_path),
+        manifest_provider=manifest_provider_for_kind("fleet"),
     )
 
 
@@ -804,6 +806,7 @@ def test_restore_cli_is_local_attended_wrapper_with_explicit_selection() -> None
     imported_from = {node.module for node in ast.walk(tree) if isinstance(node, ast.ImportFrom)}
 
     assert "--db-path" in source
+    assert "--manifest-kind" in source
     assert "--logical-name" in source
     assert "--snapshot" in source
     assert "restore_store" in source
