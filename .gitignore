@@ -36,3 +36,42 @@ docs/
 heartbeat.log
 .coverage
 output/
+
+# ─────────────────────────────────────────────────────────────────────
+# Protezione del de-track di #423/#424 (aggiunto 18/08, #405)
+# Quei task hanno de-tracciato ~340 file operativi, ma NESSUNO era
+# ignorato: un solo `git add -A` ne rimetteva dentro 332, segreti
+# compresi, annullando #423 e ricreando #425. Qui NON si cambia cosa e'
+# versionato: i file gia' tracciati restano tracciati (.gitignore non
+# de-traccia). Si chiude solo il rientro accidentale.
+# ─────────────────────────────────────────────────────────────────────
+
+# config/ — in origin/main NON c'e' nessun file tracciato: si puo'
+# ignorare in blocco. I .template restano ammessi: sono documentazione
+# di configurazione, non dati operativi.
+config/*
+!config/*.template
+
+# scripts/ — ATTENZIONE: qui ci sono 15 file sorgente legittimi
+# versionati in origin/main. Si usa `scripts/*` (non `scripts/`) perche'
+# altrimenti git non scende nella directory e le eccezioni sotto non
+# funzionerebbero. Ogni nuovo script che deve essere versionato va
+# aggiunto a questo elenco.
+scripts/*
+!scripts/audit_route_auth_coverage.py
+!scripts/backfill_codex_runtime.py
+!scripts/backfill_embeddings.py
+!scripts/claude_account.py
+!scripts/demo_containerize.py
+!scripts/install-service.sh
+!scripts/kg_ephemeral_sweep.py
+!scripts/rollback_codex_home.py
+!scripts/store_restore.py
+!scripts/store_snapshot.py
+!scripts/v3_export.py
+!scripts/restart.sh
+!scripts/launchctl/
+!scripts/systemd/
+
+# Token in chiaro nella root
+openclaw_token.txt
