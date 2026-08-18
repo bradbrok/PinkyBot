@@ -62,12 +62,16 @@ def _catalog_for(
     return catalog
 
 
-def _live_sidecars(path: Path) -> set[str]:
-    return {
-        suffix
-        for suffix in ("-wal", "-shm", "-journal")
-        if path.with_name(path.name + suffix).exists()
-    }
+def _live_sidecar_inodes(path: Path) -> dict[str, tuple[int, int]]:
+    identities = {}
+    for suffix in ("-wal", "-shm", "-journal"):
+        sidecar = path.with_name(path.name + suffix)
+        try:
+            sidecar_stat = sidecar.stat()
+        except FileNotFoundError:
+            continue
+        identities[suffix] = (sidecar_stat.st_dev, sidecar_stat.st_ino)
+    return identities
 
 
 def test_consistent_copy_reproduces_inventory_and_passes_quick_check(tmp_path: Path) -> None:
@@ -92,22 +96,42 @@ def test_consistent_copy_reproduces_inventory_and_passes_quick_check(tmp_path: P
         copy.close()
 
 
-def test_external_snapshot_reader_never_touches_live_sidecars(tmp_path: Path) -> None:
+@pytest.mark.parametrize("requested_mode", ["delete", "wal"])
+def test_snapshot_preserves_live_sidecar_set_inodes_and_journal_mode(
+    tmp_path: Path,
+    requested_mode: str,
+) -> None:
+    """Keep sidecar existence/inodes stable; WAL read-mark bytes may change in place."""
     snapshot = _snapshot_module()
-    source = tmp_path / "rollback.db"
-    authority_connection, mode = _create_store(source, journal_mode="delete")
-    catalog = _catalog_for(tmp_path, source, journal_mode=mode)
-    before = _live_sidecars(source)
-
-    [result] = snapshot.StoreSnapshotService(catalog).create_snapshots("primary")
-    reader = sqlite3.connect(result.snapshot_path)
+    source = tmp_path / f"{requested_mode}.db"
+    authority_connection, observed_mode = _create_store(
+        source,
+        journal_mode=requested_mode,
+    )
+    catalog = _catalog_for(tmp_path, source, journal_mode=observed_mode)
     try:
-        assert reader.execute("SELECT COUNT(*) FROM inventory").fetchone() == (3,)
+        mode_before = str(authority_connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        sidecars_before = _live_sidecar_inodes(source)
+        if observed_mode == "wal":
+            assert {"-wal", "-shm"}.issubset(sidecars_before)
+        else:
+            assert "-shm" not in sidecars_before
+
+        [result] = snapshot.StoreSnapshotService(catalog).create_snapshots("primary")
+
+        mode_after = str(authority_connection.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+        sidecars_after = _live_sidecar_inodes(source)
     finally:
-        reader.close()
         authority_connection.close()
 
-    assert _live_sidecars(source) == before
+    assert result.verification == "ok"
+    assert set(sidecars_after) == set(sidecars_before)
+    assert sidecars_after == sidecars_before
+    assert mode_before == observed_mode
+    assert mode_after == observed_mode
+    # Deliberately do not compare sidecar bytes or mtimes. A WAL reader's
+    # read-mark bookkeeping may legitimately update -shm bytes in place; inode
+    # stability is what proves there was no unlink-and-recreate cycle.
 
 
 @pytest.mark.parametrize("requested_mode", ["delete", "truncate", "wal"])
