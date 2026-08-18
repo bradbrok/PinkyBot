@@ -7,10 +7,12 @@ import fnmatch
 import logging
 import os
 import re
+import sqlite3
 import stat
 import threading
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
+from pathlib import Path
 from urllib.parse import parse_qsl
 
 logger = logging.getLogger("pinky.store_catalog")
@@ -41,6 +43,16 @@ class StoreRecord:
     criticality: str
     dev_ino: tuple[int, int] | None
     is_memory: bool
+
+
+@dataclass(frozen=True, slots=True)
+class StoreIntegrityTarget:
+    """One API-owned SQLite store that must pass the boot integrity gate."""
+
+    logical_name: str
+    path: str
+    criticality: str = "authoritative"
+    recovery: str = "snapshot"
 
 
 class StoreCatalogError(RuntimeError):
@@ -194,6 +206,80 @@ class StoreCatalog:
 
         return self.reconcile_filesystem()
 
+    def preflight_integrity(self, targets: Iterable[StoreIntegrityTarget]) -> None:
+        """Fail closed when an existing API-owned SQLite file is corrupt.
+
+        Targets that share a physical path are checked once and reported together.
+        Missing and in-memory stores are left for their constructors to create.
+        """
+        targets_by_path: dict[str, list[StoreIntegrityTarget]] = {}
+        for target in targets:
+            raw_path = os.fspath(target.path)
+            if self._is_memory_path(raw_path):
+                continue
+            resolved_path = os.path.realpath(raw_path)
+            targets_by_path.setdefault(resolved_path, []).append(target)
+
+        for resolved_path, matching_targets in targets_by_path.items():
+            try:
+                os.stat(resolved_path)
+            except OSError as exc:
+                if self._is_missing_path_error(exc):
+                    continue
+                self._raise_integrity_error(matching_targets, resolved_path, exc)
+
+            try:
+                connection = sqlite3.connect(
+                    Path(resolved_path).as_uri() + "?mode=ro",
+                    uri=True,
+                )
+                try:
+                    rows = connection.execute("PRAGMA quick_check").fetchall()
+                finally:
+                    connection.close()
+            except (sqlite3.Error, OSError) as exc:
+                if self._path_is_absent(resolved_path):
+                    continue
+                self._raise_integrity_error(matching_targets, resolved_path, exc)
+
+            if rows != [("ok",)]:
+                self._raise_integrity_error(
+                    matching_targets,
+                    resolved_path,
+                    f"PRAGMA quick_check returned {rows!r}",
+                )
+
+    @staticmethod
+    def _raise_integrity_error(
+        targets: list[StoreIntegrityTarget],
+        resolved_path: str,
+        detail: BaseException | str,
+    ) -> None:
+        logical_names = ", ".join(target.logical_name for target in targets)
+        if isinstance(detail, BaseException):
+            rendered_detail = f"{type(detail).__name__}: {detail}"
+        else:
+            rendered_detail = detail
+
+        if any(
+            target.criticality == "authoritative" or target.recovery == "snapshot"
+            for target in targets
+        ):
+            recovery = (
+                "Restore the authoritative store from a P0.3 snapshot or backup before restarting."
+            )
+        else:
+            recovery = "Delete the derived store so it can rebuild before restarting."
+
+        error = StoreCatalogError(
+            "Store integrity preflight failed: "
+            f"logical_stores=[{logical_names}] path={resolved_path!r} "
+            f"error={rendered_detail}. {recovery}"
+        )
+        if isinstance(detail, BaseException):
+            raise error from detail
+        raise error
+
     def reconcile_filesystem(self) -> list[str]:
         """Reconcile registered stores with SQLite files found below the data root.
 
@@ -281,6 +367,14 @@ class StoreCatalog:
         except OSError:
             return None
         return (stat.st_dev, stat.st_ino)
+
+    @classmethod
+    def _path_is_absent(cls, path: str) -> bool:
+        try:
+            os.stat(path)
+        except OSError as exc:
+            return cls._is_missing_path_error(exc)
+        return False
 
     def _refresh_identities(self) -> None:
         for entry in self._entries:

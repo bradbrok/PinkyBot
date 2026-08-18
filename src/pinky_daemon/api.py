@@ -195,7 +195,11 @@ from pinky_daemon.shared_mcp import (
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
-from pinky_daemon.store_catalog import StoreCatalog, StoreCatalogError
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    StoreCatalogError,
+    StoreIntegrityTarget,
+)
 from pinky_daemon.store_snapshot import (
     SnapshotResult,
     StoreSnapshotError,
@@ -1693,6 +1697,56 @@ def _frontend_build_status(
 # ── API Server ───────────────────────────────────────────────
 
 
+def _derive_api_store_manifest(
+    db_path: str | os.PathLike[str],
+) -> dict[str, StoreIntegrityTarget]:
+    """Return the single path and recovery manifest for API boot-opened stores."""
+    base = os.path.realpath(os.fspath(db_path))
+    data_dir = Path(base).parent
+
+    def authoritative(logical_name: str, path: str) -> StoreIntegrityTarget:
+        return StoreIntegrityTarget(
+            logical_name=logical_name,
+            path=path,
+            criticality="authoritative",
+            recovery="snapshot",
+        )
+
+    manifest = {
+        "sessions": authoritative("sessions", base.replace(".db", "_sessions.db")),
+        "session_events": authoritative("session_events", base.replace(".db", "_sessions.db")),
+        "conversations": authoritative("conversations", base),
+        "analytics": authoritative("analytics", base.replace(".db", "_analytics.db")),
+        "agents": authoritative("agents", base.replace(".db", "_agents.db")),
+        "audit": authoritative("audit", base.replace(".db", "_audit.db")),
+        "agent_comms": authoritative("agent_comms", base.replace(".db", "_agent_comms.db")),
+        "activity": authoritative("activity", base.replace(".db", "_activity.db")),
+        "message_context": authoritative(
+            "message_context", base.replace(".db", "_message_context.db")
+        ),
+        "dream_state": authoritative("dream_state", base.replace(".db", "_dream_state.db")),
+        "skills": authoritative("skills", base.replace(".db", "_skills.db")),
+        "plugins": authoritative("plugins", base.replace(".db", "_plugins.db")),
+        "outreach_config": authoritative("outreach_config", base.replace(".db", "_outreach.db")),
+        "tasks": authoritative("tasks", base.replace(".db", "_tasks.db")),
+        "research": authoritative("research", base.replace(".db", "_research.db")),
+        "presentations": authoritative("presentations", base.replace(".db", "_presentations.db")),
+        "apps": authoritative("apps", base.replace(".db", "_apps.db")),
+        "triggers": authoritative("triggers", base.replace(".db", "_triggers.db")),
+        "mesh": authoritative("mesh", base.replace(".db", "_mesh.db")),
+        "kb": authoritative("kb", os.fspath(data_dir / "kb" / "kb.db")),
+        "librarian_state": StoreIntegrityTarget(
+            logical_name="librarian_state",
+            path=base.replace(".db", "_librarian_state.db"),
+            criticality="derived",
+            recovery="rebuild",
+        ),
+        "voice": authoritative("voice", os.fspath(data_dir / "voice_calls.db")),
+        "user_profiles": authoritative("user_profiles", os.fspath(data_dir / "user_profiles.db")),
+    }
+    return manifest
+
+
 def create_api(
     *,
     max_sessions: int = 50,
@@ -1704,6 +1758,8 @@ def create_api(
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
     store_catalog = StoreCatalog(expected_root=_data_dir)
+    store_manifest = _derive_api_store_manifest(db_path)
+    store_catalog.preflight_integrity(store_manifest.values())
     store_snapshot_service = StoreSnapshotService(store_catalog)
 
     app = FastAPI(
@@ -1770,24 +1826,16 @@ def create_api(
             response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
         return response
 
-    session_store = SessionStore(
-        db_path=db_path.replace(".db", "_sessions.db"), catalog=store_catalog
-    )
+    session_store = SessionStore(db_path=store_manifest["sessions"].path, catalog=store_catalog)
     session_event_store = SessionEventStore(
-        db_path=db_path.replace(".db", "_sessions.db"), catalog=store_catalog
+        db_path=store_manifest["session_events"].path, catalog=store_catalog
     )
-    store = ConversationStore(db_path=db_path, catalog=store_catalog)
-    analytics = AnalyticsStore(
-        db_path=db_path.replace(".db", "_analytics.db"), catalog=store_catalog
-    )
-    agents = AgentRegistry(
-        db_path=db_path.replace(".db", "_agents.db"), catalog=store_catalog
-    )
+    store = ConversationStore(db_path=store_manifest["conversations"].path, catalog=store_catalog)
+    analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
+    agents = AgentRegistry(db_path=store_manifest["agents"].path, catalog=store_catalog)
     _run_grandfather_approved_users_migration(store, agents)
     _refresh_1m_models(agents)
-    audit = AuditStore(
-        db_path=db_path.replace(".db", "_audit.db"), catalog=store_catalog
-    )
+    audit = AuditStore(db_path=store_manifest["audit"].path, catalog=store_catalog)
     app.state.audit = audit
     hooks = HookManager(audit_store=audit)
 
@@ -1811,7 +1859,7 @@ def create_api(
         conversation_store=store, agent_registry=agents,
         hook_manager=hooks,
     )
-    _comms_db = db_path.replace(".db", "_agent_comms.db")
+    _comms_db = store_manifest["agent_comms"].path
     comms = AgentComms(db_path=_comms_db, catalog=store_catalog)
 
     # Auth-failure tracker — counts SDK auth errors across all streaming
@@ -2577,11 +2625,9 @@ def create_api(
         )
         return result
 
-    activity = ActivityStore(
-        db_path=db_path.replace(".db", "_activity.db"), catalog=store_catalog
-    )
+    activity = ActivityStore(db_path=store_manifest["activity"].path, catalog=store_catalog)
     message_context_store = MessageContextStore(
-        db_path=db_path.replace(".db", "_message_context.db"),
+        db_path=store_manifest["message_context"].path,
         catalog=store_catalog,
     )
     app.state.activity = activity
@@ -2730,7 +2776,7 @@ def create_api(
         return [m.to_dict() for m in messages]
 
     dream_runner = DreamRunner(
-        db_path=db_path.replace(".db", "_dream_state.db"),
+        db_path=store_manifest["dream_state"].path,
         history_provider=lambda agent_name, after_ts, limit, role: _resolve_agent_history(
             agent_name,
             after_ts=after_ts,
@@ -4156,9 +4202,7 @@ def create_api(
 
         return closed
 
-    skills = SkillStore(
-        db_path=db_path.replace(".db", "_skills.db"), catalog=store_catalog
-    )
+    skills = SkillStore(db_path=store_manifest["skills"].path, catalog=store_catalog)
     _seed_core_skills(skills)
 
     # Discover SKILL.md files from filesystem and register them
@@ -4169,7 +4213,7 @@ def create_api(
 
     # Initialize plugin manager and discover Python plugins
     plugins = PluginManager(
-        db_path=db_path.replace(".db", "_plugins.db"),
+        db_path=store_manifest["plugins"].path,
         api_url="http://localhost:8888",
         working_dir=default_working_dir,
         catalog=store_catalog,
@@ -4183,26 +4227,16 @@ def create_api(
             plugins.register_in_skill_store(skills, pname)
 
     outreach_config = OutreachConfigStore(
-        db_path=db_path.replace(".db", "_outreach.db"), catalog=store_catalog
+        db_path=store_manifest["outreach_config"].path, catalog=store_catalog
     )
-    tasks = TaskStore(
-        db_path=db_path.replace(".db", "_tasks.db"), catalog=store_catalog
-    )
-    research = ResearchStore(
-        db_path=db_path.replace(".db", "_research.db"), catalog=store_catalog
-    )
+    tasks = TaskStore(db_path=store_manifest["tasks"].path, catalog=store_catalog)
+    research = ResearchStore(db_path=store_manifest["research"].path, catalog=store_catalog)
     presentations = PresentationStore(
-        db_path=db_path.replace(".db", "_presentations.db"), catalog=store_catalog
+        db_path=store_manifest["presentations"].path, catalog=store_catalog
     )
-    app_store = AppStore(
-        db_path=db_path.replace(".db", "_apps.db"), catalog=store_catalog
-    )
-    trigger_store = TriggerStore(
-        db_path=db_path.replace(".db", "_triggers.db"), catalog=store_catalog
-    )
-    mesh_store = MeshStore(
-        db_path=db_path.replace(".db", "_mesh.db"), catalog=store_catalog
-    )
+    app_store = AppStore(db_path=store_manifest["apps"].path, catalog=store_catalog)
+    trigger_store = TriggerStore(db_path=store_manifest["triggers"].path, catalog=store_catalog)
+    mesh_store = MeshStore(db_path=store_manifest["mesh"].path, catalog=store_catalog)
 
     # Ferry host-callback (cross-fleet inbound). Constructed here so it shares
     # the live registry + broker + mesh_store; stashed on app.state for the
@@ -4220,12 +4254,15 @@ def create_api(
     )
 
     # Knowledge Base — project-level, all agents share
-    kb = KBStore(data_dir=_data_dir, catalog=store_catalog)
+    kb = KBStore(
+        data_dir=Path(store_manifest["kb"].path).parent.parent,
+        catalog=store_catalog,
+    )
 
     # KB Librarian runner — curates wiki pages from raw sources
     librarian_runner = LibrarianRunner(
         kb_store=kb,
-        db_path=db_path.replace(".db", "_librarian_state.db"),
+        db_path=store_manifest["librarian_state"].path,
         catalog=store_catalog,
     )
     app.state.librarian_runner = librarian_runner
@@ -4499,9 +4536,7 @@ def create_api(
         from pinky_daemon.voice_routes import set_dependencies as _voice_set_deps
         from pinky_daemon.voice_store import VoiceStore
 
-        _voice_store = VoiceStore(
-            db_path=str(_data_dir / "voice_calls.db"), catalog=store_catalog
-        )
+        _voice_store = VoiceStore(db_path=store_manifest["voice"].path, catalog=store_catalog)
         _voice_base_url = (
             agents.get_setting("PINKY_BASE_URL")
             or os.environ.get("PINKY_BASE_URL", "")
@@ -13532,7 +13567,7 @@ npm run build</pre>
     from pinky_daemon.user_profile_store import UserProfileStore
 
     user_profiles = UserProfileStore(
-        db_path=str(_data_dir / "user_profiles.db"), catalog=store_catalog
+        db_path=store_manifest["user_profiles"].path, catalog=store_catalog
     )
 
     from pinky_daemon.routes.user_profiles import router as _user_profiles_router

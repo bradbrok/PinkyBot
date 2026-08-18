@@ -115,6 +115,16 @@ DIRECT_OPEN_ALLOWLIST = {
         ),
     ),
     DirectOpenIdentity(
+        "src/pinky_daemon/store_catalog.py",
+        "StoreCatalog.preflight_integrity",
+    ): AllowlistEntry(
+        expected_count=1,
+        reason=(
+            "Daemon-internal storage authority opens each manifest-selected existing store "
+            "read-only for boot-time PRAGMA quick_check (#1114)."
+        ),
+    ),
+    DirectOpenIdentity(
         "src/pinky_daemon/store_snapshot.py",
         "StoreSnapshotService._backup_and_verify",
     ): AllowlistEntry(
