@@ -541,6 +541,8 @@ def test_snapshot_selection_denial_is_audited(
     assert response.status_code == 400
     entries = client.app.state.audit.get_log(event="store_snapshot", limit=5)
     assert len(entries) == 1
+    assert entries[0].agent_name == "operator"
+    assert entries[0].success is False
     summary = json.loads(entries[0].tool_input_summary)
     assert summary == {
         "requested": [logical_name],
@@ -572,6 +574,7 @@ def test_unexpected_per_store_exception_reaches_controlled_500(
 
     assert response.status_code == 500
     assert response.json() == {"detail": "store snapshot failed"}
+    assert client.app.state.audit.get_log(event="store_snapshot", limit=5) == []
 
 
 def test_missing_registered_store_is_reported_without_sinking_batch(tmp_path: Path) -> None:

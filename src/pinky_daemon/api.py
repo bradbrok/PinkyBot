@@ -5165,8 +5165,29 @@ def create_api(
         caller: str,
         logical_name: str | None,
         result: SnapshotResult | None,
+        *,
+        selection_error: StoreSnapshotSelectionError | None = None,
     ) -> None:
         requested_names = [logical_name] if logical_name is not None else ["*authoritative*"]
+        if selection_error is not None:
+            audit.log(
+                "store_snapshot",
+                agent_name=caller,
+                tool_name="store_snapshot",
+                tool_input_summary=json.dumps(
+                    {
+                        "requested": requested_names,
+                        "logical_names": [],
+                        "status": "denied",
+                        "path": None,
+                        "verification": "not_run",
+                        "error": str(selection_error),
+                    },
+                    separators=(",", ":"),
+                ),
+                success=False,
+            )
+            return
         if result is None:
             audit.log(
                 "store_snapshot",
@@ -5178,6 +5199,7 @@ def create_api(
                         "logical_names": [],
                         "status": "success",
                         "path": None,
+                        "verification": "no_matching_authoritative_stores",
                         "error": None,
                     },
                     separators=(",", ":"),
@@ -5194,6 +5216,7 @@ def create_api(
                     "logical_names": list(result.logical_names),
                     "status": result.status,
                     "path": result.snapshot_path,
+                    "verification": result.verification,
                     "error": str(result.error) if result.error is not None else None,
                 },
                 separators=(",", ":"),
@@ -5239,6 +5262,18 @@ def create_api(
                 ),
             )
         except StoreSnapshotSelectionError as exc:
+            try:
+                _audit_store_snapshot(
+                    caller,
+                    req.logical_name,
+                    None,
+                    selection_error=exc,
+                )
+            except Exception as audit_exc:
+                error = StoreSnapshotError("snapshot selection-denial audit failed")
+                error.__cause__ = audit_exc
+                _log(f"store-snapshot: selection audit failed for caller={caller!r}")
+                raise HTTPException(500, "store snapshot failed") from error
             raise HTTPException(400, str(exc)) from exc
         except StoreSnapshotError as exc:
             _log(f"store-snapshot: failed for caller={caller!r}: {type(exc).__name__}")

@@ -115,7 +115,7 @@ class StoreSnapshotService:
     def _snapshot_outcome(self, store: _SelectedStore) -> SnapshotResult:
         try:
             return self._snapshot_selected(store)
-        except Exception as exc:
+        except (StoreSnapshotError, sqlite3.Error, OSError) as exc:
             error = self._as_snapshot_error(store, exc)
             return SnapshotResult(
                 logical_names=store.logical_names,
