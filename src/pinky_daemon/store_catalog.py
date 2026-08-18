@@ -238,6 +238,8 @@ class StoreCatalog:
                 finally:
                     connection.close()
             except (sqlite3.Error, OSError) as exc:
+                if self._path_is_absent(resolved_path):
+                    continue
                 self._raise_integrity_error(matching_targets, resolved_path, exc)
 
             if rows != [("ok",)]:
@@ -365,6 +367,14 @@ class StoreCatalog:
         except OSError:
             return None
         return (stat.st_dev, stat.st_ino)
+
+    @classmethod
+    def _path_is_absent(cls, path: str) -> bool:
+        try:
+            os.stat(path)
+        except OSError as exc:
+            return cls._is_missing_path_error(exc)
+        return False
 
     def _refresh_identities(self) -> None:
         for entry in self._entries:

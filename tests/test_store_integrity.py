@@ -48,9 +48,7 @@ def _manifest(db_path: Path) -> dict[str, Any]:
 def _create_database(path: Path, *, journal_mode: str = "delete") -> sqlite3.Connection:
     path.parent.mkdir(parents=True, exist_ok=True)
     connection = sqlite3.connect(path)
-    observed = str(
-        connection.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0]
-    ).lower()
+    observed = str(connection.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()[0]).lower()
     assert observed == journal_mode
     connection.execute("CREATE TABLE inventory (id INTEGER PRIMARY KEY, value TEXT NOT NULL)")
     connection.execute("INSERT INTO inventory(value) VALUES ('seed')")
@@ -160,6 +158,52 @@ def test_absent_store_is_skipped_without_opening(
     catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
 
     _preflight(catalog, [_target("not_created", source)])
+
+
+def test_store_disappearing_during_connect_is_treated_as_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "raced-away-during-connect.db"
+    connection = _create_database(source)
+    connection.close()
+    real_connect = sqlite3.connect
+
+    def disappear_then_connect(*args: Any, **kwargs: Any) -> sqlite3.Connection:
+        source.unlink()
+        return real_connect(*args, **kwargs)
+
+    monkeypatch.setattr(sqlite3, "connect", disappear_then_connect)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    _preflight(catalog, [_target("raced_away_during_connect", source)])
+
+    assert not source.exists()
+
+
+def test_store_disappearing_during_quick_check_is_treated_as_absent(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = tmp_path / "raced-away-during-quick-check.db"
+    connection = _create_database(source)
+    connection.close()
+
+    class DisappearingQuickCheckConnection(_RecordingConnection):
+        def execute(self, statement: str) -> _RecordingConnection:
+            self.statements.append(statement)
+            source.unlink()
+            raise sqlite3.OperationalError("database disappeared during quick_check")
+
+    probe = DisappearingQuickCheckConnection([])
+    monkeypatch.setattr(sqlite3, "connect", lambda *_args, **_kwargs: probe)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
+
+    _preflight(catalog, [_target("raced_away_during_quick_check", source)])
+
+    assert probe.statements == ["PRAGMA quick_check"]
+    assert probe.closed is True
+    assert not source.exists()
 
 
 def test_memory_store_is_skipped_without_opening(
