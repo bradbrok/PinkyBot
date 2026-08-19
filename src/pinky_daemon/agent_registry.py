@@ -5746,6 +5746,23 @@ except Exception as exc:
         )
         return cursor.rowcount
 
+    def has_released_pending_wakes(self, agent_name: str) -> bool:
+        """Whether this agent holds active rows released from drain parking.
+
+        Replay triggers on confirm evidence key on THIS, not on any active
+        row: ordinary next-session backlog (never parked) must keep its
+        documented turn-idle/drain boundary, and a transiently failed FIFO
+        row must keep its attempt cadence.
+        """
+        row = self._db.execute(
+            """SELECT 1 FROM pending_schedule_wakes
+               WHERE agent_name=? AND released_at>0 AND accepted_at=0
+                 AND parked_at=0 AND abandoned_at=0 AND drain_parked_at=0
+               LIMIT 1""",
+            (agent_name,),
+        ).fetchone()
+        return row is not None
+
     def list_drain_parked_agent_names(self) -> list[str]:
         """Name every agent holding recoverable drain-parked wake debt."""
         rows = self._db.execute(

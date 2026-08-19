@@ -4657,15 +4657,18 @@ class TestScheduler:
             registry, schedule.id, older_fired_at
         ).accept() is True
         await asyncio.gather(*list(scheduler._detached_receipt_tasks))
-        for _ in range(200):
-            if deliveries:
+        ledger = None
+        for _ in range(300):
+            ledger = registry.get_schedule_wake_by_fire(
+                parked_schedule.id, parked_row.fired_at
+            )
+            if ledger is not None and ledger.ledger_state == (
+                "receipted-ran-once"
+            ):
                 break
             await asyncio.sleep(0.01)
 
         assert deliveries == ["parked work"]
-        ledger = registry.get_schedule_wake_by_fire(
-            parked_schedule.id, parked_row.fired_at
-        )
         assert ledger is not None
         assert ledger.ledger_state == "receipted-ran-once"
 

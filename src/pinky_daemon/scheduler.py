@@ -1148,31 +1148,31 @@ class AgentScheduler:
             # #635 B1: the durable confirm above already released this
             # agent's drain-parked debt at the authoritative edge (the
             # ledgerless branch releases here instead). Schedule a coalesced
-            # replay whenever released rows — or any other active debt —
-            # remain owed, so real positive transport evidence drains them
-            # promptly instead of waiting for the minute-level probe.
+            # replay ONLY when released rows remain owed: ordinary
+            # next-session backlog keeps its documented turn-idle/drain
+            # boundary, and a transiently failed FIFO row keeps its attempt
+            # cadence — neither carries release provenance.
             try:
                 released = self._registry.release_drain_parked_schedule_wakes(
                     schedule.agent_name
                 )
-                has_active = bool(
-                    self._registry.list_pending_schedule_wakes(
-                        schedule.agent_name
-                    )
+                has_released = self._registry.has_released_pending_wakes(
+                    schedule.agent_name
                 )
             except Exception as exc:
                 released = 0
-                has_active = False
+                has_released = False
                 _log(
                     "scheduler: OUTBOX_DRAIN_UNPARK_FAILURE for "
                     f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
                 )
-            if released or has_active:
+            if released or has_released:
                 self._outbox_drain_extensions.pop(schedule.agent_name, None)
                 _log(
                     f"scheduler: OUTBOX_DRAIN_UNPARKED agent="
                     f"'{schedule.agent_name}' released={released} "
-                    f"active={has_active} on confirmed live delivery"
+                    f"released_pending={has_released} on confirmed live "
+                    "delivery"
                 )
                 self.replay_pending_for_agent(schedule.agent_name)
             if self._activity:
@@ -1779,6 +1779,7 @@ class AgentScheduler:
                             schedule_id=schedule_id,
                             fired_at=fired_at,
                         )
+                        self._replay_released_debt(schedule.agent_name)
                         return
                     if not self._wake_prompt_inflight(
                         schedule, prompt=prompt
@@ -1798,6 +1799,7 @@ class AgentScheduler:
                                 schedule_id=schedule_id,
                                 fired_at=fired_at,
                             )
+                            self._replay_released_debt(schedule.agent_name)
                         return
                     await asyncio.sleep(
                         _ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC
@@ -1813,6 +1815,30 @@ class AgentScheduler:
 
         self._track_detached_receipt_task(_observe_existing_receipt())
         return True
+
+    def _replay_released_debt(self, agent_name: str) -> None:
+        """Coalesce a replay when released drain-park debt remains owed.
+
+        Called on late positive receipts: the durable confirm released the
+        debt at the authoritative edge, and this is the in-process follow-up
+        so it drains promptly instead of waiting for the minute-level probe.
+        Keys strictly on release provenance — never ordinary backlog.
+        """
+        try:
+            if not self._registry.has_released_pending_wakes(agent_name):
+                return
+        except Exception as exc:
+            _log(
+                "scheduler: released-debt check failed for "
+                f"'{agent_name}': {type(exc).__name__}: {exc}"
+            )
+            return
+        self._outbox_drain_extensions.pop(agent_name, None)
+        _log(
+            f"scheduler: OUTBOX_DRAIN_UNPARKED agent='{agent_name}' "
+            "released_pending=True on late positive receipt"
+        )
+        self.replay_pending_for_agent(agent_name)
 
     def _track_detached_receipt_task(self, observer) -> None:
         """Run one late-receipt observer outside the per-agent delivery lock."""
@@ -2655,28 +2681,28 @@ class AgentScheduler:
             # #635 B1: a confirmed delivery is transport-idle evidence on any
             # replay path. The durable confirm already released parked debt
             # at the authoritative edge; sweep any residue and schedule a
-            # coalesced follow-up pass whenever released rows — or other
-            # active debt that joined mid-pass — remain owed.
+            # coalesced follow-up pass ONLY when released rows remain owed —
+            # never for ordinary backlog or a transiently failed FIFO row.
             try:
                 released = self._registry.release_drain_parked_schedule_wakes(
                     agent_name
                 )
-                has_active = bool(
-                    self._registry.list_pending_schedule_wakes(agent_name)
+                has_released = self._registry.has_released_pending_wakes(
+                    agent_name
                 )
             except Exception as exc:
                 released = 0
-                has_active = False
+                has_released = False
                 _log(
                     "scheduler: OUTBOX_DRAIN_UNPARK_FAILURE for "
                     f"'{agent_name}': {type(exc).__name__}: {exc}"
                 )
-            if released or has_active:
+            if released or has_released:
                 self._outbox_drain_extensions.pop(agent_name, None)
                 _log(
                     f"scheduler: OUTBOX_DRAIN_UNPARKED agent='{agent_name}' "
-                    f"released={released} active={has_active} on confirmed "
-                    "delivery"
+                    f"released={released} released_pending={has_released} "
+                    "on confirmed delivery"
                 )
                 self.replay_pending_for_agent(agent_name)
 
