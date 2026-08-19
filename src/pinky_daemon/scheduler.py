@@ -1619,6 +1619,10 @@ class AgentScheduler:
                 self._log_late_abandoned_receipt(
                     schedule, schedule_id=schedule_id, fired_at=fired_at
                 )
+                # The durable confirm above released this agent's parked
+                # debt at the authoritative edge; supply the in-process
+                # coalesced follow-up, same as every other acceptance path.
+                self._replay_released_debt(schedule.agent_name)
             except asyncio.CancelledError:
                 raise
             except Exception as exc:

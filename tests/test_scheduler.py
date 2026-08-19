@@ -4673,6 +4673,85 @@ class TestScheduler:
         assert ledger.ledger_state == "receipted-ran-once"
 
     @pytest.mark.asyncio
+    async def test_receipt_wait_late_confirm_replays_released_debt(
+        self, registry
+    ):
+        """R7 follow-up: the receipt-extension abandon path's OWN late
+        observer must also replay the debt its durable confirm released —
+        both detached observers share the acceptance contract."""
+        registry.register("oleg")
+        parked_schedule = registry.add_schedule(
+            "oleg", "0 9 * * *", name="parked lane", prompt="parked work"
+        )
+        parked_row, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="oleg",
+            schedule_name=parked_schedule.name,
+            prompt=parked_schedule.prompt,
+            fired_at=time.time() - 30,
+        )
+        assert registry.drain_park_pending_schedule_wake(parked_row.id)
+        schedule = registry.add_schedule(
+            "oleg", "* * * * *", name="bounded busy", prompt="run once"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        schedule.last_run = fired_at
+        receipt = asyncio.get_running_loop().create_future()
+        deliveries: list[str] = []
+        first_call = [True]
+        busy = [True]
+
+        async def wake_cb(agent_name, session_id, prompt):
+            del agent_name, session_id
+            if first_call[0]:
+                first_call[0] = False
+                return receipt
+            deliveries.append(prompt)
+            return True
+
+        async def owner_notify(agent_name, message):
+            del agent_name, message
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=wake_cb,
+            delivery_busy_fn=lambda agent_name: busy[0],
+            delivery_inflight_fn=lambda agent_name, prompt: True,
+            owner_notify_callback=owner_notify,
+            schedule_delivery_timeout=0.01,
+            receipt_extension_attempt_cap=1,
+            receipt_extension_max_age_sec=1_000.0,
+            pending_wake_max_age_sec=100_000,
+        )
+        await scheduler._deliver_schedule(schedule)
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, fired_at
+        ).ledger_state == "abandoned"
+
+        # The transport's receipt lands late with the pane now free: the
+        # observer's durable confirm releases parked debt and must replay it.
+        busy[0] = False
+        receipt.set_result(True)
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        ledger = None
+        for _ in range(300):
+            ledger = registry.get_schedule_wake_by_fire(
+                parked_schedule.id, parked_row.fired_at
+            )
+            if ledger is not None and ledger.ledger_state == (
+                "receipted-ran-once"
+            ):
+                break
+            await asyncio.sleep(0.01)
+
+        assert deliveries == ["parked work"]
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
+        await scheduler.stop()
+
+    @pytest.mark.asyncio
     async def test_restart_after_durable_accept_recovers_parked_debt(
         self, registry
     ):
