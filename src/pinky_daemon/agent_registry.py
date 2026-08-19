@@ -2017,24 +2017,13 @@ class AgentRegistry:
             if col not in sched_existing:
                 self._db.execute(f"ALTER TABLE agent_schedules ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to agent_schedules")
-        if "last_accepted_fired_at" not in sched_existing:
-            # Backfill the supersession authority from retained accepted wake
-            # rows: that evidence is provable at upgrade time, and discarding
-            # it would let an already-superseded old occurrence replay after
-            # the upgrade. Schedules whose receipts were already reaped keep
-            # the conservative zero (floor inert until the next accept).
-            self._db.execute(
-                """UPDATE agent_schedules
-                   SET last_accepted_fired_at=COALESCE(
-                       (SELECT MAX(w.fired_at) FROM pending_schedule_wakes w
-                        WHERE w.schedule_id=agent_schedules.id
-                          AND w.accepted_at>0),
-                       0)"""
-            )
-            _log(
-                "agent_registry: migrated — backfilled "
-                "last_accepted_fired_at from retained accepted wakes"
-            )
+        # The last_accepted_fired_at backfill reads pending_schedule_wakes
+        # columns, so it MUST run after the wake-table migration below —
+        # released upgrade sources have the wake table without accepted_at,
+        # and reading it here would abort the reopen (boot-brick).
+        backfill_accepted_authority = (
+            "last_accepted_fired_at" not in sched_existing
+        )
 
         # Migrate pending_schedule_wakes table
         wake_existing = {
@@ -2074,6 +2063,27 @@ class AgentRegistry:
                    accepted_at, parked_at, abandoned_at, fired_at
                )"""
         )
+        if backfill_accepted_authority:
+            # Backfill the supersession authority from retained accepted wake
+            # rows: that evidence is provable at upgrade time, and discarding
+            # it would let an already-superseded old occurrence replay after
+            # the upgrade. Runs after the wake migration so accepted_at is
+            # guaranteed to exist; schedules whose receipts were already
+            # reaped (or upgrade sources that never had accepted stamps)
+            # keep the conservative zero — the floor stays inert until the
+            # next accept, which fails safe toward delivering.
+            self._db.execute(
+                """UPDATE agent_schedules
+                   SET last_accepted_fired_at=COALESCE(
+                       (SELECT MAX(w.fired_at) FROM pending_schedule_wakes w
+                        WHERE w.schedule_id=agent_schedules.id
+                          AND w.accepted_at>0),
+                       0)"""
+            )
+            _log(
+                "agent_registry: migrated — backfilled "
+                "last_accepted_fired_at from retained accepted wakes"
+            )
         self._db.commit()
 
         # Migrate agent_heartbeats table
@@ -5709,17 +5719,31 @@ except Exception as exc:
         recurrence-supersession floor keys on the column and no park-reason
         text — any case, any content — can dodge it.
         """
-        timestamp = time.time()
         with self._rmw_lock:
-            cursor = self._db.execute(
-                """UPDATE pending_schedule_wakes
-                   SET drain_parked_at=0,
-                       released_at=?
-                   WHERE agent_name=? AND drain_parked_at>0
-                     AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
-                (timestamp, agent_name),
+            released = self._release_drain_parked_locked(
+                agent_name, time.time()
             )
             self._db.commit()
+        return released
+
+    def _release_drain_parked_locked(
+        self, agent_name: str, timestamp: float
+    ) -> int:
+        """Release one agent's drain-parked rows; caller holds the rmw lock.
+
+        Shared by the public release and both durable confirm transitions:
+        a positive receipt is release evidence AT THE DURABLE EDGE, so a
+        process crash between the durable accept and any in-process
+        confirmed-handling can never strand recoverable debt (#991 seam).
+        """
+        cursor = self._db.execute(
+            """UPDATE pending_schedule_wakes
+               SET drain_parked_at=0,
+                   released_at=?
+               WHERE agent_name=? AND drain_parked_at>0
+                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
+            (timestamp, agent_name),
+        )
         return cursor.rowcount
 
     def list_drain_parked_agent_names(self) -> list[str]:
@@ -5794,7 +5818,7 @@ except Exception as exc:
         timestamp = delivered_at or time.time()
         with self._rmw_lock:
             row = self._db.execute(
-                """SELECT schedule_id, accepted_at, fired_at
+                """SELECT schedule_id, accepted_at, fired_at, agent_name
                    FROM pending_schedule_wakes WHERE id=?""",
                 (pending_id,),
             ).fetchone()
@@ -5818,6 +5842,9 @@ except Exception as exc:
                    WHERE id=?""",
                 (timestamp, pending_id),
             )
+            # A durable positive receipt is release evidence for every
+            # other drain-parked row this agent holds (#635, #991 seam).
+            self._release_drain_parked_locked(str(row[3]), timestamp)
             self._db.commit()
         return True
 
@@ -5832,7 +5859,8 @@ except Exception as exc:
         timestamp = delivered_at or time.time()
         with self._rmw_lock:
             row = self._db.execute(
-                """SELECT id, accepted_at FROM pending_schedule_wakes
+                """SELECT id, accepted_at, agent_name
+                   FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
             ).fetchone()
@@ -5856,6 +5884,9 @@ except Exception as exc:
                    WHERE schedule_id=? AND fired_at=?""",
                 (timestamp, schedule_id, fired_at),
             )
+            # A durable positive receipt is release evidence for every
+            # other drain-parked row this agent holds (#635, #991 seam).
+            self._release_drain_parked_locked(str(row[2]), timestamp)
             self._db.commit()
         newly_receipted = float(row[1]) == 0
         if newly_receipted:

@@ -1145,27 +1145,34 @@ class AgentScheduler:
                     delivered_at,
                     accepted_fired_at=schedule.last_run,
                 )
-            # #635 B1: every confirmed delivery — live, replay, or
-            # ledgerless — is release evidence for this agent's drain-parked
-            # debt. Without this, the minute-level drain probe (the exact
-            # evidence class this fix distrusts) would be the only recovery
-            # edge for parked-only agents.
+            # #635 B1: the durable confirm above already released this
+            # agent's drain-parked debt at the authoritative edge (the
+            # ledgerless branch releases here instead). Schedule a coalesced
+            # replay whenever released rows — or any other active debt —
+            # remain owed, so real positive transport evidence drains them
+            # promptly instead of waiting for the minute-level probe.
             try:
                 released = self._registry.release_drain_parked_schedule_wakes(
                     schedule.agent_name
                 )
+                has_active = bool(
+                    self._registry.list_pending_schedule_wakes(
+                        schedule.agent_name
+                    )
+                )
             except Exception as exc:
                 released = 0
+                has_active = False
                 _log(
                     "scheduler: OUTBOX_DRAIN_UNPARK_FAILURE for "
                     f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
                 )
-            if released:
+            if released or has_active:
                 self._outbox_drain_extensions.pop(schedule.agent_name, None)
                 _log(
                     f"scheduler: OUTBOX_DRAIN_UNPARKED agent="
-                    f"'{schedule.agent_name}' released={released} on "
-                    "confirmed live delivery"
+                    f"'{schedule.agent_name}' released={released} "
+                    f"active={has_active} on confirmed live delivery"
                 )
                 self.replay_pending_for_agent(schedule.agent_name)
             if self._activity:
@@ -2646,23 +2653,30 @@ class AgentScheduler:
             )
         if delivered_any:
             # #635 B1: a confirmed delivery is transport-idle evidence on any
-            # replay path. Release parked debt and schedule a coalesced
-            # follow-up pass so it drains through the normal replay policy.
+            # replay path. The durable confirm already released parked debt
+            # at the authoritative edge; sweep any residue and schedule a
+            # coalesced follow-up pass whenever released rows — or other
+            # active debt that joined mid-pass — remain owed.
             try:
                 released = self._registry.release_drain_parked_schedule_wakes(
                     agent_name
                 )
+                has_active = bool(
+                    self._registry.list_pending_schedule_wakes(agent_name)
+                )
             except Exception as exc:
                 released = 0
+                has_active = False
                 _log(
                     "scheduler: OUTBOX_DRAIN_UNPARK_FAILURE for "
                     f"'{agent_name}': {type(exc).__name__}: {exc}"
                 )
-            if released:
+            if released or has_active:
                 self._outbox_drain_extensions.pop(agent_name, None)
                 _log(
                     f"scheduler: OUTBOX_DRAIN_UNPARKED agent='{agent_name}' "
-                    f"released={released} on confirmed delivery"
+                    f"released={released} active={has_active} on confirmed "
+                    "delivery"
                 )
                 self.replay_pending_for_agent(agent_name)
 
