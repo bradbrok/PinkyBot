@@ -7294,7 +7294,9 @@ class TmuxSession(TransportReplacementMixin):
         sources: list[_TranscriptCandidateSource | None] = []
         handles: dict[_TranscriptSourceKey, object] = {}
         scan_starts: dict[_TranscriptSourceKey, int] = {}
-        budget_remaining: dict[_TranscriptSourceKey, int] = {}
+        # One reconciliation gets one bounded synchronous-read budget across
+        # every physical transcript source, including boundary-anchor reads.
+        budget_remaining = _PHANTOM_TRANSCRIPT_SCAN_BYTES
         anchor_checks: dict[
             tuple[_TranscriptSourceKey, int, int, bytes],
             bool,
@@ -7339,9 +7341,6 @@ class TmuxSession(TransportReplacementMixin):
 
                 key = (opened.st_dev, opened.st_ino)
                 handles.setdefault(key, handle)
-                budget_remaining.setdefault(
-                    key, _PHANTOM_TRANSCRIPT_SCAN_BYTES
-                )
                 ticket_identity = entry.transcript_file_identity_at_paste
                 offset = entry.transcript_offset_at_paste
 
@@ -7374,7 +7373,7 @@ class TmuxSession(TransportReplacementMixin):
                         cached = anchor_checks.get(check_key)
                         if cached is not None:
                             epoch_stable = cached
-                        elif len(anchor) <= budget_remaining[key]:
+                        elif len(anchor) <= budget_remaining:
                             try:
                                 current_anchor = os.pread(
                                     descriptor,
@@ -7384,7 +7383,7 @@ class TmuxSession(TransportReplacementMixin):
                             except OSError:
                                 guard_valid = False
                             else:
-                                budget_remaining[key] -= len(current_anchor)
+                                budget_remaining -= len(current_anchor)
                                 epoch_stable = (
                                     len(current_anchor) == len(anchor)
                                     and current_anchor == anchor
@@ -7452,15 +7451,14 @@ class TmuxSession(TransportReplacementMixin):
             for key, start in scan_starts.items():
                 found: list[tuple[int, int, str, bytes]] = []
                 handle = handles[key]
-                remaining = budget_remaining[key]
                 try:
                     handle.seek(start)
-                    while remaining > 0:
+                    while budget_remaining > 0:
                         row_offset = handle.tell()
-                        raw = handle.readline(remaining)
+                        raw = handle.readline(budget_remaining)
                         if not raw:
                             break
-                        remaining -= len(raw)
+                        budget_remaining -= len(raw)
                         if not raw.endswith(b"\n"):
                             incomplete.add(key)
                             break
@@ -7525,13 +7523,24 @@ class TmuxSession(TransportReplacementMixin):
                         offset is not None
                         and anchor_start is not None
                         and anchor is not None
-                        and row_offset >= anchor_start
                         and row_end <= offset
                     ):
-                        relative_start = row_offset - anchor_start
-                        relative_end = row_end - anchor_start
-                        prior = anchor[relative_start:relative_end]
-                        paste_bound = len(prior) == len(raw) and prior != raw
+                        overlap_start = max(row_offset, anchor_start)
+                        overlap_end = min(row_end, offset)
+                        if overlap_start < overlap_end:
+                            prior_start = overlap_start - anchor_start
+                            prior_end = overlap_end - anchor_start
+                            current_start = overlap_start - row_offset
+                            current_end = overlap_end - row_offset
+                            prior = anchor[prior_start:prior_end]
+                            current = raw[current_start:current_end]
+                            # JSONL rows are atomic: any changed byte in the
+                            # captured extent proves a post-ticket rewrite.
+                            # An identical partial overlap remains non-positive
+                            # because the uncaptured prefix is unknowable.
+                            paste_bound = (
+                                len(prior) == len(current) and prior != current
+                            )
 
                 if entry.turn.transport_accepted:
                     verdicts.append(True)
