@@ -1348,12 +1348,12 @@ class _QueuedTurn:
     # non-wake turns and for any internal turn whose enqueuer doesn't
     # care about post-delivery hooks.
     on_delivered: object = None  # Callable() -> None — fires on delivery proof
-    # #846 — replay-amplification guard. Incremented each time the inflight
-    # watchdog requeues this turn for replay after a stuck-head force_restart.
-    # Once it exceeds ``_inflight_replay_cap()`` the watchdog DROPS the turn
-    # (fires its completion_event, logs loudly) instead of requeuing it again,
-    # so a never-clearing wedge can't replay the same turn forever and grow
-    # the deque unboundedly (the murzik #846 loop).
+    # #846 — replay-amplification guard. Incremented whenever inflight recovery
+    # requeues this turn (watchdog restart, idle-phantom proof, or graceful
+    # disconnect). Once it exceeds ``_inflight_replay_cap()`` recovery DROPS
+    # the turn (fires its completion_event, logs loudly) instead of requeuing
+    # it again, so a never-clearing wedge can't replay the same turn forever
+    # and grow the deque unboundedly.
     replay_count: int = 0
     # Scheduler-only receipt. A serialized scheduler turn waits for the
     # pane to become explicitly idle before paste. True requires a matching
@@ -1710,6 +1710,13 @@ def _inflight_replay_tail_cap() -> int:
     except (TypeError, ValueError):
         val = 20
     return max(0, val)
+
+
+# #1127 — idle-phantom consumption proof only needs the recent transcript.
+# Aged candidates are minutes old, so a bounded binary tail read avoids loading
+# long-lived multi-gigabyte JSONL histories while preserving their UTF-8 header
+# bytes exactly (JSON escapes only the prompt's later newline separators).
+_PHANTOM_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
@@ -4291,11 +4298,11 @@ class TmuxSession(TransportReplacementMixin):
         self._processing = False
 
         # Drain the in-flight metadata deque (#560 replaces PR #496
-        # round-2's single-dict clear). Critical safety: unblock every
-        # pending ``completion_event`` BEFORE clearing the deque, so a
-        # ``wait_for_completion=True`` caller (e.g. pre-sleep save)
-        # doesn't hang forever when its turn is abandoned by a
-        # disconnect / force_restart cycle. Murzik review point #2.
+        # round-2's single-dict clear). Scheduler turns resolve False so
+        # their durable owner redelivers; plain turns replay after a warm
+        # reconnect with completion/submission receipts still pending
+        # (#1127 parity with #561). Only a replay-cap drop unblocks a plain
+        # turn as definitively abandoned.
         #
         # Also defends #496 round-1 Case 2: a straggler stop_hook_summary
         # read from a stale transcript on reconnect can't route a late
@@ -4306,13 +4313,49 @@ class TmuxSession(TransportReplacementMixin):
         # #731: session is being torn down — drop in-flight tool state so a
         # stale entry can't leak across the disconnect/reconnect boundary.
         self._inflight_tool_calls.clear()
+        replay_cap = _inflight_replay_cap()
+        replay: list[_QueuedTurn] = []
         for entry in drained:
-            if entry.completion_event is not None and not entry.completion_event.is_set():
-                entry.completion_event.set()
-            delivery = entry.turn.scheduler_delivery
-            if delivery is not None and not delivery.done():
-                delivery.set_result(False)
-            self._resolve_submission_receipt(entry.turn, False)
+            turn = entry.turn
+            delivery = turn.scheduler_delivery
+            if delivery is not None:
+                # Scheduler turns retain their existing single-owner contract:
+                # resolve False and let the durable scheduler redeliver. Also
+                # requeueing here would create two replay paths for one wake.
+                if entry.completion_event is not None and not entry.completion_event.is_set():
+                    entry.completion_event.set()
+                if not delivery.done():
+                    delivery.set_result(False)
+                self._resolve_submission_receipt(turn, False)
+                continue
+
+            # #1127 parity with the watchdog's #561/#846 replay path. Plain
+            # pasted turns survive a warm disconnect on this retained session
+            # object, and their waiters stay pending until the replay completes.
+            turn.replay_count += 1
+            if replay_cap and turn.replay_count > replay_cap:
+                header = turn.prompt.splitlines()[0] if turn.prompt else ""
+                _log(
+                    f"tmux[{self.agent_name}]: DROPPING disconnect replay "
+                    f"after {turn.replay_count - 1} replay(s) (cap={replay_cap}); "
+                    f"prompt_header={header!r}"
+                )
+                if entry.completion_event is not None and not entry.completion_event.is_set():
+                    entry.completion_event.set()
+                self._resolve_submission_receipt(turn, False)
+                continue
+
+            turn.pane_delivery_recorded = False
+            turn.pane_delivery_started = False
+            turn.pane_queue_enqueued = False
+            turn.transport_accepted = False
+            replay.append(turn)
+        self._prepend_message_queue(replay)
+        if replay:
+            _log(
+                f"tmux[{self.agent_name}]: requeued {len(replay)} plain "
+                f"inflight turn(s) across disconnect (#1127)"
+            )
 
         # Issue #547: also unblock ``_inflight_turn`` — the turn the
         # worker pulled from the queue but had NOT yet pasted (e.g.
@@ -6585,6 +6628,21 @@ class TmuxSession(TransportReplacementMixin):
             return None
         return jsonls[0] if jsonls else None
 
+    def _prepend_message_queue(self, turns: list[_QueuedTurn]) -> None:
+        """Put ``turns`` ahead of the existing backlog without changing FIFO."""
+        if not turns:
+            return
+        backlog: list[_QueuedTurn] = []
+        while not self._message_queue.empty():
+            try:
+                backlog.append(self._message_queue.get_nowait())
+            except asyncio.QueueEmpty:
+                break
+        for turn in turns:
+            self._message_queue.put_nowait(turn)
+        for turn in backlog:
+            self._message_queue.put_nowait(turn)
+
     async def _message_worker(self) -> None:
         """Drain ``_message_queue``, pasting each turn into the tmux pane.
 
@@ -6959,6 +7017,28 @@ class TmuxSession(TransportReplacementMixin):
         """
         age = self._main_transcript_age(now)
         return age is not None and age < window
+
+    def _read_phantom_transcript_tail(self) -> bytes | None:
+        """Return a bounded transcript tail for idle-phantom consumption proof.
+
+        ``None`` means the active tailer has no usable bound transcript.  The
+        caller preserves the historical drain verdict in that case, but logs
+        the missing proof distinctly.  Binary reads keep non-ASCII prompt
+        headers byte-exact and avoid JSON newline-escape mismatches (#1127).
+        """
+        tailer = self._tailer
+        path = getattr(tailer, "transcript_path", None) if tailer else None
+        if not path:
+            return None
+        try:
+            transcript = Path(path)
+            with transcript.open("rb") as handle:
+                handle.seek(0, os.SEEK_END)
+                size = handle.tell()
+                handle.seek(max(0, size - _PHANTOM_TRANSCRIPT_TAIL_BYTES))
+                return handle.read(_PHANTOM_TRANSCRIPT_TAIL_BYTES)
+        except (OSError, TypeError, ValueError):
+            return None
 
     def _background_task_recent_age(self, now: float, window: float) -> float | None:
         """Seconds since a background task last wrote a transcript, or None.
@@ -7531,35 +7611,136 @@ class TmuxSession(TransportReplacementMixin):
                     )
                     continue
                 if verdict == "idle":
-                    # #118: head aged out, transcript quiet, and the REPL last
-                    # reported idle — nothing is actually in flight, so the
-                    # lingering meta(s) are phantom (a paste with no matching
-                    # stop_hook). Reconcile by draining + firing their
-                    # completion events; do NOT restart an idle REPL. This is
-                    # the core fix for "torn down ~10min after activity even
-                    # though nothing was wedged."
-                    drained = list(self._inflight_metas)
+                    # #1127: an idle REPL proves there is no work running, but
+                    # not that every mechanically successful paste was ever
+                    # submitted.  Search each turn's single-line header in one
+                    # bounded transcript tail: present means a true phantom
+                    # stop-hook miss; absent means the REPL never consumed it.
+                    candidates = list(self._inflight_metas)
                     self._inflight_metas.clear()
                     self._head_started_at = None
                     self._inflight_pane_ext_anchor = None
-                    for m in drained:
-                        ev = m.completion_event
+                    transcript_tail = self._read_phantom_transcript_tail()
+                    replay_cap = _inflight_replay_cap()
+                    replay: list[_QueuedTurn] = []
+                    drained_count = 0
+                    dropped_count = 0
+                    if transcript_tail is None:
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            f"PHANTOM_CONSUMPTION_PROBE_UNAVAILABLE "
+                            f"deque_depth={depth} head_age_s={age:.1f} — "
+                            f"preserving legacy drain verdict"
+                        )
+
+                    for entry in candidates:
+                        turn = entry.turn
+                        header = turn.prompt.splitlines()[0] if turn.prompt else ""
+                        try:
+                            consumed = (
+                                None
+                                if transcript_tail is None or not header
+                                else header.encode("utf-8") in transcript_tail
+                            )
+                        except UnicodeEncodeError:
+                            consumed = None
+
+                        if consumed is False:
+                            turn.replay_count += 1
+                            if replay_cap and turn.replay_count > replay_cap:
+                                dropped_count += 1
+                                _log(
+                                    f"tmux[{self.agent_name}]: DROPPING "
+                                    f"unconsumed phantom turn after "
+                                    f"{turn.replay_count - 1} replay(s) "
+                                    f"(cap={replay_cap}); "
+                                    f"prompt_header={header!r}"
+                                )
+                                ev = entry.completion_event
+                                if ev is not None and not ev.is_set():
+                                    ev.set()
+                                delivery = turn.scheduler_delivery
+                                if delivery is not None and not delivery.done():
+                                    delivery.set_result(False)
+                                self._resolve_submission_receipt(turn, False)
+                                log_watchdog_decision(
+                                    watchdog="inflight",
+                                    agent=self.agent_name,
+                                    decision="drop",
+                                    reason="phantom_replay_cap_dropped",
+                                    state=self.state.value,
+                                    progress_stale_s=age,
+                                    inflight_turns=depth,
+                                    inflight_active=False,
+                                )
+                                continue
+
+                            # The old pane occurrence has no transcript proof.
+                            # Re-arm all paste/acceptance bookkeeping so the
+                            # worker records one fresh meta for the replay.
+                            turn.pane_delivery_recorded = False
+                            turn.pane_delivery_started = False
+                            turn.pane_queue_enqueued = False
+                            turn.transport_accepted = False
+                            replay.append(turn)
+                            log_watchdog_decision(
+                                watchdog="inflight",
+                                agent=self.agent_name,
+                                decision="requeue",
+                                reason="phantom_requeued_unconsumed",
+                                state=self.state.value,
+                                progress_stale_s=age,
+                                inflight_turns=depth,
+                                inflight_active=False,
+                            )
+                            continue
+
+                        # Found: the turn started, so the missing Stop hook left
+                        # only phantom routing metadata. Unavailable: preserve
+                        # #118's historical drain behavior, already audited
+                        # above, rather than changing a binding failure into a
+                        # potentially duplicate replay.
+                        drained_count += 1
+                        ev = entry.completion_event
                         if ev is not None and not ev.is_set():
                             ev.set()
-                        delivery = m.turn.scheduler_delivery
-                        if delivery is not None and not delivery.done():
+                        delivery = turn.scheduler_delivery
+                        if consumed is True:
+                            # Reuse the exact-transcript acceptance edge so a
+                            # scheduler's durable accept callback runs before
+                            # its positive in-process receipt (#1068 contract).
+                            self._mark_transport_accepted(turn)
+                            if delivery is not None and not delivery.done():
+                                # Defensive for an inconsistent pre-accepted
+                                # turn whose receipt somehow remained pending.
+                                delivery.set_result(True)
+                        elif delivery is not None and not delivery.done():
                             delivery.set_result(False)
+                        verdict_label = (
+                            "verified_consumed"
+                            if consumed is True
+                            else "unverified_legacy_fallback"
+                        )
+                        _log(
+                            f"tmux[{self.agent_name}]: drained idle phantom "
+                            f"verdict={verdict_label} prompt_header={header!r}"
+                        )
+
+                    self._prepend_message_queue(replay)
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
-                        f"but REPL is idle — reconciled {len(drained)} phantom "
-                        f"meta(s), NOT restarting (#118)"
+                        f"but REPL is idle — reconciled {drained_count} phantom "
+                        f"meta(s), requeued {len(replay)} unconsumed turn(s), "
+                        f"dropped {dropped_count} capped turn(s), NOT restarting "
+                        f"(#118/#1127)"
                     )
-                    log_watchdog_decision(
-                        watchdog="inflight", agent=self.agent_name,
-                        decision="reconcile", reason="idle_phantom",
-                        state=self.state.value, progress_stale_s=age,
-                        inflight_turns=depth, inflight_active=False,
-                    )
+                    if drained_count:
+                        log_watchdog_decision(
+                            watchdog="inflight", agent=self.agent_name,
+                            decision="reconcile", reason="idle_phantom",
+                            state=self.state.value, progress_stale_s=age,
+                            inflight_turns=depth, inflight_active=False,
+                        )
                     continue
                 if verdict == "unknown":
                     # #943 prevents one stale sample from proving a wedge.
@@ -7883,16 +8064,7 @@ class TmuxSession(TransportReplacementMixin):
                     # the original backlog. Preserves FIFO across the
                     # boundary. ``asyncio.Queue`` has no put-front, so
                     # the drain+repush is the canonical pattern.
-                    backlog: list[_QueuedTurn] = []
-                    while not self._message_queue.empty():
-                        try:
-                            backlog.append(self._message_queue.get_nowait())
-                        except asyncio.QueueEmpty:
-                            break
-                    for t in replay:
-                        self._message_queue.put_nowait(t)
-                    for t in backlog:
-                        self._message_queue.put_nowait(t)
+                    self._prepend_message_queue(replay)
                     _log(
                         f"tmux[{self.agent_name}]: requeued "
                         f"{len(replay)} turn(s) for replay after "

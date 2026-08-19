@@ -5284,6 +5284,24 @@ def test_transcript_recently_grew(tmp_path) -> None:
     assert ss._transcript_recently_grew(now, 600.0) is False
 
 
+def test_phantom_consumption_probe_reads_only_bounded_tail(tmp_path) -> None:
+    """#1127: old matching text outside the 4 MiB window is not consumption."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    transcript = tmp_path / "transcript.jsonl"
+    old_header = b"[agent | old-sender | internal | old]\n"
+    transcript.write_bytes(
+        old_header + b"x" * (tmux_session._PHANTOM_TRANSCRIPT_TAIL_BYTES + 1)
+    )
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    tail = ss._read_phantom_transcript_tail()
+
+    assert tail is not None
+    assert len(tail) == tmux_session._PHANTOM_TRANSCRIPT_TAIL_BYTES
+    assert old_header.rstrip() not in tail
+
+
 @pytest.mark.asyncio
 async def test_inflight_watchdog_drains_phantom_when_repl_idle(monkeypatch) -> None:
     """#118 end-to-end: an aged-out head with a quiet transcript and an idle
@@ -5328,6 +5346,225 @@ async def test_inflight_watchdog_drains_phantom_when_repl_idle(monkeypatch) -> N
     assert restarted["v"] is False, "must NOT restart an idle REPL"
     assert len(ss._inflight_metas) == 0, "phantom meta must be drained"
     assert ss._head_started_at is None
+
+
+async def _run_idle_reconcile(ss: TmuxSession) -> None:
+    """Run the fast-clock watchdog until its idle verdict mutates the deque."""
+    task = asyncio.create_task(ss._inflight_watchdog())
+    try:
+        for _ in range(200):
+            if not ss._inflight_metas:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("watchdog did not reconcile the aged idle deque")
+    finally:
+        task.cancel()
+        await task
+
+
+@pytest.mark.asyncio
+async def test_idle_phantom_verified_consumed_resolves_scheduler_true(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    """#1127: transcript presence proves execution and suppresses wake replay."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    header = "[agent | sender-猫 | internal | 2026-08-19T06:00:00-07:00]"
+    prompt = f"{header}\nverdict body"
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        _json.dumps({"type": "user", "message": {"content": prompt}}, ensure_ascii=False)
+        + "\n",
+        encoding="utf-8",
+    )
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    completion = asyncio.Event()
+    delivery = asyncio.get_running_loop().create_future()
+    durable_accept = MagicMock(return_value=True)
+    entry = _seed_inflight(ss, prompt=prompt, completion_event=completion)
+    entry.turn.transport_accepted = False
+    entry.turn.scheduler_delivery = delivery
+    entry.turn.scheduler_accept = durable_accept
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert completion.is_set()
+    assert delivery.result() is True
+    durable_accept.assert_called_once_with()
+    assert header in capsys.readouterr().err
+    assert ss._message_queue.empty()
+
+
+@pytest.mark.asyncio
+async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) -> None:
+    """#1127: a header absent from the transcript is replayed, not completed."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+    decisions = MagicMock()
+    monkeypatch.setattr(tmux_session, "log_watchdog_decision", decisions)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"system"}\n')
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    completion = asyncio.Event()
+    prompt = "[agent | sender | internal | 2026-08-19T06:01:00-07:00]\nbody"
+    original = _seed_inflight(
+        ss, prompt=prompt, completion_event=completion,
+    ).turn
+    backlog = _QueuedTurn(prompt="later backlog")
+    ss._message_queue.put_nowait(backlog)
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert not completion.is_set()
+    assert original.replay_count == 1
+    assert ss._message_queue.get_nowait() is original
+    assert ss._message_queue.get_nowait() is backlog
+    assert any(
+        call.kwargs.get("reason") == "phantom_requeued_unconsumed"
+        for call in decisions.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_idle_phantom_replay_cap_drops_loudly(
+    monkeypatch, tmp_path, capsys,
+) -> None:
+    """#1127/#846: an absent prompt cannot replay forever."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+    monkeypatch.setenv("PINKY_INFLIGHT_REPLAY_CAP", "1")
+    decisions = MagicMock()
+    monkeypatch.setattr(tmux_session, "log_watchdog_decision", decisions)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"system"}\n')
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    completion = asyncio.Event()
+    submission = asyncio.get_running_loop().create_future()
+    header = "[agent | sender | internal | 2026-08-19T06:02:00-07:00]"
+    turn = _seed_inflight(
+        ss, prompt=f"{header}\nbody", completion_event=completion,
+    ).turn
+    turn.submission_receipt = submission
+    turn.replay_count = 1
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert turn.replay_count == 2
+    assert completion.is_set()
+    assert submission.result() is False
+    assert ss._message_queue.empty()
+    assert header in capsys.readouterr().err
+    assert any(
+        call.kwargs.get("reason") == "phantom_replay_cap_dropped"
+        for call in decisions.call_args_list
+    )
+
+
+@pytest.mark.asyncio
+async def test_idle_phantom_without_transcript_preserves_drain_with_audit(
+    monkeypatch, capsys,
+) -> None:
+    """#1127: an unavailable transcript is explicit, bounded fallback behavior."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    ss._tailer = None
+    completion = asyncio.Event()
+    _seed_inflight(ss, prompt="header\nbody", completion_event=completion)
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert completion.is_set()
+    assert ss._message_queue.empty()
+    logs = capsys.readouterr().err
+    assert "PHANTOM_CONSUMPTION_PROBE_UNAVAILABLE" in logs
+    assert "deque_depth=1" in logs
+    assert "head_age_s=" in logs
+
+
+@pytest.mark.asyncio
+async def test_idle_phantom_mixed_deque_verdicts_per_meta(
+    monkeypatch, tmp_path,
+) -> None:
+    """#1127: a consumed head drains while an unconsumed tail replays."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    consumed_header = "[agent | sender | internal | 2026-08-19T06:03:00-07:00]"
+    consumed_prompt = f"{consumed_header}\nconsumed"
+    unconsumed_prompt = (
+        "[agent | sender | internal | 2026-08-19T06:04:00-07:00]\nunconsumed"
+    )
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text(
+        _json.dumps({"type": "user", "message": {"content": consumed_prompt}}) + "\n"
+    )
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    consumed_event = asyncio.Event()
+    unconsumed_event = asyncio.Event()
+    consumed_delivery = asyncio.get_running_loop().create_future()
+    consumed = _seed_inflight(
+        ss, prompt=consumed_prompt, completion_event=consumed_event,
+    )
+    consumed.turn.scheduler_delivery = consumed_delivery
+    unconsumed = _seed_inflight(
+        ss, prompt=unconsumed_prompt, completion_event=unconsumed_event,
+    )
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert consumed_event.is_set()
+    assert consumed_delivery.result() is True
+    assert not unconsumed_event.is_set()
+    assert unconsumed.turn.replay_count == 1
+    assert ss._message_queue.get_nowait() is unconsumed.turn
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -8614,28 +8851,88 @@ class TestInflightDequeConcurrentDispatch:
         )
 
     @pytest.mark.asyncio
-    async def test_disconnect_unblocks_pending_completion_events(self):
-        """Disconnect drains ``_inflight_metas`` and sets every pending
-        ``completion_event`` so a ``wait_for_completion=True`` caller
-        doesn't hang on an abandoned turn (e.g. force_restart cycling
-        the pane mid-save). Murzik review point #2 — explicit."""
+    async def test_disconnect_requeues_pending_completion_events(self):
+        """#1127: plain inflight waiters remain pending across reconnect."""
         ss, _ = _make_session(state=SessionState.CONNECTED)
         await ss.connect()
 
         event1 = asyncio.Event()
         event2 = asyncio.Event()
-        _seed_inflight(ss, internal=True, completion_event=event1)
-        _seed_inflight(ss, meta={"platform": "t", "chat_id": "c", "message_id": "m"})
-        # No event on the second; the entry is external — disconnect
-        # still drains it, just doesn't have anything to signal.
-        _seed_inflight(ss, internal=True, completion_event=event2)
+        turn1 = _seed_inflight(
+            ss, internal=True, completion_event=event1,
+        ).turn
+        turn2 = _seed_inflight(
+            ss, meta={"platform": "t", "chat_id": "c", "message_id": "m"},
+        ).turn
+        turn3 = _seed_inflight(
+            ss, internal=True, completion_event=event2,
+        ).turn
         assert len(ss._inflight_metas) == 3
 
         await ss.disconnect()
 
         assert len(ss._inflight_metas) == 0
-        assert event1.is_set(), "disconnect must unblock event1"
-        assert event2.is_set(), "disconnect must unblock event2"
+        assert not event1.is_set(), "event1 waits for its replay"
+        assert not event2.is_set(), "event2 waits for its replay"
+        assert [ss._message_queue.get_nowait() for _ in range(3)] == [
+            turn1,
+            turn2,
+            turn3,
+        ]
+
+    @pytest.mark.asyncio
+    async def test_disconnect_requeues_plain_but_not_scheduler_meta(self):
+        """#1127: reconnect owns plain replay; scheduler owns wake redelivery."""
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        plain_event = asyncio.Event()
+        scheduler_event = asyncio.Event()
+        plain_submission = asyncio.get_running_loop().create_future()
+        scheduler_delivery = asyncio.get_running_loop().create_future()
+
+        plain = _seed_inflight(
+            ss,
+            prompt="plain prompt",
+            completion_event=plain_event,
+        ).turn
+        plain.submission_receipt = plain_submission
+        scheduler = _seed_inflight(
+            ss,
+            prompt="scheduler prompt",
+            completion_event=scheduler_event,
+        ).turn
+        scheduler.scheduler_delivery = scheduler_delivery
+
+        await ss.disconnect()
+
+        assert not plain_event.is_set()
+        assert not plain_submission.done()
+        assert plain.replay_count == 1
+        assert ss._message_queue.get_nowait() is plain
+        assert ss._message_queue.empty()
+        assert scheduler_event.is_set()
+        assert scheduler_delivery.result() is False
+
+    @pytest.mark.asyncio
+    async def test_disconnect_plain_replay_cap_resolves_drop(self, monkeypatch):
+        """#1127/#846: repeated reconnects cannot requeue one turn forever."""
+        monkeypatch.setenv("PINKY_INFLIGHT_REPLAY_CAP", "1")
+        ss, _ = _make_session(state=SessionState.CONNECTED)
+        completion = asyncio.Event()
+        submission = asyncio.get_running_loop().create_future()
+        turn = _seed_inflight(
+            ss,
+            prompt="capped plain prompt",
+            completion_event=completion,
+        ).turn
+        turn.submission_receipt = submission
+        turn.replay_count = 1
+
+        await ss.disconnect()
+
+        assert turn.replay_count == 2
+        assert completion.is_set()
+        assert submission.result() is False
+        assert ss._message_queue.empty()
 
     @pytest.mark.asyncio
     async def test_handle_turn_complete_with_empty_deque_logs_and_bails(self):
