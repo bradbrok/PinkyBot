@@ -4489,6 +4489,235 @@ class TestScheduler:
         assert "superseded" in older_row.last_error
 
     @pytest.mark.asyncio
+    async def test_release_provenance_is_structural(self, registry):
+        """R4-1: no park-reason text can dodge the supersession floor.
+
+        SQLite LIKE is ASCII-case-insensitive while Python startswith is
+        not, so string-stamped provenance was bypassable by a case-variant
+        reason. Provenance must be structural state, not text.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "* * * * *", name="case variant", prompt="sweep now"
+        )
+        now = time.time()
+        older, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 45,
+        )
+        assert registry.drain_park_pending_schedule_wake(
+            older.id, reason="outbox_drain_released: case-variant fixture"
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 30,
+        )
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        scheduler.replay_pending_for_agent("worker")
+        await scheduler._pending_replay_tasks["worker"]
+        for _ in range(200):
+            older_row = registry.get_schedule_wake_by_fire(
+                schedule.id, older.fired_at
+            )
+            if older_row is not None and older_row.ledger_state not in (
+                "pending",
+                "drain-parked",
+            ):
+                break
+            await asyncio.sleep(0)
+
+        assert deliveries == ["sweep now"]
+        older_row = registry.get_schedule_wake_by_fire(
+            schedule.id, older.fired_at
+        )
+        assert older_row is not None
+        assert older_row.ledger_state == "quarantined"
+
+    @pytest.mark.asyncio
+    async def test_supersession_survives_accepted_row_reaping(
+        self, registry
+    ):
+        """R4-2: execution-ordering authority must outlive reapable receipts.
+
+        retain_accepted and the abandon ceiling are independently
+        configurable; with a short accepted-retention the accepted row that
+        proves a newer fire ran can be reaped while older parked debt is
+        still recoverable. The high-water mark must live on the schedule,
+        not in reapable rows.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "* * * * *", name="reaped authority", prompt="sweep now"
+        )
+        now = time.time()
+        older, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 45,
+        )
+        assert registry.drain_park_pending_schedule_wake(older.id)
+        newer, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 30,
+        )
+        assert registry.confirm_pending_schedule_wake(
+            newer.id, delivered_at=now - 10
+        )
+        # Valid (if aggressive) retention: the accepted receipt is reaped
+        # while the parked row stays comfortably under its fired-at ceiling.
+        registry.reap_pending_schedule_wakes(
+            now=now,
+            abandon_after=3_600,
+            retain_accepted=1,
+            retain_abandoned=86_400,
+            retain_parked=86_400,
+            payload_trim_after=86_400,
+        )
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, newer.fired_at
+        ) is None
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_drain_busy_fn=lambda agent_name: False,
+            pending_wake_max_age_sec=1_000,
+        )
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        await scheduler._pending_replay_tasks["worker"]
+
+        assert deliveries == []
+        older_row = registry.get_schedule_wake_by_fire(
+            schedule.id, older.fired_at
+        )
+        assert older_row is not None
+        assert older_row.ledger_state == "quarantined"
+        assert "superseded" in older_row.last_error
+
+    @pytest.mark.asyncio
+    async def test_partial_park_page_survives_relist_failure(
+        self, registry, monkeypatch
+    ):
+        """R4-3: episode identity must survive a transient re-list failure."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="relist fail", prompt="owed work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        row_a, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        row_b, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base + 5,
+        )
+        alerts: list[str] = []
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=lambda agent_name: True,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=100_000,
+            outbox_drain_extension_attempt_cap=1,
+        )
+        real_park = registry.drain_park_pending_schedule_wake
+        park_wedged = [True]
+
+        def flaky_park(pending_id, **kwargs):
+            if park_wedged[0] and pending_id == row_b.id:
+                raise RuntimeError("park write failed")
+            return real_park(pending_id, **kwargs)
+
+        real_list = registry.list_pending_schedule_wakes
+        relist_calls = [0]
+        fail_relist_once = [False]
+
+        def flaky_list(*args, **kwargs):
+            if (
+                fail_relist_once[0]
+                and args == ("worker",)
+                and not kwargs
+            ):
+                relist_calls[0] += 1
+                if relist_calls[0] == 2:
+                    # First matching call is the park listing; the second
+                    # is the post-park durable re-list. Fail only that.
+                    fail_relist_once[0] = False
+                    raise RuntimeError("re-list failed")
+            return real_list(*args, **kwargs)
+
+        monkeypatch.setattr(
+            registry, "drain_park_pending_schedule_wake", flaky_park
+        )
+        monkeypatch.setattr(
+            registry, "list_pending_schedule_wakes", flaky_list
+        )
+        fail_relist_once[0] = True
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, row_a.fired_at
+        ).ledger_state == "drain-parked"
+
+        # Next cycle: the oldest active fire changed (A parked, B active),
+        # the re-list works, B parks — same episode, NO second page.
+        park_wedged[0] = False
+        clock[0] = base + 120
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, row_b.fired_at
+        ).ledger_state == "drain-parked"
+        assert "worker" not in scheduler._outbox_drain_extensions
+
+    @pytest.mark.asyncio
     async def test_partial_park_zero_success_defers_alert(
         self, registry, monkeypatch
     ):
