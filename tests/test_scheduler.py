@@ -4489,6 +4489,62 @@ class TestScheduler:
         assert "superseded" in older_row.last_error
 
     @pytest.mark.asyncio
+    async def test_restart_after_durable_accept_recovers_parked_debt(
+        self, registry
+    ):
+        """R6-2 crash seam: a durable accept before a crash releases parked
+        debt, so a fresh process's ordinary catch-up replay delivers it."""
+        registry.register("worker")
+        parked_schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="parked lane", prompt="parked work"
+        )
+        parked_row, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="worker",
+            schedule_name=parked_schedule.name,
+            prompt=parked_schedule.prompt,
+            fired_at=time.time() - 30,
+        )
+        assert registry.drain_park_pending_schedule_wake(parked_row.id)
+        live_schedule = registry.add_schedule(
+            "worker", "30 * * * *", name="live lane", prompt="live work"
+        )
+        live_row, _ = registry.persist_schedule_wake(
+            live_schedule.id,
+            agent_name="worker",
+            schedule_name=live_schedule.name,
+            prompt=live_schedule.prompt,
+            fired_at=time.time() - 5,
+        )
+        # Durable accept lands; the process dies before any in-process
+        # confirmed=True handling runs (the #991 seam).
+        assert registry.confirm_pending_schedule_wake_by_fire(
+            live_schedule.id, live_row.fired_at
+        )
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        restarted = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            pending_wake_max_age_sec=100_000,
+        )
+        # Ordinary startup catch-up: drain_recheck=False.
+        restarted.replay_pending_for_agent("worker")
+        await restarted._pending_replay_tasks["worker"]
+
+        assert deliveries == ["parked work"]
+        ledger = registry.get_schedule_wake_by_fire(
+            parked_schedule.id, parked_row.fired_at
+        )
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
     async def test_live_confirmed_delivery_releases_parked_debt(
         self, registry
     ):
@@ -6573,6 +6629,80 @@ class TestDrainParkedWakeRegistry:
             )
         finally:
             reopened.close()
+
+    def test_migration_survives_pre_accepted_wake_schema(self, registry):
+        """R6-1: the backfill must not read wake columns the wake migration
+        has not added yet — released upgrade sources have the wake table
+        without accepted_at, and a boot abort there bricks the daemon."""
+        schedule, pending = self._persist(registry)
+        registry._db.executescript(
+            """
+            DROP INDEX IF EXISTS idx_schedule_wake_ledger_state;
+            DROP INDEX IF EXISTS idx_schedule_wake_reaper_state;
+            ALTER TABLE pending_schedule_wakes DROP COLUMN accepted_at;
+            ALTER TABLE agent_schedules DROP COLUMN last_accepted_fired_at;
+            """
+        )
+        registry._db.commit()
+
+        reopened = AgentRegistry(db_path=registry._db_path)
+        try:
+            migrated = reopened.get_schedule(schedule.id)
+            assert migrated is not None
+            # No accepted stamps existed pre-upgrade, so zero is correct —
+            # the requirement is that the reopen does not abort.
+            assert migrated.last_accepted_fired_at == 0.0
+        finally:
+            reopened.close()
+
+    def test_durable_confirm_releases_parked_debt_atomically(self, registry):
+        """R6-2: release evidence lives at the durable accept edge.
+
+        A crash between the durable accept and the in-process Future
+        resolution (the #991 seam) must not strand parked debt: the confirm
+        itself releases, so restart catch-up finds active rows.
+        """
+        schedule, parked = self._persist(registry)
+        assert registry.drain_park_pending_schedule_wake(parked.id)
+        other = registry.add_schedule(
+            "worker", "30 * * * *", name="live", prompt="live work"
+        )
+        live, _ = registry.persist_schedule_wake(
+            other.id,
+            agent_name="worker",
+            schedule_name=other.name,
+            prompt=other.prompt,
+            fired_at=time.time() - 5,
+        )
+        # The durable accept — no scheduler process involvement at all.
+        assert registry.confirm_pending_schedule_wake_by_fire(
+            other.id, live.fired_at
+        )
+        row = registry.get_schedule_wake_by_fire(
+            schedule.id, parked.fired_at
+        )
+        assert row is not None
+        assert row.ledger_state == "pending"
+        assert row.drain_parked_at == 0
+        assert row.released_at > 0
+
+        # The by-id confirm variant (late positive observer path) must
+        # release identically.
+        schedule2, parked2 = self._persist2(registry)
+        assert registry.drain_park_pending_schedule_wake(parked2.id)
+        live2, _ = registry.persist_schedule_wake(
+            other.id,
+            agent_name="worker",
+            schedule_name=other.name,
+            prompt=other.prompt,
+            fired_at=time.time() - 2,
+        )
+        assert registry.confirm_pending_schedule_wake(live2.id)
+        row2 = registry.get_schedule_wake_by_fire(
+            schedule2.id, parked2.fired_at
+        )
+        assert row2 is not None
+        assert row2.ledger_state == "pending"
 
     def test_reaper_abandons_expired_drain_parked_rows(self, registry):
         now = time.time()
