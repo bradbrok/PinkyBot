@@ -58,12 +58,17 @@ _HOOK_IP_RATE_LIMIT = 20
 _HOOK_IP_RATE_WINDOW = 60.0
 
 
-def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
-    """Return True if the client IP is within the webhook rate limit."""
-    ip = (
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP: first X-Forwarded-For hop, else socket peer."""
+    return (
         request.headers.get("x-forwarded-for", "").split(",")[0].strip()
         or (request.client.host if request.client else "unknown")
     )
+
+
+def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
+    """Return True if the client IP is within the webhook rate limit."""
+    ip = _client_ip(request)
     timestamps = _hook_ip_buckets.get(ip, [])
     timestamps = [t for t in timestamps if now - t < _HOOK_IP_RATE_WINDOW]
     if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
@@ -258,6 +263,14 @@ async def test_agent_trigger(agent_name: str, trigger_id: int):
 @router.post("/hooks/{token}")
 async def receive_webhook(token: str, request: Request):
     """Receive an inbound webhook and wake the associated agent."""
+    # Receipt log — must stay the first statement so every delivery attempt
+    # is visible even when a later check drops the request (unknown-token 404,
+    # rate-limit 429, oversized 413). The token is a credential: prefix only.
+    _log(
+        f"hooks: receipt token={token[:8]}* ip={_client_ip(request)}"
+        f" len={request.headers.get('content-length', '?')}"
+        f" type={request.headers.get('content-type', '-')}"
+    )
     now = time.time()
 
     # IP rate limit (anti-enumeration — runs before token lookup)
