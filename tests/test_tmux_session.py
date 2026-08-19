@@ -95,6 +95,19 @@ def _seed_inflight(
     return entry
 
 
+def _bind_transcript_ticket(
+    entry: _InflightMeta,
+    transcript: Path,
+    *,
+    offset: int = 0,
+) -> None:
+    """Attach a production-shaped pre-paste transcript occurrence ticket."""
+    stat = transcript.stat()
+    entry.transcript_path_at_paste = transcript
+    entry.transcript_file_identity_at_paste = (stat.st_dev, stat.st_ino)
+    entry.transcript_offset_at_paste = offset
+
+
 def _ok() -> TmuxCommandResult:
     """Successful tmux command result."""
     return TmuxCommandResult(returncode=0, stdout="", stderr="")
@@ -5284,22 +5297,103 @@ def test_transcript_recently_grew(tmp_path) -> None:
     assert ss._transcript_recently_grew(now, 600.0) is False
 
 
-def test_phantom_consumption_probe_reads_only_bounded_tail(tmp_path) -> None:
-    """#1127: old matching text outside the 4 MiB window is not consumption."""
+def test_phantom_consumption_requires_post_paste_occurrence(tmp_path) -> None:
+    """A retained exact prompt before this paste boundary is not acceptance."""
     ss, _ = _make_session(state=SessionState.CONNECTED)
     transcript = tmp_path / "transcript.jsonl"
-    old_header = b"[agent | old-sender | internal | old]\n"
-    transcript.write_bytes(
-        old_header + b"x" * (tmux_session._PHANTOM_TRANSCRIPT_TAIL_BYTES + 1)
+    prompt = "Scheduled wake: heartbeat\nrun the recurring check"
+    transcript.write_text(
+        _json.dumps({"type": "user", "message": {"content": prompt}}) + "\n"
     )
     ss._tailer = MagicMock()
     ss._tailer.transcript_path = transcript
+    entry = _seed_inflight(ss, prompt=prompt, transport_accepted=False)
+    _bind_transcript_ticket(entry, transcript, offset=transcript.stat().st_size)
+    with transcript.open("a", encoding="utf-8") as handle:
+        handle.write('{"type":"system"}\n')
 
-    tail = ss._read_phantom_transcript_tail()
+    assert ss._phantom_consumption_verdicts([entry]) == [False]
 
-    assert tail is not None
-    assert len(tail) == tmux_session._PHANTOM_TRANSCRIPT_TAIL_BYTES
-    assert old_header.rstrip() not in tail
+
+def test_phantom_consumption_same_path_new_file_resets_stale_offset(
+    tmp_path,
+) -> None:
+    """A replacement file at the same path starts a new byte namespace."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"system"}\n' + "x" * 4096)
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    prompt = "same-path replacement prompt"
+    entry = _seed_inflight(ss, prompt=prompt, transport_accepted=False)
+    old_identity = (transcript.stat().st_dev, transcript.stat().st_ino)
+    _bind_transcript_ticket(entry, transcript, offset=transcript.stat().st_size)
+
+    replacement = tmp_path / "replacement.jsonl"
+    replacement.write_text(
+        _json.dumps({"type": "user", "message": {"content": prompt}}) + "\n"
+    )
+    replacement.replace(transcript)
+    assert (transcript.stat().st_dev, transcript.stat().st_ino) != old_identity
+
+    assert ss._phantom_consumption_verdicts([entry]) == [True]
+
+
+def test_phantom_consumption_accepted_duplicate_claims_fifo_row(tmp_path) -> None:
+    """An accepted earlier duplicate cannot donate its row to a later paste."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    transcript = tmp_path / "transcript.jsonl"
+    prompt = "duplicate complete prompt"
+    transcript.write_text(
+        _json.dumps({"type": "user", "message": {"content": prompt}}) + "\n"
+    )
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    accepted = _seed_inflight(ss, prompt=prompt, transport_accepted=True)
+    unaccepted = _seed_inflight(ss, prompt=prompt, transport_accepted=False)
+    _bind_transcript_ticket(accepted, transcript)
+    _bind_transcript_ticket(unaccepted, transcript)
+
+    assert ss._phantom_consumption_verdicts([accepted, unaccepted]) == [
+        True,
+        False,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_deliver_turn_captures_occurrence_boundary_before_paste(
+    tmp_path,
+) -> None:
+    """The fallback ticket predates even a user row written during paste."""
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"system"}\n')
+    initial_size = transcript.stat().st_size
+    prompt = "prompt written before paste coroutine returns"
+    tmux = _make_mock_tmux()
+
+    async def paste_text(body: str, *, enter: bool = True) -> TmuxCommandResult:
+        assert body == prompt
+        assert enter is True
+        with transcript.open("a", encoding="utf-8") as handle:
+            handle.write(
+                _json.dumps({"type": "user", "message": {"content": body}})
+                + "\n"
+            )
+        return _ok()
+
+    tmux.paste_text = AsyncMock(side_effect=paste_text)
+    ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    ss._tailer.mark_active = MagicMock()
+    turn = _QueuedTurn(prompt=prompt)
+
+    await ss._deliver_turn(turn)
+
+    assert len(ss._inflight_metas) == 1
+    entry = ss._inflight_metas[0]
+    assert entry.transcript_offset_at_paste == initial_size
+    assert ss._phantom_consumption_verdicts([entry]) == [True]
 
 
 @pytest.mark.asyncio
@@ -5391,8 +5485,13 @@ async def test_idle_phantom_verified_consumed_resolves_scheduler_true(
     completion = asyncio.Event()
     delivery = asyncio.get_running_loop().create_future()
     durable_accept = MagicMock(return_value=True)
-    entry = _seed_inflight(ss, prompt=prompt, completion_event=completion)
-    entry.turn.transport_accepted = False
+    entry = _seed_inflight(
+        ss,
+        prompt=prompt,
+        completion_event=completion,
+        transport_accepted=False,
+    )
+    _bind_transcript_ticket(entry, transcript)
     entry.turn.scheduler_delivery = delivery
     entry.turn.scheduler_accept = durable_accept
     ss._head_started_at = _time.time() - 1.0
@@ -5428,8 +5527,12 @@ async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) 
     completion = asyncio.Event()
     prompt = "[agent | sender | internal | 2026-08-19T06:01:00-07:00]\nbody"
     original = _seed_inflight(
-        ss, prompt=prompt, completion_event=completion,
-    ).turn
+        ss,
+        prompt=prompt,
+        completion_event=completion,
+        transport_accepted=False,
+    )
+    _bind_transcript_ticket(original, transcript)
     backlog = _QueuedTurn(prompt="later backlog")
     ss._message_queue.put_nowait(backlog)
     ss._head_started_at = _time.time() - 1.0
@@ -5437,8 +5540,8 @@ async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) 
     await _run_idle_reconcile(ss)
 
     assert not completion.is_set()
-    assert original.replay_count == 1
-    assert ss._message_queue.get_nowait() is original
+    assert original.turn.replay_count == 1
+    assert ss._message_queue.get_nowait() is original.turn
     assert ss._message_queue.get_nowait() is backlog
     assert any(
         call.kwargs.get("reason") == "phantom_requeued_unconsumed"
@@ -5471,9 +5574,14 @@ async def test_idle_phantom_replay_cap_drops_loudly(
     completion = asyncio.Event()
     submission = asyncio.get_running_loop().create_future()
     header = "[agent | sender | internal | 2026-08-19T06:02:00-07:00]"
-    turn = _seed_inflight(
-        ss, prompt=f"{header}\nbody", completion_event=completion,
-    ).turn
+    entry = _seed_inflight(
+        ss,
+        prompt=f"{header}\nbody",
+        completion_event=completion,
+        transport_accepted=False,
+    )
+    _bind_transcript_ticket(entry, transcript)
+    turn = entry.turn
     turn.submission_receipt = submission
     turn.replay_count = 1
     ss._head_started_at = _time.time() - 1.0
@@ -5507,7 +5615,12 @@ async def test_idle_phantom_without_transcript_preserves_drain_with_audit(
     ss._transcript_recently_grew = lambda *_args: False
     ss._tailer = None
     completion = asyncio.Event()
-    _seed_inflight(ss, prompt="header\nbody", completion_event=completion)
+    _seed_inflight(
+        ss,
+        prompt="header\nbody",
+        completion_event=completion,
+        transport_accepted=False,
+    )
     ss._head_started_at = _time.time() - 1.0
 
     await _run_idle_reconcile(ss)
@@ -5550,12 +5663,20 @@ async def test_idle_phantom_mixed_deque_verdicts_per_meta(
     unconsumed_event = asyncio.Event()
     consumed_delivery = asyncio.get_running_loop().create_future()
     consumed = _seed_inflight(
-        ss, prompt=consumed_prompt, completion_event=consumed_event,
+        ss,
+        prompt=consumed_prompt,
+        completion_event=consumed_event,
+        transport_accepted=False,
     )
     consumed.turn.scheduler_delivery = consumed_delivery
     unconsumed = _seed_inflight(
-        ss, prompt=unconsumed_prompt, completion_event=unconsumed_event,
+        ss,
+        prompt=unconsumed_prompt,
+        completion_event=unconsumed_event,
+        transport_accepted=False,
     )
+    _bind_transcript_ticket(consumed, transcript)
+    _bind_transcript_ticket(unconsumed, transcript)
     ss._head_started_at = _time.time() - 1.0
 
     await _run_idle_reconcile(ss)
@@ -8859,13 +8980,21 @@ class TestInflightDequeConcurrentDispatch:
         event1 = asyncio.Event()
         event2 = asyncio.Event()
         turn1 = _seed_inflight(
-            ss, internal=True, completion_event=event1,
+            ss,
+            internal=True,
+            completion_event=event1,
+            transport_accepted=False,
         ).turn
         turn2 = _seed_inflight(
-            ss, meta={"platform": "t", "chat_id": "c", "message_id": "m"},
+            ss,
+            meta={"platform": "t", "chat_id": "c", "message_id": "m"},
+            transport_accepted=False,
         ).turn
         turn3 = _seed_inflight(
-            ss, internal=True, completion_event=event2,
+            ss,
+            internal=True,
+            completion_event=event2,
+            transport_accepted=False,
         ).turn
         assert len(ss._inflight_metas) == 3
 
@@ -8893,12 +9022,14 @@ class TestInflightDequeConcurrentDispatch:
             ss,
             prompt="plain prompt",
             completion_event=plain_event,
+            transport_accepted=False,
         ).turn
         plain.submission_receipt = plain_submission
         scheduler = _seed_inflight(
             ss,
             prompt="scheduler prompt",
             completion_event=scheduler_event,
+            transport_accepted=False,
         ).turn
         scheduler.scheduler_delivery = scheduler_delivery
 
@@ -8923,6 +9054,7 @@ class TestInflightDequeConcurrentDispatch:
             ss,
             prompt="capped plain prompt",
             completion_event=completion,
+            transport_accepted=False,
         ).turn
         turn.submission_receipt = submission
         turn.replay_count = 1

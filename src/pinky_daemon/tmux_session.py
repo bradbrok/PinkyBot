@@ -1372,6 +1372,13 @@ class _QueuedTurn:
     # race ahead of the tmux command coroutine's return; in that case the
     # transcript callback records metadata before a same-read Stop row fires.
     pane_delivery_recorded: bool = False
+    # Occurrence ticket captured immediately before the physical pane paste.
+    # The idle-phantom fallback uses the exact file identity + byte boundary
+    # to prove that one complete user row belongs to this paste, rather than
+    # accepting matching text retained from an older occurrence.
+    transcript_path_at_paste: Path | None = None
+    transcript_file_identity_at_paste: tuple[int, int] | None = None
+    transcript_offset_at_paste: int | None = None
     # Wake-only exact submission receipt (#953). True requires a matching
     # transcript user row or queue enqueue→dequeue; successful tmux paste/Enter
     # commands alone are deliberately insufficient. Kept separate from the
@@ -1494,6 +1501,14 @@ class _InflightMeta:
     # this turn's paste time regardless of write lag. Both None ⇒ fall back to wedged.
     transcript_mtime_at_paste: float | None = None
     paste_succeeded_at: float | None = None
+    # Direct idle-reconcile fallback ticket. ``transcript_offset_at_paste``
+    # is the file size sampled immediately before the pane paste. The device /
+    # inode pair prevents a stale offset from hiding rows when a new transcript
+    # materializes at the same pathname; identity change or truncation resets
+    # the scan boundary to byte zero.
+    transcript_path_at_paste: Path | None = None
+    transcript_file_identity_at_paste: tuple[int, int] | None = None
+    transcript_offset_at_paste: int | None = None
     # Non-zero only for turns delivered during the active post-fresh lineage.
     # A completion may end ``_fresh_context_respawn_grace_until`` only when
     # this epoch matches the session's active epoch.  This prevents an
@@ -1711,12 +1726,6 @@ def _inflight_replay_tail_cap() -> int:
         val = 20
     return max(0, val)
 
-
-# #1127 — idle-phantom consumption proof only needs the recent transcript.
-# Aged candidates are minutes old, so a bounded binary tail read avoids loading
-# long-lived multi-gigabyte JSONL histories while preserving their UTF-8 header
-# bytes exactly (JSON escapes only the prompt's later newline separators).
-_PHANTOM_TRANSCRIPT_TAIL_BYTES = 4 * 1024 * 1024
 
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
 # ``_session_ready_event`` for turns with ``internal=True and
@@ -4251,9 +4260,26 @@ class TmuxSession(TransportReplacementMixin):
                 await asyncio.gather(recovery_task, return_exceptions=True)
             self._wake_submission_recovery_task = None
 
-        # Fail and cancel scheduler-only delivery tasks before tearing down the
-        # ordinary worker/pane. A pane shutdown is a terminal non-receipt.
-        for turn in list(self._scheduler_pending_turns):
+        # Fail and cancel scheduler delivery before tearing down the ordinary
+        # worker/pane. Include turns whose idle recovery transferred ownership
+        # to the ordinary queue: pane shutdown is a terminal non-receipt, and a
+        # terminal receipt may not leave an executable queue alias behind.
+        scheduler_turns = list(self._scheduler_pending_turns)
+        if self.state != SessionState.RECONNECTING:
+            # A watchdog force-restart deliberately transfers an unaccepted
+            # scheduler head into the ordinary queue before entering
+            # RECONNECTING (#943). That queue occurrence owns the still-pending
+            # receipt across replacement-pane startup. Other disconnect modes
+            # are terminal and must retire queued scheduler replay.
+            scheduler_turns.extend(
+                turn
+                for turn in self._message_queue._queue  # type: ignore[attr-defined]
+                if turn.scheduler_serialized
+            )
+        unique_scheduler_turns: dict[int, _QueuedTurn] = {}
+        for turn in scheduler_turns:
+            unique_scheduler_turns.setdefault(id(turn), turn)
+        for turn in unique_scheduler_turns.values():
             delivery = turn.scheduler_delivery
             if delivery is not None and not delivery.done():
                 delivery.set_result(False)
@@ -4265,6 +4291,13 @@ class TmuxSession(TransportReplacementMixin):
             await asyncio.gather(*scheduler_tasks, return_exceptions=True)
         self._scheduler_delivery_tasks.clear()
         self._scheduler_pending_turns.clear()
+        removed_scheduler_replays = self._remove_terminal_scheduler_replays()
+        if removed_scheduler_replays:
+            _log(
+                f"tmux[{self.agent_name}]: removed "
+                f"{removed_scheduler_replays} terminal scheduler replay "
+                f"turn(s) during disconnect"
+            )
         self._pane_queue_operations.clear()
         self._pane_dequeued_turns.clear()
         self._wake_context_reload_guard = None
@@ -4299,10 +4332,11 @@ class TmuxSession(TransportReplacementMixin):
 
         # Drain the in-flight metadata deque (#560 replaces PR #496
         # round-2's single-dict clear). Scheduler turns resolve False so
-        # their durable owner redelivers; plain turns replay after a warm
-        # reconnect with completion/submission receipts still pending
-        # (#1127 parity with #561). Only a replay-cap drop unblocks a plain
-        # turn as definitively abandoned.
+        # their durable owner redelivers; unaccepted plain turns replay after a
+        # warm reconnect with completion/submission receipts still pending.
+        # Accepted plain turns retain #561's non-replay fence because they may
+        # already have performed side effects. Only an accepted disposition or
+        # replay-cap drop unblocks a plain turn as definitively abandoned.
         #
         # Also defends #496 round-1 Case 2: a straggler stop_hook_summary
         # read from a stale transcript on reconnect can't route a late
@@ -4315,6 +4349,7 @@ class TmuxSession(TransportReplacementMixin):
         self._inflight_tool_calls.clear()
         replay_cap = _inflight_replay_cap()
         replay: list[_QueuedTurn] = []
+        drained_turn_ids = {id(entry.turn) for entry in drained}
         for entry in drained:
             turn = entry.turn
             delivery = turn.scheduler_delivery
@@ -4329,9 +4364,20 @@ class TmuxSession(TransportReplacementMixin):
                 self._resolve_submission_receipt(turn, False)
                 continue
 
-            # #1127 parity with the watchdog's #561/#846 replay path. Plain
-            # pasted turns survive a warm disconnect on this retained session
-            # object, and their waiters stay pending until the replay completes.
+            # #561 accepted-head fence: exact transport acceptance outranks
+            # teardown replay. The pane may have executed side effects even if
+            # its Stop metadata never arrived, so replay would be unsafe.
+            if turn.transport_accepted:
+                if (
+                    entry.completion_event is not None
+                    and not entry.completion_event.is_set()
+                ):
+                    entry.completion_event.set()
+                continue
+
+            # #1127 parity with the watchdog's #561/#846 replay path. Only
+            # unaccepted pasted turns survive a warm disconnect on this
+            # retained session object; waiters remain pending until replay.
             turn.replay_count += 1
             if replay_cap and turn.replay_count > replay_cap:
                 header = turn.prompt.splitlines()[0] if turn.prompt else ""
@@ -4365,14 +4411,24 @@ class TmuxSession(TransportReplacementMixin):
         # ``wait_for_completion=True`` caller hangs forever when its
         # internal turn is interrupted pre-paste.
         if self._inflight_turn is not None:
-            evt = self._inflight_turn.completion_event
-            if evt is not None and not evt.is_set():
-                evt.set()
-            delivery = self._inflight_turn.scheduler_delivery
-            if delivery is not None and not delivery.done():
-                delivery.set_result(False)
-            self._resolve_submission_receipt(self._inflight_turn, False)
-            self._inflight_turn = None
+            in_hand = self._inflight_turn
+            if id(in_hand) in drained_turn_ids:
+                # Receipt-verified wakes can legitimately remain in-hand while
+                # their exact row also owns an inflight meta. The drained-meta
+                # disposition above is authoritative: replayed occurrences keep
+                # live receipts, while accepted/dropped ones are terminal. Do
+                # not terminalize the same object a second time through this
+                # pre-paste slot.
+                self._inflight_turn = None
+            else:
+                evt = in_hand.completion_event
+                if evt is not None and not evt.is_set():
+                    evt.set()
+                delivery = in_hand.scheduler_delivery
+                if delivery is not None and not delivery.done():
+                    delivery.set_result(False)
+                self._resolve_submission_receipt(in_hand, False)
+                self._inflight_turn = None
 
         # Stop the response tailer (PR8b). Tailer instance is retained
         # so stats/path persist; only the background task is cancelled.
@@ -4620,12 +4676,55 @@ class TmuxSession(TransportReplacementMixin):
         return True
 
     def _scheduler_receipt_done(self, turn: _QueuedTurn) -> None:
-        """Forget one receipt turn by identity, preserving equal duplicates."""
+        """Retire every scheduler ownership path for one terminal receipt."""
         self._scheduler_pending_turns[:] = [
             pending
             for pending in self._scheduler_pending_turns
             if pending is not turn
         ]
+        self._remove_queued_turn(turn)
+
+    @staticmethod
+    def _scheduler_receipt_terminal(turn: _QueuedTurn) -> bool:
+        receipt = turn.scheduler_delivery
+        return receipt is not None and receipt.done()
+
+    def _transfer_scheduler_replay_ownership(self, turn: _QueuedTurn) -> None:
+        """Move one scheduler occurrence exclusively to ordinary replay."""
+        if not turn.scheduler_serialized:
+            return
+        self._scheduler_pending_turns[:] = [
+            pending
+            for pending in self._scheduler_pending_turns
+            if pending is not turn
+        ]
+
+    def _remove_queued_turn(self, target: _QueuedTurn) -> int:
+        """Remove queued occurrences of ``target`` by identity, preserving FIFO."""
+        queued = self._message_queue._queue  # type: ignore[attr-defined]
+        retained = [turn for turn in queued if turn is not target]
+        removed = len(queued) - len(retained)
+        if removed:
+            queued.clear()
+            queued.extend(retained)
+        return removed
+
+    def _remove_terminal_scheduler_replays(self) -> int:
+        """Fence queued scheduler turns whose authoritative receipt ended."""
+        queued = self._message_queue._queue  # type: ignore[attr-defined]
+        retained = [
+            turn
+            for turn in queued
+            if not (
+                turn.scheduler_serialized
+                and self._scheduler_receipt_terminal(turn)
+            )
+        ]
+        removed = len(queued) - len(retained)
+        if removed:
+            queued.clear()
+            queued.extend(retained)
+        return removed
 
     def _scheduler_delivery_done(
         self, task: asyncio.Task, turn: _QueuedTurn
@@ -4653,7 +4752,7 @@ class TmuxSession(TransportReplacementMixin):
         try:
             async with self._scheduler_delivery_lock:
                 while self.state == SessionState.CONNECTED:
-                    if receipt is None or receipt.cancelled():
+                    if receipt is None or receipt.done():
                         return
                     try:
                         self._processing = True
@@ -7018,27 +7117,142 @@ class TmuxSession(TransportReplacementMixin):
         age = self._main_transcript_age(now)
         return age is not None and age < window
 
-    def _read_phantom_transcript_tail(self) -> bytes | None:
-        """Return a bounded transcript tail for idle-phantom consumption proof.
+    def _capture_transcript_occurrence_ticket(
+        self,
+    ) -> tuple[Path | None, tuple[int, int] | None, int | None]:
+        """Snapshot the active transcript identity and EOF before one paste.
 
-        ``None`` means the active tailer has no usable bound transcript.  The
-        caller preserves the historical drain verdict in that case, but logs
-        the missing proof distinctly.  Binary reads keep non-ASCII prompt
-        headers byte-exact and avoid JSON newline-escape mismatches (#1127).
+        The transcript user row can be written before ``paste_text`` returns,
+        so the boundary must be sampled immediately before the physical paste,
+        not during post-paste metadata recording. A missing-but-bound path is a
+        valid cold-start ticket at byte zero; the first materialized file then
+        scans from its beginning.
         """
         tailer = self._tailer
-        path = getattr(tailer, "transcript_path", None) if tailer else None
-        if not path:
-            return None
+        raw_path = getattr(tailer, "transcript_path", None) if tailer else None
+        if not raw_path:
+            return (None, None, None)
         try:
-            transcript = Path(path)
-            with transcript.open("rb") as handle:
-                handle.seek(0, os.SEEK_END)
-                size = handle.tell()
-                handle.seek(max(0, size - _PHANTOM_TRANSCRIPT_TAIL_BYTES))
-                return handle.read(_PHANTOM_TRANSCRIPT_TAIL_BYTES)
-        except (OSError, TypeError, ValueError):
-            return None
+            path = Path(raw_path)
+        except (TypeError, ValueError):
+            return (None, None, None)
+        try:
+            stat = path.stat()
+        except FileNotFoundError:
+            return (path, None, 0)
+        except OSError:
+            return (path, None, None)
+        return (path, (stat.st_dev, stat.st_ino), stat.st_size)
+
+    def _phantom_consumption_verdicts(
+        self, candidates: list[_InflightMeta]
+    ) -> list[bool | None]:
+        """Allocate complete post-paste user rows to candidates one-to-one.
+
+        ``True`` proves this exact occurrence was accepted, ``False`` means a
+        usable transcript contained no allocatable occurrence, and ``None``
+        means the transcript itself was unavailable (the historical fail-safe
+        drain remains in force for that case).
+
+        Already accepted candidates still participate in FIFO row allocation:
+        acceptance outranks a missing fallback row, but an earlier accepted
+        duplicate must claim its own row so that row cannot falsely certify a
+        later unaccepted duplicate.
+        """
+        # Per candidate: either a readable source key + scan boundary, False
+        # for a usable transcript without a paste ticket, or None when no
+        # transcript can be inspected at all.
+        sources: list[
+            tuple[tuple[Path, tuple[int, int]], int] | bool | None
+        ] = []
+        scan_starts: dict[tuple[Path, tuple[int, int]], int] = {}
+        for entry in candidates:
+            path = entry.transcript_path_at_paste
+            offset = entry.transcript_offset_at_paste
+            if path is None or offset is None:
+                tailer = self._tailer
+                raw_path = (
+                    getattr(tailer, "transcript_path", None) if tailer else None
+                )
+                try:
+                    usable = bool(raw_path) and Path(raw_path).is_file()
+                except (OSError, TypeError, ValueError):
+                    usable = False
+                sources.append(False if usable else None)
+                continue
+            try:
+                transcript = Path(path)
+                stat = transcript.stat()
+            except (OSError, TypeError, ValueError):
+                sources.append(None)
+                continue
+            current_identity = (stat.st_dev, stat.st_ino)
+            start = max(0, offset)
+            if (
+                entry.transcript_file_identity_at_paste != current_identity
+                or stat.st_size < start
+            ):
+                # A new/truncated file at the same path must not inherit the
+                # predecessor's stale EOF. Its occurrence namespace starts at 0.
+                start = 0
+            key = (transcript, current_identity)
+            sources.append((key, start))
+            scan_starts[key] = min(scan_starts.get(key, start), start)
+
+        rows: dict[
+            tuple[Path, tuple[int, int]], list[tuple[int, str]]
+        ] = {}
+        unreadable: set[tuple[Path, tuple[int, int]]] = set()
+        for key, start in scan_starts.items():
+            transcript, _identity = key
+            found: list[tuple[int, str]] = []
+            try:
+                with transcript.open("rb") as handle:
+                    handle.seek(start)
+                    while True:
+                        row_offset = handle.tell()
+                        raw = handle.readline()
+                        if not raw:
+                            break
+                        try:
+                            parsed = json.loads(raw)
+                        except (json.JSONDecodeError, UnicodeDecodeError):
+                            continue
+                        if not isinstance(parsed, dict) or parsed.get("type") != "user":
+                            continue
+                        prompt = self._transcript_user_text(parsed)
+                        if prompt is not None:
+                            found.append((row_offset, prompt))
+            except (OSError, TypeError, ValueError):
+                unreadable.add(key)
+            rows[key] = found
+
+        used: set[tuple[tuple[Path, tuple[int, int]], int]] = set()
+        verdicts: list[bool | None] = []
+        for entry, source in zip(candidates, sources, strict=True):
+            claimed = False
+            if isinstance(source, tuple):
+                key, start = source
+                if key not in unreadable:
+                    for row_offset, prompt in rows.get(key, []):
+                        occurrence = (key, row_offset)
+                        if (
+                            row_offset >= start
+                            and occurrence not in used
+                            and prompt == entry.turn.prompt
+                        ):
+                            used.add(occurrence)
+                            claimed = True
+                            break
+                else:
+                    source = None
+            if entry.turn.transport_accepted:
+                verdicts.append(True)
+            elif source is None:
+                verdicts.append(None)
+            else:
+                verdicts.append(claimed)
+        return verdicts
 
     def _background_task_recent_age(self, now: float, window: float) -> float | None:
         """Seconds since a background task last wrote a transcript, or None.
@@ -7611,41 +7825,66 @@ class TmuxSession(TransportReplacementMixin):
                     )
                     continue
                 if verdict == "idle":
-                    # #1127: an idle REPL proves there is no work running, but
-                    # not that every mechanically successful paste was ever
-                    # submitted.  Search each turn's single-line header in one
-                    # bounded transcript tail: present means a true phantom
-                    # stop-hook miss; absent means the REPL never consumed it.
+                    # #1127/#1128: an idle REPL proves there is no work running,
+                    # but not that every mechanically successful paste was ever
+                    # submitted. Allocate complete ``type=user`` rows from each
+                    # turn's post-paste transcript boundary, FIFO and one-to-one.
+                    # Existing exact acceptance remains authoritative, while an
+                    # older/equal prompt occurrence cannot certify a new paste.
                     candidates = list(self._inflight_metas)
+                    consumption_verdicts = self._phantom_consumption_verdicts(
+                        candidates
+                    )
                     self._inflight_metas.clear()
                     self._head_started_at = None
                     self._inflight_pane_ext_anchor = None
-                    transcript_tail = self._read_phantom_transcript_tail()
                     replay_cap = _inflight_replay_cap()
                     replay: list[_QueuedTurn] = []
                     drained_count = 0
                     dropped_count = 0
-                    if transcript_tail is None:
+                    terminal_fenced_count = 0
+                    unavailable_count = sum(
+                        consumed is None for consumed in consumption_verdicts
+                    )
+                    if unavailable_count:
                         _log(
                             f"tmux[{self.agent_name}]: "
                             f"PHANTOM_CONSUMPTION_PROBE_UNAVAILABLE "
+                            f"unavailable={unavailable_count} "
                             f"deque_depth={depth} head_age_s={age:.1f} — "
                             f"preserving legacy drain verdict"
                         )
 
-                    for entry in candidates:
+                    for entry, consumed in zip(
+                        candidates, consumption_verdicts, strict=True
+                    ):
                         turn = entry.turn
                         header = turn.prompt.splitlines()[0] if turn.prompt else ""
-                        try:
-                            consumed = (
-                                None
-                                if transcript_tail is None or not header
-                                else header.encode("utf-8") in transcript_tail
-                            )
-                        except UnicodeEncodeError:
-                            consumed = None
 
                         if consumed is False:
+                            if turn.scheduler_serialized:
+                                # The ordinary queue becomes the sole replay
+                                # owner before the turn is made visible there.
+                                # A receipt that ended during reconciliation
+                                # fences the occurrence instead of enqueueing it.
+                                self._transfer_scheduler_replay_ownership(turn)
+                                if self._scheduler_receipt_terminal(turn):
+                                    terminal_fenced_count += 1
+                                    ev = entry.completion_event
+                                    if ev is not None and not ev.is_set():
+                                        ev.set()
+                                    self._resolve_submission_receipt(turn, False)
+                                    log_watchdog_decision(
+                                        watchdog="inflight",
+                                        agent=self.agent_name,
+                                        decision="drop",
+                                        reason="phantom_scheduler_receipt_terminal",
+                                        state=self.state.value,
+                                        progress_stale_s=age,
+                                        inflight_turns=depth,
+                                        inflight_active=False,
+                                    )
+                                    continue
                             turn.replay_count += 1
                             if replay_cap and turn.replay_count > replay_cap:
                                 dropped_count += 1
@@ -7731,7 +7970,9 @@ class TmuxSession(TransportReplacementMixin):
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
                         f"but REPL is idle — reconciled {drained_count} phantom "
                         f"meta(s), requeued {len(replay)} unconsumed turn(s), "
-                        f"dropped {dropped_count} capped turn(s), NOT restarting "
+                        f"dropped {dropped_count} capped turn(s), fenced "
+                        f"{terminal_fenced_count} terminal scheduler turn(s), "
+                        f"NOT restarting "
                         f"(#118/#1127)"
                     )
                     if drained_count:
@@ -7973,6 +8214,18 @@ class TmuxSession(TransportReplacementMixin):
 
                 def _consider_replay(t: _QueuedTurn, *, kind: str) -> bool:
                     ev = t.completion_event
+                    if (
+                        t.scheduler_serialized
+                        and self._scheduler_receipt_terminal(t)
+                    ):
+                        self._transfer_scheduler_replay_ownership(t)
+                        if ev is not None and not ev.is_set():
+                            ev.set()
+                        _log(
+                            f"tmux[{self.agent_name}]: skipping replay of "
+                            f"terminal-receipt {kind} scheduler turn"
+                        )
+                        return False
                     if ev is not None and ev.is_set():
                         _log(
                             f"tmux[{self.agent_name}]: skipping replay of "
@@ -8024,11 +8277,7 @@ class TmuxSession(TransportReplacementMixin):
                     # replay candidate, while still waiting behind earlier
                     # work.
                     if head.turn.scheduler_serialized:
-                        self._scheduler_pending_turns[:] = [
-                            pending
-                            for pending in self._scheduler_pending_turns
-                            if pending is not head.turn
-                        ]
+                        self._transfer_scheduler_replay_ownership(head.turn)
                     # Any enqueue/dequeue evidence belonged to the killed pane.
                     # Re-arm exact matching for the replacement paste.
                     head.turn.pane_delivery_started = False
@@ -8140,18 +8389,14 @@ class TmuxSession(TransportReplacementMixin):
         if not turn.scheduler_serialized:
             return
 
+        if self._scheduler_receipt_terminal(turn):
+            raise _SchedulerDeliveryCancelled
         while self._scheduler_pane_busy(turn):
-            if (
-                turn.scheduler_delivery is not None
-                and turn.scheduler_delivery.cancelled()
-            ):
+            if self._scheduler_receipt_terminal(turn):
                 raise _SchedulerDeliveryCancelled
             await asyncio.sleep(0.25)
 
-        if (
-            turn.scheduler_delivery is not None
-            and turn.scheduler_delivery.cancelled()
-        ):
+        if self._scheduler_receipt_terminal(turn):
             raise _SchedulerDeliveryCancelled
 
     def _scheduler_pane_busy(
@@ -9230,8 +9475,7 @@ class TmuxSession(TransportReplacementMixin):
                 # instead.
                 if (
                     turn.scheduler_serialized
-                    and turn.scheduler_delivery is not None
-                    and turn.scheduler_delivery.cancelled()
+                    and self._scheduler_receipt_terminal(turn)
                 ):
                     raise _SchedulerDeliveryCancelled
                 # An ordinary send can win the REPL lock after the scheduler's
@@ -9244,6 +9488,11 @@ class TmuxSession(TransportReplacementMixin):
                     retry_scheduler_gate = True
                 else:
                     retry_scheduler_gate = False
+                    (
+                        turn.transcript_path_at_paste,
+                        turn.transcript_file_identity_at_paste,
+                        turn.transcript_offset_at_paste,
+                    ) = self._capture_transcript_occurrence_ticket()
                     turn.pane_delivery_started = True
                     result = await self._tmux.paste_text(
                         turn.prompt, enter=True
@@ -9363,6 +9612,11 @@ class TmuxSession(TransportReplacementMixin):
             turn=turn,
             transcript_mtime_at_paste=_tmtime_at_paste,
             paste_succeeded_at=_paste_succeeded_at,
+            transcript_path_at_paste=turn.transcript_path_at_paste,
+            transcript_file_identity_at_paste=(
+                turn.transcript_file_identity_at_paste
+            ),
+            transcript_offset_at_paste=turn.transcript_offset_at_paste,
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
         # Watchdog head-clock. If this entry just became the head (deque
