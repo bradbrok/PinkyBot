@@ -513,6 +513,7 @@ class TestAgentSchedules:
                 "agent_name": "oleg",
                 "count": 1,
                 "abandoned_count": 0,
+                "drain_parked_count": 0,
                 "oldest_fired_at": 100.0,
                 "newest_fired_at": 100.0,
                 "oldest_age_seconds": 400.0,
@@ -888,6 +889,7 @@ class TestOutboxReaper:
                 "agent_name": "oleg",
                 "count": 2,
                 "abandoned_count": 2,
+                "drain_parked_count": 0,
                 "oldest_fired_at": now - 3_600,
                 "newest_fired_at": now - 3_599,
                 "oldest_age_seconds": 3_600.0,
@@ -939,6 +941,7 @@ class TestOutboxReaper:
                 "agent_name": "oleg",
                 "count": 0,
                 "abandoned_count": 5,
+                "drain_parked_count": 0,
                 "oldest_fired_at": 0.0,
                 "newest_fired_at": 0.0,
                 "oldest_age_seconds": 0.0,
@@ -3883,22 +3886,39 @@ class TestScheduler:
         )
         assert ledger is not None
         assert ledger.attempts == 0
-        assert ledger.ledger_state == "abandoned"
-        assert ledger.last_error.startswith("OUTBOX_DRAIN_ABANDONED:")
+        # #635: cap expiry parks recoverably instead of terminalizing. The
+        # wake stays out of drain retry pressure but is not silently lost.
+        assert ledger.ledger_state == "drain-parked"
+        assert ledger.abandoned_at == 0
+        assert ledger.last_error.startswith("OUTBOX_DRAIN_PARKED:")
+        assert registry.list_pending_schedule_wakes("worker") == []
+        health = registry.get_pending_schedule_wake_health("worker")
+        assert health and health[0]["drain_parked_count"] == 1
+        assert health[0]["count"] == 0
         assert len(alerts) == 1
         assert alerts[0][0] == "worker"
         assert "OUTBOX DRAIN EXTENSION EXPIRED" in alerts[0][1]
+        assert "parked" in alerts[0][1]
         assert expected_bound in alerts[0][1]
+        assert "worker" not in scheduler._outbox_drain_extensions
 
+        # A still-busy follow-up cycle probes for un-park evidence but must
+        # neither replay the parked row nor duplicate the owner alert.
         clock[0] += 60
         scheduler._check_pending_wake_liveness(clock[0])
-        await asyncio.sleep(0)
-        assert "worker" not in scheduler._pending_replay_tasks
-        assert "worker" not in scheduler._outbox_drain_extensions
+        follow_up = scheduler._pending_replay_tasks.get("worker")
+        if follow_up is not None:
+            await follow_up
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert deliveries == []
         assert len(alerts) == 1
+        ledger = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert ledger is not None and ledger.ledger_state == "drain-parked"
         logs = capsys.readouterr().err
         assert "OUTBOX_DRAIN_EXTENSION_EXPIRED" in logs
-        assert "terminalized=1/1" in logs
+        assert "parked=1/1" in logs
 
     @pytest.mark.asyncio
     async def test_drain_probe_timeout_counts_busy_and_releases_replay_lock(
@@ -3940,14 +3960,21 @@ class TestScheduler:
         )
         scheduler.replay_pending_for_agent("worker", drain_recheck=True)
         task = scheduler._pending_replay_tasks["worker"]
-        await asyncio.wait_for(asyncio.shield(task), timeout=0.1)
+        await asyncio.wait_for(asyncio.shield(task), timeout=1.0)
         release_probe.set()
 
         assert probe_started.is_set()
         assert deliveries == []
         assert len(registry.list_pending_schedule_wakes("worker")) == 1
-        assert scheduler._outbox_drain_extensions["worker"].attempts == 1
-        assert "counting as busy and releasing" in capsys.readouterr().err
+        # #635 A1: a probe timeout is not busy evidence. The probe is retried
+        # once with a longer window; a still-indeterminate verdict defers but
+        # records the extension as unverified instead of manufacturing busy.
+        state = scheduler._outbox_drain_extensions["worker"]
+        assert state.attempts == 1
+        assert state.unverified_checks == 1
+        logs = capsys.readouterr().err
+        assert "retrying once" in logs
+        assert "indeterminate" in logs
 
     @pytest.mark.asyncio
     async def test_drain_wall_cap_uses_oldest_active_not_abandoned_history(
@@ -3999,6 +4026,253 @@ class TestScheduler:
         assert scheduler._outbox_drain_extensions["worker"].oldest_fired_at == (
             active.fired_at
         )
+
+    @pytest.mark.asyncio
+    async def test_drain_probe_timeout_retry_success_delivers(self, registry):
+        """#635 A1: one slow probe sample must not defer a deliverable wake."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="flaky probe", prompt="owed work"
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=time.time(),
+        )
+        probe_calls: list[str] = []
+        deliveries: list[str] = []
+
+        def flaky_probe(agent_name):
+            probe_calls.append(agent_name)
+            if len(probe_calls) == 1:
+                # Exceeds the first probe window but not the retry window.
+                time.sleep(0.3)
+                return True
+            return False
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_drain_busy_fn=flaky_probe,
+            outbox_drain_probe_timeout_sec=0.05,
+        )
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        await asyncio.wait_for(
+            asyncio.shield(scheduler._pending_replay_tasks["worker"]),
+            timeout=5.0,
+        )
+
+        assert probe_calls == ["worker", "worker"]
+        assert deliveries == ["owed work"]
+        assert registry.list_pending_schedule_wakes("worker") == []
+        assert "worker" not in scheduler._outbox_drain_extensions
+
+    @pytest.mark.asyncio
+    async def test_drain_parked_rows_release_on_verified_idle(
+        self, registry, monkeypatch
+    ):
+        """#635 B1: a parked wake auto-replays at the next verified idle."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="parked recovery", prompt="owed work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        busy = [True]
+        alerts: list[str] = []
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=lambda agent_name: busy[0],
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=1_000,
+            outbox_drain_extension_attempt_cap=1,
+        )
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        parked = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert parked is not None
+        assert parked.ledger_state == "drain-parked"
+        assert deliveries == []
+        assert len(alerts) == 1
+
+        # The phantom clears (e.g. the #118 watchdog reconciled the pane, or
+        # a real turn completed): the next periodic cycle must still visit
+        # the agent, verify idle, un-park, and deliver the retained wake.
+        busy[0] = False
+        clock[0] = base + 120
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+
+        assert deliveries == ["owed work"]
+        recovered = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert recovered is not None
+        assert recovered.ledger_state == "receipted-ran-once"
+        assert recovered.drain_parked_at == 0
+        assert len(alerts) == 1
+        assert "worker" not in scheduler._outbox_drain_extensions
+
+    @pytest.mark.asyncio
+    async def test_drain_parked_release_still_drops_stale_rows(
+        self, registry, monkeypatch, capsys
+    ):
+        """#635 B1: un-park replays through the #1102 staleness policy."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "* * * * *", name="stale parked", prompt="stale work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        busy = [True]
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_drain_busy_fn=lambda agent_name: busy[0],
+            pending_wake_max_age_sec=1_000,
+            outbox_drain_extension_attempt_cap=1,
+        )
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        parked = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert parked is not None
+        assert parked.ledger_state == "drain-parked"
+
+        # By the time the transport verifies idle the wake has aged past its
+        # every-minute replay window: release must drop it with the existing
+        # explicit stale policy, not deliver a zombie prompt.
+        busy[0] = False
+        clock[0] = base + 400
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+
+        assert deliveries == []
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ) is None
+        drops = registry.list_recurring_schedule_stale_drops("worker")
+        assert len(drops) == 1
+        assert "PERSISTED_WAKE_STALE_DROPPED" in capsys.readouterr().err
+
+    @pytest.mark.asyncio
+    async def test_confirmed_delivery_releases_drain_parked_backlog(
+        self, registry
+    ):
+        """#635 B1: a successful delivery is un-park evidence on any path."""
+        registry.register("worker")
+        parked_schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="parked lane", prompt="parked work"
+        )
+        active_schedule = registry.add_schedule(
+            "worker", "30 * * * *", name="active lane", prompt="fresh work"
+        )
+        now = time.time()
+        parked_row, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="worker",
+            schedule_name=parked_schedule.name,
+            prompt=parked_schedule.prompt,
+            fired_at=now - 30,
+        )
+        assert registry.drain_park_pending_schedule_wake(
+            parked_row.id, reason="OUTBOX_DRAIN_PARKED: test fixture"
+        )
+        registry.persist_schedule_wake(
+            active_schedule.id,
+            agent_name="worker",
+            schedule_name=active_schedule.name,
+            prompt=active_schedule.prompt,
+            fired_at=now - 10,
+        )
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            pending_wake_max_age_sec=100_000,
+        )
+        scheduler.replay_pending_for_agent("worker")
+        await scheduler._pending_replay_tasks["worker"]
+        # The success-release follow-up pass coalesces through the done
+        # callback; spin the loop until the released row fully drains.
+        for _ in range(200):
+            if (
+                len(deliveries) == 2
+                and not registry.list_pending_schedule_wakes("worker")
+            ):
+                break
+            await asyncio.sleep(0)
+
+        assert deliveries == ["fresh work", "parked work"]
+        assert registry.list_pending_schedule_wakes("worker") == []
+        ledger = registry.get_schedule_wake_by_fire(
+            parked_schedule.id, parked_row.fired_at
+        )
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
 
     @pytest.mark.asyncio
     async def test_idle_trigger_during_replay_guarantees_follow_up_pass(
@@ -4973,6 +5247,137 @@ class TestScheduler:
 
 
 # ── Heartbeat Watchdog Resurrection (issue #338) ──────────────────────────
+
+
+class TestDrainParkedWakeRegistry:
+    """#635 B1: the recoverable drain-parked outbox state machine."""
+
+    def _persist(self, registry, *, fired_at=None):
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="parked", prompt="owed work"
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=time.time() - 60 if fired_at is None else fired_at,
+        )
+        return schedule, pending
+
+    def test_drain_park_state_machine(self, registry):
+        schedule, pending = self._persist(registry)
+        assert registry.drain_park_pending_schedule_wake(
+            pending.id, reason="OUTBOX_DRAIN_PARKED: budget expired"
+        )
+        # Idempotent: a second park is a no-op, not a fresh transition.
+        assert not registry.drain_park_pending_schedule_wake(
+            pending.id, reason="OUTBOX_DRAIN_PARKED: duplicate"
+        )
+
+        assert registry.list_pending_schedule_wakes("worker") == []
+        visible = registry.list_pending_schedule_wakes(
+            "worker", include_parked=True
+        )
+        assert [row.id for row in visible] == [pending.id]
+        row = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert row is not None
+        assert row.ledger_state == "drain-parked"
+        assert row.drain_parked_at > 0
+        assert row.abandoned_at == 0 and row.parked_at == 0
+        assert row.last_error.startswith("OUTBOX_DRAIN_PARKED:")
+        assert row.to_dict()["state"] == "drain-parked"
+
+        assert [
+            r.id
+            for r in registry.list_schedule_wake_ledger(
+                "worker", state="drain-parked"
+            )
+        ] == [pending.id]
+        assert registry.list_schedule_wake_ledger(
+            "worker", state="pending"
+        ) == []
+        health = registry.get_pending_schedule_wake_health("worker")
+        assert health[0]["count"] == 0
+        assert health[0]["drain_parked_count"] == 1
+        assert registry.list_drain_parked_agent_names() == ["worker"]
+        # A parked row is excluded from delivery bookkeeping entirely.
+        assert registry.increment_pending_schedule_wake_attempts(
+            pending.id
+        ) is None
+
+        assert registry.release_drain_parked_schedule_wakes("worker") == 1
+        assert registry.release_drain_parked_schedule_wakes("worker") == 0
+        released = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert released is not None
+        assert released.ledger_state == "pending"
+        assert released.drain_parked_at == 0
+        assert [
+            row.id for row in registry.list_pending_schedule_wakes("worker")
+        ] == [pending.id]
+        assert registry.list_drain_parked_agent_names() == []
+        health = registry.get_pending_schedule_wake_health("worker")
+        assert health[0]["count"] == 1
+        assert health[0]["drain_parked_count"] == 0
+
+    def test_confirm_clears_drain_park(self, registry):
+        schedule, pending = self._persist(registry)
+        assert registry.drain_park_pending_schedule_wake(
+            pending.id, reason="OUTBOX_DRAIN_PARKED: budget expired"
+        )
+        assert registry.confirm_pending_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        row = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert row is not None
+        assert row.ledger_state == "receipted-ran-once"
+        assert row.drain_parked_at == 0
+
+    def test_terminal_transitions_win_over_drain_park(self, registry):
+        schedule, pending = self._persist(registry)
+        assert registry.drain_park_pending_schedule_wake(
+            pending.id, reason="OUTBOX_DRAIN_PARKED: budget expired"
+        )
+        # An explicit operator discard/zombie quarantine terminalizes even a
+        # drain-parked row, and release must not resurrect it afterwards.
+        assert registry.park_pending_schedule_wake(
+            pending.id, reason="retired via discard"
+        )
+        row = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert row is not None
+        assert row.ledger_state == "quarantined"
+        assert registry.release_drain_parked_schedule_wakes("worker") == 0
+        assert registry.list_pending_schedule_wakes("worker") == []
+
+    def test_reaper_abandons_expired_drain_parked_rows(self, registry):
+        now = time.time()
+        schedule, pending = self._persist(registry, fired_at=now - 10_000)
+        assert registry.drain_park_pending_schedule_wake(
+            pending.id, reason="OUTBOX_DRAIN_PARKED: budget expired"
+        )
+        registry.reap_pending_schedule_wakes(
+            now=now,
+            abandon_after=3_600,
+            retain_accepted=86_400,
+            retain_abandoned=86_400,
+            retain_parked=86_400,
+            payload_trim_after=86_400,
+        )
+        row = registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        )
+        assert row is not None
+        assert row.ledger_state == "abandoned"
+        assert row.prompt == "owed work"
 
 
 class TestHeartbeatResurrection:

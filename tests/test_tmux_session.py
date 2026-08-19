@@ -11991,3 +11991,70 @@ async def test_scheduler_drain_busy_pasted_unaccepted_outranks_newer_idle(
     assert turn.transport_accepted is False
     assert ss.scheduler_wake_inflight(turn.prompt) is True
     assert ss.scheduler_drain_busy() is True
+
+
+def test_scheduler_drain_busy_discounts_pre_spawn_working_row() -> None:
+    """#635 A3: a hook row from a dead REPL process is not busy evidence.
+
+    ``connect()`` always reaps any surviving pane and freshly spawns the
+    REPL, so a persisted working-status row stamped BEFORE
+    ``_current_session_started_at`` cannot describe the current process.
+    After an unclean host reboot that frozen "working" row otherwise pins
+    every scheduler drain busy until an unrelated turn rewrites it — the
+    exact starvation that terminalized a real wake on 08-18.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    ss._current_session_started_at = now - 5.0
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": now - 100.0,
+    }
+
+    assert not ss._inflight_metas
+    assert ss.scheduler_drain_busy() is False
+
+
+def test_scheduler_drain_busy_post_spawn_working_row_stays_busy() -> None:
+    """A working row stamped by THIS process life keeps failing closed."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    ss._current_session_started_at = now - 5.0
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": now - 1.0,
+    }
+
+    assert ss.scheduler_drain_busy() is True
+
+
+def test_scheduler_drain_busy_pre_spawn_discount_needs_quiet_pane() -> None:
+    """A paste this process life outranks the pre-spawn discount.
+
+    If the daemon pasted a turn and the hooks then broke (no status write),
+    the stale row plus a live inflight meta must still read busy — the
+    discount only applies when nothing was ever pasted into the fresh REPL.
+    """
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    ss._current_session_started_at = now - 5.0
+    _seed_inflight(ss)
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": now - 100.0,
+    }
+
+    assert ss.scheduler_drain_busy() is True
+
+
+def test_scheduler_drain_busy_unstamped_spawn_keeps_fail_closed() -> None:
+    """Without a spawn stamp the stale-row discount must never engage."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    assert ss._current_session_started_at == 0.0
+    ss._config.live_status_fn = lambda: {
+        "status": "working",
+        "last_updated": now - 100.0,
+    }
+
+    assert ss.scheduler_drain_busy() is True
