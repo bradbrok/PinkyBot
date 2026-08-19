@@ -114,11 +114,24 @@ def _client_ip(request: Request) -> str:
     )
 
 
+def _prune_bucket(timestamps: list[float], now: float, window: float) -> list[float]:
+    """Keep only stamps inside the window AND not in the future.
+
+    ``now - t < window`` alone retains future-stamped entries forever
+    (``now - t`` is negative), so timestamps written under a fast clock that
+    is later corrected backwards would occupy the bucket until process death,
+    silently rejecting every delivery. Future debris is clock damage, not
+    load — discard it.
+    """
+    return [t for t in timestamps if 0 <= now - t < window]
+
+
 def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
     """Return True if the client IP is within the webhook rate limit."""
     ip = _client_ip(request)
-    timestamps = _hook_ip_buckets.get(ip, [])
-    timestamps = [t for t in timestamps if now - t < _HOOK_IP_RATE_WINDOW]
+    timestamps = _prune_bucket(
+        _hook_ip_buckets.get(ip, []), now, _HOOK_IP_RATE_WINDOW
+    )
     if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
         _hook_ip_buckets[ip] = timestamps
         _log(f"hooks: IP rate limited {ip} ({len(timestamps)} reqs in {_HOOK_IP_RATE_WINDOW}s)")
@@ -132,10 +145,16 @@ def _check_hook_rate_limit(token: str, now: float) -> bool:
     """Return True if the request is within the rate limit (60/min per token)."""
     window = 60.0
     limit = 60
-    timestamps = _hook_rate_buckets.get(token, [])
-    timestamps = [t for t in timestamps if now - t < window]
+    timestamps = _prune_bucket(_hook_rate_buckets.get(token, []), now, window)
     if len(timestamps) >= limit:
         _hook_rate_buckets[token] = timestamps
+        # One line per dropped delivery: a saturated bucket must be visible
+        # (and countable) in the journal, never a silent 429. Token prefix
+        # only — the full token is a credential.
+        _log(
+            f"hooks: token rate limited {token[:8]}* "
+            f"({len(timestamps)} reqs in {window:.0f}s)"
+        )
         return False
     timestamps.append(now)
     _hook_rate_buckets[token] = timestamps
