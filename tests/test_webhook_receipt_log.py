@@ -252,3 +252,50 @@ class TestAccessLogTokenRedaction:
         assert "/hooks/" in emitted, "no access-log line observed"
         assert TOKEN not in emitted
         assert f"/hooks/{TOKEN[:8]}*" in emitted
+
+
+def _balanced_call(text: str, open_paren_index: int) -> str:
+    depth = 0
+    for end in range(open_paren_index, len(text)):
+        char = text[end]
+        if char == "(":
+            depth += 1
+        elif char == ")":
+            depth -= 1
+            if depth == 0:
+                return text[open_paren_index : end + 1]
+    return text[open_paren_index:]
+
+
+def test_every_daemon_uvicorn_site_passes_the_redacting_log_config():
+    """Any uvicorn Config/run in the daemon process re-runs dictConfig
+    process-wide; an unpatched site would strip the token redaction off the
+    access handler (the shared-MCP supervisor restarts uvicorn at arbitrary
+    times). Every in-process site must pass log_config explicitly.
+
+    Scope is the pinky_daemon package only: pinky_hub runs as its own
+    process, so its logging config cannot strip this daemon's filter.
+    """
+    from pathlib import Path
+
+    package_root = Path(triggers_module.__file__).resolve().parents[1]
+    violations = []
+    for source_path in sorted(package_root.rglob("*.py")):
+        text = source_path.read_text(encoding="utf-8")
+        for pattern in ("uvicorn.run(", "uvicorn.Config("):
+            start = 0
+            while True:
+                index = text.find(pattern, start)
+                if index == -1:
+                    break
+                call_text = _balanced_call(text, index + len(pattern) - 1)
+                if "log_config" not in call_text:
+                    line_number = text.count("\n", 0, index) + 1
+                    violations.append(
+                        f"{source_path.relative_to(package_root)}:{line_number}"
+                    )
+                start = index + len(pattern)
+    assert violations == [], (
+        "uvicorn started without the redacting log_config at: "
+        + ", ".join(violations)
+    )
