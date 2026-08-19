@@ -4489,6 +4489,213 @@ class TestScheduler:
         assert "superseded" in older_row.last_error
 
     @pytest.mark.asyncio
+    async def test_live_confirmed_delivery_releases_parked_debt(
+        self, registry
+    ):
+        """R5-2: a confirmed LIVE fire is release evidence, not only replay.
+
+        The persisted replay loop's success path releases parked debt; a
+        normal live scheduled fire must do the same, or the minute-level
+        drain probe — the exact evidence class this fix distrusts — remains
+        the only recovery edge.
+        """
+        registry.register("worker")
+        parked_schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="parked lane", prompt="parked work"
+        )
+        parked_row, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="worker",
+            schedule_name=parked_schedule.name,
+            prompt=parked_schedule.prompt,
+            fired_at=time.time() - 30,
+        )
+        assert registry.drain_park_pending_schedule_wake(parked_row.id)
+        live_schedule = registry.add_schedule(
+            "worker", "30 * * * *", name="live lane", prompt="live work"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(live_schedule.id, fired_at)
+        live_schedule.last_run = fired_at
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            pending_wake_max_age_sec=100_000,
+        )
+        await scheduler._deliver_schedule(live_schedule)
+        for _ in range(200):
+            if (
+                len(deliveries) == 2
+                and not registry.list_pending_schedule_wakes("worker")
+            ):
+                break
+            await asyncio.sleep(0)
+
+        assert deliveries == ["live work", "parked work"]
+        ledger = registry.get_schedule_wake_by_fire(
+            parked_schedule.id, parked_row.fired_at
+        )
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
+    async def test_direct_send_success_advances_floor_and_releases(
+        self, registry
+    ):
+        """R5-3: a ledgerless direct-send success carries exact fire
+        identity and must advance the durable floor and release debt."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "* * * * *", name="switched", prompt="sweep now"
+        )
+        now = time.time()
+        older, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 45,
+        )
+        assert registry.drain_park_pending_schedule_wake(older.id)
+        # Supported partial update: the same schedule identity switches to
+        # direct-send delivery.
+        registry.update_schedule(
+            schedule.id, direct_send=True, target_channel="chan"
+        )
+        direct = registry.get_schedule(schedule.id)
+        fired_at = now - 30
+        registry.update_schedule_last_run(schedule.id, fired_at)
+        direct.last_run = fired_at
+        sent: list[str] = []
+
+        async def direct_send(agent_name, platform, chat_id, message):
+            del agent_name, platform, chat_id
+            sent.append(message)
+
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            direct_send_callback=direct_send,
+        )
+        await scheduler._deliver_schedule(direct)
+        assert sent == ["sweep now"]
+        refreshed = registry.get_schedule(schedule.id)
+        assert refreshed.last_accepted_fired_at == pytest.approx(fired_at)
+        for _ in range(200):
+            older_row = registry.get_schedule_wake_by_fire(
+                schedule.id, older.fired_at
+            )
+            if older_row is not None and older_row.ledger_state not in (
+                "pending",
+                "drain-parked",
+            ):
+                break
+            await asyncio.sleep(0)
+
+        # The released older occurrence is superseded by the newer direct
+        # fire; it must not replay into the agent.
+        assert deliveries == []
+        older_row = registry.get_schedule_wake_by_fire(
+            schedule.id, older.fired_at
+        )
+        assert older_row is not None
+        assert older_row.ledger_state == "quarantined"
+
+    @pytest.mark.asyncio
+    async def test_rekey_boundary_rejects_fresh_cohort(
+        self, registry, monkeypatch
+    ):
+        """R5-4: a deferred re-key must not merge a LATER fresh cohort into
+        an already-alerted episode and suppress its page."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="boundary", prompt="owed work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        first, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        alerts: list[str] = []
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=lambda agent_name: True,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=100_000,
+            outbox_drain_extension_attempt_cap=1,
+        )
+        real_list = registry.list_pending_schedule_wakes
+        relist_state = [0]
+
+        def flaky_list(*args, **kwargs):
+            if args == ("worker",) and not kwargs:
+                relist_state[0] += 1
+                if relist_state[0] == 2:
+                    # Fail only the post-park durable re-list of cycle 1.
+                    raise RuntimeError("re-list failed")
+            return real_list(*args, **kwargs)
+
+        monkeypatch.setattr(
+            registry, "list_pending_schedule_wakes", flaky_list
+        )
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, first.fired_at
+        ).ledger_state == "drain-parked"
+
+        # A brand-new fire arrives AFTER the fully-parked first cohort. It
+        # is a fresh episode and must earn its own page when it parks.
+        second, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base + 90,
+        )
+        clock[0] = base + 120
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, second.fired_at
+        ).ledger_state == "drain-parked"
+        assert len(alerts) == 2
+
+    @pytest.mark.asyncio
     async def test_release_provenance_is_structural(self, registry):
         """R4-1: no park-reason text can dodge the supersession floor.
 
@@ -6339,6 +6546,33 @@ class TestDrainParkedWakeRegistry:
         )
         assert row is not None
         assert row.ledger_state == "drain-parked"
+
+    def test_migration_backfills_accepted_fire_authority(self, registry):
+        """R5-1: adding the schedule high-water column must backfill from
+        retained accepted rows — that evidence is provable, not ambiguous."""
+        schedule, pending = self._persist(registry)
+        assert registry.confirm_pending_schedule_wake(pending.id)
+        assert registry.get_schedule(
+            schedule.id
+        ).last_accepted_fired_at == pytest.approx(pending.fired_at)
+
+        # Simulate a pre-upgrade database: drop the column, discarding the
+        # authority, while the accepted wake row remains retained. Reopening
+        # runs the migration, which must backfill from that retained row.
+        registry._db.execute(
+            "ALTER TABLE agent_schedules DROP COLUMN last_accepted_fired_at"
+        )
+        registry._db.commit()
+
+        reopened = AgentRegistry(db_path=registry._db_path)
+        try:
+            migrated = reopened.get_schedule(schedule.id)
+            assert migrated is not None
+            assert migrated.last_accepted_fired_at == pytest.approx(
+                pending.fired_at
+            )
+        finally:
+            reopened.close()
 
     def test_reaper_abandons_expired_drain_parked_rows(self, registry):
         now = time.time()
