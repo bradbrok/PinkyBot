@@ -114,11 +114,14 @@ class _OutboxDrainExtensionState:
     # #635 A1: deferrals whose busy verdict came from an indeterminate probe
     # (timeout/exception after one retry), not a positive transport signal.
     unverified_checks: int = 0
-    # #635 review round 4: set when the post-park durable re-list failed, so
-    # this episode's identity could not be re-keyed. The next health sample
-    # ADOPTS its new oldest fire into this state (keeping alert dedup and
-    # attempt history) instead of starting a fresh un-alerted episode.
+    # #635 review rounds 4-5: set when the post-park durable re-list failed,
+    # so this episode's identity could not be re-keyed. The next health
+    # sample ADOPTS its new oldest fire into this state (keeping alert dedup
+    # and attempt history) — but only for fires at or below
+    # ``rekey_boundary`` (the newest fire the parking pass targeted). A
+    # later fire is a FRESH episode that must earn its own page.
     rekey_pending: bool = False
+    rekey_boundary: float = 0.0
 
 
 def _retrieve_probe_outcome(future: "asyncio.Future") -> None:
@@ -1134,9 +1137,37 @@ class AgentScheduler:
                 )
             )
             if not receipted_pending:
+                # Ledgerless confirmation (direct-send fires create no wake
+                # row): the exact fire identity still advances the durable
+                # supersession floor.
                 self._registry.update_schedule_last_delivered(
-                    schedule.id, delivered_at
+                    schedule.id,
+                    delivered_at,
+                    accepted_fired_at=schedule.last_run,
                 )
+            # #635 B1: every confirmed delivery — live, replay, or
+            # ledgerless — is release evidence for this agent's drain-parked
+            # debt. Without this, the minute-level drain probe (the exact
+            # evidence class this fix distrusts) would be the only recovery
+            # edge for parked-only agents.
+            try:
+                released = self._registry.release_drain_parked_schedule_wakes(
+                    schedule.agent_name
+                )
+            except Exception as exc:
+                released = 0
+                _log(
+                    "scheduler: OUTBOX_DRAIN_UNPARK_FAILURE for "
+                    f"'{schedule.agent_name}': {type(exc).__name__}: {exc}"
+                )
+            if released:
+                self._outbox_drain_extensions.pop(schedule.agent_name, None)
+                _log(
+                    f"scheduler: OUTBOX_DRAIN_UNPARKED agent="
+                    f"'{schedule.agent_name}' released={released} on "
+                    "confirmed live delivery"
+                )
+                self.replay_pending_for_agent(schedule.agent_name)
             if self._activity:
                 try:
                     self._activity.log(
@@ -2045,13 +2076,20 @@ class AgentScheduler:
         oldest_fired_at = float(summary["oldest_fired_at"])
         state = self._outbox_drain_extensions.get(agent_name)
         if state is not None and state.oldest_fired_at != oldest_fired_at:
-            if state.rekey_pending:
+            if (
+                state.rekey_pending
+                and oldest_fired_at <= state.rekey_boundary
+            ):
                 # The prior cycle parked rows but could not re-list the
-                # remaining cohort; this sample supplies the re-key. Same
-                # episode: alert dedup and attempt history survive.
+                # remaining cohort; this sample supplies the re-key for a
+                # fire the parking pass actually targeted. Same episode:
+                # alert dedup and attempt history survive.
                 state.oldest_fired_at = oldest_fired_at
                 state.rekey_pending = False
             else:
+                # Either an ordinary new-oldest transition or a fire NEWER
+                # than the parked cohort's boundary: a fresh episode with
+                # its own alert budget.
                 state = None
         if state is None:
             state = _OutboxDrainExtensionState(oldest_fired_at)
@@ -2168,8 +2206,11 @@ class AgentScheduler:
             remaining = None
             # Episode identity must survive this transient read failure:
             # the next health sample's changed oldest fire will be ADOPTED
-            # into this state instead of starting a fresh un-alerted one.
+            # into this state instead of starting a fresh un-alerted one —
+            # bounded by the newest fire this parking pass targeted, so a
+            # LATER fresh cohort still earns its own page.
             state.rekey_pending = True
+            state.rekey_boundary = float(summary["newest_fired_at"])
             _log(
                 "scheduler: OUTBOX_DRAIN_PARK_FAILURE re-listing active "
                 f"rows for '{agent_name}': {type(exc).__name__}: {exc}; "

@@ -2017,6 +2017,24 @@ class AgentRegistry:
             if col not in sched_existing:
                 self._db.execute(f"ALTER TABLE agent_schedules ADD COLUMN {col} {typedef}")
                 _log(f"agent_registry: migrated — added {col} to agent_schedules")
+        if "last_accepted_fired_at" not in sched_existing:
+            # Backfill the supersession authority from retained accepted wake
+            # rows: that evidence is provable at upgrade time, and discarding
+            # it would let an already-superseded old occurrence replay after
+            # the upgrade. Schedules whose receipts were already reaped keep
+            # the conservative zero (floor inert until the next accept).
+            self._db.execute(
+                """UPDATE agent_schedules
+                   SET last_accepted_fired_at=COALESCE(
+                       (SELECT MAX(w.fired_at) FROM pending_schedule_wakes w
+                        WHERE w.schedule_id=agent_schedules.id
+                          AND w.accepted_at>0),
+                       0)"""
+            )
+            _log(
+                "agent_registry: migrated — backfilled "
+                "last_accepted_fired_at from retained accepted wakes"
+            )
 
         # Migrate pending_schedule_wakes table
         wake_existing = {
@@ -5152,13 +5170,23 @@ except Exception as exc:
         return cursor.rowcount > 0
 
     def update_schedule_last_delivered(
-        self, schedule_id: int, timestamp: float = 0.0
+        self, schedule_id: int, timestamp: float = 0.0,
+        *, accepted_fired_at: float = 0.0,
     ) -> None:
-        """Record when the session confirmed acceptance of a fired prompt."""
+        """Record when the session confirmed acceptance of a fired prompt.
+
+        ``accepted_fired_at`` carries the exact fire identity for ledgerless
+        confirmations (direct-send fires have no wake row): the durable
+        supersession floor must advance on EVERY confirmed occurrence, not
+        only receipted ones.
+        """
         ts = timestamp or time.time()
         self._db.execute(
-            "UPDATE agent_schedules SET last_delivered=? WHERE id=?",
-            (ts, schedule_id),
+            """UPDATE agent_schedules
+               SET last_delivered=?,
+                   last_accepted_fired_at=MAX(last_accepted_fired_at, ?)
+               WHERE id=?""",
+            (ts, max(0.0, accepted_fired_at), schedule_id),
         )
         self._db.commit()
 
