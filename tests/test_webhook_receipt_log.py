@@ -138,6 +138,50 @@ class TestWebhookReceiptLog:
         assert len(_receipts(logs)) == 3
 
 
+class TestRateLimiterClockWedge:
+    """A backwards clock step must not wedge the limiter buckets.
+
+    The prune ``now - t < window`` keeps FUTURE-stamped entries forever
+    (``now - t`` is negative), so timestamps written under a fast clock that
+    NTP later corrects backwards occupy the bucket until process death —
+    every delivery is then silently rejected while the sender sees 429s.
+    Observed in production 2026-08-18: a host power-cut's clock correction
+    silenced a webhook token for the process's entire remaining life, cured
+    only by restart. Future debris is clock damage, not load: discard it.
+    """
+
+    def test_future_stamped_token_bucket_recovers(self, rig):
+        client, _ = rig
+        now = time.time()
+        triggers_module._hook_rate_buckets[TOKEN] = [now + 3_600.0] * 60
+        response = client.post(f"/hooks/{TOKEN}", json={})
+        assert response.status_code == 200
+        # The wedge debris is gone; only this request's stamp remains.
+        bucket = triggers_module._hook_rate_buckets[TOKEN]
+        assert all(t <= time.time() for t in bucket)
+        assert len(bucket) == 1
+
+    def test_future_stamped_ip_bucket_recovers(self, rig):
+        client, _ = rig
+        now = time.time()
+        triggers_module._hook_ip_buckets["testclient"] = [now + 3_600.0] * 20
+        response = client.post(f"/hooks/{TOKEN}", json={})
+        assert response.status_code == 200
+
+    def test_genuine_token_flood_still_limited_and_loud(self, rig):
+        client, logs = rig
+        now = time.time()
+        triggers_module._hook_rate_buckets[TOKEN] = [now - 1.0] * 60
+        response = client.post(f"/hooks/{TOKEN}", json={})
+        assert response.status_code == 429
+        limited = [
+            line for line in logs if "token rate limited" in line
+        ]
+        assert len(limited) == 1
+        assert f"{TOKEN[:8]}*" in limited[0]
+        _assert_token_never_logged(logs, TOKEN)
+
+
 class _CaptureHandler(logging.Handler):
     def __init__(self, sink: list[str]):
         super().__init__()
