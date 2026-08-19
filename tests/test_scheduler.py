@@ -4390,7 +4390,7 @@ class TestScheduler:
         schedule = registry.add_schedule(
             "worker", "* * * * *", name="late accept", prompt="sweep now"
         )
-        base = time.time() - 120
+        base = time.time() - 90
         fire_a, _ = registry.persist_schedule_wake(
             schedule.id,
             agent_name="worker",

@@ -116,6 +116,12 @@ class _OutboxDrainExtensionState:
     unverified_checks: int = 0
 
 
+def _retrieve_probe_outcome(future: "asyncio.Future") -> None:
+    """Consume a drain-probe future's outcome so no exception goes unread."""
+    if not future.cancelled():
+        future.exception()
+
+
 def _positive_env_seconds(name: str, default: float) -> float:
     """Read one finite positive duration, falling back loudly."""
     raw_value = os.environ.get(name, str(default))
@@ -1836,13 +1842,31 @@ class AgentScheduler:
         if probe is None:
             return False, True
         outstanding = self._drain_probe_futures.get(agent_name)
-        if outstanding is not None and not outstanding.done():
-            _log(
-                f"scheduler: previous drain probe for '{agent_name}' is "
-                "still outstanding; deferring without a new probe"
-            )
-            return True, False
+        if outstanding is not None:
+            if not outstanding.done():
+                _log(
+                    f"scheduler: previous drain probe for '{agent_name}' is "
+                    "still outstanding; deferring without a new probe"
+                )
+                return True, False
+            # Structured harvesting: a probe that resolved with an exception
+            # AFTER its waits expired must surface in this log, not as an
+            # unstructured "exception was never retrieved" artifact when the
+            # future is overwritten below.
+            if not outstanding.cancelled():
+                late_error = outstanding.exception()
+                if late_error is not None:
+                    _log(
+                        f"scheduler: previous drain probe for "
+                        f"'{agent_name}' resolved late with "
+                        f"{type(late_error).__name__}: {late_error}"
+                    )
         future = asyncio.ensure_future(asyncio.to_thread(probe, agent_name))
+        # Retrieval-only callback: even if no later cycle ever visits this
+        # agent again, the exception is consumed so asyncio never reports an
+        # unretrieved shielded-future error; the log line above (or the
+        # in-band handler below) remains the human-visible record.
+        future.add_done_callback(_retrieve_probe_outcome)
         self._drain_probe_futures[agent_name] = future
         base_timeout = self._outbox_drain_probe_timeout_sec
         waits = (
@@ -2059,7 +2083,27 @@ class AgentScheduler:
                 "next cycle"
             )
             return True
-        targeted, parked, leftover_oldest_fired_at = park_outcome
+        targeted, parked = park_outcome
+        if parked == 0:
+            if targeted == 0:
+                # A second writer settled every row between the health
+                # sample and the listing: nothing recoverable to claim,
+                # nothing to page about. The budget is settled.
+                self._outbox_drain_extensions.pop(agent_name, None)
+                _log(
+                    "scheduler: OUTBOX_DRAIN_EXTENSION_EXPIRED settled for "
+                    f"'{agent_name}': no active rows remained to park"
+                )
+                return True
+            # Every park write failed: the owner page must never claim a
+            # recoverable transition that did not happen. Keep the budget
+            # (and its un-alerted status) so the next cycle retries.
+            _log(
+                "scheduler: OUTBOX_DRAIN_EXTENSION_EXPIRED park failed for "
+                f"'{agent_name}': 0/{targeted} rows parked; retrying next "
+                "cycle"
+            )
+            return True
         evidence_note = (
             ""
             if state.unverified_checks == 0
@@ -2100,18 +2144,28 @@ class AgentScheduler:
                     "and wake ledger before intervening."
                 ),
             )
-        if targeted == parked:
-            # Every active row is parked, so this oldest-fire budget is
-            # settled. Released rows start a fresh budget on a new oldest
-            # fire.
-            self._outbox_drain_extensions.pop(agent_name, None)
-        elif leftover_oldest_fired_at is not None:
-            # A partial park leaves NEWER rows active (parking iterates
-            # oldest-first), so the next health sample leads with a
-            # different oldest fire. Re-key the SAME budget state to it —
-            # this is one episode, and its alert-dedup and attempt history
-            # must survive the oldest-row change.
-            state.oldest_fired_at = leftover_oldest_fired_at
+        # Settle or re-key the budget from DURABLE state: a failed park
+        # write does not prove its row is still active (a second writer may
+        # have settled it), so the remaining cohort must be re-read, not
+        # inferred from UPDATE results.
+        try:
+            remaining = self._registry.list_pending_schedule_wakes(agent_name)
+        except Exception as exc:
+            remaining = None
+            _log(
+                "scheduler: OUTBOX_DRAIN_PARK_FAILURE re-listing active "
+                f"rows for '{agent_name}': {type(exc).__name__}: {exc}; "
+                "keeping the budget state as-is"
+            )
+        if remaining is not None:
+            if not remaining:
+                # Every active row is settled or parked; this budget is
+                # done. Released rows start a fresh budget later.
+                self._outbox_drain_extensions.pop(agent_name, None)
+            else:
+                # One partial-park episode: keep alert dedup and attempt
+                # history, keyed to the oldest row that is REALLY active.
+                state.oldest_fired_at = remaining[0].fired_at
         return True
 
     def _drain_park_outbox_rows(
@@ -2129,11 +2183,10 @@ class AgentScheduler:
         ever supersede a terminal state — abandonment there was silent loss.
         Parked rows stay recoverable and re-enter replay on delivery evidence.
 
-        Returns ``(targeted, parked, leftover_oldest_fired_at)`` where the
-        third element is the oldest fire that FAILED to park (``None`` when
-        everything parked), or ``None`` entirely when the active rows could
-        not even be listed — a listing failure must never read as an empty
-        outbox.
+        Returns ``(targeted, parked)``, or ``None`` when the active rows
+        could not even be listed — a listing failure must never read as an
+        empty outbox. The caller re-reads the durable cohort afterwards; a
+        failed park write here is NOT evidence its row is still active.
         """
         try:
             pending_wakes = self._registry.list_pending_schedule_wakes(
@@ -2155,25 +2208,20 @@ class AgentScheduler:
             f"max_age={self._outbox_drain_extension_max_age_sec:.1f}s)"
         )
         parked = 0
-        leftover_oldest_fired_at: float | None = None
         for pending in pending_wakes:
-            parked_this = False
             try:
-                parked_this = self._registry.drain_park_pending_schedule_wake(
+                if self._registry.drain_park_pending_schedule_wake(
                     pending.id,
                     reason=reason,
-                )
+                ):
+                    parked += 1
             except Exception as exc:
                 _log(
                     "scheduler: OUTBOX_DRAIN_PARK_FAILURE pending "
                     f"#{pending.id} for '{agent_name}': "
                     f"{type(exc).__name__}: {exc}"
                 )
-            if parked_this:
-                parked += 1
-            elif leftover_oldest_fired_at is None:
-                leftover_oldest_fired_at = pending.fired_at
-        return len(pending_wakes), parked, leftover_oldest_fired_at
+        return len(pending_wakes), parked
 
     async def _replay_pending_locked(
         self, agent_name: str, *, drain_recheck: bool = False
@@ -2308,35 +2356,49 @@ class AgentScheduler:
                 continue
             if (
                 not current_schedule.one_shot
-                and current_schedule.last_delivered > 0
-                and pending.fired_at <= current_schedule.last_delivered
-                and pending.last_error.startswith("OUTBOX_DRAIN_PARKED")
+                and pending.last_error.startswith("OUTBOX_DRAIN_RELEASED")
             ):
-                # #635 B1 review round 2: an un-parked recurring occurrence
-                # older than a delivery this schedule already confirmed is
-                # superseded work — the release trigger WAS that newer
-                # delivery, and the newer row is accepted (absent from this
-                # pass), so recurrence collapse has no peer to catch this.
-                # The persistent OUTBOX_DRAIN_PARKED trace scopes the floor
-                # to released rows; the ordinary minutes-scale deferred-fire
-                # recovery path keeps its documented replay semantics.
-                superseded = self._registry.park_pending_schedule_wake(
-                    pending.id,
-                    reason=(
-                        "terminal replay policy: recurrence superseded by "
-                        "confirmed delivery at "
-                        f"{current_schedule.last_delivered}"
-                    ),
+                # #635 B1 review rounds 2-3: a released recurring occurrence
+                # older than the newest ACCEPTED exact fire of its schedule
+                # is superseded work — that newer accepted row is absent
+                # from this pass, so recurrence collapse has no peer to
+                # catch this. The comparison is fire-identity against
+                # fire-identity: receipt wall-clock time is NOT ordering
+                # evidence (an older fire accepted late must never
+                # supersede newer owed work). The OUTBOX_DRAIN_RELEASED
+                # provenance is stamped by the release transition itself,
+                # so the floor covers every released row regardless of the
+                # original park reason, while the ordinary minutes-scale
+                # deferred-fire recovery path keeps its documented replay
+                # semantics.
+                accepted_high_water = (
+                    self._registry.get_max_accepted_fired_at(
+                        pending.schedule_id
+                    )
                 )
-                _log(
-                    f"scheduler: RECURRENCE_SUPERSEDED_BY_DELIVERY pending "
-                    f"#{pending.id}, schedule '{pending.schedule_name}' "
-                    f"(#{pending.schedule_id}) for agent "
-                    f"'{pending.agent_name}': fired_at={pending.fired_at} "
-                    f"last_delivered={current_schedule.last_delivered} "
-                    f"quarantined={superseded}"
-                )
-                continue
+                if (
+                    accepted_high_water > 0
+                    and pending.fired_at <= accepted_high_water
+                ):
+                    superseded = self._registry.park_pending_schedule_wake(
+                        pending.id,
+                        reason=(
+                            "terminal replay policy: recurrence superseded "
+                            "by accepted fire at "
+                            f"{accepted_high_water}"
+                        ),
+                    )
+                    _log(
+                        f"scheduler: RECURRENCE_SUPERSEDED_BY_DELIVERY "
+                        f"pending #{pending.id}, schedule "
+                        f"'{pending.schedule_name}' "
+                        f"(#{pending.schedule_id}) for agent "
+                        f"'{pending.agent_name}': "
+                        f"fired_at={pending.fired_at} "
+                        f"accepted_high_water={accepted_high_water} "
+                        f"quarantined={superseded}"
+                    )
+                    continue
             if pending.schedule_id in abandoned_schedule_ids:
                 _log(
                     f"scheduler: persisted wake #{pending.id}, schedule "

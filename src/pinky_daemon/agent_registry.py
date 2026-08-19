@@ -5656,17 +5656,43 @@ except Exception as exc:
         confirmed delivery to this agent). Released rows re-enter the normal
         replay policy, so the #1102 staleness and zombie rules still bound
         what actually replays. Terminal rows are never resurrected.
+
+        The release stamps ``OUTBOX_DRAIN_RELEASED`` provenance onto
+        ``last_error``: this transition is the ONLY creator of released rows,
+        so replay's recurrence-supersession floor can key on it without
+        depending on what reason string the park was originally given.
         """
         with self._rmw_lock:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
-                   SET drain_parked_at=0
+                   SET drain_parked_at=0,
+                       last_error=CASE
+                           WHEN last_error LIKE 'OUTBOX_DRAIN_RELEASED:%'
+                           THEN last_error
+                           ELSE 'OUTBOX_DRAIN_RELEASED: ' || last_error END
                    WHERE agent_name=? AND drain_parked_at>0
                      AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
                 (agent_name,),
             )
             self._db.commit()
         return cursor.rowcount
+
+    def get_max_accepted_fired_at(self, schedule_id: int) -> float:
+        """Return the newest ACCEPTED exact-fire timestamp for one schedule.
+
+        This is the exact-fire high-water mark replay's supersession floor
+        compares against — receipt wall-clock time (``last_delivered``) is
+        NOT ordering evidence, because an older fire can be accepted after a
+        newer one fired. Returns 0.0 when no accepted receipt is retained
+        (including after the reaper prunes old accepted rows — parked debt
+        hits the reaper's own fired-at ceiling long before that window).
+        """
+        row = self._db.execute(
+            """SELECT MAX(fired_at) FROM pending_schedule_wakes
+               WHERE schedule_id=? AND accepted_at>0""",
+            (schedule_id,),
+        ).fetchone()
+        return float(row[0]) if row and row[0] is not None else 0.0
 
     def list_drain_parked_agent_names(self) -> list[str]:
         """Name every agent holding recoverable drain-parked wake debt."""
