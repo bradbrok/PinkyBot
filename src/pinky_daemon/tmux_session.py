@@ -8023,9 +8023,28 @@ class TmuxSession(TransportReplacementMixin):
             live = live_status_fn() or {}
         except Exception:
             return True
+        last_updated = live.get("last_updated")
+        spawn_at = self._current_session_started_at
+        if (
+            not self._inflight_metas
+            and spawn_at > 0
+            and isinstance(last_updated, (int, float))
+            and not isinstance(last_updated, bool)
+            and 0 < last_updated <= spawn_at
+        ):
+            # #635 A3 — boot-phantom reconciliation. ``connect()`` always
+            # reaps any surviving pane before freshly spawning the REPL, so a
+            # persisted hook row stamped BEFORE ``_current_session_started_at``
+            # can only describe a dead process. Every in-daemon busy signal is
+            # already quiet here (tool calls, in-hand turn, queue, unresolved
+            # pastes above; the empty meta deque means nothing was pasted this
+            # process life), so nothing can be in flight that this row could
+            # be describing. Without this, an unclean-restart "working" row
+            # froze every scheduler drain until an unrelated turn rewrote it,
+            # and the drain budget then terminalized real wakes (#635).
+            return False
         if live.get("status") != "idle":
             return True
-        last_updated = live.get("last_updated")
         if not (
             isinstance(last_updated, (int, float))
             and not isinstance(last_updated, bool)
