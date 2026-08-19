@@ -4489,6 +4489,187 @@ class TestScheduler:
         assert "superseded" in older_row.last_error
 
     @pytest.mark.asyncio
+    async def test_live_confirm_does_not_replay_ordinary_backlog(
+        self, registry
+    ):
+        """R7-1: released debt replays on confirm evidence; ordinary
+        backlog does not — a new cron fire never replays backlog into the
+        old session (documented contract)."""
+        registry.register("worker")
+        backlog_schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="backlog lane", prompt="backlog work"
+        )
+        registry.persist_schedule_wake(
+            backlog_schedule.id,
+            agent_name="worker",
+            schedule_name=backlog_schedule.name,
+            prompt=backlog_schedule.prompt,
+            fired_at=time.time() - 30,
+        )
+        live_schedule = registry.add_schedule(
+            "worker", "30 * * * *", name="live lane", prompt="live work"
+        )
+        fired_at = time.time()
+        registry.update_schedule_last_run(live_schedule.id, fired_at)
+        live_schedule.last_run = fired_at
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            pending_wake_max_age_sec=100_000,
+        )
+        await scheduler._deliver_schedule(live_schedule)
+        for _ in range(50):
+            await asyncio.sleep(0)
+
+        # The live fire delivered; the never-parked backlog row waits for
+        # its own turn-idle/drain boundary as before.
+        assert deliveries == ["live work"]
+        assert [
+            row.schedule_id
+            for row in registry.list_pending_schedule_wakes("worker")
+        ] == [backlog_schedule.id]
+
+    @pytest.mark.asyncio
+    async def test_confirmed_pass_does_not_self_retry_failed_fifo(
+        self, registry
+    ):
+        """R7-2: a transient FIFO failure keeps its attempt cadence — a
+        confirmed earlier delivery must not immediately re-attempt it."""
+        registry.register("worker")
+        schedule_ok = registry.add_schedule(
+            "worker", "0 * * * *", name="ok lane", prompt="ok work"
+        )
+        ok_row, _ = registry.persist_schedule_wake(
+            schedule_ok.id,
+            agent_name="worker",
+            schedule_name=schedule_ok.name,
+            prompt=schedule_ok.prompt,
+            fired_at=time.time() - 40,
+        )
+        schedule_flaky = registry.add_schedule(
+            "worker", "30 * * * *", name="flaky lane", prompt="flaky work"
+        )
+        flaky_row, _ = registry.persist_schedule_wake(
+            schedule_flaky.id,
+            agent_name="worker",
+            schedule_name=schedule_flaky.name,
+            prompt=schedule_flaky.prompt,
+            fired_at=time.time() - 20,
+        )
+        attempts_by_prompt: dict[str, int] = {}
+
+        async def flaky(agent_name, session_id, prompt):
+            del agent_name, session_id
+            attempts_by_prompt[prompt] = attempts_by_prompt.get(prompt, 0) + 1
+            return prompt == "ok work"
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=flaky,
+            pending_wake_max_age_sec=100_000,
+        )
+        scheduler.replay_pending_for_agent("worker")
+        await scheduler._pending_replay_tasks["worker"]
+        for _ in range(100):
+            await asyncio.sleep(0)
+
+        assert attempts_by_prompt == {"ok work": 1, "flaky work": 1}
+        assert registry.get_schedule_wake_by_fire(
+            schedule_ok.id, ok_row.fired_at
+        ).ledger_state == "receipted-ran-once"
+        flaky_ledger = registry.get_schedule_wake_by_fire(
+            schedule_flaky.id, flaky_row.fired_at
+        )
+        assert flaky_ledger.ledger_state == "pending"
+        assert flaky_ledger.attempts == 1
+
+    @pytest.mark.asyncio
+    async def test_late_observer_confirm_replays_released_debt(
+        self, registry, monkeypatch
+    ):
+        """R7-3: a late positive receipt observed by the detached observer
+        must trigger the coalesced replay of the debt it released."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 8 * * *", name="daily", prompt="same prompt"
+        )
+        older_fired_at = 1_800_000_000.0
+        older, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=older_fired_at,
+        )
+        parked_schedule = registry.add_schedule(
+            "worker", "0 9 * * *", name="parked lane", prompt="parked work"
+        )
+        parked_row, _ = registry.persist_schedule_wake(
+            parked_schedule.id,
+            agent_name="worker",
+            schedule_name=parked_schedule.name,
+            prompt=parked_schedule.prompt,
+            fired_at=older_fired_at + 50.0,
+        )
+        assert registry.drain_park_pending_schedule_wake(parked_row.id)
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time",
+            lambda: older_fired_at + 3_601.0,
+        )
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler._ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC",
+            0.01,
+        )
+        pasted_inflight = [True]
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        def inflight(agent_name, prompt):
+            del agent_name, prompt
+            return pasted_inflight[0]
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_inflight_fn=inflight,
+            pending_wake_max_age_sec=100_000,
+        )
+        await scheduler._replay_pending_locked("worker")
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, older_fired_at
+        ).ledger_state == "abandoned"
+
+        # The transport's late positive receipt lands durably; the detached
+        # observer sees it and must replay the released parked debt.
+        pasted_inflight[0] = False
+        assert ScheduleWakeReceipt(
+            registry, schedule.id, older_fired_at
+        ).accept() is True
+        await asyncio.gather(*list(scheduler._detached_receipt_tasks))
+        for _ in range(200):
+            if deliveries:
+                break
+            await asyncio.sleep(0.01)
+
+        assert deliveries == ["parked work"]
+        ledger = registry.get_schedule_wake_by_fire(
+            parked_schedule.id, parked_row.fired_at
+        )
+        assert ledger is not None
+        assert ledger.ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
     async def test_restart_after_durable_accept_recovers_parked_debt(
         self, registry
     ):
