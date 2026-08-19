@@ -114,6 +114,11 @@ class _OutboxDrainExtensionState:
     # #635 A1: deferrals whose busy verdict came from an indeterminate probe
     # (timeout/exception after one retry), not a positive transport signal.
     unverified_checks: int = 0
+    # #635 review round 4: set when the post-park durable re-list failed, so
+    # this episode's identity could not be re-keyed. The next health sample
+    # ADOPTS its new oldest fire into this state (keeping alert dedup and
+    # attempt history) instead of starting a fresh un-alerted episode.
+    rekey_pending: bool = False
 
 
 def _retrieve_probe_outcome(future: "asyncio.Future") -> None:
@@ -2039,7 +2044,16 @@ class AgentScheduler:
         """Bound consecutive drain deferrals by count and oldest-fire age."""
         oldest_fired_at = float(summary["oldest_fired_at"])
         state = self._outbox_drain_extensions.get(agent_name)
-        if state is None or state.oldest_fired_at != oldest_fired_at:
+        if state is not None and state.oldest_fired_at != oldest_fired_at:
+            if state.rekey_pending:
+                # The prior cycle parked rows but could not re-list the
+                # remaining cohort; this sample supplies the re-key. Same
+                # episode: alert dedup and attempt history survive.
+                state.oldest_fired_at = oldest_fired_at
+                state.rekey_pending = False
+            else:
+                state = None
+        if state is None:
             state = _OutboxDrainExtensionState(oldest_fired_at)
             self._outbox_drain_extensions[agent_name] = state
         state.attempts += 1
@@ -2152,10 +2166,14 @@ class AgentScheduler:
             remaining = self._registry.list_pending_schedule_wakes(agent_name)
         except Exception as exc:
             remaining = None
+            # Episode identity must survive this transient read failure:
+            # the next health sample's changed oldest fire will be ADOPTED
+            # into this state instead of starting a fresh un-alerted one.
+            state.rekey_pending = True
             _log(
                 "scheduler: OUTBOX_DRAIN_PARK_FAILURE re-listing active "
                 f"rows for '{agent_name}': {type(exc).__name__}: {exc}; "
-                "keeping the budget state as-is"
+                "deferring the episode re-key to the next health sample"
             )
         if remaining is not None:
             if not remaining:
@@ -2166,6 +2184,7 @@ class AgentScheduler:
                 # One partial-park episode: keep alert dedup and attempt
                 # history, keyed to the oldest row that is REALLY active.
                 state.oldest_fired_at = remaining[0].fired_at
+                state.rekey_pending = False
         return True
 
     def _drain_park_outbox_rows(
@@ -2175,7 +2194,7 @@ class AgentScheduler:
         bound_reason: str,
         state: _OutboxDrainExtensionState,
         oldest_age: float,
-    ) -> tuple[int, int, float | None] | None:
+    ) -> tuple[int, int] | None:
         """Park every active row behind an expired drain budget (#635 B1).
 
         Parking replaces the old terminal abandonment: an idle agent behind a
@@ -2354,28 +2373,22 @@ class AgentScheduler:
                 or pending.drain_parked_at != 0
             ):
                 continue
-            if (
-                not current_schedule.one_shot
-                and pending.last_error.startswith("OUTBOX_DRAIN_RELEASED")
-            ):
-                # #635 B1 review rounds 2-3: a released recurring occurrence
+            if not current_schedule.one_shot and pending.released_at > 0:
+                # #635 B1 review rounds 2-4: a released recurring occurrence
                 # older than the newest ACCEPTED exact fire of its schedule
                 # is superseded work — that newer accepted row is absent
                 # from this pass, so recurrence collapse has no peer to
-                # catch this. The comparison is fire-identity against
-                # fire-identity: receipt wall-clock time is NOT ordering
-                # evidence (an older fire accepted late must never
-                # supersede newer owed work). The OUTBOX_DRAIN_RELEASED
-                # provenance is stamped by the release transition itself,
-                # so the floor covers every released row regardless of the
-                # original park reason, while the ordinary minutes-scale
-                # deferred-fire recovery path keeps its documented replay
-                # semantics.
-                accepted_high_water = (
-                    self._registry.get_max_accepted_fired_at(
-                        pending.schedule_id
-                    )
-                )
+                # catch this. Fire identity compares against fire identity:
+                # receipt wall-clock time is NOT ordering evidence (an older
+                # fire accepted late must never supersede newer owed work).
+                # ``released_at`` is structural provenance stamped by the
+                # release transition itself, so no park-reason text can
+                # dodge the floor, and the schedule's durable
+                # ``last_accepted_fired_at`` high-water mark outlives the
+                # reapable accepted receipt rows regardless of retention
+                # configuration. The ordinary minutes-scale deferred-fire
+                # recovery path keeps its documented replay semantics.
+                accepted_high_water = current_schedule.last_accepted_fired_at
                 if (
                     accepted_high_water > 0
                     and pending.fired_at <= accepted_high_water
