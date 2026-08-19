@@ -4376,6 +4376,347 @@ class TestScheduler:
         assert "superseded" in older_row.last_error
 
     @pytest.mark.asyncio
+    async def test_supersession_uses_accepted_fire_high_water_mark(
+        self, registry
+    ):
+        """R3-1a: a released occurrence NEWER than every accepted fire is
+        owed work, even when an older fire was accepted late.
+
+        ``last_delivered`` is receipt wall-clock time; comparing a fired_at
+        against it falsely supersedes newer work whenever an older fire is
+        accepted after the newer one fired.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "* * * * *", name="late accept", prompt="sweep now"
+        )
+        base = time.time() - 120
+        fire_a, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        fire_b, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base + 60,
+        )
+        # Older fire A is accepted LATE — after B fired.
+        assert registry.confirm_pending_schedule_wake(
+            fire_a.id, delivered_at=base + 90
+        )
+        # B was drain-parked through the registry's own DEFAULT reason: the
+        # floor must not depend on any caller-supplied magic string.
+        assert registry.drain_park_pending_schedule_wake(fire_b.id)
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            wake_callback=confirmed,
+            delivery_drain_busy_fn=lambda agent_name: False,
+            pending_wake_max_age_sec=1_000,
+        )
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        await scheduler._pending_replay_tasks["worker"]
+
+        assert deliveries == ["sweep now"]
+        row = registry.get_schedule_wake_by_fire(schedule.id, fire_b.fired_at)
+        assert row is not None
+        assert row.ledger_state == "receipted-ran-once"
+
+    @pytest.mark.asyncio
+    async def test_supersession_applies_regardless_of_park_reason(
+        self, registry
+    ):
+        """R3-1b: default-reason parks must not dodge the supersession floor."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "* * * * *", name="default reason", prompt="sweep now"
+        )
+        now = time.time()
+        older, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 45,
+        )
+        # Parked via the registry default reason — no magic prefix.
+        assert registry.drain_park_pending_schedule_wake(older.id)
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=now - 30,
+        )
+        deliveries: list[str] = []
+
+        async def confirmed(agent_name, session_id, prompt):
+            del agent_name, session_id
+            deliveries.append(prompt)
+            return True
+
+        scheduler = AgentScheduler(registry, wake_callback=confirmed)
+        scheduler.replay_pending_for_agent("worker")
+        await scheduler._pending_replay_tasks["worker"]
+        for _ in range(200):
+            older_row = registry.get_schedule_wake_by_fire(
+                schedule.id, older.fired_at
+            )
+            if older_row is not None and older_row.ledger_state not in (
+                "pending",
+                "drain-parked",
+            ):
+                break
+            await asyncio.sleep(0)
+
+        assert deliveries == ["sweep now"]
+        older_row = registry.get_schedule_wake_by_fire(
+            schedule.id, older.fired_at
+        )
+        assert older_row is not None
+        assert older_row.ledger_state == "quarantined"
+        assert "superseded" in older_row.last_error
+
+    @pytest.mark.asyncio
+    async def test_partial_park_zero_success_defers_alert(
+        self, registry, monkeypatch
+    ):
+        """R3-2a: the recoverable-park page may only claim an actual park."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="zero park", prompt="owed work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        alerts: list[str] = []
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=lambda agent_name: True,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=100_000,
+            outbox_drain_extension_attempt_cap=1,
+        )
+        failing = [True]
+        real_park = registry.drain_park_pending_schedule_wake
+
+        def broken_park(pending_id, **kwargs):
+            if failing[0]:
+                raise RuntimeError("park write failed")
+            return real_park(pending_id, **kwargs)
+
+        monkeypatch.setattr(
+            registry, "drain_park_pending_schedule_wake", broken_park
+        )
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+
+        # Zero rows parked: no page, and the budget survives for a retry.
+        assert alerts == []
+        assert "worker" in scheduler._outbox_drain_extensions
+        assert not scheduler._outbox_drain_extensions["worker"].alerted
+
+        failing[0] = False
+        clock[0] = base + 120
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, pending.fired_at
+        ).ledger_state == "drain-parked"
+
+    @pytest.mark.asyncio
+    async def test_partial_park_rekey_uses_durable_state(
+        self, registry, monkeypatch
+    ):
+        """R3-2b: re-key must come from the durable active cohort.
+
+        A False park return can mean a CONCURRENTLY SETTLED row, not a
+        still-active one; keying the budget to it lets the next health
+        sample replace the state and double-page one episode.
+        """
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="two writer", prompt="owed work"
+        )
+        base = 1_800_000_000.0
+        clock = [base]
+        monkeypatch.setattr(
+            "pinky_daemon.scheduler.time.time", lambda: clock[0]
+        )
+        row_a, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base,
+        )
+        row_b, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base + 5,
+        )
+        row_c, _ = registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=base + 10,
+        )
+        alerts: list[str] = []
+
+        async def owner_notify(agent_name, message):
+            del agent_name
+            alerts.append(message)
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            delivery_busy_fn=lambda agent_name: True,
+            delivery_drain_busy_fn=lambda agent_name: True,
+            owner_notify_callback=owner_notify,
+            pending_wake_max_age_sec=100_000,
+            outbox_drain_extension_attempt_cap=1,
+        )
+        real_park = registry.drain_park_pending_schedule_wake
+        wedged = [True]
+
+        def two_writer_park(pending_id, **kwargs):
+            if pending_id == row_b.id:
+                # A second writer terminalized B between the listing and
+                # this write: our own park honestly returns False.
+                registry.park_pending_schedule_wake(
+                    row_b.id, reason="terminal replay policy: fixture"
+                )
+                return real_park(pending_id, **kwargs)
+            if wedged[0] and pending_id == row_c.id:
+                raise RuntimeError("park write failed")
+            return real_park(pending_id, **kwargs)
+
+        monkeypatch.setattr(
+            registry, "drain_park_pending_schedule_wake", two_writer_park
+        )
+        scheduler._check_pending_wake_liveness(base)
+        clock[0] = base + 60
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+        # The budget must be keyed to the still-active row C, not the
+        # concurrently settled row B.
+        state = scheduler._outbox_drain_extensions["worker"]
+        assert state.oldest_fired_at == row_c.fired_at
+        assert state.alerted
+
+        clock[0] = base + 120
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+
+        wedged[0] = False
+        clock[0] = base + 180
+        scheduler._check_pending_wake_liveness(clock[0])
+        await scheduler._pending_replay_tasks["worker"]
+        await asyncio.gather(*list(scheduler._owner_alert_tasks))
+        assert len(alerts) == 1
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, row_a.fired_at
+        ).ledger_state == "drain-parked"
+        assert registry.get_schedule_wake_by_fire(
+            schedule.id, row_c.fired_at
+        ).ledger_state == "drain-parked"
+        assert "worker" not in scheduler._outbox_drain_extensions
+
+    @pytest.mark.asyncio
+    async def test_late_raising_probe_is_harvested(self, registry, capsys):
+        """R3-3: a probe that raises after both waits must surface in OUR log
+        on the next cycle, not as an unstructured asyncio error."""
+        registry.register("worker")
+        schedule = registry.add_schedule(
+            "worker", "0 * * * *", name="late raise", prompt="owed work"
+        )
+        registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=schedule.name,
+            prompt=schedule.prompt,
+            fired_at=time.time(),
+        )
+        release = threading.Event()
+        calls: list[int] = []
+
+        def late_raising_probe(agent_name):
+            del agent_name
+            calls.append(1)
+            if len(calls) == 1:
+                release.wait(timeout=5.0)
+                raise RuntimeError("late probe explosion")
+            return True
+
+        scheduler = AgentScheduler(
+            registry,
+            delivery_drain_busy_fn=late_raising_probe,
+            outbox_drain_probe_timeout_sec=0.01,
+        )
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        await asyncio.wait_for(
+            asyncio.shield(scheduler._pending_replay_tasks["worker"]),
+            timeout=2.0,
+        )
+        # Let the blocked probe resolve with its exception.
+        release.set()
+        for _ in range(200):
+            outstanding = scheduler._drain_probe_futures.get("worker")
+            if outstanding is not None and outstanding.done():
+                break
+            await asyncio.sleep(0.01)
+
+        scheduler.replay_pending_for_agent("worker", drain_recheck=True)
+        await asyncio.wait_for(
+            asyncio.shield(scheduler._pending_replay_tasks["worker"]),
+            timeout=2.0,
+        )
+
+        logs = capsys.readouterr().err
+        assert "late probe explosion" in logs
+        assert "RuntimeError" in logs
+        assert len(calls) == 2
+
+    @pytest.mark.asyncio
     async def test_hung_drain_probe_is_single_flight_across_cycles(
         self, registry
     ):
