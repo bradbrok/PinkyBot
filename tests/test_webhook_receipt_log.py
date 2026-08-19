@@ -9,6 +9,8 @@ logged; only its prefix may appear.
 
 from __future__ import annotations
 
+import logging
+import time
 from dataclasses import dataclass
 
 import pytest
@@ -40,8 +42,7 @@ class _Store:
         self.fired.append(trigger_id)
 
 
-@pytest.fixture()
-def rig(monkeypatch):
+def _wire(monkeypatch) -> tuple[FastAPI, list[str]]:
     monkeypatch.setattr(triggers_module, "_hook_rate_buckets", {})
     monkeypatch.setattr(triggers_module, "_hook_ip_buckets", {})
     logs: list[str] = []
@@ -57,6 +58,12 @@ def rig(monkeypatch):
     )
     app = FastAPI()
     app.include_router(triggers_module.router)
+    return app, logs
+
+
+@pytest.fixture()
+def rig(monkeypatch):
+    app, logs = _wire(monkeypatch)
     return TestClient(app), logs
 
 
@@ -129,3 +136,119 @@ class TestWebhookReceiptLog:
         client.post(f"/hooks/{UNKNOWN_TOKEN}", json={})
         client.post(f"/hooks/{TOKEN}", json={})
         assert len(_receipts(logs)) == 3
+
+
+class _CaptureHandler(logging.Handler):
+    def __init__(self, sink: list[str]):
+        super().__init__()
+        self.sink = sink
+
+    def emit(self, record: logging.LogRecord) -> None:
+        self.sink.append(self.format(record))
+
+
+@pytest.fixture()
+def access_capture():
+    """Capture formatted uvicorn.access records with redaction installed."""
+    access_logger = logging.getLogger("uvicorn.access")
+    redaction_filter = triggers_module.HookTokenRedactionFilter()
+    access_logger.addFilter(redaction_filter)
+    records: list[str] = []
+    handler = _CaptureHandler(records)
+    previous_level = access_logger.level
+    access_logger.addHandler(handler)
+    access_logger.setLevel(logging.INFO)
+    yield records
+    access_logger.removeHandler(handler)
+    access_logger.setLevel(previous_level)
+    access_logger.removeFilter(redaction_filter)
+
+
+class TestAccessLogTokenRedaction:
+    def test_request_line_args_are_redacted(self, access_capture):
+        # Exact record shape uvicorn's protocol emits for an access line.
+        logging.getLogger("uvicorn.access").info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:12345",
+            "POST",
+            f"/hooks/{TOKEN}",
+            "1.1",
+            404,
+        )
+        assert len(access_capture) == 1
+        assert TOKEN not in access_capture[0]
+        assert f"/hooks/{TOKEN[:8]}*" in access_capture[0]
+
+    def test_non_hook_paths_pass_through_unchanged(self, access_capture):
+        logging.getLogger("uvicorn.access").info(
+            '%s - "%s %s HTTP/%s" %d',
+            "127.0.0.1:12345",
+            "GET",
+            "/agents/barsik/status",
+            "1.1",
+            200,
+        )
+        assert access_capture == [
+            '127.0.0.1:12345 - "GET /agents/barsik/status HTTP/1.1" 200'
+        ]
+
+    def test_uvicorn_log_config_wires_redaction_into_access_handler(self):
+        import uvicorn.config
+
+        config = triggers_module.uvicorn_log_config()
+        assert config["filters"]["hook_token_redaction"]["()"] == (
+            "pinky_daemon.routes.triggers.HookTokenRedactionFilter"
+        )
+        assert "hook_token_redaction" in config["handlers"]["access"]["filters"]
+        # The patched dict must be a copy, not a mutation of uvicorn's default.
+        assert "hook_token_redaction" not in (
+            uvicorn.config.LOGGING_CONFIG.get("filters") or {}
+        )
+
+    def test_live_uvicorn_access_log_never_emits_full_token(
+        self, monkeypatch, capfd
+    ):
+        """End-to-end with the production log config: the emitted access
+        record must carry the token prefix, never the full credential."""
+        import threading
+        import urllib.request
+
+        import uvicorn
+
+        app, _ = _wire(monkeypatch)
+        config = uvicorn.Config(
+            app,
+            host="127.0.0.1",
+            port=0,
+            access_log=True,
+            log_config=triggers_module.uvicorn_log_config(),
+        )
+        server = uvicorn.Server(config)
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+        try:
+            deadline = time.time() + 15
+            while not server.started and time.time() < deadline:
+                time.sleep(0.05)
+            assert server.started, "uvicorn did not start in time"
+            port = server.servers[0].sockets[0].getsockname()[1]
+            request = urllib.request.Request(
+                f"http://127.0.0.1:{port}/hooks/{TOKEN}",
+                data=b"{}",
+                headers={"content-type": "application/json"},
+                method="POST",
+            )
+            with urllib.request.urlopen(request, timeout=10) as response:
+                assert response.status == 200
+            deadline = time.time() + 10
+            emitted = ""
+            while "/hooks/" not in emitted and time.time() < deadline:
+                time.sleep(0.05)
+                captured = capfd.readouterr()
+                emitted += captured.out + captured.err
+        finally:
+            server.should_exit = True
+            thread.join(timeout=15)
+        assert "/hooks/" in emitted, "no access-log line observed"
+        assert TOKEN not in emitted
+        assert f"/hooks/{TOKEN[:8]}*" in emitted

@@ -11,6 +11,7 @@ process-local in api.py too — a server restart resets them.
 from __future__ import annotations
 
 import json
+import logging
 import re as _re2
 import time
 from datetime import datetime
@@ -56,6 +57,53 @@ _hook_ip_buckets: dict[str, list[float]] = {}
 
 _HOOK_IP_RATE_LIMIT = 20
 _HOOK_IP_RATE_WINDOW = 60.0
+
+
+_HOOKS_PATH_RE = _re2.compile(r"(/hooks/)([^/\s\"?]+)")
+
+
+def _redact_hook_path(value: str) -> str:
+    """Replace the token segment of a /hooks/<token> path with its 8-char prefix."""
+    return _HOOKS_PATH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)[:8]}*", value)
+
+
+class HookTokenRedactionFilter(logging.Filter):
+    """Redact webhook tokens from uvicorn access-log request lines.
+
+    The handler-level receipt log already truncates the token, but uvicorn's
+    access log prints the raw request path — including the full /hooks/<token>
+    credential — so the token must also be redacted at this boundary.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _redact_hook_path(arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        if isinstance(record.msg, str) and "/hooks/" in record.msg:
+            record.msg = _redact_hook_path(record.msg)
+        return True
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's default logging config with token redaction on the access handler.
+
+    A logger-level addFilter() does not survive uvicorn's dictConfig (each
+    Config load resets the access logger, and ferry mode loads two Configs),
+    so the filter must ship inside the config that every load re-applies.
+    """
+    import copy
+
+    import uvicorn.config
+
+    config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    config.setdefault("filters", {})["hook_token_redaction"] = {
+        "()": "pinky_daemon.routes.triggers.HookTokenRedactionFilter",
+    }
+    access_handler = config["handlers"]["access"]
+    access_handler.setdefault("filters", []).append("hook_token_redaction")
+    return config
 
 
 def _client_ip(request: Request) -> str:
