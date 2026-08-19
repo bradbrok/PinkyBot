@@ -784,6 +784,7 @@ class PendingScheduleWake:
     failed_at: float = 0.0
     last_error: str = ""
     abandoned_at: float = 0.0
+    drain_parked_at: float = 0.0
 
     @property
     def name(self) -> str:
@@ -792,13 +793,21 @@ class PendingScheduleWake:
 
     @property
     def ledger_state(self) -> str:
-        """Return the exact operational outcome used by fleet health."""
+        """Return the exact operational outcome used by fleet health.
+
+        ``drain-parked`` is the one NON-terminal marker here: the row is
+        excluded from drain retry pressure but remains owed work until a
+        release, a late receipt, an explicit terminal transition, or the
+        reaper's fired-at ceiling resolves it.
+        """
         if self.accepted_at > 0:
             return "receipted-ran-once"
         if self.abandoned_at > 0:
             return "abandoned"
         if self.parked_at > 0:
             return "quarantined"
+        if self.drain_parked_at > 0:
+            return "drain-parked"
         return "pending"
 
     def to_dict(self) -> dict:
@@ -816,6 +825,7 @@ class PendingScheduleWake:
             "failed_at": self.failed_at,
             "last_error": self.last_error,
             "abandoned_at": self.abandoned_at,
+            "drain_parked_at": self.drain_parked_at,
             "state": self.ledger_state,
         }
 
@@ -1515,6 +1525,7 @@ class AgentRegistry:
                 failed_at REAL NOT NULL DEFAULT 0,
                 last_error TEXT NOT NULL DEFAULT '',
                 abandoned_at REAL NOT NULL DEFAULT 0,
+                drain_parked_at REAL NOT NULL DEFAULT 0,
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -2006,6 +2017,7 @@ class AgentRegistry:
             ("failed_at", "REAL NOT NULL DEFAULT 0"),
             ("last_error", "TEXT NOT NULL DEFAULT ''"),
             ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
+            ("drain_parked_at", "REAL NOT NULL DEFAULT 0"),
         ]
         for col, typedef in wake_migrations:
             if col not in wake_existing:
@@ -5315,7 +5327,7 @@ except Exception as exc:
         return self._db.execute(
             """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                       fired_at, created_at, attempts, parked_at, accepted_at,
-                      failed_at, last_error, abandoned_at
+                      failed_at, last_error, abandoned_at, drain_parked_at
                FROM pending_schedule_wakes
                WHERE schedule_id=? AND fired_at=?""",
             (schedule_id, fired_at),
@@ -5359,7 +5371,7 @@ except Exception as exc:
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                           fired_at, created_at, attempts, parked_at, accepted_at,
-                          failed_at, last_error, abandoned_at
+                          failed_at, last_error, abandoned_at, drain_parked_at
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -5375,13 +5387,14 @@ except Exception as exc:
     ) -> list[PendingScheduleWake]:
         """Return pending scheduler wakes oldest-first.
 
-        Accepted receipts are always excluded. Quarantined and abandoned rows
-        are excluded by default; pass ``include_parked=True`` to inspect those
-        terminal records alongside the active replay outbox.
+        Accepted receipts are always excluded. Quarantined, abandoned, and
+        drain-parked rows are excluded by default; pass ``include_parked=True``
+        to inspect those records alongside the active replay outbox
+        (drain-parked rows are non-terminal but carry no retry pressure).
         """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error, abandoned_at
+                        failed_at, last_error, abandoned_at, drain_parked_at
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5390,7 +5403,9 @@ except Exception as exc:
             params.append(agent_name)
         conditions.append("accepted_at=0")
         if not include_parked:
-            conditions.extend(("parked_at=0", "abandoned_at=0"))
+            conditions.extend(
+                ("parked_at=0", "abandoned_at=0", "drain_parked_at=0")
+            )
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
         sql += " ORDER BY fired_at ASC, id ASC"
@@ -5410,10 +5425,15 @@ except Exception as exc:
         never as active replay debt.
         """
         sql = """SELECT agent_name,
-                        SUM(CASE WHEN abandoned_at=0 THEN 1 ELSE 0 END),
-                        MIN(CASE WHEN abandoned_at=0 THEN fired_at END),
-                        MAX(CASE WHEN abandoned_at=0 THEN fired_at END),
-                        SUM(CASE WHEN abandoned_at>0 THEN 1 ELSE 0 END)
+                        SUM(CASE WHEN abandoned_at=0 AND drain_parked_at=0
+                            THEN 1 ELSE 0 END),
+                        MIN(CASE WHEN abandoned_at=0 AND drain_parked_at=0
+                            THEN fired_at END),
+                        MAX(CASE WHEN abandoned_at=0 AND drain_parked_at=0
+                            THEN fired_at END),
+                        SUM(CASE WHEN abandoned_at>0 THEN 1 ELSE 0 END),
+                        SUM(CASE WHEN abandoned_at=0 AND drain_parked_at>0
+                            THEN 1 ELSE 0 END)
                  FROM pending_schedule_wakes
                  WHERE accepted_at=0 AND parked_at=0"""
         params: list = []
@@ -5430,8 +5450,9 @@ except Exception as exc:
             result.append(
                 {
                     "agent_name": str(row[0]),
-                    "count": int(row[1]),
+                    "count": int(row[1] or 0),
                     "abandoned_count": int(row[4]),
+                    "drain_parked_count": int(row[5]),
                     "oldest_fired_at": oldest_fired_at,
                     "newest_fired_at": newest_fired_at,
                     "oldest_age_seconds": (
@@ -5458,11 +5479,12 @@ except Exception as exc:
             "receipted-ran-once",
             "quarantined",
             "abandoned",
+            "drain-parked",
         }:
             raise ValueError(f"invalid scheduler wake ledger state: {state}")
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error, abandoned_at
+                        failed_at, last_error, abandoned_at, drain_parked_at
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5474,7 +5496,12 @@ except Exception as exc:
             params.append(fired_after)
         if state == "pending":
             conditions.extend(
-                ("accepted_at=0", "parked_at=0", "abandoned_at=0")
+                (
+                    "accepted_at=0",
+                    "parked_at=0",
+                    "abandoned_at=0",
+                    "drain_parked_at=0",
+                )
             )
         elif state == "receipted-ran-once":
             conditions.append("accepted_at>0")
@@ -5485,6 +5512,15 @@ except Exception as exc:
         elif state == "abandoned":
             conditions.extend(
                 ("accepted_at=0", "parked_at=0", "abandoned_at>0")
+            )
+        elif state == "drain-parked":
+            conditions.extend(
+                (
+                    "accepted_at=0",
+                    "parked_at=0",
+                    "abandoned_at=0",
+                    "drain_parked_at>0",
+                )
             )
         if conditions:
             sql += " WHERE " + " AND ".join(conditions)
@@ -5518,6 +5554,7 @@ except Exception as exc:
                 current.accepted_at > 0
                 or current.parked_at > 0
                 or current.abandoned_at > 0
+                or current.drain_parked_at > 0
             ):
                 return current, False
             first_failure = current.failed_at == 0
@@ -5526,7 +5563,7 @@ except Exception as exc:
                    SET failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
                    WHERE id=? AND accepted_at=0 AND parked_at=0
-                     AND abandoned_at=0""",
+                     AND abandoned_at=0 AND drain_parked_at=0""",
                 (timestamp, reason, current.id),
             )
             row = self._select_schedule_wake_by_fire(schedule_id, fired_at)
@@ -5542,7 +5579,7 @@ except Exception as exc:
                 """UPDATE pending_schedule_wakes
                    SET attempts=attempts + 1
                    WHERE id=? AND accepted_at=0 AND parked_at=0
-                     AND abandoned_at=0""",
+                     AND abandoned_at=0 AND drain_parked_at=0""",
                 (pending_id,),
             )
             if cursor.rowcount == 0:
@@ -5576,6 +5613,65 @@ except Exception as exc:
             )
             self._db.commit()
         return cursor.rowcount > 0
+
+    def drain_park_pending_schedule_wake(
+        self,
+        pending_id: int,
+        *,
+        drain_parked_at: float = 0.0,
+        reason: str = "drain-extension budget expired",
+    ) -> bool:
+        """Move one active wake into recoverable drain parking once (#635).
+
+        Unlike quarantine or abandonment this is NOT terminal: the row keeps
+        its prompt and exact-fire identity, drops out of drain retry pressure,
+        and returns to the active outbox via
+        ``release_drain_parked_schedule_wakes`` (or a late positive receipt).
+        The outbox reaper's fired-at ceiling remains the ultimate terminal
+        bound for a row that never becomes deliverable again.
+        """
+        timestamp = drain_parked_at or time.time()
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET drain_parked_at=?,
+                       failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
+                       last_error=?
+                   WHERE id=? AND drain_parked_at=0 AND parked_at=0
+                     AND accepted_at=0 AND abandoned_at=0""",
+                (timestamp, timestamp, reason, pending_id),
+            )
+            self._db.commit()
+        return cursor.rowcount > 0
+
+    def release_drain_parked_schedule_wakes(self, agent_name: str) -> int:
+        """Return an agent's drain-parked wakes to the active outbox.
+
+        Callers hold delivery evidence (a verified-idle transport probe or a
+        confirmed delivery to this agent). Released rows re-enter the normal
+        replay policy, so the #1102 staleness and zombie rules still bound
+        what actually replays. Terminal rows are never resurrected.
+        """
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                """UPDATE pending_schedule_wakes
+                   SET drain_parked_at=0
+                   WHERE agent_name=? AND drain_parked_at>0
+                     AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
+                (agent_name,),
+            )
+            self._db.commit()
+        return cursor.rowcount
+
+    def list_drain_parked_agent_names(self) -> list[str]:
+        """Name every agent holding recoverable drain-parked wake debt."""
+        rows = self._db.execute(
+            """SELECT DISTINCT agent_name FROM pending_schedule_wakes
+               WHERE drain_parked_at>0 AND accepted_at=0 AND parked_at=0
+                 AND abandoned_at=0
+               ORDER BY agent_name"""
+        ).fetchall()
+        return [str(row[0]) for row in rows]
 
     def abandon_pending_schedule_wake(
         self,
@@ -5655,6 +5751,7 @@ except Exception as exc:
                            WHEN accepted_at=0 THEN ? ELSE accepted_at END,
                        parked_at=0,
                        abandoned_at=0,
+                       drain_parked_at=0,
                        last_error=''
                    WHERE id=?""",
                 (timestamp, pending_id),
@@ -5691,6 +5788,7 @@ except Exception as exc:
                            WHEN accepted_at=0 THEN ? ELSE accepted_at END,
                        parked_at=0,
                        abandoned_at=0,
+                       drain_parked_at=0,
                        last_error=''
                    WHERE schedule_id=? AND fired_at=?""",
                 (timestamp, schedule_id, fired_at),
@@ -5783,6 +5881,12 @@ except Exception as exc:
         so every newly backfilled abandonment survives its full forensic window.
         Large populations are committed in bounded chunks while the registry's
         mutation lock prevents in-process replay races.
+
+        Drain-parked rows (#635) deliberately share the active fired-at
+        ceiling: a recoverable park whose agent never becomes deliverable
+        again crosses into explicit abandonment here — the ultimate terminal
+        bound that keeps parked debt from becoming immortal. Their prompt
+        payloads are never trimmed while the row is still recoverable.
         """
         observed_at = float(now)
         windows = {
@@ -5846,6 +5950,7 @@ except Exception as exc:
                 """SELECT agent_name, COUNT(*)
                    FROM pending_schedule_wakes
                    WHERE accepted_at=0 AND parked_at=0 AND abandoned_at=0
+                     AND drain_parked_at=0
                    GROUP BY agent_name"""
             ).fetchall()
             for agent_name, count in active_rows:
