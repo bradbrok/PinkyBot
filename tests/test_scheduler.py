@@ -4049,7 +4049,8 @@ class TestScheduler:
             probe_calls.append(agent_name)
             # Exceeds the first wait window but resolves inside the
             # widened continuation wait on the same single probe call.
-            time.sleep(0.1)
+            # Generous margins: thread-pool spin-up must not eat the window.
+            time.sleep(0.4)
             return False
 
         async def confirmed(agent_name, session_id, prompt):
@@ -4061,7 +4062,7 @@ class TestScheduler:
             registry,
             wake_callback=confirmed,
             delivery_drain_busy_fn=slow_probe,
-            outbox_drain_probe_timeout_sec=0.05,
+            outbox_drain_probe_timeout_sec=0.2,
         )
         scheduler.replay_pending_for_agent("worker", drain_recheck=True)
         await asyncio.wait_for(

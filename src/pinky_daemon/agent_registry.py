@@ -5599,12 +5599,17 @@ except Exception as exc:
         parked_at: float = 0.0,
         reason: str = "delivery attempts exhausted",
     ) -> bool:
-        """Atomically move an active wake to terminal quarantine once."""
+        """Atomically move an active wake to terminal quarantine once.
+
+        Terminal transitions clear ``drain_parked_at``: no row may carry the
+        recoverable marker and a terminal marker simultaneously.
+        """
         timestamp = parked_at or time.time()
         with self._rmw_lock:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET parked_at=?,
+                       drain_parked_at=0,
                        failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
                    WHERE id=? AND parked_at=0 AND accepted_at=0
@@ -5691,6 +5696,7 @@ except Exception as exc:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET abandoned_at=?,
+                       drain_parked_at=0,
                        failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
                    WHERE id=? AND parked_at=0 AND accepted_at=0
@@ -5717,6 +5723,7 @@ except Exception as exc:
             cursor = self._db.execute(
                 """UPDATE pending_schedule_wakes
                    SET parked_at=?,
+                       drain_parked_at=0,
                        failed_at=CASE WHEN failed_at=0 THEN ? ELSE failed_at END,
                        last_error=?
                    WHERE id=? AND parked_at=0 AND accepted_at=0
@@ -5829,7 +5836,7 @@ except Exception as exc:
         (tracked separately; accepted rows already accumulate the same way).
         """
         sql = """UPDATE pending_schedule_wakes
-                 SET parked_at=?, last_error=?
+                 SET parked_at=?, drain_parked_at=0, last_error=?
                  WHERE id=? AND accepted_at=0 AND parked_at=0
                    AND abandoned_at=0"""
         params: list = [time.time(), "retired via discard", pending_id]
@@ -5849,13 +5856,15 @@ except Exception as exc:
         rows unboundedly without a reaper. Deliberate/manual retirement uses
         ``discard_pending_schedule_wake`` (which tombstones) so a retired fire
         cannot be re-created by a later reconciliation. Accepted, parked, or
-        abandoned rows are terminal and are left as-is.
+        abandoned rows are terminal and are left as-is; drain-parked rows are
+        recoverable debt and equally must not be erased by a stale replay
+        object or a second writer.
         """
         with self._rmw_lock:
             cursor = self._db.execute(
                 """DELETE FROM pending_schedule_wakes
                    WHERE id=? AND accepted_at=0 AND parked_at=0
-                     AND abandoned_at=0""",
+                     AND abandoned_at=0 AND drain_parked_at=0""",
                 (pending_id,),
             )
             self._db.commit()
@@ -6025,7 +6034,7 @@ except Exception as exc:
                 failed_phase = "abandon"
                 _apply_batched(
                     """UPDATE pending_schedule_wakes
-                       SET abandoned_at=?, parked_at=0
+                       SET abandoned_at=?, parked_at=0, drain_parked_at=0
                        WHERE id IN (
                            SELECT id FROM pending_schedule_wakes
                            WHERE accepted_at=0 AND abandoned_at=0

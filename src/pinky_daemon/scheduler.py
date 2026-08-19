@@ -536,6 +536,9 @@ class AgentScheduler:
         self._outbox_drain_extensions: dict[
             str, _OutboxDrainExtensionState
         ] = {}
+        # #635 single-flight fence: at most one outstanding drain-probe
+        # thread per agent (see _agent_busy_for_drain).
+        self._drain_probe_futures: dict[str, asyncio.Future] = {}
         self._receipt_extension_alerted: set[tuple[int, float]] = set()
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
@@ -1001,16 +1004,19 @@ class AgentScheduler:
                 prompt=self._wake_prompt(schedule),
                 fired_at=schedule.last_run,
             )
-            # A terminal or already-accepted fire must not be delivered:
-            # an operator may have discarded this fire while its cohort task
-            # waited behind the per-agent delivery lock. Delivering would
-            # resurrect the tombstone (and the delivery-confirm would clear it).
-            # Set the cohort-start event first so ``_check_schedules`` does not
-            # wait out its timeout on a discarded first cohort member.
+            # A terminal, already-accepted, or drain-parked fire must not be
+            # delivered: an operator may have discarded this fire while its
+            # cohort task waited behind the per-agent delivery lock, and a
+            # drain-parked row waits for verified release evidence — a live
+            # cohort delivering it would bypass that rule and the confirm
+            # would clear the park marker. Set the cohort-start event first so
+            # ``_check_schedules`` does not wait out its timeout on a
+            # discarded first cohort member.
             if row is not None and (
                 row.parked_at > 0
                 or row.abandoned_at > 0
                 or row.accepted_at > 0
+                or row.drain_parked_at > 0
             ):
                 if attempt_started is not None:
                     attempt_started.set()
@@ -1812,55 +1818,67 @@ class AgentScheduler:
     async def _agent_busy_for_drain(self, agent_name: str) -> tuple[bool, bool]:
         """Re-read pane state without letting a hung probe hold the lane lock.
 
-        Returns ``(busy, verified)``. A probe timeout or failure is retried
-        once with a widened window; a still-indeterminate probe defers safely
-        but reports ``verified=False`` — a timeout is not busy evidence, and
-        recording it as such let a 30-minute deferral budget terminalize real
-        wakes against an idle agent (#635 A1). A timed-out probe thread keeps
-        running detached; the retry is bounded to one to cap that leak.
+        Returns ``(busy, verified)``. A timeout is not busy evidence: the
+        wait widens once on the SAME outstanding probe call, and a
+        still-indeterminate probe defers safely with ``verified=False`` —
+        recording timeouts as busy let a 30-minute deferral budget
+        terminalize real wakes against an idle agent (#635 A1).
+
+        Single-flight per agent: at most ONE probe thread may be outstanding.
+        The periodic scan revisits parked/pending agents every minute, so a
+        permanently hung probe must occupy exactly one executor worker, not
+        accumulate new detached threads per visit until the shared default
+        executor is exhausted. While the previous probe is still unresolved,
+        later cycles defer unverified without spawning; once it resolves (or
+        raises) the next cycle probes fresh.
         """
         probe = self._delivery_drain_busy_fn or self._delivery_busy_fn
         if probe is None:
             return False, True
+        outstanding = self._drain_probe_futures.get(agent_name)
+        if outstanding is not None and not outstanding.done():
+            _log(
+                f"scheduler: previous drain probe for '{agent_name}' is "
+                "still outstanding; deferring without a new probe"
+            )
+            return True, False
+        future = asyncio.ensure_future(asyncio.to_thread(probe, agent_name))
+        self._drain_probe_futures[agent_name] = future
         base_timeout = self._outbox_drain_probe_timeout_sec
-        timeouts = (
-            base_timeout,
-            base_timeout * _OUTBOX_DRAIN_PROBE_RETRY_MULTIPLIER,
+        waits = (
+            (base_timeout, False),
+            (base_timeout * _OUTBOX_DRAIN_PROBE_RETRY_MULTIPLIER, True),
         )
-        for attempt, timeout in enumerate(timeouts, start=1):
-            final = attempt == len(timeouts)
+        for timeout, final in waits:
             try:
+                # shield: the timeout must not cancel the probe future — a
+                # cancelled wrapper would read as done() and defeat the
+                # single-flight fence while its thread keeps running.
                 result = await asyncio.wait_for(
-                    asyncio.to_thread(probe, agent_name),
-                    timeout=timeout,
+                    asyncio.shield(future), timeout=timeout
                 )
+                self._drain_probe_futures.pop(agent_name, None)
                 return result is True, True
             except asyncio.TimeoutError:
                 if not final:
                     _log(
-                        f"scheduler: drain-time transport recheck timed out "
-                        f"for '{agent_name}' after {timeout:.1f}s; "
-                        "retrying once with a widened window"
+                        f"scheduler: drain-time transport recheck for "
+                        f"'{agent_name}' passed {timeout:.1f}s; continuing "
+                        "to wait on the same probe with a widened window"
                     )
                     continue
                 _log(
                     f"scheduler: drain-time transport recheck indeterminate "
-                    f"for '{agent_name}' (timed out twice, last "
-                    f"{timeout:.1f}s); deferring without busy evidence and "
-                    "releasing the replay lock"
+                    f"for '{agent_name}' (probe still unresolved after the "
+                    f"widened {timeout:.1f}s wait); deferring without busy "
+                    "evidence and releasing the replay lock"
                 )
                 return True, False
             except Exception as exc:
-                if not final:
-                    _log(
-                        f"scheduler: drain-time transport recheck failed for "
-                        f"'{agent_name}': {type(exc).__name__}: {exc}; "
-                        "retrying once with a widened window"
-                    )
-                    continue
+                self._drain_probe_futures.pop(agent_name, None)
                 _log(
-                    f"scheduler: drain-time transport recheck indeterminate "
-                    f"for '{agent_name}': {type(exc).__name__}: {exc}; "
+                    f"scheduler: drain-time transport recheck failed for "
+                    f"'{agent_name}': {type(exc).__name__}: {exc}; "
                     "deferring without busy evidence"
                 )
                 return True, False
@@ -2025,18 +2043,29 @@ class AgentScheduler:
         bound_reason = (
             "wall-clock cap" if wall_clock_expired else "attempt cap"
         )
-        targeted, parked = self._drain_park_outbox_rows(
+        park_outcome = self._drain_park_outbox_rows(
             agent_name,
             bound_reason=bound_reason,
             state=state,
             oldest_age=oldest_age,
         )
+        if park_outcome is None:
+            # A listing failure is not an empty outbox: park nothing, page
+            # nobody, and KEEP the budget state so the next cycle retries
+            # the park with its alert dedup intact.
+            _log(
+                "scheduler: OUTBOX_DRAIN_EXTENSION_EXPIRED park deferred "
+                f"for '{agent_name}': active-row listing failed; retrying "
+                "next cycle"
+            )
+            return True
+        targeted, parked, leftover_oldest_fired_at = park_outcome
         evidence_note = (
             ""
             if state.unverified_checks == 0
             else (
                 f" ({state.unverified_checks}/{state.attempts} busy checks "
-                "were unverified probe timeouts)"
+                "had indeterminate probes)"
             )
         )
         if state.alerted:
@@ -2074,8 +2103,15 @@ class AgentScheduler:
         if targeted == parked:
             # Every active row is parked, so this oldest-fire budget is
             # settled. Released rows start a fresh budget on a new oldest
-            # fire; a partial park keeps state for alert dedup and bounding.
+            # fire.
             self._outbox_drain_extensions.pop(agent_name, None)
+        elif leftover_oldest_fired_at is not None:
+            # A partial park leaves NEWER rows active (parking iterates
+            # oldest-first), so the next health sample leads with a
+            # different oldest fire. Re-key the SAME budget state to it —
+            # this is one episode, and its alert-dedup and attempt history
+            # must survive the oldest-row change.
+            state.oldest_fired_at = leftover_oldest_fired_at
         return True
 
     def _drain_park_outbox_rows(
@@ -2085,13 +2121,19 @@ class AgentScheduler:
         bound_reason: str,
         state: _OutboxDrainExtensionState,
         oldest_age: float,
-    ) -> tuple[int, int]:
+    ) -> tuple[int, int, float | None] | None:
         """Park every active row behind an expired drain budget (#635 B1).
 
         Parking replaces the old terminal abandonment: an idle agent behind a
         phantom busy signal never receives a delivery, so no late receipt can
         ever supersede a terminal state — abandonment there was silent loss.
         Parked rows stay recoverable and re-enter replay on delivery evidence.
+
+        Returns ``(targeted, parked, leftover_oldest_fired_at)`` where the
+        third element is the oldest fire that FAILED to park (``None`` when
+        everything parked), or ``None`` entirely when the active rows could
+        not even be listed — a listing failure must never read as an empty
+        outbox.
         """
         try:
             pending_wakes = self._registry.list_pending_schedule_wakes(
@@ -2102,7 +2144,7 @@ class AgentScheduler:
                 "scheduler: OUTBOX_DRAIN_PARK_FAILURE listing active rows "
                 f"for '{agent_name}': {type(exc).__name__}: {exc}"
             )
-            return 0, 0
+            return None
 
         reason = (
             "OUTBOX_DRAIN_PARKED: drain-extension budget expired "
@@ -2113,20 +2155,25 @@ class AgentScheduler:
             f"max_age={self._outbox_drain_extension_max_age_sec:.1f}s)"
         )
         parked = 0
+        leftover_oldest_fired_at: float | None = None
         for pending in pending_wakes:
+            parked_this = False
             try:
-                if self._registry.drain_park_pending_schedule_wake(
+                parked_this = self._registry.drain_park_pending_schedule_wake(
                     pending.id,
                     reason=reason,
-                ):
-                    parked += 1
+                )
             except Exception as exc:
                 _log(
                     "scheduler: OUTBOX_DRAIN_PARK_FAILURE pending "
                     f"#{pending.id} for '{agent_name}': "
                     f"{type(exc).__name__}: {exc}"
                 )
-        return len(pending_wakes), parked
+            if parked_this:
+                parked += 1
+            elif leftover_oldest_fired_at is None:
+                leftover_oldest_fired_at = pending.fired_at
+        return len(pending_wakes), parked, leftover_oldest_fired_at
 
     async def _replay_pending_locked(
         self, agent_name: str, *, drain_recheck: bool = False
@@ -2258,6 +2305,37 @@ class AgentScheduler:
                 or pending.abandoned_at != 0
                 or pending.drain_parked_at != 0
             ):
+                continue
+            if (
+                not current_schedule.one_shot
+                and current_schedule.last_delivered > 0
+                and pending.fired_at <= current_schedule.last_delivered
+                and pending.last_error.startswith("OUTBOX_DRAIN_PARKED")
+            ):
+                # #635 B1 review round 2: an un-parked recurring occurrence
+                # older than a delivery this schedule already confirmed is
+                # superseded work — the release trigger WAS that newer
+                # delivery, and the newer row is accepted (absent from this
+                # pass), so recurrence collapse has no peer to catch this.
+                # The persistent OUTBOX_DRAIN_PARKED trace scopes the floor
+                # to released rows; the ordinary minutes-scale deferred-fire
+                # recovery path keeps its documented replay semantics.
+                superseded = self._registry.park_pending_schedule_wake(
+                    pending.id,
+                    reason=(
+                        "terminal replay policy: recurrence superseded by "
+                        "confirmed delivery at "
+                        f"{current_schedule.last_delivered}"
+                    ),
+                )
+                _log(
+                    f"scheduler: RECURRENCE_SUPERSEDED_BY_DELIVERY pending "
+                    f"#{pending.id}, schedule '{pending.schedule_name}' "
+                    f"(#{pending.schedule_id}) for agent "
+                    f"'{pending.agent_name}': fired_at={pending.fired_at} "
+                    f"last_delivered={current_schedule.last_delivered} "
+                    f"quarantined={superseded}"
+                )
                 continue
             if pending.schedule_id in abandoned_schedule_ids:
                 _log(
