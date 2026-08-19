@@ -135,6 +135,11 @@ def _run_api_with_authority(args) -> None:
     import uvicorn
 
     from pinky_daemon.api import create_api
+    from pinky_daemon.routes.triggers import uvicorn_log_config
+
+    # The access log prints raw request paths; /hooks/<token> carries a
+    # credential in the path, so every server start gets the redacting config.
+    log_config = uvicorn_log_config()
 
     working_dir = os.path.abspath(args.working_dir)
 
@@ -183,7 +188,7 @@ def _run_api_with_authority(args) -> None:
         )
         if enabled_requested:
             print(f"[pinky] Ferry disabled: {ferry_cfg.why_disabled()}", file=sys.stderr)
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port, log_config=log_config)
         return
 
     # Ferry enabled: run the main API + a dedicated ferry listener bound to the
@@ -204,7 +209,7 @@ def _run_api_with_authority(args) -> None:
             "[pinky] ferry enabled but host_pinky missing — starting API only",
             file=sys.stderr,
         )
-        uvicorn.run(app, host=args.host, port=args.port)
+        uvicorn.run(app, host=args.host, port=args.port, log_config=log_config)
         return
 
     ferry_app = build_ferry_app(host_pinky=host_pinky, config=ferry_cfg)
@@ -214,9 +219,16 @@ def _run_api_with_authority(args) -> None:
         file=sys.stderr,
     )
 
-    main_server = uvicorn.Server(uvicorn.Config(app, host=args.host, port=args.port))
+    main_server = uvicorn.Server(
+        uvicorn.Config(app, host=args.host, port=args.port, log_config=log_config)
+    )
     ferry_server = uvicorn.Server(
-        uvicorn.Config(ferry_app, host=ferry_cfg.bind_host, port=ferry_cfg.bind_port)
+        uvicorn.Config(
+            ferry_app,
+            host=ferry_cfg.bind_host,
+            port=ferry_cfg.bind_port,
+            log_config=log_config,
+        )
     )
     # uvicorn's serve() does `with self.capture_signals():` — a context manager
     # that installs signal.signal(...) handlers. With two servers on one loop the

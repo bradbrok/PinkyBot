@@ -766,16 +766,22 @@ class SharedMcpManager:
         """Run the shared MCP server in a dedicated thread with supervisor loop."""
         import uvicorn
 
+        from pinky_daemon.routes.triggers import uvicorn_log_config
+
         backoff = 1
         max_backoff = 60
 
         while self._running:
             app = self._create_app()
+            # log_config: this Config load (and every supervisor restart)
+            # re-runs dictConfig process-wide; without the patched config it
+            # would strip the /hooks token redaction off the access handler.
             config = uvicorn.Config(
                 app,
                 host=self._host,
                 port=self._port,
                 log_level="warning",
+                log_config=uvicorn_log_config(),
             )
             self._server = uvicorn.Server(config)
             try:

@@ -11,6 +11,7 @@ process-local in api.py too — a server restart resets them.
 from __future__ import annotations
 
 import json
+import logging
 import re as _re2
 import time
 from datetime import datetime
@@ -58,12 +59,64 @@ _HOOK_IP_RATE_LIMIT = 20
 _HOOK_IP_RATE_WINDOW = 60.0
 
 
-def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
-    """Return True if the client IP is within the webhook rate limit."""
-    ip = (
+_HOOKS_PATH_RE = _re2.compile(r"(/hooks/)([^/\s\"?]+)")
+
+
+def _redact_hook_path(value: str) -> str:
+    """Replace the token segment of a /hooks/<token> path with its 8-char prefix."""
+    return _HOOKS_PATH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)[:8]}*", value)
+
+
+class HookTokenRedactionFilter(logging.Filter):
+    """Redact webhook tokens from uvicorn access-log request lines.
+
+    The handler-level receipt log already truncates the token, but uvicorn's
+    access log prints the raw request path — including the full /hooks/<token>
+    credential — so the token must also be redacted at this boundary.
+    """
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        if isinstance(record.args, tuple):
+            record.args = tuple(
+                _redact_hook_path(arg) if isinstance(arg, str) else arg
+                for arg in record.args
+            )
+        if isinstance(record.msg, str) and "/hooks/" in record.msg:
+            record.msg = _redact_hook_path(record.msg)
+        return True
+
+
+def uvicorn_log_config() -> dict:
+    """uvicorn's default logging config with token redaction on the access handler.
+
+    A logger-level addFilter() does not survive uvicorn's dictConfig (each
+    Config load resets the access logger, and ferry mode loads two Configs),
+    so the filter must ship inside the config that every load re-applies.
+    """
+    import copy
+
+    import uvicorn.config
+
+    config = copy.deepcopy(uvicorn.config.LOGGING_CONFIG)
+    config.setdefault("filters", {})["hook_token_redaction"] = {
+        "()": "pinky_daemon.routes.triggers.HookTokenRedactionFilter",
+    }
+    access_handler = config["handlers"]["access"]
+    access_handler.setdefault("filters", []).append("hook_token_redaction")
+    return config
+
+
+def _client_ip(request: Request) -> str:
+    """Best-effort client IP: first X-Forwarded-For hop, else socket peer."""
+    return (
         request.headers.get("x-forwarded-for", "").split(",")[0].strip()
         or (request.client.host if request.client else "unknown")
     )
+
+
+def _check_hook_ip_rate_limit(request: Request, now: float) -> bool:
+    """Return True if the client IP is within the webhook rate limit."""
+    ip = _client_ip(request)
     timestamps = _hook_ip_buckets.get(ip, [])
     timestamps = [t for t in timestamps if now - t < _HOOK_IP_RATE_WINDOW]
     if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
@@ -258,6 +311,14 @@ async def test_agent_trigger(agent_name: str, trigger_id: int):
 @router.post("/hooks/{token}")
 async def receive_webhook(token: str, request: Request):
     """Receive an inbound webhook and wake the associated agent."""
+    # Receipt log — must stay the first statement so every delivery attempt
+    # is visible even when a later check drops the request (unknown-token 404,
+    # rate-limit 429, oversized 413). The token is a credential: prefix only.
+    _log(
+        f"hooks: receipt token={token[:8]}* ip={_client_ip(request)}"
+        f" len={request.headers.get('content-length', '?')}"
+        f" type={request.headers.get('content-type', '-')}"
+    )
     now = time.time()
 
     # IP rate limit (anti-enumeration — runs before token lookup)
