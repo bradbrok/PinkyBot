@@ -106,6 +106,13 @@ def _bind_transcript_ticket(
     entry.transcript_path_at_paste = transcript
     entry.transcript_file_identity_at_paste = (stat.st_dev, stat.st_ino)
     entry.transcript_offset_at_paste = offset
+    anchor_start = max(0, offset - 4096)
+    with transcript.open("rb") as handle:
+        handle.seek(anchor_start)
+        anchor = handle.read(offset - anchor_start)
+    entry.transcript_anchor_start_at_paste = anchor_start
+    entry.transcript_anchor_at_paste = anchor
+    entry.transcript_ticket_captured_at_ns = _time.time_ns()
 
 
 def _ok() -> TmuxCommandResult:
@@ -5318,7 +5325,7 @@ def test_phantom_consumption_requires_post_paste_occurrence(tmp_path) -> None:
 def test_phantom_consumption_same_path_new_file_resets_stale_offset(
     tmp_path,
 ) -> None:
-    """A replacement file at the same path starts a new byte namespace."""
+    """A replacement file reserves rows but cannot prove this paste."""
     ss, _ = _make_session(state=SessionState.CONNECTED)
     transcript = tmp_path / "transcript.jsonl"
     transcript.write_text('{"type":"system"}\n' + "x" * 4096)
@@ -5336,7 +5343,65 @@ def test_phantom_consumption_same_path_new_file_resets_stale_offset(
     replacement.replace(transcript)
     assert (transcript.stat().st_dev, transcript.stat().st_ino) != old_identity
 
-    assert ss._phantom_consumption_verdicts([entry]) == [True]
+    assert ss._phantom_consumption_verdicts([entry]) == [False]
+
+
+def test_phantom_consumption_same_inode_identical_old_row_is_not_proof(
+    tmp_path,
+) -> None:
+    """An epoch rewrite cannot promote a byte-identical retained occurrence."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    transcript = tmp_path / "transcript.jsonl"
+    prompt = "same-inode retained recurring prompt"
+    row = (
+        _json.dumps({"type": "user", "message": {"content": prompt}}) + "\n"
+    ).encode()
+    transcript.write_bytes(row + b"x" * 1024)
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    entry = _seed_inflight(ss, prompt=prompt, transport_accepted=False)
+    before = transcript.stat()
+    _bind_transcript_ticket(entry, transcript, offset=before.st_size)
+
+    transcript.write_bytes(row + b" " * 2048)
+    after = transcript.stat()
+    assert (after.st_dev, after.st_ino) == (before.st_dev, before.st_ino)
+    assert after.st_size > before.st_size
+
+    assert ss._phantom_consumption_verdicts([entry]) == [False]
+
+
+def test_capture_occurrence_ticket_binds_opened_descriptor(
+    monkeypatch,
+    tmp_path,
+) -> None:
+    """A path swap after stat binds the descriptor actually opened."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    transcript = tmp_path / "transcript.jsonl"
+    replacement = tmp_path / "replacement.jsonl"
+    transcript.write_bytes(b"old transcript")
+    replacement.write_bytes(b'{"type":"system"}\n')
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    original_open = Path.open
+    swapped = False
+
+    def racing_open(path: Path, *args, **kwargs):
+        nonlocal swapped
+        mode = args[0] if args else kwargs.get("mode", "r")
+        if path == transcript and mode == "rb" and not swapped:
+            replacement.replace(transcript)
+            swapped = True
+        return original_open(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", racing_open)
+
+    ticket = ss._capture_transcript_occurrence_ticket()
+    identity = (transcript.stat().st_dev, transcript.stat().st_ino)
+    assert tuple(ticket) == (transcript, identity, transcript.stat().st_size)
+    assert ticket.anchor_start == 0
+    assert ticket.anchor == b'{"type":"system"}\n'
+    assert ticket.captured_at_ns is not None
 
 
 def test_phantom_consumption_accepted_duplicate_claims_fifo_row(tmp_path) -> None:
@@ -5358,6 +5423,32 @@ def test_phantom_consumption_accepted_duplicate_claims_fifo_row(tmp_path) -> Non
         True,
         False,
     ]
+
+
+def test_phantom_consumption_early_stop_respects_each_candidate_boundary(
+    tmp_path,
+) -> None:
+    """Rows before a later ticket do not satisfy its allocation demand."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.touch()
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    prompt = "duplicate prompt across distinct paste boundaries"
+    row = (
+        _json.dumps({"type": "user", "message": {"content": prompt}}) + "\n"
+    ).encode()
+    first = _seed_inflight(ss, prompt=prompt, transport_accepted=False)
+    _bind_transcript_ticket(first, transcript, offset=0)
+
+    transcript.write_bytes(row + row)
+    second_start = transcript.stat().st_size
+    second = _seed_inflight(ss, prompt=prompt, transport_accepted=False)
+    _bind_transcript_ticket(second, transcript, offset=second_start)
+    with transcript.open("ab") as handle:
+        handle.write(row)
+
+    assert ss._phantom_consumption_verdicts([first, second]) == [True, True]
 
 
 @pytest.mark.asyncio
@@ -5393,6 +5484,9 @@ async def test_deliver_turn_captures_occurrence_boundary_before_paste(
     assert len(ss._inflight_metas) == 1
     entry = ss._inflight_metas[0]
     assert entry.transcript_offset_at_paste == initial_size
+    assert entry.transcript_anchor_start_at_paste == 0
+    assert entry.transcript_anchor_at_paste == b'{"type":"system"}\n'
+    assert entry.transcript_ticket_captured_at_ns is not None
     assert ss._phantom_consumption_verdicts([entry]) == [True]
 
 

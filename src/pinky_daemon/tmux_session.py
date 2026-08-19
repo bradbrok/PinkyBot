@@ -65,6 +65,8 @@ import shlex
 import threading
 import time
 from collections import OrderedDict, deque
+from collections.abc import Iterator
+from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
@@ -1302,6 +1304,72 @@ async def reconcile_tmux_spawn_cleanup_debts(
 # ──────────────────────────────────────────────────────────────────────────
 
 
+def _snapshot_transcript_boundary(
+    path: Path,
+    *,
+    expected_identity: tuple[int, int] | None = None,
+    expected_offset: int | None = None,
+) -> tuple[tuple[int, int], int, int, bytes, int] | None:
+    """Read one descriptor-bound EOF and its exact bounded suffix."""
+    try:
+        with path.open("rb") as handle:
+            opened = os.fstat(handle.fileno())
+            identity = (opened.st_dev, opened.st_ino)
+            offset = opened.st_size
+            if (
+                (expected_identity is not None and identity != expected_identity)
+                or (expected_offset is not None and offset != expected_offset)
+            ):
+                return None
+            anchor_start = max(
+                0, offset - _TRANSCRIPT_BOUNDARY_ANCHOR_BYTES
+            )
+            handle.seek(anchor_start)
+            anchor = handle.read(offset - anchor_start)
+            revalidated = os.fstat(handle.fileno())
+    except (OSError, TypeError, ValueError):
+        return None
+    if (
+        (revalidated.st_dev, revalidated.st_ino) != identity
+        or revalidated.st_size != offset
+        or len(anchor) != offset - anchor_start
+    ):
+        return None
+    return (identity, offset, anchor_start, anchor, time.time_ns())
+
+
+@dataclass(frozen=True)
+class _TranscriptOccurrenceTicket:
+    """Descriptor-validated pre-paste boundary plus its content epoch anchor.
+
+    Iteration intentionally exposes the historical three-tuple interface used
+    by focused tests; production reads the anchor fields explicitly.
+    """
+
+    path: Path | None
+    identity: tuple[int, int] | None
+    offset: int | None
+    anchor_start: int | None = None
+    anchor: bytes | None = None
+    captured_at_ns: int | None = None
+
+    def __iter__(
+        self,
+    ) -> Iterator[Path | tuple[int, int] | int | None]:
+        yield self.path
+        yield self.identity
+        yield self.offset
+
+
+_TranscriptSourceKey = tuple[int, int]
+_TranscriptCandidateSource = tuple[
+    _TranscriptSourceKey,
+    int,
+    bool,
+    bool | None,
+]
+
+
 @dataclass
 class _QueuedTurn:
     """Inbound message awaiting delivery to the claude REPL.
@@ -1379,6 +1447,9 @@ class _QueuedTurn:
     transcript_path_at_paste: Path | None = None
     transcript_file_identity_at_paste: tuple[int, int] | None = None
     transcript_offset_at_paste: int | None = None
+    transcript_anchor_start_at_paste: int | None = None
+    transcript_anchor_at_paste: bytes | None = None
+    transcript_ticket_captured_at_ns: int | None = None
     # Wake-only exact submission receipt (#953). True requires a matching
     # transcript user row or queue enqueue→dequeue; successful tmux paste/Enter
     # commands alone are deliberately insufficient. Kept separate from the
@@ -1502,19 +1573,43 @@ class _InflightMeta:
     transcript_mtime_at_paste: float | None = None
     paste_succeeded_at: float | None = None
     # Direct idle-reconcile fallback ticket. ``transcript_offset_at_paste``
-    # is the file size sampled immediately before the pane paste. The device /
-    # inode pair prevents a stale offset from hiding rows when a new transcript
-    # materializes at the same pathname; identity change or truncation resets
-    # the scan boundary to byte zero.
+    # is the opened descriptor's size immediately before the pane paste. The
+    # device/inode pair and exact EOF suffix bind a physical append epoch.
+    # Identity/epoch loss may scan byte zero only to reserve FIFO rows; it
+    # cannot prove acceptance by matching content alone.
     transcript_path_at_paste: Path | None = None
     transcript_file_identity_at_paste: tuple[int, int] | None = None
     transcript_offset_at_paste: int | None = None
+    transcript_anchor_start_at_paste: int | None = None
+    transcript_anchor_at_paste: bytes | None = None
+    transcript_ticket_captured_at_ns: int | None = None
     # Non-zero only for turns delivered during the active post-fresh lineage.
     # A completion may end ``_fresh_context_respawn_grace_until`` only when
     # this epoch matches the session's active epoch.  This prevents an
     # autonomous/stale Stop hook (or any pre-fresh metadata) from reopening
     # ``--continue`` before the replacement turn completes.
     fresh_context_epoch: int = 0
+
+    def __post_init__(self) -> None:
+        """Give direct production-shaped fixtures the same boundary guard."""
+        if (
+            self.transcript_ticket_captured_at_ns is not None
+            or self.transcript_path_at_paste is None
+            or self.transcript_file_identity_at_paste is None
+            or self.transcript_offset_at_paste is None
+        ):
+            return
+        snapshot = _snapshot_transcript_boundary(
+            self.transcript_path_at_paste,
+            expected_identity=self.transcript_file_identity_at_paste,
+            expected_offset=self.transcript_offset_at_paste,
+        )
+        if snapshot is None:
+            return
+        _identity, _offset, anchor_start, anchor, captured_at_ns = snapshot
+        self.transcript_anchor_start_at_paste = anchor_start
+        self.transcript_anchor_at_paste = anchor
+        self.transcript_ticket_captured_at_ns = captured_at_ns
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -1725,6 +1820,17 @@ def _inflight_replay_tail_cap() -> int:
     except (TypeError, ValueError):
         val = 20
     return max(0, val)
+
+
+# A watchdog reconciliation runs on the daemon event loop, so transcript
+# evidence must have a fixed synchronous I/O ceiling. The bound is cumulative
+# per opened physical file, not per candidate/path alias.
+_PHANTOM_TRANSCRIPT_SCAN_BYTES = 4 * 1024 * 1024
+
+# Exact bytes immediately below the pre-paste EOF distinguish a stable append
+# epoch from copy-truncate/regrow on the same inode. The anchor is deliberately
+# small because it is captured on every pane delivery.
+_TRANSCRIPT_BOUNDARY_ANCHOR_BYTES = 4096
 
 
 # Issue #570 — wake-prompt readiness-gate timeout. ``_deliver_turn`` awaits
@@ -7119,140 +7225,327 @@ class TmuxSession(TransportReplacementMixin):
 
     def _capture_transcript_occurrence_ticket(
         self,
-    ) -> tuple[Path | None, tuple[int, int] | None, int | None]:
+    ) -> _TranscriptOccurrenceTicket:
         """Snapshot the active transcript identity and EOF before one paste.
 
         The transcript user row can be written before ``paste_text`` returns,
         so the boundary must be sampled immediately before the physical paste,
         not during post-paste metadata recording. A missing-but-bound path is a
-        valid cold-start ticket at byte zero; the first materialized file then
-        scans from its beginning.
+        cold-start allocation ticket at byte zero; the first materialized file
+        may reserve rows from its beginning but cannot positively certify them
+        without independent occurrence-bound evidence.
         """
         tailer = self._tailer
         raw_path = getattr(tailer, "transcript_path", None) if tailer else None
         if not raw_path:
-            return (None, None, None)
+            return _TranscriptOccurrenceTicket(None, None, None)
         try:
             path = Path(raw_path)
         except (TypeError, ValueError):
-            return (None, None, None)
+            return _TranscriptOccurrenceTicket(None, None, None)
         try:
-            stat = path.stat()
+            # Preserve the fail-safe distinction between a missing path and an
+            # inaccessible bound path. Identity never comes from this lookup;
+            # the opened descriptor below is the sole identity authority.
+            path.stat()
         except FileNotFoundError:
-            return (path, None, 0)
+            return _TranscriptOccurrenceTicket(
+                path,
+                None,
+                0,
+                anchor_start=0,
+                anchor=b"",
+                captured_at_ns=time.time_ns(),
+            )
         except OSError:
-            return (path, None, None)
-        return (path, (stat.st_dev, stat.st_ino), stat.st_size)
+            return _TranscriptOccurrenceTicket(path, None, None)
+
+        snapshot = _snapshot_transcript_boundary(path)
+        if snapshot is None:
+            return _TranscriptOccurrenceTicket(path, None, None)
+        identity, offset, anchor_start, anchor, captured_at_ns = snapshot
+        return _TranscriptOccurrenceTicket(
+            path,
+            identity,
+            offset,
+            anchor_start=anchor_start,
+            anchor=anchor,
+            captured_at_ns=captured_at_ns,
+        )
 
     def _phantom_consumption_verdicts(
         self, candidates: list[_InflightMeta]
     ) -> list[bool | None]:
         """Allocate complete post-paste user rows to candidates one-to-one.
 
-        ``True`` proves this exact occurrence was accepted, ``False`` means a
-        usable transcript contained no allocatable occurrence, and ``None``
-        means the transcript itself was unavailable (the historical fail-safe
-        drain remains in force for that case).
+        ``True`` proves this exact occurrence was accepted, ``False`` means
+        no paste-bound occurrence was proved (including allocation-only rows
+        from a lost epoch), and ``None`` means the transcript evidence was
+        unavailable (the historical fail-safe drain remains in force).
 
         Already accepted candidates still participate in FIFO row allocation:
         acceptance outranks a missing fallback row, but an earlier accepted
         duplicate must claim its own row so that row cannot falsely certify a
         later unaccepted duplicate.
         """
-        # Per candidate: either a readable source key + scan boundary, False
-        # for a usable transcript without a paste ticket, or None when no
-        # transcript can be inspected at all.
-        sources: list[
-            tuple[tuple[Path, tuple[int, int]], int] | bool | None
-        ] = []
-        scan_starts: dict[tuple[Path, tuple[int, int]], int] = {}
-        for entry in candidates:
-            path = entry.transcript_path_at_paste
-            offset = entry.transcript_offset_at_paste
-            if path is None or offset is None:
-                tailer = self._tailer
-                raw_path = (
-                    getattr(tailer, "transcript_path", None) if tailer else None
-                )
-                try:
-                    usable = bool(raw_path) and Path(raw_path).is_file()
-                except (OSError, TypeError, ValueError):
-                    usable = False
-                sources.append(False if usable else None)
-                continue
-            try:
-                transcript = Path(path)
-                stat = transcript.stat()
-            except (OSError, TypeError, ValueError):
-                sources.append(None)
-                continue
-            current_identity = (stat.st_dev, stat.st_ino)
-            start = max(0, offset)
-            if (
-                entry.transcript_file_identity_at_paste != current_identity
-                or stat.st_size < start
-            ):
-                # A new/truncated file at the same path must not inherit the
-                # predecessor's stale EOF. Its occurrence namespace starts at 0.
-                start = 0
-            key = (transcript, current_identity)
-            sources.append((key, start))
-            scan_starts[key] = min(scan_starts.get(key, start), start)
-
-        rows: dict[
-            tuple[Path, tuple[int, int]], list[tuple[int, str]]
+        # Per candidate: opened physical source, allocation boundary, whether
+        # row-local post-ticket proof is available, and the conservative result
+        # when no paste-bound row can be proved.
+        sources: list[_TranscriptCandidateSource | None] = []
+        handles: dict[_TranscriptSourceKey, object] = {}
+        scan_starts: dict[_TranscriptSourceKey, int] = {}
+        budget_remaining: dict[_TranscriptSourceKey, int] = {}
+        anchor_checks: dict[
+            tuple[_TranscriptSourceKey, int, int, bytes],
+            bool,
         ] = {}
-        unreadable: set[tuple[Path, tuple[int, int]]] = set()
-        for key, start in scan_starts.items():
-            transcript, _identity = key
-            found: list[tuple[int, str]] = []
-            try:
-                with transcript.open("rb") as handle:
+
+        def _descriptor(handle: object) -> int:
+            """Reach the real descriptor through transparent test wrappers."""
+            current = handle
+            for _ in range(4):
+                fileno = getattr(current, "fileno", None)
+                if fileno is not None:
+                    return int(fileno())
+                current = getattr(current, "_wrapped")
+            raise AttributeError("opened transcript has no file descriptor")
+
+        with ExitStack() as stack:
+            for entry in candidates:
+                ticket_had_path = entry.transcript_path_at_paste is not None
+                path = entry.transcript_path_at_paste
+                if path is None:
+                    tailer = self._tailer
+                    path = (
+                        getattr(tailer, "transcript_path", None)
+                        if tailer
+                        else None
+                    )
+                try:
+                    transcript = Path(path) if path is not None else None
+                except (TypeError, ValueError):
+                    transcript = None
+                if transcript is None:
+                    sources.append(None)
+                    continue
+
+                try:
+                    handle = stack.enter_context(transcript.open("rb"))
+                    descriptor = _descriptor(handle)
+                    opened = os.fstat(descriptor)
+                except (AttributeError, OSError, TypeError, ValueError):
+                    sources.append(None)
+                    continue
+
+                key = (opened.st_dev, opened.st_ino)
+                handles.setdefault(key, handle)
+                budget_remaining.setdefault(
+                    key, _PHANTOM_TRANSCRIPT_SCAN_BYTES
+                )
+                ticket_identity = entry.transcript_file_identity_at_paste
+                offset = entry.transcript_offset_at_paste
+
+                # Allocation is broader than proof. A candidate whose ticket
+                # capture failed still claims an equal physical row in FIFO
+                # order, but that row cannot turn its unavailable verdict into
+                # positive acceptance.
+                if ticket_identity is None or offset is None:
+                    allocation_start = 0
+                    proof_available = False
+                    # A bound path whose descriptor ticket failed is
+                    # unavailable. A legacy/pathless entry inspected through
+                    # the current tailer is provenance-lost and non-positive.
+                    fallback: bool | None = None if ticket_had_path else False
+                elif ticket_identity == key:
+                    start = max(0, offset)
+                    anchor_start = entry.transcript_anchor_start_at_paste
+                    anchor = entry.transcript_anchor_at_paste
+                    guard_valid = (
+                        entry.transcript_ticket_captured_at_ns is not None
+                        and anchor_start is not None
+                        and anchor is not None
+                        and anchor_start >= 0
+                        and len(anchor) <= _TRANSCRIPT_BOUNDARY_ANCHOR_BYTES
+                        and anchor_start + len(anchor) == start
+                    )
+                    epoch_stable = False
+                    if guard_valid:
+                        check_key = (key, start, anchor_start, anchor)
+                        cached = anchor_checks.get(check_key)
+                        if cached is not None:
+                            epoch_stable = cached
+                        elif len(anchor) <= budget_remaining[key]:
+                            try:
+                                current_anchor = os.pread(
+                                    descriptor,
+                                    len(anchor),
+                                    anchor_start,
+                                )
+                            except OSError:
+                                guard_valid = False
+                            else:
+                                budget_remaining[key] -= len(current_anchor)
+                                epoch_stable = (
+                                    len(current_anchor) == len(anchor)
+                                    and current_anchor == anchor
+                                    and opened.st_size >= start
+                                )
+                                anchor_checks[check_key] = epoch_stable
+                        else:
+                            guard_valid = False
+
+                    proof_available = guard_valid
+                    if epoch_stable:
+                        allocation_start = start
+                    else:
+                        # Same-inode epoch loss scans from byte zero for FIFO
+                        # reservation. Positive proof, if any, is decided per
+                        # row against the captured suffix below.
+                        allocation_start = 0
+                    fallback = False
+                else:
+                    # A different opened inode is allocation-only regardless
+                    # of pathname timing, timestamps, or matching content.
+                    allocation_start = 0
+                    proof_available = False
+                    fallback = False
+
+                source = (
+                    key,
+                    allocation_start,
+                    proof_available,
+                    fallback,
+                )
+                sources.append(source)
+                scan_starts[key] = min(
+                    scan_starts.get(key, allocation_start),
+                    allocation_start,
+                )
+
+            def _allocation_complete(
+                key: _TranscriptSourceKey,
+                found: list[tuple[int, int, str, bytes]],
+            ) -> bool:
+                """Whether every candidate on one source owns a distinct row."""
+                reserved: set[int] = set()
+                for entry, source in zip(candidates, sources, strict=True):
+                    if source is None or source[0] != key:
+                        continue
+                    allocation_start = source[1]
+                    for row_offset, _row_end, prompt, _raw in found:
+                        if (
+                            row_offset >= allocation_start
+                            and row_offset not in reserved
+                            and prompt == entry.turn.prompt
+                        ):
+                            reserved.add(row_offset)
+                            break
+                    else:
+                        return False
+                return True
+
+            rows: dict[
+                _TranscriptSourceKey,
+                list[tuple[int, int, str, bytes]],
+            ] = {}
+            incomplete: set[_TranscriptSourceKey] = set()
+            for key, start in scan_starts.items():
+                found: list[tuple[int, int, str, bytes]] = []
+                handle = handles[key]
+                remaining = budget_remaining[key]
+                try:
                     handle.seek(start)
-                    while True:
+                    while remaining > 0:
                         row_offset = handle.tell()
-                        raw = handle.readline()
+                        raw = handle.readline(remaining)
                         if not raw:
+                            break
+                        remaining -= len(raw)
+                        if not raw.endswith(b"\n"):
+                            incomplete.add(key)
                             break
                         try:
                             parsed = json.loads(raw)
                         except (json.JSONDecodeError, UnicodeDecodeError):
                             continue
-                        if not isinstance(parsed, dict) or parsed.get("type") != "user":
+                        if (
+                            not isinstance(parsed, dict)
+                            or parsed.get("type") != "user"
+                        ):
                             continue
                         prompt = self._transcript_user_text(parsed)
-                        if prompt is not None:
-                            found.append((row_offset, prompt))
-            except (OSError, TypeError, ValueError):
-                unreadable.add(key)
-            rows[key] = found
+                        if prompt is None:
+                            continue
+                        found.append(
+                            (row_offset, row_offset + len(raw), prompt, raw)
+                        )
+                        if _allocation_complete(key, found):
+                            break
+                    else:
+                        incomplete.add(key)
+                except (AttributeError, OSError, TypeError, ValueError):
+                    incomplete.add(key)
+                rows[key] = found
 
-        used: set[tuple[tuple[Path, tuple[int, int]], int]] = set()
-        verdicts: list[bool | None] = []
-        for entry, source in zip(candidates, sources, strict=True):
-            claimed = False
-            if isinstance(source, tuple):
-                key, start = source
-                if key not in unreadable:
-                    for row_offset, prompt in rows.get(key, []):
+            used: set[tuple[_TranscriptSourceKey, int]] = set()
+            verdicts: list[bool | None] = []
+            for entry, source in zip(candidates, sources, strict=True):
+                claimed: tuple[int, int, bytes] | None = None
+                if source is not None:
+                    (
+                        key,
+                        allocation_start,
+                        proof_available,
+                        fallback,
+                    ) = source
+                    for row_offset, row_end, prompt, raw in rows.get(key, []):
                         occurrence = (key, row_offset)
                         if (
-                            row_offset >= start
+                            row_offset >= allocation_start
                             and occurrence not in used
                             and prompt == entry.turn.prompt
                         ):
                             used.add(occurrence)
-                            claimed = True
+                            claimed = (row_offset, row_end, raw)
                             break
                 else:
-                    source = None
-            if entry.turn.transport_accepted:
-                verdicts.append(True)
-            elif source is None:
-                verdicts.append(None)
-            else:
-                verdicts.append(claimed)
-        return verdicts
+                    key = None
+                    proof_available = False
+                    fallback = None
+
+                paste_bound = False
+                if claimed is not None and proof_available and key is not None:
+                    row_offset, row_end, raw = claimed
+                    offset = entry.transcript_offset_at_paste
+                    anchor_start = entry.transcript_anchor_start_at_paste
+                    anchor = entry.transcript_anchor_at_paste
+                    if offset is not None and row_end > offset:
+                        paste_bound = True
+                    elif (
+                        offset is not None
+                        and anchor_start is not None
+                        and anchor is not None
+                        and row_offset >= anchor_start
+                        and row_end <= offset
+                    ):
+                        relative_start = row_offset - anchor_start
+                        relative_end = row_end - anchor_start
+                        prior = anchor[relative_start:relative_end]
+                        paste_bound = len(prior) == len(raw) and prior != raw
+
+                if entry.turn.transport_accepted:
+                    verdicts.append(True)
+                elif paste_bound:
+                    verdicts.append(True)
+                elif (
+                    key is not None
+                    and key in incomplete
+                    and (proof_available or fallback is None)
+                ):
+                    verdicts.append(None)
+                else:
+                    verdicts.append(fallback)
+            return verdicts
 
     def _background_task_recent_age(self, now: float, window: float) -> float | None:
         """Seconds since a background task last wrote a transcript, or None.
@@ -9488,11 +9781,21 @@ class TmuxSession(TransportReplacementMixin):
                     retry_scheduler_gate = True
                 else:
                     retry_scheduler_gate = False
+                    transcript_ticket = (
+                        self._capture_transcript_occurrence_ticket()
+                    )
                     (
                         turn.transcript_path_at_paste,
                         turn.transcript_file_identity_at_paste,
                         turn.transcript_offset_at_paste,
-                    ) = self._capture_transcript_occurrence_ticket()
+                    ) = transcript_ticket
+                    turn.transcript_anchor_start_at_paste = (
+                        transcript_ticket.anchor_start
+                    )
+                    turn.transcript_anchor_at_paste = transcript_ticket.anchor
+                    turn.transcript_ticket_captured_at_ns = (
+                        transcript_ticket.captured_at_ns
+                    )
                     turn.pane_delivery_started = True
                     result = await self._tmux.paste_text(
                         turn.prompt, enter=True
@@ -9617,6 +9920,13 @@ class TmuxSession(TransportReplacementMixin):
                 turn.transcript_file_identity_at_paste
             ),
             transcript_offset_at_paste=turn.transcript_offset_at_paste,
+            transcript_anchor_start_at_paste=(
+                turn.transcript_anchor_start_at_paste
+            ),
+            transcript_anchor_at_paste=turn.transcript_anchor_at_paste,
+            transcript_ticket_captured_at_ns=(
+                turn.transcript_ticket_captured_at_ns
+            ),
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
         # Watchdog head-clock. If this entry just became the head (deque
