@@ -7,11 +7,16 @@ Dry-run by default. Pass --apply to update matching rows.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ for _safe_db
+
+from _safe_db import refuse_if_live_store  # noqa: E402
 
 DEFAULT_DB_PATH = Path("data/pinky_agents.db")
 
@@ -36,6 +41,8 @@ UPDATE_QUERY = """
 def _connect(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"agents database not found: {db_path}")
+    # Never open a live daemon store in place (#1126): stop the daemon first.
+    refuse_if_live_store(db_path, write=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     return conn
