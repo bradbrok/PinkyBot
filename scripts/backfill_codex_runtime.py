@@ -13,6 +13,8 @@ import time
 from pathlib import Path
 from typing import Any
 
+from _safe_db import refuse_if_live_store
+
 DEFAULT_DB_PATH = Path("data/pinky_agents.db")
 
 MATCH_QUERY = """
@@ -36,6 +38,8 @@ UPDATE_QUERY = """
 def _connect(db_path: Path) -> sqlite3.Connection:
     if not db_path.exists():
         raise FileNotFoundError(f"agents database not found: {db_path}")
+    # Never open a live daemon store in place (#1126): stop the daemon first.
+    refuse_if_live_store(db_path, write=True)
     conn = sqlite3.connect(str(db_path))
     conn.row_factory = sqlite3.Row
     return conn

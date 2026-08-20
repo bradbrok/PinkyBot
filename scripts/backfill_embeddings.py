@@ -13,8 +13,11 @@ Safety:
   * Idempotent: only touches rows whose embedding is empty (``length<=2``,
     i.e. the ``'[]'`` default) AND have non-empty content. Never overwrites an
     existing real embedding, never touches content.
-  * Per-batch transactions with a busy timeout so it cooperates with the live
-    daemon's WAL connections.
+  * Per-batch transactions with a busy timeout (handles LOCK contention). NOTE:
+    busy_timeout does NOT make an in-place open safe against a live holder — an
+    external open still recreates the -wal/-shm sidecars and orphans the
+    holder's WAL (#1126). Run with the daemon + pinky-memory MCPs stopped; the
+    _safe_db guard refuses otherwise.
   * The OpenAI key is read from system_settings (same source the fix uses);
     nothing is printed.
 
@@ -33,7 +36,10 @@ import sqlite3
 import sys
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ for _safe_db
 sys.path.insert(0, os.path.join(REPO, "src"))
+
+from _safe_db import refuse_if_live_store  # noqa: E402
 
 SETTINGS_DB = os.path.join(REPO, "data", "conversations_agents.db")
 BATCH = 100
@@ -42,6 +48,7 @@ BATCH = 100
 def resolve_openai_key() -> str:
     """Read OPENAI_API_KEY from system_settings, else env. No printing."""
     try:
+        refuse_if_live_store(SETTINGS_DB, write=False)
         conn = sqlite3.connect(SETTINGS_DB)
         row = conn.execute(
             "SELECT value FROM system_settings WHERE key='OPENAI_API_KEY'"
@@ -63,6 +70,7 @@ def discover_dbs(agent: str = "") -> list[str]:
     dbs = []
     for p in sorted(glob.glob(pat)):
         try:
+            refuse_if_live_store(p, write=False)
             c = sqlite3.connect(p)
             has = c.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='reflections'"
@@ -77,6 +85,7 @@ def discover_dbs(agent: str = "") -> list[str]:
 
 def backfill_db(path: str, embedder, apply: bool) -> tuple[int, int]:
     """Returns (rows_needing_backfill, rows_written)."""
+    refuse_if_live_store(path, write=apply)
     conn = sqlite3.connect(path, timeout=30.0)
     conn.execute("PRAGMA busy_timeout=30000")
     rows = conn.execute(

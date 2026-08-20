@@ -41,6 +41,9 @@ from datetime import datetime, timezone
 # runs this cron.
 from pinky_memory.ephemeral_guard import is_ephemeral
 
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ for _safe_db
+from _safe_db import refuse_if_live_store  # noqa: E402
+
 
 def find_candidates(conn):
     rows = conn.execute("SELECT id, name, type FROM kg_entities").fetchall()
@@ -85,6 +88,9 @@ def main():
         print(f"ERROR: db not found: {db}")
         sys.exit(2)
 
+    # Never open a live memory.db in place (#1126): stop the agent's MCP first.
+    # (busy_timeout below handles lock contention, NOT WAL-sidecar orphaning.)
+    refuse_if_live_store(db, write=True)
     conn = sqlite3.connect(db, timeout=10)
     conn.execute("PRAGMA busy_timeout = 8000")
 
