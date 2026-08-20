@@ -25,7 +25,7 @@ curl -fsSL https://pinkybot.ai/install.sh | bash
 Installs the `pinky` command, Claude Code (if not present), and all dependencies. Then:
 
 ```bash
-pinky --mode api --port 8888
+pinky run --mode api --port 8888
 ```
 
 Open the dashboard at `http://localhost:8888`.

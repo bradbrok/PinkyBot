@@ -1339,10 +1339,42 @@ class DaemonStoreCatalog(StoreCatalog):
                 )
             mode = stat.S_IMODE(current_stat.st_mode)
             if mode & 0o022:
-                raise PermissionError(
-                    "WAL preflight path component is writable by a non-daemon uid: "
-                    f"path={current_path!r} mode={mode:04o}"
-                )
+                # A group/other-writable ancestor lets a non-daemon uid tamper
+                # with the store path, so it must not stay writable. When the
+                # daemon owns the directory it tightens it in place — this
+                # self-heals permission drift (an umask or deploy quirk) rather
+                # than refusing to boot. A directory owned by another uid is an
+                # unrecoverable tamper surface and still hard-fails.
+                if current_stat.st_uid == daemon_uid:
+                    tightened = mode & ~0o022
+                    try:
+                        os.chmod(current_path, tightened)
+                        current_stat = os.stat(current_path, follow_symlinks=False)
+                    except OSError as error:
+                        raise PermissionError(
+                            "WAL preflight path component is writable by a "
+                            "non-daemon uid and could not be tightened: "
+                            f"path={current_path!r} mode={mode:04o} error={error}"
+                        ) from error
+                    remaining = stat.S_IMODE(current_stat.st_mode)
+                    if remaining & 0o022:
+                        raise PermissionError(
+                            "WAL preflight path component stayed writable after "
+                            f"repair: path={current_path!r} mode={remaining:04o}"
+                        )
+                    logger.warning(
+                        "store_catalog: tightened world/group-writable store "
+                        "path component %r (%04o -> %04o)",
+                        current_path,
+                        mode,
+                        tightened,
+                    )
+                else:
+                    raise PermissionError(
+                        "WAL preflight path component is writable by a "
+                        f"non-daemon uid: path={current_path!r} mode={mode:04o} "
+                        f"uid={current_stat.st_uid}"
+                    )
             inside_catalog = self._path_at_or_below(current_path, expected_root)
             allowed_uids = {daemon_uid} if inside_catalog else {0, daemon_uid}
             if current_stat.st_uid not in allowed_uids:

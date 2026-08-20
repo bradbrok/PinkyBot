@@ -312,7 +312,7 @@ def test_tenant_capable_catalog_cannot_reach_wal_pathname_branch(tmp_path: Path)
     assert _sidecar_identities(source) == sidecars_before
 
 
-@pytest.mark.parametrize("unsafe_kind", ["writable", "tenant-owned"])
+@pytest.mark.parametrize("unsafe_kind", ["writable-foreign", "tenant-owned"])
 def test_daemon_wal_pathname_branch_requires_trusted_directory_chain(
     daemon_store_root: Path,
     monkeypatch: pytest.MonkeyPatch,
@@ -321,25 +321,28 @@ def test_daemon_wal_pathname_branch_requires_trusted_directory_chain(
     source = daemon_store_root / "fleet-wal.db"
     authority = _create_database(source, journal_mode="wal")
     authority.close()
-    original_mode = daemon_store_root.stat().st_mode & 0o777
-    if unsafe_kind == "writable":
-        daemon_store_root.chmod(original_mode | 0o020)
-    else:
-        real_stat = os.stat
 
-        def stat_with_tenant_owned_component(
-            path: str | os.PathLike[str],
-            *args: Any,
-            **kwargs: Any,
-        ) -> os.stat_result:
-            result = real_stat(path, *args, **kwargs)
-            if os.path.abspath(os.fspath(path)) == os.path.abspath(daemon_store_root):
-                values = list(result)
-                values[4] = os.geteuid() + 1
-                return os.stat_result(values)
-            return result
+    real_stat = os.stat
 
-        monkeypatch.setattr(store_catalog_module.os, "stat", stat_with_tenant_owned_component)
+    def stat_with_unsafe_component(
+        path: str | os.PathLike[str],
+        *args: Any,
+        **kwargs: Any,
+    ) -> os.stat_result:
+        result = real_stat(path, *args, **kwargs)
+        if os.path.abspath(os.fspath(path)) == os.path.abspath(daemon_store_root):
+            values = list(result)
+            # A component owned by another uid can never be tightened by the
+            # daemon, so both kinds stay hard rejections. "writable-foreign"
+            # additionally flips on group-write to prove the self-heal path is
+            # NOT taken when the daemon does not own the directory.
+            if unsafe_kind == "writable-foreign":
+                values[0] = result.st_mode | 0o020
+            values[4] = os.geteuid() + 1
+            return os.stat_result(values)
+        return result
+
+    monkeypatch.setattr(store_catalog_module.os, "stat", stat_with_unsafe_component)
 
     sqlite_opened = False
 
@@ -350,13 +353,34 @@ def test_daemon_wal_pathname_branch_requires_trusted_directory_chain(
 
     monkeypatch.setattr(store_catalog_module.sqlite3, "connect", forbidden_connect)
     catalog = DaemonStoreCatalog(expected_root=daemon_store_root, silence_allowlist={})
+
+    with pytest.raises(StoreCatalogError, match="writable|owner"):
+        _preflight(catalog, [_target("fleet", source)])
+    assert sqlite_opened is False
+
+
+def test_daemon_owned_writable_component_is_self_healed(
+    daemon_store_root: Path,
+) -> None:
+    """A daemon-owned group/other-writable ancestor is tightened in place
+    instead of aborting boot (regression for the permission-drift outage)."""
+    source = daemon_store_root / "fleet-wal.db"
+    authority = _create_database(source, journal_mode="wal")
+    authority.execute("UPDATE inventory SET value = 'wal-live' WHERE id = 1")
+    authority.commit()
+    original_mode = daemon_store_root.stat().st_mode & 0o777
+    daemon_store_root.chmod(original_mode | 0o022)
+    assert daemon_store_root.stat().st_mode & 0o022
+
+    catalog = DaemonStoreCatalog(expected_root=daemon_store_root, silence_allowlist={})
     try:
-        with pytest.raises(StoreCatalogError, match="writable|owner"):
-            _preflight(catalog, [_target("fleet", source)])
-        assert sqlite_opened is False
+        _preflight(catalog, [_target("fleet", source)])
     finally:
-        if unsafe_kind == "writable":
-            daemon_store_root.chmod(original_mode)
+        authority.rollback()
+        authority.close()
+        catalog.close()
+
+    assert not (daemon_store_root.stat().st_mode & 0o022)
 
 
 def test_daemon_wal_pathname_open_requires_pinned_identity_corroboration(
