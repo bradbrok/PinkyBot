@@ -7,13 +7,16 @@ Dry-run by default. Pass --apply to update matching rows.
 from __future__ import annotations
 
 import argparse
+import os
 import sqlite3
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-from _safe_db import refuse_if_live_store
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))  # scripts/ for _safe_db
+
+from _safe_db import refuse_if_live_store  # noqa: E402
 
 DEFAULT_DB_PATH = Path("data/pinky_agents.db")
 
