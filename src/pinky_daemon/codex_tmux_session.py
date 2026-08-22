@@ -51,6 +51,7 @@ import shlex
 import time
 from pathlib import Path
 
+from pinky_daemon import tmux_session
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
@@ -58,8 +59,6 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
-
-from pinky_daemon import tmux_session
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
