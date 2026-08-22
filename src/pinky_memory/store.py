@@ -1833,36 +1833,45 @@ class ReflectionStore:
     ) -> list[tuple[float, Reflection]]:
         """sqlite-vec based k-NN for consolidation."""
         query_blob = self._embedding_to_blob(ref.embedding)
-        fetch_k = k * 3  # over-fetch for filtering
 
-        try:
-            vec_rows = self._conn.execute(
-                "SELECT rowid, distance FROM reflections_vec "
-                "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
-                (query_blob, fetch_k),
-            ).fetchall()
-        except sqlite3.OperationalError as e:
-            # vec query failed during consolidation — use numpy k-NN. #295
-            logger.debug("vec k-NN failed, using numpy: %s", e)
-            return self._knn_numpy(ref, k, exclude)
+        # The kNN window is filtered (active / self / exclude set) only AFTER
+        # the search, so rows the filters discard can fill it entirely and
+        # consolidation then sees fewer than `k` neighbours — or none — with
+        # no error. Widen the window until it yields enough survivors or the
+        # index is exhausted. #486
+        fetch_k = max(k * 3, 16)
+        while True:
+            try:
+                vec_rows = self._conn.execute(
+                    "SELECT rowid, distance FROM reflections_vec "
+                    "WHERE embedding MATCH ? AND k = ? ORDER BY distance",
+                    (query_blob, fetch_k),
+                ).fetchall()
+            except sqlite3.OperationalError as e:
+                # vec query failed during consolidation — use numpy k-NN. #295
+                logger.debug("vec k-NN failed, using numpy: %s", e)
+                return self._knn_numpy(ref, k, exclude)
 
-        results = []
-        for rowid, distance in vec_rows:
-            if len(results) >= k:
-                break
-            similarity = 1.0 - distance
-            row = self._conn.execute(
-                "SELECT * FROM reflections WHERE rowid = ? AND active = 1",
-                (rowid,),
-            ).fetchone()
-            if row is None:
-                continue
-            candidate = self._row_to_reflection(row)
-            if candidate.id == ref.id or candidate.id in exclude:
-                continue
-            results.append((similarity, candidate))
+            results = []
+            for rowid, distance in vec_rows:
+                if len(results) >= k:
+                    break
+                similarity = 1.0 - distance
+                row = self._conn.execute(
+                    "SELECT * FROM reflections WHERE rowid = ? AND active = 1",
+                    (rowid,),
+                ).fetchone()
+                if row is None:
+                    continue
+                candidate = self._row_to_reflection(row)
+                if candidate.id == ref.id or candidate.id in exclude:
+                    continue
+                results.append((similarity, candidate))
 
-        return results
+            # Enough neighbours, or the index has nothing left to give.
+            if len(results) >= k or len(vec_rows) < fetch_k:
+                return results
+            fetch_k *= 4
 
     def _knn_numpy(
         self,
