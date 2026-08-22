@@ -13,9 +13,6 @@ and the test would prove nothing.
 
 from __future__ import annotations
 
-import os
-import tempfile
-
 import pytest
 from fastapi.testclient import TestClient
 
@@ -36,8 +33,10 @@ AGENT = "engineer"
 @pytest.fixture
 def env(monkeypatch, tmp_path):
     """Real app + a real per-agent memory.db holding one reflection."""
-    fd, db_path = tempfile.mkstemp(suffix=".db")
-    os.close(fd)
+    # Under tmp_path, not tempfile.mkstemp: the store-integrity preflight
+    # (#1126) refuses any path component writable by a non-daemon uid, and
+    # /tmp is 1777.
+    db_path = str(tmp_path / "daemon.db")
     monkeypatch.setenv("PINKY_SESSION_SECRET", "test-session-secret")
     monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
 
@@ -53,7 +52,6 @@ def env(monkeypatch, tmp_path):
     app.state.agents.register(AGENT, model="opus", working_dir=str(working_dir))
 
     yield TestClient(app), reflection.id
-    os.unlink(db_path)
 
 
 def _agent_headers(client, method: str, path: str) -> dict[str, str]:
