@@ -3102,12 +3102,37 @@ class ReflectionStore:
         previous sweep — the instrument that decides write-guard urgency.
 
         Dry-run by default. ``apply=True`` deletes each candidate entity and
-        every edge touching it, in one transaction, after a transaction-
-        consistent backup via the SQLite backup API. Every run appends one
-        JSONL record to ``log_path`` (default: ``kg_sweep_log.jsonl`` next to
-        the DB) so the regrowth series stays measurable and deletions stay
-        auditable.
+        every edge touching it, in one transaction (rolled back wholesale on
+        any failure — never a partial sweep), after a transaction-consistent
+        backup via the SQLite backup API. Every run appends one JSONL record
+        to ``log_path`` (default: ``kg_sweep_log.jsonl`` next to the DB) so
+        the regrowth series stays measurable and deletions stay auditable.
+
+        ``log_path`` and ``backup_dir`` must resolve under the DB's own
+        directory: the store can run inside the daemon process, so an
+        unconstrained path here would be a cross-boundary write primitive
+        for an isolated tenant (#149).
         """
+        db_root = Path(self._db_path).resolve().parent
+
+        def _under_db_root(raw: str, what: str) -> Path:
+            p = Path(raw).resolve()
+            if not p.is_relative_to(db_root):
+                raise ValueError(
+                    f"kg_sweep_ephemeral: {what} must resolve under the "
+                    f"store's own directory ({db_root}), got: {raw}"
+                )
+            return p
+
+        log_file = (
+            _under_db_root(log_path, "log_path")
+            if log_path else db_root / "kg_sweep_log.jsonl"
+        )
+        backup_root = (
+            _under_db_root(backup_dir, "backup_dir")
+            if backup_dir else db_root
+        )
+
         rows = self._conn.execute("SELECT id, name, type FROM kg_entities").fetchall()
         candidates = [
             (r["id"], r["name"], r["type"])
@@ -3132,10 +3157,12 @@ class ReflectionStore:
 
         backup_path: str | None = None
         applied = False
+        apply_error: str | None = None
         if apply and candidates:
-            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
-            base_dir = Path(backup_dir) if backup_dir else Path(self._db_path).parent
-            dest_dir = base_dir / f"{ts}_sweep"
+            # Microsecond granularity: a same-second double apply must never
+            # overwrite the previous run's only pre-delete backup.
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S_%f")
+            dest_dir = backup_root / f"{ts}_sweep"
             dest_dir.mkdir(parents=True, exist_ok=True)
             dest = dest_dir / Path(self._db_path).name
             with self._lock:
@@ -3147,24 +3174,37 @@ class ReflectionStore:
                 finally:
                     dst.close()
                 backup_path = str(dest)
-                for _eid, name, _etype in candidates:
-                    self._conn.execute(
-                        "DELETE FROM kg_triples WHERE subject = ? OR object = ?",
-                        (name, name),
+                try:
+                    for _eid, name, _etype in candidates:
+                        self._conn.execute(
+                            "DELETE FROM kg_triples WHERE subject = ? OR object = ?",
+                            (name, name),
+                        )
+                        self._conn.execute(
+                            "DELETE FROM kg_entities WHERE name = ?", (name,)
+                        )
+                    self._conn.commit()
+                    applied = True
+                except Exception as e:
+                    # All-or-nothing: a partial sweep left in an open
+                    # transaction would be silently committed by the next
+                    # unrelated write. Roll back and report.
+                    try:
+                        self._conn.rollback()
+                    except sqlite3.Error:
+                        pass
+                    apply_error = str(e)
+                    logging.getLogger(__name__).error(
+                        "kg_sweep_ephemeral: apply failed, rolled back: %s", e
                     )
-                    self._conn.execute(
-                        "DELETE FROM kg_entities WHERE name = ?", (name,)
-                    )
-                self._conn.commit()
-                applied = True
 
         record = {
             "ts": datetime.now(timezone.utc).isoformat(),
             "db": self._db_path,
+            # Bare name strings — parity with scripts/kg_ephemeral_sweep.py so
+            # one consumer can read the whole regrowth series.
             "n_candidates": len(candidates),
-            "candidates": [
-                {"name": n, "type": t} for _i, n, t in candidates
-            ],
+            "candidates": [n for _i, n, _t in candidates],
             "n_edges": len(deleted_edges),
             "n_active_edges": sum(1 for e in deleted_edges if e["active"]),
             "deleted_edges": deleted_edges if applied else [],
@@ -3172,9 +3212,8 @@ class ReflectionStore:
             "backup": backup_path,
             "runner": "store",
         }
-        log_file = Path(log_path) if log_path else (
-            Path(self._db_path).parent / "kg_sweep_log.jsonl"
-        )
+        if apply_error is not None:
+            record["apply_error"] = apply_error
         try:
             log_file.parent.mkdir(parents=True, exist_ok=True)
             with open(log_file, "a", encoding="utf-8") as f:
@@ -3195,6 +3234,7 @@ class ReflectionStore:
             "applied": applied,
             "backup": backup_path,
             "log": str(log_file),
+            **({"apply_error": apply_error} if apply_error is not None else {}),
             **(
                 {"log_error": record["log_error"]}
                 if "log_error" in record else {}
