@@ -267,7 +267,14 @@ def test_one_step_bind_configures_inbound_gates_and_starts_native_poller(
         assert fetched.json()["principals"] == policy["principals"]
         status = client.get("/broker/status").json()
         assert status["active_pollers"] == [
-            {"agent": "barsik", "polls": 0, "running": True}
+            {
+                "agent": "barsik",
+                "polls": 0,
+                "running": True,
+                # Buzz pollers carry no telegram watchdog (#1145)
+                "watchdog_fires": None,
+                "last_poll_ok_age_s": None,
+            }
         ]
 
         disabled = client.post("/system/buzz-identities/barsik/disable")
@@ -405,7 +412,13 @@ def test_daemon_restart_resumes_configured_native_buzz_poller(
     app = _app(tmp_path)
     with TestClient(app) as client:
         assert client.get("/broker/status").json()["active_pollers"] == [
-            {"agent": "barsik", "polls": 0, "running": True}
+            {
+                "agent": "barsik",
+                "polls": 0,
+                "running": True,
+                "watchdog_fires": None,
+                "last_poll_ok_age_s": None,
+            }
         ]
         assert app.state.agents._db.execute(
             "SELECT claimed_at FROM buzz_inbound_events WHERE event_id=?",

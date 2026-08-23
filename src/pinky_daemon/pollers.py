@@ -12,6 +12,7 @@ import re
 import sys
 import time
 import unicodedata
+from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from typing import TYPE_CHECKING
 
@@ -82,7 +83,133 @@ if TYPE_CHECKING:
     from pinky_outreach.types import Chat
 
 
-class TelegramPoller:
+# Seconds past poll_timeout before a poll is declared stuck. Telegram's server
+# always answers a getUpdates long poll within poll_timeout, so anything this
+# far past it means the connection is dead and the read will never return.
+_POLL_WATCHDOG_GRACE = 30.0
+
+
+class _TelegramPollWatchdog:
+    """Deadline + recovery for blocking getUpdates calls (#1145).
+
+    The 2026-08-23 incident: a network blip left every Telegram poller's
+    long-poll blocked in ssl.read indefinitely — the httpx client-level read
+    timeout demonstrably did not fire — and because polls ran on the event
+    loop's DEFAULT executor, the stuck threads consumed most of that shared
+    pool and starved unrelated daemon work. Three structural changes:
+
+      * every poller owns a DEDICATED single-thread executor, so a stuck
+        poll can never starve anything beyond its own poller;
+      * each poll runs under an outer asyncio deadline that does not depend
+        on the HTTP stack honoring its own timeouts;
+      * on deadline the adapter's HTTP client is recycled (closing its pooled
+        sockets frees the stuck thread) and the executor is replaced, so
+        polling continues even if the old thread never exits.
+
+    Host classes must define ``_poll_timeout``, ``_adapter`` (with
+    ``get_updates``/``recycle``) and ``_process_messages`` before calling
+    ``_init_watchdog``.
+
+    Tradeoffs, deliberately accepted: a thread the recycle cannot free (e.g.
+    wedged in DNS resolution before any pooled socket exists) accumulates
+    one non-daemon thread per fire — observable via ``watchdog_fires`` and
+    the loud log — and any still-stuck thread is joined at interpreter exit,
+    so a truly immortal one can hang daemon shutdown until the supervisor
+    kills the process. Both beat the alternative this replaces (silent
+    fleet-wide inbound death).
+    """
+
+    def _init_watchdog(self, label: str, grace: float) -> None:
+        self._watchdog_label = label
+        self._watchdog_grace = grace
+        self._poll_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=label
+        )
+        self._watchdog_fires = 0
+        self._last_poll_ok = 0.0
+
+    async def _watched_poll(self, poll_fn):
+        """Run ``poll_fn`` on the dedicated executor under a hard deadline.
+
+        Returns the poll result, or ``[]`` after firing the watchdog — the
+        recovery is loud (log + counter) so the empty result never masks it.
+
+        A poll that completes AT or AFTER the deadline is never discarded:
+        its ``get_updates`` already advanced the offset, so the next poll
+        would confirm-and-drop those updates server-side — dropping the
+        result here would be silent, permanent message loss. Completed-at-
+        the-edge results are returned directly; genuinely late completions
+        are delivered through ``_process_messages`` when they arrive.
+        """
+        loop = asyncio.get_running_loop()
+        fut = loop.run_in_executor(self._poll_executor, poll_fn)
+        deadline = self._poll_timeout + self._watchdog_grace
+        try:
+            result = await asyncio.wait_for(asyncio.shield(fut), timeout=deadline)
+        except TimeoutError:
+            if fut.done() and not fut.cancelled() and fut.exception() is None:
+                # Completed on the deadline edge (loop scheduled the timeout
+                # callback first) — a healthy poll, not a stuck one.
+                self._last_poll_ok = time.monotonic()
+                return fut.result()
+            fut.add_done_callback(self._on_abandoned_poll_done)
+            self._recycle_after_stuck_poll(deadline)
+            return []
+        self._last_poll_ok = time.monotonic()
+        return result
+
+    def _on_abandoned_poll_done(self, fut) -> None:
+        """An abandoned poll eventually finished (usually because the recycle
+        closed its socket). Consume the error quietly; deliver a late RESULT
+        — its updates are already offset-confirmed and exist nowhere else."""
+        if fut.cancelled():
+            return
+        if fut.exception() is not None:  # consumed: no "never retrieved" noise
+            return
+        late = fut.result()
+        if not late:
+            return
+        _log(
+            f"{self._watchdog_label}: abandoned poll completed late with "
+            f"{len(late)} update(s) — delivering (offset already advanced)"
+        )
+        _deliver_in_background(
+            self._process_messages(late),
+            f"{self._watchdog_label} late-delivery",
+        )
+
+    def _recycle_after_stuck_poll(self, deadline: float) -> None:
+        self._watchdog_fires += 1
+        age = time.monotonic() - self._last_poll_ok if self._last_poll_ok else -1.0
+        _log(
+            f"{self._watchdog_label}: WATCHDOG poll exceeded {deadline:.0f}s hard "
+            f"deadline (fire #{self._watchdog_fires}, last successful poll "
+            f"{age:.0f}s ago) — recycling HTTP client + poll thread"
+        )
+        try:
+            self._adapter.recycle()
+        except Exception as e:
+            _log(f"{self._watchdog_label}: adapter recycle failed: {e}")
+        old = self._poll_executor
+        self._poll_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix=self._watchdog_label
+        )
+        old.shutdown(wait=False)
+
+    def _shutdown_watchdog(self) -> None:
+        self._poll_executor.shutdown(wait=False)
+
+    @property
+    def watchdog_fires(self) -> int:
+        return self._watchdog_fires
+
+    @property
+    def last_poll_ok(self) -> float:
+        """monotonic timestamp of the last completed poll (0.0 = never)."""
+        return self._last_poll_ok
+
+
+class TelegramPoller(_TelegramPollWatchdog):
     """Polls Telegram Bot API for new messages.
 
     Uses long polling (getUpdates) to receive messages in near-realtime.
@@ -98,6 +225,7 @@ class TelegramPoller:
         poll_interval: float = 1.0,
         allowed_chat_ids: list[str] | None = None,
         event_callback=None,
+        watchdog_grace: float = _POLL_WATCHDOG_GRACE,
     ) -> None:
         self._adapter = adapter
         self._handler = handler
@@ -107,18 +235,24 @@ class TelegramPoller:
         self._event_callback = event_callback  # async fn(platform, chat_id, sender, content)
         self._running = False
         self._poll_count = 0
+        self._init_watchdog("telegram-poller", watchdog_grace)
 
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
         _log("telegram-poller: starting")
 
-        # Verify bot connection
+        # Verify bot connection — on the poller's executor, under a deadline,
+        # so a wedged network can't block the event loop or hang startup.
+        loop = asyncio.get_running_loop()
         try:
-            me = self._adapter.get_me()
+            me = await asyncio.wait_for(
+                loop.run_in_executor(self._poll_executor, self._adapter.get_me),
+                timeout=30,
+            )
             _log(f"telegram-poller: connected as @{me.get('username', '?')}")
-        except TelegramError as e:
-            _log(f"telegram-poller: failed to connect: {e}")
+        except (TelegramError, TimeoutError) as e:
+            _log(f"telegram-poller: failed to connect: {e!r}")
             return
 
         while self._running:
@@ -135,14 +269,19 @@ class TelegramPoller:
 
     async def _poll_once(self) -> None:
         """Single poll iteration."""
-        # Run blocking HTTP call in thread pool
-        messages = await asyncio.get_running_loop().run_in_executor(
-            None,
+        # Blocking HTTP call on the poller's OWN executor, under a hard
+        # deadline (#1145) — never the loop default pool.
+        messages = await self._watched_poll(
             lambda: self._adapter.get_updates(timeout=self._poll_timeout),
         )
 
         self._poll_count += 1
 
+        await self._process_messages(messages)
+
+    async def _process_messages(self, messages) -> None:
+        """Route polled updates to the handler — also the watchdog's
+        late-delivery path for polls that complete after abandonment."""
         for msg in messages:
             # Filter by allowed chats
             if self._allowed_chats and msg.chat_id not in self._allowed_chats:
@@ -186,6 +325,7 @@ class TelegramPoller:
     def stop(self) -> None:
         """Stop the polling loop."""
         self._running = False
+        self._shutdown_watchdog()
         _log("telegram-poller: stopping")
 
     @property
@@ -197,7 +337,7 @@ class TelegramPoller:
         return self._running
 
 
-class BrokerTelegramPoller:
+class BrokerTelegramPoller(_TelegramPollWatchdog):
     """Polls Telegram for a specific agent's bot token, routes through MessageBroker.
 
     Unlike TelegramPoller which uses a single handler, this poller:
@@ -216,6 +356,7 @@ class BrokerTelegramPoller:
         poll_timeout: int = 30,
         poll_interval: float = 1.0,
         event_callback=None,
+        watchdog_grace: float = _POLL_WATCHDOG_GRACE,
     ) -> None:
         from pinky_daemon.broker import BrokerMessage, MessageBroker
         self._BrokerMessage = BrokerMessage
@@ -230,18 +371,25 @@ class BrokerTelegramPoller:
         self._running = False
         self._poll_count = 0
         self._bot_username = ""
+        self._init_watchdog(f"broker-poller[{agent_name}]", watchdog_grace)
 
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
         _log(f"broker-poller[{self._agent_name}]: starting")
 
+        # On the poller's executor, under a deadline — a wedged network can't
+        # block the event loop or hang startup.
+        loop = asyncio.get_running_loop()
         try:
-            me = self._adapter.get_me()
+            me = await asyncio.wait_for(
+                loop.run_in_executor(self._poll_executor, self._adapter.get_me),
+                timeout=30,
+            )
             self._bot_username = me.get("username", "?")
             _log(f"broker-poller[{self._agent_name}]: connected as @{self._bot_username}")
-        except TelegramError as e:
-            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e}")
+        except (TelegramError, TimeoutError) as e:
+            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e!r}")
             return
 
         while self._running:
@@ -258,13 +406,19 @@ class BrokerTelegramPoller:
 
     async def _poll_once(self) -> None:
         """Single poll iteration — routes messages through broker."""
-        messages = await asyncio.get_running_loop().run_in_executor(
-            None,
+        # Blocking HTTP call on the poller's OWN executor, under a hard
+        # deadline (#1145) — never the loop default pool.
+        messages = await self._watched_poll(
             lambda: self._adapter.get_updates(timeout=self._poll_timeout),
         )
 
         self._poll_count += 1
 
+        await self._process_messages(messages)
+
+    async def _process_messages(self, messages) -> None:
+        """Route polled updates through the broker — also the watchdog's
+        late-delivery path for polls that complete after abandonment."""
         for msg in messages:
             chat_type = msg.metadata.get("chat_type", "")
             is_group = chat_type in ("group", "supergroup")
@@ -323,6 +477,7 @@ class BrokerTelegramPoller:
     def stop(self) -> None:
         """Stop the polling loop."""
         self._running = False
+        self._shutdown_watchdog()
         _log(f"broker-poller[{self._agent_name}]: stopping")
 
     @property

@@ -31,11 +31,31 @@ class TelegramAdapter:
     def __init__(self, bot_token: str, *, timeout: float = 30.0) -> None:
         self._token = bot_token
         self._base = self.BASE_URL.format(token=bot_token)
+        self._timeout = timeout
         self._client = httpx.Client(timeout=timeout)
         self._last_update_id: int = 0
 
     def close(self) -> None:
         self._client.close()
+
+    def recycle(self) -> None:
+        """Replace the HTTP client, preserving the getUpdates offset.
+
+        Used by the poller watchdog (#1145) after a poll exceeds its hard
+        deadline: closing the old client tears down its pooled sockets, which
+        frees a worker thread stuck in a read on a dead connection. The
+        ``_last_update_id`` offset is deliberately kept so the fresh client
+        resumes exactly where the wedged one stopped — recreating the whole
+        adapter instead would replay up to 24h of queued updates.
+        """
+        old = self._client
+        self._client = httpx.Client(timeout=self._timeout)
+        try:
+            old.close()
+        except Exception:
+            # Best-effort close: the old client is being discarded precisely
+            # because its connection is wedged, so close() may itself fail.
+            pass
 
     def _request(self, method: str, **params) -> dict:
         """Make a Telegram Bot API request."""
