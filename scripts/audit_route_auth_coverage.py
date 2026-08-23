@@ -30,6 +30,55 @@ import tempfile
 from collections import defaultdict
 
 
+def _kind(route) -> str:
+    """Map a concrete route object to the audit's kind label."""
+    from fastapi.routing import APIRoute
+    from starlette.routing import Mount, WebSocketRoute
+
+    if isinstance(route, WebSocketRoute):
+        return "WS"
+    if isinstance(route, (APIRoute, Mount)):
+        return "MOUNT" if isinstance(route, Mount) else "HTTP"
+    return "HTTP"
+
+
+def _included_children(router) -> list[tuple[str, str]] | None:
+    """Expand a FastAPI ``_IncludedRouter`` into (kind, effective path) pairs.
+
+    Returns ``None`` when ``router`` is not that kind of wrapper, so the caller
+    can fall through to the other strategies.
+    """
+    candidates = getattr(router, "effective_candidates", None)
+    if not callable(candidates):
+        return None
+
+    collected: list[tuple[str, str]] = []
+    for ctx in candidates():
+        nested = _included_children(ctx)
+        if nested is not None:
+            # A router included inside another router.
+            collected.extend(nested)
+            continue
+        original = getattr(ctx, "original_route", None)
+        path = getattr(ctx, "path", None)
+        if path is None:
+            raise RuntimeError(
+                f"included route {type(ctx).__name__!r} has no effective .path — "
+                "extend collect() rather than letting it go unaudited"
+            )
+        if _is_mount(original):
+            collected.append(("MOUNT", path.rstrip("/") + "/"))
+        else:
+            collected.append((_kind(original), path))
+    return collected
+
+
+def _is_mount(route) -> bool:
+    from starlette.routing import Mount
+
+    return isinstance(route, Mount)
+
+
 def _walk(container) -> list[tuple[str, str]]:
     """Collect (kind, path) for every route reachable from ``container.routes``."""
     from fastapi.routing import APIRoute
@@ -62,13 +111,17 @@ def _walk(container) -> list[tuple[str, str]]:
             # exact failure mode #510 exposed. Surface it instead.
             path = getattr(r, "path", None)
             if path is None:
-                # Some FastAPI/Starlette versions wrap an included router in an
-                # object that carries no .path of its own but exposes the child
-                # routes it registered (e.g. _IncludedRouter). Those children are
-                # real, reachable paths: descend instead of failing, so the audit
-                # stays exhaustive across dependency versions.
-                nested = getattr(r, "routes", None)
+                # FastAPI >= 0.141 wraps an included router in an _IncludedRouter:
+                # no .path and no .routes of its own, but effective_candidates()
+                # yields the child routes with their prefix already applied. Those
+                # children are real, reachable paths — descend instead of failing,
+                # so the audit stays exhaustive across dependency versions.
+                nested = _included_children(r)
                 if nested is not None:
+                    routes.extend(nested)
+                    continue
+                # Older layouts expose the children directly.
+                if getattr(r, "routes", None) is not None:
                     routes.extend(_walk(r))
                     continue
                 raise RuntimeError(
