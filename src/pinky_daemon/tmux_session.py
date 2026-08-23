@@ -4748,8 +4748,14 @@ class TmuxSession(TransportReplacementMixin):
                     self.id, "user", prompt,
                     platform=platform, chat_id=chat_id,
                 )
-            except Exception:
-                pass
+            except Exception as e:
+                # Loud, like the assistant-side append handler: a silently
+                # swallowed failure here is indistinguishable from a quiet
+                # day, which hid a fleet-wide store freeze (#1145).
+                _log(
+                    f"tmux[{self.agent_name}]: conversation_store.append "
+                    f"(user) raised: {e}"
+                )
 
         queued_prompt = prompt + agent_hint if agent_hint else prompt
         turn = _QueuedTurn(
