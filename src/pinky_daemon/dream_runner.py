@@ -1587,6 +1587,24 @@ class DreamRunner:
             for r in rows
         ]
 
+    def update_summary(self, agent_name: str, summary: str) -> bool:
+        """Edit the last_summary for an agent's dream state.  Returns True if updated."""
+        with self._db:
+            cur = self._db.execute(
+                "UPDATE dream_state SET last_summary = ? WHERE agent_name = ?",
+                (summary, agent_name),
+            )
+            return cur.rowcount > 0
+
+    def delete_state(self, agent_name: str) -> bool:
+        """Delete dream state for an agent.  Returns True if deleted."""
+        with self._db:
+            cur = self._db.execute(
+                "DELETE FROM dream_state WHERE agent_name = ?",
+                (agent_name,),
+            )
+            return cur.rowcount > 0
+
     # ── User profile extraction ─────────────────────────────
 
     def _extract_user_profiles(self, dream_output: str) -> int:

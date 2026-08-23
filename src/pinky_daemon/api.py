@@ -11407,6 +11407,26 @@ npm run build</pre>
         states = dream_runner.list_states()
         return {"dream_states": states, "count": len(states)}
 
+    @app.patch("/agents/{agent_name}/dream")
+    async def update_dream_summary(agent_name: str, req: Request):
+        """Edit the dream summary for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        body = await req.json()
+        summary = body.get("summary", "")
+        if not dream_runner.update_summary(agent_name, summary):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
+    @app.delete("/agents/{agent_name}/dream")
+    async def delete_dream_state(agent_name: str):
+        """Delete dream state for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not dream_runner.delete_state(agent_name):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
     # ── Agent Context (continuation state) ──────────────────
 
     @app.put("/agents/{agent_name}/context")
