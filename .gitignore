@@ -36,3 +36,8 @@ docs/
 heartbeat.log
 .coverage
 output/
+
+# Segreti operativi — MAI tracciare (task #405)
+config/gsc_service_account.json
+config/gsc_oauth_credentials.json
+config/substack_config.json
