@@ -252,7 +252,7 @@ class TelegramPoller(_TelegramPollWatchdog):
             )
             _log(f"telegram-poller: connected as @{me.get('username', '?')}")
         except (TelegramError, TimeoutError) as e:
-            _log(f"telegram-poller: failed to connect: {e}")
+            _log(f"telegram-poller: failed to connect: {e!r}")
             return
 
         while self._running:
@@ -389,7 +389,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
             self._bot_username = me.get("username", "?")
             _log(f"broker-poller[{self._agent_name}]: connected as @{self._bot_username}")
         except (TelegramError, TimeoutError) as e:
-            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e}")
+            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e!r}")
             return
 
         while self._running:
