@@ -827,6 +827,27 @@ def create_server(
         return json.dumps({"count": len(result), "contradictions": result})
 
     @mcp.tool()
+    def kg_sweep_ephemeral(apply: bool = False) -> str:
+        """Sweep pure-ID ephemeral nodes from the knowledge graph (#153 step 1).
+        The holder-side replacement for scripts/kg_ephemeral_sweep.py (#654):
+        runs inside the store owner, so no external process opens the live DB.
+        n_candidates per run = ephemeral regrowth since the previous sweep.
+        Dry-run by default; apply=True backs the DB up (SQLite backup API,
+        transaction-consistent) then deletes candidates + their edges in one
+        transaction (rolled back wholesale on failure). Each run appends a
+        JSONL record to kg_sweep_log.jsonl next to the DB. No path inputs:
+        the store may run in the daemon process, so log/backup destinations
+        are fixed to the store's own directory.
+        """
+        s = _get_store()
+        result = s.kg_sweep_ephemeral(apply=apply)
+        _log(
+            f"kg_sweep_ephemeral: {result['n_candidates']} candidate(s), "
+            f"{result['n_edges']} edge(s), applied={result['applied']}"
+        )
+        return json.dumps(result)
+
+    @mcp.tool()
     def kg_stats() -> str:
         """Get knowledge graph statistics — entity count, triple count, predicates."""
         s = _get_store()
