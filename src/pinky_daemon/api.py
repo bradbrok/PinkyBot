@@ -9474,10 +9474,22 @@ npm run build</pre>
     @app.get("/broker/status")
     async def broker_status():
         """Get message broker status."""
+        now = time.monotonic()
         return {
             "stats": broker.stats,
             "active_pollers": [
-                {"agent": p.agent_name, "polls": p.poll_count, "running": p.is_running}
+                {
+                    "agent": p.agent_name,
+                    "polls": p.poll_count,
+                    "running": p.is_running,
+                    # Watchdog-equipped pollers only (#1145); None elsewhere.
+                    "watchdog_fires": getattr(p, "watchdog_fires", None),
+                    "last_poll_ok_age_s": (
+                        round(now - p.last_poll_ok, 1)
+                        if getattr(p, "last_poll_ok", 0.0)
+                        else None
+                    ),
+                }
                 for p in _broker_pollers
             ],
         }

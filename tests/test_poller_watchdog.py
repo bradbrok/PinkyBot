@@ -79,6 +79,80 @@ class FakeStuckAdapter:
         self._release.set()
 
 
+class FakeHardStuckAdapter:
+    """First poll wedges somewhere recycle() cannot reach (the DNS-resolution
+    case from the watchdog docstring): ``recycle()`` counts the call but does
+    NOT free the thread. Delivery must still resume — that is the
+    executor-replacement leg, and nothing else covers it.
+
+    ``release()`` is a test-teardown-only handle so the wedged non-daemon
+    thread doesn't hang the test process at exit.
+    """
+
+    def __init__(self) -> None:
+        self._release = threading.Event()
+        self._calls = 0
+        self.recycle_calls = 0
+        self._delivered = False
+
+    def get_me(self) -> dict:
+        return {"username": "hardstuck_test_bot"}
+
+    def get_updates(self, *, timeout: int = 0, limit: int = 100):
+        self._calls += 1
+        if self._calls == 1:
+            self._release.wait()  # recycle() will NOT free this
+            return []
+        if not self._delivered:
+            self._delivered = True
+            return [_fake_msg("post-stuck")]
+        return []
+
+    def recycle(self) -> None:
+        self.recycle_calls += 1  # deliberately does NOT release the thread
+
+    def release(self) -> None:
+        self._release.set()
+
+    def close(self) -> None:
+        self._release.set()
+
+
+class FakeLateCompletionAdapter:
+    """First poll blocks until ``release()``, then returns a REAL message —
+    the genuinely-late-completion leg. Telegram has already advanced the
+    offset for that batch, so dropping it would be permanent loss; the
+    watchdog must hand it to ``_process_messages`` when it finally lands.
+
+    ``recycle()`` does not free the thread, so the test controls exactly
+    when the abandoned poll completes.
+    """
+
+    def __init__(self) -> None:
+        self._release = threading.Event()
+        self._calls = 0
+        self.recycle_calls = 0
+
+    def get_me(self) -> dict:
+        return {"username": "late_test_bot"}
+
+    def get_updates(self, *, timeout: int = 0, limit: int = 100):
+        self._calls += 1
+        if self._calls == 1:
+            self._release.wait()
+            return [_fake_msg("late-hello")]
+        return []
+
+    def recycle(self) -> None:
+        self.recycle_calls += 1
+
+    def release(self) -> None:
+        self._release.set()
+
+    def close(self) -> None:
+        self._release.set()
+
+
 class FakeHandler:
     def __init__(self) -> None:
         self.received: list = []
@@ -114,13 +188,16 @@ class TestWatchdogRecyclesStuckPoll:
         task = asyncio.create_task(poller.start())
         try:
             await asyncio.wait_for(handler.delivered.wait(), timeout=10)
+            # Captured BEFORE teardown's own recycle() — this pins that the
+            # WATCHDOG recycled the client, not the finally block below.
+            recycles_at_delivery = adapter.recycle_calls
         finally:
             adapter.recycle()  # belt-and-suspenders: never leave the thread stuck
             poller.stop()
             await asyncio.wait_for(task, timeout=5)
 
         assert poller.watchdog_fires == 1
-        assert adapter.recycle_calls >= 1
+        assert recycles_at_delivery >= 1
         assert handler.received[0].content == "hello"
         assert poller.last_poll_ok > 0.0
         err = capsys.readouterr().err
@@ -142,13 +219,75 @@ class TestWatchdogRecyclesStuckPoll:
         task = asyncio.create_task(poller.start())
         try:
             await asyncio.wait_for(broker.delivered.wait(), timeout=10)
+            recycles_at_delivery = adapter.recycle_calls
         finally:
             adapter.recycle()
             poller.stop()
             await asyncio.wait_for(task, timeout=5)
 
         assert poller.watchdog_fires == 1
+        assert recycles_at_delivery >= 1
         assert broker.received[0].content == "hello"
+
+    @pytest.mark.asyncio
+    async def test_delivery_resumes_even_when_recycle_cannot_free_thread(self):
+        """Executor-replacement leg: when the recycle can't free the wedged
+        thread (DNS-style wedge), polling must continue on a fresh thread
+        anyway. With executor replacement removed this times out RED —
+        the replacement is the only thing keeping the poller alive here."""
+        adapter = FakeHardStuckAdapter()
+        handler = FakeHandler()
+        poller = TelegramPoller(
+            adapter,
+            handler,
+            poll_timeout=0,
+            poll_interval=0.01,
+            watchdog_grace=0.3,
+        )
+        task = asyncio.create_task(poller.start())
+        try:
+            await asyncio.wait_for(handler.delivered.wait(), timeout=10)
+            fires_at_delivery = poller.watchdog_fires
+            recycles_at_delivery = adapter.recycle_calls
+        finally:
+            adapter.release()  # free the wedged non-daemon thread for exit
+            poller.stop()
+            await asyncio.wait_for(task, timeout=5)
+
+        assert fires_at_delivery == 1
+        assert recycles_at_delivery >= 1
+        assert handler.received[0].content == "post-stuck"
+
+    @pytest.mark.asyncio
+    async def test_late_completing_abandoned_poll_is_delivered_not_lost(self):
+        """An abandoned poll that later completes WITH updates must deliver
+        them (#1146 must-fix): getUpdates already confirmed the offset
+        server-side, so a drop here is silent, permanent message loss."""
+        adapter = FakeLateCompletionAdapter()
+        handler = FakeHandler()
+        poller = TelegramPoller(
+            adapter,
+            handler,
+            poll_timeout=0,
+            poll_interval=0.01,
+            watchdog_grace=0.3,
+        )
+        task = asyncio.create_task(poller.start())
+        try:
+            deadline = time.monotonic() + 10
+            while poller.watchdog_fires == 0:
+                assert time.monotonic() < deadline, "watchdog never fired"
+                await asyncio.sleep(0.01)
+            # Poll #1 is now abandoned. Complete it — with a message.
+            adapter.release()
+            await asyncio.wait_for(handler.delivered.wait(), timeout=10)
+        finally:
+            adapter.release()
+            poller.stop()
+            await asyncio.wait_for(task, timeout=5)
+
+        assert handler.received[0].content == "late-hello"
+        assert poller.watchdog_fires == 1
 
     @pytest.mark.asyncio
     async def test_healthy_poll_never_fires_watchdog(self):
