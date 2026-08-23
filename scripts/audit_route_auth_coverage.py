@@ -33,7 +33,7 @@ from collections import defaultdict
 def collect(app) -> tuple[list[tuple[str, str]], dict]:
     """Return ([(kind, path), ...], auth_route_sets) for ``app``."""
     from fastapi.routing import APIRoute
-    from starlette.routing import Mount, WebSocketRoute
+    from starlette.routing import Mount, Route, WebSocketRoute
 
     routes: list[tuple[str, str]] = []
     for r in app.routes:
@@ -50,6 +50,23 @@ def collect(app) -> tuple[list[tuple[str, str]], dict]:
             # subtree prefix (trailing slash) so it matches the public/protected
             # prefix tuples the middleware uses.
             routes.append(("MOUNT", r.path.rstrip("/") + "/"))
+        elif isinstance(r, Route):
+            # Plain Starlette routes — NOT APIRoutes. FastAPI registers /docs,
+            # /redoc, /openapi.json and /docs/oauth2-redirect this way. Skipping
+            # them made this audit BLIND (#510): they reach the app through the
+            # same gate as everything else, and all four were unclassified while
+            # the audit reported zero gaps. Anything callable must be collected.
+            routes.append(("HTTP", r.path))
+        else:
+            # Never drop a route silently — an unrecognised route type is the
+            # exact failure mode #510 exposed. Surface it instead.
+            path = getattr(r, "path", None)
+            if path is None:
+                raise RuntimeError(
+                    f"uncollectable route {type(r).__name__!r} has no .path — "
+                    "extend collect() rather than letting it go unaudited"
+                )
+            routes.append((type(r).__name__.upper()[:5], path))
     return routes, app.state.auth_route_sets
 
 

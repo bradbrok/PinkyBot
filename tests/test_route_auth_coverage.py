@@ -145,3 +145,49 @@ def test_off_and_shadow_modes_fall_through_unmapped_path():
             assert resp.status_code == 404, f"mode={mode} should fall through, got {resp.status_code}"
         finally:
             os.unlink(path)
+
+
+def test_audit_collects_plain_starlette_routes():
+    """#510 blind spot: ``collect()`` only recognised APIRoute/WebSocketRoute/
+    Mount, so plain ``starlette.routing.Route`` objects were dropped in silence.
+    FastAPI registers /docs, /redoc and /openapi.json exactly that way — four
+    unclassified surfaces while this suite reported zero. A synthetic plain Route
+    at an unmapped path must now be collected AND classified UNCLASSIFIED."""
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+
+    async def _endpoint(_request):  # pragma: no cover - never called
+        return PlainTextResponse("ok")
+
+    app = audit_mod.build_app()
+    app.router.routes.append(Route("/synthetic-plain-route", _endpoint))
+    routes, sets = audit_mod.collect(app)
+
+    assert ("HTTP", "/synthetic-plain-route") in routes, "plain Route not collected"
+    assert audit_mod.classifier(sets)("/synthetic-plain-route") == "UNCLASSIFIED"
+
+
+def test_docs_surfaces_are_disabled():
+    """#510: /docs, /redoc and /openapi.json served an unauthenticated map of
+    every route (reachable from the public internet). They are disabled at the
+    FastAPI constructor, so no such route is registered at all."""
+    app = audit_mod.build_app()
+    assert app.docs_url is None
+    assert app.redoc_url is None
+    assert app.openapi_url is None
+
+    paths = {p for (_kind, p) in audit_mod.collect(app)[0]}
+    for leaked in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+        assert leaked not in paths, f"{leaked} is still registered"
+
+
+@pytest.mark.real_auth
+def test_docs_surfaces_not_served():
+    """End-to-end counterpart: the disabled surfaces do not answer 200."""
+    client, path = _client()
+    try:
+        for leaked in ("/docs", "/redoc", "/openapi.json", "/docs/oauth2-redirect"):
+            resp = client.get(leaked)
+            assert resp.status_code != 200, f"{leaked} still served: {resp.status_code}"
+    finally:
+        os.unlink(path)
