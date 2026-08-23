@@ -3084,6 +3084,123 @@ class ReflectionStore:
             "predicates": {r["predicate"]: r["cnt"] for r in predicates},
         }
 
+    def kg_sweep_ephemeral(
+        self,
+        apply: bool = False,
+        log_path: str = "",
+        backup_dir: str = "",
+    ) -> dict:
+        """Holder-side pure-ID ephemeral sweep (#153 step-1 instrument; #654).
+
+        Mirrors ``scripts/kg_ephemeral_sweep.py`` — same detector
+        (``ephemeral_guard.is_ephemeral_entity``, the write-guard's own
+        regexes), same JSONL record shape, same backup-before-delete
+        discipline — but runs INSIDE the store owner, so no external process
+        ever opens the live DB (storage-authority #619 drives the direct-open
+        allowlist to zero; the script now refuses in-place opens while the
+        holder runs, #1132). ``n_candidates`` per run = regrowth since the
+        previous sweep — the instrument that decides write-guard urgency.
+
+        Dry-run by default. ``apply=True`` deletes each candidate entity and
+        every edge touching it, in one transaction, after a transaction-
+        consistent backup via the SQLite backup API. Every run appends one
+        JSONL record to ``log_path`` (default: ``kg_sweep_log.jsonl`` next to
+        the DB) so the regrowth series stays measurable and deletions stay
+        auditable.
+        """
+        rows = self._conn.execute("SELECT id, name, type FROM kg_entities").fetchall()
+        candidates = [
+            (r["id"], r["name"], r["type"])
+            for r in rows
+            if is_ephemeral_entity(r["name"])
+        ]
+
+        deleted_edges: list[dict] = []
+        for _eid, name, _etype in candidates:
+            for e in self._conn.execute(
+                "SELECT id, subject, predicate, object, valid_to FROM kg_triples "
+                "WHERE subject = ? OR object = ?",
+                (name, name),
+            ).fetchall():
+                deleted_edges.append(
+                    {
+                        "triple_id": e["id"], "subject": e["subject"],
+                        "predicate": e["predicate"], "object": e["object"],
+                        "active": e["valid_to"] is None, "via": name,
+                    }
+                )
+
+        backup_path: str | None = None
+        applied = False
+        if apply and candidates:
+            ts = datetime.now(timezone.utc).strftime("%Y-%m-%d_%H%M%S")
+            base_dir = Path(backup_dir) if backup_dir else Path(self._db_path).parent
+            dest_dir = base_dir / f"{ts}_sweep"
+            dest_dir.mkdir(parents=True, exist_ok=True)
+            dest = dest_dir / Path(self._db_path).name
+            with self._lock:
+                # Backup API, not file copy: transaction-consistent even with
+                # WAL frames not yet checkpointed.
+                dst = sqlite3.connect(str(dest))
+                try:
+                    self._conn.backup(dst)
+                finally:
+                    dst.close()
+                backup_path = str(dest)
+                for _eid, name, _etype in candidates:
+                    self._conn.execute(
+                        "DELETE FROM kg_triples WHERE subject = ? OR object = ?",
+                        (name, name),
+                    )
+                    self._conn.execute(
+                        "DELETE FROM kg_entities WHERE name = ?", (name,)
+                    )
+                self._conn.commit()
+                applied = True
+
+        record = {
+            "ts": datetime.now(timezone.utc).isoformat(),
+            "db": self._db_path,
+            "n_candidates": len(candidates),
+            "candidates": [
+                {"name": n, "type": t} for _i, n, t in candidates
+            ],
+            "n_edges": len(deleted_edges),
+            "n_active_edges": sum(1 for e in deleted_edges if e["active"]),
+            "deleted_edges": deleted_edges if applied else [],
+            "applied": applied,
+            "backup": backup_path,
+            "runner": "store",
+        }
+        log_file = Path(log_path) if log_path else (
+            Path(self._db_path).parent / "kg_sweep_log.jsonl"
+        )
+        try:
+            log_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(log_file, "a", encoding="utf-8") as f:
+                f.write(json.dumps(record, ensure_ascii=True) + "\n")
+        except OSError as e:
+            # The sweep result is still returned; a log-write failure must be
+            # visible, not silent (the log IS the regrowth instrument).
+            record["log_error"] = str(e)
+            logging.getLogger(__name__).error(
+                "kg_sweep_ephemeral: regrowth log append failed: %s", e
+            )
+
+        return {
+            "n_candidates": len(candidates),
+            "candidates": [n for _i, n, _t in candidates],
+            "n_edges": len(deleted_edges),
+            "n_active_edges": record["n_active_edges"],
+            "applied": applied,
+            "backup": backup_path,
+            "log": str(log_file),
+            **(
+                {"log_error": record["log_error"]}
+                if "log_error" in record else {}
+            ),
+        }
+
     # ── KG Extraction Tracking ────────────────────────────────
 
     def kg_get_unprocessed_reflections(
