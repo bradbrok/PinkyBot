@@ -53,6 +53,8 @@ class TelegramAdapter:
         try:
             old.close()
         except Exception:
+            # Best-effort close: the old client is being discarded precisely
+            # because its connection is wedged, so close() may itself fail.
             pass
 
     def _request(self, method: str, **params) -> dict:
