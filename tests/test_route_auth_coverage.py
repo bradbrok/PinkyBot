@@ -191,3 +191,25 @@ def test_docs_surfaces_not_served():
             assert resp.status_code != 200, f"{leaked} still served: {resp.status_code}"
     finally:
         os.unlink(path)
+
+
+def test_audit_descends_into_included_router_without_path():
+    """Some FastAPI/Starlette versions expose an included router as an object
+    with no ``.path`` but with its own ``.routes`` (e.g. ``_IncludedRouter``).
+    Raising on it would make the audit fail on a dependency bump rather than
+    audit the child paths, so ``collect()`` must descend and surface them."""
+    from starlette.responses import PlainTextResponse
+    from starlette.routing import Route
+
+    class _FakeIncludedRouter:
+        def __init__(self, routes):
+            self.routes = routes
+
+    app = audit_mod.build_app()
+    child = Route(
+        "/api/__nested_probe__", lambda request: PlainTextResponse("ok"), methods=["GET"]
+    )
+    app.router.routes.append(_FakeIncludedRouter([child]))
+
+    paths = {p for (_kind, p) in audit_mod.collect(app)[0]}
+    assert "/api/__nested_probe__" in paths

@@ -30,13 +30,13 @@ import tempfile
 from collections import defaultdict
 
 
-def collect(app) -> tuple[list[tuple[str, str]], dict]:
-    """Return ([(kind, path), ...], auth_route_sets) for ``app``."""
+def _walk(container) -> list[tuple[str, str]]:
+    """Collect (kind, path) for every route reachable from ``container.routes``."""
     from fastapi.routing import APIRoute
     from starlette.routing import Mount, Route, WebSocketRoute
 
     routes: list[tuple[str, str]] = []
-    for r in app.routes:
+    for r in container.routes:
         if isinstance(r, APIRoute):
             routes.append(("HTTP", r.path))
         elif isinstance(r, WebSocketRoute):
@@ -62,12 +62,26 @@ def collect(app) -> tuple[list[tuple[str, str]], dict]:
             # exact failure mode #510 exposed. Surface it instead.
             path = getattr(r, "path", None)
             if path is None:
+                # Some FastAPI/Starlette versions wrap an included router in an
+                # object that carries no .path of its own but exposes the child
+                # routes it registered (e.g. _IncludedRouter). Those children are
+                # real, reachable paths: descend instead of failing, so the audit
+                # stays exhaustive across dependency versions.
+                nested = getattr(r, "routes", None)
+                if nested is not None:
+                    routes.extend(_walk(r))
+                    continue
                 raise RuntimeError(
                     f"uncollectable route {type(r).__name__!r} has no .path — "
                     "extend collect() rather than letting it go unaudited"
                 )
             routes.append((type(r).__name__.upper()[:5], path))
-    return routes, app.state.auth_route_sets
+    return routes
+
+
+def collect(app) -> tuple[list[tuple[str, str]], dict]:
+    """Return ([(kind, path), ...], auth_route_sets) for ``app``."""
+    return _walk(app), app.state.auth_route_sets
 
 
 def classifier(sets: dict):
