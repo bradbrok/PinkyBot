@@ -5170,7 +5170,14 @@ class TmuxSession(TransportReplacementMixin):
         review).
         """
         requested_session_id = (session_id or "").strip()
-        bind_window_open = self._tailer_first_bind_pending
+        # #1150 SF-1: the trust window suppresses the foreign-session lineage
+        # check, so it must open only for a genuine fresh spawn where a
+        # legitimately new id is expected. A --continue relaunch re-arms the
+        # pending flag, but its resumed id is already known and must match.
+        bind_window_open = (
+            self._tailer_first_bind_pending
+            and not self._last_launch_used_continue
+        )
         bound_session_id = self._bound_transcript_session_id
         rejection_reason = ""
         if not requested_session_id:

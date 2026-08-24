@@ -2695,6 +2695,41 @@ async def test_transcript_bind_rejects_foreign_mid_session(
 
 
 @pytest.mark.asyncio
+async def test_transcript_bind_continue_window_rejects_foreign_session(
+    tmp_path,
+    capsys,
+) -> None:
+    """A continue relaunch cannot admit a different session lineage."""
+    ss, _ = _make_session()
+    await ss.connect()
+    original = tmp_path / "continued-session.jsonl"
+    foreign = tmp_path / "foreign-session.jsonl"
+    original.touch()
+    foreign.touch()
+
+    assert ss.set_transcript_path(
+        original,
+        session_id="continued-session-id",
+    ) is True
+
+    ss._last_launch_used_continue = True
+    ss._tailer_first_bind_pending = True
+
+    assert ss.set_transcript_path(
+        foreign,
+        session_id="foreign-session-id",
+    ) is False
+    assert ss._tailer.transcript_path == original
+    assert ss._bound_transcript_session_id == "continued-session-id"
+    assert ss._tailer_first_bind_pending is True
+    assert ss.stats["transcript_bind_rejections"] == 1
+    rejection_log = capsys.readouterr().err
+    assert "TRANSCRIPT_BIND_REJECTED" in rejection_log
+    assert "reason=foreign_session_id" in rejection_log
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("session_id", ["", "   "], ids=["empty", "blank"])
 async def test_transcript_bind_rejects_absent_session_id_without_consuming_window(
     tmp_path,
@@ -2745,30 +2780,61 @@ async def test_transcript_bind_accepts_fresh_and_same_lineage_repeat(tmp_path) -
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize(
-    "last_launch_used_continue",
-    [True, False],
-    ids=["daemon-resume", "context-restart"],
-)
-async def test_transcript_bind_window_accepts_new_lineage_on_daemon_relaunch(
+async def test_transcript_bind_continue_window_accepts_bound_session(
     tmp_path,
-    last_launch_used_continue,
+    capsys,
 ) -> None:
-    """Every daemon-initiated pane relaunch may establish its new session id."""
+    """A continue relaunch still accepts the resumed session's own hook."""
     ss, _ = _make_session()
     await ss.connect()
-    old_path = tmp_path / "old.jsonl"
-    new_path = tmp_path / "new.jsonl"
-    old_path.touch()
-    new_path.touch()
-    assert ss.set_transcript_path(old_path, session_id="old-session-id") is True
+    original = tmp_path / "continued-session.jsonl"
+    resumed = tmp_path / "continued-session-rotated.jsonl"
+    original.touch()
+    resumed.touch()
+    assert ss.set_transcript_path(
+        original,
+        session_id="continued-session-id",
+    ) is True
 
     await ss._stop_tailer()
-    ss._last_launch_used_continue = last_launch_used_continue
     await ss._start_tailer()
+    ss._last_launch_used_continue = True
 
     assert ss._tailer_first_bind_pending is True
-    assert ss.set_transcript_path(new_path, session_id="new-session-id") is True
+    assert ss.set_transcript_path(
+        resumed,
+        session_id="continued-session-id",
+    ) is True
+    assert ss._bound_transcript_session_id == "continued-session-id"
+    assert ss._tailer.transcript_path == resumed
+    assert ss.stats["transcript_bind_rejections"] == 0
+    assert "TRANSCRIPT_BIND_REJECTED" not in capsys.readouterr().err
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_transcript_bind_fresh_window_accepts_new_session(tmp_path) -> None:
+    """A fresh relaunch still admits its legitimately new session lineage."""
+    ss, _ = _make_session()
+    await ss.connect()
+    old_path = tmp_path / "old-session.jsonl"
+    new_path = tmp_path / "new-session.jsonl"
+    old_path.touch()
+    new_path.touch()
+    assert ss.set_transcript_path(
+        old_path,
+        session_id="old-session-id",
+    ) is True
+
+    await ss._stop_tailer()
+    await ss._start_tailer()
+    ss._last_launch_used_continue = False
+
+    assert ss._tailer_first_bind_pending is True
+    assert ss.set_transcript_path(
+        new_path,
+        session_id="new-session-id",
+    ) is True
     assert ss._bound_transcript_session_id == "new-session-id"
     assert ss._tailer.transcript_path == new_path
     await ss.disconnect()
