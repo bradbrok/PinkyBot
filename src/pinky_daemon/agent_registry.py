@@ -1311,6 +1311,13 @@ forwards transcript_path to the daemon.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
+# #1148: daemon-spawned headless sessions can load the workspace settings, but
+# the daemon environment never carries this marker, so they exit before POSTing.
+# Processes descended from the pane inherit it; the session-lineage guard is
+# the backstop for transcript binds from those descendants.
+if os.environ.get("PINKY_TMUX_TRANSCRIPT_BIND", "").strip() != "1":
+    sys.exit(0)
+
 secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)

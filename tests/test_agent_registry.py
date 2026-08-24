@@ -5,9 +5,13 @@ from __future__ import annotations
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import threading
 import time
+import urllib.request
+from io import StringIO
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -389,6 +393,46 @@ class TestSigningKeys:
             # The old inline f-string shape (f"http://localhost:8888{path}")
             # must be gone — that URL can never be overridden at runtime.
             assert 'f"http://localhost:8888' not in src
+
+    def test_tmux_session_start_hook_skips_post_without_pane_marker(
+        self,
+        monkeypatch,
+    ):
+        """#1148: a headless Claude session in the cwd never reports a bind."""
+        from pinky_daemon import agent_registry as ar
+
+        source = ar._tmux_session_start_hook_source("dymok")
+        post = MagicMock()
+        monkeypatch.setattr(urllib.request, "urlopen", post)
+        monkeypatch.setenv("PINKY_AGENT_KEY", "test-agent-key")
+        monkeypatch.delenv("PINKY_TMUX_TRANSCRIPT_BIND", raising=False)
+        monkeypatch.setattr(
+            sys,
+            "stdin",
+            StringIO(json.dumps({
+                "transcript_path": "/tmp/headless.jsonl",
+                "session_id": "headless-session-id",
+            })),
+        )
+
+        with pytest.raises(SystemExit) as exit_info:
+            exec(compile(source, "hook_tmux_session_start.py", "exec"), {})
+
+        assert exit_info.value.code == 0
+        post.assert_not_called()
+
+    def test_stale_session_start_hook_is_rewritten_with_pane_marker(self, tmp_path):
+        """Workspace hook sync upgrades existing agents to the #1148 gate."""
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        hook_path = claude_dir / "hook_tmux_session_start.py"
+        hook_path.write_text("#!/usr/bin/env python3\n# stale pre-1148 hook\n")
+
+        AgentRegistry._setup_hooks(tmp_path, "dymok")
+
+        source = hook_path.read_text()
+        assert "stale pre-1148" not in source
+        assert 'os.environ.get("PINKY_TMUX_TRANSCRIPT_BIND", "")' in source
 
     def test_stale_status_hooks_rewritten_in_place(self, tmp_path):
         """#638 review fix: hook_working.py / hook_idle.py were historically

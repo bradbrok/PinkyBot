@@ -7558,13 +7558,15 @@ npm run build</pre>
         update = getattr(session, "set_transcript_path", None)
         if callable(update):
             try:
-                update(normalised)
+                accepted = update(normalised, session_id=req.session_id)
             except Exception as e:
                 _log(
                     f"api: transport_transcript_path set_transcript_path "
                     f"raised for {name}: {e}"
                 )
                 raise HTTPException(500, str(e))
+            if accepted is False:
+                raise HTTPException(409, "transcript bind rejected")
         return {"ok": True, "agent": name, "transcript_path": str(normalised)}
 
     @app.post("/agents/{name}/transport/tool-use")
