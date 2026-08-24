@@ -15,6 +15,7 @@ import os
 import tempfile
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 from fastapi.testclient import TestClient
@@ -560,6 +561,67 @@ class TestTransportEndpoints:
         # session: None (the path validation already succeeded, which is
         # what this test pins).
         assert body.get("session") is None
+
+    def test_transcript_path_rejection_is_loud_and_forwards_session_id(self):
+        """#1148: a live transport rejection is an HTTP conflict, not 200."""
+        from pathlib import Path
+
+        client = self._client_with_agent()
+        app = client.app
+        session = FakeStreamingSession("dymok")
+        session.set_transcript_path = MagicMock(return_value=False)
+        app.state.broker.register_streaming("dymok", session, label="main")
+        candidate = (
+            Path.home() / ".claude" / "projects" / "test-agent"
+            / "foreign-session.jsonl"
+        )
+
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={
+                "transcript_path": str(candidate),
+                "session_id": "foreign-session-id",
+            },
+        )
+
+        assert resp.status_code == 409
+        assert "rejected" in resp.json()["detail"].lower()
+        session.set_transcript_path.assert_called_once_with(
+            candidate.resolve(strict=False),
+            session_id="foreign-session-id",
+        )
+
+    def test_transcript_path_payload_cannot_select_internal_rebind(self):
+        """The trusted #565 call site is not an HTTP-selectable code path."""
+        from pathlib import Path
+
+        client = self._client_with_agent()
+        app = client.app
+        session = FakeStreamingSession("dymok")
+        session.set_transcript_path = MagicMock(return_value=False)
+        session._set_transcript_path_internal = MagicMock(return_value=True)
+        app.state.broker.register_streaming("dymok", session, label="main")
+        candidate = (
+            Path.home() / ".claude" / "projects" / "test-agent"
+            / "untrusted-session.jsonl"
+        )
+
+        resp = client.post(
+            "/agents/dymok/transport/transcript-path",
+            json={
+                "transcript_path": str(candidate),
+                "trusted": True,
+                "internal": True,
+                "daemon_initiated": True,
+            },
+        )
+
+        assert resp.status_code == 409
+        session.set_transcript_path.assert_called_once_with(
+            candidate.resolve(strict=False),
+            session_id="",
+        )
+        session._set_transcript_path_internal.assert_not_called()
 
 
 # ──────────────────────────────────────────────────────────────────────────

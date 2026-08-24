@@ -510,6 +510,16 @@ _PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 # SessionStart hook latency (sub-second to ~200ms).
 _FIRST_BIND_RECOVERY_DELAY_SEC = 5.0
 
+# #1148 — only a daemon-launched tmux pane receives this marker. The generated
+# SessionStart hook requires the exact value before it can report a transcript
+# bind, keeping sibling/headless Claude processes in the same cwd silent.
+_TMUX_TRANSCRIPT_BIND_MARKER_ENV = "PINKY_TMUX_TRANSCRIPT_BIND"
+_TMUX_TRANSCRIPT_BIND_MARKER_VALUE = "1"
+
+# Stable incident signature for api.log greps. Keep the prefix unchanged even
+# if the structured fields below evolve.
+_TRANSCRIPT_BIND_REJECTED_LOG_PREFIX = "TRANSCRIPT_BIND_REJECTED"
+
 
 class _ContextLockDeferral(Exception):  # noqa: N818
     """Transient: context-lock file present at paste time.
@@ -1986,6 +1996,7 @@ class TmuxSession(TransportReplacementMixin):
             "errors": 0,
             "reconnects": 0,
             "auto_restarts": 0,
+            "transcript_bind_rejections": 0,
         }
         self.usage = SessionUsage()
 
@@ -2153,6 +2164,12 @@ class TmuxSession(TransportReplacementMixin):
         # ``stop_hook_summary``. Continue launches preserve the
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
+
+        # #1148 — lineage reported by the pane's SessionStart hook. A new
+        # non-empty id may replace this only while the daemon's per-spawn
+        # first-bind window above is open. Retain it across relaunches; a
+        # legitimate daemon relaunch re-arms the window in ``_start_tailer``.
+        self._bound_transcript_session_id: str = ""
 
         # Issue #565 — handle to the delayed first-bind recovery task
         # scheduled from ``_start_tailer``. Cancelled in ``_stop_tailer``
@@ -4237,6 +4254,7 @@ class TmuxSession(TransportReplacementMixin):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
+        env[_TMUX_TRANSCRIPT_BIND_MARKER_ENV] = _TMUX_TRANSCRIPT_BIND_MARKER_VALUE
         env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(
             DEFAULT_MAX_CONCURRENT_SUBAGENTS
         )
@@ -5065,9 +5083,24 @@ class TmuxSession(TransportReplacementMixin):
         if self._tailer is not None:
             self._tailer.wake()
 
-    def set_transcript_path(self, path: Path | str) -> None:
+    def set_transcript_path(
+        self,
+        path: Path | str,
+        *,
+        session_id: str,
+    ) -> bool:
         """Update the watched transcript path — called when SessionStart
         hook reports the actual path Claude Code is writing to.
+
+        #1148 session-lineage perimeter: external callers must provide a
+        non-empty ``session_id``. A new id is accepted only during the
+        daemon-opened per-spawn first-bind window; after that, only repeat
+        reports from the bound lineage may update the path. Returns ``False``
+        on rejection so the HTTP boundary can return a loud conflict.
+
+        Trusted filesystem discovery never calls this method. It uses the
+        separate ``_set_transcript_path_internal`` call site below, so no HTTP
+        payload shape can turn a missing session id into an internal bypass.
 
         Cleaner than guessing the path via mtime glob: the SessionStart
         hook fires before the first model call, so the tailer is
@@ -5133,6 +5166,37 @@ class TmuxSession(TransportReplacementMixin):
         delivery (not enqueue) so the wake turn stays at queue head
         and external sends queue behind — FIFO preserved (Murzik #571
         review).
+        """
+        requested_session_id = (session_id or "").strip()
+        bind_window_open = self._tailer_first_bind_pending
+        bound_session_id = self._bound_transcript_session_id
+        rejection_reason = ""
+        if not requested_session_id:
+            rejection_reason = "missing_session_id"
+        elif not bind_window_open and requested_session_id != bound_session_id:
+            rejection_reason = "foreign_session_id"
+
+        if rejection_reason:
+            self._stats["transcript_bind_rejections"] += 1
+            _log(
+                f"{_TRANSCRIPT_BIND_REJECTED_LOG_PREFIX} "
+                f"agent={self.agent_name} reason={rejection_reason} "
+                f"requested_session_id={requested_session_id[:12] or '<missing>'} "
+                f"bound_session_id={bound_session_id[:12] or '<none>'} "
+                f"bind_window_open={str(bind_window_open).lower()}"
+            )
+            return False
+
+        self._bound_transcript_session_id = requested_session_id
+        self._set_transcript_path_internal(path)
+        return True
+
+    def _set_transcript_path_internal(self, path: Path | str) -> None:
+        """Trusted call-site-only transcript rebind for daemon discovery.
+
+        This is intentionally a separate method rather than a flag on the
+        public hook path. Only in-process first-bind recovery calls it; the API
+        endpoint exposes ``set_transcript_path`` and cannot select this path.
         """
         if self._tailer is None:
             return
@@ -6621,10 +6685,11 @@ class TmuxSession(TransportReplacementMixin):
 
         Recovery decision needs ``_tailer_first_bind_pending`` and
         ``_last_launch_used_continue``, which the tailer doesn't know
-        about — keep it here at ``TmuxSession``. Route the rebind
-        through ``set_transcript_path`` so the existing first-bind
-        seek-to-start path (PR #564) handles the seek + flag-consume,
-        and so the #496 continue-launch reply-spam defense remains
+        about — keep it here at ``TmuxSession``. Route the rebind through
+        the call-site-only ``_set_transcript_path_internal`` method so the
+        existing first-bind seek-to-start path (PR #564) handles the seek +
+        flag-consume without making a missing external session id a trust
+        discriminator. The #496 continue-launch reply-spam defense remains
         intact for the predicate-evaluates-False branch.
 
         No-op when:
@@ -6669,7 +6734,7 @@ class TmuxSession(TransportReplacementMixin):
         )
         # Routes through the standard first-bind path → seeks to byte 0
         # and consumes the ``_tailer_first_bind_pending`` flag (PR #564).
-        self.set_transcript_path(discovered)
+        self._set_transcript_path_internal(discovered)
 
     async def _stop_tailer(self) -> None:
         """Stop the tailer if running. Idempotent.

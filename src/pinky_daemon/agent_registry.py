@@ -1311,6 +1311,12 @@ forwards transcript_path to the daemon.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
+# #1148: only daemon-launched tmux panes receive this exact marker. A headless
+# utility Claude session can inherit the workspace's settings.json, but not the
+# pane-only marker, so it exits before signing or POSTing a transcript bind.
+if os.environ.get("PINKY_TMUX_TRANSCRIPT_BIND", "").strip() != "1":
+    sys.exit(0)
+
 secret = os.environ.get("PINKY_AGENT_KEY", "").strip() or os.environ.get("PINKY_SESSION_SECRET", "").strip()
 if not secret:
     sys.exit(0)
