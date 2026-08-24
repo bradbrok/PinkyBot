@@ -5093,10 +5093,12 @@ class TmuxSession(TransportReplacementMixin):
         hook reports the actual path Claude Code is writing to.
 
         #1148 session-lineage perimeter: external callers must provide a
-        non-empty ``session_id``. A new id is accepted only during the
-        daemon-opened per-spawn first-bind window; after that, only repeat
-        reports from the bound lineage may update the path. Returns ``False``
-        on rejection so the HTTP boundary can return a loud conflict.
+        non-empty ``session_id``. A new id is accepted during the
+        daemon-opened per-spawn first-bind window or when trusted recovery
+        consumed that window without establishing lineage. Once lineage is
+        established, only its repeat reports may update the path outside a
+        new window. Returns ``False`` on rejection so the HTTP boundary can
+        return a loud conflict.
 
         Trusted filesystem discovery never calls this method. It uses the
         separate ``_set_transcript_path_internal`` call site below, so no HTTP
@@ -5173,7 +5175,11 @@ class TmuxSession(TransportReplacementMixin):
         rejection_reason = ""
         if not requested_session_id:
             rejection_reason = "missing_session_id"
-        elif not bind_window_open and requested_session_id != bound_session_id:
+        elif (
+            bound_session_id
+            and not bind_window_open
+            and requested_session_id != bound_session_id
+        ):
             rejection_reason = "foreign_session_id"
 
         if rejection_reason:

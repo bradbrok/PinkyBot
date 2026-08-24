@@ -3220,6 +3220,76 @@ async def test_first_bind_recovery_fresh_with_prior_history_rebinds_and_seeks_to
 
 
 @pytest.mark.asyncio
+async def test_late_hook_establishes_lineage_after_internal_recovery(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """#1148: an authoritative late hook can correct recovery's mtime guess."""
+    ss, _ = _make_session()
+    await ss.connect()
+    recovered_guess = tmp_path / "newest-sibling.jsonl"
+    authoritative = tmp_path / "real-pane.jsonl"
+    recovered_guess.touch()
+    authoritative.touch()
+    ss._last_launch_used_continue = False
+    monkeypatch.setattr(
+        ss,
+        "_discover_transcript_path",
+        lambda: recovered_guess,
+    )
+
+    ss._attempt_first_bind_recovery()
+
+    assert ss._tailer.transcript_path == recovered_guess
+    assert ss._tailer_first_bind_pending is False
+    assert ss._bound_transcript_session_id == ""
+    assert ss.set_transcript_path(
+        authoritative,
+        session_id="real-pane-session-id",
+    ) is True
+    assert ss._bound_transcript_session_id == "real-pane-session-id"
+    assert ss._tailer.transcript_path == authoritative
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
+async def test_late_hook_lineage_rejects_foreign_followup(
+    tmp_path,
+    monkeypatch,
+) -> None:
+    """Once the late hook establishes lineage, ordinary mismatch rules resume."""
+    ss, _ = _make_session()
+    await ss.connect()
+    recovered_guess = tmp_path / "newest-sibling.jsonl"
+    authoritative = tmp_path / "real-pane.jsonl"
+    foreign = tmp_path / "later-foreign.jsonl"
+    recovered_guess.touch()
+    authoritative.touch()
+    foreign.touch()
+    ss._last_launch_used_continue = False
+    monkeypatch.setattr(
+        ss,
+        "_discover_transcript_path",
+        lambda: recovered_guess,
+    )
+
+    ss._attempt_first_bind_recovery()
+    assert ss.set_transcript_path(
+        authoritative,
+        session_id="real-pane-session-id",
+    ) is True
+
+    assert ss.set_transcript_path(
+        foreign,
+        session_id="foreign-session-id",
+    ) is False
+    assert ss._bound_transcript_session_id == "real-pane-session-id"
+    assert ss._tailer.transcript_path == authoritative
+    assert ss.stats["transcript_bind_rejections"] == 1
+    await ss.disconnect()
+
+
+@pytest.mark.asyncio
 async def test_first_bind_recovery_continue_launch_noops_and_preserves_eof(
     tmp_path, monkeypatch,
 ) -> None:
