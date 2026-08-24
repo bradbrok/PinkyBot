@@ -1311,9 +1311,10 @@ forwards transcript_path to the daemon.
 """
 import hashlib, hmac, base64, time, urllib.request, json, os, sys
 
-# #1148: only daemon-launched tmux panes receive this exact marker. A headless
-# utility Claude session can inherit the workspace's settings.json, but not the
-# pane-only marker, so it exits before signing or POSTing a transcript bind.
+# #1148: daemon-spawned headless sessions can load the workspace settings, but
+# the daemon environment never carries this marker, so they exit before POSTing.
+# Processes descended from the pane inherit it; the session-lineage guard is
+# the backstop for transcript binds from those descendants.
 if os.environ.get("PINKY_TMUX_TRANSCRIPT_BIND", "").strip() != "1":
     sys.exit(0)
 

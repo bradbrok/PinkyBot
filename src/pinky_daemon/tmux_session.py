@@ -510,9 +510,9 @@ _PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 # SessionStart hook latency (sub-second to ~200ms).
 _FIRST_BIND_RECOVERY_DELAY_SEC = 5.0
 
-# #1148 — only a daemon-launched tmux pane receives this marker. The generated
-# SessionStart hook requires the exact value before it can report a transcript
-# bind, keeping sibling/headless Claude processes in the same cwd silent.
+# #1148 — this per-session marker gates daemon-spawned headless sessions because
+# the daemon environment never carries it. Pane-descendant processes inherit
+# the marker; the session-lineage guard is the backstop for their binds.
 _TMUX_TRANSCRIPT_BIND_MARKER_ENV = "PINKY_TMUX_TRANSCRIPT_BIND"
 _TMUX_TRANSCRIPT_BIND_MARKER_VALUE = "1"
 
