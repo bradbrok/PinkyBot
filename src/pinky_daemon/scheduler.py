@@ -701,6 +701,21 @@ class AgentScheduler:
                     self._outbox_reaper_payload_trim_after_sec
                 ),
             )
+            # #667: bound the durable inbound-idempotency table on the same
+            # daily pass. Guarded independently so retention housekeeping can
+            # never fail the wake-reaper maintenance it rides along with.
+            try:
+                pruned = self._registry.prune_delivered_turns(now=now)
+                if pruned:
+                    _log(
+                        f"scheduler: pruned {pruned} expired delivery-ledger "
+                        "row(s)"
+                    )
+            except Exception as exc:
+                _log(
+                    "scheduler: delivery-ledger prune failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
         except Exception as exc:
             self._last_outbox_reaper_failed_at = now
             _log(

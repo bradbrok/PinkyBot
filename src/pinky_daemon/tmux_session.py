@@ -4755,6 +4755,34 @@ class TmuxSession(TransportReplacementMixin):
             )
             return False
 
+        # #667: durable inbound idempotency. A message already delivered to
+        # this agent in a prior life re-enters here carrying the same durable
+        # platform message_id but not the in-memory transport-accepted fence
+        # (which a restart wipes) — the realistic source is a platform poller
+        # re-fetching the same update after a bounce on an uncommitted offset.
+        # It would be re-pasted as a duplicate the user sees (and wasted work
+        # re-running the turn). Suppress it before any side effect
+        # (conversation log, stats, paste). Only external turns with a stable
+        # platform message_id are guarded; internal, wake, scheduler, and
+        # approval-drain turns carry no message_id and pass through — their
+        # re-delivery stays at-least-once, as the broker already documents.
+        # Return True — the message genuinely WAS delivered, so the caller
+        # commits its offset instead of retrying — never False, which the
+        # approval-drain path treats as a hard handoff failure.
+        if (
+            message_id
+            and not scheduler_serialized
+            and self._registry is not None
+            and self._registry.is_turn_delivered(
+                self.agent_name, platform, chat_id, message_id
+            )
+        ):
+            _log(
+                f"tmux[{self.agent_name}]: DROPPING already-delivered inbound "
+                f"message (idempotent #667; chat={chat_id}, msg={message_id})"
+            )
+            return True
+
         self.last_active = time.time()
         self._stats["messages_sent"] += 1
 
@@ -9060,6 +9088,34 @@ class TmuxSession(TransportReplacementMixin):
                     "positive evidence; suppressing unsafe replay"
                 )
         turn.transport_accepted = True
+        # #667: mirror the just-confirmed acceptance into the durable delivery
+        # ledger so a later re-entry of the same external message (across a
+        # restart that wipes this in-memory fence) is suppressed at the inbound
+        # entry point. Written strictly AFTER positive delivery evidence, so a
+        # recorded key always means a genuine prior delivery — the guard can
+        # only ever drop a true duplicate, never an undelivered message.
+        # Internal/wake/scheduler turns carry no message_id and are skipped.
+        if (
+            turn.message_id
+            and not turn.scheduler_serialized
+            and self._registry is not None
+        ):
+            try:
+                self._registry.mark_turn_delivered(
+                    self.agent_name,
+                    turn.platform,
+                    turn.chat_id,
+                    turn.message_id,
+                    source=turn.platform,
+                )
+            except Exception as exc:
+                # Durability is a safety net over the in-memory fence, never a
+                # correctness precondition for this turn — log loudly and let
+                # acceptance proceed rather than fail an accepted delivery.
+                _log(
+                    f"tmux[{self.agent_name}]: delivery-ledger mark failed "
+                    f"({type(exc).__name__}: {exc})"
+                )
         for receipt in (turn.scheduler_delivery, turn.submission_receipt):
             if receipt is not None and not receipt.done():
                 receipt.set_result(True)
