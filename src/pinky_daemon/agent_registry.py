@@ -1618,6 +1618,25 @@ class AgentRegistry:
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
+            -- Durable inbound-delivery idempotency (#667). Records that a
+            -- given external message was already delivered to an agent's
+            -- session, keyed by the stable platform identity
+            -- (platform+chat+message_id). A message re-entering the pipeline
+            -- after a bounce (poller re-fetch on an uncommitted offset, broker
+            -- re-route, escalation re-feed) carries the same durable id but not
+            -- the in-memory transport-accepted fence, so it would be re-pasted
+            -- as a duplicate. The entry point consults this table and drops the
+            -- re-delivery. Rows are written only after positive delivery
+            -- evidence, so a present key always means a genuine prior delivery;
+            -- the table is bounded by a retention prune.
+            CREATE TABLE IF NOT EXISTS delivered_turn (
+                agent_name    TEXT NOT NULL,
+                idem_key      TEXT NOT NULL,
+                source        TEXT NOT NULL DEFAULT '',
+                delivered_at  REAL NOT NULL,
+                PRIMARY KEY (agent_name, idem_key)
+            );
+
             CREATE TABLE IF NOT EXISTS approval_requests (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 agent_name TEXT NOT NULL,
@@ -1727,6 +1746,8 @@ class AgentRegistry:
                 ON recurring_schedule_stale_drops(agent_name, schedule_id);
             CREATE INDEX IF NOT EXISTS idx_pending_messages_agent_chat
                 ON pending_messages(agent_name, chat_id, delivered);
+            CREATE INDEX IF NOT EXISTS idx_delivered_turn_at
+                ON delivered_turn(delivered_at);
             CREATE INDEX IF NOT EXISTS idx_approval_requests_retry
                 ON approval_requests(gate_state, notification_state, next_retry_at);
             CREATE INDEX IF NOT EXISTS idx_group_chats_agent
@@ -7076,6 +7097,95 @@ except Exception as exc:
         )
         self._db.commit()
         return cursor.rowcount > 0
+
+    # ── Inbound-delivery idempotency (#667) ───────────────────────────
+    #
+    # A durable record that a given external message was already delivered to
+    # an agent's session, so a re-entry after a bounce is suppressed at the
+    # single inbound entry point. Key construction lives here so the mark and
+    # the check can never drift apart. \x1f (unit separator) can't occur in a
+    # platform/chat/message id, so the joined key is unambiguous.
+
+    @staticmethod
+    def _delivery_idem_key(platform: str, chat_id: str, message_id: str) -> str:
+        return f"{platform}\x1f{chat_id}\x1f{message_id}"
+
+    def mark_turn_delivered(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        message_id: str,
+        *,
+        source: str = "",
+    ) -> bool:
+        """Record an external message as delivered to ``agent_name``.
+
+        Returns ``True`` if this call inserted a new row, ``False`` if the key
+        was already present (idempotent) or the message has no stable id.
+        Call only after positive delivery evidence — a present key must always
+        mean a genuine prior delivery, never merely an attempt.
+        """
+        if not agent_name or not message_id:
+            return False
+        key = self._delivery_idem_key(platform, chat_id, message_id)
+        # The mark runs on the transcript-tailer thread while the check runs on
+        # the send path; serialize both through the same lock every other
+        # writer on this shared connection uses, so an interleaved commit can't
+        # flush a half-formed statement from another thread.
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                "INSERT INTO delivered_turn (agent_name, idem_key, source, delivered_at) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(agent_name, idem_key) DO NOTHING",
+                (agent_name, key, source, time.time()),
+            )
+            self._db.commit()
+            return cursor.rowcount > 0
+
+    def is_turn_delivered(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        message_id: str,
+    ) -> bool:
+        """True if this external message was already delivered in any prior life.
+
+        Messages without a stable platform id (internal, wake, scheduler, or
+        approval-drain turns) are never in the ledger and always return False.
+        """
+        if not agent_name or not message_id:
+            return False
+        key = self._delivery_idem_key(platform, chat_id, message_id)
+        with self._rmw_lock:
+            row = self._db.execute(
+                "SELECT 1 FROM delivered_turn WHERE agent_name=? AND idem_key=? LIMIT 1",
+                (agent_name, key),
+            ).fetchone()
+        return row is not None
+
+    def prune_delivered_turns(
+        self,
+        *,
+        retention_sec: float = 14 * 24 * 60 * 60,
+        now: float | None = None,
+    ) -> int:
+        """Delete delivered-turn rows older than the retention window.
+
+        A delivered key only needs to outlive the windows in which a stale
+        turn could still re-enter (restart drain, watchdog, boot-drain,
+        poller offset lag) — minutes — so a multi-day floor is generous while
+        bounding table growth. Returns the number of rows removed.
+        """
+        cutoff = (time.time() if now is None else now) - retention_sec
+        with self._rmw_lock:
+            cursor = self._db.execute(
+                "DELETE FROM delivered_turn WHERE delivered_at < ?",
+                (cutoff,),
+            )
+            self._db.commit()
+            return cursor.rowcount
 
     def delete_pending_messages(self, agent_name: str, chat_id: str = "") -> int:
         """Delete pending messages. If chat_id given, only for that chat."""
