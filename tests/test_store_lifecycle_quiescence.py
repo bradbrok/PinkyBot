@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+import threading
 from concurrent.futures import Future
 from pathlib import Path
 from types import SimpleNamespace
@@ -13,6 +14,53 @@ import pytest
 from pinky_daemon import pollers
 from pinky_daemon.store_catalog import StoreCatalog, StoreIntegrityTarget
 from pinky_daemon.store_shutdown import StoreShutdownError
+
+
+@pytest.mark.asyncio
+async def test_stop_promptly_unblocks_an_inflight_telegram_poll() -> None:
+    """Stopping must recycle the poll client instead of awaiting its long-poll deadline."""
+    poll_entered = threading.Event()
+    poll_released = threading.Event()
+    recycle_calls = 0
+
+    class Adapter:
+        @staticmethod
+        def get_me():
+            return {"username": "quiescence"}
+
+        @staticmethod
+        def get_updates(*, timeout: int):
+            assert timeout == 30
+            poll_entered.set()
+            poll_released.wait()
+            raise pollers.TelegramError("poll client recycled")
+
+        @staticmethod
+        def recycle() -> None:
+            nonlocal recycle_calls
+            recycle_calls += 1
+            poll_released.set()
+
+    poller = pollers.TelegramPoller(
+        Adapter(),
+        object(),
+        poll_interval=30,
+    )
+    poller_task = pollers.start_poller(poller)
+    assert await asyncio.to_thread(poll_entered.wait, 1)
+
+    poller.stop()
+    try:
+        await asyncio.wait_for(asyncio.shield(poller_task), timeout=0.5)
+    finally:
+        poll_released.set()
+        for _ in range(3):
+            await asyncio.sleep(0)
+        if not poller_task.done():
+            poller_task.cancel()
+        await asyncio.gather(poller_task, return_exceptions=True)
+
+    assert recycle_calls == 1
 
 
 @pytest.mark.asyncio
