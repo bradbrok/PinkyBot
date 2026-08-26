@@ -155,6 +155,7 @@ def _stub_daemon_wal_path_check(request, monkeypatch):
         "_verified_daemon_owned_path",
         lambda self, path: os.path.realpath(path),
     )
+    yield
 
 
 @pytest.fixture(autouse=True, scope="session")
