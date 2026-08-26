@@ -210,6 +210,7 @@ from pinky_daemon.store_manifest import (
     derive_fleet_store_manifest,
     derive_standalone_tenant_store_manifest_for_agent,
 )
+from pinky_daemon.store_shutdown import StoreShutdownError
 from pinky_daemon.store_snapshot import (
     SnapshotResult,
     StoreSnapshotError,
@@ -1731,8 +1732,9 @@ def create_api(
 
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
-    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
     store_manifest = _derive_api_store_manifest(db_path)
+    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
+    store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
     try:
         store_catalog.preflight_integrity(
@@ -1845,6 +1847,7 @@ def create_api(
             tenant_catalog = StoreCatalog(
                 expected_root=tenant_root,
                 silence_allowlist={},
+                manifest=tenant_manifest,
             )
             observations = tenant_catalog.preflight_integrity(tenant_manifest.values())
             for target in tenant_manifest.values():
@@ -2713,6 +2716,7 @@ def create_api(
         message_context_store=message_context_store,
     )
     _broker_pollers: list = []  # Track active broker pollers
+    from pinky_daemon.pollers import quiesce_delivery_tasks, start_poller
 
     app.state.manager = manager
     app.state.broker = broker
@@ -8662,7 +8666,7 @@ npm run build</pre>
                     adapter, name, broker, registry=agents,
                 )
                 _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
+                start_poller(poller)
                 _log(f"api: started telegram poller for {name}")
             except Exception as e:
                 _log(f"api: failed to start telegram poller for {name}: {e}")
@@ -8696,7 +8700,7 @@ npm run build</pre>
                     watched_channels=watched,
                 )
                 _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
+                start_poller(poller)
                 _log(
                     f"api: started discord poller for {name} "
                     f"(poll_interval={poll_interval}s, "
@@ -12609,7 +12613,7 @@ npm run build</pre>
                         adapter, agent.name, broker, registry=agents,
                     )
                     _broker_pollers.append(poller)
-                    asyncio.create_task(poller.start())
+                    start_poller(poller)
                     _log(f"startup: broker poller started for {agent.name}")
 
             # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
@@ -12639,7 +12643,7 @@ npm run build</pre>
                             watched_channels=watched,
                         )
                         _broker_pollers.append(d_poller)
-                        asyncio.create_task(d_poller.start())
+                        start_poller(d_poller)
                         _log(
                             f"startup: discord poller started for {agent.name} "
                             f"(interval={poll_interval}s, "
@@ -12683,7 +12687,7 @@ npm run build</pre>
                                 app_token=app_token,
                             )
                             _broker_pollers.append(s_poller)
-                            asyncio.create_task(s_poller.start())
+                            start_poller(s_poller)
                             _log(f"startup: slack socket-mode poller started for {agent.name}")
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
@@ -12709,7 +12713,7 @@ npm run build</pre>
                         im_adapter, agent.name, broker,
                     )
                     _broker_pollers.append(im_poller)
-                    asyncio.create_task(im_poller.start())
+                    start_poller(im_poller)
                     _log(f"startup: iMessage poller started for {agent.name}")
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
@@ -12873,6 +12877,7 @@ npm run build</pre>
         if app.state.buzz_poller_tasks:
             await asyncio.gather(*app.state.buzz_poller_tasks, return_exceptions=True)
         app.state.buzz_poller_tasks.clear()
+        await quiesce_delivery_tasks()
         await autonomy.stop()
         await scheduler.stop()
         await watchdog.stop()
@@ -12880,10 +12885,19 @@ npm run build</pre>
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
-        message_context_store.close()
         for tenant_catalog in tenant_store_catalogs.values():
             tenant_catalog.close()
-        store_catalog.close()
+        try:
+            report = store_catalog.shutdown(deadline_seconds=10.0)
+        except StoreShutdownError as exc:
+            app.state.store_shutdown_report = exc.report
+            _log(f"ERROR shutdown: {exc}")
+            raise
+        app.state.store_shutdown_report = report
+        _log(
+            "shutdown: store finalization complete "
+            f"attempted={len(report.attempted)} finalized={len(report.finalized)}"
+        )
 
     # ── Admin: Session Watchdog ─────────────────────────
 

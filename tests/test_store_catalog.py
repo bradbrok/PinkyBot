@@ -6,7 +6,12 @@ from pathlib import Path
 
 import pytest
 
-from pinky_daemon.store_catalog import StoreCatalog, StoreCatalogError, StoreRecord
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    StoreCatalogError,
+    StoreRecord,
+    default_store_connection_policy,
+)
 
 
 def _register(
@@ -42,6 +47,7 @@ def test_register_snapshot_round_trip(tmp_path: Path) -> None:
             criticality="authoritative",
             dev_ino=(stat.st_dev, stat.st_ino),
             is_memory=False,
+            connection_policy=default_store_connection_policy("tasks"),
         )
     ]
 
@@ -704,7 +710,8 @@ def test_librarian_runner_participates_in_alias_validation(tmp_path: Path) -> No
         record for record in catalog.snapshot() if record.logical_name == "librarian_state"
     )
     assert record.owner == "LibrarianRunner"
-    assert record.criticality == "derived"
+    assert record.criticality == "telemetry"
+    assert record.recovery == "rebuild"
     with pytest.raises(StoreCatalogError, match="same physical file"):
         catalog.validate()
 
@@ -759,7 +766,7 @@ def test_create_api_registers_all_authoritative_stores_and_validates_once(
     assert {record.journal_mode for record in records} == {"truncate", "wal"}
     assert (
         next(record for record in records if record.logical_name == "librarian_state").criticality
-        == "derived"
+        == "telemetry"
     )
     session_records = [
         record for record in records if record.logical_name in {"sessions", "session_events"}

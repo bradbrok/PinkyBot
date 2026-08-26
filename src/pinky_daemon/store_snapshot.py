@@ -95,7 +95,7 @@ class StoreSnapshotService:
         *,
         on_outcome: Callable[[SnapshotResult], None] | None = None,
     ) -> list[SnapshotResult]:
-        """Snapshot one named store or every authoritative filesystem store.
+        """Snapshot one named store or every snapshot-recovery filesystem store.
 
         The global lock serializes backup work across all service instances. A
         single catalog snapshot is selected and grouped before any source is
@@ -181,7 +181,7 @@ class StoreSnapshotService:
             requested = [
                 record
                 for record in records
-                if record.criticality == "authoritative" and not record.is_memory
+                if record.recovery == "snapshot" and not record.is_memory
             ]
             selected_paths = {record.resolved_path for record in requested}
 

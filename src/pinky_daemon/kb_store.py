@@ -34,7 +34,7 @@ from pathlib import Path
 
 import yaml
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 
 def _log(msg: str) -> None:
@@ -184,7 +184,12 @@ class KBStore:
         self._init_db()
 
     def _conn(self) -> sqlite3.Connection:
-        conn = sqlite3.connect(str(self.db_path))
+        conn = open_store_connection(
+            self._catalog,
+            "kb",
+            str(self.db_path),
+            owner=type(self).__name__,
+        )
         journal_mode = str(
             conn.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         ).lower()

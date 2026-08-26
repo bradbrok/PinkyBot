@@ -28,6 +28,12 @@ from __future__ import annotations
 import sqlite3
 import time
 
+from pinky_daemon.store_catalog import (
+    StoreConnectionPolicy,
+    apply_store_connection_policy,
+    default_store_connection_policy,
+)
+
 
 class RollbackJournalError(RuntimeError):
     """Raised when a store DB cannot be confirmed in rollback (TRUNCATE) journal
@@ -37,9 +43,10 @@ class RollbackJournalError(RuntimeError):
 def configure_rollback_journal(
     conn: sqlite3.Connection,
     *,
-    busy_ms: int = 30000,
-    retries: int = 6,
+    busy_ms: int | None = None,
+    retries: int | None = None,
     strict: bool = True,
+    policy: StoreConnectionPolicy | None = None,
 ) -> str:
     """Put ``conn`` into rollback (TRUNCATE) journal mode. Returns the effective
     journal mode (``"truncate"`` on success).
@@ -51,9 +58,19 @@ def configure_rollback_journal(
     serialization. With ``strict=True`` (default) raises :class:`RollbackJournalError`
     if the mode cannot be confirmed, rather than silently continuing on WAL.
     """
-    conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
+    declared_policy = policy or default_store_connection_policy("conversations")
+    effective_busy_ms = declared_policy.busy_timeout_ms if busy_ms is None else busy_ms
+    effective_retries = declared_policy.rollback_retries if retries is None else retries
+    apply_store_connection_policy(
+        conn,
+        StoreConnectionPolicy(
+            busy_timeout_ms=effective_busy_ms,
+            rollback_retries=declared_policy.rollback_retries,
+            rollback_retry_delay_seconds=declared_policy.rollback_retry_delay_seconds,
+        ),
+    )
     last: str | None = None
-    for attempt in range(retries):
+    for attempt in range(effective_retries):
         try:
             cur = conn.execute("PRAGMA journal_mode").fetchone()
             if cur and str(cur[0]).lower() == "wal":
@@ -67,10 +84,10 @@ def configure_rollback_journal(
                 return last
         except sqlite3.OperationalError as exc:
             last = f"error:{exc}"
-        time.sleep(0.2 * (attempt + 1))
+        time.sleep(declared_policy.rollback_retry_delay_seconds * (attempt + 1))
     if strict:
         raise RollbackJournalError(
-            f"DB refused to leave WAL: journal_mode={last!r} after {retries} "
+            f"DB refused to leave WAL: journal_mode={last!r} after {effective_retries} "
             f"attempts — refusing to run on the #889 deleted-WAL substrate."
         )
     return last or "unknown"

@@ -20,7 +20,12 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    apply_store_connection_policy,
+    open_store_connection,
+    store_connection_policy,
+)
 
 SESSION_DB_OWNER = "SessionStore+SessionEventStore"
 
@@ -80,11 +85,19 @@ class SessionStore:
         """Return the calling thread's connection, creating it on first use."""
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(self._db_path)
+            connection = open_store_connection(
+                self._catalog,
+                "sessions",
+                self._db_path,
+                owner=SESSION_DB_OWNER,
+            )
             journal_mode = str(
                 connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             ).lower()
-            connection.execute("PRAGMA busy_timeout=30000")
+            apply_store_connection_policy(
+                connection,
+                store_connection_policy(self._catalog, "sessions"),
+            )
             if self._catalog is not None:
                 self._catalog.register(
                     "sessions",
@@ -338,11 +351,19 @@ class SessionEventStore:
         """Return the calling thread's connection, creating it on first use."""
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(self._db_path)
+            connection = open_store_connection(
+                self._catalog,
+                "session_events",
+                self._db_path,
+                owner=SESSION_DB_OWNER,
+            )
             journal_mode = str(
                 connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             ).lower()
-            connection.execute("PRAGMA busy_timeout=30000")
+            apply_store_connection_policy(
+                connection,
+                store_connection_policy(self._catalog, "session_events"),
+            )
             if self._catalog is not None:
                 self._catalog.register(
                     "session_events",

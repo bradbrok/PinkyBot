@@ -19,7 +19,11 @@ from dataclasses import asdict, dataclass
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    open_store_connection,
+    store_connection_policy,
+)
 
 
 @dataclass
@@ -98,14 +102,22 @@ class UserProfileStore:
         """Return the calling thread's connection, creating it on first use."""
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(self._db_path)
+            connection = open_store_connection(
+                self._catalog,
+                "user_profiles",
+                self._db_path,
+                owner=type(self).__name__,
+            )
             # #889: rollback (TRUNCATE) journal mode, NOT WAL. user_profiles.db is
             # cross-process/-thread concurrent-read (every agent's dream run opens a
             # fresh connection). With WAL, its deleted -wal/-shm broke WAL-index
             # coordination for fresh readers → SQLITE_IOERR across all reader connections (2026-08-17
             # dream failures). Rollback mode has no -wal/-shm to orphan; the busy_timeout
             # absorbs the whole-file-lock serialization. See pinky_daemon.db_journal.
-            journal_mode = configure_rollback_journal(connection, busy_ms=30000)
+            journal_mode = configure_rollback_journal(
+                connection,
+                policy=store_connection_policy(self._catalog, "user_profiles"),
+            )
             if self._catalog is not None:
                 self._catalog.register(
                     "user_profiles",

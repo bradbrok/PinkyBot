@@ -38,7 +38,7 @@ from typing import Any, Callable
 
 import yaml
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 
 def _log(msg: str) -> None:
@@ -142,7 +142,13 @@ class PluginContext:
                 data_dir = self._working_dir / "data"
                 data_dir.mkdir(parents=True, exist_ok=True)
                 self._db_path = str(data_dir / "plugins.db")
-            self._db = sqlite3.connect(self._db_path, check_same_thread=False)
+            self._db = open_store_connection(
+                self._catalog,
+                "plugins",
+                self._db_path,
+                owner="PluginManager",
+                check_same_thread=False,
+            )
             journal_mode = str(
                 self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             ).lower()
@@ -310,7 +316,13 @@ class PluginManager:
     def _init_state_db(self) -> None:
         """Initialize the plugin state tracking table."""
         Path(self._state_db_path).parent.mkdir(parents=True, exist_ok=True)
-        db = sqlite3.connect(self._state_db_path, check_same_thread=False)
+        db = open_store_connection(
+            self._catalog,
+            "plugins",
+            self._state_db_path,
+            owner="PluginManager",
+            check_same_thread=False,
+        )
         journal_mode = str(db.execute("PRAGMA journal_mode=WAL").fetchone()[0]).lower()
         if self._catalog is not None:
             self._catalog.register(
@@ -556,7 +568,13 @@ class PluginManager:
 
     def _save_state(self, name: str, state: str) -> None:
         try:
-            db = sqlite3.connect(self._state_db_path, check_same_thread=False)
+            db = open_store_connection(
+                self._catalog,
+                "plugins",
+                self._state_db_path,
+                owner="PluginManager",
+                check_same_thread=False,
+            )
             now = time.time()
             db.execute(
                 """INSERT INTO plugin_state (name, state, enabled, updated_at)
@@ -573,7 +591,13 @@ class PluginManager:
     def get_previously_enabled(self) -> list[str]:
         """Get names of plugins that were enabled in previous run."""
         try:
-            db = sqlite3.connect(self._state_db_path, check_same_thread=False)
+            db = open_store_connection(
+                self._catalog,
+                "plugins",
+                self._state_db_path,
+                owner="PluginManager",
+                check_same_thread=False,
+            )
             rows = db.execute("SELECT name FROM plugin_state WHERE enabled=1").fetchall()
             db.close()
             return [r[0] for r in rows]

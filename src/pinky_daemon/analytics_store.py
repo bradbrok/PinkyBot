@@ -6,7 +6,7 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 # Providers to include in analytics dashboards.
 # Only Anthropic/Claude usage — excludes Codex CLI (OpenAI) and other non-Anthropic providers.
@@ -75,7 +75,12 @@ class AnalyticsStore:
 
     @contextmanager
     def _connect(self):
-        conn = sqlite3.connect(self.db_path)
+        conn = open_store_connection(
+            self._catalog,
+            "analytics",
+            self.db_path,
+            owner=type(self).__name__,
+        )
         conn.row_factory = sqlite3.Row
         try:
             yield conn

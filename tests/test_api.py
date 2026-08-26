@@ -8347,10 +8347,10 @@ class TestGoogleOAuthStateValidation:
                 params={"code": "auth-code", "state": "stale-nonce"},
                 follow_redirects=False,
             )
-        assert resp.status_code == 400
-        assert "expired" in resp.text.lower()
-        # Expired state must be purged so it can't be retried.
-        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_stale-nonce") == ""
+            assert resp.status_code == 400
+            assert "expired" in resp.text.lower()
+            # Expired state must be purged so it can't be retried.
+            assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_stale-nonce") == ""
 
     def test_callback_rejects_replayed_state(self):
         """A state nonce must be single-use. After one consume, a second hit
@@ -8406,9 +8406,9 @@ class TestGoogleOAuthStateValidation:
                     params={"code": "bad-code", "state": "single-use"},
                     follow_redirects=False,
                 )
-        assert resp.status_code == 400
-        assert "oauth error" in resp.text.lower()
-        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_single-use") == ""
+                assert resp.status_code == 400
+                assert "oauth error" in resp.text.lower()
+                assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_single-use") == ""
 
     def test_direct_auth_url_persists_state(self):
         """The direct-auth-url endpoint must persist a single-use state nonce
@@ -8432,13 +8432,13 @@ class TestGoogleOAuthStateValidation:
                     create_session_cookie(os.environ["PINKY_SESSION_SECRET"]),
                 )
                 resp = client.get("/calendar/google/direct-auth-url")
-        assert resp.status_code == 200
-        body = resp.json()
-        assert body["state"] == "xyz"
-        assert "accounts.google.com" in body["auth_url"]
-        # State key must be present and non-empty (timestamp).
-        stored = app.state.agents.get_setting("GOOGLE_OAUTH_STATE_xyz")
-        assert stored != ""
+                assert resp.status_code == 200
+                body = resp.json()
+                assert body["state"] == "xyz"
+                assert "accounts.google.com" in body["auth_url"]
+                # State key must be present and non-empty (timestamp).
+                stored = app.state.agents.get_setting("GOOGLE_OAUTH_STATE_xyz")
+                assert stored != ""
 
     def test_direct_auth_url_requires_credentials(self):
         """Without stored client credentials, direct-auth must 400 — there's
@@ -8544,10 +8544,10 @@ class TestGoogleOAuthStateValidation:
                 params={"code": "auth-code", "state": "naive-nonce"},
                 follow_redirects=False,
             )
-        assert resp.status_code == 400
-        assert "corrupt state" in resp.text.lower()
-        # Still purged, even though it was malformed — can't be retried.
-        assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_naive-nonce") == ""
+            assert resp.status_code == 400
+            assert "corrupt state" in resp.text.lower()
+            # Still purged, even though it was malformed — can't be retried.
+            assert app.state.agents.get_setting("GOOGLE_OAUTH_STATE_naive-nonce") == ""
 
 
 class TestBuildStreamingWakeContextReasonGating:
