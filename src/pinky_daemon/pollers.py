@@ -78,6 +78,14 @@ def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
     task.add_done_callback(_on_done)
     return task
 
+
+async def quiesce_delivery_tasks() -> None:
+    """Wait until every admitted inbound delivery has stopped writing."""
+    while _DELIVERY_TASKS:
+        tasks = tuple(_DELIVERY_TASKS)
+        await asyncio.gather(*tasks, return_exceptions=True)
+        _DELIVERY_TASKS.difference_update(tasks)
+
 if TYPE_CHECKING:
     from pinky_outreach.slack import SlackAdapter
     from pinky_outreach.types import Chat
@@ -167,7 +175,7 @@ class _TelegramPollWatchdog:
         if fut.exception() is not None:  # consumed: no "never retrieved" noise
             return
         late = fut.result()
-        if not late:
+        if not late or not self._accepting_deliveries:
             return
         _log(
             f"{self._watchdog_label}: abandoned poll completed late with "
@@ -234,12 +242,14 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._allowed_chats = set(allowed_chat_ids) if allowed_chat_ids else None
         self._event_callback = event_callback  # async fn(platform, chat_id, sender, content)
         self._running = False
+        self._accepting_deliveries = True
         self._poll_count = 0
         self._init_watchdog("telegram-poller", watchdog_grace)
 
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
+        self._accepting_deliveries = True
         _log("telegram-poller: starting")
 
         # Verify bot connection — on the poller's executor, under a deadline,
@@ -277,12 +287,16 @@ class TelegramPoller(_TelegramPollWatchdog):
 
         self._poll_count += 1
 
+        if not self._accepting_deliveries:
+            return
         await self._process_messages(messages)
 
     async def _process_messages(self, messages) -> None:
         """Route polled updates to the handler — also the watchdog's
         late-delivery path for polls that complete after abandonment."""
         for msg in messages:
+            if not self._accepting_deliveries:
+                return
             # Filter by allowed chats
             if self._allowed_chats and msg.chat_id not in self._allowed_chats:
                 _log(f"telegram-poller: ignoring message from chat {msg.chat_id}")
@@ -325,6 +339,7 @@ class TelegramPoller(_TelegramPollWatchdog):
     def stop(self) -> None:
         """Stop the polling loop."""
         self._running = False
+        self._accepting_deliveries = False
         self._shutdown_watchdog()
         _log("telegram-poller: stopping")
 
@@ -369,6 +384,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._poll_interval = poll_interval
         self._event_callback = event_callback
         self._running = False
+        self._accepting_deliveries = True
         self._poll_count = 0
         self._bot_username = ""
         self._init_watchdog(f"broker-poller[{agent_name}]", watchdog_grace)
@@ -376,6 +392,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
+        self._accepting_deliveries = True
         _log(f"broker-poller[{self._agent_name}]: starting")
 
         # On the poller's executor, under a deadline — a wedged network can't
@@ -414,12 +431,16 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
 
         self._poll_count += 1
 
+        if not self._accepting_deliveries:
+            return
         await self._process_messages(messages)
 
     async def _process_messages(self, messages) -> None:
         """Route polled updates through the broker — also the watchdog's
         late-delivery path for polls that complete after abandonment."""
         for msg in messages:
+            if not self._accepting_deliveries:
+                return
             chat_type = msg.metadata.get("chat_type", "")
             is_group = chat_type in ("group", "supergroup")
 
@@ -477,6 +498,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
     def stop(self) -> None:
         """Stop the polling loop."""
         self._running = False
+        self._accepting_deliveries = False
         self._shutdown_watchdog()
         _log(f"broker-poller[{self._agent_name}]: stopping")
 
@@ -518,11 +540,13 @@ class BrokeriMessagePoller:
         self._poll_interval = poll_interval
         self._event_callback = event_callback
         self._running = False
+        self._accepting_deliveries = True
         self._poll_count = 0
 
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
+        self._accepting_deliveries = True
         _log(f"imessage-poller[{self._agent_name}]: starting")
 
         if not self._adapter.can_receive:
@@ -561,7 +585,11 @@ class BrokeriMessagePoller:
 
         self._poll_count += 1
 
+        if not self._accepting_deliveries:
+            return
         for msg in messages:
+            if not self._accepting_deliveries:
+                return
             is_group = msg.metadata.get("is_group", False)
 
             broker_msg = self._BrokerMessage(
@@ -600,6 +628,7 @@ class BrokeriMessagePoller:
 
     def stop(self) -> None:
         self._running = False
+        self._accepting_deliveries = False
         _log(f"imessage-poller[{self._agent_name}]: stopping")
 
     @property
@@ -660,6 +689,7 @@ class BrokerDiscordPoller:
         self._configured_channels = list(watched_channels or [])
         self._event_callback = event_callback
         self._running = False
+        self._accepting_deliveries = True
         self._poll_count = 0
         self._bot_user_id = ""
         self._bot_username = ""
@@ -691,6 +721,7 @@ class BrokerDiscordPoller:
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
+        self._accepting_deliveries = True
         _log(f"discord-poller[{self._agent_name}]: starting")
 
         # Verify bot connection
@@ -892,6 +923,8 @@ class BrokerDiscordPoller:
                 )
                 continue
 
+            if not self._accepting_deliveries:
+                return
             if not messages:
                 continue
 
@@ -904,10 +937,14 @@ class BrokerDiscordPoller:
             # renames are rare). Resolve once per channel per sweep instead
             # of fanning out N get_channel calls in the per-message loop.
             chat_info = await self._resolve_channel_info(channel_id)
+            if not self._accepting_deliveries:
+                return
             chat_title = chat_info.title if chat_info and chat_info.title else ""
             is_group = bool(chat_info and chat_info.chat_type != "dm")
 
             for msg in messages:
+                if not self._accepting_deliveries:
+                    return
                 # Track high-water mark even for skipped messages so we don't
                 # re-fetch them next tick.
                 self._last_id[channel_id] = msg.message_id
@@ -968,6 +1005,7 @@ class BrokerDiscordPoller:
     def stop(self) -> None:
         """Stop the polling loop."""
         self._running = False
+        self._accepting_deliveries = False
         _log(f"discord-poller[{self._agent_name}]: stopping")
 
 
@@ -1074,6 +1112,7 @@ class BrokerSlackPoller:
         self._app_token = app_token
         self._event_callback = event_callback
         self._running = False
+        self._accepting_deliveries = True
         self._bot_user_id = ""
         self._bot_id = ""  # our own bot_id (from auth.test) — filters our bot_message echoes
         self._client = None  # slack_sdk SocketModeClient, created in start()
@@ -1187,6 +1226,7 @@ class BrokerSlackPoller:
         client.socket_mode_request_listeners.append(_on_request)
 
         self._running = True
+        self._accepting_deliveries = True
         try:
             await client.connect()
             _log(f"slack-poller[{self._agent_name}]: socket mode connected, listening")
@@ -1475,6 +1515,8 @@ class BrokerSlackPoller:
         )
 
     async def _handle_event(self, payload: dict) -> None:
+        if not self._accepting_deliveries:
+            return
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
             return
@@ -1522,6 +1564,9 @@ class BrokerSlackPoller:
                 sender_name = resolved
         chat_title = await self._resolve_channel_title(channel)
         text = await self._resolve_text_refs(text)
+
+        if not self._accepting_deliveries:
+            return
 
         attachments = [
             {
@@ -1587,6 +1632,7 @@ class BrokerSlackPoller:
         logged rather than silently dropped.
         """
         self._running = False
+        self._accepting_deliveries = False
         _log(f"slack-poller[{self._agent_name}]: stopping")
         client = self._client
         if client is not None:

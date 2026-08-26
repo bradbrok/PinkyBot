@@ -290,7 +290,15 @@ class StoreIntegrityTarget:
     criticality: str = "authoritative"
     recovery: str = "snapshot"
     journal_mode: str | None = None
-    connection_policy: StoreConnectionPolicy = field(default_factory=StoreConnectionPolicy)
+    connection_policy: StoreConnectionPolicy | None = None
+
+    def __post_init__(self) -> None:
+        if self.connection_policy is None:
+            object.__setattr__(
+                self,
+                "connection_policy",
+                default_store_connection_policy(self.logical_name),
+            )
 
 
 class StoreCatalogError(RuntimeError):
@@ -371,6 +379,11 @@ class _StoreConnectionAuthority:
                     f"store connection opened after shutdown began: {logical_name!r}"
                 )
             connection = sqlite3.connect(database, **kwargs)
+            try:
+                apply_store_connection_policy(connection, policy)
+            except BaseException:
+                connection.close()
+                raise
             handle_id = self._next_handle_id
             self._next_handle_id += 1
             target = self._catalog.manifest_target(logical_name)
@@ -440,8 +453,22 @@ class _StoreConnectionAuthority:
             except BaseException as exc:
                 errors.append(exc)
         if errors:
+            already_closed = (
+                connection._store_authority is None
+                and connection._store_handle_id is None
+                and all(_is_closed_database_error(exc) for exc in errors)
+            )
+            if already_closed:
+                return
             details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
             raise RuntimeError(details)
+
+
+def _is_closed_database_error(exc: BaseException) -> bool:
+    return (
+        isinstance(exc, sqlite3.ProgrammingError)
+        and str(exc) == "Cannot operate on a closed database."
+    )
 
 
 @dataclass(slots=True)
@@ -1748,4 +1775,10 @@ def open_store_connection(
     kwargs["timeout"] = (
         _SQLITE_DEFAULT_TIMEOUT_SECONDS if requested_timeout is None else float(requested_timeout)
     )
-    return sqlite3.connect(database, **kwargs)
+    connection = sqlite3.connect(database, **kwargs)
+    try:
+        apply_store_connection_policy(connection, policy)
+    except BaseException:
+        connection.close()
+        raise
+    return connection

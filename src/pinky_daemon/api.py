@@ -12876,6 +12876,9 @@ npm run build</pre>
         if app.state.buzz_poller_tasks:
             await asyncio.gather(*app.state.buzz_poller_tasks, return_exceptions=True)
         app.state.buzz_poller_tasks.clear()
+        from pinky_daemon.pollers import quiesce_delivery_tasks
+
+        await quiesce_delivery_tasks()
         await autonomy.stop()
         await scheduler.stop()
         await watchdog.stop()
