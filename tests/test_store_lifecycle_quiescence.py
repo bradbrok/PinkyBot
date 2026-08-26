@@ -17,6 +17,69 @@ from pinky_daemon.store_shutdown import StoreShutdownError
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "poller_kind",
+    ["telegram", "broker_telegram", "imessage", "slack"],
+)
+async def test_stop_before_scheduled_start_is_sticky_for_every_other_poller(
+    poller_kind: str,
+) -> None:
+    """A scheduled start may never reopen ingress after an explicit stop."""
+    startup_calls = 0
+
+    class Adapter:
+        bot_token = "xoxb-quiescence"
+        can_receive = False
+
+        @staticmethod
+        def get_me():
+            nonlocal startup_calls
+            startup_calls += 1
+            return {"username": "quiescence"}
+
+        @staticmethod
+        def get_bot_info():
+            nonlocal startup_calls
+            startup_calls += 1
+            return {}
+
+        @staticmethod
+        def recycle() -> None:
+            return None
+
+    adapter = Adapter()
+    if poller_kind == "telegram":
+        current = pollers.TelegramPoller(adapter, object())
+    elif poller_kind == "broker_telegram":
+        current = pollers.BrokerTelegramPoller(
+            adapter,
+            "quiescence",
+            object(),
+        )
+    elif poller_kind == "imessage":
+        current = pollers.BrokeriMessagePoller(
+            adapter,
+            "quiescence",
+            object(),
+        )
+    else:
+        current = pollers.BrokerSlackPoller(
+            adapter,
+            "quiescence",
+            object(),
+            app_token="xapp-quiescence",
+        )
+
+    poller_task = pollers.start_poller(current)
+    current.stop()
+    await asyncio.wait_for(poller_task, timeout=0.5)
+
+    assert startup_calls == 0
+    assert not current.is_running
+    assert not current._accepting_deliveries
+
+
+@pytest.mark.asyncio
 async def test_stop_promptly_unblocks_an_inflight_telegram_poll() -> None:
     """Stopping must recycle the poll client instead of awaiting its long-poll deadline."""
     poll_entered = threading.Event()
