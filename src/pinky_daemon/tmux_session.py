@@ -2103,6 +2103,10 @@ class TmuxSession(TransportReplacementMixin):
         # genuinely new head (deque advanced) auto-starts a fresh ceiling budget
         # without having to touch the out-of-loop head-start sites.
         self._inflight_pane_ext_anchor: tuple[object, float] | None = None
+        # (#1156) One watchdog-tick grace for transcript proof that lags the
+        # busy→idle boundary. Keyed by the deque head's identity so advancing
+        # to a genuinely new turn grants that turn its own bounded recheck.
+        self._inflight_idle_grace_head: object | None = None
         # #984 Defect 2 — continuous frozen-live-status observation.  One
         # bounded tuple per TmuxSession: (last_updated value, first-seen wall
         # clock, consecutive observations).  Any changed value starts a new
@@ -8216,6 +8220,13 @@ class TmuxSession(TransportReplacementMixin):
                 # (capture-pane + sample gap), during which a stop hook can pop or
                 # advance the head out from under us.
                 head_meta = self._inflight_metas[0]
+                if verdict != "idle":
+                    # Grace is per idle-entry, not per turn lifetime. If the
+                    # pane becomes active between samples, the next idle streak
+                    # must earn a fresh first-pass recheck. Two consecutive idle
+                    # samples still consume the latch and reconcile, so
+                    # busy/idle oscillation cannot create an unbounded deferral.
+                    self._inflight_idle_grace_head = None
                 restart_reason: str | None = None
                 if verdict == "growing":
                     # #118: head aged out BUT the transcript is still being
@@ -8249,6 +8260,35 @@ class TmuxSession(TransportReplacementMixin):
                     consumption_verdicts = self._phantom_consumption_verdicts(
                         candidates
                     )
+                    if (
+                        any(consumed is False for consumed in consumption_verdicts)
+                        and self._inflight_idle_grace_head is not head_meta
+                    ):
+                        # #1156: the REPL can consume pane input at the end of a
+                        # long turn just before its transcript row becomes
+                        # visible. Preserve every owner/bookkeeping field and
+                        # re-run the authoritative transcript probe next tick.
+                        # The aged head clock is intentionally NOT reset, making
+                        # this exactly one watchdog-cycle of grace.
+                        self._inflight_idle_grace_head = head_meta
+                        _log(
+                            f"tmux[{self.agent_name}]: inflight head aged "
+                            f"{age:.1f}s and REPL is idle but transcript proof "
+                            f"is absent — deferring reconciliation for one "
+                            f"watchdog tick (#1156; deque depth={depth})"
+                        )
+                        log_watchdog_decision(
+                            watchdog="inflight",
+                            agent=self.agent_name,
+                            decision="skip",
+                            reason="phantom_consumption_grace",
+                            state=self.state.value,
+                            progress_stale_s=age,
+                            inflight_turns=depth,
+                            inflight_active=False,
+                        )
+                        continue
+                    self._inflight_idle_grace_head = None
                     self._inflight_metas.clear()
                     self._head_started_at = None
                     self._inflight_pane_ext_anchor = None

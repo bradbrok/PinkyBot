@@ -5863,6 +5863,74 @@ async def test_idle_phantom_verified_consumed_resolves_scheduler_true(
 
 
 @pytest.mark.asyncio
+async def test_idle_phantom_delayed_proof_rechecks_before_requeue(
+    monkeypatch, tmp_path,
+) -> None:
+    """#1156: proof landing one watchdog tick late suppresses duplicate replay."""
+    monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
+    monkeypatch.setattr(tmux_session, "_WATCHDOG_TICK_SEC", 0.01)
+    decisions = MagicMock()
+    monkeypatch.setattr(tmux_session, "log_watchdog_decision", decisions)
+
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    ss._config.live_status_fn = lambda: {
+        "status": "idle",
+        "last_updated": _time.time(),
+    }
+    ss._transcript_recently_grew = lambda *_args: False
+    transcript = tmp_path / "transcript.jsonl"
+    transcript.write_text('{"type":"system"}\n')
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    completion = asyncio.Event()
+    delivery = asyncio.get_running_loop().create_future()
+    durable_accept = MagicMock(return_value=True)
+    prompt = "[agent | sender | internal | 2026-08-25T17:09:36-07:00]\nbody"
+    entry = _seed_inflight(
+        ss,
+        prompt=prompt,
+        completion_event=completion,
+        transport_accepted=False,
+    )
+    _bind_transcript_ticket(entry, transcript)
+    entry.turn.scheduler_delivery = delivery
+    entry.turn.scheduler_accept = durable_accept
+    backlog = _QueuedTurn(prompt="later backlog")
+    ss._message_queue.put_nowait(backlog)
+
+    original_probe = ss._phantom_consumption_verdicts
+    probe_results: list[list[bool | None]] = []
+
+    def probe_with_delayed_proof(candidates: list[_InflightMeta]) -> list[bool | None]:
+        verdicts = original_probe(candidates)
+        probe_results.append(verdicts)
+        if len(probe_results) == 1:
+            with transcript.open("a", encoding="utf-8") as handle:
+                handle.write(
+                    _json.dumps({"type": "user", "message": {"content": prompt}})
+                    + "\n"
+                )
+        return verdicts
+
+    monkeypatch.setattr(ss, "_phantom_consumption_verdicts", probe_with_delayed_proof)
+    ss._head_started_at = _time.time() - 1.0
+
+    await _run_idle_reconcile(ss)
+
+    assert probe_results == [[False], [True]]
+    assert completion.is_set()
+    assert delivery.result() is True
+    durable_accept.assert_called_once_with()
+    assert entry.turn.replay_count == 0
+    assert ss._message_queue.get_nowait() is backlog
+    assert ss._message_queue.empty()
+    reasons = [call.kwargs.get("reason") for call in decisions.call_args_list]
+    assert reasons.count("phantom_consumption_grace") == 1
+    assert "phantom_requeued_unconsumed" not in reasons
+
+
+@pytest.mark.asyncio
 async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) -> None:
     """#1127: a header absent from the transcript is replayed, not completed."""
     monkeypatch.setattr(tmux_session, "_TURN_DONE_TIMEOUT_SEC", 0.01)
@@ -5890,6 +5958,8 @@ async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) 
         transport_accepted=False,
     )
     _bind_transcript_ticket(original, transcript)
+    consumption_probe = MagicMock(wraps=ss._phantom_consumption_verdicts)
+    monkeypatch.setattr(ss, "_phantom_consumption_verdicts", consumption_probe)
     backlog = _QueuedTurn(prompt="later backlog")
     ss._message_queue.put_nowait(backlog)
     ss._head_started_at = _time.time() - 1.0
@@ -5897,13 +5967,13 @@ async def test_idle_phantom_unconsumed_requeues_at_front(monkeypatch, tmp_path) 
     await _run_idle_reconcile(ss)
 
     assert not completion.is_set()
+    assert consumption_probe.call_count == 2
     assert original.turn.replay_count == 1
     assert ss._message_queue.get_nowait() is original.turn
     assert ss._message_queue.get_nowait() is backlog
-    assert any(
-        call.kwargs.get("reason") == "phantom_requeued_unconsumed"
-        for call in decisions.call_args_list
-    )
+    reasons = [call.kwargs.get("reason") for call in decisions.call_args_list]
+    assert reasons.count("phantom_consumption_grace") == 1
+    assert reasons.count("phantom_requeued_unconsumed") == 1
 
 
 @pytest.mark.asyncio
@@ -5939,21 +6009,23 @@ async def test_idle_phantom_replay_cap_drops_loudly(
     )
     _bind_transcript_ticket(entry, transcript)
     turn = entry.turn
+    consumption_probe = MagicMock(wraps=ss._phantom_consumption_verdicts)
+    monkeypatch.setattr(ss, "_phantom_consumption_verdicts", consumption_probe)
     turn.submission_receipt = submission
     turn.replay_count = 1
     ss._head_started_at = _time.time() - 1.0
 
     await _run_idle_reconcile(ss)
 
+    assert consumption_probe.call_count == 2
     assert turn.replay_count == 2
     assert completion.is_set()
     assert submission.result() is False
     assert ss._message_queue.empty()
     assert header in capsys.readouterr().err
-    assert any(
-        call.kwargs.get("reason") == "phantom_replay_cap_dropped"
-        for call in decisions.call_args_list
-    )
+    reasons = [call.kwargs.get("reason") for call in decisions.call_args_list]
+    assert reasons.count("phantom_consumption_grace") == 1
+    assert reasons.count("phantom_replay_cap_dropped") == 1
 
 
 @pytest.mark.asyncio
