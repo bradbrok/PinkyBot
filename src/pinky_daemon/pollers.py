@@ -292,6 +292,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._allowed_chats = set(allowed_chat_ids) if allowed_chat_ids else None
         self._event_callback = event_callback  # async fn(platform, chat_id, sender, content)
         self._running = False
+        self._stop_requested = False
         self._accepting_deliveries = True
         self._stop_event = asyncio.Event()
         self._poll_count = 0
@@ -299,6 +300,9 @@ class TelegramPoller(_TelegramPollWatchdog):
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log("telegram-poller: start suppressed after stop")
+            return
         self._running = True
         self._accepting_deliveries = True
         self._stop_event.clear()
@@ -388,6 +392,7 @@ class TelegramPoller(_TelegramPollWatchdog):
 
     def stop(self) -> None:
         """Stop the polling loop."""
+        self._stop_requested = True
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
@@ -435,6 +440,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._poll_interval = poll_interval
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
         self._accepting_deliveries = True
         self._stop_event = asyncio.Event()
         self._poll_count = 0
@@ -443,6 +449,9 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log(f"broker-poller[{self._agent_name}]: start suppressed after stop")
+            return
         self._running = True
         self._accepting_deliveries = True
         self._stop_event.clear()
@@ -548,6 +557,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
 
     def stop(self) -> None:
         """Stop the polling loop."""
+        self._stop_requested = True
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
@@ -592,12 +602,16 @@ class BrokeriMessagePoller:
         self._poll_interval = poll_interval
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
         self._accepting_deliveries = True
         self._stop_event = asyncio.Event()
         self._poll_count = 0
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log(f"imessage-poller[{self._agent_name}]: start suppressed after stop")
+            return
         self._running = True
         self._accepting_deliveries = True
         self._stop_event.clear()
@@ -679,6 +693,7 @@ class BrokeriMessagePoller:
                     _log(f"imessage-poller[{self._agent_name}]: event callback error: {e}")
 
     def stop(self) -> None:
+        self._stop_requested = True
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
@@ -742,6 +757,7 @@ class BrokerDiscordPoller:
         self._configured_channels = list(watched_channels or [])
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
         self._accepting_deliveries = True
         self._stop_event = asyncio.Event()
         self._poll_count = 0
@@ -774,6 +790,9 @@ class BrokerDiscordPoller:
 
     async def start(self) -> None:
         """Start the polling loop."""
+        if self._stop_requested:
+            _log(f"discord-poller[{self._agent_name}]: start suppressed after stop")
+            return
         self._running = True
         self._accepting_deliveries = True
         self._stop_event.clear()
@@ -1062,6 +1081,7 @@ class BrokerDiscordPoller:
 
     def stop(self) -> None:
         """Stop the polling loop."""
+        self._stop_requested = True
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
@@ -1171,6 +1191,7 @@ class BrokerSlackPoller:
         self._app_token = app_token
         self._event_callback = event_callback
         self._running = False
+        self._stop_requested = False
         self._accepting_deliveries = True
         self._bot_user_id = ""
         self._bot_id = ""  # our own bot_id (from auth.test) — filters our bot_message echoes
@@ -1199,6 +1220,9 @@ class BrokerSlackPoller:
         background tasks, then returns — the connection stays alive as long as
         this poller (and thus ``self._client``) is referenced by the daemon.
         """
+        if self._stop_requested:
+            _log(f"slack-poller[{self._agent_name}]: start suppressed after stop")
+            return
         if self._running:
             _log(f"slack-poller[{self._agent_name}]: already running, ignoring start()")
             return
@@ -1223,6 +1247,9 @@ class BrokerSlackPoller:
         except Exception as e:
             _log(f"slack-poller[{self._agent_name}]: auth.test failed: {e}")
             return
+        if self._stop_requested:
+            _log(f"slack-poller[{self._agent_name}]: startup stopped before connect")
+            return
         self._bot_user_id = info.get("user_id", "") or ""
         if not self._bot_user_id:
             # Fail closed: without our own user id the self-filter is disarmed
@@ -1245,6 +1272,18 @@ class BrokerSlackPoller:
         )
         self._client = client
 
+        async def _run_admitted_request(req_type: str, payload: dict) -> None:
+            try:
+                if req_type == "interactive":
+                    await self._handle_interactive(payload, _admitted=True)
+                else:
+                    await self._handle_event(payload, _admitted=True)
+            except Exception as e:
+                _log(
+                    f"slack-poller[{self._agent_name}]: handle_{req_type} "
+                    f"error: {e!r}"
+                )
+
         async def _on_request(smc, req) -> None:
             # ACK FIRST — every Socket Mode request envelope (events_api,
             # slash_commands, interactive, …) carries an envelope_id and must be
@@ -1258,15 +1297,25 @@ class BrokerSlackPoller:
                     )
                 except Exception as e:
                     _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
-            # Interactive envelopes (block_actions button clicks) carry the
-            # purchase Approve/Reject buttons (#249). Handle them here; every
-            # other non-events_api envelope is dropped (already acked) so Slack
-            # doesn't keep retrying.
-            if req.type == "interactive":
-                try:
-                    await self._handle_interactive(req.payload or {})
-                except Exception as e:
-                    _log(f"slack-poller[{self._agent_name}]: handle_interactive error: {e!r}")
+            # After the prompt ACK, atomically fence or transfer the whole
+            # request into the delivery-task set. slack_sdk does not retain its
+            # own listener tasks, so this tracked child is the publication
+            # barrier for both message and interactive paths.
+            if req.type in ("interactive", "events_api"):
+                if not self._accepting_deliveries:
+                    _log(
+                        f"slack-poller[{self._agent_name}]: dropping {req.type} "
+                        "envelope after stop"
+                    )
+                    return
+                admitted = _deliver_in_background(
+                    _run_admitted_request(req.type, req.payload or {}),
+                    f"slack-poller[{self._agent_name}] {req.type} listener",
+                )
+                # Preserve the listener's existing completion contract for
+                # callers while shielding the retained child from SDK task
+                # cancellation during close(). The ACK already completed.
+                await asyncio.shield(admitted)
                 return
             # Only message events are wired up for #224; other (already-acked)
             # envelope types are dropped so Slack doesn't keep retrying them.
@@ -1277,10 +1326,6 @@ class BrokerSlackPoller:
                         f"envelope ({req.type})"
                     )
                 return
-            try:
-                await self._handle_event(req.payload or {})
-            except Exception as e:
-                _log(f"slack-poller[{self._agent_name}]: handle_event error: {e!r}")
 
         client.socket_mode_request_listeners.append(_on_request)
 
@@ -1288,12 +1333,18 @@ class BrokerSlackPoller:
         self._accepting_deliveries = True
         try:
             await client.connect()
-            _log(f"slack-poller[{self._agent_name}]: socket mode connected, listening")
+            if not self._stop_requested:
+                _log(f"slack-poller[{self._agent_name}]: socket mode connected, listening")
         except Exception as e:
             _log(f"slack-poller[{self._agent_name}]: connect failed: {e}")
             self._running = False
 
-    async def _handle_interactive(self, payload: dict) -> None:
+    async def _handle_interactive(
+        self,
+        payload: dict,
+        *,
+        _admitted: bool = False,
+    ) -> None:
         """Handle a Slack interactive (block_actions) envelope — purchase buttons (#249).
 
         SECURITY (financial boundary): the approver identity is taken from
@@ -1303,6 +1354,9 @@ class BrokerSlackPoller:
         here and never reach the agent. The agent is told to act ONLY after this
         gate passes, so the LLM is not the security boundary.
         """
+        if not _admitted and not self._accepting_deliveries:
+            _log(f"slack-poller[{self._agent_name}]: dropping interactive after stop")
+            return
         if (payload or {}).get("type") != "block_actions":
             return
         actions = payload.get("actions") or []
@@ -1573,8 +1627,14 @@ class BrokerSlackPoller:
             channel_namer=self._resolve_channel_title,
         )
 
-    async def _handle_event(self, payload: dict) -> None:
-        if not self._accepting_deliveries:
+    async def _handle_event(
+        self,
+        payload: dict,
+        *,
+        _admitted: bool = False,
+    ) -> None:
+        if not _admitted and not self._accepting_deliveries:
+            _log(f"slack-poller[{self._agent_name}]: dropping events_api after stop")
             return
         event = (payload or {}).get("event") or {}
         if event.get("type") != "message":
@@ -1623,6 +1683,13 @@ class BrokerSlackPoller:
                 sender_name = resolved
         chat_title = await self._resolve_channel_title(channel)
         text = await self._resolve_text_refs(text)
+
+        if not _admitted and not self._accepting_deliveries:
+            _log(
+                f"slack-poller[{self._agent_name}]: dropping message after stop "
+                "before broker publication"
+            )
+            return
 
         attachments = [
             {
@@ -1687,6 +1754,7 @@ class BrokerSlackPoller:
         task is strongly referenced (not GC'd mid-flight) and any close error is
         logged rather than silently dropped.
         """
+        self._stop_requested = True
         self._running = False
         self._accepting_deliveries = False
         _log(f"slack-poller[{self._agent_name}]: stopping")
