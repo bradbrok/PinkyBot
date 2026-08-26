@@ -13,7 +13,12 @@ import time
 from pathlib import Path
 from typing import Protocol, runtime_checkable
 
-from pinky_daemon.store_catalog import BoundSQLiteFile, StoreCatalog, StoreObservation
+from pinky_daemon.store_catalog import (
+    BoundSQLiteFile,
+    StoreCatalog,
+    StoreObservation,
+    open_store_connection,
+)
 
 AGENT_SIGNING_KEY_LOGICAL_NAME = "agent_signing_keys"
 FLEET_SIGNING_KEY_OWNER = "AgentRegistry+AgentSigningKeyStore"
@@ -192,7 +197,13 @@ class AgentSigningKeyStore:
                     staging_root_path / attempt_name,
                     attempt_descriptor,
                 )
-                connection = sqlite3.connect(database, uri=uri)
+                connection = open_store_connection(
+                    catalog,
+                    AGENT_SIGNING_KEY_LOGICAL_NAME,
+                    database,
+                    owner=cls.__name__,
+                    uri=uri,
+                )
                 try:
                     row = connection.execute("PRAGMA journal_mode=DELETE").fetchone()
                     journal_mode = str(row[0]).lower() if row else ""

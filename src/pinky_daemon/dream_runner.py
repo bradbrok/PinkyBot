@@ -39,7 +39,12 @@ from pinky_daemon.auth import (
 )
 from pinky_daemon.dream_prompt import DREAM_SYSTEM_PROMPT
 from pinky_daemon.sdk_runner import SDKRunner, SDKRunnerConfig
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    apply_store_connection_policy,
+    open_store_connection,
+    store_connection_policy,
+)
 from pinky_daemon.tmux_dream_runner import TmuxDreamConfig, TmuxDreamRunner
 from pinky_memory.store import ReflectionStore
 
@@ -170,11 +175,19 @@ class DreamRunner:
         """Return the calling thread's connection, creating it on first use."""
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(self._db_path)
+            connection = open_store_connection(
+                self._catalog,
+                "dream_state",
+                self._db_path,
+                owner=type(self).__name__,
+            )
             journal_mode = str(
                 connection.execute("PRAGMA journal_mode=WAL").fetchone()[0]
             ).lower()
-            connection.execute("PRAGMA busy_timeout=30000")
+            apply_store_connection_policy(
+                connection,
+                store_connection_policy(self._catalog, "dream_state"),
+            )
             if self._catalog is not None:
                 self._catalog.register(
                     "dream_state",

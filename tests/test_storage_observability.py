@@ -141,10 +141,12 @@ def test_admin_watchdog_exposes_bounded_boot_preflight_inventory_and_reconcile_m
     assert inventory["physical_count"] == 22
     assert set(inventory["stores"]) == manifest_names
     assert {details["criticality"] for details in inventory["stores"].values()} == {
-        "authoritative",
-        "derived",
+        "delivery",
+        "authority",
+        "memory",
+        "telemetry",
     }
-    assert inventory["stores"]["librarian_state"]["criticality"] == "derived"
+    assert inventory["stores"]["librarian_state"]["criticality"] == "telemetry"
     assert {details["journal_mode"] for details in inventory["stores"].values()} <= {
         "delete",
         "truncate",

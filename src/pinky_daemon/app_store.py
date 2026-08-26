@@ -12,13 +12,12 @@ from __future__ import annotations
 
 import re
 import secrets
-import sqlite3
 import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 
 def _log(msg: str) -> None:
@@ -84,7 +83,13 @@ class AppStore:
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
         self._db_path = db_path
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db = open_store_connection(
+            catalog,
+            "apps",
+            db_path,
+            owner=type(self).__name__,
+            check_same_thread=False,
+        )
         journal_mode = str(
             self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         ).lower()

@@ -20,7 +20,11 @@ from dataclasses import dataclass
 from pathlib import Path
 
 from pinky_daemon.db_journal import configure_rollback_journal
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    open_store_connection,
+    store_connection_policy,
+)
 
 
 def _log(msg: str) -> None:
@@ -95,11 +99,19 @@ class TriggerStore:
         """Return the calling thread's connection, creating it on first use."""
         connection = getattr(self._thread_local, "connection", None)
         if connection is None:
-            connection = sqlite3.connect(self._db_path)
+            connection = open_store_connection(
+                self._catalog,
+                "triggers",
+                self._db_path,
+                owner=type(self).__name__,
+            )
             # #889: rollback (TRUNCATE) journal mode, NOT WAL — an external sqlite
             # client's open/close can't unlink -wal/-shm out from under the daemon.
             # Sets busy_timeout internally. See pinky_daemon.db_journal.
-            journal_mode = configure_rollback_journal(connection, busy_ms=30000)
+            journal_mode = configure_rollback_journal(
+                connection,
+                policy=store_connection_policy(self._catalog, "triggers"),
+            )
             connection.execute("PRAGMA foreign_keys=ON")
             connection.row_factory = sqlite3.Row
             if self._catalog is not None:

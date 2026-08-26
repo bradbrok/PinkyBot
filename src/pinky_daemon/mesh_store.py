@@ -22,14 +22,13 @@ PinkyBot issue: #419.
 from __future__ import annotations
 
 import json
-import sqlite3
 import threading
 import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Literal
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 # -- Records -------------------------------------------------------------------
 
@@ -108,7 +107,13 @@ class MeshStore:
         catalog: StoreCatalog | None = None,
     ) -> None:
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db = open_store_connection(
+            catalog,
+            "mesh",
+            db_path,
+            owner=type(self).__name__,
+            check_same_thread=False,
+        )
         journal_mode = str(
             self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         ).lower()

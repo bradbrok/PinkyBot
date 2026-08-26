@@ -43,7 +43,14 @@ from pinky_daemon.agent_signing_key_store import (
 )
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    StoreConnectionPolicy,
+    apply_store_connection_policy,
+    default_store_connection_policy,
+    open_store_connection,
+    store_connection_policy,
+)
 
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts
 # under .claude/, settings.json, .mcp.json) and database queries. Restrict
@@ -1367,7 +1374,11 @@ class AgentDbConfigError(RuntimeError):
 
 
 def _configure_agents_db_connection(
-    conn: sqlite3.Connection, *, retries: int = 6, busy_ms: int = 5000
+    conn: sqlite3.Connection,
+    *,
+    retries: int | None = None,
+    busy_ms: int | None = None,
+    policy: StoreConnectionPolicy | None = None,
 ) -> str:
     """Put the agents-DB connection into rollback (TRUNCATE) journal mode.
 
@@ -1386,9 +1397,19 @@ def _configure_agents_db_connection(
     bounded retries, raises :class:`AgentDbConfigError` rather than silently
     running on WAL. Returns the effective journal mode (``"truncate"``).
     """
-    conn.execute(f"PRAGMA busy_timeout={int(busy_ms)}")
+    declared_policy = policy or default_store_connection_policy("agents")
+    effective_busy_ms = declared_policy.busy_timeout_ms if busy_ms is None else busy_ms
+    effective_retries = declared_policy.rollback_retries if retries is None else retries
+    apply_store_connection_policy(
+        conn,
+        StoreConnectionPolicy(
+            busy_timeout_ms=effective_busy_ms,
+            rollback_retries=declared_policy.rollback_retries,
+            rollback_retry_delay_seconds=declared_policy.rollback_retry_delay_seconds,
+        ),
+    )
     last: str | None = None
-    for attempt in range(retries):
+    for attempt in range(effective_retries):
         # If still on WAL, drain it first so no hot WAL content is stranded
         # before the wal-index is dropped. Busy here is non-fatal — the mode
         # switch below retries.
@@ -1405,10 +1426,10 @@ def _configure_agents_db_connection(
                 return last
         except sqlite3.OperationalError as exc:
             last = f"error:{exc}"
-        time.sleep(0.2 * (attempt + 1))
+        time.sleep(declared_policy.rollback_retry_delay_seconds * (attempt + 1))
     raise AgentDbConfigError(
         f"conversations_agents.db refused to leave WAL: journal_mode={last!r} "
-        f"after {retries} attempts — refusing to run on the WAL -shm SIGBUS "
+        f"after {effective_retries} attempts — refusing to run on the WAL -shm SIGBUS "
         f"surface (#797/#220)."
     )
 
@@ -1428,12 +1449,19 @@ class AgentRegistry:
         # stdio MCP subprocesses an explicit DB location for request-time
         # signing-key lookup (#641) rather than relying on their cwd.
         self._db_path = str(Path(db_path).resolve())
+        self._catalog = catalog
         self._buzz_device_key_path = str(
             Path(buzz_device_key_path).resolve()
             if buzz_device_key_path
             else Path(self._db_path).parent / "identity" / ".device_key"
         )
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db = open_store_connection(
+            catalog,
+            "agents",
+            db_path,
+            owner=FLEET_SIGNING_KEY_OWNER,
+            check_same_thread=False,
+        )
         # #797/#220: the agents DB runs in ROLLBACK (TRUNCATE) journal mode, NOT
         # WAL. The WAL wal-index (-shm) is always mmap'd; under the long-lived
         # registry connection + per-request RO signing-key resolver churn, that
@@ -1441,7 +1469,10 @@ class AgentRegistry:
         # (si_addr confirmed inside conversations_agents.db-shm). Rollback mode
         # has no -shm, so the daemon never maps it. Runs before _init_tables and
         # before any MCP/session resume spawns stdio children. Agents DB only.
-        journal_mode = _configure_agents_db_connection(self._db)
+        journal_mode = _configure_agents_db_connection(
+            self._db,
+            policy=store_connection_policy(catalog, "agents"),
+        )
         self._db.execute("PRAGMA foreign_keys=ON")
         if catalog is not None:
             catalog.register(
@@ -7396,10 +7427,13 @@ except Exception as exc:
         a durable held row always has the request discovered by the restart
         retry loop; before commit, neither side survives.
         """
-        transaction_db = sqlite3.connect(
-            self._db_path, timeout=5.0, check_same_thread=False,
+        transaction_db = open_store_connection(
+            self._catalog,
+            "agents",
+            self._db_path,
+            owner=FLEET_SIGNING_KEY_OWNER,
+            check_same_thread=False,
         )
-        transaction_db.execute("PRAGMA busy_timeout=5000")
         transaction_db.execute("PRAGMA foreign_keys=ON")
         try:
             transaction_db.execute("BEGIN IMMEDIATE")

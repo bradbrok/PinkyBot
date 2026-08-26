@@ -12,11 +12,43 @@ import stat
 import sys
 import threading
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
+from typing import Any
 from urllib.parse import parse_qsl
 
+from pinky_daemon.store_shutdown import StoreShutdownCoordinator, StoreShutdownReport
+
 logger = logging.getLogger("pinky.store_catalog")
+
+_THIRTY_SECOND_BUSY_STORES = frozenset(
+    {
+        "sessions",
+        "session_events",
+        "conversations",
+        "audit",
+        "agent_comms",
+        "activity",
+        "dream_state",
+        "skills",
+        "outreach_config",
+        "tasks",
+        "research",
+        "presentations",
+        "triggers",
+        "voice",
+        "user_profiles",
+    }
+)
+_CRITICALITY_RANK = {
+    "telemetry": 0,
+    "derived": 0,
+    "memory": 1,
+    "authority": 2,
+    "authoritative": 2,
+    "delivery": 3,
+}
+_SQLITE_DEFAULT_TIMEOUT_SECONDS = 5.0
 
 
 DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST: dict[str, str] = {
@@ -220,6 +252,21 @@ def sqlite_header_journal_mode(path: str | os.PathLike[str]) -> str | None:
 
 
 @dataclass(frozen=True, slots=True)
+class StoreConnectionPolicy:
+    """One logical store's centrally declared SQLite open/retry policy."""
+
+    busy_timeout_ms: int = 5_000
+    rollback_retries: int = 6
+    rollback_retry_delay_seconds: float = 0.2
+
+
+def default_store_connection_policy(logical_name: str) -> StoreConnectionPolicy:
+    """Return the behavior-preserving policy for a logical daemon store."""
+    busy_timeout_ms = 30_000 if logical_name in _THIRTY_SECOND_BUSY_STORES else 5_000
+    return StoreConnectionPolicy(busy_timeout_ms=busy_timeout_ms)
+
+
+@dataclass(frozen=True, slots=True)
 class StoreRecord:
     """One logical store's observed physical SQLite identity."""
 
@@ -230,6 +277,8 @@ class StoreRecord:
     criticality: str
     dev_ino: tuple[int, int] | None
     is_memory: bool
+    recovery: str = "snapshot"
+    connection_policy: StoreConnectionPolicy = field(default_factory=StoreConnectionPolicy)
 
 
 @dataclass(frozen=True, slots=True)
@@ -241,10 +290,158 @@ class StoreIntegrityTarget:
     criticality: str = "authoritative"
     recovery: str = "snapshot"
     journal_mode: str | None = None
+    connection_policy: StoreConnectionPolicy = field(default_factory=StoreConnectionPolicy)
 
 
 class StoreCatalogError(RuntimeError):
     """Raised when the daemon's store layout is unsafe or incoherent."""
+
+
+class _ManagedSQLiteConnection(sqlite3.Connection):
+    """Connection subclass that removes itself from the live-handle ledger."""
+
+    _store_authority: _StoreConnectionAuthority | None = None
+    _store_handle_id: int | None = None
+
+    def close(self) -> None:
+        super().close()
+        authority = self._store_authority
+        handle_id = self._store_handle_id
+        if authority is not None and handle_id is not None:
+            authority._forget(handle_id)
+            self._store_authority = None
+            self._store_handle_id = None
+
+
+@dataclass(slots=True)
+class _ManagedConnection:
+    handle_id: int
+    logical_name: str
+    path: str
+    owner: str
+    connection: _ManagedSQLiteConnection
+    sequence: int
+    journal_mode: str | None
+
+
+class _StoreConnectionAuthority:
+    """Open and retain every live catalog-owned SQLite connection."""
+
+    def __init__(self, catalog: StoreCatalog) -> None:
+        self._catalog = catalog
+        self._lock = threading.RLock()
+        self._handles: dict[int, _ManagedConnection] = {}
+        self._next_handle_id = 1
+        self._accepting = True
+
+    def open(
+        self,
+        logical_name: str,
+        database: Any,
+        *,
+        owner: str,
+        **kwargs: Any,
+    ) -> sqlite3.Connection:
+        policy = self._catalog.connection_policy(logical_name)
+        requested_timeout = kwargs.pop("timeout", None)
+        timeout_seconds = policy.busy_timeout_ms / 1_000
+        if requested_timeout is not None and float(requested_timeout) != timeout_seconds:
+            raise StoreCatalogError(
+                "connection timeout override diverges from catalog policy: "
+                f"logical_store={logical_name!r} requested={requested_timeout!r} "
+                f"declared={timeout_seconds!r}"
+            )
+        if "factory" in kwargs:
+            raise StoreCatalogError("catalog-owned store connections cannot override the factory")
+
+        # Catalog-owned handles must be finalizable by the single shutdown
+        # coordinator after request worker threads have quiesced. Stores retain
+        # their existing thread-local access discipline; only the sqlite runtime
+        # affinity check is relaxed for central close.
+        kwargs["check_same_thread"] = False
+        kwargs["timeout"] = (
+            _SQLITE_DEFAULT_TIMEOUT_SECONDS
+            if requested_timeout is None
+            else float(requested_timeout)
+        )
+        kwargs["factory"] = _ManagedSQLiteConnection
+        with self._lock:
+            if not self._accepting:
+                raise StoreCatalogError(
+                    f"store connection opened after shutdown began: {logical_name!r}"
+                )
+            connection = sqlite3.connect(database, **kwargs)
+            handle_id = self._next_handle_id
+            self._next_handle_id += 1
+            target = self._catalog.manifest_target(logical_name)
+            path = os.path.realpath(os.fspath(target.path if target is not None else database))
+            handle = _ManagedConnection(
+                handle_id=handle_id,
+                logical_name=logical_name,
+                path=path,
+                owner=owner,
+                connection=connection,
+                sequence=handle_id,
+                journal_mode=None if target is None else target.journal_mode,
+            )
+            connection._store_authority = self
+            connection._store_handle_id = handle_id
+            self._handles[handle_id] = handle
+            return connection
+
+    def update_registration(self, record: StoreRecord) -> None:
+        with self._lock:
+            for handle in self._handles.values():
+                if (
+                    handle.logical_name == record.logical_name
+                    and handle.path == record.resolved_path
+                    and handle.owner == record.owner
+                ):
+                    handle.journal_mode = record.journal_mode
+
+    def _forget(self, handle_id: int) -> None:
+        with self._lock:
+            self._handles.pop(handle_id, None)
+
+    def shutdown(self, *, deadline_seconds: float) -> StoreShutdownReport:
+        with self._lock:
+            self._accepting = False
+            handles = sorted(self._handles.values(), key=lambda handle: handle.sequence)
+        coordinator = StoreShutdownCoordinator(deadline_seconds=deadline_seconds)
+        for handle in handles:
+            coordinator.register(
+                handle.logical_name,
+                self._catalog.effective_criticality(handle.logical_name),
+                lambda handle=handle: self._finalize(handle),
+            )
+        return coordinator.shutdown()
+
+    @staticmethod
+    def _finalize(handle: _ManagedConnection) -> None:
+        connection = handle.connection
+        errors: list[BaseException] = []
+        try:
+            connection.commit()
+            journal_mode = handle.journal_mode
+            if journal_mode is None:
+                row = connection.execute("PRAGMA journal_mode").fetchone()
+                journal_mode = str(row[0]).lower() if row else None
+            if journal_mode == "wal":
+                checkpoint = connection.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+                if checkpoint and int(checkpoint[0]):
+                    raise sqlite3.OperationalError(
+                        "WAL checkpoint remained busy during store finalization"
+                    )
+        except BaseException as exc:
+            errors.append(exc)
+        finally:
+            try:
+                connection.close()
+            except BaseException as exc:
+                errors.append(exc)
+        if errors:
+            details = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors)
+            raise RuntimeError(details)
 
 
 @dataclass(slots=True)
@@ -304,6 +501,7 @@ class StoreCatalog:
         expected_root: str | os.PathLike[str] | None = None,
         *,
         silence_allowlist: Mapping[str, str] | None = None,
+        manifest: Mapping[str, StoreIntegrityTarget] | None = None,
     ) -> None:
         root = os.getcwd() if expected_root is None else os.fspath(expected_root)
         self._expected_root = os.path.realpath(root)
@@ -311,14 +509,85 @@ class StoreCatalog:
             DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST if silence_allowlist is None else silence_allowlist
         )
         self._silence_allowlist = dict(configured_allowlist)
+        self._manifest = dict(manifest or {})
         self._entries: list[_CatalogEntry] = []
         self._observations: list[StoreObservation] = []
         self._lock = threading.RLock()
+        self._connection_authority = _StoreConnectionAuthority(self)
 
     @property
     def expected_root(self) -> str:
         """Return the canonical filesystem root this catalog governs."""
         return self._expected_root
+
+    def manifest_target(self, logical_name: str) -> StoreIntegrityTarget | None:
+        """Return the declared target for one logical store, if configured."""
+        return self._manifest.get(logical_name)
+
+    def configure_manifest(
+        self,
+        manifest: Mapping[str, StoreIntegrityTarget],
+    ) -> None:
+        """Attach the boot manifest before any constructor registers a store."""
+        with self._lock:
+            if self._entries:
+                raise StoreCatalogError("store manifest cannot change after registration")
+            self._manifest = dict(manifest)
+
+    def connection_policy(self, logical_name: str) -> StoreConnectionPolicy:
+        """Return the catalog-declared connection policy for one store."""
+        target = self.manifest_target(logical_name)
+        if target is not None:
+            return target.connection_policy
+        return default_store_connection_policy(logical_name)
+
+    def effective_criticality(self, logical_name: str) -> str:
+        """Return physical-cohort criticality using the strongest declaration."""
+        target = self.manifest_target(logical_name)
+        if target is not None:
+            target_path = os.path.realpath(os.fspath(target.path))
+            cohort = [
+                candidate.criticality
+                for candidate in self._manifest.values()
+                if os.path.realpath(os.fspath(candidate.path)) == target_path
+            ]
+            return max(cohort, key=lambda criticality: _CRITICALITY_RANK[criticality])
+        with self._lock:
+            records = [
+                entry.record for entry in self._entries if entry.record.logical_name == logical_name
+            ]
+        if not records:
+            return "authority"
+        record = records[-1]
+        cohort = []
+        with self._lock:
+            for entry in self._entries:
+                if entry.record.resolved_path == record.resolved_path:
+                    cohort.append(entry.record.criticality)
+        return max(cohort, key=lambda criticality: _CRITICALITY_RANK[criticality])
+
+    def open_connection(
+        self,
+        logical_name: str,
+        database: Any,
+        *,
+        owner: str,
+        **kwargs: Any,
+    ) -> sqlite3.Connection:
+        """Open and track one connection under the catalog's declared policy."""
+        return self._connection_authority.open(
+            logical_name,
+            database,
+            owner=owner,
+            **kwargs,
+        )
+
+    def shutdown(self, *, deadline_seconds: float) -> StoreShutdownReport:
+        """Finalize every tracked connection, then release preflight descriptors."""
+        try:
+            return self._connection_authority.shutdown(deadline_seconds=deadline_seconds)
+        finally:
+            self.close()
 
     def register(
         self,
@@ -327,7 +596,9 @@ class StoreCatalog:
         *,
         journal_mode: str,
         owner: str,
-        criticality: str = "authoritative",
+        criticality: str | None = None,
+        recovery: str | None = None,
+        connection_policy: StoreConnectionPolicy | None = None,
     ) -> None:
         """Record one store connection, canonicalized to physical path identity.
 
@@ -338,14 +609,26 @@ class StoreCatalog:
         raw_path = os.fspath(path)
         is_memory = self._is_memory_path(raw_path)
         resolved_path = os.path.realpath(raw_path)
+        target = self.manifest_target(logical_name)
+        declared_criticality = (
+            target.criticality if target is not None else criticality or "authoritative"
+        )
+        declared_recovery = target.recovery if target is not None else recovery or "snapshot"
+        declared_policy = (
+            target.connection_policy
+            if target is not None
+            else connection_policy or default_store_connection_policy(logical_name)
+        )
         record = StoreRecord(
             logical_name=logical_name,
             resolved_path=resolved_path,
             journal_mode=journal_mode.lower(),
             owner=owner,
-            criticality=criticality,
+            criticality=declared_criticality,
             dev_ino=None if is_memory else self._stat_identity(resolved_path),
             is_memory=is_memory,
+            recovery=declared_recovery,
+            connection_policy=declared_policy,
         )
         used_relative_path = not os.path.isabs(raw_path)
 
@@ -358,10 +641,13 @@ class StoreCatalog:
                     and current.resolved_path == record.resolved_path
                     and current.journal_mode == record.journal_mode
                     and current.criticality == record.criticality
+                    and current.recovery == record.recovery
+                    and current.connection_policy == record.connection_policy
                     and current.is_memory == record.is_memory
                 ):
                     entry.record = record
                     entry.used_relative_path = entry.used_relative_path or used_relative_path
+                    self._connection_authority.update_registration(record)
                     return
             self._entries.append(
                 _CatalogEntry(
@@ -369,6 +655,7 @@ class StoreCatalog:
                     used_relative_path=used_relative_path,
                 )
             )
+            self._connection_authority.update_registration(record)
 
     def register_observed(
         self,
@@ -408,6 +695,8 @@ class StoreCatalog:
                 criticality=target.criticality,
                 dev_ino=observation.dev_ino,
                 is_memory=False,
+                recovery=target.recovery,
+                connection_policy=target.connection_policy,
             )
             if any(
                 entry.record.logical_name == record.logical_name
@@ -427,6 +716,7 @@ class StoreCatalog:
                     observation=(observation if observation.dev_ino is not None else None),
                 )
             )
+            self._connection_authority.update_registration(record)
 
     def reserve(
         self,
@@ -435,7 +725,9 @@ class StoreCatalog:
         *,
         journal_mode: str,
         owner: str,
-        criticality: str = "authoritative",
+        criticality: str | None = None,
+        recovery: str | None = None,
+        connection_policy: StoreConnectionPolicy | None = None,
     ) -> StoreReservation:
         """Publish an absent store in the catalog before its exclusive create.
 
@@ -449,14 +741,23 @@ class StoreCatalog:
         if is_memory:
             raise StoreCatalogError("cannot reserve an in-memory store")
         absolute_path = os.path.abspath(raw_path)
+        target = self.manifest_target(logical_name)
         record = StoreRecord(
             logical_name=logical_name,
             resolved_path=absolute_path,
             journal_mode=journal_mode.lower(),
             owner=owner,
-            criticality=criticality,
+            criticality=(
+                target.criticality if target is not None else criticality or "authoritative"
+            ),
             dev_ino=self._stat_identity(absolute_path),
             is_memory=False,
+            recovery=target.recovery if target is not None else recovery or "snapshot",
+            connection_policy=(
+                target.connection_policy
+                if target is not None
+                else connection_policy or default_store_connection_policy(logical_name)
+            ),
         )
         entry = _CatalogEntry(
             record=record,
@@ -494,6 +795,8 @@ class StoreCatalog:
                 criticality=record.criticality,
                 dev_ino=dev_ino,
                 is_memory=False,
+                recovery=record.recovery,
+                connection_policy=record.connection_policy,
             )
             return entry.record
 
@@ -532,6 +835,8 @@ class StoreCatalog:
                 criticality=record.criticality,
                 dev_ino=observation.dev_ino,
                 is_memory=False,
+                recovery=record.recovery,
+                connection_policy=record.connection_policy,
             )
             self._observations.append(observation)
             return entry.record
@@ -565,6 +870,7 @@ class StoreCatalog:
             entries = list(self._entries)
 
         violations: list[str] = []
+        warnings: list[str] = []
         records = [entry.record for entry in entries]
 
         for entry in entries:
@@ -583,6 +889,8 @@ class StoreCatalog:
 
         records_by_logical_name: dict[str, list[StoreRecord]] = {}
         for record in records:
+            if record.criticality not in _CRITICALITY_RANK:
+                violations.append("unknown criticality on " + self._format_record(record))
             records_by_logical_name.setdefault(record.logical_name, []).append(record)
         for logical_name, matching_records in records_by_logical_name.items():
             if len({record.resolved_path for record in matching_records}) > 1:
@@ -612,12 +920,29 @@ class StoreCatalog:
                         "without a shared owner identity: " + pair
                     )
 
+        registered_logical_names = set(records_by_logical_name)
+        for logical_name in self._manifest:
+            if logical_name in registered_logical_names:
+                continue
+            effective_criticality = self.effective_criticality(logical_name)
+            absence = (
+                f"logical_store={logical_name!r} "
+                f"effective_criticality={effective_criticality!r} "
+                "post-construction catalog absence"
+            )
+            if effective_criticality == "telemetry":
+                warnings.append(f"degraded telemetry store: {absence}")
+            else:
+                violations.append(absence)
+
         if violations:
             raise StoreCatalogError(
                 "Store catalog validation failed:\n- " + "\n- ".join(violations)
             )
 
-        return self.reconcile_filesystem()
+        for warning in warnings:
+            logger.warning("STORE CATALOG WARNING: %s", warning)
+        return [*warnings, *self.reconcile_filesystem()]
 
     def preflight_integrity(
         self,
@@ -999,6 +1324,8 @@ class StoreCatalog:
                     criticality=record.criticality,
                     dev_ino=dev_ino,
                     is_memory=record.is_memory,
+                    recovery=record.recovery,
+                    connection_policy=record.connection_policy,
                 )
 
     def _enumerate_database_files(
@@ -1233,6 +1560,7 @@ class StoreCatalog:
         return (
             f"{record.logical_name!r} owner={record.owner!r} "
             f"path={record.resolved_path!r} journal_mode={record.journal_mode!r} "
+            f"criticality={record.criticality!r} recovery={record.recovery!r} "
             f"dev_ino={record.dev_ino!r} is_memory={record.is_memory!r}"
         )
 
@@ -1247,7 +1575,9 @@ class DaemonStoreCatalog(StoreCatalog):
         *,
         journal_mode: str,
         owner: str,
-        criticality: str = "authoritative",
+        criticality: str | None = None,
+        recovery: str | None = None,
+        connection_policy: StoreConnectionPolicy | None = None,
     ) -> None:
         """Allow a fleet authority constructor to fulfill a preflight absence."""
         raw_path = os.fspath(path)
@@ -1266,6 +1596,8 @@ class DaemonStoreCatalog(StoreCatalog):
             journal_mode=journal_mode,
             owner=owner,
             criticality=criticality,
+            recovery=recovery,
+            connection_policy=connection_policy,
         )
         if fulfilled_absences:
             with self._lock:
@@ -1372,3 +1704,48 @@ class DaemonStoreCatalog(StoreCatalog):
                 continue
             identities[descriptor] = (descriptor_stat.st_dev, descriptor_stat.st_ino)
         return identities
+
+
+def store_connection_policy(
+    catalog: StoreCatalog | None,
+    logical_name: str,
+) -> StoreConnectionPolicy:
+    """Resolve one store's policy with or without a boot catalog."""
+    if catalog is not None:
+        return catalog.connection_policy(logical_name)
+    return default_store_connection_policy(logical_name)
+
+
+def apply_store_connection_policy(
+    connection: sqlite3.Connection,
+    policy: StoreConnectionPolicy,
+) -> None:
+    """Apply a declared post-open policy without changing journal mode."""
+    connection.execute(f"PRAGMA busy_timeout={int(policy.busy_timeout_ms)}")
+
+
+def open_store_connection(
+    catalog: StoreCatalog | None,
+    logical_name: str,
+    database: Any,
+    *,
+    owner: str,
+    **kwargs: Any,
+) -> sqlite3.Connection:
+    """Route every owner-side SQLite open through the central policy seam."""
+    if catalog is not None:
+        return catalog.open_connection(logical_name, database, owner=owner, **kwargs)
+
+    policy = default_store_connection_policy(logical_name)
+    timeout_seconds = policy.busy_timeout_ms / 1_000
+    requested_timeout = kwargs.pop("timeout", None)
+    if requested_timeout is not None and float(requested_timeout) != timeout_seconds:
+        raise ValueError(
+            "connection timeout override diverges from store policy: "
+            f"logical_store={logical_name!r} requested={requested_timeout!r} "
+            f"declared={timeout_seconds!r}"
+        )
+    kwargs["timeout"] = (
+        _SQLITE_DEFAULT_TIMEOUT_SECONDS if requested_timeout is None else float(requested_timeout)
+    )
+    return sqlite3.connect(database, **kwargs)

@@ -9,7 +9,12 @@ import time
 from pathlib import Path
 from typing import Any
 
-from pinky_daemon.store_catalog import StoreCatalog
+from pinky_daemon.store_catalog import (
+    StoreCatalog,
+    apply_store_connection_policy,
+    open_store_connection,
+    store_connection_policy,
+)
 
 DEFAULT_RETENTION_DAYS = 30
 DEFAULT_MAX_PER_AGENT = 1000
@@ -31,12 +36,21 @@ class MessageContextStore:
         self.max_per_agent = max(1, max_per_agent)
         self._lock = threading.RLock()
         Path(db_path).parent.mkdir(parents=True, exist_ok=True)
-        self._db = sqlite3.connect(db_path, check_same_thread=False)
+        self._db = open_store_connection(
+            catalog,
+            "message_context",
+            db_path,
+            owner=type(self).__name__,
+            check_same_thread=False,
+        )
         self._db.row_factory = sqlite3.Row
         journal_mode = str(
             self._db.execute("PRAGMA journal_mode=WAL").fetchone()[0]
         ).lower()
-        self._db.execute("PRAGMA busy_timeout=5000")
+        apply_store_connection_policy(
+            self._db,
+            store_connection_policy(catalog, "message_context"),
+        )
         if catalog is not None:
             catalog.register(
                 "message_context",

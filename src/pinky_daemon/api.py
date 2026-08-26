@@ -210,6 +210,7 @@ from pinky_daemon.store_manifest import (
     derive_fleet_store_manifest,
     derive_standalone_tenant_store_manifest_for_agent,
 )
+from pinky_daemon.store_shutdown import StoreShutdownError
 from pinky_daemon.store_snapshot import (
     SnapshotResult,
     StoreSnapshotError,
@@ -1731,8 +1732,9 @@ def create_api(
 
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
-    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
     store_manifest = _derive_api_store_manifest(db_path)
+    store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
+    store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
     try:
         store_catalog.preflight_integrity(
@@ -1845,6 +1847,7 @@ def create_api(
             tenant_catalog = StoreCatalog(
                 expected_root=tenant_root,
                 silence_allowlist={},
+                manifest=tenant_manifest,
             )
             observations = tenant_catalog.preflight_integrity(tenant_manifest.values())
             for target in tenant_manifest.values():
@@ -12880,10 +12883,19 @@ npm run build</pre>
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
-        message_context_store.close()
         for tenant_catalog in tenant_store_catalogs.values():
             tenant_catalog.close()
-        store_catalog.close()
+        try:
+            report = store_catalog.shutdown(deadline_seconds=10.0)
+        except StoreShutdownError as exc:
+            app.state.store_shutdown_report = exc.report
+            _log(f"ERROR shutdown: {exc}")
+            raise
+        app.state.store_shutdown_report = report
+        _log(
+            "shutdown: store finalization complete "
+            f"attempted={len(report.attempted)} finalized={len(report.finalized)}"
+        )
 
     # ── Admin: Session Watchdog ─────────────────────────
 
