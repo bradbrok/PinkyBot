@@ -60,6 +60,7 @@ _PRIME_FRESH_WINDOW_SECONDS = 30.0
 # weak references, so a bare fire-and-forget create_task can be garbage
 # collected mid-flight and its exception silently dropped.
 _DELIVERY_TASKS: set["asyncio.Task"] = set()
+_POLLER_TASKS: set["asyncio.Task"] = set()
 
 
 def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
@@ -79,11 +80,29 @@ def _deliver_in_background(coro, log_prefix: str) -> "asyncio.Task":
     return task
 
 
+def start_poller(poller) -> "asyncio.Task":
+    """Start and retain one poller loop until its admitted batch has drained."""
+    task = asyncio.create_task(poller.start())
+    _POLLER_TASKS.add(task)
+
+    def _on_done(done: "asyncio.Task") -> None:
+        _POLLER_TASKS.discard(done)
+        if done.cancelled():
+            return
+        exc = done.exception()
+        if exc is not None:
+            _log(f"{type(poller).__name__}: poller task failed: {exc!r}")
+
+    task.add_done_callback(_on_done)
+    return task
+
+
 async def quiesce_delivery_tasks() -> None:
-    """Wait until every admitted inbound delivery has stopped writing."""
-    while _DELIVERY_TASKS:
-        tasks = tuple(_DELIVERY_TASKS)
+    """Wait until poller loops and every admitted delivery stop writing."""
+    while _POLLER_TASKS or _DELIVERY_TASKS:
+        tasks = tuple(_POLLER_TASKS | _DELIVERY_TASKS)
         await asyncio.gather(*tasks, return_exceptions=True)
+        _POLLER_TASKS.difference_update(tasks)
         _DELIVERY_TASKS.difference_update(tasks)
 
 if TYPE_CHECKING:
@@ -175,7 +194,13 @@ class _TelegramPollWatchdog:
         if fut.exception() is not None:  # consumed: no "never retrieved" noise
             return
         late = fut.result()
-        if not late or not self._accepting_deliveries:
+        if not late:
+            return
+        if not self._accepting_deliveries:
+            _log(
+                f"{self._watchdog_label}: abandoned poll completed after stop; "
+                f"platform=telegram dropping {len(late)} update(s)"
+            )
             return
         _log(
             f"{self._watchdog_label}: abandoned poll completed late with "
@@ -295,8 +320,6 @@ class TelegramPoller(_TelegramPollWatchdog):
         """Route polled updates to the handler — also the watchdog's
         late-delivery path for polls that complete after abandonment."""
         for msg in messages:
-            if not self._accepting_deliveries:
-                return
             # Filter by allowed chats
             if self._allowed_chats and msg.chat_id not in self._allowed_chats:
                 _log(f"telegram-poller: ignoring message from chat {msg.chat_id}")
@@ -439,8 +462,6 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         """Route polled updates through the broker — also the watchdog's
         late-delivery path for polls that complete after abandonment."""
         for msg in messages:
-            if not self._accepting_deliveries:
-                return
             chat_type = msg.metadata.get("chat_type", "")
             is_group = chat_type in ("group", "supergroup")
 
@@ -588,8 +609,6 @@ class BrokeriMessagePoller:
         if not self._accepting_deliveries:
             return
         for msg in messages:
-            if not self._accepting_deliveries:
-                return
             is_group = msg.metadata.get("is_group", False)
 
             broker_msg = self._BrokerMessage(
@@ -1564,9 +1583,6 @@ class BrokerSlackPoller:
                 sender_name = resolved
         chat_title = await self._resolve_channel_title(channel)
         text = await self._resolve_text_refs(text)
-
-        if not self._accepting_deliveries:
-            return
 
         attachments = [
             {

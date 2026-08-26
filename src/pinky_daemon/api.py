@@ -2716,6 +2716,7 @@ def create_api(
         message_context_store=message_context_store,
     )
     _broker_pollers: list = []  # Track active broker pollers
+    from pinky_daemon.pollers import quiesce_delivery_tasks, start_poller
 
     app.state.manager = manager
     app.state.broker = broker
@@ -8665,7 +8666,7 @@ npm run build</pre>
                     adapter, name, broker, registry=agents,
                 )
                 _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
+                start_poller(poller)
                 _log(f"api: started telegram poller for {name}")
             except Exception as e:
                 _log(f"api: failed to start telegram poller for {name}: {e}")
@@ -8699,7 +8700,7 @@ npm run build</pre>
                     watched_channels=watched,
                 )
                 _broker_pollers.append(poller)
-                asyncio.create_task(poller.start())
+                start_poller(poller)
                 _log(
                     f"api: started discord poller for {name} "
                     f"(poll_interval={poll_interval}s, "
@@ -12612,7 +12613,7 @@ npm run build</pre>
                         adapter, agent.name, broker, registry=agents,
                     )
                     _broker_pollers.append(poller)
-                    asyncio.create_task(poller.start())
+                    start_poller(poller)
                     _log(f"startup: broker poller started for {agent.name}")
 
             # Discord poller — REST polling (Gateway/WebSocket is a future v0.2)
@@ -12642,7 +12643,7 @@ npm run build</pre>
                             watched_channels=watched,
                         )
                         _broker_pollers.append(d_poller)
-                        asyncio.create_task(d_poller.start())
+                        start_poller(d_poller)
                         _log(
                             f"startup: discord poller started for {agent.name} "
                             f"(interval={poll_interval}s, "
@@ -12686,7 +12687,7 @@ npm run build</pre>
                                 app_token=app_token,
                             )
                             _broker_pollers.append(s_poller)
-                            asyncio.create_task(s_poller.start())
+                            start_poller(s_poller)
                             _log(f"startup: slack socket-mode poller started for {agent.name}")
                     except Exception as e:
                         _log(f"startup: slack poller failed for {agent.name}: {e}")
@@ -12712,7 +12713,7 @@ npm run build</pre>
                         im_adapter, agent.name, broker,
                     )
                     _broker_pollers.append(im_poller)
-                    asyncio.create_task(im_poller.start())
+                    start_poller(im_poller)
                     _log(f"startup: iMessage poller started for {agent.name}")
                 except Exception as e:
                     _log(f"startup: iMessage poller failed for {agent.name}: {e}")
@@ -12876,8 +12877,6 @@ npm run build</pre>
         if app.state.buzz_poller_tasks:
             await asyncio.gather(*app.state.buzz_poller_tasks, return_exceptions=True)
         app.state.buzz_poller_tasks.clear()
-        from pinky_daemon.pollers import quiesce_delivery_tasks
-
         await quiesce_delivery_tasks()
         await autonomy.stop()
         await scheduler.stop()
