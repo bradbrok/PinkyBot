@@ -97,7 +97,7 @@ class SDKRunner:
         self._ensure_sdk()
 
     def _ensure_sdk(self) -> None:
-        """Verify the SDK is available."""
+        """Verify the SDK is available and its bundled binary is executable."""
         try:
             import claude_agent_sdk  # noqa: F401
         except ImportError:
@@ -105,6 +105,33 @@ class SDKRunner:
                 "claude-agent-sdk is required for SDKRunner. "
                 "Install it: pip install claude-agent-sdk"
             )
+        # The SDK bundles a Claude binary that pip sometimes installs without
+        # the execute bit (wheel doesn't preserve permissions). Fix it here
+        # so dreams and other SDK-driven sessions don't fail with EACCES.
+        self._fix_bundled_binary_permissions(claude_agent_sdk)
+
+    @staticmethod
+    def _fix_bundled_binary_permissions(sdk_module) -> None:
+        """Ensure the SDK's bundled Claude binary has the execute bit set.
+
+        pip wheels don't preserve POSIX permissions, so the bundled ELF
+        binary at ``claude_agent_sdk/_bundled/claude`` can end up 0644
+        after install/upgrade — causing ``[Errno 13] Permission denied``
+        when the SDK tries to spawn it (it prefers the bundled copy over
+        ``shutil.which('claude')``).  Best-effort; silently ignored on
+        failure (the SDK will still fall back to the system binary).
+        """
+        import os
+        import stat
+        from pathlib import Path
+
+        try:
+            bundled = Path(sdk_module.__file__).resolve().parent / "_bundled" / "claude"
+            if bundled.is_file() and not os.access(bundled, os.X_OK):
+                bundled.chmod(bundled.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                _log(f"sdk-runner: fixed +x on bundled CLI at {bundled}")
+        except Exception:
+            pass  # best-effort — system `claude` binary is the fallback
 
     async def run(
         self,
