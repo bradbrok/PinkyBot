@@ -97,6 +97,19 @@ def start_poller(poller) -> "asyncio.Task":
     return task
 
 
+async def _sleep_until_stopped(stop_event: asyncio.Event, delay: float) -> None:
+    """Sleep between polls, returning immediately when stop closes ingress."""
+    if stop_event.is_set():
+        return
+    if delay <= 0:
+        await asyncio.sleep(0)
+        return
+    try:
+        await asyncio.wait_for(stop_event.wait(), timeout=delay)
+    except TimeoutError:
+        pass
+
+
 async def quiesce_delivery_tasks() -> None:
     """Wait until poller loops and every admitted delivery stop writing."""
     while _POLLER_TASKS or _DELIVERY_TASKS:
@@ -154,6 +167,7 @@ class _TelegramPollWatchdog:
         )
         self._watchdog_fires = 0
         self._last_poll_ok = 0.0
+        self._active_poll = None
 
     async def _watched_poll(self, poll_fn):
         """Run ``poll_fn`` on the dedicated executor under a hard deadline.
@@ -170,18 +184,23 @@ class _TelegramPollWatchdog:
         """
         loop = asyncio.get_running_loop()
         fut = loop.run_in_executor(self._poll_executor, poll_fn)
+        self._active_poll = fut
         deadline = self._poll_timeout + self._watchdog_grace
         try:
-            result = await asyncio.wait_for(asyncio.shield(fut), timeout=deadline)
-        except TimeoutError:
-            if fut.done() and not fut.cancelled() and fut.exception() is None:
-                # Completed on the deadline edge (loop scheduled the timeout
-                # callback first) — a healthy poll, not a stuck one.
-                self._last_poll_ok = time.monotonic()
-                return fut.result()
-            fut.add_done_callback(self._on_abandoned_poll_done)
-            self._recycle_after_stuck_poll(deadline)
-            return []
+            try:
+                result = await asyncio.wait_for(asyncio.shield(fut), timeout=deadline)
+            except TimeoutError:
+                if fut.done() and not fut.cancelled() and fut.exception() is None:
+                    # Completed on the deadline edge (loop scheduled the timeout
+                    # callback first) — a healthy poll, not a stuck one.
+                    self._last_poll_ok = time.monotonic()
+                    return fut.result()
+                fut.add_done_callback(self._on_abandoned_poll_done)
+                self._recycle_after_stuck_poll(deadline)
+                return []
+        finally:
+            if self._active_poll is fut:
+                self._active_poll = None
         self._last_poll_ok = time.monotonic()
         return result
 
@@ -230,6 +249,12 @@ class _TelegramPollWatchdog:
         old.shutdown(wait=False)
 
     def _shutdown_watchdog(self) -> None:
+        active = self._active_poll
+        if active is not None and not active.done():
+            try:
+                self._adapter.recycle()
+            except Exception as e:
+                _log(f"{self._watchdog_label}: stop-time adapter recycle failed: {e}")
         self._poll_executor.shutdown(wait=False)
 
     @property
@@ -268,6 +293,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._event_callback = event_callback  # async fn(platform, chat_id, sender, content)
         self._running = False
         self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
         self._init_watchdog("telegram-poller", watchdog_grace)
 
@@ -275,6 +301,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         """Start the polling loop."""
         self._running = True
         self._accepting_deliveries = True
+        self._stop_event.clear()
         _log("telegram-poller: starting")
 
         # Verify bot connection — on the poller's executor, under a deadline,
@@ -295,12 +322,12 @@ class TelegramPoller(_TelegramPollWatchdog):
                 await self._poll_once()
             except TelegramError as e:
                 _log(f"telegram-poller: error: {e}")
-                await asyncio.sleep(5)  # Back off on error
+                await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"telegram-poller: unexpected error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _poll_once(self) -> None:
         """Single poll iteration."""
@@ -363,6 +390,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         """Stop the polling loop."""
         self._running = False
         self._accepting_deliveries = False
+        self._stop_event.set()
         self._shutdown_watchdog()
         _log("telegram-poller: stopping")
 
@@ -408,6 +436,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._event_callback = event_callback
         self._running = False
         self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
         self._bot_username = ""
         self._init_watchdog(f"broker-poller[{agent_name}]", watchdog_grace)
@@ -416,6 +445,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         """Start the polling loop."""
         self._running = True
         self._accepting_deliveries = True
+        self._stop_event.clear()
         _log(f"broker-poller[{self._agent_name}]: starting")
 
         # On the poller's executor, under a deadline — a wedged network can't
@@ -437,12 +467,12 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
                 await self._poll_once()
             except TelegramError as e:
                 _log(f"broker-poller[{self._agent_name}]: error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"broker-poller[{self._agent_name}]: unexpected error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _poll_once(self) -> None:
         """Single poll iteration — routes messages through broker."""
@@ -520,6 +550,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         """Stop the polling loop."""
         self._running = False
         self._accepting_deliveries = False
+        self._stop_event.set()
         self._shutdown_watchdog()
         _log(f"broker-poller[{self._agent_name}]: stopping")
 
@@ -562,12 +593,14 @@ class BrokeriMessagePoller:
         self._event_callback = event_callback
         self._running = False
         self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
 
     async def start(self) -> None:
         """Start the polling loop."""
         self._running = True
         self._accepting_deliveries = True
+        self._stop_event.clear()
         _log(f"imessage-poller[{self._agent_name}]: starting")
 
         if not self._adapter.can_receive:
@@ -578,7 +611,7 @@ class BrokeriMessagePoller:
             _log(f"imessage-poller[{self._agent_name}]: send-only mode (no inbound)")
             # Don't return — keep running so outbound still works
             while self._running:
-                await asyncio.sleep(self._poll_interval)
+                await _sleep_until_stopped(self._stop_event, self._poll_interval)
             return
 
         _log(f"imessage-poller[{self._agent_name}]: chat.db connected, polling")
@@ -588,9 +621,9 @@ class BrokeriMessagePoller:
                 await self._poll_once()
             except Exception as e:
                 _log(f"imessage-poller[{self._agent_name}]: error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _poll_once(self) -> None:
         """Single poll iteration."""
@@ -648,6 +681,7 @@ class BrokeriMessagePoller:
     def stop(self) -> None:
         self._running = False
         self._accepting_deliveries = False
+        self._stop_event.set()
         _log(f"imessage-poller[{self._agent_name}]: stopping")
 
     @property
@@ -709,6 +743,7 @@ class BrokerDiscordPoller:
         self._event_callback = event_callback
         self._running = False
         self._accepting_deliveries = True
+        self._stop_event = asyncio.Event()
         self._poll_count = 0
         self._bot_user_id = ""
         self._bot_username = ""
@@ -741,6 +776,7 @@ class BrokerDiscordPoller:
         """Start the polling loop."""
         self._running = True
         self._accepting_deliveries = True
+        self._stop_event.clear()
         _log(f"discord-poller[{self._agent_name}]: starting")
 
         # Verify bot connection
@@ -776,15 +812,18 @@ class BrokerDiscordPoller:
                     f"discord-poller[{self._agent_name}]: rate limited, "
                     f"sleeping {e.retry_after:.2f}s"
                 )
-                await asyncio.sleep(min(e.retry_after, 30.0))
+                await _sleep_until_stopped(
+                    self._stop_event,
+                    min(e.retry_after, 30.0),
+                )
             except DiscordError as e:
                 _log(f"discord-poller[{self._agent_name}]: error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"discord-poller[{self._agent_name}]: unexpected error: {e}")
-                await asyncio.sleep(5)
+                await _sleep_until_stopped(self._stop_event, 5)
 
-            await asyncio.sleep(self._poll_interval)
+            await _sleep_until_stopped(self._stop_event, self._poll_interval)
 
     async def _refresh_channels(self, *, verbose: bool) -> None:
         """Refresh the watched-channel set and prime last_id for newcomers.
@@ -1025,6 +1064,7 @@ class BrokerDiscordPoller:
         """Stop the polling loop."""
         self._running = False
         self._accepting_deliveries = False
+        self._stop_event.set()
         _log(f"discord-poller[{self._agent_name}]: stopping")
 
 
