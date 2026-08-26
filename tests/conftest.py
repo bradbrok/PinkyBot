@@ -123,6 +123,28 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
         )
 
 
+@pytest.fixture(autouse=True)
+def _stub_daemon_wal_path_check(monkeypatch):
+    """Bypass the DaemonStoreCatalog WAL path ownership/mode check in tests.
+
+    The check rejects any store path whose ancestor directories are writable by
+    non-daemon UIDs — /tmp (mode 1777) is one such ancestor.  All test helpers
+    that call create_api() use tempfile paths under /tmp, so without this stub
+    the preflight fails whenever a prior test left a store file behind.
+
+    Tests in this suite are not exercising the store-security boundary;
+    returning the realpath directly preserves the path-resolution contract
+    while removing the environment-dependent permission check.
+    """
+    from pinky_daemon.store_catalog import DaemonStoreCatalog
+
+    monkeypatch.setattr(
+        DaemonStoreCatalog,
+        "_verified_daemon_owned_path",
+        lambda self, path: os.path.realpath(path),
+    )
+
+
 @pytest.fixture(autouse=True, scope="session")
 def _ensure_test_session_secret():
     """Make sure PINKY_SESSION_SECRET is set for the whole test run.

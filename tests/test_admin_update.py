@@ -25,17 +25,9 @@ def _stub_resolve_and_verify():
     these endpoint tests treat it as a verified black box and focus on the
     deploy mechanics (fetch, checkout, deps, frontend, force-reset, restart).
     """
-    # DaemonStoreCatalog._verified_daemon_owned_path rejects /tmp (mode 1777);
-    # stub it out since these tests target admin-update logic, not store security.
-    with (
-        patch(
-            "pinky_daemon.self_update.resolve_and_verify",
-            return_value=DeployDecision(ref="26.06.109", kind="release", verified=True),
-        ),
-        patch(
-            "pinky_daemon.store_catalog.DaemonStoreCatalog._verified_daemon_owned_path",
-            side_effect=lambda path: os.path.realpath(path),
-        ),
+    with patch(
+        "pinky_daemon.self_update.resolve_and_verify",
+        return_value=DeployDecision(ref="26.06.109", kind="release", verified=True),
     ):
         yield
 
