@@ -312,6 +312,7 @@ def test_tenant_capable_catalog_cannot_reach_wal_pathname_branch(tmp_path: Path)
     assert _sidecar_identities(source) == sidecars_before
 
 
+@pytest.mark.store_security
 @pytest.mark.parametrize("unsafe_kind", ["writable", "tenant-owned"])
 def test_daemon_wal_pathname_branch_requires_trusted_directory_chain(
     daemon_store_root: Path,
