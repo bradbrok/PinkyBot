@@ -4,13 +4,111 @@ from __future__ import annotations
 
 import asyncio
 import sqlite3
+from concurrent.futures import Future
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
 from pinky_daemon import pollers
 from pinky_daemon.store_catalog import StoreCatalog, StoreIntegrityTarget
 from pinky_daemon.store_shutdown import StoreShutdownError
+
+
+@pytest.mark.asyncio
+async def test_quiescence_drains_an_already_fetched_telegram_batch() -> None:
+    """Stopping ingress must not strand the remainder of an offset-advanced batch."""
+    first_callback_entered = asyncio.Event()
+    release_first_callback = asyncio.Event()
+    finalizer_entered = asyncio.Event()
+    delivered: list[str] = []
+    callback_count = 0
+
+    messages = [
+        SimpleNamespace(
+            chat_id="chat",
+            sender="sender",
+            metadata={},
+            content=content,
+            timestamp=1.0,
+            message_id=content,
+        )
+        for content in ("first", "second")
+    ]
+
+    class Adapter:
+        @staticmethod
+        def get_me():
+            return {"username": "quiescence"}
+
+        @staticmethod
+        def get_updates(*, timeout: int):
+            assert timeout == 30
+            return messages
+
+    class Handler:
+        @staticmethod
+        async def handle(message) -> None:
+            delivered.append(message.content)
+
+    async def event_callback(**_event) -> None:
+        nonlocal callback_count
+        callback_count += 1
+        if callback_count == 1:
+            first_callback_entered.set()
+            await release_first_callback.wait()
+
+    poller = pollers.TelegramPoller(
+        Adapter(),
+        Handler(),
+        poll_interval=0,
+        event_callback=event_callback,
+    )
+    start_poller = getattr(
+        pollers,
+        "start_poller",
+        lambda current: asyncio.create_task(current.start()),
+    )
+    poller_task = start_poller(poller)
+    await first_callback_entered.wait()
+    poller.stop()
+
+    async def quiesce_then_finalize() -> None:
+        await pollers.quiesce_delivery_tasks()
+        finalizer_entered.set()
+
+    shutdown_task = asyncio.create_task(quiesce_then_finalize())
+    await asyncio.sleep(0)
+    finalized_before_batch_drain = finalizer_entered.is_set()
+
+    release_first_callback.set()
+    await asyncio.wait_for(poller_task, timeout=2)
+    await asyncio.wait_for(shutdown_task, timeout=2)
+
+    assert not finalized_before_batch_drain
+    assert delivered == ["first", "second"]
+    assert callback_count == 2
+
+
+def test_abandoned_telegram_batch_drop_after_stop_is_loud(capsys) -> None:
+    """An unsafe late watchdog result is dropped with platform and count."""
+
+    class Adapter:
+        @staticmethod
+        def get_me():
+            return {"username": "quiescence"}
+
+    poller = pollers.TelegramPoller(Adapter(), object())
+    poller.stop()
+    abandoned = Future()
+    abandoned.set_result([object(), object()])
+
+    poller._on_abandoned_poll_done(abandoned)
+
+    stderr = capsys.readouterr().err
+    assert "abandoned poll" in stderr
+    assert "platform=telegram" in stderr
+    assert "dropping 2" in stderr
 
 
 @pytest.mark.asyncio
