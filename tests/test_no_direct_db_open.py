@@ -240,12 +240,10 @@ def _assert_direct_opens_allowed(
     assert not failures, "\n\n".join(failures)
 
 
-def test_daemon_direct_sqlite_opens_are_owned_or_allowlisted() -> None:
+def test_daemon_direct_sqlite_opens_are_centralized_in_storage_authority() -> None:
     _assert_direct_opens_allowed(
         _scan_daemon_sources(),
-        owner_modules=(
-            APPROVED_STORAGE_OWNER_MODULES | APPROVED_STORAGE_AUTHORITY_MODULES
-        ),
+        owner_modules=APPROVED_STORAGE_AUTHORITY_MODULES,
         allowlist=DIRECT_OPEN_ALLOWLIST,
     )
 
@@ -259,9 +257,7 @@ def test_connector_exception_mapping_is_exactly_empty_and_authority_is_separate(
             "src/pinky_daemon/store_snapshot.py",
         }
     )
-    assert APPROVED_STORAGE_OWNER_MODULES.isdisjoint(
-        APPROVED_STORAGE_AUTHORITY_MODULES
-    )
+    assert APPROVED_STORAGE_OWNER_MODULES.isdisjoint(APPROVED_STORAGE_AUTHORITY_MODULES)
 
 
 def test_scanner_resolves_sqlite_import_aliases() -> None:
