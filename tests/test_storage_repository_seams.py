@@ -719,7 +719,7 @@ def test_fleet_and_standalone_manifest_providers_are_explicit_and_non_guessing(
         "agent_signing_keys": StoreIntegrityTarget(
             logical_name="agent_signing_keys",
             path=os.fspath(keystore),
-            criticality="authoritative",
+            criticality="authority",
             recovery="snapshot",
             journal_mode="delete",
         )
