@@ -226,7 +226,7 @@ class StorageObservability:
                         metrics.lock_wait_event_latched = True
                         wait_event = True
                         wait_observed_ms = upper_bound_ms
-                else:
+                elif succeeded:
                     metrics.lock_wait_event_latched = False
 
             if sqlite_primary_error_code == 5:

@@ -98,6 +98,16 @@ def _first_sql_token(statement: str) -> str:
     return prefix[token_start:index].upper()
 
 
+def _sql_is_lock_bearing(statement: str, token: str) -> bool:
+    """Classify bounded SQL, including assignment-form mutating PRAGMAs."""
+    if token != "PRAGMA":
+        return token not in _READ_ONLY_SQL_TOKENS
+    for character in statement[:64]:
+        if character == "=":
+            return True
+    return False
+
+
 def _sqlite_header_journal_mode(header: bytes) -> str | None:
     if len(header) < 20 or not header.startswith(_SQLITE_HEADER_PREFIX):
         return None
@@ -344,6 +354,7 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
     _store_logical_name: str | None = None
     _store_observability: StorageObservability | None = None
     _store_transaction_started_ns: int | None = None
+    _store_boundary_observation_depth = 0
     _store_closed = False
 
     @property
@@ -380,80 +391,87 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
         return self._run_observed_statement(sql_script, lambda: executescript(sql_script))
 
     def commit(self) -> None:
-        observability = self._store_observability
-        logical_name = self._store_logical_name
-        if observability is None or logical_name is None or not self.in_transaction:
-            return super().commit()
-        started_ns = self._store_transaction_started_ns
-        if started_ns is None:
-            started_ns = observability.start_transaction()
-        try:
-            super().commit()
-        except BaseException:
-            if not self.in_transaction:
-                self._store_transaction_started_ns = None
-            raise
-        if started_ns is not None and not self.in_transaction:
-            observability.finish_transaction(
-                logical_name,
-                started_ns,
-                outcome="committed",
-            )
-            self._store_transaction_started_ns = None
+        commit = super().commit
+        if self._store_boundary_observation_depth:
+            return commit()
+        self._run_observed_transaction_boundary(commit, sql_token="COMMIT")
 
     def rollback(self) -> None:
-        observability = self._store_observability
-        logical_name = self._store_logical_name
-        if observability is None or logical_name is None or not self.in_transaction:
-            return super().rollback()
-        started_ns = self._store_transaction_started_ns
-        if started_ns is None:
-            started_ns = observability.start_transaction()
-        try:
-            super().rollback()
-        except BaseException:
-            if not self.in_transaction:
-                self._store_transaction_started_ns = None
-            raise
-        if started_ns is not None and not self.in_transaction:
-            observability.finish_transaction(
-                logical_name,
-                started_ns,
-                outcome="rolled_back",
-            )
-            self._store_transaction_started_ns = None
+        rollback = super().rollback
+        if self._store_boundary_observation_depth:
+            return rollback()
+        self._run_observed_transaction_boundary(rollback, sql_token="ROLLBACK")
 
     def __enter__(self) -> _ManagedSQLiteConnection:
         super().__enter__()
         return self
 
     def __exit__(self, exc_type, exc, traceback) -> bool:
+        exit_context = super().__exit__
+        if self._store_boundary_observation_depth:
+            return bool(exit_context(exc_type, exc, traceback))
+        suppressed = self._run_observed_transaction_boundary(
+            lambda: exit_context(exc_type, exc, traceback),
+            sql_token="COMMIT" if exc_type is None else "ROLLBACK",
+        )
+        return bool(suppressed)
+
+    def _run_observed_transaction_boundary(
+        self,
+        call: Callable[[], Any],
+        *,
+        sql_token: str,
+    ) -> Any:
         observability = self._store_observability
         logical_name = self._store_logical_name
-        transaction_active = self.in_transaction
-        started_ns = self._store_transaction_started_ns
-        if observability is not None and transaction_active and started_ns is None:
-            started_ns = observability.start_transaction()
-            self._store_transaction_started_ns = started_ns
+        transaction_before = self.in_transaction
+        if observability is None or logical_name is None or not transaction_before:
+            return call()
+        operation = observability.begin_runtime_operation(
+            logical_name,
+            lock_bearing=sql_token not in _ROLLBACK_SQL_TOKENS,
+        )
+        if operation is None:
+            return call()
+        if self._store_transaction_started_ns is None:
+            self._store_transaction_started_ns = operation.started_ns
+
+        self._store_boundary_observation_depth += 1
         try:
-            suppressed = super().__exit__(exc_type, exc, traceback)
-        except BaseException:
-            if not self.in_transaction:
-                self._finish_context_transaction(
-                    observability,
-                    logical_name,
-                    started_ns,
-                    outcome="rolled_back",
-                )
-            raise
-        if transaction_active and not self.in_transaction:
-            self._finish_context_transaction(
-                observability,
-                logical_name,
-                started_ns,
-                outcome="committed" if exc_type is None else "rolled_back",
+            result = call()
+        except BaseException as exc:
+            primary_error_code = None
+            if isinstance(exc, sqlite3.Error):
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                if error_code is not None:
+                    primary_error_code = int(error_code) & 0xFF
+            finished_ns = observability.finish_runtime_operation(
+                operation,
+                succeeded=False,
+                sqlite_primary_error_code=primary_error_code,
             )
-        return bool(suppressed)
+            self._record_transaction_transition(
+                operation,
+                finished_ns,
+                sql_token,
+                transaction_before=transaction_before,
+                transaction_after=self.in_transaction,
+                succeeded=False,
+            )
+            raise
+        finally:
+            self._store_boundary_observation_depth -= 1
+
+        finished_ns = observability.finish_runtime_operation(operation, succeeded=True)
+        self._record_transaction_transition(
+            operation,
+            finished_ns,
+            sql_token,
+            transaction_before=transaction_before,
+            transaction_after=self.in_transaction,
+            succeeded=True,
+        )
+        return result
 
     def _run_observed_statement(
         self,
@@ -467,7 +485,7 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
         token = _first_sql_token(statement)
         operation = observability.begin_runtime_operation(
             logical_name,
-            lock_bearing=token not in _READ_ONLY_SQL_TOKENS,
+            lock_bearing=_sql_is_lock_bearing(statement, token),
         )
         if operation is None:
             return call()
@@ -552,32 +570,44 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
                 finished_ns,
             )
 
-    def _finish_context_transaction(
-        self,
-        observability: StorageObservability | None,
-        logical_name: str | None,
-        started_ns: int | None,
-        *,
-        outcome: str,
-    ) -> None:
-        if (
-            observability is not None
-            and logical_name is not None
-            and started_ns is not None
-            and self._store_transaction_started_ns is not None
-        ):
-            observability.finish_transaction(logical_name, started_ns, outcome=outcome)
-        self._store_transaction_started_ns = None
-
     def close(self) -> None:
-        super().close()
+        transaction_active = self.in_transaction
+        observability = self._store_observability
+        logical_name = self._store_logical_name
+        started_ns = self._store_transaction_started_ns
+        if (
+            transaction_active
+            and started_ns is None
+            and observability is not None
+            and logical_name is not None
+        ):
+            started_ns = observability.start_transaction()
+        self._store_boundary_observation_depth += 1
+        try:
+            super().close()
+        finally:
+            self._store_boundary_observation_depth -= 1
         self._store_closed = True
-        authority = self._store_authority
-        handle_id = self._store_handle_id
-        if authority is not None and handle_id is not None:
-            authority._forget(handle_id)
-            self._store_authority = None
-            self._store_handle_id = None
+        try:
+            if (
+                transaction_active
+                and observability is not None
+                and logical_name is not None
+                and started_ns is not None
+            ):
+                observability.finish_transaction(
+                    logical_name,
+                    started_ns,
+                    outcome="rolled_back",
+                )
+        finally:
+            self._store_transaction_started_ns = None
+            authority = self._store_authority
+            handle_id = self._store_handle_id
+            if authority is not None and handle_id is not None:
+                authority._forget(handle_id)
+                self._store_authority = None
+                self._store_handle_id = None
 
 
 @dataclass(slots=True)
@@ -1375,6 +1405,7 @@ class StoreCatalog:
                         f"was unperformable: preflight={type(exc).__name__}: {exc}; "
                         "reconciliation="
                         f"{type(reconciliation_error).__name__}: {reconciliation_error}",
+                        quick_check_failed=quick_check_failed,
                     )
                 if failure_path_state == "absent":
                     observation = StoreObservation.absent(logical_names, absolute_path)
