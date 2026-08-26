@@ -14,10 +14,13 @@ import threading
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl
 
 from pinky_daemon.store_shutdown import StoreShutdownCoordinator, StoreShutdownReport
+
+if TYPE_CHECKING:
+    from pinky_daemon.storage_observability import RuntimeOperation, StorageObservability
 
 logger = logging.getLogger("pinky.store_catalog")
 
@@ -65,6 +68,34 @@ _SQLITE_SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 _IGNORED_DIRECTORY_KINDS = frozenset({"snapshot", "snapshots", "temp", "temporary", "tmp"})
 _SQLITE_HEADER_PREFIX = b"SQLite format 3\x00"
 _SQLITE_HEADER_JOURNAL_BYTES = slice(18, 20)
+_READ_ONLY_SQL_TOKENS = frozenset({"EXPLAIN", "PRAGMA", "SELECT", "VALUES"})
+_ROLLBACK_SQL_TOKENS = frozenset({"ROLLBACK"})
+
+
+def _first_sql_token(statement: str) -> str:
+    """Classify from at most 64 bytes of SQL without a regex or full-string scan."""
+    prefix = statement[:64]
+    index = 0
+    while index < len(prefix):
+        while index < len(prefix) and prefix[index].isspace():
+            index += 1
+        if prefix.startswith("--", index):
+            newline = prefix.find("\n", index + 2)
+            if newline < 0:
+                return ""
+            index = newline + 1
+            continue
+        if prefix.startswith("/*", index):
+            comment_end = prefix.find("*/", index + 2)
+            if comment_end < 0:
+                return ""
+            index = comment_end + 2
+            continue
+        break
+    token_start = index
+    while index < len(prefix) and (prefix[index].isalnum() or prefix[index] == "_"):
+        index += 1
+    return prefix[token_start:index].upper()
 
 
 def _sqlite_header_journal_mode(header: bytes) -> str | None:
@@ -306,13 +337,241 @@ class StoreCatalogError(RuntimeError):
 
 
 class _ManagedSQLiteConnection(sqlite3.Connection):
-    """Connection subclass that removes itself from the live-handle ledger."""
+    """Catalog connection with optional synchronous runtime recording."""
 
     _store_authority: _StoreConnectionAuthority | None = None
     _store_handle_id: int | None = None
+    _store_logical_name: str | None = None
+    _store_observability: StorageObservability | None = None
+    _store_transaction_started_ns: int | None = None
+    _store_closed = False
+
+    @property
+    def in_transaction(self) -> bool:
+        """Preserve the final false state for post-close ledger inspection."""
+        if self._store_closed:
+            return False
+        descriptor = sqlite3.Connection.in_transaction
+        return bool(descriptor.__get__(self, type(self)))
+
+    def execute(
+        self,
+        sql: str,
+        parameters: Any = (),
+        /,
+    ) -> sqlite3.Cursor:
+        execute = super().execute
+        return self._run_observed_statement(sql, lambda: execute(sql, parameters))
+
+    def executemany(
+        self,
+        sql: str,
+        seq_of_parameters: Iterable[Any],
+        /,
+    ) -> sqlite3.Cursor:
+        executemany = super().executemany
+        return self._run_observed_statement(
+            sql,
+            lambda: executemany(sql, seq_of_parameters),
+        )
+
+    def executescript(self, sql_script: str, /) -> sqlite3.Cursor:
+        executescript = super().executescript
+        return self._run_observed_statement(sql_script, lambda: executescript(sql_script))
+
+    def commit(self) -> None:
+        observability = self._store_observability
+        logical_name = self._store_logical_name
+        if observability is None or logical_name is None or not self.in_transaction:
+            return super().commit()
+        started_ns = self._store_transaction_started_ns
+        if started_ns is None:
+            started_ns = observability.start_transaction()
+        try:
+            super().commit()
+        except BaseException:
+            if not self.in_transaction:
+                self._store_transaction_started_ns = None
+            raise
+        if started_ns is not None and not self.in_transaction:
+            observability.finish_transaction(
+                logical_name,
+                started_ns,
+                outcome="committed",
+            )
+            self._store_transaction_started_ns = None
+
+    def rollback(self) -> None:
+        observability = self._store_observability
+        logical_name = self._store_logical_name
+        if observability is None or logical_name is None or not self.in_transaction:
+            return super().rollback()
+        started_ns = self._store_transaction_started_ns
+        if started_ns is None:
+            started_ns = observability.start_transaction()
+        try:
+            super().rollback()
+        except BaseException:
+            if not self.in_transaction:
+                self._store_transaction_started_ns = None
+            raise
+        if started_ns is not None and not self.in_transaction:
+            observability.finish_transaction(
+                logical_name,
+                started_ns,
+                outcome="rolled_back",
+            )
+            self._store_transaction_started_ns = None
+
+    def __enter__(self) -> _ManagedSQLiteConnection:
+        super().__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, traceback) -> bool:
+        observability = self._store_observability
+        logical_name = self._store_logical_name
+        transaction_active = self.in_transaction
+        started_ns = self._store_transaction_started_ns
+        if observability is not None and transaction_active and started_ns is None:
+            started_ns = observability.start_transaction()
+            self._store_transaction_started_ns = started_ns
+        try:
+            suppressed = super().__exit__(exc_type, exc, traceback)
+        except BaseException:
+            if not self.in_transaction:
+                self._finish_context_transaction(
+                    observability,
+                    logical_name,
+                    started_ns,
+                    outcome="rolled_back",
+                )
+            raise
+        if transaction_active and not self.in_transaction:
+            self._finish_context_transaction(
+                observability,
+                logical_name,
+                started_ns,
+                outcome="committed" if exc_type is None else "rolled_back",
+            )
+        return bool(suppressed)
+
+    def _run_observed_statement(
+        self,
+        statement: str,
+        call: Callable[[], sqlite3.Cursor],
+    ) -> sqlite3.Cursor:
+        observability = self._store_observability
+        logical_name = self._store_logical_name
+        if observability is None or logical_name is None:
+            return call()
+        token = _first_sql_token(statement)
+        operation = observability.begin_runtime_operation(
+            logical_name,
+            lock_bearing=token not in _READ_ONLY_SQL_TOKENS,
+        )
+        if operation is None:
+            return call()
+
+        transaction_before = self.in_transaction
+        try:
+            cursor = call()
+        except BaseException as exc:
+            primary_error_code = None
+            if isinstance(exc, sqlite3.Error):
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                if error_code is not None:
+                    primary_error_code = int(error_code) & 0xFF
+            finished_ns = observability.finish_runtime_operation(
+                operation,
+                succeeded=False,
+                sqlite_primary_error_code=primary_error_code,
+            )
+            self._record_transaction_transition(
+                operation,
+                finished_ns,
+                token,
+                transaction_before=transaction_before,
+                transaction_after=self.in_transaction,
+                succeeded=False,
+            )
+            raise
+
+        finished_ns = observability.finish_runtime_operation(operation, succeeded=True)
+        self._record_transaction_transition(
+            operation,
+            finished_ns,
+            token,
+            transaction_before=transaction_before,
+            transaction_after=self.in_transaction,
+            succeeded=True,
+        )
+        return cursor
+
+    def _record_transaction_transition(
+        self,
+        operation: RuntimeOperation,
+        finished_ns: int,
+        sql_token: str,
+        *,
+        transaction_before: bool,
+        transaction_after: bool,
+        succeeded: bool,
+    ) -> None:
+        observability = self._store_observability
+        logical_name = self._store_logical_name
+        if observability is None or logical_name is None:
+            return
+        if not transaction_before and transaction_after:
+            self._store_transaction_started_ns = operation.started_ns
+            return
+        if transaction_before and not transaction_after:
+            started_ns = self._store_transaction_started_ns
+            if started_ns is not None:
+                outcome = (
+                    "rolled_back"
+                    if sql_token in _ROLLBACK_SQL_TOKENS or not succeeded
+                    else "committed"
+                )
+                observability.record_transaction_duration(
+                    logical_name,
+                    started_ns,
+                    finished_ns,
+                    outcome=outcome,
+                )
+            self._store_transaction_started_ns = None
+            return
+        if (
+            not transaction_before
+            and not transaction_after
+            and succeeded
+            and operation.lock_bearing
+        ):
+            observability.record_transaction_duration(
+                logical_name,
+                operation.started_ns,
+                finished_ns,
+            )
+
+    def _finish_context_transaction(
+        self,
+        observability: StorageObservability | None,
+        logical_name: str | None,
+        started_ns: int | None,
+        *,
+        outcome: str,
+    ) -> None:
+        if (
+            observability is not None
+            and logical_name is not None
+            and started_ns is not None
+            and self._store_transaction_started_ns is not None
+        ):
+            observability.finish_transaction(logical_name, started_ns, outcome=outcome)
+        self._store_transaction_started_ns = None
 
     def close(self) -> None:
         super().close()
+        self._store_closed = True
         authority = self._store_authority
         handle_id = self._store_handle_id
         if authority is not None and handle_id is not None:
@@ -399,6 +658,8 @@ class _StoreConnectionAuthority:
             )
             connection._store_authority = self
             connection._store_handle_id = handle_id
+            connection._store_logical_name = logical_name
+            connection._store_observability = self._catalog._observability
             self._handles[handle_id] = handle
             return connection
 
@@ -529,6 +790,7 @@ class StoreCatalog:
         *,
         silence_allowlist: Mapping[str, str] | None = None,
         manifest: Mapping[str, StoreIntegrityTarget] | None = None,
+        observability: StorageObservability | None = None,
     ) -> None:
         root = os.getcwd() if expected_root is None else os.fspath(expected_root)
         self._expected_root = os.path.realpath(root)
@@ -537,6 +799,7 @@ class StoreCatalog:
         )
         self._silence_allowlist = dict(configured_allowlist)
         self._manifest = dict(manifest or {})
+        self._observability = observability
         self._entries: list[_CatalogEntry] = []
         self._observations: list[StoreObservation] = []
         self._lock = threading.RLock()
@@ -560,6 +823,13 @@ class StoreCatalog:
             if self._entries:
                 raise StoreCatalogError("store manifest cannot change after registration")
             self._manifest = dict(manifest)
+
+    def configure_observability(self, observability: StorageObservability) -> None:
+        """Attach the optional recorder before catalog-owned connections open."""
+        with self._lock:
+            if self._entries:
+                raise StoreCatalogError("storage observability cannot change after registration")
+            self._observability = observability
 
     def connection_policy(self, logical_name: str) -> StoreConnectionPolicy:
         """Return the catalog-declared connection policy for one store."""
@@ -602,6 +872,8 @@ class StoreCatalog:
         **kwargs: Any,
     ) -> sqlite3.Connection:
         """Open and track one connection under the catalog's declared policy."""
+        if self._observability is not None:
+            self._observability.enable_runtime_if_armed()
         return self._connection_authority.open(
             logical_name,
             database,
@@ -1019,6 +1291,7 @@ class StoreCatalog:
                 self._raise_integrity_error(matching_targets, absolute_path, exc)
 
             retain_bound_file = False
+            quick_check_failed = False
             try:
                 header_journal_mode = bound_file.header_journal_mode()
                 rollback_required = any(
@@ -1051,7 +1324,11 @@ class StoreCatalog:
                         journal_row = connection.execute("PRAGMA journal_mode").fetchone()
                         if journal_row and journal_row[0]:
                             observed_journal_mode = str(journal_row[0]).lower()
-                    rows = connection.execute("PRAGMA quick_check").fetchall()
+                    try:
+                        rows = connection.execute("PRAGMA quick_check").fetchall()
+                    except sqlite3.Error:
+                        quick_check_failed = True
+                        raise
                 finally:
                     connection.close()
 
@@ -1118,7 +1395,12 @@ class StoreCatalog:
                     outcomes,
                     on_outcome,
                 )
-                self._raise_integrity_error(matching_targets, absolute_path, exc)
+                self._raise_integrity_error(
+                    matching_targets,
+                    absolute_path,
+                    exc,
+                    quick_check_failed=quick_check_failed,
+                )
             else:
                 if rows != [("ok",)]:
                     self._record_integrity_outcomes(
@@ -1131,6 +1413,7 @@ class StoreCatalog:
                         matching_targets,
                         absolute_path,
                         f"PRAGMA quick_check returned {rows!r}",
+                        quick_check_failed=True,
                     )
                 observation = StoreObservation(
                     logical_names=logical_names,
@@ -1179,12 +1462,19 @@ class StoreCatalog:
             if on_outcome is not None:
                 on_outcome(target.logical_name, outcome)
 
-    @staticmethod
     def _raise_integrity_error(
+        self,
         targets: list[StoreIntegrityTarget],
         resolved_path: str,
         detail: BaseException | str,
+        *,
+        quick_check_failed: bool = False,
     ) -> None:
+        if self._observability is not None:
+            self._observability.record_preflight_refusal(
+                (target.logical_name for target in targets),
+                quick_check_failed=quick_check_failed,
+            )
         logical_names = ", ".join(target.logical_name for target in targets)
         if isinstance(detail, BaseException):
             rendered_detail = f"{type(detail).__name__}: {detail}"
@@ -1666,9 +1956,7 @@ class DaemonStoreCatalog(StoreCatalog):
             newly_opened = matching_descriptors.difference(descriptors_before)
             sqlite_reused = matching_descriptors.intersection(descriptors_before)
             if not newly_opened and not sqlite_reused:
-                raise OSError(
-                    "pathname-opened WAL database does not match its pinned preflight fd"
-                )
+                raise OSError("pathname-opened WAL database does not match its pinned preflight fd")
             bound_file.require_path_unchanged()
         except BaseException:
             connection.close()
@@ -1681,8 +1969,7 @@ class DaemonStoreCatalog(StoreCatalog):
         resolved_parent = os.path.dirname(resolved_path)
         if not self._is_under_expected_root(resolved_path):
             raise PermissionError(
-                "WAL preflight path escapes the daemon-owned catalog root: "
-                f"{resolved_path!r}"
+                f"WAL preflight path escapes the daemon-owned catalog root: {resolved_path!r}"
             )
 
         daemon_uid = os.geteuid()

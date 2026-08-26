@@ -1736,6 +1736,7 @@ def create_api(
     store_catalog = DaemonStoreCatalog(expected_root=_data_dir)
     store_catalog.configure_manifest(store_manifest)
     storage_observability = StorageObservability(store_manifest)
+    store_catalog.configure_observability(storage_observability)
     try:
         store_catalog.preflight_integrity(
             store_manifest.values(),
@@ -1745,7 +1746,10 @@ def create_api(
         store_catalog.close()
         storage_observability.record_boot_failure()
         raise
-    store_snapshot_service = StoreSnapshotService(store_catalog)
+    store_snapshot_service = StoreSnapshotService(
+        store_catalog,
+        observability=storage_observability,
+    )
 
     app = FastAPI(
         title="Pinky",
@@ -1755,6 +1759,14 @@ def create_api(
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
     app.state.ferry_listener = FerryListenerState.from_config(FerryConfig.from_env())
+
+    @app.middleware("http")
+    async def _activate_storage_runtime(request: Request, call_next):
+        # ``create_api`` is still constructor time. The first ASGI request is
+        # the serving boundary for test harnesses that do not run lifespan;
+        # production also enables at startup before background work begins.
+        storage_observability.enable_runtime()
+        return await call_next(request)
 
     @app.exception_handler(RequestValidationError)
     async def _request_validation_response(
@@ -12395,6 +12407,8 @@ npm run build</pre>
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
         nonlocal shared_mcp_manager
 
+        storage_observability.enable_runtime()
+
         # Lock down SQLite file permissions to owner-only. Runs here (not in
         # create_api) so every store's __init__ has already created its DB
         # file; the sweep is idempotent and best-effort.
@@ -14201,5 +14215,6 @@ npm run build</pre>
         _log(f"ERROR startup: store catalog validation failed: {exc}")
         raise
     storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
+    storage_observability.arm_runtime()
 
     return app
