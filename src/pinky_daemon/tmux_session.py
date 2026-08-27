@@ -9341,7 +9341,13 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_context_reload_guard is guard:
             self._wake_context_reload_guard = None
 
-    def _on_transcript_entry(self, entry: dict) -> None:
+    def _on_transcript_entry(
+        self,
+        entry: dict,
+        *,
+        entry_offset: int | None = None,
+        source_identity: tuple[int, int] | None = None,
+    ) -> None:
         """Consume transcript evidence strong enough for exact-turn receipts."""
         entry_type = entry.get("type")
         if entry_type == "queue-operation":
@@ -9418,6 +9424,29 @@ class TmuxSession(TransportReplacementMixin):
                     self._mark_transport_accepted(turn)
                 else:
                     for folded_turn in self._folded_acceptance_turns(prompt):
+                        folded_meta = next(
+                            (
+                                meta
+                                for meta in self._inflight_metas
+                                if meta.turn is folded_turn
+                            ),
+                            None,
+                        )
+                        if folded_meta is None:
+                            continue
+                        ticket_identity = (
+                            folded_meta.transcript_file_identity_at_paste
+                        )
+                        ticket_offset = folded_meta.transcript_offset_at_paste
+                        if (
+                            source_identity is None
+                            or ticket_identity is None
+                            or source_identity != ticket_identity
+                            or entry_offset is None
+                            or ticket_offset is None
+                            or entry_offset < ticket_offset
+                        ):
+                            continue
                         self._mark_transport_accepted(folded_turn)
 
     @staticmethod
