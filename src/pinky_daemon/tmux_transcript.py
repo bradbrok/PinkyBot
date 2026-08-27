@@ -46,7 +46,9 @@ Two reasons:
 from __future__ import annotations
 
 import asyncio
+import inspect
 import json
+import os
 import sys
 import time
 from pathlib import Path
@@ -275,6 +277,29 @@ def _parse_ts(raw: str) -> float | None:
 # can do async work like awaiting the response_callback / cost_callback /
 # conversation_store writes without forcing a sync bridge.
 TurnCallback = Callable[[TurnResponse], Awaitable[None]]
+EntryCallback = Callable[..., None]
+_BoundEntryCallback = Callable[[dict, int, tuple[int, int]], None]
+
+
+def _bind_entry_callback(
+    callback: EntryCallback | None,
+) -> _BoundEntryCallback | None:
+    """Bind legacy entry-only or provenance-aware callback arity once."""
+    if callback is None:
+        return None
+    try:
+        inspect.signature(callback).bind(
+            {},
+            entry_offset=0,
+            source_identity=(0, 0),
+        )
+    except (TypeError, ValueError):
+        return lambda entry, _entry_offset, _source_identity: callback(entry)
+    return lambda entry, entry_offset, source_identity: callback(
+        entry,
+        entry_offset=entry_offset,
+        source_identity=source_identity,
+    )
 
 
 class TmuxTranscriptTailer:
@@ -307,7 +332,7 @@ class TmuxTranscriptTailer:
         active_poll_sec: float = _ACTIVE_POLL_SEC,
         path_discovery: Callable[[], Path | None] | None = None,
         on_usage: Callable[[dict], None] | None = None,
-        on_entry: Callable[[dict], None] | None = None,
+        on_entry: EntryCallback | None = None,
         on_bound_path_wedge: Callable[[Path, float], None] | None = None,
     ) -> None:
         self._path = Path(transcript_path)
@@ -351,7 +376,7 @@ class TmuxTranscriptTailer:
         self._on_usage = on_usage
         # Raw-entry hook used by TmuxSession to observe prompt acceptance.
         # Sync so reading a chunk has no new suspension point.
-        self._on_entry = on_entry
+        self._on_entry = _bind_entry_callback(on_entry)
 
         self._offset: int = 0
         # Bumped by every path-changing ``set_transcript_path``. Lets
@@ -732,42 +757,48 @@ class TmuxTranscriptTailer:
         """
         if not self._path.exists():
             return 0
-        self._bound_path_ever_materialized = True
-
         # Snapshot for the mid-chunk swap check below. The only awaits in
         # this method are the turn callbacks; everything else is sync, so
         # a concurrent ``set_transcript_path`` can only land while a
         # callback is in flight.
         generation = self._swap_generation
 
-        size = self._path.stat().st_size
-        if size < self._offset:
-            # File truncated or rotated underneath us. Reset to 0 and
-            # replay; downstream consumers should be idempotent against
-            # repeat turns, but in practice the buffer is empty on
-            # rotation so this just rebuilds state from scratch.
-            _log(
-                f"tmux_tailer[{self._agent_name}]: file shrank "
-                f"({size} < {self._offset}); resetting to 0"
-            )
-            self._offset = 0
-            self._buffer.drain()  # discard partial state
-            self._stats["rotations"] += 1
-
-        if size == self._offset:
-            return 0
-
         bytes_read = 0
-        # Read in text mode — Claude Code transcripts are UTF-8. Buffer
-        # may contain a partial trailing line if Claude Code is mid-write;
-        # we only advance offset by complete lines.
+        # Read bytes so offsets stay exact across UTF-8 and the opened
+        # descriptor can authoritatively identify every delivered row. Buffer
+        # may contain a partial trailing line if Claude Code is mid-write; we
+        # only advance offset by complete lines.
         #
         # ``_MAX_READ_CHUNK_BYTES`` caps single-read memory so a pathological
         # transcript path (or attacker-pointed file via the path-update
         # endpoint) can't OOM the daemon. If more data remains after the
         # cap, the wake_event is re-armed below so the next loop iteration
         # picks it up — slower but bounded.
-        with self._path.open("r", encoding="utf-8", errors="replace") as fh:
+        try:
+            handle = self._path.open("rb")
+        except FileNotFoundError:
+            return 0
+        with handle as fh:
+            opened = os.fstat(fh.fileno())
+            source_identity = (opened.st_dev, opened.st_ino)
+            size = opened.st_size
+            self._bound_path_ever_materialized = True
+            if size < self._offset:
+                # File truncated or rotated underneath us. Reset to 0 and
+                # replay; downstream consumers should be idempotent against
+                # repeat turns, but in practice the buffer is empty on
+                # rotation so this just rebuilds state from scratch.
+                _log(
+                    f"tmux_tailer[{self._agent_name}]: file shrank "
+                    f"({size} < {self._offset}); resetting to 0"
+                )
+                self._offset = 0
+                self._buffer.drain()  # discard partial state
+                self._stats["rotations"] += 1
+
+            if size == self._offset:
+                return 0
+
             fh.seek(self._offset)
             chunk = fh.read(_MAX_READ_CHUNK_BYTES)
             more_pending = (size - self._offset) > _MAX_READ_CHUNK_BYTES
@@ -775,35 +806,40 @@ class TmuxTranscriptTailer:
             # line (no trailing newline → don't consume).
             if not chunk:
                 return 0
-            if chunk.endswith("\n"):
+            if chunk.endswith(b"\n"):
                 complete = chunk
-                partial = ""
+                partial = b""
             else:
-                last_nl = chunk.rfind("\n")
+                last_nl = chunk.rfind(b"\n")
                 if last_nl == -1:
                     # No complete line yet. Don't advance offset.
                     return 0
                 complete = chunk[: last_nl + 1]
                 partial = chunk[last_nl + 1:]
 
-            for line in complete.splitlines():
+            for line in complete.split(b"\n")[:-1]:
+                entry_offset = self._offset + bytes_read
+                bytes_read += len(line) + 1
                 if not line.strip():
                     continue
                 self._stats["lines_read"] += 1
                 try:
-                    entry = json.loads(line)
+                    entry = json.loads(line.decode("utf-8", errors="replace"))
                 except json.JSONDecodeError:
                     self._stats["parse_errors"] += 1
                     _log(
                         f"tmux_tailer[{self._agent_name}]: skipping malformed "
-                        f"JSON at offset {self._offset}+{bytes_read}"
+                        f"JSON at offset {entry_offset}"
                     )
-                    bytes_read += len(line) + 1
                     continue
 
                 if self._on_entry is not None:
                     try:
-                        self._on_entry(dict(entry))
+                        self._on_entry(
+                            dict(entry),
+                            entry_offset,
+                            source_identity,
+                        )
                     except Exception as e:
                         self._stats["callback_errors"] += 1
                         _log(
@@ -824,8 +860,6 @@ class TmuxTranscriptTailer:
                         f"tmux_tailer[{self._agent_name}]: feed raised "
                         f"({type(e).__name__}: {e}); skipping entry"
                     )
-
-                bytes_read += len(line.encode("utf-8")) + 1  # +1 for the \n
 
                 # Mid-turn context surfacing: this entry refreshed the
                 # usage snapshot — hand it to the consumer NOW rather
@@ -869,7 +903,7 @@ class TmuxTranscriptTailer:
 
             # Advance past complete lines only. Partial line stays in the
             # file and we'll re-read it next loop.
-            self._offset += len(complete.encode("utf-8"))
+            self._offset += len(complete)
             # ``partial`` is dropped intentionally — next read picks it up.
             _ = partial
 

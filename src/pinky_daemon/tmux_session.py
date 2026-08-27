@@ -7601,27 +7601,72 @@ class TmuxSession(TransportReplacementMixin):
                     incomplete.add(key)
                 rows[key] = found
 
-            used: set[tuple[_TranscriptSourceKey, int]] = set()
+            # Phase 1 is the pre-#1163 exact allocator byte-for-byte: each
+            # candidate claims its oldest distinct exact row, including an
+            # already accepted candidate whose row must not be donated to a
+            # later duplicate. Exact-reserved rows are wholly unavailable to
+            # containment, even for a different nested prompt.
+            exact_rows: set[tuple[_TranscriptSourceKey, int]] = set()
+            claims: list[tuple[int, int, bytes] | None] = [None] * len(candidates)
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                if source is None:
+                    continue
+                key, allocation_start, _proof_available, _fallback = source
+                for row_offset, row_end, prompt, raw in rows.get(key, []):
+                    occurrence = (key, row_offset)
+                    if (
+                        row_offset >= allocation_start
+                        and occurrence not in exact_rows
+                        and prompt == entry.turn.prompt
+                    ):
+                        exact_rows.add(occurrence)
+                        claims[index] = (row_offset, row_end, raw)
+                        break
+
+            # Phase 2 allocates full-prompt occurrences inside folded rows to
+            # candidates still lacking an exact row. One folded row may prove
+            # several turns, but every character span is globally owned by at
+            # most one candidate. Candidate order remains the existing FIFO.
+            occupied_spans: dict[
+                tuple[_TranscriptSourceKey, int],
+                list[tuple[int, int]],
+            ] = {}
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                candidate_prompt = entry.turn.prompt
+                if (
+                    claims[index] is not None
+                    or source is None
+                    or not candidate_prompt
+                ):
+                    continue
+                key, allocation_start, _proof_available, _fallback = source
+                for row_offset, row_end, prompt, raw in rows.get(key, []):
+                    row_key = (key, row_offset)
+                    if row_offset < allocation_start or row_key in exact_rows:
+                        continue
+                    spans = occupied_spans.setdefault(row_key, [])
+                    claimed_span = self._first_unoccupied_prompt_span(
+                        prompt,
+                        candidate_prompt,
+                        spans,
+                    )
+                    if claimed_span is None:
+                        continue
+                    spans.append(claimed_span)
+                    claims[index] = (row_offset, row_end, raw)
+                    break
+
             verdicts: list[bool | None] = []
-            for entry, source in zip(candidates, sources, strict=True):
-                claimed: tuple[int, int, bytes] | None = None
+            for index, (entry, source) in enumerate(
+                zip(candidates, sources, strict=True)
+            ):
+                claimed = claims[index]
                 if source is not None:
-                    (
-                        key,
-                        allocation_start,
-                        proof_available,
-                        fallback,
-                    ) = source
-                    for row_offset, row_end, prompt, raw in rows.get(key, []):
-                        occurrence = (key, row_offset)
-                        if (
-                            row_offset >= allocation_start
-                            and occurrence not in used
-                            and prompt == entry.turn.prompt
-                        ):
-                            used.add(occurrence)
-                            claimed = (row_offset, row_end, raw)
-                            break
+                    key, _allocation_start, proof_available, fallback = source
                 else:
                     key = None
                     proof_available = False
@@ -8296,6 +8341,7 @@ class TmuxSession(TransportReplacementMixin):
                     replay: list[_QueuedTurn] = []
                     drained_count = 0
                     dropped_count = 0
+                    ledger_suppressed_count = 0
                     terminal_fenced_count = 0
                     unavailable_count = sum(
                         consumed is None for consumed in consumption_verdicts
@@ -8316,6 +8362,68 @@ class TmuxSession(TransportReplacementMixin):
                         header = turn.prompt.splitlines()[0] if turn.prompt else ""
 
                         if consumed is False:
+                            ledgered = False
+                            if (
+                                turn.message_id
+                                and not turn.scheduler_serialized
+                                and self._registry is not None
+                            ):
+                                try:
+                                    ledgered = self._registry.is_turn_delivered(
+                                        self.agent_name,
+                                        turn.platform,
+                                        turn.chat_id,
+                                        turn.message_id,
+                                    )
+                                except Exception as exc:
+                                    # This is a duplicate-suppression backstop,
+                                    # never proof by itself. Registry uncertainty
+                                    # must fail open to today's replay behavior.
+                                    _log(
+                                        f"tmux[{self.agent_name}]: "
+                                        "PHANTOM_LEDGER_READ_FAILURE; failing "
+                                        "open to requeue "
+                                        f"(message_id={turn.message_id!r}, "
+                                        f"{type(exc).__name__}: {exc})"
+                                    )
+                            if ledgered:
+                                ledger_suppressed_count += 1
+                                scheduler_state = self._receipt_state_label(
+                                    turn.scheduler_delivery
+                                )
+                                submission_state = self._receipt_state_label(
+                                    turn.submission_receipt
+                                )
+                                _log(
+                                    f"tmux[{self.agent_name}]: "
+                                    "PHANTOM_SUPPRESSED_LEDGERED dropping "
+                                    "already-delivered phantom instead of "
+                                    "duplicate replay "
+                                    f"(platform={turn.platform!r}, "
+                                    f"chat_id={turn.chat_id!r}, "
+                                    f"message_id={turn.message_id!r}, "
+                                    f"scheduler_receipt={scheduler_state}, "
+                                    f"submission_receipt={submission_state}, "
+                                    f"prompt_header={header!r})"
+                                )
+                                ev = entry.completion_event
+                                if ev is not None and not ev.is_set():
+                                    ev.set()
+                                delivery = turn.scheduler_delivery
+                                if delivery is not None and not delivery.done():
+                                    delivery.set_result(False)
+                                self._resolve_submission_receipt(turn, False)
+                                log_watchdog_decision(
+                                    watchdog="inflight",
+                                    agent=self.agent_name,
+                                    decision="drop",
+                                    reason="phantom_suppressed_ledgered",
+                                    state=self.state.value,
+                                    progress_stale_s=age,
+                                    inflight_turns=depth,
+                                    inflight_active=False,
+                                )
+                                continue
                             if turn.scheduler_serialized:
                                 # The ordinary queue becomes the sole replay
                                 # owner before the turn is made visible there.
@@ -8420,6 +8528,12 @@ class TmuxSession(TransportReplacementMixin):
                         )
 
                     self._prepend_message_queue(replay)
+                    if ledger_suppressed_count:
+                        _log(
+                            f"tmux[{self.agent_name}]: "
+                            "PHANTOM_LEDGER_SUPPRESSION_SUMMARY "
+                            f"suppressed={ledger_suppressed_count}"
+                        )
                     _log(
                         f"tmux[{self.agent_name}]: inflight head aged {age:.1f}s "
                         f"but REPL is idle — reconciled {drained_count} phantom "
@@ -8983,6 +9097,56 @@ class TmuxSession(TransportReplacementMixin):
             unique.setdefault(id(turn), turn)
         return sorted(unique.values(), key=lambda turn: turn.queued_at)
 
+    @staticmethod
+    def _first_unoccupied_prompt_span(
+        content: str,
+        prompt: str,
+        occupied: list[tuple[int, int]],
+    ) -> tuple[int, int] | None:
+        """Return the first full prompt occurrence not overlapping a claim."""
+        if not prompt:
+            return None
+        search_from = 0
+        while True:
+            start = content.find(prompt, search_from)
+            if start < 0:
+                return None
+            end = start + len(prompt)
+            if all(
+                end <= used_start or start >= used_end
+                for used_start, used_end in occupied
+            ):
+                return start, end
+            search_from = start + 1
+
+    def _folded_acceptance_turns(self, content: str) -> list[_QueuedTurn]:
+        """Allocate one folded user-row occurrence per pending pane turn."""
+        occupied: list[tuple[int, int]] = []
+        matched: list[_QueuedTurn] = []
+        for turn in self._acceptance_candidates():
+            if not turn.pane_delivery_started or not turn.prompt:
+                continue
+            if (
+                not turn.transport_accepted
+                and turn.submission_receipt is not None
+                and turn.submission_receipt.done()
+                and not self._receipt_accepted(turn.submission_receipt)
+            ):
+                continue
+            span = self._first_unoccupied_prompt_span(
+                content,
+                turn.prompt,
+                occupied,
+            )
+            if span is None:
+                continue
+            occupied.append(span)
+            # Accepted occurrences still reserve their span so a replayed row
+            # cannot donate it, but _mark_transport_accepted must not run twice.
+            if not turn.transport_accepted:
+                matched.append(turn)
+        return matched
+
     def _match_acceptance_turn(
         self, prompt: str, *, for_enqueue: bool = False
     ) -> _QueuedTurn | None:
@@ -9177,7 +9341,13 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_context_reload_guard is guard:
             self._wake_context_reload_guard = None
 
-    def _on_transcript_entry(self, entry: dict) -> None:
+    def _on_transcript_entry(
+        self,
+        entry: dict,
+        *,
+        entry_offset: int | None = None,
+        source_identity: tuple[int, int] | None = None,
+    ) -> None:
         """Consume transcript evidence strong enough for exact-turn receipts."""
         entry_type = entry.get("type")
         if entry_type == "queue-operation":
@@ -9249,9 +9419,35 @@ class TmuxSession(TransportReplacementMixin):
                     if not evidence.accepted_at_dequeue and not evidence.retired:
                         self._mark_transport_accepted(evidence.turn)
                     return
-                self._mark_transport_accepted(
-                    self._match_acceptance_content(prompt)
-                )
+                turn = self._match_acceptance_content(prompt)
+                if turn is not None:
+                    self._mark_transport_accepted(turn)
+                else:
+                    for folded_turn in self._folded_acceptance_turns(prompt):
+                        folded_meta = next(
+                            (
+                                meta
+                                for meta in self._inflight_metas
+                                if meta.turn is folded_turn
+                            ),
+                            None,
+                        )
+                        if folded_meta is None:
+                            continue
+                        ticket_identity = (
+                            folded_meta.transcript_file_identity_at_paste
+                        )
+                        ticket_offset = folded_meta.transcript_offset_at_paste
+                        if (
+                            source_identity is None
+                            or ticket_identity is None
+                            or source_identity != ticket_identity
+                            or entry_offset is None
+                            or ticket_offset is None
+                            or entry_offset < ticket_offset
+                        ):
+                            continue
+                        self._mark_transport_accepted(folded_turn)
 
     @staticmethod
     def _resolve_submission_receipt(
@@ -9261,6 +9457,20 @@ class TmuxSession(TransportReplacementMixin):
         receipt = turn.submission_receipt
         if receipt is not None and not receipt.done():
             receipt.set_result(accepted)
+
+    @staticmethod
+    def _receipt_state_label(receipt: asyncio.Future[bool] | None) -> str:
+        """Compact receipt state for anomalous-drop diagnostics."""
+        if receipt is None:
+            return "absent"
+        if not receipt.done():
+            return "pending"
+        if receipt.cancelled():
+            return "cancelled"
+        try:
+            return "accepted" if receipt.result() is True else "rejected"
+        except Exception:
+            return "error"
 
     @staticmethod
     def _receipt_accepted(receipt: asyncio.Future[bool]) -> bool:
