@@ -124,6 +124,8 @@ def test_admin_watchdog_exposes_bounded_boot_preflight_inventory_and_reconcile_m
         "inventory",
         "reconcile_warning_count",
         "snapshots",
+        "runtime",
+        "corruption",
     }
     assert storage["boot_gate"]["outcome"] == "warn"
     expected_warning_count = len(DEFAULT_FILESYSTEM_SILENCE_ALLOWLIST)
