@@ -228,7 +228,11 @@ async def test_fold_live_acceptance_persists_receipts_and_drains_without_requeue
     row = _folded_user_entry(prompt)
     _append_entry(transcript, row)
 
-    session._on_transcript_entry(row)
+    session._on_transcript_entry(
+        row,
+        entry_offset=folded.transcript_offset_at_paste,
+        source_identity=folded.transcript_file_identity_at_paste,
+    )
 
     assert folded.turn.transport_accepted is True
     assert scheduler_receipt.result() is True
@@ -253,7 +257,9 @@ async def test_fold_live_acceptance_persists_receipts_and_drains_without_requeue
 
 
 @pytest.mark.asyncio
-async def test_fold_acceptance_releases_scheduler_gate_before_idle_reconcile() -> None:
+async def test_fold_acceptance_releases_scheduler_gate_before_idle_reconcile(
+    tmp_path: Path,
+) -> None:
     """Fold evidence settles the receipt that makes the scheduler gate busy."""
     session = _make_session()
     session._config.live_status_fn = lambda: {
@@ -267,9 +273,20 @@ async def test_fold_acceptance_releases_scheduler_gate_before_idle_reconcile() -
         prompt=prompt,
         submission_receipt=receipt,
     )
+    transcript = tmp_path / "session.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    session._tailer = MagicMock()
+    session._tailer.transcript_path = transcript
+    _bind_ticket(entry, transcript)
+    row = _folded_user_entry(prompt)
+    _append_entry(transcript, row)
 
     assert session._scheduler_pane_busy() is True
-    session._on_transcript_entry(_folded_user_entry(prompt))
+    session._on_transcript_entry(
+        row,
+        entry_offset=entry.transcript_offset_at_paste,
+        source_identity=entry.transcript_file_identity_at_paste,
+    )
 
     assert entry.turn.transport_accepted is True
     assert receipt.result() is True
