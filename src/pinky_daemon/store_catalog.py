@@ -102,10 +102,7 @@ def _sql_is_lock_bearing(statement: str, token: str) -> bool:
     """Classify bounded SQL, including assignment-form mutating PRAGMAs."""
     if token != "PRAGMA":
         return token not in _READ_ONLY_SQL_TOKENS
-    for character in statement[:64]:
-        if character == "=":
-            return True
-    return False
+    return "=" in statement
 
 
 def _sqlite_header_journal_mode(header: bytes) -> str | None:
