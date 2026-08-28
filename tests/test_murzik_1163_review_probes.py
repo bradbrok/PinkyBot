@@ -167,7 +167,7 @@ def test_partial_fold_row_at_scan_budget_boundary_stays_unavailable(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    """A budget-truncated row cannot become positive containment evidence."""
+    """A budget-clipped row means replay under end-cause discrimination."""
     session = _make_session()
     transcript = tmp_path / "partial-budget.jsonl"
     transcript.write_text('{"type":"system"}\n', encoding="utf-8")
@@ -187,7 +187,7 @@ def test_partial_fold_row_at_scan_budget_boundary_stays_unavailable(
         anchor_bytes + 8,
     )
 
-    assert session._phantom_consumption_verdicts([entry]) == [None]
+    assert session._phantom_consumption_verdicts([entry]) == [False]
 
 
 @pytest.mark.asyncio
