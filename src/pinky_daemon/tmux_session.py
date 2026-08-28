@@ -7641,6 +7641,7 @@ class TmuxSession(TransportReplacementMixin):
             ] = {}
             incomplete: set[_TranscriptSourceKey] = set()
             parsed_rows: set[_TranscriptSourceKey] = set()
+            budget_exhausted: set[_TranscriptSourceKey] = set()
             for key, start in scan_starts.items():
                 found: list[tuple[int, int, str, bytes]] = []
                 handle = handles[key]
@@ -7648,12 +7649,15 @@ class TmuxSession(TransportReplacementMixin):
                     handle.seek(start)
                     while budget_remaining > 0:
                         row_offset = handle.tell()
-                        raw = handle.readline(budget_remaining)
+                        read_budget = budget_remaining
+                        raw = handle.readline(read_budget)
                         if not raw:
                             break
                         budget_remaining -= len(raw)
                         if not raw.endswith(b"\n"):
                             incomplete.add(key)
+                            if len(raw) == read_budget:
+                                budget_exhausted.add(key)
                             break
                         try:
                             parsed = json.loads(raw)
@@ -7673,6 +7677,7 @@ class TmuxSession(TransportReplacementMixin):
                             break
                     else:
                         incomplete.add(key)
+                        budget_exhausted.add(key)
                 except (AttributeError, OSError, TypeError, ValueError):
                     incomplete.add(key)
                 rows[key] = found
@@ -8056,15 +8061,20 @@ class TmuxSession(TransportReplacementMixin):
                     and key is not None
                     and bool(entry.turn.prompt)
                     and key in fold_history_incomplete
-                    and (key not in incomplete or key in parsed_rows)
+                    and (
+                        key in budget_exhausted
+                        or key not in incomplete
+                        or key in parsed_rows
+                    )
                 ):
                     # A partial byte-zero reconstruction cannot classify an
                     # orphan safely. This fold-candidate verdict takes
                     # precedence over the legacy unavailable-source branch:
-                    # at least one complete row made the source available, but
-                    # its fold history is ambiguous, so recovery is replay
-                    # (False), not drain (None). If even the first row was
-                    # partial, the non-fold unavailable verdict stays None.
+                    # a complete row or a budget-caused phase-1 end made the
+                    # opened source available, but its fold history is
+                    # ambiguous, so recovery is replay (False), not drain
+                    # (None). Exceptions and genuine short first-row partials
+                    # retain the legacy unavailable verdict.
                     verdicts.append(False)
                 elif (
                     key is not None
