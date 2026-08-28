@@ -916,16 +916,18 @@ def test_sibling_source_budget_starvation_requires_replay(
 
 
 @pytest.mark.parametrize(
-    ("budget_clipped", "expected"),
+    ("partial_kind", "expected"),
     [
-        pytest.param(True, False, id="budget-clipped"),
-        pytest.param(False, None, id="genuine-partial"),
+        pytest.param("budget-clipped", False, id="budget-clipped"),
+        pytest.param("exact-eof-at-budget", None, id="exact-eof-at-budget"),
+        pytest.param("budget-minus-one", None, id="budget-minus-one"),
+        pytest.param("genuine-partial", None, id="genuine-partial"),
     ],
 )
 def test_first_row_partial_distinguishes_budget_starvation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
-    budget_clipped: bool,
+    partial_kind: str,
     expected: bool | None,
 ) -> None:
     scan_budget = 128
@@ -935,15 +937,21 @@ def test_first_row_partial_distinguishes_budget_starvation(
         scan_budget,
     )
     session = _make_session()
-    transcript = tmp_path / f"first-row-{'clipped' if budget_clipped else 'partial'}.jsonl"
+    transcript = tmp_path / f"first-row-{partial_kind}.jsonl"
     transcript.write_text('{"type":"system"}\n', encoding="utf-8")
     seeded = _seed_inflight(session, prompt="fold candidate with partial first row")
     _bind_ticket(seeded, transcript)
     post_anchor_budget = scan_budget - transcript.stat().st_size
-    partial_size = post_anchor_budget if budget_clipped else 20
-    assert 0 < partial_size <= post_anchor_budget
+    partial_size = {
+        "budget-clipped": post_anchor_budget + 20,
+        "exact-eof-at-budget": post_anchor_budget,
+        "budget-minus-one": post_anchor_budget - 1,
+        "genuine-partial": 20,
+    }[partial_kind]
+    assert partial_size > 0
     with transcript.open("ab") as handle:
         handle.write(b"x" * partial_size)
+    assert (transcript.stat().st_size > scan_budget) is (partial_kind == "budget-clipped")
 
     assert session._phantom_consumption_verdicts([seeded]) == [expected]
 
