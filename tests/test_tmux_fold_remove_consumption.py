@@ -804,6 +804,90 @@ async def test_requeue_decision_logs_repr_quoted_first_line_prompt_header(
     assert "hidden later line" not in rendered
 
 
+def test_replay_purge_covers_attachment_first_partial_cancel_and_refold(
+    tmp_path: Path,
+) -> None:
+    observed: dict[str, tuple[bool, list[bool | None]]] = {}
+    for fresh_attachment in (False, True):
+        flavor = "refold" if fresh_attachment else "cancel"
+        session = _make_session()
+        transcript = tmp_path / f"partial-{flavor}.jsonl"
+        transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+        prompt = f"attachment-first partial before {flavor}"
+        seeded = _seed_inflight(session, prompt=prompt)
+        _bind_ticket(seeded, transcript)
+
+        _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+        _emit_live(session, transcript, _attachment_entry(prompt))
+        assert len(session._pane_queue_operations) == 1
+        assert len(session._pane_fold_attachments) == 1
+        assert not session._pane_fold_removes
+
+        session._purge_fold_removes_for_turn(seeded.turn)
+        _bind_ticket(seeded, transcript)
+        seeded.turn.replay_count = 1
+        seeded.turn.pane_delivery_started = True
+        seeded.turn.pane_queue_enqueued = False
+
+        _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+        if fresh_attachment:
+            _emit_live(session, transcript, _attachment_entry(prompt))
+        _emit_live(session, transcript, _queue_entry("remove", prompt))
+
+        live_accepted = seeded.turn.transport_accepted
+        seeded.turn.transport_accepted = False
+        probe_verdict = session._phantom_consumption_verdicts([seeded])
+        observed[flavor] = (live_accepted, probe_verdict)
+        _assert_fold_pair_byte_counters(session)
+
+    assert observed == {
+        "cancel": (False, [False]),
+        "refold": (False, [True]),
+    }
+
+
+def test_incomplete_full_history_for_fold_candidate_requires_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    monkeypatch.setattr(tmux_session, "_PHANTOM_TRANSCRIPT_SCAN_BYTES", 256)
+    session = _make_session()
+    transcript = tmp_path / "over-budget-fold-history.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    seeded = _seed_inflight(session, prompt="fold candidate beyond scan budget")
+    _bind_ticket(seeded, transcript)
+    for index in range(8):
+        _append_entry(
+            transcript,
+            {
+                "type": "progress",
+                "index": index,
+                "payload": "x" * 48,
+            },
+        )
+
+    assert transcript.stat().st_size > 256
+    assert session._phantom_consumption_verdicts([seeded]) == [False]
+
+
+def test_probe_refold_fresh_chain_survives_prior_equal_prompt_attempts(
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "fresh-chain-after-prior-attempts.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    prompt = "fresh refold after prior equal prompt attempts"
+
+    _append_fold_chain(transcript, prompt, attachment_first=False)
+    _append_fold_chain(transcript, prompt, attachment_first=True)
+    seeded = _seed_inflight(session, prompt=prompt)
+    seeded.turn.replay_count = 1
+    _bind_ticket(seeded, transcript)
+    _append_fold_chain(transcript, prompt, attachment_first=False)
+
+    assert session._phantom_consumption_verdicts([seeded]) == [True]
+
+
 @pytest.mark.asyncio
 async def test_p1_cancel_remove_without_attachment_never_certifies(
     tmp_path: Path,
