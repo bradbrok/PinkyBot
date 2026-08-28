@@ -7640,6 +7640,7 @@ class TmuxSession(TransportReplacementMixin):
                 list[tuple[int, int, str, bytes]],
             ] = {}
             incomplete: set[_TranscriptSourceKey] = set()
+            parsed_rows: set[_TranscriptSourceKey] = set()
             for key, start in scan_starts.items():
                 found: list[tuple[int, int, str, bytes]] = []
                 handle = handles[key]
@@ -7660,6 +7661,7 @@ class TmuxSession(TransportReplacementMixin):
                             continue
                         if not isinstance(parsed, dict):
                             continue
+                        parsed_rows.add(key)
                         row_end = row_offset + len(raw)
                         if parsed.get("type") != "user":
                             continue
@@ -7767,8 +7769,46 @@ class TmuxSession(TransportReplacementMixin):
                     tuple[_TranscriptProbeFoldOccurrence, _TranscriptProbeRow]
                 ] = []
                 complete_chains: list[_TranscriptProbeFoldChain] = []
+                primary_chains: list[_TranscriptProbeFoldChain] = []
                 history_complete = False
                 handle = handles[key]
+
+                def _record_primary_chain(
+                    occurrence: _TranscriptProbeFoldOccurrence,
+                    remove: _TranscriptProbeRow,
+                    attachment: _TranscriptProbeRow,
+                ) -> None:
+                    """Record one FIFO chain plus two-attachment alternatives."""
+                    primary = _TranscriptProbeFoldChain(
+                        occurrence.prompt,
+                        occurrence.enqueue,
+                        remove,
+                        attachment,
+                    )
+                    primary_chains.append(primary)
+                    complete_chains.append(primary)
+                    # A replay can leave one attachment-first occurrence open
+                    # before its fresh redelivery. When both occurrences carry
+                    # attachments but only one remove lands, every realizable
+                    # attribution consumed the content at least once: either
+                    # the stale fold completed late or the redelivery folded.
+                    # Requiring this primary attachment and each alternative's
+                    # attachment is the two-attachment discriminator; a cancel
+                    # with only one attachment never gains this attribution.
+                    complete_chains.extend(
+                        _TranscriptProbeFoldChain(
+                            occurrence.prompt,
+                            alternative.enqueue,
+                            remove,
+                            alternative.attachment,
+                        )
+                        for alternative in open_occurrences
+                        if (
+                            alternative.prompt == occurrence.prompt
+                            and alternative.attachment is not None
+                        )
+                    )
+
                 try:
                     handle.seek(0)
                     while budget_remaining > 0:
@@ -7818,13 +7858,10 @@ class TmuxSession(TransportReplacementMixin):
                                 if occurrence.attachment is None:
                                     pending_removes.append((occurrence, row))
                                 else:
-                                    complete_chains.append(
-                                        _TranscriptProbeFoldChain(
-                                            content,
-                                            occurrence.enqueue,
-                                            row,
-                                            occurrence.attachment,
-                                        )
+                                    _record_primary_chain(
+                                        occurrence,
+                                        row,
+                                        occurrence.attachment,
                                     )
                             continue
 
@@ -7852,13 +7889,10 @@ class TmuxSession(TransportReplacementMixin):
                             occurrence, remove = pending_removes.pop(
                                 matching_remove
                             )
-                            complete_chains.append(
-                                _TranscriptProbeFoldChain(
-                                    prompt,
-                                    occurrence.enqueue,
-                                    remove,
-                                    row,
-                                )
+                            _record_primary_chain(
+                                occurrence,
+                                remove,
+                                row,
                             )
                             continue
                         open_occurrence = next(
@@ -7874,6 +7908,19 @@ class TmuxSession(TransportReplacementMixin):
                         )
                         if open_occurrence is not None:
                             open_occurrence.attachment = row
+                            # The primary remove may have landed before this
+                            # fresh attachment. Complete the same A-prime
+                            # alternative only now that both attachments exist.
+                            complete_chains.extend(
+                                _TranscriptProbeFoldChain(
+                                    prompt,
+                                    open_occurrence.enqueue,
+                                    primary.remove,
+                                    row,
+                                )
+                                for primary in primary_chains
+                                if primary.prompt == prompt
+                            )
                 except (AttributeError, OSError, TypeError, ValueError):
                     history_complete = False
                 if history_complete:
@@ -7902,11 +7949,12 @@ class TmuxSession(TransportReplacementMixin):
                 ):
                     continue
                 key = source[0]
-                # A replaying turn owns its prior failed fold attempts plus the
-                # current one. Reserve every such FIFO occurrence before any
-                # ticket is evaluated; a stale chain remains non-positive while
-                # a distinct fresh refold can still prove consumption.
-                claim_limit = entry.turn.replay_count + 1
+                # Greedily reserve every equal-prompt chain for this candidate
+                # before any ticket is evaluated. Candidate FIFO plus the
+                # global reservation prevents a stale/unavailable occurrence
+                # from being donated forward, while any independently fresh
+                # chain can still prove consumption. An equal-prompt twin may
+                # conservatively starve here, which is duplicate-at-worst.
                 for chain_index, chain in enumerate(chains.get(key, [])):
                     occurrence = (key, chain_index)
                     if (
@@ -7916,8 +7964,6 @@ class TmuxSession(TransportReplacementMixin):
                         continue
                     reserved_chains.add(occurrence)
                     chain_claims[index].append(chain)
-                    if len(chain_claims[index]) >= claim_limit:
-                        break
 
             def _probe_row_is_paste_bound(
                 entry: _InflightMeta,
@@ -8006,22 +8052,26 @@ class TmuxSession(TransportReplacementMixin):
                 elif paste_bound:
                     verdicts.append(True)
                 elif (
+                    claimed is None
+                    and key is not None
+                    and bool(entry.turn.prompt)
+                    and key in fold_history_incomplete
+                    and (key not in incomplete or key in parsed_rows)
+                ):
+                    # A partial byte-zero reconstruction cannot classify an
+                    # orphan safely. This fold-candidate verdict takes
+                    # precedence over the legacy unavailable-source branch:
+                    # at least one complete row made the source available, but
+                    # its fold history is ambiguous, so recovery is replay
+                    # (False), not drain (None). If even the first row was
+                    # partial, the non-fold unavailable verdict stays None.
+                    verdicts.append(False)
+                elif (
                     key is not None
                     and key in incomplete
                     and (proof_available or fallback is None)
                 ):
                     verdicts.append(None)
-                elif (
-                    claimed is None
-                    and key is not None
-                    and bool(entry.turn.prompt)
-                    and key in fold_history_incomplete
-                ):
-                    # A partial byte-zero reconstruction cannot classify an
-                    # orphan safely. This is available-but-ambiguous evidence,
-                    # so recovery is replay (False), not the historical
-                    # unavailable-source drain (None).
-                    verdicts.append(False)
                 else:
                     verdicts.append(fallback)
             return verdicts
@@ -9932,15 +9982,59 @@ class TmuxSession(TransportReplacementMixin):
         """Drop old occurrence ownership before this turn is replay-armed."""
         keys: list[_FoldPairKey] = []
         seen: set[_FoldPairKey] = set()
+
+        def _remember_key(key: _FoldPairKey) -> None:
+            if key not in seen:
+                seen.add(key)
+                keys.append(key)
+
+        owned_occurrences: set[tuple[tuple[int, int] | None, int]] = set()
         for evidence in self._pane_fold_removes:
             if evidence.queued.turn is turn:
-                key = self._fold_pair_key(
-                    evidence.queued.content or "",
+                owned_occurrences.add(
+                    (
+                        evidence.queued.source_identity,
+                        evidence.queued.occurrence_id,
+                    )
+                )
+                _remember_key(
+                    self._fold_pair_key(
+                        evidence.queued.content or "",
+                        evidence.source_identity,
+                    )
+                )
+        for index, evidence in enumerate(self._pane_queue_operations):
+            if evidence.turn is not turn:
+                continue
+            owned_occurrences.add(
+                (evidence.source_identity, evidence.occurrence_id)
+            )
+            _remember_key(
+                self._fold_pair_key(
+                    evidence.content or "",
                     evidence.source_identity,
                 )
-                if key not in seen:
-                    seen.add(key)
-                    keys.append(key)
+            )
+            # Preserve the native FIFO slot for M3's contentless dequeue, but
+            # retire its acceptance ownership before the same turn is replayed.
+            # Deleting it would shift a later occurrence onto the wrong turn.
+            if not evidence.retired:
+                self._pane_queue_operations[index] = replace(
+                    evidence,
+                    retired=True,
+                )
+        for evidence in self._pane_fold_attachments:
+            if (
+                evidence.occurrence_id is not None
+                and (evidence.source_identity, evidence.occurrence_id)
+                in owned_occurrences
+            ):
+                _remember_key(
+                    self._fold_pair_key(
+                        evidence.prompt,
+                        evidence.source_identity,
+                    )
+                )
         for source_identity, prompt in keys:
             self._fence_fold_pair_key(
                 prompt=prompt,
