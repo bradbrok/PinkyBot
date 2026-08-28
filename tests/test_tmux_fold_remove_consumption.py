@@ -268,6 +268,20 @@ async def _run_until_requeued(session: TmuxSession) -> None:
         await task
 
 
+async def _run_until_reconciled(session: TmuxSession) -> None:
+    task = asyncio.create_task(session._inflight_watchdog())
+    try:
+        for _ in range(200):
+            if not session._inflight_metas:
+                break
+            await asyncio.sleep(0.01)
+        else:
+            pytest.fail("watchdog did not reconcile the consumed idle turn")
+    finally:
+        task.cancel()
+        await task
+
+
 @pytest.mark.asyncio
 @pytest.mark.parametrize(
     "attachment_first",
@@ -508,18 +522,19 @@ async def test_f10_busy_receiver_refold_binds_only_redelivery_ticket(
     session._tailer.transcript_path = transcript
     prompt = "busy receiver refolds this redelivery"
 
-    # This attachment belongs to the original occurrence and predates its
-    # ticket. The later enqueue/remove are live but cannot complete a valid
-    # three-leg chain with this stale row.
-    stale_attachment = _attachment_entry(prompt)
-    stale_attachment_offset = _append_entry(transcript, stale_attachment)
     original = _seed_inflight(session, prompt=prompt, message_id="redelivery")
     _bind_ticket(original, transcript)
     original_ticket_offset = original.transcript_offset_at_paste
-    original_enqueue = _queue_entry("enqueue", prompt)
-    original_remove = _queue_entry("remove", prompt)
-    _emit_live(session, transcript, original_enqueue)
-    _emit_live(session, transcript, original_remove)
+    original_enqueue_offset = _emit_live(
+        session,
+        transcript,
+        _queue_entry("enqueue", prompt),
+    )
+    original_remove_offset = _emit_live(
+        session,
+        transcript,
+        _queue_entry("remove", prompt),
+    )
 
     _enable_fast_idle_reconcile(monkeypatch, session)
     await _run_until_requeued(session)
@@ -527,6 +542,15 @@ async def test_f10_busy_receiver_refold_binds_only_redelivery_ticket(
     turn = session._message_queue.get_nowait()
     assert turn is original.turn
     assert turn.replay_count == 1
+
+    # The delayed attachment completes occurrence 1 only after its bounded
+    # live remove evidence was purged. It lands before the redelivery ticket,
+    # so the complete stale chain cannot certify occurrence 2.
+    original_attachment_offset = _emit_live(
+        session,
+        transcript,
+        _attachment_entry(prompt),
+    )
     _bind_turn_ticket(turn, transcript)
     turn.pane_delivery_started = True
     session._finish_turn_delivery(turn)
@@ -537,23 +561,38 @@ async def test_f10_busy_receiver_refold_binds_only_redelivery_ticket(
     assert original_ticket_offset is not None
     assert redelivery.transcript_offset_at_paste is not None
     assert redelivery.transcript_offset_at_paste > original_ticket_offset
-
-    # All three original rows are now before the replacement paste boundary.
-    # They reserve their old occurrence but cannot certify the new ticket.
-    assert stale_attachment_offset < redelivery.transcript_offset_at_paste
+    assert (
+        max(
+            original_enqueue_offset,
+            original_remove_offset,
+            original_attachment_offset,
+        )
+        < redelivery.transcript_offset_at_paste
+    )
     assert session._phantom_consumption_verdicts([redelivery]) == [False]
     assert turn.transport_accepted is False
     registry.mark_turn_delivered.assert_not_called()
 
+    # Occurrence 2 carries its own attachment. The bounded live path remains
+    # fenced after purge and must refuse it; byte-zero FIFO reconstruction sees
+    # two attachments, binds each to its own remove, and proves only chain 2 is
+    # fresh-ticket-bound. Reconciliation therefore settles at replay cycle 1
+    # instead of advancing toward the replay cap.
     _emit_fold_chain(
         session,
         transcript,
         prompt,
-        attachment_first=False,
+        attachment_first=True,
     )
+
+    assert turn.transport_accepted is False
+    assert session._phantom_consumption_verdicts([redelivery]) == [True]
+    session._head_started_at = time.time() - 1
+    await _run_until_reconciled(session)
 
     assert turn.transport_accepted is True
     assert turn.replay_count == 1
+    assert session._message_queue.empty()
     registry.mark_turn_delivered.assert_called_once_with(
         "dymok",
         "telegram",
