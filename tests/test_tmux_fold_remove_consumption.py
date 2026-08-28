@@ -17,7 +17,7 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from pinky_daemon import tmux_session
+from pinky_daemon import tmux_session, watchdog_log
 from pinky_daemon.codex_session import CodexSession
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.streaming_session import StreamingSessionConfig
@@ -227,6 +227,17 @@ def _append_fold_chain(
     _append_entry(transcript, _queue_entry("remove", prompt))
     if not attachment_first:
         _append_entry(transcript, _attachment_entry(prompt))
+
+
+def _assert_fold_pair_byte_counters(session: TmuxSession) -> None:
+    assert session._pane_fold_attachment_bytes == sum(
+        session._fold_pair_prompt_bytes(evidence.prompt)
+        for evidence in session._pane_fold_attachments
+    )
+    assert session._pane_fold_remove_bytes == sum(
+        session._fold_pair_prompt_bytes(evidence.queued.content or "")
+        for evidence in session._pane_fold_removes
+    )
 
 
 def _enable_fast_idle_reconcile(
@@ -550,6 +561,208 @@ async def test_f10_busy_receiver_refold_binds_only_redelivery_ticket(
         "redelivery",
         source="telegram",
     )
+
+
+@pytest.mark.parametrize(
+    "delayed_attachment_before_enqueue",
+    [
+        pytest.param(True, id="delayed-before-new-enqueue"),
+        pytest.param(False, id="delayed-after-new-enqueue"),
+    ],
+)
+def test_evicted_remove_cannot_donate_delayed_attachment_to_new_cancel(
+    delayed_attachment_before_enqueue: bool,
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "evicted-remove.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    prompt = "equal prompt with delayed attachment"
+
+    _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+    _emit_live(session, transcript, _queue_entry("remove", prompt))
+    for index in range(1024):
+        filler = f"remove-cache filler {index}"
+        _emit_live(session, transcript, _queue_entry("enqueue", filler))
+        _emit_live(session, transcript, _queue_entry("remove", filler))
+
+    assert all(evidence.queued.content != prompt for evidence in session._pane_fold_removes)
+    _assert_fold_pair_byte_counters(session)
+
+    seeded = _seed_inflight(session, prompt=prompt)
+    _bind_ticket(seeded, transcript)
+    if delayed_attachment_before_enqueue:
+        _emit_live(session, transcript, _attachment_entry(prompt))
+        _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+    else:
+        _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+        _emit_live(session, transcript, _attachment_entry(prompt))
+    _emit_live(session, transcript, _queue_entry("remove", prompt))
+
+    assert seeded.turn.transport_accepted is False
+    _assert_fold_pair_byte_counters(session)
+
+
+@pytest.mark.parametrize(
+    "delayed_attachment_before_enqueue",
+    [
+        pytest.param(True, id="delayed-before-new-enqueue"),
+        pytest.param(False, id="delayed-after-new-enqueue"),
+    ],
+)
+def test_probe_old_remove_cannot_donate_delayed_attachment_to_new_cancel(
+    delayed_attachment_before_enqueue: bool,
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "probe-delayed-attachment.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    prompt = "probe equal prompt with delayed attachment"
+
+    _append_entry(transcript, _queue_entry("enqueue", prompt))
+    _append_entry(transcript, _queue_entry("remove", prompt))
+    seeded = _seed_inflight(session, prompt=prompt)
+    _bind_ticket(seeded, transcript)
+
+    if delayed_attachment_before_enqueue:
+        _append_entry(transcript, _attachment_entry(prompt))
+        _append_entry(transcript, _queue_entry("enqueue", prompt))
+    else:
+        _append_entry(transcript, _queue_entry("enqueue", prompt))
+        _append_entry(transcript, _attachment_entry(prompt))
+    _append_entry(transcript, _queue_entry("remove", prompt))
+
+    assert session._phantom_consumption_verdicts([seeded]) == [False]
+
+
+def test_replay_purge_fences_delayed_attachment_from_new_cancel(
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "replay-purge.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    prompt = "replayed equal prompt with delayed attachment"
+    original = _seed_inflight(session, prompt=prompt, message_id="original")
+    survivor = _seed_inflight(
+        session,
+        prompt="unrelated pending remove",
+        message_id="survivor",
+    )
+    _bind_ticket(original, transcript)
+    _bind_ticket(survivor, transcript)
+    for seeded in (original, survivor):
+        _emit_live(
+            session,
+            transcript,
+            _queue_entry("enqueue", seeded.turn.prompt),
+        )
+        _emit_live(
+            session,
+            transcript,
+            _queue_entry("remove", seeded.turn.prompt),
+        )
+
+    session._purge_fold_removes_for_turn(original.turn)
+
+    assert [evidence.queued.turn for evidence in session._pane_fold_removes] == [survivor.turn]
+    _assert_fold_pair_byte_counters(session)
+
+    _bind_ticket(original, transcript)
+    original.turn.pane_delivery_started = True
+    original.turn.pane_queue_enqueued = False
+    _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+    _emit_live(session, transcript, _attachment_entry(prompt))
+    _emit_live(session, transcript, _queue_entry("remove", prompt))
+
+    assert original.turn.transport_accepted is False
+    _assert_fold_pair_byte_counters(session)
+
+
+def test_nonhead_retirement_preserves_occurrence_and_frozen_ticket_fields(
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "retire-in-place.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    first = _seed_inflight(session, prompt="first")
+    second = _seed_inflight(session, prompt="second")
+    _bind_ticket(first, transcript)
+    _bind_ticket(second, transcript)
+    _emit_live(session, transcript, _queue_entry("enqueue", first.turn.prompt))
+    _emit_live(session, transcript, _queue_entry("enqueue", second.turn.prompt))
+    before = list(session._pane_queue_operations)
+
+    session._retire_acceptance_evidence(second.turn)
+    after = list(session._pane_queue_operations)
+
+    assert [item.content for item in after] == ["first", "second"]
+    assert after[0] is before[0]
+    assert after[1].retired is True
+    assert after[1].occurrence_id == before[1].occurrence_id
+    assert after[1].entry_offset == before[1].entry_offset
+    assert after[1].source_identity == before[1].source_identity
+    assert after[1].ticket_offset == before[1].ticket_offset
+    assert after[1].ticket_identity == before[1].ticket_identity
+
+
+@pytest.mark.asyncio
+async def test_disconnect_resets_fold_pair_occurrence_epoch_as_one_unit(
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "before-disconnect.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    prompt = "same prompt after disconnect"
+    original = _seed_inflight(session, prompt=prompt)
+    _bind_ticket(original, transcript)
+    _emit_live(session, transcript, _queue_entry("enqueue", prompt))
+    first_occurrence_id = session._pane_queue_operations[-1].occurrence_id
+    _emit_live(session, transcript, _queue_entry("remove", prompt))
+    session._purge_fold_removes_for_turn(original.turn)
+
+    await session.disconnect()
+
+    assert not session._pane_queue_operations
+    assert not session._pane_fold_attachments
+    assert not session._pane_fold_removes
+    assert session._pane_fold_attachment_bytes == 0
+    assert session._pane_fold_remove_bytes == 0
+
+    replacement = tmp_path / "after-disconnect.jsonl"
+    replacement.write_text('{"type":"system"}\n', encoding="utf-8")
+    replay = _seed_inflight(session, prompt=prompt)
+    _bind_ticket(replay, replacement)
+    _emit_live(session, replacement, _queue_entry("enqueue", prompt))
+    reset_occurrence_id = session._pane_queue_operations[-1].occurrence_id
+    _emit_live(session, replacement, _queue_entry("remove", prompt))
+    _emit_live(session, replacement, _attachment_entry(prompt))
+
+    assert reset_occurrence_id == first_occurrence_id
+    assert replay.turn.transport_accepted is True
+
+
+@pytest.mark.asyncio
+async def test_requeue_decision_logs_repr_quoted_first_line_prompt_header(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "requeue-log.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    session._tailer = MagicMock()
+    session._tailer.transcript_path = transcript
+    prompt = "visible first line\nhidden later line"
+    seeded = _seed_inflight(session, prompt=prompt)
+    _bind_ticket(seeded, transcript)
+    logs: list[str] = []
+    monkeypatch.setattr(watchdog_log, "_log", logs.append)
+
+    _enable_fast_idle_reconcile(monkeypatch, session)
+    await _run_until_requeued(session)
+
+    rendered = next(line for line in logs if "reason=phantom_requeued_unconsumed" in line)
+    assert rendered.endswith("prompt_header='visible first line'")
+    assert "hidden later line" not in rendered
 
 
 @pytest.mark.asyncio
