@@ -40,6 +40,7 @@ _FIELDS = (
     "inflight_active",
     "inflight_liveness_reason",
     "inflight_liveness_age_s",
+    "prompt_header",
 )
 
 
@@ -55,7 +56,9 @@ def format_watchdog_decision(**fields) -> str:
         val = fields.get(key)
         if val is None:
             continue
-        if isinstance(val, float):
+        if key == "prompt_header":
+            val = repr(val)
+        elif isinstance(val, float):
             val = round(val, 1)
         parts.append(f"{key}={val}")
     return "watchdog_decision " + " ".join(parts)
