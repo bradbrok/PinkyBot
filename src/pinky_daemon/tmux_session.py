@@ -7656,7 +7656,10 @@ class TmuxSession(TransportReplacementMixin):
                         budget_remaining -= len(raw)
                         if not raw.endswith(b"\n"):
                             incomplete.add(key)
-                            if len(raw) == read_budget:
+                            if (
+                                len(raw) == read_budget
+                                and os.fstat(_descriptor(handle)).st_size > handle.tell()
+                            ):
                                 budget_exhausted.add(key)
                             break
                         try:
@@ -8073,7 +8076,7 @@ class TmuxSession(TransportReplacementMixin):
                     # a complete row or a budget-caused phase-1 end made the
                     # opened source available, but its fold history is
                     # ambiguous, so recovery is replay (False), not drain
-                    # (None). Exceptions and genuine short first-row partials
+                    # (None). Exceptions and genuine first-row partials
                     # retain the legacy unavailable verdict.
                     verdicts.append(False)
                 elif (
