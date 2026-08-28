@@ -870,6 +870,126 @@ def test_incomplete_full_history_for_fold_candidate_requires_replay(
     assert session._phantom_consumption_verdicts([seeded]) == [False]
 
 
+def test_sibling_source_budget_starvation_requires_replay(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scan_budget = 256
+    monkeypatch.setattr(
+        tmux_session,
+        "_PHANTOM_TRANSCRIPT_SCAN_BYTES",
+        scan_budget,
+    )
+    session = _make_session()
+    spender_transcript = tmp_path / "budget-spender.jsonl"
+    starved_transcript = tmp_path / "budget-starved.jsonl"
+    for transcript in (spender_transcript, starved_transcript):
+        transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+
+    spender = _seed_inflight(
+        session,
+        prompt="fold candidate whose source spends the shared budget",
+        message_id="spender",
+    )
+    _bind_ticket(spender, spender_transcript)
+    starved = _seed_inflight(
+        session,
+        prompt="fold candidate on a later available source",
+        message_id="starved",
+    )
+    _bind_ticket(starved, starved_transcript)
+    for index in range(8):
+        _append_entry(
+            spender_transcript,
+            {
+                "type": "progress",
+                "index": index,
+                "payload": "x" * 48,
+            },
+        )
+
+    assert spender_transcript.stat().st_size > scan_budget
+    assert session._phantom_consumption_verdicts([spender, starved]) == [
+        False,
+        False,
+    ]
+
+
+@pytest.mark.parametrize(
+    ("budget_clipped", "expected"),
+    [
+        pytest.param(True, False, id="budget-clipped"),
+        pytest.param(False, None, id="genuine-partial"),
+    ],
+)
+def test_first_row_partial_distinguishes_budget_starvation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    budget_clipped: bool,
+    expected: bool | None,
+) -> None:
+    scan_budget = 128
+    monkeypatch.setattr(
+        tmux_session,
+        "_PHANTOM_TRANSCRIPT_SCAN_BYTES",
+        scan_budget,
+    )
+    session = _make_session()
+    transcript = tmp_path / f"first-row-{'clipped' if budget_clipped else 'partial'}.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    seeded = _seed_inflight(session, prompt="fold candidate with partial first row")
+    _bind_ticket(seeded, transcript)
+    post_anchor_budget = scan_budget - transcript.stat().st_size
+    partial_size = post_anchor_budget if budget_clipped else 20
+    assert 0 < partial_size <= post_anchor_budget
+    with transcript.open("ab") as handle:
+        handle.write(b"x" * partial_size)
+
+    assert session._phantom_consumption_verdicts([seeded]) == [expected]
+
+
+def test_genuinely_unavailable_fold_source_preserves_legacy_drain(
+    tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "unavailable-fold-source.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    seeded = _seed_inflight(session, prompt="fold candidate with missing source")
+    _bind_ticket(seeded, transcript)
+    transcript.unlink()
+
+    assert session._phantom_consumption_verdicts([seeded]) == [None]
+
+
+def test_non_fold_budget_exhaustion_preserves_legacy_drain(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    scan_budget = 128
+    monkeypatch.setattr(
+        tmux_session,
+        "_PHANTOM_TRANSCRIPT_SCAN_BYTES",
+        scan_budget,
+    )
+    session = _make_session()
+    transcript = tmp_path / "non-fold-over-budget.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    seeded = _seed_inflight(session, prompt="")
+    _bind_ticket(seeded, transcript)
+    for index in range(4):
+        _append_entry(
+            transcript,
+            {
+                "type": "progress",
+                "index": index,
+                "payload": "x" * 48,
+            },
+        )
+
+    assert transcript.stat().st_size > scan_budget
+    assert session._phantom_consumption_verdicts([seeded]) == [None]
+
+
 def test_probe_refold_fresh_chain_survives_prior_equal_prompt_attempts(
     tmp_path: Path,
 ) -> None:
