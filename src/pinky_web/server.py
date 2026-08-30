@@ -33,6 +33,38 @@ def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
 
+def _fix_playwright_permissions() -> None:
+    """Ensure playwright's driver/node binary has execute permissions.
+
+    pip wheels don't preserve POSIX permissions, so the bundled node binary
+    at .venv/lib/python*/site-packages/playwright/driver/node can end up 0644
+    after install/upgrade — causing [Errno 13] Permission denied when
+    Camoufox/Playwright tries to spawn it. Best-effort; silently ignored on
+    failure (similar to SDK runner fix for #862).
+    """
+    import os
+    import stat
+    from pathlib import Path
+
+    try:
+        # Find playwright in site-packages
+        import site
+        for site_dir in site.getsitepackages() + [site.getusersitepackages()]:
+            if not site_dir:
+                continue
+            node_binary = Path(site_dir) / "playwright" / "driver" / "node"
+            if node_binary.is_file() and not os.access(node_binary, os.X_OK):
+                node_binary.chmod(node_binary.stat().st_mode | stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+                _log(f"[pinky-web] fixed +x on playwright driver/node at {node_binary}")
+                return
+    except Exception:
+        pass  # best-effort — playwright will fail later with clear error if needed
+
+
+# Fix playwright permissions on module load (before any browser operations)
+_fix_playwright_permissions()
+
+
 def _html_to_markdown(html: str, base_url: str = "") -> str:
     """Convert HTML to clean markdown, stripping noise."""
     from bs4 import BeautifulSoup
