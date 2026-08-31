@@ -1060,9 +1060,10 @@ _ISOLATION_PATH_RES = (
     re.compile(r"^/autonomy/([^/]+)/.+$"),
 )
 
-# #1187: these surfaces mutate the fleet-wide skill catalog rather than an
-# isolated agent's own resources. Reads remain available, as do self-scoped
-# assignment routes under /agents/{name}/skills/* (covered by #149 above).
+# #1187: these matched surfaces mutate the fleet-wide skill catalog rather
+# than an isolated agent's own resources. Reads remain available. Self-scoped
+# assignment routes under /agents/{name}/skills/* stay outside this matcher;
+# their caller-attribution hardening is tracked separately in #1192.
 _ISOLATION_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
 _ISOLATION_FLEET_WRITE_RES = (
     re.compile(r"^/skills(?:/.*)?$"),
@@ -4929,7 +4930,9 @@ def create_api(
 
         Defense-in-depth on top of tool-gating: isolated agents are provisioned
         without admin/register gates, but this enforces the tenant boundary at
-        the daemon regardless of what tools the agent manages to invoke.
+        the daemon regardless of what tools the agent manages to invoke. A
+        missing caller row fails closed for fleet catalog writes only; existing
+        cross-agent behavior remains unchanged.
         """
         if not caller_name:
             return False
@@ -4940,13 +4943,21 @@ def create_api(
         if not fleet_write and target == caller_name:
             return False  # acting on self — always allowed, no lookup
         # Boundary-shaped request. Resolve the caller's isolation flag. Fail
-        # CLOSED on registry error rather than risk a tenant escape.
+        # CLOSED on registry errors, and on missing callers for fleet writes,
+        # rather than risk a tenant escape.
         try:
             caller = agents.get(caller_name)
         except Exception as e:
             _log(
                 f"isolation-check: registry lookup failed for '{caller_name}' "
                 f"on {request.url.path}: {e} — failing closed (deny)"
+            )
+            return True
+        if fleet_write and caller is None:
+            _log(
+                f"isolation-check: registry has no caller '{caller_name}' "
+                f"for fleet skill catalog write {request.method} "
+                f"{request.url.path} — failing closed (deny)"
             )
             return True
         if caller and getattr(caller, "isolated", False):
