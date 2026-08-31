@@ -1371,38 +1371,33 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_all_mounted_fleet_catalog_mutations_match_production_guard(
-        self, monkeypatch, tmp_path
-    ):
-        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
-        try:
-            matchers = getattr(api_module, "_ISOLATION_FLEET_WRITE_RES", ())
-            safe_methods = getattr(api_module, "_ISOLATION_SAFE_METHODS", frozenset())
-            assert matchers, "production fleet-write matcher is missing"
-            assert safe_methods == frozenset({"GET", "HEAD", "OPTIONS"})
+    def test_all_defined_fleet_catalog_mutations_match_production_guard(self):
+        matchers = getattr(api_module, "_ISOLATION_FLEET_WRITE_RES", ())
+        safe_methods = getattr(api_module, "_ISOLATION_SAFE_METHODS", frozenset())
+        assert matchers, "production fleet-write matcher is missing"
+        assert safe_methods == frozenset({"GET", "HEAD", "OPTIONS"})
 
-            relevant = []
-            uncovered = []
-            for route in client.app.routes:
-                route_path = getattr(route, "path", "")
-                methods = set(getattr(route, "methods", ()) or ())
-                session_skill_path = route_path.startswith("/sessions/") and "/skills" in route_path
-                if not (
-                    route_path.startswith("/skills")
-                    or route_path.startswith("/plugins")
-                    or session_skill_path
-                ):
-                    continue
-                for method in sorted(methods - safe_methods):
-                    relevant.append((method, route_path))
-                    if not any(rx.match(route_path) for rx in matchers):
-                        uncovered.append((method, route_path))
+        relevant = []
+        uncovered = []
+        # FastAPI 0.141+ keeps included routers as path-less wrapper routes on
+        # the app, so enumerate the catalog router's stable definitions.
+        for route in skill_routes.router.routes:
+            route_path = getattr(route, "path", "")
+            methods = set(getattr(route, "methods", ()) or ())
+            session_skill_path = route_path.startswith("/sessions/") and "/skills" in route_path
+            if not (
+                route_path.startswith("/skills")
+                or route_path.startswith("/plugins")
+                or session_skill_path
+            ):
+                continue
+            for method in sorted(methods - safe_methods):
+                relevant.append((method, route_path))
+                if not any(rx.match(route_path) for rx in matchers):
+                    uncovered.append((method, route_path))
 
-            assert relevant, "expected mounted fleet catalog mutations"
-            assert not uncovered, f"fleet catalog routes outside guard: {uncovered}"
-        finally:
-            client.close()
-            os.unlink(path)
+        assert relevant, "expected defined fleet catalog mutations"
+        assert not uncovered, f"fleet catalog routes outside guard: {uncovered}"
 
     # ── #637: isolated teammates in the SAME group may message each other ──
 
