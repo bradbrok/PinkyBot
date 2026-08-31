@@ -1327,6 +1327,23 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
+    def test_fleet_catalog_missing_caller_fails_closed(self, monkeypatch, tmp_path):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+
+        monkeypatch.setattr(client.app.state.agents, "get", lambda name: None)
+        try:
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                "/skills",
+                {"name": "must-fail-closed"},
+            )
+            self._assert_catalog_denied(response)
+        finally:
+            client.close()
+            os.unlink(path)
+
     def test_fleet_catalog_guard_does_not_change_session_auth_outcome(self, monkeypatch, tmp_path):
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         matcher = getattr(api_module, "_ISOLATION_FLEET_WRITE_RES", ())
