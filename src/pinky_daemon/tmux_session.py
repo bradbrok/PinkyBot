@@ -70,6 +70,7 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
+from pinky_daemon.agent_registry import CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
 from pinky_daemon.command_runner import (
@@ -2642,8 +2643,33 @@ class TmuxSession(TransportReplacementMixin):
             "    try: s=json.loads(sp.read_text())\n"
             "    except Exception: s={}\n"
             "if not isinstance(s,dict): s={}\n"
+            # Keep the spawn-critical skip-prompt mutation and the policy
+            # repairs before one changed/write gate so a bad policy shape
+            # cannot prevent the prompt flag from reaching disk.
+            "changed=False\n"
             "if not s.get('skipDangerousModePermissionPrompt'):\n"
             "    s['skipDangerousModePermissionPrompt']=True\n"
+            "    changed=True\n"
+            "permissions=s.get('permissions')\n"
+            "if not isinstance(permissions,dict):\n"
+            "    permissions={}\n"
+            "    s['permissions']=permissions\n"
+            "    changed=True\n"
+            "denied_tools=permissions.get('deny')\n"
+            "if not isinstance(denied_tools,list):\n"
+            "    denied_tools=[]\n"
+            "    permissions['deny']=denied_tools\n"
+            "    changed=True\n"
+            # Force-union the live-validated bare-name deny boundary while
+            # leaving an explicit inbound policy untouched.
+            f"for tool_name in {CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS!r}:\n"
+            "    if tool_name not in denied_tools:\n"
+            "        denied_tools.append(tool_name)\n"
+            "        changed=True\n"
+            "if 'crossSessionInbound' not in s:\n"
+            "    s['crossSessionInbound']='refuse'\n"
+            "    changed=True\n"
+            "if changed:\n"
             "    sp.write_text(json.dumps(s,indent=2))\n"
         )
         try:

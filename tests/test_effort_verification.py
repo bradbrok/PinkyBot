@@ -29,6 +29,7 @@ from pathlib import Path
 
 import pytest
 
+import pinky_daemon.agent_registry as agent_registry
 from pinky_daemon.agent_registry import (
     AgentRegistry,
     _verify_effort_hook_source,
@@ -269,6 +270,157 @@ class TestHookInstaller:
         assert second.count("hook_verify_effort.py") == 1
         # And working count is also 1
         assert second.count("hook_working.py") == first.count("hook_working.py")
+
+    def test_setup_settings_seeds_native_cross_session_deny(self, tmp_path):
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        settings = json.loads(
+            (tmp_path / ".claude" / "settings.json").read_text()
+        )
+
+        assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        assert settings["crossSessionInbound"] == "refuse"
+
+    def test_setup_merges_native_deny_without_clobbering_user_settings(
+        self, tmp_path, monkeypatch
+    ):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "crossSessionInbound": "accept",
+            "permissions": {"deny": ["Bash", "ListAgents"]},
+            "hooks": {
+                "PreToolUse": [{
+                    "matcher": ".*",
+                    "hooks": [{
+                        "type": "command",
+                        "command": "python3 /custom/user-hook.py || true",
+                    }],
+                }],
+            },
+        }))
+
+        messages = []
+        monkeypatch.setattr(agent_registry, "_log", messages.append)
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        merged = json.loads(settings_path.read_text())
+        assert merged["theme"] == "dark"
+        assert merged["crossSessionInbound"] == "accept"
+        assert merged["permissions"]["deny"] == [
+            "Bash",
+            "ListAgents",
+            "SendMessage",
+        ]
+        commands = [
+            hook["command"]
+            for entry in merged["hooks"]["PreToolUse"]
+            for hook in entry["hooks"]
+        ]
+        assert any("user-hook.py" in command for command in commands)
+        assert any(
+            "WARN" in message
+            and "crossSessionInbound" in message
+            and "accept" in message
+            for message in messages
+        )
+
+    def test_setup_repairs_non_dict_permissions_before_hook_merge(self, tmp_path):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "crossSessionInbound": "refuse",
+            "permissions": "invalid",
+            "hooks": {},
+        }))
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        merged = json.loads(settings_path.read_text())
+        assert merged["theme"] == "dark"
+        assert merged["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        commands = [
+            hook["command"]
+            for entry in merged["hooks"]["PreToolUse"]
+            for hook in entry["hooks"]
+        ]
+        assert any("hook_working.py" in command for command in commands)
+        assert any("hook_verify_effort.py" in command for command in commands)
+
+    def test_setup_repairs_non_list_deny_before_hook_merge(self, tmp_path):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "crossSessionInbound": "refuse",
+            "permissions": {"deny": "invalid"},
+            "hooks": {},
+        }))
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        merged = json.loads(settings_path.read_text())
+        assert merged["theme"] == "dark"
+        assert merged["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        commands = [
+            hook["command"]
+            for entry in merged["hooks"]["PreToolUse"]
+            for hook in entry["hooks"]
+        ]
+        assert any("hook_working.py" in command for command in commands)
+        assert any("hook_verify_effort.py" in command for command in commands)
+
+    def test_setup_existing_settings_without_permissions_gets_native_deny(
+        self, tmp_path
+    ):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({"theme": "dark", "hooks": {}}))
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        merged = json.loads(settings_path.read_text())
+        assert merged["theme"] == "dark"
+        assert merged["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        assert merged["crossSessionInbound"] == "refuse"
+
+    def test_setup_native_deny_second_sync_does_not_rewrite(self, tmp_path):
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+        settings_path = tmp_path / ".claude" / "settings.json"
+        first = settings_path.read_text()
+        sentinel_ns = 1_700_000_000_000_000_000
+        os.utime(settings_path, ns=(sentinel_ns, sentinel_ns))
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        assert settings_path.read_text() == first
+        assert settings_path.stat().st_mtime_ns == sentinel_ns
+
+    def test_setup_malformed_settings_skips_merge_loudly(
+        self, tmp_path, monkeypatch
+    ):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        malformed = "{not-json\n"
+        settings_path.write_text(malformed)
+        messages = []
+        monkeypatch.setattr(agent_registry, "_log", messages.append)
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        assert settings_path.read_text() == malformed
+        assert any(
+            "WARN" in message
+            and "settings.json parse failed for alpha" in message
+            and "skipping merge" in message
+            for message in messages
+        )
 
     def test_setup_merges_into_legacy_settings(self, tmp_path):
         # Simulate an old agent: settings.json exists with only working hook.

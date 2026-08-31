@@ -70,6 +70,10 @@ BUZZ_INBOUND_CLAIM_LEASE_SECONDS = 5 * 60
 OUTBOX_REAPER_BATCH_SIZE = 10_000
 OUTBOX_REAPER_PAYLOAD_TRIMMED = "[payload trimmed by outbox reaper]"
 
+# Claude Code CLI 2.1.251: bare names in permissions.deny remove these native
+# tools even under --dangerously-skip-permissions. Revalidate on CLI upgrades.
+CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS = ("SendMessage", "ListAgents")
+
 
 def _validate_buzz_pubkey(value: str, *, field_name: str = "pubkey") -> str:
     pubkey = str(value or "")
@@ -2785,6 +2789,10 @@ except Exception as exc:
 
         if not settings_path.exists():
             settings = {
+                "permissions": {
+                    "deny": list(CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS),
+                },
+                "crossSessionInbound": "refuse",
                 "hooks": {
                     "PreToolUse": [
                         {
@@ -2866,12 +2874,37 @@ except Exception as exc:
             data = _json.loads(settings_path.read_text())
         except Exception as e:
             _log(
-                f"agent_registry: settings.json parse failed for {agent_name}: {e}; "
+                f"agent_registry: WARN settings.json parse failed for {agent_name}: {e}; "
                 "skipping merge"
             )
             return
 
         changed = False
+        permissions = data.get("permissions")
+        if not isinstance(permissions, dict):
+            permissions = {}
+            data["permissions"] = permissions
+            changed = True
+        denied_tools = permissions.get("deny")
+        if not isinstance(denied_tools, list):
+            denied_tools = []
+            permissions["deny"] = denied_tools
+            changed = True
+
+        # Force-union the deny list because it is the enforcement boundary;
+        # preserve an explicit inbound policy and only seed that key when absent.
+        for tool_name in CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS:
+            if tool_name not in denied_tools:
+                denied_tools.append(tool_name)
+                changed = True
+        if "crossSessionInbound" not in data:
+            data["crossSessionInbound"] = "refuse"
+            changed = True
+        elif data["crossSessionInbound"] not in ("refuse", "hold"):
+            _log(
+                "agent_registry: WARN crossSessionInbound holds a non-refusing "
+                f"value for {agent_name}: {data['crossSessionInbound']!r}; preserving it"
+            )
         hooks = data.setdefault("hooks", {})
 
         # Working/idle status hooks predate the managed merge path.  Existing
@@ -2940,7 +2973,7 @@ except Exception as exc:
                 _json.dumps(data, indent=2) + "\n",
             )
             _log(
-                f"agent_registry: merged PinkyBot hooks into settings.json "
+                f"agent_registry: merged PinkyBot settings into settings.json "
                 f"for {agent_name}"
             )
 
