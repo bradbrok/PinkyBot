@@ -257,6 +257,21 @@ class TestEnsureContainerStarted:
 
 @pytest.mark.asyncio
 class TestSeedContainerTrust:
+    @staticmethod
+    async def _container_seed_script(monkeypatch):
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _RecordingInner()
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_trust("/srv/agents/dymok")
+        command = inner.calls[0]
+        return command[command.index("-c") + 1]
+
     async def test_noop_for_local_agent(self, monkeypatch):
         # Local agents seed trust on the host path; the in-container seeder is a
         # no-op for them (runner isn't a ContainerCommandRunner) — never execs.
@@ -345,6 +360,66 @@ class TestSeedContainerTrust:
             "ListAgents",
             "SendMessage",
         ]
+
+    async def test_seed_script_repairs_non_dict_permissions_and_keeps_skip_prompt(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        import subprocess
+
+        seed = await self._container_seed_script(monkeypatch)
+        cfg = tmp_path / "cfgdir"
+        cfg.mkdir()
+        settings_path = cfg / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "permissions": "invalid",
+        }))
+
+        completed = subprocess.run(
+            ["python3", "-c", seed, str(tmp_path / "proj")],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"CLAUDE_CONFIG_DIR": str(cfg), "HOME": str(tmp_path)},
+        )
+
+        settings = json.loads(settings_path.read_text())
+        assert settings.get("skipDangerousModePermissionPrompt") is True
+        assert completed.returncode == 0, completed.stderr
+        assert settings["theme"] == "dark"
+        assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        assert settings["crossSessionInbound"] == "refuse"
+
+    async def test_seed_script_repairs_non_list_deny_and_keeps_skip_prompt(
+        self, monkeypatch, tmp_path
+    ):
+        import json
+        import subprocess
+
+        seed = await self._container_seed_script(monkeypatch)
+        cfg = tmp_path / "cfgdir"
+        cfg.mkdir()
+        settings_path = cfg / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "permissions": {"deny": "invalid"},
+        }))
+
+        completed = subprocess.run(
+            ["python3", "-c", seed, str(tmp_path / "proj")],
+            check=False,
+            capture_output=True,
+            text=True,
+            env={"CLAUDE_CONFIG_DIR": str(cfg), "HOME": str(tmp_path)},
+        )
+
+        settings = json.loads(settings_path.read_text())
+        assert settings.get("skipDangerousModePermissionPrompt") is True
+        assert completed.returncode == 0, completed.stderr
+        assert settings["theme"] == "dark"
+        assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        assert settings["crossSessionInbound"] == "refuse"
 
     async def test_seed_script_settings_path_without_config_dir(
         self, monkeypatch, tmp_path

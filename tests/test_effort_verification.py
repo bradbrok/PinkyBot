@@ -281,7 +281,7 @@ class TestHookInstaller:
         assert settings["crossSessionInbound"] == "refuse"
 
     def test_setup_merges_native_deny_without_clobbering_user_settings(
-        self, tmp_path
+        self, tmp_path, monkeypatch
     ):
         claude_dir = tmp_path / ".claude"
         claude_dir.mkdir()
@@ -301,6 +301,9 @@ class TestHookInstaller:
             },
         }))
 
+        messages = []
+        monkeypatch.setattr(agent_registry, "_log", messages.append)
+
         AgentRegistry._setup_hooks(tmp_path, "alpha")
 
         merged = json.loads(settings_path.read_text())
@@ -317,6 +320,60 @@ class TestHookInstaller:
             for hook in entry["hooks"]
         ]
         assert any("user-hook.py" in command for command in commands)
+        assert any(
+            "WARN" in message
+            and "crossSessionInbound" in message
+            and "accept" in message
+            for message in messages
+        )
+
+    def test_setup_repairs_non_dict_permissions_before_hook_merge(self, tmp_path):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "crossSessionInbound": "refuse",
+            "permissions": "invalid",
+            "hooks": {},
+        }))
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        merged = json.loads(settings_path.read_text())
+        assert merged["theme"] == "dark"
+        assert merged["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        commands = [
+            hook["command"]
+            for entry in merged["hooks"]["PreToolUse"]
+            for hook in entry["hooks"]
+        ]
+        assert any("hook_working.py" in command for command in commands)
+        assert any("hook_verify_effort.py" in command for command in commands)
+
+    def test_setup_repairs_non_list_deny_before_hook_merge(self, tmp_path):
+        claude_dir = tmp_path / ".claude"
+        claude_dir.mkdir()
+        settings_path = claude_dir / "settings.json"
+        settings_path.write_text(json.dumps({
+            "theme": "dark",
+            "crossSessionInbound": "refuse",
+            "permissions": {"deny": "invalid"},
+            "hooks": {},
+        }))
+
+        AgentRegistry._setup_hooks(tmp_path, "alpha")
+
+        merged = json.loads(settings_path.read_text())
+        assert merged["theme"] == "dark"
+        assert merged["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        commands = [
+            hook["command"]
+            for entry in merged["hooks"]["PreToolUse"]
+            for hook in entry["hooks"]
+        ]
+        assert any("hook_working.py" in command for command in commands)
+        assert any("hook_verify_effort.py" in command for command in commands)
 
     def test_setup_existing_settings_without_permissions_gets_native_deny(
         self, tmp_path
@@ -333,24 +390,16 @@ class TestHookInstaller:
         assert merged["permissions"]["deny"] == ["SendMessage", "ListAgents"]
         assert merged["crossSessionInbound"] == "refuse"
 
-    def test_setup_native_deny_second_sync_does_not_rewrite(
-        self, tmp_path, monkeypatch
-    ):
+    def test_setup_native_deny_second_sync_does_not_rewrite(self, tmp_path):
         AgentRegistry._setup_hooks(tmp_path, "alpha")
         settings_path = tmp_path / ".claude" / "settings.json"
         first = settings_path.read_text()
-        writes = []
-        original_replace = agent_registry.replace_agent_text
-
-        def record_replace(agent_name, agent_dir, path, text):
-            writes.append(Path(path))
-            return original_replace(agent_name, agent_dir, path, text)
-
-        monkeypatch.setattr(agent_registry, "replace_agent_text", record_replace)
+        sentinel_ns = 1_700_000_000_000_000_000
+        os.utime(settings_path, ns=(sentinel_ns, sentinel_ns))
         AgentRegistry._setup_hooks(tmp_path, "alpha")
 
         assert settings_path.read_text() == first
-        assert settings_path not in writes
+        assert settings_path.stat().st_mtime_ns == sentinel_ns
 
     def test_setup_malformed_settings_skips_merge_loudly(
         self, tmp_path, monkeypatch
@@ -367,7 +416,8 @@ class TestHookInstaller:
 
         assert settings_path.read_text() == malformed
         assert any(
-            "settings.json parse failed for alpha" in message
+            "WARN" in message
+            and "settings.json parse failed for alpha" in message
             and "skipping merge" in message
             for message in messages
         )
