@@ -4945,7 +4945,7 @@ def create_api(
             caller = agents.get(caller_name)
         except Exception as e:
             _log(
-                f"isolation: registry lookup failed for '{caller_name}' "
+                f"isolation-check: registry lookup failed for '{caller_name}' "
                 f"on {request.url.path}: {e} — failing closed (deny)"
             )
             return True
@@ -5153,18 +5153,12 @@ def create_api(
             # cross-agent /agents/{other}/* access even with a valid signature.
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
             if _internal_isolation_denied(request, caller):
+                error = "isolated agent may only access its own resources"
                 if _isolation_fleet_write(request.method, request.url.path):
-                    content = {
-                        "detail": (
-                            f"isolated agent '{caller}' cannot modify the fleet "
-                            "skill catalog"
-                        )
-                    }
-                else:
-                    content = {
-                        "error": "isolated agent may only access its own resources",
-                        "agent": caller,
-                    }
+                    error = (
+                        f"isolated agent '{caller}' cannot modify the fleet skill catalog"
+                    )
+                content = {"error": error, "agent": caller}
                 hint = _isolation_denial_hint(request)
                 if hint:
                     content["hint"] = hint
