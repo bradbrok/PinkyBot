@@ -1060,6 +1060,16 @@ _ISOLATION_PATH_RES = (
     re.compile(r"^/autonomy/([^/]+)/.+$"),
 )
 
+# #1187: these surfaces mutate the fleet-wide skill catalog rather than an
+# isolated agent's own resources. Reads remain available, as do self-scoped
+# assignment routes under /agents/{name}/skills/* (covered by #149 above).
+_ISOLATION_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+_ISOLATION_FLEET_WRITE_RES = (
+    re.compile(r"^/skills(?:/.*)?$"),
+    re.compile(r"^/plugins(?:/.*)?$"),
+    re.compile(r"^/sessions/[^/]+/skills(?:/.*)?$"),
+)
+
 _ISOLATION_MESH_HINT = (
     'cross-fleet messaging is available via mesh_remote_send(target="agent@fleet") '
     "— requires your mesh_outbound_allowlist to include the target"
@@ -1080,6 +1090,13 @@ class _IsolationDeniedError(HTTPException):
 # /broker/send with a forged agent_name — Pushok's review catch). Those are
 # guarded in the handlers via _deny_isolated_cross_actor(), where the body is
 # already parsed (reading the body in BaseHTTPMiddleware is fragile).
+
+
+def _isolation_fleet_write(method: str, path: str) -> bool:
+    """Return whether a request mutates the fleet-wide skill catalog."""
+    return method.upper() not in _ISOLATION_SAFE_METHODS and any(
+        rx.match(path) for rx in _ISOLATION_FLEET_WRITE_RES
+    )
 
 
 def _isolation_path_target(path: str) -> str | None:
@@ -4894,17 +4911,15 @@ def create_api(
         )
 
     def _internal_isolation_denied(request: Request, caller_name: str) -> bool:
-        """#149 tenant isolation (PATH-target surfaces): an authenticated
-        *isolated* agent may only act on its OWN resources. Returns True (deny)
-        when the caller is isolated and the request path targets a DIFFERENT
-        agent (``/agents/{other}/*`` or ``/autonomy/{other}/*``).
+        """#149/#1187 tenant isolation: an authenticated *isolated* agent may
+        only act on its OWN resources and cannot mutate the fleet skill
+        catalog. Returns True when either boundary is crossed.
 
         Only reached after _has_valid_internal_auth succeeds, so ``caller_name``
         is the verified signed identity (the signature binds the name). The
-        cheap path checks (no agent-target match, or target == caller) short-
-        circuit BEFORE any registry lookup, so the hot path (self-calls, non-
-        targeted endpoints) pays no extra DB read — only a genuine cross-agent
-        target triggers the isolated-flag lookup.
+        cheap path checks short-circuit BEFORE any registry lookup, so the hot
+        path pays no extra DB read. Only a fleet catalog write or a genuine
+        cross-agent target triggers the isolated-flag lookup.
 
         Body-actor surfaces (/broker/*, where the sender is named in the request
         body, not the path) are NOT covered here — they're enforced in the
@@ -4918,24 +4933,29 @@ def create_api(
         """
         if not caller_name:
             return False
+        fleet_write = _isolation_fleet_write(request.method, request.url.path)
         target = _isolation_path_target(request.url.path)
-        if target is None:
+        if not fleet_write and target is None:
             return False  # path does not name a specific agent
-        if target == caller_name:
+        if not fleet_write and target == caller_name:
             return False  # acting on self — always allowed, no lookup
-        # Genuine cross-agent target. Resolve the caller's isolation flag.
-        # Fail CLOSED: a registry error means we cannot prove the caller is
-        # non-isolated, so deny this (already cross-agent shaped) request rather
-        # than risk a tenant escape.
+        # Boundary-shaped request. Resolve the caller's isolation flag. Fail
+        # CLOSED on registry error rather than risk a tenant escape.
         try:
             caller = agents.get(caller_name)
         except Exception as e:
             _log(
-                f"isolation-check: registry lookup failed for '{caller_name}' "
+                f"isolation: registry lookup failed for '{caller_name}' "
                 f"on {request.url.path}: {e} — failing closed (deny)"
             )
             return True
         if caller and getattr(caller, "isolated", False):
+            if fleet_write:
+                _log(
+                    f"isolation: denied isolated agent '{caller_name}' fleet "
+                    f"skill catalog write {request.method} {request.url.path}"
+                )
+                return True
             # #637: an isolated agent may still MESSAGE a peer it shares a
             # group with (teammate coordination) — the inter-agent message
             # endpoint ONLY, never admin/config/autonomy. Only a message-path
@@ -5021,6 +5041,8 @@ def create_api(
 
     def _isolation_denial_hint(request: Request) -> str | None:
         """Point denied callers at ferry, except for a known-local message peer."""
+        if _isolation_fleet_write(request.method, request.url.path):
+            return None
         target = _isolation_path_target(request.url.path)
         if (
             target
@@ -5131,10 +5153,18 @@ def create_api(
             # cross-agent /agents/{other}/* access even with a valid signature.
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
             if _internal_isolation_denied(request, caller):
-                content = {
-                    "error": "isolated agent may only access its own resources",
-                    "agent": caller,
-                }
+                if _isolation_fleet_write(request.method, request.url.path):
+                    content = {
+                        "detail": (
+                            f"isolated agent '{caller}' cannot modify the fleet "
+                            "skill catalog"
+                        )
+                    }
+                else:
+                    content = {
+                        "error": "isolated agent may only access its own resources",
+                        "agent": caller,
+                    }
                 hint = _isolation_denial_hint(request)
                 if hint:
                     content["hint"] = hint
