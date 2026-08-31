@@ -2785,6 +2785,10 @@ except Exception as exc:
 
         if not settings_path.exists():
             settings = {
+                "permissions": {
+                    "deny": ["SendMessage", "ListAgents"],
+                },
+                "crossSessionInbound": "refuse",
                 "hooks": {
                     "PreToolUse": [
                         {
@@ -2872,6 +2876,15 @@ except Exception as exc:
             return
 
         changed = False
+        permissions = data.setdefault("permissions", {})
+        denied_tools = permissions.setdefault("deny", [])
+        for tool_name in ("SendMessage", "ListAgents"):
+            if tool_name not in denied_tools:
+                denied_tools.append(tool_name)
+                changed = True
+        if "crossSessionInbound" not in data:
+            data["crossSessionInbound"] = "refuse"
+            changed = True
         hooks = data.setdefault("hooks", {})
 
         # Working/idle status hooks predate the managed merge path.  Existing
@@ -2940,7 +2953,7 @@ except Exception as exc:
                 _json.dumps(data, indent=2) + "\n",
             )
             _log(
-                f"agent_registry: merged PinkyBot hooks into settings.json "
+                f"agent_registry: merged PinkyBot settings into settings.json "
                 f"for {agent_name}"
             )
 
