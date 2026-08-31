@@ -9,6 +9,7 @@ faked, runner selection is asserted via wrap() shapes."""
 
 from __future__ import annotations
 
+import os
 import re
 from pathlib import Path
 from unittest.mock import AsyncMock, MagicMock
@@ -318,8 +319,12 @@ class TestSeedContainerTrust:
 
         cfg = tmp_path / "cfgdir"
         cfg.mkdir()
-        # Pre-existing settings must survive the merge.
-        (cfg / "settings.json").write_text(json.dumps({"theme": "dark"}))
+        # Pre-existing settings must survive the merge, including user policy.
+        (cfg / "settings.json").write_text(json.dumps({
+            "theme": "dark",
+            "crossSessionInbound": "accept",
+            "permissions": {"deny": ["Bash", "ListAgents"]},
+        }))
         subprocess.run(
             ["python3", "-c", seed, str(tmp_path / "proj")],
             check=True, env={"CLAUDE_CONFIG_DIR": str(cfg), "HOME": str(tmp_path)},
@@ -334,6 +339,12 @@ class TestSeedContainerTrust:
         settings = json.loads((cfg / "settings.json").read_text())
         assert settings["skipDangerousModePermissionPrompt"] is True
         assert settings["theme"] == "dark"  # merged, not clobbered
+        assert settings["crossSessionInbound"] == "accept"
+        assert settings["permissions"]["deny"] == [
+            "Bash",
+            "ListAgents",
+            "SendMessage",
+        ]
 
     async def test_seed_script_settings_path_without_config_dir(
         self, monkeypatch, tmp_path
@@ -364,7 +375,42 @@ class TestSeedContainerTrust:
             (tmp_path / ".claude" / "settings.json").read_text()
         )
         assert settings["skipDangerousModePermissionPrompt"] is True
+        assert settings["permissions"]["deny"] == ["SendMessage", "ListAgents"]
+        assert settings["crossSessionInbound"] == "refuse"
         assert not (tmp_path / "settings.json").exists()
+
+    async def test_seed_script_settings_merge_is_idempotent(
+        self, monkeypatch, tmp_path
+    ):
+        """A second container trust seed must not rewrite settings.json."""
+        import subprocess
+
+        monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
+        ss = _session(registry=_FakeRegistry(
+            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+        ))
+        inner = _RecordingInner()
+        runner = ContainerCommandRunner(
+            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+        )
+        monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+        await ss._seed_container_trust("/srv/agents/dymok")
+        seed = inner.calls[0][inner.calls[0].index("-c") + 1]
+
+        cfg = tmp_path / "cfgdir"
+        cfg.mkdir()
+        env = {"CLAUDE_CONFIG_DIR": str(cfg), "HOME": str(tmp_path)}
+        command = ["python3", "-c", seed, str(tmp_path / "proj")]
+        subprocess.run(command, check=True, env=env)
+
+        settings_path = cfg / "settings.json"
+        first = settings_path.read_text()
+        sentinel_ns = 1_700_000_000_000_000_000
+        os.utime(settings_path, ns=(sentinel_ns, sentinel_ns))
+        subprocess.run(command, check=True, env=env)
+
+        assert settings_path.read_text() == first
+        assert settings_path.stat().st_mtime_ns == sentinel_ns
 
 
 @pytest.mark.asyncio
