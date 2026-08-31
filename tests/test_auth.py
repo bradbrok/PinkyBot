@@ -3,12 +3,16 @@
 from __future__ import annotations
 
 import os
+import subprocess
 import tempfile
 import time
+from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from fastapi.testclient import TestClient
 
+import pinky_daemon.api as api_module
 from pinky_daemon.api import create_api
 from pinky_daemon.auth import (
     build_internal_auth_headers,
@@ -22,6 +26,7 @@ from pinky_daemon.auth import (
     verify_password,
     verify_session_cookie,
 )
+from pinky_daemon.routes import skills as skill_routes
 
 # Tests in this module exercise the real auth flow (redirects, 401s,
 # cookie issuance). The conftest auto-injects a valid session cookie
@@ -1032,6 +1037,7 @@ class TestAgentIsolationScoping:
         'cross-fleet messaging is available via mesh_remote_send(target="agent@fleet") '
         "— requires your mesh_outbound_allowlist to include the target"
     )
+    _CATALOG_DENIAL = "isolated agent 'tenant' cannot modify the fleet skill catalog"
 
     def _make_client_with_agents(self, monkeypatch, tmp_path):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -1055,22 +1061,88 @@ class TestAgentIsolationScoping:
         # Falls back to the global secret only if a key is somehow absent.
         return client.app.state.agents.get_signing_key(agent_name) or "test-session-secret"
 
-    def _signed_get(self, client, agent_name, target_path):
+    def _signed_request(self, client, agent_name, method, target_path, body=None):
+        method = method.upper()
+        signed_path = target_path.split("?", 1)[0]
         headers = build_internal_auth_headers(
-            self._signing_key(client, agent_name), agent_name=agent_name,
-            method="GET", path=target_path,
+            self._signing_key(client, agent_name),
+            agent_name=agent_name,
+            method=method,
+            path=signed_path,
         )
-        return client.get(target_path, headers=headers)
+        kwargs = {"headers": headers}
+        if body is not None:
+            kwargs["json"] = body
+        return client.request(method, target_path, **kwargs)
+
+    def _signed_get(self, client, agent_name, target_path):
+        return self._signed_request(client, agent_name, "GET", target_path)
 
     def _signed_post(self, client, agent_name, target_path, body):
         # The signature binds the CALLER name + method + path, NOT the body —
         # so ``body`` can name any agent (the impersonation vector the
         # body-actor guard defends against).
-        headers = build_internal_auth_headers(
-            self._signing_key(client, agent_name), agent_name=agent_name,
-            method="POST", path=target_path,
+        return self._signed_request(client, agent_name, "POST", target_path, body)
+
+    class _FakePluginManager:
+        def discover_all(self, *, project_root):
+            return [SimpleNamespace(name="catalog-plugin")]
+
+        def get(self, name):
+            return SimpleNamespace(error="")
+
+        def enable(self, name):
+            return True
+
+        def disable(self, name):
+            return True
+
+        def register_in_skill_store(self, skills, name):
+            return None
+
+    def _make_skill_catalog_client(self, monkeypatch, tmp_path):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+
+        # /skills/from-md and /skills/from-git persist under _pinky_root. Keep
+        # every effect test inside pytest's external scratch tree so a RED run
+        # on the vulnerable base cannot clobber the live checkout (#1078).
+        monkeypatch.setattr(skill_routes, "_pinky_root", Path(tmp_path))
+        monkeypatch.setattr(skill_routes, "_plugins", self._FakePluginManager())
+
+        def fake_git_run(args, **kwargs):
+            target = Path(args[-1])
+            target.mkdir(parents=True, exist_ok=True)
+            (target / "SKILL.md").write_text(
+                "---\nname: git-positive\ndescription: positive control\n---\nbody\n",
+                encoding="utf-8",
+            )
+            return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+        monkeypatch.setattr(subprocess, "run", fake_git_run)
+
+        seeded = self._signed_request(
+            client,
+            "other",
+            "POST",
+            "/skills",
+            {
+                "name": "catalog-probe",
+                "description": "isolation fixture",
+                "self_assignable": True,
+            },
         )
-        return client.post(target_path, json=body, headers=headers)
+        assert seeded.status_code == 200, seeded.text
+        client.app.state.manager.create(
+            session_id="catalog-session",
+            working_dir=str(tmp_path),
+        )
+        return client, path
+
+    def _assert_catalog_denied(self, response):
+        assert response.status_code == 403, response.text
+        body = response.json()
+        assert body["error"] == self._CATALOG_DENIAL
+        assert "hint" not in body
 
     def test_isolated_agent_denied_cross_agent_access(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
@@ -1093,6 +1165,226 @@ class TestAgentIsolationScoping:
         resp = self._signed_get(client, "other", "/agents/tenant")
         assert resp.status_code != 403
         os.unlink(path)
+
+    # ── #1187: isolated callers cannot mutate the fleet skill catalog ────
+
+    @pytest.mark.parametrize(
+        ("method", "target_path", "body"),
+        [
+            ("POST", "/skills", {"name": "isolated-register-probe"}),
+            ("PUT", "/skills/catalog-probe", {"description": "poisoned"}),
+            ("DELETE", "/skills/catalog-probe", None),
+            ("POST", "/skills/catalog-probe/enable", None),
+            ("POST", "/skills/catalog-probe/disable", None),
+            ("POST", "/skills/from-git", {"url": "https://github.com/test/probe"}),
+            ("POST", "/skills/discover", None),
+            ("POST", "/plugins/discover", None),
+            ("POST", "/plugins/catalog-plugin/enable", None),
+            ("POST", "/plugins/catalog-plugin/disable", None),
+            (
+                "PUT",
+                "/sessions/catalog-session/skills/catalog-probe",
+                {"enabled": False},
+            ),
+            ("DELETE", "/sessions/catalog-session/skills/catalog-probe", None),
+        ],
+        ids=[
+            "register",
+            "update",
+            "delete",
+            "enable",
+            "disable",
+            "from-git",
+            "skill-discover",
+            "plugin-discover",
+            "plugin-enable",
+            "plugin-disable",
+            "session-put",
+            "session-delete",
+        ],
+    )
+    def test_isolated_agent_denied_fleet_catalog_mutation(
+        self, monkeypatch, tmp_path, method, target_path, body
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            response = self._signed_request(client, "tenant", method, target_path, body)
+            self._assert_catalog_denied(response)
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_isolated_from_md_denied_without_catalog_or_filesystem_write(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "isolated-poison"
+        content = f"---\nname: {skill_name}\ndescription: must stay absent\n---\nbody\n"
+        try:
+            before = self._signed_get(client, "tenant", f"/skills/{skill_name}")
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                "/skills/from-md",
+                {"content": content},
+            )
+            after = self._signed_get(client, "tenant", f"/skills/{skill_name}")
+
+            assert before.status_code == 404
+            self._assert_catalog_denied(response)
+            assert after.status_code == 404, after.text
+            assert not (tmp_path / "skills" / skill_name).exists()
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_non_isolated_agent_catalog_mutations_still_succeed(self, monkeypatch, tmp_path):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        md_content = "---\nname: md-positive\ndescription: positive control\n---\nbody\n"
+        requests = [
+            (
+                "POST",
+                "/skills",
+                {"name": "positive-crud", "description": "before"},
+            ),
+            ("PUT", "/skills/positive-crud", {"description": "after"}),
+            ("POST", "/skills/positive-crud/disable", None),
+            ("POST", "/skills/positive-crud/enable", None),
+            ("POST", "/skills/from-md", {"content": md_content}),
+            (
+                "POST",
+                "/skills/from-git",
+                {"url": "https://github.com/test/git-positive"},
+            ),
+            ("POST", "/skills/discover", None),
+            ("POST", "/plugins/discover", None),
+            ("POST", "/plugins/catalog-plugin/enable", None),
+            ("POST", "/plugins/catalog-plugin/disable", None),
+            (
+                "PUT",
+                "/sessions/catalog-session/skills/catalog-probe",
+                {"enabled": False},
+            ),
+            ("DELETE", "/sessions/catalog-session/skills/catalog-probe", None),
+            ("DELETE", "/skills/positive-crud", None),
+        ]
+        try:
+            for method, target_path, body in requests:
+                response = self._signed_request(client, "other", method, target_path, body)
+                assert response.status_code == 200, (
+                    f"{method} {target_path}: {response.status_code} {response.text}"
+                )
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_isolated_agent_catalog_read_and_self_assignment_still_work(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            read = self._signed_get(client, "tenant", "/skills/catalog-probe")
+            add = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                "/agents/tenant/skills/catalog-probe",
+                {"assigned_by": "self"},
+            )
+            remove = self._signed_request(
+                client,
+                "tenant",
+                "DELETE",
+                "/agents/tenant/skills/catalog-probe",
+            )
+
+            assert read.status_code == 200, read.text
+            assert add.status_code == 200, add.text
+            assert remove.status_code == 200, remove.text
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_fleet_catalog_registry_error_fails_closed(self, monkeypatch, tmp_path):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+
+        def registry_unavailable(name):
+            raise RuntimeError("registry unavailable")
+
+        monkeypatch.setattr(client.app.state.agents, "get", registry_unavailable)
+        try:
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                "/skills",
+                {"name": "must-fail-closed"},
+            )
+            self._assert_catalog_denied(response)
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_fleet_catalog_guard_does_not_change_session_auth_outcome(self, monkeypatch, tmp_path):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        matcher = getattr(api_module, "_ISOLATION_FLEET_WRITE_RES", ())
+        request_body = {"name": "browser-session-probe"}
+        try:
+            monkeypatch.setattr(api_module, "_ISOLATION_FLEET_WRITE_RES", (), raising=False)
+            unauth_baseline = client.post("/skills", json=request_body)
+            monkeypatch.setattr(api_module, "_ISOLATION_FLEET_WRITE_RES", matcher, raising=False)
+            unauth_guard_on = client.post("/skills", json=request_body)
+
+            assert unauth_baseline.status_code in (401, 403)
+            assert unauth_guard_on.status_code == unauth_baseline.status_code
+
+            setup = client.post("/auth/setup", json={"password": "hunter22", "next": "/"})
+            assert setup.status_code == 200, setup.text
+
+            monkeypatch.setattr(api_module, "_ISOLATION_FLEET_WRITE_RES", (), raising=False)
+            session_baseline = client.post("/skills", json=request_body)
+            monkeypatch.setattr(api_module, "_ISOLATION_FLEET_WRITE_RES", matcher, raising=False)
+            session_guard_on = client.post("/skills", json=request_body)
+
+            assert session_baseline.status_code == 200, session_baseline.text
+            assert session_guard_on.status_code == session_baseline.status_code
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_all_mounted_fleet_catalog_mutations_match_production_guard(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        try:
+            matchers = getattr(api_module, "_ISOLATION_FLEET_WRITE_RES", ())
+            safe_methods = getattr(api_module, "_ISOLATION_SAFE_METHODS", frozenset())
+            assert matchers, "production fleet-write matcher is missing"
+            assert safe_methods == frozenset({"GET", "HEAD", "OPTIONS"})
+
+            relevant = []
+            uncovered = []
+            for route in client.app.routes:
+                route_path = getattr(route, "path", "")
+                methods = set(getattr(route, "methods", ()) or ())
+                session_skill_path = route_path.startswith("/sessions/") and "/skills" in route_path
+                if not (
+                    route_path.startswith("/skills")
+                    or route_path.startswith("/plugins")
+                    or session_skill_path
+                ):
+                    continue
+                for method in sorted(methods - safe_methods):
+                    relevant.append((method, route_path))
+                    if not any(rx.match(route_path) for rx in matchers):
+                        uncovered.append((method, route_path))
+
+            assert relevant, "expected mounted fleet catalog mutations"
+            assert not uncovered, f"fleet catalog routes outside guard: {uncovered}"
+        finally:
+            client.close()
+            os.unlink(path)
 
     # ── #637: isolated teammates in the SAME group may message each other ──
 
