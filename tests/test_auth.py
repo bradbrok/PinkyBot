@@ -1141,7 +1141,7 @@ class TestAgentIsolationScoping:
     def _assert_catalog_denied(self, response):
         assert response.status_code == 403, response.text
         body = response.json()
-        assert body["error"] == self._CATALOG_DENIAL
+        assert body["detail"] == self._CATALOG_DENIAL
         assert "hint" not in body
 
     def test_isolated_agent_denied_cross_agent_access(self, monkeypatch, tmp_path):
