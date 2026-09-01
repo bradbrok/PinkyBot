@@ -38,6 +38,8 @@ from pinky_daemon.wake_prompt import (
 _1M_MODELS = {
     "claude-fable-5",
     "claude-mythos-5",
+    "claude-fable-5-1",
+    "claude-mythos-5-1",
     "claude-sonnet-5",
     "claude-sonnet-4-6",
     "claude-opus-4-6",
