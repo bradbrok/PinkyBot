@@ -68,6 +68,7 @@ class Skill:
     shared: bool = False
     file_templates: dict = field(default_factory=dict)
     default_config: dict = field(default_factory=dict)
+    origin_agent: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -89,6 +90,7 @@ class Skill:
             "shared": self.shared,
             "file_templates": self.file_templates,
             "default_config": self.default_config,
+            "origin_agent": self.origin_agent,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -121,7 +123,7 @@ _SKILL_COLS = (
     "name, description, skill_type, version, enabled, config, "
     "mcp_server_config, tool_patterns, directive, requires, "
     "self_assignable, privileged_tool_opt_in, category, shared, file_templates, default_config, "
-    "created_at, updated_at"
+    "origin_agent, created_at, updated_at"
 )
 
 
@@ -144,8 +146,9 @@ def _row_to_skill(row: tuple) -> Skill:
         shared=bool(row[13]),
         file_templates=json.loads(row[14]),
         default_config=json.loads(row[15]),
-        created_at=row[16],
-        updated_at=row[17],
+        origin_agent=row[16],
+        created_at=row[17],
+        updated_at=row[18],
     )
 
 
@@ -227,9 +230,9 @@ class SkillStore:
             );
         """)
         self._db.commit()
-        self._migrate()
+        self._ensure_columns()
 
-    def _migrate(self) -> None:
+    def _ensure_columns(self) -> None:
         """Add new columns to existing skills table."""
         existing = {
             row[1] for row in self._db.execute("PRAGMA table_info(skills)").fetchall()
@@ -245,6 +248,7 @@ class SkillStore:
             ("shared", "INTEGER NOT NULL DEFAULT 0"),
             ("file_templates", "TEXT NOT NULL DEFAULT '{}'"),
             ("default_config", "TEXT NOT NULL DEFAULT '{}'"),
+            ("origin_agent", "TEXT NOT NULL DEFAULT ''"),
         ]
         added_privileged_opt_in = "privileged_tool_opt_in" not in existing
         for col, typedef in migrations:
@@ -316,6 +320,7 @@ class SkillStore:
         shared: bool = False,
         file_templates: dict | None = None,
         default_config: dict | None = None,
+        origin_agent: str = "",
         agent_originated: bool = False,
     ) -> Skill:
         """Register a new skill or update an existing one."""
@@ -326,6 +331,7 @@ class SkillStore:
         requires = requires or []
         file_templates = file_templates or {}
         default_config = default_config or {}
+        origin_agent = origin_agent.strip()
 
         existing = self.get(name)
         with self._db:
@@ -383,13 +389,13 @@ class SkillStore:
             else:
                 self._db.execute(
                     f"""INSERT INTO skills ({_SKILL_COLS})
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         name, description, skill_type, version, int(enabled), json.dumps(config),
                         json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
                         json.dumps(requires), int(self_assignable), int(privileged_tool_opt_in),
                         category, int(shared),
-                        json.dumps(file_templates), json.dumps(default_config), now, now,
+                        json.dumps(file_templates), json.dumps(default_config), origin_agent, now, now,
                     ),
                 )
 
@@ -525,6 +531,8 @@ class SkillStore:
         """Assign a skill to an agent. Returns False if skill doesn't exist."""
         skill = self.get(skill_name)
         if not skill:
+            return False
+        if enabled and not skill.enabled:
             return False
 
         # Recompute privilege from persisted patterns.  The catalog flag alone

@@ -313,6 +313,7 @@ def register_discovered_skills(
     overwrite: bool = False,
     agent_originated: bool = False,
     privileged_tool_opt_in: bool | None = None,
+    origin_agent: str = "",
 ) -> dict:
     """Register discovered SKILL.md skills into the SkillStore.
 
@@ -330,6 +331,12 @@ def register_discovered_skills(
 
     for skill in skills:
         existing = skill_store.get(skill.name)
+        persisted_origin = existing.origin_agent if existing else origin_agent.strip()
+        enforce_agent_clamps = (
+            bool(persisted_origin)
+            if existing
+            else agent_originated or bool(persisted_origin)
+        )
 
         try:
             validate_tool_patterns(
@@ -350,10 +357,18 @@ def register_discovered_skills(
                 continue
             # Update if it was previously discovered (same type)
             # but check if content changed
-            if (
+            content_unchanged = (
                 existing.directive == skill.body
                 and existing.description == skill.description
                 and existing.tool_patterns == skill.allowed_tools
+            )
+            clamps_converged = (
+                not existing.shared
+                and not existing.privileged_tool_opt_in
+                and (not skill.allowed_tools or not existing.self_assignable)
+            )
+            if content_unchanged and (
+                not enforce_agent_clamps or clamps_converged
             ):
                 skipped.append(skill.name)
                 continue
@@ -386,7 +401,8 @@ def register_discovered_skills(
             privileged_tool_opt_in=privileged_tool_opt_in,
             category="skill",  # Distinct from core/development/productivity
             shared=False,  # Not auto-applied; agents opt in
-            agent_originated=agent_originated,
+            origin_agent=persisted_origin,
+            agent_originated=enforce_agent_clamps,
         )
 
         if existing:

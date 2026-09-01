@@ -6497,6 +6497,8 @@ npm run build</pre>
         skill = skills.get(skill_name)
         if not skill:
             raise HTTPException(404, f"Skill '{skill_name}' not found")
+        if not skill.enabled:
+            raise HTTPException(400, f"Skill '{skill_name}' is globally disabled")
 
         # Derive provenance from the signature-verified caller, never the
         # caller-controlled body. Browser requests are operator assignments;
@@ -6525,6 +6527,9 @@ npm run build</pre>
             config_overrides=req.config_overrides,
         )
         if not ok:
+            current = skills.get(skill_name)
+            if current and not current.enabled:
+                raise HTTPException(400, f"Skill '{skill_name}' is globally disabled")
             raise HTTPException(500, "Failed to assign skill")
         return {"assigned": True, "agent": name, "skill": skill_name}
 

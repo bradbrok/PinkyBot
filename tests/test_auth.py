@@ -2033,7 +2033,7 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_agent_originated_tool_upgrade_keeps_operator_grant_live(
+    def test_signed_tool_upgrade_cannot_mutate_operator_owned_grant(
         self, monkeypatch, tmp_path
     ):
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
@@ -2051,6 +2051,7 @@ class TestAgentIsolationScoping:
                 json={"assigned_by": "user"},
             )
             assert assigned.status_code == 200, assigned.text
+            before_catalog = self._catalog_skill(client, "other", skill_name)
             before_apply = self._apply_snapshot(client, "other")
             assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
 
@@ -2062,7 +2063,9 @@ class TestAgentIsolationScoping:
                 {"tool_patterns": [self._MINT_TOOL_PATTERN]},
             )
 
-            assert updated.status_code == 200, updated.text
+            assert updated.status_code == 403, updated.text
+            assert updated.json()["detail"] == "operator-owned skill"
+            assert self._catalog_skill(client, "other", skill_name) == before_catalog
             after_assignment = self._assigned_skill(
                 client,
                 "other",
@@ -2074,7 +2077,7 @@ class TestAgentIsolationScoping:
             assert after_assignment["assigned_by"] == "user"
             assert after_assignment["agent_enabled"] is True
             assert after_assignment["effective_enabled"] is True
-            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
+            assert self._MINT_TOOL_PATTERN not in self._apply_snapshot(
                 client, "other"
             )["tool_patterns"]
         finally:
