@@ -1577,7 +1577,7 @@ class TestAgentIsolationScoping:
 
             assert response.status_code == 403, response.text
             assert response.json()["detail"] == (
-                f"Skill '{self._RESTRICTED_SKILL}' is not self-assignable"
+                "signed agents may only assign self-assignable skills"
             )
             assert self._assigned_skill(
                 client, "tenant", self._RESTRICTED_SKILL
@@ -1656,20 +1656,13 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_cross_agent_internal_assignment_documents_638_residual(
+    def test_cross_agent_internal_assignment_is_refused_for_restricted_skill(
         self, monkeypatch, tmp_path
     ):
-        """DOCUMENTS THE #638 RESIDUAL — this 200 is NOT enforcement.
+        """#638 residual closed: assignment provenance comes from the verified caller.
 
-        A non-isolated caller ("other") assigns a RESTRICTED skill to another
-        agent with body assigned_by="user": caller != target, so the derivation
-        falls to the body value and the self_assignable gate is skipped. Because
-        a non-isolated agent holds the fleetwide global secret (which
-        authenticates as any non-isolated peer), this is also the shape of the
-        self-grant BYPASS — an attacker signs as a peer to grant a restricted
-        skill to itself. #1192's fix does NOT close this; only the isolated
-        self-grant path is closed. Kept as a characterization pin: if #638 is
-        ever resolved, this assertion should flip and prompt revisiting.
+        The request body's assigned_by field is ignored, and signed callers may
+        only assign self-assignable skills.
         """
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         try:
@@ -1681,12 +1674,14 @@ class TestAgentIsolationScoping:
                 {"assigned_by": "user"},
             )
 
-            assert response.status_code == 200, response.text
+            assert response.status_code == 403, response.text
+            assert response.json()["detail"] == (
+                "signed agents may only assign self-assignable skills"
+            )
             assigned = self._assigned_skill(
                 client, "tenant", self._RESTRICTED_SKILL, caller="other"
             )
-            assert assigned is not None
-            assert assigned["assigned_by"] == "user"
+            assert assigned is None
         finally:
             client.close()
             os.unlink(path)
@@ -2297,10 +2292,10 @@ class TestAgentIsolationScoping:
             ("from-git", "git-cross-tools"),
         ],
     )
-    def test_cross_agent_mint_documents_638_residual(
+    def test_cross_agent_tool_bearing_mint_refuses_assignment(
         self, monkeypatch, tmp_path, source, skill_name
     ):
-        """DOCUMENTS #638: peer-signed fleet grants remain intentionally possible."""
+        """#638 residual closed: peer-signed imports cannot auto-assign restricted skills."""
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         try:
             before_apply = self._apply_snapshot(client, "tenant")
@@ -2315,20 +2310,32 @@ class TestAgentIsolationScoping:
 
             assert response.status_code == 200, response.text
             result = response.json()
-            assert "assignment_refused" not in result
-            assert result["assigned_to"] == "tenant"
+            refusal_value = result["assignment_refused"]
+            refusals = refusal_value if isinstance(refusal_value, list) else [refusal_value]
+            assert len(refusals) == 1
+            refusal = refusals[0]
+            assert refusal["skill"] == skill_name
+            reason = refusal["reason"].lower()
+            assert "tool" in reason
+            assert "operator" in reason
+            assert f"/agents/tenant/skills/{skill_name}" in refusal["reason"]
+            assert "assigned_to" not in result
             if source == "from-git":
-                assert result["assigned_skills"] == [skill_name]
+                assert result["assigned_skills"] == []
 
             catalog = self._catalog_skill(client, "tenant", skill_name)
             assert catalog["self_assignable"] is False
-            assigned = self._assigned_skill(client, "tenant", skill_name)
-            assert assigned is not None
-            assert assigned["assigned_by"] == "other"
+            assert self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
 
             after_apply = self._apply_snapshot(client, "tenant")
-            assert self._MINT_TOOL_PATTERN in after_apply["tool_patterns"]
-            assert after_apply["directives_count"] == before_apply["directives_count"] + 1
+            assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+            assert after_apply["directives_count"] == before_apply["directives_count"]
         finally:
             client.close()
             os.unlink(path)
