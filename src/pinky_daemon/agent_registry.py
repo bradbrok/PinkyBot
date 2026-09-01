@@ -8166,7 +8166,7 @@ except Exception as exc:
         # and 200k-class window — so revisit all three tables (catalog /
         # RATE_TABLE / analytics seeds) together when the alias moves.
         ("openai", "gpt-daybreak-blue-latest", "Daybreak Blue", "Daybreak Access alias — currently gpt-5.6-sol with safeguards tuned for authorized defensive-security work. Tracks the newest Daybreak Blue model; pricing follows the underlying model. 200k-class context. Codex sign-in auth.", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 53),
-        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. 200k-class context; ChatGPT-sub proxy compacts at 150k below its observed ~167k backend limit. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
+        ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "200k-class context; backend window observed near 167k. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
         ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
         ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),
         ("openai", "gpt-5.4-mini", "GPT-5.4 Mini", "Fast + capable. Daily driver.", "mid", 200_000, 0, 0.25, 2.0, 0.025, 0, 70),
@@ -8203,8 +8203,8 @@ except Exception as exc:
         # (id, (stale_ctx, stale_is_1m), (correct_ctx, correct_is_1m))
         # #356 supersedes #873's inferred 1M designation: live ChatGPT-sub
         # backend evidence puts gpt-5.6-sol near 167k. Treat it as 200k-class so
-        # the 400k-only restart logic never applies; tmux independently compacts
-        # the subscription proxy at 150k. Correct only the exact stale 1M pair.
+        # the 400k-only restart logic never applies. Correct only the exact stale
+        # 1M pair.
         ("openai/gpt-5.6-sol", (1_000_000, 1), (200_000, 0)),
     ]
 

@@ -177,9 +177,8 @@ async def test_kill_switch_keeps_sse_but_suppresses_nudge(monkeypatch) -> None:
 # [1m] tier-suffix tolerance (#873 follow-up)
 #
 # A trailing ``[tier]`` suffix is normalized before the reviewed-set lookup, but
-# it must never fabricate a 1M window. #356 established that gpt-5.6-sol is
-# 200k-class despite solik's legacy ``[1m]`` suffix; its subscription backend is
-# near 167k and receives a separate 150k tmux autocompact cap.
+# it must never fabricate a 1M window. #356 established that a legacy ``[1m]``
+# suffix on a 200k-class model must never fabricate a 1M window.
 # ──────────────────────────────────────────────────────────────────────────
 
 _MODEL_SOL_SUFFIXED = "gpt-5.6-sol[1m]"
