@@ -281,19 +281,21 @@ class SkillStore:
         existing = self.get(name)
         with self._db:
             # Stage 1 capability guard (#1197): a remotely agent-originated
-            # skill that requests any tools is retained for operator review
-            # but cannot be self-assigned. Disable any existing self-grant in
-            # the same transaction so an update cannot leave it materialized.
+            # skill is retained for operator review but cannot auto-apply to
+            # peers, and capability-bearing skills cannot be self-assigned.
             # Stage 2 replaces this coarse predicate with the central
             # tool-pattern classifier.
-            if agent_originated and tool_patterns:
-                self_assignable = False
-                self._db.execute(
-                    """UPDATE agent_skills
-                       SET enabled=0
-                       WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
-                    (name,),
-                )
+            if agent_originated:
+                shared = False
+                if tool_patterns or mcp_server_config or file_templates:
+                    self_assignable = False
+                    # Fail safe fleet-wide so a name collision revokes every enabled self-grant.
+                    self._db.execute(
+                        """UPDATE agent_skills
+                           SET enabled=0
+                           WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
+                        (name,),
+                    )
 
             if existing:
                 self._db.execute(
