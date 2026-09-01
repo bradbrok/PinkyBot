@@ -48,6 +48,46 @@ class TestSkillStore:
         assert skill.description == "v2"
         assert skill.version == "0.2.0"
 
+    def test_set_tool_patterns_invalidates_privileged_opt_in_on_change(self, store):
+        mcp_server_config = {
+            "command": "custom-server",
+            "args": ["--marker", "preserved"],
+        }
+        original = store.register(
+            "operator-tools",
+            skill_type="mcp_tool",
+            mcp_server_config=mcp_server_config,
+            tool_patterns=["Bash"],
+            self_assignable=True,
+            privileged_tool_opt_in=True,
+        )
+        assert original.privileged_tool_opt_in is True
+        assert original.self_assignable is True
+
+        updated = store.set_tool_patterns("operator-tools", ["Bash", "Write"])
+
+        assert updated is not None
+        assert updated.tool_patterns == ["Bash", "Write"]
+        assert updated.privileged_tool_opt_in is False
+        assert updated.self_assignable is False
+        assert updated.mcp_server_config == mcp_server_config
+
+    def test_set_tool_patterns_same_set_is_noop(self, store):
+        original = store.register(
+            "operator-tools",
+            tool_patterns=["Bash", "Write"],
+            self_assignable=True,
+            privileged_tool_opt_in=True,
+        )
+
+        unchanged = store.set_tool_patterns("operator-tools", ["Write", "Bash"])
+
+        assert unchanged == original
+        assert unchanged.updated_at == original.updated_at
+
+    def test_set_tool_patterns_missing_returns_none(self, store):
+        assert store.set_tool_patterns("missing", ["Bash"]) is None
+
     def test_get(self, store):
         store.register("test-skill")
         skill = store.get("test-skill")

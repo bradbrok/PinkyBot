@@ -68,6 +68,76 @@ def test_seeded_shared_core_patterns_materialize_without_policy_warnings(tmp_pat
         store.close()
 
 
+def test_core_seed_converges_legacy_memory_patterns_surgically(tmp_path):
+    store = SkillStore(str(tmp_path / "skills.db"))
+    custom_mcp_config = {
+        "command": "custom-memory-server",
+        "args": ["--db", "custom.db"],
+    }
+    try:
+        store.register(
+            "pinky-memory",
+            skill_type="mcp_tool",
+            category="core",
+            shared=True,
+            self_assignable=False,
+            mcp_server_config=custom_mcp_config,
+            tool_patterns=["mcp__pinky-memory__*", "mcp__memory__*"],
+        )
+
+        _seed_core_skills(store)
+
+        memory = store.get("pinky-memory")
+        assert memory is not None
+        assert memory.tool_patterns == ["mcp__pinky-memory__*"]
+        assert memory.mcp_server_config == custom_mcp_config
+        assert memory.privileged_tool_opt_in is False
+        assert has_privileged_tool_grant(
+            memory.tool_patterns,
+            skill_name=memory.name,
+            mcp_server_config=memory.mcp_server_config,
+            skill_type=memory.skill_type,
+        ) is False
+
+        core_skills = store.list(category="core")
+        expected_patterns = [
+            pattern
+            for skill in core_skills
+            for pattern in skill.tool_patterns
+        ]
+        warnings: list[str] = []
+        materialized = store.materialize_for_agent("fresh-agent")
+        assert filter_skill_tool_grants(
+            materialized["tool_grants"],
+            agent_name="fresh-agent",
+            warn=warnings.append,
+        ) == expected_patterns
+        assert warnings == []
+    finally:
+        store.close()
+
+
+def test_second_core_seed_pass_does_not_rewrite_unchanged_rows(tmp_path):
+    store = SkillStore(str(tmp_path / "skills.db"))
+    try:
+        _seed_core_skills(store)
+        before = {
+            skill.name: skill.updated_at
+            for skill in store.list(category="core")
+        }
+        assert before
+
+        time.sleep(0.01)
+        _seed_core_skills(store)
+
+        assert {
+            skill.name: skill.updated_at
+            for skill in store.list(category="core")
+        } == before
+    finally:
+        store.close()
+
+
 def _make_client(monkeypatch, tmp_path) -> TestClient:
     monkeypatch.setenv("PINKY_SESSION_SECRET", "followup-policy-secret")
     monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
