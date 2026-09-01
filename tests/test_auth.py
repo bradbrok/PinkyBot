@@ -2277,7 +2277,8 @@ class TestAgentIsolationScoping:
                 assert result["assigned_skills"] == [skill_name]
 
             catalog = self._catalog_skill(client, "tenant", skill_name)
-            assert catalog["self_assignable"] is True
+            assert catalog["self_assignable"] is False
+            assert catalog["privileged_tool_opt_in"] is False
             assigned = self._assigned_skill(client, "tenant", skill_name)
             assert assigned is not None
             assert assigned["assigned_by"] == "user"

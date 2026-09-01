@@ -40,12 +40,19 @@ def _make_client(monkeypatch, tmp_path) -> TestClient:
     return client
 
 
-def _signed_request(client: TestClient, method: str, path: str, body: dict | None = None):
-    signing_key = client.app.state.agents.get_signing_key("tenant")
+def _signed_request(
+    client: TestClient,
+    method: str,
+    path: str,
+    body: dict | None = None,
+    *,
+    agent_name: str = "tenant",
+):
+    signing_key = client.app.state.agents.get_signing_key(agent_name)
     assert signing_key
     headers = build_internal_auth_headers(
         signing_key,
-        agent_name="tenant",
+        agent_name=agent_name,
         method=method,
         path=path,
     )
@@ -117,6 +124,48 @@ def test_operator_upload_requires_separate_privileged_self_assignment_opt_in(
         existing_skill = client.get(f"/skills/{existing_name}").json()
         assert existing_skill["self_assignable"] is True
         assert existing_skill["privileged_tool_opt_in"] is True
+    finally:
+        client.close()
+
+
+def test_imported_privileged_skill_accepts_only_operator_self_assignment_opt_in(
+    monkeypatch, tmp_path
+):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "md-explicit-opt-in"
+    try:
+        client.app.state.agents.register(
+            "internal",
+            model="opus",
+            working_dir=str(tmp_path / "internal"),
+        )
+        uploaded = _upload_skill(client, "from-md", skill_name)
+
+        assert uploaded.status_code == 200, uploaded.text
+        catalog = client.get(f"/skills/{skill_name}").json()
+        assert catalog["self_assignable"] is False
+        assert catalog["privileged_tool_opt_in"] is False
+
+        operator_opt_in = client.put(
+            f"/skills/{skill_name}",
+            json={"self_assignable": True},
+        )
+
+        assert operator_opt_in.status_code == 200, operator_opt_in.text
+        assert operator_opt_in.json()["self_assignable"] is True
+        assert operator_opt_in.json()["privileged_tool_opt_in"] is True
+
+        internal_opt_in = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {"self_assignable": True},
+            agent_name="internal",
+        )
+
+        assert internal_opt_in.status_code == 200, internal_opt_in.text
+        assert internal_opt_in.json()["self_assignable"] is False
+        assert internal_opt_in.json()["privileged_tool_opt_in"] is False
     finally:
         client.close()
 
