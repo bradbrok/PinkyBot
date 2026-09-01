@@ -4174,6 +4174,10 @@ class TmuxSession(TransportReplacementMixin):
         if cli_effort and cli_effort != "auto":
             parts.extend(["--effort", cli_effort])
 
+        # CC 2.1.200 removed AskUserQuestion's auto-continue fallback; headless
+        # agents now hang indefinitely if the model calls it (#850, #876).
+        parts.extend(["--disallowedTools", "AskUserQuestion"])
+
         # Claude Code 2.1.215 does not reliably discover project or local-scope
         # MCP configuration when the daemon launches its tmux REPL. Pass the
         # agent workspace config explicitly when present so both fresh and
