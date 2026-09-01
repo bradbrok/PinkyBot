@@ -38,6 +38,7 @@ from datetime import datetime, timezone
 from mcp.server.fastmcp import FastMCP
 
 from pinky_daemon.auth import build_internal_auth_headers, resolve_request_signing_secret
+from pinky_daemon.research_store import VALID_TOPIC_STATUSES
 from pinky_daemon.shared_mcp import (
     LazyAgentName,
     record_mcp_success,
@@ -1389,6 +1390,25 @@ def create_server(
             if "error" in result:
                 return f"Failed to claim topic: {result['error']}"
             return f"Claimed topic [{topic_id}] '{result.get('title', '')}'. Status: {result.get('status', 'assigned')}. Start researching!"
+
+        @mcp.tool()
+        def update_research_status(topic_id: int, status: str) -> str:
+            """Move a research topic through its lifecycle.
+
+            status: open | assigned | researching | in_review | revising |
+            published | cancelled. Set "researching" when you start working on
+            a topic, "in_review" when the brief is ready for peer review.
+            """
+            if status not in VALID_TOPIC_STATUSES:
+                valid = ", ".join(VALID_TOPIC_STATUSES)
+                return f"Invalid status '{status}'. Valid statuses: {valid}"
+            result = _api("PUT", f"/research/{topic_id}", {"status": status})
+            if "error" in result:
+                return f"Failed to update status: {result['error']}"
+            return (
+                f"Topic [{topic_id}] '{result.get('title', '')}' "
+                f"is now: {result.get('status', status)}"
+            )
 
         @mcp.tool()
         def create_research_topic(
