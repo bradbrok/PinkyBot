@@ -8435,6 +8435,43 @@ class TmuxSession(TransportReplacementMixin):
             live = self._read_live_status()
         live_last_updated = live.get("last_updated") if live else None
         head = self._inflight_metas[0]
+        live_timestamp_is_numeric = (
+            isinstance(live_last_updated, (int, float))
+            and not isinstance(live_last_updated, bool)
+        )
+        live_sample_predates_session = (
+            live is not None
+            and self._current_session_started_at > 0
+            and (
+                not live_timestamp_is_numeric
+                or live_last_updated <= self._current_session_started_at
+            )
+        )
+
+        def transcript_proves_completed_after_paste() -> bool:
+            """Whether #592 proves this head ran after its paste boundary."""
+            baseline = head.paste_succeeded_at
+            mtime_at = head.transcript_mtime_at_paste
+            if mtime_at is not None and (
+                baseline is None or mtime_at > baseline
+            ):
+                baseline = mtime_at
+            if baseline is None:
+                return False
+            tailer = self._tailer
+            transcript_path = (
+                getattr(tailer, "transcript_path", None) if tailer else None
+            )
+            if not transcript_path:
+                return False
+            try:
+                return (
+                    Path(transcript_path).stat().st_mtime
+                    > baseline + _TRANSCRIPT_PASTE_SLACK
+                )
+            except OSError:
+                return False
+
         if live and live.get("status") == "idle":
             last_updated = live.get("last_updated") or 0.0
             # Floor the idle-freshness check at when the current head was
@@ -8468,32 +8505,25 @@ class TmuxSession(TransportReplacementMixin):
             # daemon stamp anchors the floor to THIS turn even when the JSONL
             # write lags the tmux paste; without it a stale previous-turn mtime
             # could let a real hang-on-paste's echo clear the slack (#595 review).
-            baseline = head.paste_succeeded_at
-            mtime_at = head.transcript_mtime_at_paste
-            if mtime_at is not None and (baseline is None or mtime_at > baseline):
-                baseline = mtime_at
-            if baseline is not None:
-                _t = self._tailer
-                _tp = getattr(_t, "transcript_path", None) if _t else None
-                if _tp:
-                    try:
-                        if Path(_tp).stat().st_mtime > baseline + _TRANSCRIPT_PASTE_SLACK:
-                            return "idle"
-                    except OSError:
-                        pass
+            if transcript_proves_completed_after_paste():
+                return "idle"
+        elif (
+            live_sample_predates_session
+            and transcript_proves_completed_after_paste()
+        ):
+            # A status value from before this process is not evidence about
+            # the current turn. Apply the same post-paste transcript proof
+            # regardless of whether that fossil says "idle" or "working".
+            return "idle"
         # Positive idle evidence above is authoritative (#118/#592), even if
         # the numeric live-status timestamp itself predates this head. Only a
         # sample that failed both idle proofs may become an unknown/stale veto
         # and accrue toward #984's bounded frozen-signal recovery.
         live_floor = min(self._head_started_at, head.dispatched_at)
-        if (
+        if live_sample_predates_session or (
             self._current_session_started_at > 0
-            and isinstance(live_last_updated, (int, float))
-            and not isinstance(live_last_updated, bool)
-            and (
-                live_last_updated <= self._current_session_started_at
-                or live_last_updated < live_floor
-            )
+            and live_timestamp_is_numeric
+            and live_last_updated < live_floor
         ):
             return "unknown"
         self._log_wedged_inputs(now, live)
