@@ -62,6 +62,7 @@ from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
 )
+from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     _PLACEHOLDER_TRANSCRIPT_PATH,
@@ -111,6 +112,51 @@ class CodexTmuxSession(TmuxSession):
     # path's default (CodexSession._analytics_log_turn_usage) and
     # analytics_store._provider_alias maps it onto the openai rate rows.
     _ANALYTICS_PROVIDER = "codex_cli"
+
+    def _reported_context_window(self) -> int:
+        """Return the latest positive window reported by the Codex rollout."""
+        tailer = getattr(self, "_tailer", None)
+        tailer_value = getattr(tailer, "model_context_window", 0)
+        if (
+            isinstance(tailer_value, (int, float))
+            and not isinstance(tailer_value, bool)
+            and tailer_value > 0
+        ):
+            return int(tailer_value)
+        usage = getattr(self, "usage", None)
+        last = getattr(usage, "last_usage", {})
+        if not isinstance(last, dict):
+            return 0
+        value = last.get("model_context_window")
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            return int(value)
+        return 0
+
+    def _raw_max_tokens_for_model(self) -> int:
+        """Resolve Codex's own window without Claude Code buffer semantics."""
+        return resolve_context_window(
+            self._config.model or "",
+            reported_max=self._reported_context_window(),
+        )
+
+    def _max_tokens_for_model(self) -> int:
+        """Codex has no Claude Code autocompact buffer to subtract."""
+        return self._raw_max_tokens_for_model()
+
+    def _current_total_tokens(self) -> int:
+        """Use Codex's explicit live-window occupancy, not a schema sum."""
+        usage = getattr(self, "usage", None)
+        last = getattr(usage, "last_usage", {})
+        if not isinstance(last, dict):
+            return 0
+        try:
+            return max(0, int(last.get("total_tokens", 0) or 0))
+        except (TypeError, ValueError):
+            return 0
 
     @staticmethod
     def _normalize_turn_usage(u: dict) -> dict:

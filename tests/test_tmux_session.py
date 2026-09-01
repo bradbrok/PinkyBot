@@ -5421,6 +5421,101 @@ def test_inflight_verdict_real_session_keeps_transcript_proven_idle(tmp_path) ->
     assert ss._inflight_stall_verdict(_time.time()) == "idle"
 
 
+@pytest.mark.parametrize(
+    ("sample_age", "status", "transcript_grew_after_paste", "expected"),
+    [
+        pytest.param("fresh", "idle", False, "idle", id="fresh-idle-quiet"),
+        pytest.param("fresh", "idle", True, "idle", id="fresh-idle-grew"),
+        pytest.param(
+            "fresh", "working", False, "wedged", id="fresh-working-quiet"
+        ),
+        pytest.param(
+            "fresh", "working", True, "wedged", id="fresh-working-grew"
+        ),
+        pytest.param("stale", "idle", False, "unknown", id="stale-idle-quiet"),
+        pytest.param("stale", "idle", True, "idle", id="stale-idle-grew"),
+        pytest.param(
+            "stale", "working", False, "unknown", id="stale-working-quiet"
+        ),
+        pytest.param(
+            "stale", "working", True, "idle", id="stale-working-grew"
+        ),
+    ],
+)
+def test_inflight_verdict_status_freshness_by_transcript_proof_table(
+    tmp_path, sample_age, status, transcript_grew_after_paste, expected
+) -> None:
+    """Only stale-working with post-paste proof changes; fresh hooks do not."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    head_t = now - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    session_started_at = head_t - 50.0
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    meta.transcript_mtime_at_paste = head_t
+    meta.paste_succeeded_at = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._current_session_started_at = session_started_at
+    # The broad "recently grew" carve-out is a different signal. This table
+    # isolates #592's completed-after-paste proof for a now-quiet transcript.
+    ss._transcript_recently_grew = lambda now, window: False
+
+    transcript = tmp_path / "status-freshness.jsonl"
+    transcript.write_text("{}\n")
+    if transcript_grew_after_paste:
+        transcript_mtime = head_t + 30.0
+    else:
+        transcript_mtime = head_t + 1.0
+    os.utime(transcript, (transcript_mtime, transcript_mtime))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+
+    if sample_age == "fresh":
+        last_updated = head_t + 10.0
+    else:
+        last_updated = session_started_at - 10.0
+    live = {"status": status, "last_updated": last_updated}
+
+    assert ss._inflight_stall_verdict(now, live) == expected
+
+
+@pytest.mark.parametrize(
+    ("last_updated", "transcript_grew_after_paste", "expected"),
+    [
+        pytest.param("bad", False, "unknown", id="string-no-proof"),
+        pytest.param("bad", True, "idle", id="string-with-proof"),
+        pytest.param(None, False, "unknown", id="none-no-proof"),
+    ],
+)
+def test_inflight_verdict_idle_with_non_numeric_timestamp_is_total(
+    tmp_path, last_updated, transcript_grew_after_paste, expected
+) -> None:
+    """An idle sample with a non-numeric timestamp never raises."""
+    ss, _ = _make_session(state=SessionState.CONNECTED)
+    now = _time.time()
+    head_t = now - (tmux_session._TURN_DONE_TIMEOUT_SEC + 100.0)
+    session_started_at = head_t - 50.0
+    meta = _mk_inflight_meta()
+    meta.dispatched_at = head_t
+    meta.transcript_mtime_at_paste = head_t
+    meta.paste_succeeded_at = head_t
+    ss._inflight_metas.append(meta)
+    ss._head_started_at = head_t
+    ss._current_session_started_at = session_started_at
+    ss._transcript_recently_grew = lambda now, window: False
+
+    transcript = tmp_path / "idle-non-numeric-status.jsonl"
+    transcript.write_text("{}\n")
+    transcript_mtime = head_t + (30.0 if transcript_grew_after_paste else 1.0)
+    os.utime(transcript, (transcript_mtime, transcript_mtime))
+    ss._tailer = MagicMock()
+    ss._tailer.transcript_path = transcript
+    live = {"status": "idle", "last_updated": last_updated}
+
+    assert ss._inflight_stall_verdict(now, live) == expected
+
+
 def test_inflight_verdict_wedged_when_transcript_only_paste_echo(tmp_path) -> None:
     """#592: stale live_status, transcript mtime is only the paste echo (< slack) → wedged."""
     ss, _ = _make_session(state=SessionState.CONNECTED)

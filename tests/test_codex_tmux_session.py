@@ -26,6 +26,7 @@ from pinky_daemon.codex_tmux_session import (
     _CodexTmuxControl,
 )
 from pinky_daemon.codex_tmux_transcript import CodexTmuxTranscriptTailer
+from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
     TmuxCommandResult,
@@ -80,6 +81,13 @@ async def _to_connected(session: CodexTmuxSession) -> None:
         SessionState.CONNECTED,
         trigger=Trigger.BOOT_COMPLETE,
     )
+
+
+def _append_codex_payloads(path, payloads: list[dict]) -> None:
+    """Append minimal format-valid event_msg rows to a rollout."""
+    with path.open("a", encoding="utf-8") as fh:
+        for payload in payloads:
+            fh.write(json.dumps({"type": "event_msg", "payload": payload}) + "\n")
 
 
 @pytest.mark.asyncio
@@ -559,6 +567,195 @@ async def test_codex_acceptance_reserves_meta_before_same_read_completion():
     )
     assert len(ss._inflight_metas) == 0
     assert idle_agents == [ss.agent_name]
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "close_kind",
+    ["task_complete", "turn_aborted"],
+    ids=["empty-task-complete", "empty-turn-aborted"],
+)
+async def test_real_tailer_empty_close_retires_session_effects(
+    tmp_path, close_kind
+):
+    """A textless close must retire every session effect without an outbound."""
+    tmux = _mock_tmux()
+    ss = _session(working_dir=str(tmp_path), tmux=tmux)
+    ss._state_machine._state = SessionState.CONNECTED
+    response_callback = MagicMock()
+    ss._response_callback = response_callback
+    idle_agents: list[str] = []
+    ss._config.on_turn_idle = idle_agents.append
+
+    rollout = tmp_path / f"rollout-{close_kind}.jsonl"
+    rollout.touch()
+    ss._tailer = CodexTmuxTranscriptTailer(
+        rollout,
+        ss._handle_turn_complete,
+        model="gpt-5.6-sol",
+        on_entry=ss._on_transcript_entry,
+    )
+
+    completion_event = asyncio.Event()
+    scheduler_delivery = asyncio.get_running_loop().create_future()
+    turn = _QueuedTurn(
+        prompt=f"textless {close_kind}",
+        completion_event=completion_event,
+        scheduler_delivery=scheduler_delivery,
+        scheduler_serialized=True,
+    )
+    ss._scheduler_pending_turns.append(turn)
+    await ss._deliver_turn(turn)
+    tmux.paste_text.assert_awaited_once_with(turn.prompt, enter=True)
+    assert len(ss._inflight_metas) == 1
+
+    # Make a surviving head observably stale: after a correct close the empty
+    # deque returns "ok"; the pre-fix strand instead classifies as growing.
+    ss._head_started_at = time.time() - 10_000
+    close_payload = {
+        "type": close_kind,
+        "turn_id": "textless-turn",
+        "duration_ms": 25,
+    }
+    if close_kind == "task_complete":
+        close_payload["last_agent_message"] = None
+    _append_codex_payloads(
+        rollout,
+        [
+            {"type": "user_message", "message": turn.prompt},
+            {
+                "type": "task_started",
+                "turn_id": "textless-turn",
+                "model_context_window": 258_400,
+            },
+            {"type": "agent_message", "message": ""},
+            {
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 258_400,
+                    "last_token_usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 2,
+                        "total_tokens": 12,
+                    },
+                },
+            },
+            close_payload,
+        ],
+    )
+    await ss._tailer.read_once()
+
+    assert {
+        "inflight_depth": len(ss._inflight_metas),
+        "completion_event": completion_event.is_set(),
+        "scheduler_delivery": (
+            scheduler_delivery.done() and scheduler_delivery.result() is True
+        ),
+        "usage_turns": ss.usage.total_turns,
+        "last_stop_reason": ss.usage.last_stop_reason,
+        "idle_notifications": idle_agents,
+        "watchdog_verdict": ss._inflight_stall_verdict(time.time()),
+    } == {
+        "inflight_depth": 0,
+        "completion_event": True,
+        "scheduler_delivery": True,
+        "usage_turns": 1,
+        "last_stop_reason": close_kind,
+        "idle_notifications": [ss.agent_name],
+        "watchdog_verdict": "ok",
+    }
+    response_callback.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_codex_rollout_numeric_gauge_is_predeploy_proof(tmp_path):
+    """The rollout's explicit total/window drive the Codex gauge unchanged."""
+    ss = _session(model="gpt-5.6-sol", working_dir=str(tmp_path))
+    ss._state_machine._state = SessionState.CONNECTED
+    rollout = tmp_path / "rollout-gauge.jsonl"
+    rollout.touch()
+    ss._tailer = CodexTmuxTranscriptTailer(
+        rollout,
+        ss._handle_turn_complete,
+        model="gpt-5.6-sol",
+        on_entry=ss._on_transcript_entry,
+    )
+    _seed_inflight(ss)
+    _append_codex_payloads(
+        rollout,
+        [
+            {
+                "type": "task_started",
+                "turn_id": "gauge-turn",
+                "model_context_window": 258_400,
+            },
+            {"type": "agent_message", "message": ""},
+            {
+                "type": "token_count",
+                "info": {
+                    "model_context_window": 258_400,
+                    # Deliberately does not equal the normalized component sum:
+                    # total_tokens is the explicit Codex occupancy source.
+                    "last_token_usage": {
+                        "input_tokens": 60_000,
+                        "cached_input_tokens": 50_000,
+                        "output_tokens": 1_000,
+                        "total_tokens": 75_591,
+                    },
+                },
+            },
+            {
+                "type": "task_complete",
+                "turn_id": "gauge-turn",
+                "last_agent_message": None,
+            },
+        ],
+    )
+    await ss._tailer.read_once()
+
+    info = ss.get_context_info()
+    assert {
+        "totalTokens": info["totalTokens"],
+        "maxTokens": info["maxTokens"],
+        "rawMaxTokens": info["rawMaxTokens"],
+        "percentage": info["percentage"],
+    } == {
+        "totalTokens": 75_591,
+        "maxTokens": 258_400,
+        "rawMaxTokens": 258_400,
+        "percentage": round(75_591 / 258_400 * 100, 1),
+    }
+
+    # Absent Codex reports fail closed through the shared resolver: no crash,
+    # no zero max, no Claude Code-only 33K subtraction, and no invented total.
+    fallback = _session(model="unknown-codex-model", working_dir=str(tmp_path))
+    fallback._state_machine._state = SessionState.CONNECTED
+    fallback_rollout = tmp_path / "rollout-gauge-fallback.jsonl"
+    fallback_rollout.touch()
+    fallback._tailer = CodexTmuxTranscriptTailer(
+        fallback_rollout,
+        fallback._handle_turn_complete,
+        model="unknown-codex-model",
+        on_entry=fallback._on_transcript_entry,
+    )
+    _seed_inflight(fallback)
+    _append_codex_payloads(
+        fallback_rollout,
+        [
+            {"type": "task_started", "turn_id": "missing-usage"},
+            {
+                "type": "task_complete",
+                "turn_id": "missing-usage",
+                "last_agent_message": None,
+            },
+        ],
+    )
+    await fallback._tailer.read_once()
+    fallback_info = fallback.get_context_info()
+    expected_fallback = resolve_context_window("unknown-codex-model")
+    assert fallback_info["totalTokens"] == 0
+    assert fallback_info["maxTokens"] == expected_fallback
+    assert fallback_info["rawMaxTokens"] == expected_fallback
 
 
 @pytest.mark.asyncio

@@ -581,6 +581,217 @@ class TestTailerReadOnce:
         assert cb2.responses == []  # empty buffer → no spurious callback
 
     @pytest.mark.asyncio
+    async def test_initial_bind_and_self_heal_snapshot_historical_high_water(
+        self, tmp_path
+    ):
+        """Initial history is frozen, but a self-heal consumes unseen closes.
+
+        The bare close after the historical scan pins the silent-close drain reset:
+        an observed historical ``task_started`` must not leak into the next marker.
+        The explicit ``drain_buffer`` case pins the other lifecycle reset path.
+        """
+        rollout = tmp_path / "rollout-initial.jsonl"
+        _write_jsonl(
+            rollout,
+            [
+                _task_started("historical-text"),
+                _task_complete(
+                    "historical-text", last_agent_message="Historical reply."
+                ),
+                # Keep the silently-drained turn last so the next bare marker
+                # proves that branch reset its observed task_started state.
+                _task_started("historical-empty"),
+                _agent_message(""),
+                _task_complete("historical-empty", last_agent_message=""),
+            ],
+        )
+        cb = _Captor()
+        # Constructor bind: snapshot the replay boundary before reading bytes.
+        tailer = CodexTmuxTranscriptTailer(rollout, cb)
+
+        await tailer.read_once()
+        assert [response.text for response in cb.responses] == [
+            "Historical reply."
+        ]
+
+        # No task_started after the prior silent drain: this remains replay
+        # noise even though the marker itself is beyond the bind boundary.
+        _append_jsonl(
+            rollout,
+            [_task_complete("bare-after-history", last_agent_message="")],
+        )
+        await tailer.read_once()
+        assert [response.text for response in cb.responses] == [
+            "Historical reply."
+        ]
+
+        _append_jsonl(
+            rollout,
+            [
+                _task_started("live-empty"),
+                _agent_message(""),
+                _token_count(total_tokens=75_591),
+                _task_complete("live-empty", last_agent_message=""),
+            ],
+        )
+        await tailer.read_once()
+        assert [response.text for response in cb.responses] == [
+            "Historical reply.",
+            "",
+        ]
+        assert cb.responses[-1].usage["total_tokens"] == 75_591
+        assert cb.responses[-1].usage["model_context_window"] == 258_400
+
+        # A lifecycle drain after a start marker must clear the observed-live
+        # bit; the following bare marker cannot inherit it and fire.
+        _append_jsonl(rollout, [_task_started("discarded-live-start")])
+        await tailer.read_once()
+        tailer.drain_buffer()
+        _append_jsonl(
+            rollout,
+            [_task_complete("discarded-live-start", last_agent_message="")],
+        )
+        await tailer.read_once()
+        assert len(cb.responses) == 2
+
+        # Self-heal sees bytes this daemon process has never consumed. A
+        # complete textless turn already present on the rollout is live.
+        healed = tmp_path / "rollout-self-heal.jsonl"
+        _write_jsonl(
+            healed,
+            [
+                _task_started("healed-empty"),
+                _agent_message(""),
+                _token_count(total_tokens=75_591),
+                _task_complete("healed-empty", last_agent_message=""),
+            ],
+        )
+        healed_cb = _Captor()
+        inflight = ["head"]
+
+        async def consume_healed(response: TurnResponse) -> None:
+            await healed_cb(response)
+            inflight.pop(0)
+
+        healed_tailer = CodexTmuxTranscriptTailer(
+            tmp_path / "placeholder-self-heal.jsonl", consume_healed
+        )
+        healed_tailer.set_transcript_path(healed, seek_to_start=True)
+        await healed_tailer.read_once()
+
+        assert healed_tailer.stats["turns_fired"] == 1
+        assert inflight == []
+        assert [response.text for response in healed_cb.responses] == [""]
+        assert healed_cb.responses[0].usage["total_tokens"] == 75_591
+        assert healed_tailer.stats["buffer_empty"] is True
+
+        # The close marker, not the start marker, owns the replay boundary.  A
+        # turn that began below the bind high-water but completes above it is
+        # live and must fire.
+        straddle = tmp_path / "rollout-straddled-boundary.jsonl"
+        _write_jsonl(straddle, [_task_started("straddled")])
+        cb = _Captor()
+        tailer = CodexTmuxTranscriptTailer(straddle, cb)
+        await tailer.read_once()
+        _append_jsonl(
+            straddle,
+            [_task_complete("straddled", last_agent_message="")],
+        )
+        await tailer.read_once()
+        assert [response.text for response in cb.responses] == [""]
+
+    @pytest.mark.parametrize("bind_kind", ("constructor", "eof-swap", "resume"))
+    @pytest.mark.asyncio
+    async def test_frozen_replay_boundaries_keep_textless_history_silent(
+        self, tmp_path, bind_kind
+    ):
+        """Constructor, default EOF swap, and resume keep frozen history silent."""
+        rollout = tmp_path / f"rollout-{bind_kind}.jsonl"
+        _write_jsonl(
+            rollout,
+            [
+                _task_started("historical-empty"),
+                _task_complete("historical-empty", last_agent_message=""),
+            ],
+        )
+        cb = _Captor()
+
+        if bind_kind == "eof-swap":
+            tailer = CodexTmuxTranscriptTailer(
+                tmp_path / "placeholder-eof-swap.jsonl", cb
+            )
+            tailer.set_transcript_path(rollout)
+        else:
+            tailer = CodexTmuxTranscriptTailer(rollout, cb)
+            if bind_kind == "resume":
+                tailer.set_offset(0)
+
+        await tailer.read_once()
+
+        assert tailer.stats["turns_fired"] == 0
+        assert cb.responses == []
+
+    @pytest.mark.asyncio
+    async def test_truncation_replacement_delivers_unconsumed_textless_close(
+        self, tmp_path
+    ):
+        """A replacement already containing a complete textless turn is live."""
+        rollout = tmp_path / "rollout-truncated.jsonl"
+        _write_jsonl(
+            rollout,
+            [_task_started("old"), _agent_message("x" * 2_000)],
+        )
+        old_size = rollout.stat().st_size
+        cb = _Captor()
+        inflight = ["head"]
+
+        async def consume_replacement(response: TurnResponse) -> None:
+            await cb(response)
+            inflight.pop(0)
+
+        tailer = CodexTmuxTranscriptTailer(rollout, consume_replacement)
+        tailer.set_offset(old_size)
+        _write_jsonl(
+            rollout,
+            [
+                _task_started("replacement-empty"),
+                _task_complete("replacement-empty", last_agent_message=""),
+            ],
+        )
+        assert rollout.stat().st_size < old_size
+
+        await tailer.read_once()
+
+        assert tailer.stats["turns_fired"] == 1
+        assert inflight == []
+        assert [response.text for response in cb.responses] == [""]
+        assert tailer.stats["buffer_empty"] is True
+
+    @pytest.mark.asyncio
+    async def test_self_heal_repoint_without_complete_turn_does_not_pop_head(
+        self, tmp_path
+    ):
+        """A repoint with no complete turn cannot over-pop the inflight head."""
+        rollout = tmp_path / "rollout-incomplete-self-heal.jsonl"
+        _write_jsonl(rollout, [_task_started("still-running")])
+        cb = _Captor()
+        inflight = ["head"]
+
+        async def consume_incomplete(response: TurnResponse) -> None:
+            await cb(response)
+            inflight.pop(0)
+
+        tailer = CodexTmuxTranscriptTailer(
+            tmp_path / "placeholder-incomplete.jsonl", consume_incomplete
+        )
+        tailer.set_transcript_path(rollout, seek_to_start=True)
+        await tailer.read_once()
+
+        assert tailer.stats["turns_fired"] == 0
+        assert inflight == ["head"]
+        assert cb.responses == []
+
+    @pytest.mark.asyncio
     async def test_callback_exception_swallowed(self, transcript):
         """A misbehaving callback does not strand the tailer."""
         cb = _Captor()

@@ -99,10 +99,23 @@ class _CodexTurnBuffer:
     def __init__(self) -> None:
         self._message_chunks: list[str] = []
         self._last_usage: dict = {}          # from token_count.info.last_token_usage
+        self._model_context_window: int = 0
         self._turn_id: str = ""
         self._started_at: float | None = None  # epoch seconds from task_started
         self._duration_ms: int = 0            # from task_complete / turn_aborted
         self._agent_message_count: int = 0    # rough analog of assistant_entry_count
+        # Unlike text accumulation, this bit records the live turn boundary
+        # itself. It is reset by every drain, including silent lifecycle drains.
+        self._observed_task_started_since_drain: bool = False
+
+    def _capture_model_context_window(self, value: object) -> None:
+        """Snapshot a positive Codex-reported context window, if present."""
+        if (
+            isinstance(value, (int, float))
+            and not isinstance(value, bool)
+            and value > 0
+        ):
+            self._model_context_window = int(value)
 
     def feed(self, entry: dict) -> tuple[bool, bool]:
         """Process one transcript entry.
@@ -119,11 +132,15 @@ class _CodexTurnBuffer:
         ptype = payload.get("type", "")
 
         if ptype == "task_started":
+            self._observed_task_started_since_drain = True
             self._turn_id = payload.get("turn_id", "")
             raw_started = payload.get("started_at")
             # started_at is an integer epoch (seconds) in the real format.
             if isinstance(raw_started, (int, float)):
                 self._started_at = float(raw_started)
+            self._capture_model_context_window(
+                payload.get("model_context_window")
+            )
             return False, False
 
         if ptype == "agent_message":
@@ -138,6 +155,9 @@ class _CodexTurnBuffer:
             # info is sometimes null (rate-limit-only token_count events).
             # Null-guard: only snapshot when info is a non-null dict.
             if isinstance(info, dict):
+                self._capture_model_context_window(
+                    info.get("model_context_window")
+                )
                 usage = info.get("last_token_usage")
                 if isinstance(usage, dict):
                     self._last_usage = dict(usage)
@@ -170,10 +190,13 @@ class _CodexTurnBuffer:
     def drain(self, *, model: str = "", aborted: bool = False) -> TurnResponse:
         """Snapshot accumulated state into a ``TurnResponse`` and reset."""
         text = "".join(self._message_chunks)
+        usage = dict(self._last_usage)
+        if usage and self._model_context_window > 0:
+            usage["model_context_window"] = self._model_context_window
 
         resp = TurnResponse(
             text=text,
-            usage=dict(self._last_usage),
+            usage=usage,
             model=model,
             duration_ms=self._duration_ms,
             assistant_entry_count=self._agent_message_count,
@@ -185,10 +208,12 @@ class _CodexTurnBuffer:
         # Reset for the next turn.
         self._message_chunks.clear()
         self._last_usage = {}
+        self._model_context_window = 0
         self._turn_id = ""
         self._started_at = None
         self._duration_ms = 0
         self._agent_message_count = 0
+        self._observed_task_started_since_drain = False
 
         return resp
 
@@ -200,6 +225,16 @@ class _CodexTurnBuffer:
         replay path to avoid firing empty callbacks.
         """
         return self._agent_message_count == 0 and not self._message_chunks
+
+    @property
+    def observed_task_started_since_drain(self) -> bool:
+        """Whether this buffer observed a turn start since its last drain."""
+        return self._observed_task_started_since_drain
+
+    @property
+    def model_context_window(self) -> int:
+        """Latest positive Codex window observed in this buffered turn."""
+        return self._model_context_window
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -285,6 +320,11 @@ class CodexTmuxTranscriptTailer:
     directly to a rollout filename, allowing exact binding without a glob.
     The cwd-based glob is the self-heal fallback when that notification
     never arrives (mirrors PR #515's ``path_discovery`` pattern).
+
+    Textless close markers use a frozen replay boundary for constructor
+    binds, default EOF-seek swaps, and ``set_offset`` resumes. Bytes this
+    process has never consumed after a self-heal repoint or truncation
+    replacement are live instead.
     """
 
     def __init__(
@@ -311,11 +351,25 @@ class CodexTmuxTranscriptTailer:
         self._on_entry = on_entry
 
         self._offset: int = 0
+        # Frozen replay boundary for the constructor bind. Existing bytes are
+        # historical; appended close markers are live. Default EOF-seek swaps
+        # take the same snapshot, while unseen self-heal/truncation bytes are
+        # live and reset their boundary to zero.
+        try:
+            self._historical_high_water: int = (
+                self._path.stat().st_size if self._path.exists() else 0
+            )
+        except OSError:
+            self._historical_high_water = 0
         # Bumped on every path-changing ``set_transcript_path``. Lets
         # ``_read_and_dispatch`` detect a concurrent swap that landed
         # while it was parked in a turn callback (mirrors #496 gen-check).
         self._swap_generation: int = 0
         self._buffer = _CodexTurnBuffer()
+        # Latest harness-reported cap for the bound rollout. Unlike per-turn
+        # usage this remains available after the buffer drains, including when
+        # token_count.info is absent and task_started is the only source.
+        self.model_context_window: int = 0
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task | None = None
         self._stopped = False
@@ -376,7 +430,8 @@ class CodexTmuxTranscriptTailer:
 
         ``seek_to_start=True``: seek to byte 0. Used by the self-heal
         discovery path when transitioning from a placeholder to a freshly-
-        discovered rollout (created seconds ago; daemon has never read it).
+        discovered rollout. Every byte is live because this process has never
+        consumed the file.
 
         Also drains the in-memory buffer (mirrors #496 Case 2' fix) to
         prevent partial text from a killed session leaking into a fresh one.
@@ -384,13 +439,19 @@ class CodexTmuxTranscriptTailer:
         if Path(path) != self._path:
             self._path = Path(path)
             self._swap_generation += 1
+            try:
+                bind_size = (
+                    self._path.stat().st_size if self._path.exists() else 0
+                )
+            except OSError:
+                bind_size = 0
+            self.model_context_window = 0
             if seek_to_start:
                 self._offset = 0
+                self._historical_high_water = 0
             else:
-                try:
-                    self._offset = self._path.stat().st_size if self._path.exists() else 0
-                except OSError:
-                    self._offset = 0
+                self._offset = bind_size
+                self._historical_high_water = bind_size
             self._buffer.drain()    # silent drain; we're not at a boundary
             self._stats["rotations"] += 1
             self._wake_event.set()
@@ -558,13 +619,17 @@ class CodexTmuxTranscriptTailer:
         generation = self._swap_generation
 
         size = self._path.stat().st_size
-        if size < self._offset:
-            # File truncated / rotated. Reset and replay from 0.
+        if size < self._offset or size < self._historical_high_water:
+            # File truncated / replaced. Reset and consume from 0; every byte
+            # in the replacement is live because this process has not read it.
             _log(
                 f"codex_tailer[{self._agent_name}]: file shrank "
-                f"({size} < {self._offset}); resetting to 0"
+                f"({size} < offset={self._offset} / "
+                f"high_water={self._historical_high_water}); resetting to 0"
             )
             self._offset = 0
+            self._historical_high_water = 0
+            self.model_context_window = 0
             self._buffer.drain()
             self._stats["rotations"] += 1
 
@@ -629,6 +694,9 @@ class CodexTmuxTranscriptTailer:
                 aborted = False
                 try:
                     closes_turn, aborted = self._buffer.feed(entry)
+                    captured_window = self._buffer.model_context_window
+                    if captured_window > 0:
+                        self.model_context_window = captured_window
                     if closes_turn:
                         # Sync active flag before the await below so a
                         # concurrent mark_active doesn't race the flip.
@@ -642,18 +710,28 @@ class CodexTmuxTranscriptTailer:
 
                 bytes_read += len(line.encode("utf-8")) + 1  # +1 for \n
 
-                if closes_turn and not self._buffer.is_empty:
-                    response = self._buffer.drain(model=self._model, aborted=aborted)
-                    self._stats["turns_fired"] += 1
-                    await self._safe_callback(response)
-                    if self._swap_generation != generation:
-                        # Path swapped mid-callback. Discard remainder of
-                        # old file's chunk (mirrors #496 gen-check).
-                        return bytes_read
-                elif closes_turn:
-                    # Cold-start replay: turn marker with empty buffer.
-                    # Drain silently; don't fire.
-                    self._buffer.drain()
+                if closes_turn:
+                    marker_end = self._offset + bytes_read
+                    live_textless_close = (
+                        marker_end > self._historical_high_water
+                        and self._buffer.observed_task_started_since_drain
+                    )
+                    should_fire = (
+                        not self._buffer.is_empty or live_textless_close
+                    )
+                    # Every close drains, including replay-silent closes. This
+                    # prevents a historical task_started observation leaking
+                    # into a later bare marker.
+                    response = self._buffer.drain(
+                        model=self._model, aborted=aborted
+                    )
+                    if should_fire:
+                        self._stats["turns_fired"] += 1
+                        await self._safe_callback(response)
+                        if self._swap_generation != generation:
+                            # Path swapped mid-callback. Discard remainder of
+                            # old file's chunk (mirrors #496 gen-check).
+                            return bytes_read
 
             # Advance past complete lines only. Partial line stays on disk.
             self._offset += len(complete.encode("utf-8"))
