@@ -1428,9 +1428,21 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_cross_agent_internal_assignment_preserves_body_provenance(
+    def test_cross_agent_internal_assignment_documents_638_residual(
         self, monkeypatch, tmp_path
     ):
+        """DOCUMENTS THE #638 RESIDUAL — this 200 is NOT enforcement.
+
+        A non-isolated caller ("other") assigns a RESTRICTED skill to another
+        agent with body assigned_by="user": caller != target, so the derivation
+        falls to the body value and the self_assignable gate is skipped. Because
+        a non-isolated agent holds the fleetwide global secret (which
+        authenticates as any non-isolated peer), this is also the shape of the
+        self-grant BYPASS — an attacker signs as a peer to grant a restricted
+        skill to itself. #1192's fix does NOT close this; only the isolated
+        self-grant path is closed. Kept as a characterization pin: if #638 is
+        ever resolved, this assertion should flip and prompt revisiting.
+        """
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         try:
             response = self._signed_request(

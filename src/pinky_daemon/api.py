@@ -6468,6 +6468,16 @@ npm run build</pre>
         if not skill:
             raise HTTPException(404, f"Skill '{skill_name}' not found")
 
+        # Derive provenance from the signature-verified caller, never the
+        # caller-controlled body. This closes the ISOLATED-tenant self-grant
+        # path (#1192): an isolated agent can only sign as itself, so
+        # caller == name forces "self" and the self_assignable gate applies.
+        # RESIDUAL (#638): a non-isolated agent holds the fleetwide global
+        # secret, which authenticates as any non-isolated peer — so it can
+        # sign as a peer (caller != name), fall to the body value, and skip
+        # the gate. self_assignable is therefore NOT a security boundary
+        # against non-isolated agents; fully closing that needs the
+        # global-secret drop (#638), tracked separately.
         internal_caller = getattr(request.state, "internal_caller", "")
         effective_assigned_by = "self" if internal_caller == name else req.assigned_by
 
