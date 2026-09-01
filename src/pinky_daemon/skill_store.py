@@ -396,6 +396,38 @@ class SkillStore:
         _log(f"skill_store: {'updated' if existing else 'registered'} {name}")
         return self.get(name)  # type: ignore
 
+    def set_tool_patterns(self, name: str, tool_patterns: list[str]) -> Skill | None:
+        """Converge one stored pattern set without replacing unrelated skill fields."""
+        existing = self.get(name)
+        if existing is None:
+            return None
+        if set(existing.tool_patterns) == set(tool_patterns):
+            return existing
+
+        privileged = has_privileged_tool_grant(
+            tool_patterns,
+            skill_name=name,
+            mcp_server_config=existing.mcp_server_config,
+            skill_type=existing.skill_type,
+        )
+        self_assignable = False if privileged else existing.self_assignable
+        with self._db:
+            self._db.execute(
+                """UPDATE skills
+                   SET tool_patterns=?, updated_at=?, privileged_tool_opt_in=0,
+                       self_assignable=?
+                   WHERE name=?""",
+                (
+                    json.dumps(tool_patterns),
+                    time.time(),
+                    int(self_assignable),
+                    name,
+                ),
+            )
+
+        _log(f"skill_store: converged tool_patterns for {name}")
+        return self.get(name)
+
     def get(self, name: str) -> Skill | None:
         """Get a skill by name."""
         row = self._db.execute(

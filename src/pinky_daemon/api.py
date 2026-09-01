@@ -846,6 +846,7 @@ def _seed_core_skills(skill_store) -> None:
     """Pre-register core and optional skills on startup.
 
     Core skills (shared=True) auto-apply to all agents.
+    Core tool patterns are code-defined and converge at boot.
     Optional skills can be assigned manually or by agents themselves.
     Uses register() which is idempotent — safe to call every startup.
     """
@@ -905,9 +906,17 @@ def _seed_core_skills(skill_store) -> None:
     ]
 
     for skill_def in _core:
-        # Only seed if skill doesn't exist yet (preserve user edits)
-        if not skill_store.get(skill_def["name"]):
+        existing = skill_store.get(skill_def["name"])
+        if existing is None:
             skill_store.register(**skill_def)
+        elif (
+            skill_def["category"] == "core"
+            and set(existing.tool_patterns) != set(skill_def["tool_patterns"])
+        ):
+            skill_store.set_tool_patterns(
+                skill_def["name"],
+                skill_def["tool_patterns"],
+            )
 
 
 # ── MCP Config ──────────────────────────────────────────────
