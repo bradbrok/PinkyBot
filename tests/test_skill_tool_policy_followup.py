@@ -119,6 +119,90 @@ def test_core_seed_converges_legacy_memory_patterns_surgically(tmp_path):
         store.close()
 
 
+def test_agent_originated_privileged_grant_requires_exact_set_operator_opt_in(tmp_path):
+    store = SkillStore(str(tmp_path / "skills.db"))
+    skill_name = "signed-privileged-grant"
+    agent_name = "target"
+    try:
+        created = store.register(
+            skill_name,
+            tool_patterns=["Bash"],
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert created.origin_agent == "writer"
+        assert created.privileged_tool_opt_in is False
+        assert store.assign_to_agent(agent_name, skill_name, assigned_by="user")
+
+        grant = store.materialize_for_agent(agent_name)["tool_grants"][0]
+        warnings: list[str] = []
+        assert grant["origin_agent"] == "writer"
+        assert filter_skill_tool_grants(
+            [grant],
+            agent_name=agent_name,
+            warn=warnings.append,
+        ) == []
+        assert any("operator opt-in" in warning for warning in warnings)
+
+        opted_in = store.register(
+            skill_name,
+            tool_patterns=["Bash"],
+            self_assignable=True,
+            privileged_tool_opt_in=True,
+        )
+        assert opted_in.origin_agent == "writer"
+        assert opted_in.privileged_tool_opt_in is True
+        opted_in_grant = store.materialize_for_agent(agent_name)["tool_grants"][0]
+        assert filter_skill_tool_grants(
+            [opted_in_grant],
+            agent_name=agent_name,
+        ) == ["Bash"]
+
+        widened = store.register(
+            skill_name,
+            tool_patterns=["Bash", "Write"],
+            self_assignable=True,
+            privileged_tool_opt_in=None,
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert widened.origin_agent == "writer"
+        assert widened.privileged_tool_opt_in is False
+        widened_grants = store.materialize_for_agent(agent_name)["tool_grants"]
+        warnings = []
+        assert filter_skill_tool_grants(
+            widened_grants,
+            agent_name=agent_name,
+            warn=warnings.append,
+        ) == []
+        assert all(grant["origin_agent"] == "writer" for grant in widened_grants)
+        assert any("operator opt-in" in warning for warning in warnings)
+    finally:
+        store.close()
+
+
+def test_operator_owned_privileged_grant_keeps_user_assignment_exemption(tmp_path):
+    store = SkillStore(str(tmp_path / "skills.db"))
+    skill_name = "operator-privileged-grant"
+    try:
+        created = store.register(skill_name, tool_patterns=["Bash"])
+        assert created.origin_agent == ""
+        assert created.privileged_tool_opt_in is False
+        assert store.assign_to_agent("target", skill_name, assigned_by="user")
+
+        grant = store.materialize_for_agent("target")["tool_grants"][0]
+        warnings: list[str] = []
+        assert grant["origin_agent"] == ""
+        assert filter_skill_tool_grants(
+            [grant],
+            agent_name="target",
+            warn=warnings.append,
+        ) == ["Bash"]
+        assert warnings == []
+    finally:
+        store.close()
+
+
 def test_second_core_seed_pass_does_not_rewrite_unchanged_rows(tmp_path):
     store = SkillStore(str(tmp_path / "skills.db"))
     try:
