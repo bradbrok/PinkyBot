@@ -858,7 +858,7 @@ def _seed_core_skills(skill_store) -> None:
             "category": "core",
             "shared": True,
             "self_assignable": False,
-            "tool_patterns": ["mcp__pinky-memory__*", "mcp__memory__*"],
+            "tool_patterns": ["mcp__pinky-memory__*"],
             "mcp_server_config": {
                 "command": sys.executable,
                 "args": ["-m", "pinky_memory", "--db", "data/memory.db"],
