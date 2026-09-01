@@ -6503,7 +6503,7 @@ npm run build</pre>
         effective_assigned_by = "self" if internal_caller == name else req.assigned_by
 
         # Check self-assignable constraint
-        if effective_assigned_by == "self" and not skill.self_assignable:
+        if effective_assigned_by == "self" and not skills.effective_self_assignable(skill):
             raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
 
         # Check dependencies
@@ -6545,7 +6545,7 @@ npm run build</pre>
         """Enable an assigned skill for an agent."""
         actor = _authorize_skill_assignment_mutation(request, name)
         skill = skills.get(skill_name)
-        if actor == "self" and skill and not skill.self_assignable:
+        if actor == "self" and skill and not skills.effective_self_assignable(skill):
             raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
         if not skills.set_agent_skill_enabled(name, skill_name, True):
             raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")

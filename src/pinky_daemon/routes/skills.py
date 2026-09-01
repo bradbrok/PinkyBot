@@ -375,7 +375,7 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
         tool_patterns=parsed.allowed_tools,
         directive=parsed.body,
         self_assignable=True,
-        privileged_tool_opt_in=not bool(internal_caller),
+        privileged_tool_opt_in=None,
         category="skill",
         shared=False,
         agent_originated=bool(internal_caller),
@@ -493,7 +493,7 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         found,
         overwrite=True,
         agent_originated=bool(internal_caller),
-        privileged_tool_opt_in=not bool(internal_caller),
+        privileged_tool_opt_in=None,
     )
 
     # Auto-assign to agent if specified

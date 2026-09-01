@@ -466,6 +466,18 @@ class SkillStore:
 
     # ── Agent Skill Assignment ────────────────────────────────
 
+    def effective_self_assignable(self, skill: Skill) -> bool:
+        """Return whether persisted policy permits an enabled self assignment."""
+        if not skill.self_assignable:
+            return False
+        privileged = has_privileged_tool_grant(
+            skill.tool_patterns,
+            skill_name=skill.name,
+            mcp_server_config=skill.mcp_server_config,
+            skill_type=skill.skill_type,
+        )
+        return not privileged or skill.privileged_tool_opt_in
+
     def assign_to_agent(
         self,
         agent_name: str,
@@ -482,19 +494,7 @@ class SkillStore:
 
         # Recompute privilege from persisted patterns.  The catalog flag alone
         # is not a security boundary because legacy or hostile rows can set it.
-        if enabled and assigned_by == "self" and not skill.self_assignable:
-            return False
-        if (
-            enabled
-            and assigned_by == "self"
-            and has_privileged_tool_grant(
-                skill.tool_patterns,
-                skill_name=skill.name,
-                mcp_server_config=skill.mcp_server_config,
-                skill_type=skill.skill_type,
-            )
-            and not skill.privileged_tool_opt_in
-        ):
+        if enabled and assigned_by == "self" and not self.effective_self_assignable(skill):
             return False
 
         now = time.time()

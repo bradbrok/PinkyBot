@@ -312,7 +312,7 @@ def register_discovered_skills(
     *,
     overwrite: bool = False,
     agent_originated: bool = False,
-    privileged_tool_opt_in: bool = False,
+    privileged_tool_opt_in: bool | None = False,
 ) -> dict:
     """Register discovered SKILL.md skills into the SkillStore.
 

@@ -78,7 +78,7 @@ def classify_tool_pattern(
 
     if not isinstance(pattern, str) or not pattern or pattern != pattern.strip():
         raise ToolPatternValidationError(f"invalid tool pattern: {pattern!r}")
-    if any(char in pattern for char in "\r\n\t"):
+    if any(ord(char) < 32 or ord(char) == 0x7F for char in pattern):
         raise ToolPatternValidationError(f"invalid tool pattern: {pattern!r}")
 
     match = _TOOL_PATTERN_RE.fullmatch(pattern)
