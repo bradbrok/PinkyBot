@@ -64,6 +64,29 @@ class TestSkillStore:
         )
         assert updated.origin_agent == "writer"
 
+    def test_origin_agent_is_immutable_after_insert(self, store):
+        operator_owned = store.register("operator-owned")
+        assert operator_owned.origin_agent == ""
+        attempted_claim = store.register(
+            "operator-owned",
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert attempted_claim.origin_agent == ""
+
+        signed_owned = store.register(
+            "signed-owned",
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert signed_owned.origin_agent == "writer"
+        attempted_transfer = store.register(
+            "signed-owned",
+            origin_agent="peer",
+            agent_originated=True,
+        )
+        assert attempted_transfer.origin_agent == "writer"
+
     def test_origin_agent_migration_marks_legacy_rows_operator_owned(self, tmp_path):
         db_path = tmp_path / "legacy-skills.db"
         legacy = sqlite3.connect(db_path)

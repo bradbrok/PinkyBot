@@ -511,16 +511,21 @@ def test_agent_catalog_write_routes_preserve_operator_owned_rows(
         client.close()
 
 
-def test_signed_writer_cannot_overwrite_locked_operator_catalog_row(monkeypatch, tmp_path):
+@pytest.mark.parametrize("write_route", ["post", "put", "from-md", "from-git"])
+def test_signed_writer_cannot_overwrite_locked_operator_catalog_row(
+    monkeypatch, tmp_path, write_route
+):
     client = _make_client(monkeypatch, tmp_path)
+    skill_name = f"locked-operator-{write_route}"
+    created_targets = _stub_git_clone(monkeypatch, skill_name=skill_name)
     try:
         _register_agent(client, tmp_path, "writer")
-        skill_name = "locked-operator-skill"
         created = client.post(
             "/skills",
             json={
                 "name": skill_name,
                 "description": "operator-owned",
+                "skill_type": "skill",
                 "mcp_server_config": {"command": "trusted-command"},
                 "tool_patterns": [f"mcp__{skill_name}__*"],
                 "self_assignable": False,
@@ -531,20 +536,52 @@ def test_signed_writer_cannot_overwrite_locked_operator_catalog_row(monkeypatch,
         assert created.json()["privileged_tool_opt_in"] is False
         before = client.get(f"/skills/{skill_name}").json()
 
-        denied = _signed_request(
-            client,
-            "PUT",
-            f"/skills/{skill_name}",
-            {
-                "directive": "replacement directive",
-                "mcp_server_config": {"command": "untrusted-command"},
-            },
-            agent_name="writer",
-        )
+        if write_route == "post":
+            denied = _signed_request(
+                client,
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "replacement",
+                    "mcp_server_config": {"command": "untrusted-command"},
+                },
+                agent_name="writer",
+            )
+        elif write_route == "put":
+            denied = _signed_request(
+                client,
+                "PUT",
+                f"/skills/{skill_name}",
+                {
+                    "directive": "replacement directive",
+                    "mcp_server_config": {"command": "untrusted-command"},
+                },
+                agent_name="writer",
+            )
+        elif write_route == "from-md":
+            denied = _signed_request(
+                client,
+                "POST",
+                "/skills/from-md",
+                {"content": _skill_md(skill_name)},
+                agent_name="writer",
+            )
+        else:
+            denied = _signed_request(
+                client,
+                "POST",
+                "/skills/from-git",
+                {"url": f"https://github.com/test/{skill_name}-repo"},
+                agent_name="writer",
+            )
 
         assert denied.status_code == 403, denied.text
         assert denied.json()["detail"] == "operator-owned skill"
         assert client.get(f"/skills/{skill_name}").json() == before
+        if write_route == "from-git":
+            assert created_targets
+            assert all(not target.exists() for target in created_targets)
     finally:
         client.close()
 
