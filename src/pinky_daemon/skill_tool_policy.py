@@ -28,7 +28,6 @@ class ToolPatternClassification:
 _TOOL_PATTERN_RE = re.compile(r"^([A-Za-z][A-Za-z0-9_.\-*]*)(?:\(([^()\[\]'\"]+)\))?$")
 _BASELINE_TOOLS = frozenset({"Read", "Glob", "Grep", "Agent"})
 _BASELINE_MCP_PREFIXES = (
-    "mcp__memory__",
     "mcp__pinky-memory__",
     "mcp__pinky-self__",
     "mcp__pinky-messaging__",
@@ -148,7 +147,7 @@ def filter_skill_tool_grants(
     """Apply provenance and opt-in policy to stored skill tool grants.
 
     Unknown legacy rows fail closed only when they would elevate access.
-    Operator, system, shared, and verified peer grants remain effective.
+    Privileged grants require an operator assignment or explicit catalog opt-in.
     """
 
     accepted: list[str] = []
@@ -175,10 +174,10 @@ def filter_skill_tool_grants(
             continue
         if (
             classification.privileged
-            and assigned_by == "self"
+            and assigned_by != "user"
             and not bool(grant.get("privileged_tool_opt_in"))
         ):
-            _warn_drop(warn, agent_name, skill_name, pattern, "self grant lacks operator opt-in")
+            _warn_drop(warn, agent_name, skill_name, pattern, "grant lacks operator opt-in")
             continue
 
         if pattern not in seen:

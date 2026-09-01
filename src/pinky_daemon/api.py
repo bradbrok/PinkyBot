@@ -6490,21 +6490,16 @@ npm run build</pre>
             raise HTTPException(404, f"Skill '{skill_name}' not found")
 
         # Derive provenance from the signature-verified caller, never the
-        # caller-controlled body. This closes the ISOLATED-tenant self-grant
-        # path (#1192): an isolated agent can only sign as itself, so
-        # caller == name forces "self" and the self_assignable gate applies.
-        # RESIDUAL (#638): a non-isolated agent holds the fleetwide global
-        # secret, which authenticates as any non-isolated peer — so it can
-        # sign as a peer (caller != name), fall to the body value, and skip
-        # the gate. self_assignable is therefore NOT a security boundary
-        # against non-isolated agents; fully closing that needs the
-        # global-secret drop (#638), tracked separately.
+        # caller-controlled body. Browser requests are operator assignments;
+        # self and peer signatures retain their verified provenance.
         internal_caller = getattr(request.state, "internal_caller", "")
-        effective_assigned_by = "self" if internal_caller == name else req.assigned_by
+        actor = derive_skill_assignment_actor(internal_caller, name)
 
-        # Check self-assignable constraint
-        if effective_assigned_by == "self" and not skills.effective_self_assignable(skill):
-            raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
+        if internal_caller and not skills.effective_self_assignable(skill):
+            raise HTTPException(
+                403,
+                "signed agents may only assign self-assignable skills",
+            )
 
         # Check dependencies
         missing = skills.check_dependencies(skill_name, name)
@@ -6517,7 +6512,7 @@ npm run build</pre>
 
         ok = skills.assign_to_agent(
             name, skill_name,
-            assigned_by=effective_assigned_by,
+            assigned_by=actor,
             config_overrides=req.config_overrides,
         )
         if not ok:

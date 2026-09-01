@@ -78,6 +78,19 @@ def _reject_if_core(name: str, action: str) -> None:
         raise HTTPException(400, f"Cannot {action} core skill '{name}'")
 
 
+def _reject_agent_catalog_overwrite(name: str, internal_caller: str) -> None:
+    """Keep signed catalog writes from replacing operator-owned rows."""
+    if not internal_caller:
+        return
+    skill = _skills.get(name)
+    if skill and (
+        skill.category == "core"
+        or skill.shared
+        or skill.privileged_tool_opt_in
+    ):
+        raise HTTPException(403, "operator-owned skill")
+
+
 def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
     operator_path = f"/agents/{agent_name}/skills/{skill_name}"
     return {
@@ -114,6 +127,7 @@ def _validate_catalog_tool_patterns(
 async def register_skill(req: RegisterSkillRequest, request: Request):
     """Register a new skill or update an existing one."""
     internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(req.name, internal_caller)
     _validate_catalog_tool_patterns(
         req.tool_patterns,
         skill_name=req.name,
@@ -193,6 +207,7 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         raise HTTPException(404, f"Skill '{name}' not found")
 
     internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     skill_type = req.skill_type if req.skill_type is not None else existing.skill_type
     mcp_server_config = (
         req.mcp_server_config
@@ -326,6 +341,9 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
     if not parsed:
         raise HTTPException(400, "Failed to parse SKILL.md — check frontmatter (name and description required)")
 
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(parsed.name, internal_caller)
+
     _validate_catalog_tool_patterns(
         parsed.allowed_tools,
         skill_name=parsed.name,
@@ -364,7 +382,6 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
     if parsed.metadata:
         config["metadata"] = parsed.metadata
 
-    internal_caller = getattr(request.state, "internal_caller", "")
     skill = _skills.register(
         parsed.name,
         description=parsed.description,
@@ -488,6 +505,8 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         raise HTTPException(400, f"No SKILL.md files found in {repo_name}" + (f"/{subdir}" if subdir else ""))
 
     internal_caller = getattr(request.state, "internal_caller", "")
+    for parsed in found:
+        _reject_agent_catalog_overwrite(parsed.name, internal_caller)
     result = _register(
         _skills,
         found,
@@ -538,6 +557,8 @@ async def discover_skills_endpoint(request: Request):
     """Re-scan filesystem for SKILL.md files and register new skills."""
     internal_caller = getattr(request.state, "internal_caller", "")
     found = discover_all_skills(project_root=str(_pinky_root))
+    for parsed in found:
+        _reject_agent_catalog_overwrite(parsed.name, internal_caller)
     result = register_discovered_skills(
         _skills,
         found,
@@ -570,10 +591,11 @@ async def enable_plugin(name: str, request: Request):
     info = _plugins.get(name)
     if not info:
         raise HTTPException(404, f"Plugin '{name}' not found")
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     ok = _plugins.enable(name)
     if not ok:
         raise HTTPException(500, f"Failed to enable plugin: {info.error}")
-    internal_caller = getattr(request.state, "internal_caller", "")
     _plugins.register_in_skill_store(
         _skills,
         name,

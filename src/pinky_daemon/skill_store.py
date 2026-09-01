@@ -337,7 +337,10 @@ class SkillStore:
             )
             if privileged_tool_opt_in is None:
                 privileged_tool_opt_in = (
-                    existing.privileged_tool_opt_in if existing is not None else False
+                    existing.privileged_tool_opt_in
+                    if existing is not None
+                    and set(existing.tool_patterns) == set(tool_patterns)
+                    else False
                 )
             privileged_tool_opt_in = bool(privileged and privileged_tool_opt_in)
             if privileged and not privileged_tool_opt_in:
@@ -494,7 +497,8 @@ class SkillStore:
 
         # Recompute privilege from persisted patterns.  The catalog flag alone
         # is not a security boundary because legacy or hostile rows can set it.
-        if enabled and assigned_by == "self" and not self.effective_self_assignable(skill):
+        operator_assigned = assigned_by.strip() == "user"
+        if enabled and not operator_assigned and not self.effective_self_assignable(skill):
             return False
 
         now = time.time()

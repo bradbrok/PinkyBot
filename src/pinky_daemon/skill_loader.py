@@ -312,7 +312,7 @@ def register_discovered_skills(
     *,
     overwrite: bool = False,
     agent_originated: bool = False,
-    privileged_tool_opt_in: bool | None = False,
+    privileged_tool_opt_in: bool | None = None,
 ) -> dict:
     """Register discovered SKILL.md skills into the SkillStore.
 
@@ -383,11 +383,7 @@ def register_discovered_skills(
             tool_patterns=tool_patterns,
             directive=skill.body,  # Full SKILL.md body as directive
             self_assignable=True,  # Agents can add filesystem skills to themselves
-            privileged_tool_opt_in=(
-                existing.privileged_tool_opt_in
-                if existing is not None
-                else privileged_tool_opt_in
-            ),
+            privileged_tool_opt_in=privileged_tool_opt_in,
             category="skill",  # Distinct from core/development/productivity
             shared=False,  # Not auto-applied; agents opt in
             agent_originated=agent_originated,
