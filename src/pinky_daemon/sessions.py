@@ -37,7 +37,11 @@ CHARS_PER_TOKEN = 4
 # absent this entry the gauge over-reports usage and triggers restarts
 # early. Other codex models (e.g. gpt-5.6-terra, gpt-5.6-sol) still fall
 # to the default until their real windows are confirmed — add them here
-# once verified rather than guessing.
+# once verified rather than guessing. gpt-daybreak-blue-latest stays on
+# the default DELIBERATELY: it is OpenAI's alias currently pointing to
+# gpt-5.6-sol, whose ChatGPT-sub backend measured ~167k live despite
+# cache metadata claiming 272k — so it gets sol's treatment (the 200k
+# default) until a fresh live measurement says otherwise.
 MODEL_CONTEXT_SIZES = {
     "opus": 200_000,
     "sonnet": 200_000,

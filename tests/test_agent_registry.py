@@ -1723,6 +1723,45 @@ class TestModelSeeds:
         assert sol["is_1m"] == 0
         assert "gpt-5.6-sol" not in registry.get_1m_models()
 
+    def test_daybreak_blue_alias_seeded_at_sol_parity(self, registry):
+        """gpt-daybreak-blue-latest is OpenAI's Daybreak Access alias,
+        officially "an alias that currently points to gpt-5.6-sol" with
+        pricing "adjusted to match each underlying model"
+        (developers.openai.com/api/docs/pricing, verified 2026-09-01). Pin
+        catalog parity with sol on every inherited axis — a price or window
+        that drifts from sol's is a missed alias-repoint or a half-updated
+        table."""
+        models = {
+            m["model_id"]: m
+            for m in registry.list_models(provider="openai", active_only=False)
+        }
+        assert "gpt-daybreak-blue-latest" in models
+        blue = models["gpt-daybreak-blue-latest"]
+        sol = models["gpt-5.6-sol"]
+        assert (blue["input_price"], blue["output_price"],
+                blue["cached_input_price"]) == (
+            sol["input_price"], sol["output_price"], sol["cached_input_price"])
+        assert blue["tier"] == "flagship"
+        assert blue["context_window"] == sol["context_window"]
+        assert blue["is_1m"] == 0
+        assert "gpt-daybreak-blue-latest" not in registry.get_1m_models()
+
+        # The live cost path reads pricing.RATE_TABLE, and the existing OpenAI
+        # parity guards SKIP a catalog row that is absent from RATE_TABLE
+        # (`if rate is None: continue`) — so registry+analytics presence alone
+        # would leave a green suite while cost() returns $0 for the alias.
+        # Require the RATE_TABLE entry here, at sol parity; that in turn forces
+        # the analytics seed via test_seed_pricing_matches_rate_table, closing
+        # the three-table chain.
+        from pinky_daemon.pricing import RATE_TABLE
+        assert RATE_TABLE.get("gpt-daybreak-blue-latest") is RATE_TABLE["gpt-5.6-sol"]
+
+        # The context gauge must resolve the alias to the deliberate 200k
+        # default (see sessions.py) — not the 272k the codex cache advertises.
+        from pinky_daemon.context_window import resolve_context_window
+        assert resolve_context_window("gpt-daybreak-blue-latest") == \
+            resolve_context_window("gpt-5.6-sol") == 200_000
+
     def test_openai_seed_prices_match_pricing_rate_table(self, registry):
         """#860 extends the #741 invariant to the OpenAI family: catalog
         display prices must agree with pricing.py (the actual cost engine)

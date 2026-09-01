@@ -287,6 +287,11 @@ class AnalyticsStore:
         # 2026-07-10). Mirrors pricing.RATE_TABLE (_GPT_FRONTIER), parity-pinned
         # by test_seed_pricing_matches_rate_table.
         ("openai", "gpt-5.6-sol", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
+        # gpt-daybreak-blue-latest: Daybreak Access alias currently pointing
+        # to gpt-5.6-sol — rates mirror sol / pricing.RATE_TABLE, parity-
+        # pinned by test_seed_pricing_matches_rate_table. Re-verify when
+        # OpenAI repoints the alias.
+        ("openai", "gpt-daybreak-blue-latest", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
         # Sonnet 5 (2026-06): the current Sonnet tier. Standard $3/$15 (cached
         # $0.30) — mirrors pinky_daemon.pricing.RATE_TABLE (_SONNET), pinned by
         # test_seed_pricing_matches_rate_table. Introductory $2/$10 runs through
