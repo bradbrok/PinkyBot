@@ -282,7 +282,20 @@
     "type_insight": "Insight",
     "type_interaction_pattern": "Interaction Pattern",
     "type_label": "Type",
-    "type_project_state": "Project State"
+    "type_project_state": "Project State",
+    "edit_title": "Edit Memory",
+    "edit_hint": "Editing clears the stale embedding; semantic recall re-indexes this memory on the agent's next reflection.",
+    "edit_empty": "Content cannot be empty",
+    "edit_failed": "Failed to update memory",
+    "updated": "Memory updated",
+    "delete_title": "Delete Memory",
+    "delete_explain": "Archiving hides the memory and can be undone. Permanent deletion cannot.",
+    "delete_archive": "Archive (reversible)",
+    "delete_hard": "Delete permanently",
+    "delete_hard_confirm": "This removes the memory for good. Click again to confirm.",
+    "delete_failed": "Failed to delete memory",
+    "archived": "Memory archived",
+    "deleted": "Memory permanently deleted"
   },
   "chat": {
     "select_agent": "Select an agent to start chatting",
