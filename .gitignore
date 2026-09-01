@@ -6,9 +6,6 @@ data/
 .claude/
 logs/
 .env
-# .env backups carry live credentials — the bare `.env` rule does NOT match
-# these, so ignore the whole backup family (operator account-switch rollbacks).
-.env.bak*
 __pycache__/
 *.pyc
 *.egg-info/
@@ -36,3 +33,42 @@ docs/
 heartbeat.log
 .coverage
 output/
+
+# --- #423: contenuto operativo del Mac Mini, de-tracciato l'08/08/2026 ---
+# Questi file VIVONO su prod (60+ eseguibili in crontab) ma non appartengono al
+# repo: erano tracciati solo dal commit catch-all 6d50c86a, che non esiste
+# upstream. Tracciarli rendeva `git checkout <tag>` distruttivo — un deploy li
+# avrebbe cancellati dal disco spegnendo le automazioni in silenzio.
+# NON rimuovere questi pattern senza rileggere il task #423.
+scripts/*
+!scripts/audit_route_auth_coverage.py
+!scripts/backfill_codex_runtime.py
+!scripts/backfill_embeddings.py
+!scripts/demo_containerize.py
+!scripts/install-service.sh
+!scripts/kg_ephemeral_sweep.py
+!scripts/restart.sh
+!scripts/v3_export.py
+!scripts/launchctl/
+!scripts/systemd/
+config/
+openclaw_token.txt
+db.sqlite3
+*.patch
+*.bak.*
+*.bak_*
+ANALISI_CODICE_WEB_UI.md
+ISSUE_WAL_FIX.md
+src/pinky_email/
+
+# --- #424: utility CLI standalone di prod, de-tracciate l'08/08/2026 (opzione A) ---
+# Stesso motivo di #423: codice vero che vive solo su prod, mai esistito upstream
+# (origin/main non ha affatto tools/). Nessun file del repo li importa, non sono
+# in crontab. Tracciati => `git checkout <tag>` li cancellerebbe dal disco.
+# Se un giorno vanno portati upstream come codice di progetto, si rimuovono questi
+# pattern DENTRO quella PR — non prima. Rileggere il task #424.
+tools/
+templates/aiena_article_template.html
+
+# Deploy guard-rail (#425) — must never become a tracked file a deploy can remove
+.pinky-deploy-lock
