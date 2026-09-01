@@ -1782,11 +1782,19 @@ class TestModelSeeds:
         assert f51["context_window"] == 1_000_000
         assert f51["is_1m"] == 1
         assert f51["supports_thinking"] == 1
-        # Mythos 5.1 shares Fable 5.1's pricing/specs.
-        assert models["claude-mythos-5-1"]["input_price"] == 10.0
-        assert models["claude-mythos-5-1"]["cached_input_price"] == 0.25
-        # 1M-context set (SDK 200k-report correction path).
+        # Mythos 5.1 shares Fable 5.1's pricing/specs — pin the full row so
+        # a half-seeded twin (e.g. a 200k context_window) fails loud, not
+        # just its display price.
+        m51 = models["claude-mythos-5-1"]
+        assert m51["input_price"] == 10.0
+        assert m51["output_price"] == 50.0
+        assert m51["cached_input_price"] == 0.25
+        assert m51["context_window"] == 1_000_000
+        assert m51["is_1m"] == 1
+        assert m51["supports_thinking"] == 1
+        # 1M-context set (SDK 200k-report correction path) — both twins.
         assert "claude-fable-5-1" in registry.get_1m_models()
+        assert "claude-mythos-5-1" in registry.get_1m_models()
         # The live cost path reads pricing.RATE_TABLE; the parity guards skip a
         # catalog row absent from RATE_TABLE, so require the entry here at the
         # right rates — that forces the analytics seed via
@@ -1797,6 +1805,27 @@ class TestModelSeeds:
         assert _FABLE_51["input"] == 10.0
         assert _FABLE_51["output"] == 50.0
         assert _FABLE_51["cache_read"] == 0.25
+        assert _FABLE_51["cache_write_5m"] == 12.50
+        assert _FABLE_51["cache_write_1h"] == 20.00
+
+    def test_fable_5_1_cost_path_prices_all_five_fields(self):
+        """A hand-computed mixed-token turn through the live cost engine —
+        display-price asserts alone let a mutated cache-write tariff ride
+        (every field below contributes a distinct dollar amount)."""
+        from pinky_daemon.pricing import _FABLE_51, compute_turn_cost_usd, lookup_rate
+
+        for model_id in ("claude-fable-5-1", "claude-mythos-5-1"):
+            cost = compute_turn_cost_usd(
+                model_id,
+                input_tokens=1_000_000,  # 1.00M x $10.00 = $10.00
+                output_tokens=100_000,  # 0.10M x $50.00 = $5.00
+                cache_read_tokens=2_000_000,  # 2.00M x $0.25 = $0.50
+                cache_creation_5m_tokens=40_000,  # 0.04M x $12.50 = $0.50
+                cache_creation_1h_tokens=10_000,  # 0.01M x $20.00 = $0.20
+            )
+            assert cost == pytest.approx(16.20)
+        # The 1M-tier suffix strips to the same rate row.
+        assert lookup_rate("claude-fable-5-1[1m]") is _FABLE_51
 
     def test_openai_seed_prices_match_pricing_rate_table(self, registry):
         """#860 extends the #741 invariant to the OpenAI family: catalog
