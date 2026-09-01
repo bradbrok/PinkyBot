@@ -92,8 +92,9 @@ def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
 
 
 @router.post("/skills")
-async def register_skill(req: RegisterSkillRequest):
+async def register_skill(req: RegisterSkillRequest, request: Request):
     """Register a new skill or update an existing one."""
+    internal_caller = getattr(request.state, "internal_caller", "")
     skill = _skills.register(
         req.name,
         description=req.description,
@@ -110,6 +111,7 @@ async def register_skill(req: RegisterSkillRequest):
         shared=req.shared,
         file_templates=req.file_templates,
         default_config=req.default_config,
+        agent_originated=bool(internal_caller),
     )
     return skill.to_dict()
 
@@ -158,12 +160,13 @@ async def get_skill(name: str):
 
 
 @router.put("/skills/{name}")
-async def update_skill(name: str, req: UpdateSkillRequest):
+async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
     """Update an existing skill's properties."""
     existing = _skills.get(name)
     if not existing:
         raise HTTPException(404, f"Skill '{name}' not found")
 
+    internal_caller = getattr(request.state, "internal_caller", "")
     skill = _skills.register(
         name,
         description=req.description if req.description is not None else existing.description,
@@ -180,6 +183,7 @@ async def update_skill(name: str, req: UpdateSkillRequest):
         shared=req.shared if req.shared is not None else existing.shared,
         file_templates=req.file_templates if req.file_templates is not None else existing.file_templates,
         default_config=req.default_config if req.default_config is not None else existing.default_config,
+        agent_originated=bool(internal_caller),
     )
     return skill.to_dict()
 
@@ -478,10 +482,16 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
 
 
 @router.post("/skills/discover")
-async def discover_skills_endpoint():
+async def discover_skills_endpoint(request: Request):
     """Re-scan filesystem for SKILL.md files and register new skills."""
+    internal_caller = getattr(request.state, "internal_caller", "")
     found = discover_all_skills(project_root=str(_pinky_root))
-    result = register_discovered_skills(_skills, found, overwrite=False)
+    result = register_discovered_skills(
+        _skills,
+        found,
+        overwrite=False,
+        agent_originated=bool(internal_caller),
+    )
     return {
         "discovered": len(found),
         **result,

@@ -278,41 +278,49 @@ class SkillStore:
         file_templates = file_templates or {}
         default_config = default_config or {}
 
-        # Stage 1 capability guard (#1197): a remotely agent-originated skill
-        # that requests any tools is retained for operator review but cannot
-        # be self-assigned. Stage 2 replaces this coarse predicate with the
-        # central tool-pattern classifier.
-        if agent_originated and tool_patterns:
-            self_assignable = False
-
         existing = self.get(name)
-        if existing:
-            self._db.execute(
-                """UPDATE skills
-                   SET description=?, skill_type=?, version=?, enabled=?, config=?,
-                       mcp_server_config=?, tool_patterns=?, directive=?, requires=?,
-                       self_assignable=?, category=?, shared=?, file_templates=?,
-                       default_config=?, updated_at=?
-                   WHERE name=?""",
-                (
-                    description, skill_type, version, int(enabled), json.dumps(config),
-                    json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
-                    json.dumps(requires), int(self_assignable), category, int(shared),
-                    json.dumps(file_templates), json.dumps(default_config), now, name,
-                ),
-            )
-        else:
-            self._db.execute(
-                f"""INSERT INTO skills ({_SKILL_COLS})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    name, description, skill_type, version, int(enabled), json.dumps(config),
-                    json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
-                    json.dumps(requires), int(self_assignable), category, int(shared),
-                    json.dumps(file_templates), json.dumps(default_config), now, now,
-                ),
-            )
-        self._db.commit()
+        with self._db:
+            # Stage 1 capability guard (#1197): a remotely agent-originated
+            # skill that requests any tools is retained for operator review
+            # but cannot be self-assigned. Disable any existing self-grant in
+            # the same transaction so an update cannot leave it materialized.
+            # Stage 2 replaces this coarse predicate with the central
+            # tool-pattern classifier.
+            if agent_originated and tool_patterns:
+                self_assignable = False
+                self._db.execute(
+                    """UPDATE agent_skills
+                       SET enabled=0
+                       WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
+                    (name,),
+                )
+
+            if existing:
+                self._db.execute(
+                    """UPDATE skills
+                       SET description=?, skill_type=?, version=?, enabled=?, config=?,
+                           mcp_server_config=?, tool_patterns=?, directive=?, requires=?,
+                           self_assignable=?, category=?, shared=?, file_templates=?,
+                           default_config=?, updated_at=?
+                       WHERE name=?""",
+                    (
+                        description, skill_type, version, int(enabled), json.dumps(config),
+                        json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
+                        json.dumps(requires), int(self_assignable), category, int(shared),
+                        json.dumps(file_templates), json.dumps(default_config), now, name,
+                    ),
+                )
+            else:
+                self._db.execute(
+                    f"""INSERT INTO skills ({_SKILL_COLS})
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        name, description, skill_type, version, int(enabled), json.dumps(config),
+                        json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
+                        json.dumps(requires), int(self_assignable), category, int(shared),
+                        json.dumps(file_templates), json.dumps(default_config), now, now,
+                    ),
+                )
 
         _log(f"skill_store: {'updated' if existing else 'registered'} {name}")
         return self.get(name)  # type: ignore

@@ -28,12 +28,15 @@ def derive_skill_assignment_actor(internal_caller: str, target_agent: str) -> st
 
     Browser/operator requests have no internal caller and retain ``user``
     provenance. A signed agent acting on itself is ``self``; a signed peer
-    acting on another agent records the verified peer name.
+    acting on another agent records the verified peer name. Peer names that
+    collide with reserved provenance literals are prefixed with ``agent:``.
     """
     if not internal_caller:
         return "user"
     if internal_caller == target_agent:
         return "self"
+    if internal_caller in {"user", "self"}:
+        return f"agent:{internal_caller}"
     return internal_caller
 
 
