@@ -949,3 +949,38 @@ async def test_integration_codex_tmux_roundtrip(tmp_path):
         assert "PONG" in captured[-1].text.upper()
     finally:
         await ss.disconnect()
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# #445 — the codex override needs the same bounded, visible slot wait
+# ──────────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_codex_scheduler_slot_wait_gives_up_after_cap(monkeypatch) -> None:
+    """The codex override must inherit the #445 cap, not spin forever."""
+    from pinky_daemon import codex_tmux_session
+    from pinky_daemon import tmux_session as _ts
+
+    monkeypatch.setattr(_ts, "_SCHEDULER_SLOT_WAIT_TIMEOUT_SEC", 0.20)
+    monkeypatch.setattr(_ts, "_SCHEDULER_SLOT_WAIT_LOG_INTERVAL_SEC", 0.05)
+    lines: list[str] = []
+    monkeypatch.setattr(codex_tmux_session, "_log", lines.append)
+
+    ss = _session()
+    # Precondition, not the behavior under test: a pane that never frees a
+    # slot (the latched-live_status signature of #445).
+    ss._scheduler_pane_busy = lambda candidate=None: True
+    turn = _QueuedTurn(
+        prompt="wake",
+        internal=True,
+        reason="wake_scheduled",
+        scheduler_serialized=True,
+        scheduler_delivery=asyncio.get_event_loop().create_future(),
+    )
+
+    with pytest.raises(_ts._SchedulerDeliverySlotTimeout):
+        await asyncio.wait_for(
+            ss._wait_for_scheduler_delivery_slot(turn), timeout=5
+        )
+    assert any("SCHEDULER_SLOT_WAIT" in ln for ln in lines), lines
