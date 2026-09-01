@@ -297,6 +297,7 @@ def register_discovered_skills(
     skills: list[ParsedSkill],
     *,
     overwrite: bool = False,
+    agent_originated: bool = False,
 ) -> dict:
     """Register discovered SKILL.md skills into the SkillStore.
 
@@ -353,6 +354,7 @@ def register_discovered_skills(
             self_assignable=True,  # Agents can add filesystem skills to themselves
             category="skill",  # Distinct from core/development/productivity
             shared=False,  # Not auto-applied; agents opt in
+            agent_originated=agent_originated,
         )
 
         if existing:

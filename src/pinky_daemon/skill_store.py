@@ -267,6 +267,7 @@ class SkillStore:
         shared: bool = False,
         file_templates: dict | None = None,
         default_config: dict | None = None,
+        agent_originated: bool = False,
     ) -> Skill:
         """Register a new skill or update an existing one."""
         now = time.time()
@@ -276,6 +277,13 @@ class SkillStore:
         requires = requires or []
         file_templates = file_templates or {}
         default_config = default_config or {}
+
+        # Stage 1 capability guard (#1197): a remotely agent-originated skill
+        # that requests any tools is retained for operator review but cannot
+        # be self-assigned. Stage 2 replaces this coarse predicate with the
+        # central tool-pattern classifier.
+        if agent_originated and tool_patterns:
+            self_assignable = False
 
         existing = self.get(name)
         if existing:
@@ -389,6 +397,7 @@ class SkillStore:
         *,
         assigned_by: str = "user",
         config_overrides: dict | None = None,
+        enabled: bool = True,
     ) -> bool:
         """Assign a skill to an agent. Returns False if skill doesn't exist."""
         skill = self.get(skill_name)
@@ -396,17 +405,24 @@ class SkillStore:
             return False
 
         # Check self-assignable constraint
-        if assigned_by == "self" and not skill.self_assignable:
+        if enabled and assigned_by == "self" and not skill.self_assignable:
             return False
 
         now = time.time()
         self._db.execute(
             """INSERT INTO agent_skills (agent_name, skill_name, enabled, assigned_by, config_overrides, assigned_at)
-               VALUES (?, ?, 1, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT (agent_name, skill_name)
-               DO UPDATE SET enabled=1, assigned_by=excluded.assigned_by,
+               DO UPDATE SET enabled=excluded.enabled, assigned_by=excluded.assigned_by,
                              config_overrides=excluded.config_overrides, assigned_at=excluded.assigned_at""",
-            (agent_name, skill_name, assigned_by, json.dumps(config_overrides or {}), now),
+            (
+                agent_name,
+                skill_name,
+                int(enabled),
+                assigned_by,
+                json.dumps(config_overrides or {}),
+                now,
+            ),
         )
         self._db.commit()
         _log(f"skill_store: assigned {skill_name} to {agent_name} (by {assigned_by})")

@@ -14,7 +14,7 @@ import tempfile
 from pathlib import Path
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 from pinky_daemon.api_models import (
     CreateSkillFromMdRequest,
@@ -23,6 +23,7 @@ from pinky_daemon.api_models import (
     SessionSkillRequest,
     UpdateSkillRequest,
 )
+from pinky_daemon.auth import derive_skill_assignment_actor
 from pinky_daemon.skill_loader import (
     _CONSECUTIVE_HYPHENS,
     _NAME_RE,
@@ -74,6 +75,17 @@ def _reject_if_core(name: str, action: str) -> None:
     skill = _skills.get(name)
     if skill and skill.category == "core":
         raise HTTPException(400, f"Cannot {action} core skill '{name}'")
+
+
+def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
+    operator_path = f"/agents/{agent_name}/skills/{skill_name}"
+    return {
+        "skill": skill_name,
+        "reason": (
+            "Skill requests tool access and cannot be self-assigned; "
+            f"an operator can assign it with POST {operator_path}"
+        ),
+    }
 
 
 # ── Skill Management ──────────────────────────────────────────────────────────
@@ -243,7 +255,7 @@ async def clear_session_skill_override(session_id: str, skill_name: str):
 
 
 @router.post("/skills/from-md")
-async def create_skill_from_md(req: CreateSkillFromMdRequest):
+async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
     """Create a skill by parsing SKILL.md content inline.
 
     Parses the frontmatter + body, registers as a skill, and optionally
@@ -298,6 +310,7 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest):
     if parsed.metadata:
         config["metadata"] = parsed.metadata
 
+    internal_caller = getattr(request.state, "internal_caller", "")
     skill = _skills.register(
         parsed.name,
         description=parsed.description,
@@ -310,6 +323,7 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest):
         self_assignable=True,
         category="skill",
         shared=False,
+        agent_originated=bool(internal_caller),
     )
 
     result = skill.to_dict()
@@ -318,14 +332,27 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest):
     if req.agent_name:
         agent = _agents.get(req.agent_name)
         if agent:
-            _skills.assign_to_agent(req.agent_name, parsed.name, assigned_by="user")
-            result["assigned_to"] = req.agent_name
+            assigned_by = derive_skill_assignment_actor(
+                internal_caller,
+                req.agent_name,
+            )
+            if _skills.assign_to_agent(
+                req.agent_name,
+                parsed.name,
+                assigned_by=assigned_by,
+            ):
+                result["assigned_to"] = req.agent_name
+            else:
+                result["assignment_refused"] = _assignment_refusal(
+                    parsed.name,
+                    req.agent_name,
+                )
 
     return result
 
 
 @router.post("/skills/from-git")
-async def install_skill_from_git(req: InstallSkillFromGitRequest):
+async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Request):
     """Clone a git repo into skills/ and register any SKILL.md files found.
 
     Supports:
@@ -405,26 +432,49 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest):
     if not found:
         raise HTTPException(400, f"No SKILL.md files found in {repo_name}" + (f"/{subdir}" if subdir else ""))
 
-    result = _register(_skills, found, overwrite=True)
+    internal_caller = getattr(request.state, "internal_caller", "")
+    result = _register(
+        _skills,
+        found,
+        overwrite=True,
+        agent_originated=bool(internal_caller),
+    )
 
     # Auto-assign to agent if specified
     assigned = []
+    assignment_refused = []
     if req.agent_name:
         agent = _agents.get(req.agent_name)
         if agent:
+            assigned_by = derive_skill_assignment_actor(
+                internal_caller,
+                req.agent_name,
+            )
             for name in result["registered"] + result["updated"]:
-                _skills.assign_to_agent(req.agent_name, name, assigned_by="user")
-                assigned.append(name)
+                if _skills.assign_to_agent(
+                    req.agent_name,
+                    name,
+                    assigned_by=assigned_by,
+                ):
+                    assigned.append(name)
+                else:
+                    assignment_refused.append(
+                        _assignment_refusal(name, req.agent_name)
+                    )
 
-    return {
+    response = {
         "repo": repo_name,
         "skills_found": len(found),
         "registered": result["registered"],
         "updated": result["updated"],
         "skipped": result["skipped"],
-        "assigned_to": req.agent_name if assigned else "",
         "assigned_skills": assigned,
     }
+    if assigned:
+        response["assigned_to"] = req.agent_name
+    if assignment_refused:
+        response["assignment_refused"] = assignment_refused
+    return response
 
 
 @router.post("/skills/discover")
