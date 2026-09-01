@@ -4432,31 +4432,6 @@ class TmuxSession(TransportReplacementMixin):
         elif secret:
             env["PINKY_SESSION_SECRET"] = secret
 
-        # ChatGPT-sub Codex models: tell Claude Code the safe 150k upstream
-        # window so it auto-compacts before the backend 502s (see
-        # _CODEX_SUB_CONTEXT_WINDOW). The "[1m]" suffix otherwise lets CC ride
-        # context toward ~1M and overflow the sub's real ~167k cap (2026-07-16
-        # solik wedge; the prior 272k assumption left his pane dead for 13h).
-        # SCOPED to the ChatGPT-sub PROXY route (trusted loopback
-        # :18765): paid/custom API gateways are outside this measured cap and
-        # must not inherit the subscription override. An operator's smaller
-        # ambient CLAUDE_CODE_AUTO_COMPACT_WINDOW remains a tuning escape hatch,
-        # but a larger/malformed value cannot raise the live-evidenced ceiling.
-        from pinky_daemon.pricing import strip_tier
-
-        auto_window = self._CODEX_SUB_CONTEXT_WINDOW.get(
-            strip_tier(self._config.model or ""), 0
-        )
-        if auto_window and self._is_codex_sub_proxy(self._config.provider_url or ""):
-            ambient = os.environ.get("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "").strip()
-            if ambient:
-                try:
-                    ambient_window = int(ambient)
-                except ValueError:
-                    ambient_window = 0
-                if ambient_window > 0:
-                    auto_window = min(auto_window, ambient_window)
-            env["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] = str(auto_window)
         return env
 
     async def disconnect(self) -> None:
@@ -5568,38 +5543,6 @@ class TmuxSession(TransportReplacementMixin):
     # the percentage-based threshold (always true on 1M, never on 200k
     # since 400k exceeds that window entirely).
     _RESTART_TOKENS_CAP_1M = 400_000
-
-    # ChatGPT-subscription Codex models exposed to Claude Code via the local
-    # codex proxy. The legacy "[1m]" model suffix hints CC a 1M window, but
-    # live #356 evidence puts solik's real backend window near 167k: the prior
-    # #877 272k value overflowed and wedged his pane for 13 hours on 2026-07-16.
-    # Compact at 150k for headroom below that observed limit. This map is scoped
-    # to the subscription proxy; paid/custom gateways retain their own window.
-    # Do not restore 272k from the older cache/README evidence without a new
-    # live backend measurement.
-    _CODEX_SUB_CONTEXT_WINDOW = {
-        "gpt-5.6-sol": 150_000,
-    }
-
-    @staticmethod
-    def _is_codex_sub_proxy(provider_url: str) -> bool:
-        """True if provider_url is the local ChatGPT-sub Codex proxy (trusted
-        http(s) loopback on :18765). The 150k auto-compact cap applies ONLY to
-        this route — the same model slug on a paid/custom API gateway does not
-        inherit the subscription override. Total/fail-closed: a
-        malformed url (incl. a non-numeric or out-of-range port, which raises
-        only when ``parsed.port`` is accessed) returns False, never raises."""
-        import urllib.parse
-
-        try:
-            parsed = urllib.parse.urlparse((provider_url or "").strip())
-            return (
-                parsed.scheme in {"http", "https"}
-                and parsed.hostname in {"localhost", "127.0.0.1", "::1"}
-                and parsed.port == 18765
-            )
-        except ValueError:
-            return False
 
     def _raw_max_tokens_for_model(self) -> int:
         """Return the model's **raw** context-window cap (no buffer).
