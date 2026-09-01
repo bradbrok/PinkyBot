@@ -1110,8 +1110,9 @@ class TestAgentIsolationScoping:
         # The static /skills/apply route is currently declared after the
         # /skills/{skill_name} POST route, so FastAPI otherwise dispatches
         # "apply" as a skill name and returns a missing-body 422. Route-order
-        # repair is outside this PR; promote the existing static route in this
-        # fixture so the signed effect checks exercise its real handler.
+        # repair is tracked in #1202 and outside this PR; promote the existing
+        # static route in this fixture so signed effect checks exercise its
+        # real handler.
         routes = client.app.router.routes
         apply_route = next(
             route
@@ -1315,6 +1316,26 @@ class TestAgentIsolationScoping:
         resp = self._signed_get(client, "other", "/agents/tenant")
         assert resp.status_code != 403
         os.unlink(path)
+
+    def test_skill_apply_route_shadowing_documents_1202(self, monkeypatch, tmp_path):
+        """DOCUMENTS #1202: the earlier assignment route shadows static /apply."""
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        try:
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                "/agents/tenant/skills/apply",
+            )
+
+            assert response.status_code == 422, response.text
+            assert any(
+                error["type"] == "missing" and error["loc"] == ["body"]
+                for error in response.json()["detail"]
+            )
+        finally:
+            client.close()
+            os.unlink(path)
 
     # ── #1187: isolated callers cannot mutate the fleet skill catalog ────
 
