@@ -8155,6 +8155,15 @@ except Exception as exc:
         ("anthropic", "claude-opus-4-5", "Claude Opus 4.5", "Previous-gen Opus.", "opus", 200_000, 0, 5.0, 25.0, 0.5, 1, 40),
         ("anthropic", "claude-sonnet-4-5", "Claude Sonnet 4.5", "Previous-gen Sonnet.", "sonnet", 200_000, 0, 3.0, 15.0, 0.3, 1, 50),
         # OpenAI / Codex CLI
+        # gpt-daybreak-blue-latest: OpenAI Daybreak Access alias (enrollment-
+        # gated tier for authorized defensive-security work). Officially "an
+        # alias that currently points to gpt-5.6-sol"; OpenAI repoints it as
+        # new Daybreak models release, "with pricing adjusted to match each
+        # underlying model" (developers.openai.com/api/docs/pricing, verified
+        # 2026-09-01). Seeded at sol parity on every inherited axis — prices
+        # and 200k-class window — so revisit all three tables (catalog /
+        # RATE_TABLE / analytics seeds) together when the alias moves.
+        ("openai", "gpt-daybreak-blue-latest", "Daybreak Blue", "Daybreak Access alias — currently gpt-5.6-sol with safeguards tuned for authorized defensive-security work. Tracks the newest Daybreak Blue model; pricing follows the underlying model. 200k-class context. Codex sign-in auth.", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 53),
         ("openai", "gpt-5.6-sol", "GPT-5.6 Sol", "Current codex fleet model (2026-07). Frontier coding + reasoning. 200k-class context; ChatGPT-sub proxy compacts at 150k below its observed ~167k backend limit. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 54),
         ("openai", "gpt-5.5", "GPT-5.5", "Previous frontier. Coding + reasoning. Codex sign-in auth only (API pending).", "flagship", 200_000, 0, 5.0, 30.0, 0.5, 0, 55),
         ("openai", "gpt-5.4", "GPT-5.4", "Flagship. Complex reasoning & coding.", "flagship", 200_000, 0, 1.75, 14.0, 0.175, 0, 60),

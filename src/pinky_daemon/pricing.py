@@ -155,6 +155,12 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     # (2026-07-09→); gpt-5.5 the previous one; gpt-5.3-codex kept because the
     # analytics seed carries it (parity-pinned).
     "gpt-5.6-sol": _GPT_56_SOL,
+    # gpt-daybreak-blue-latest: Daybreak Access alias — officially "currently
+    # point[s] to gpt-5.6-sol", with pricing "adjusted to match each
+    # underlying model" (developers.openai.com/api/docs/pricing, verified
+    # 2026-09-01). Sol's dict verbatim; update together with the catalog and
+    # analytics seeds when OpenAI repoints the alias.
+    "gpt-daybreak-blue-latest": _GPT_56_SOL,
     "gpt-5.5": _GPT_55,
     "gpt-5.3-codex": _GPT_53_CODEX,
 }
