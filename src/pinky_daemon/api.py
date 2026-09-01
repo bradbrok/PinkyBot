@@ -5163,6 +5163,7 @@ def create_api(
             # #149: an isolated agent is scoped to its OWN resources. Deny any
             # cross-agent /agents/{other}/* access even with a valid signature.
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
+            request.state.internal_caller = caller
             if _internal_isolation_denied(request, caller):
                 error = "isolated agent may only access its own resources"
                 if _isolation_fleet_write(request.method, request.url.path):
@@ -6456,7 +6457,9 @@ npm run build</pre>
         return {"agent": name, "skills": [s.to_dict() for s in result], "count": len(result)}
 
     @app.post("/agents/{name}/skills/{skill_name}")
-    async def assign_agent_skill(name: str, skill_name: str, req: AssignSkillRequest):
+    async def assign_agent_skill(
+        name: str, skill_name: str, req: AssignSkillRequest, request: Request
+    ):
         """Assign a skill to an agent."""
         agent = agents.get(name)
         if not agent:
@@ -6465,8 +6468,11 @@ npm run build</pre>
         if not skill:
             raise HTTPException(404, f"Skill '{skill_name}' not found")
 
+        internal_caller = getattr(request.state, "internal_caller", "")
+        effective_assigned_by = "self" if internal_caller == name else req.assigned_by
+
         # Check self-assignable constraint
-        if req.assigned_by == "self" and not skill.self_assignable:
+        if effective_assigned_by == "self" and not skill.self_assignable:
             raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
 
         # Check dependencies
@@ -6480,7 +6486,7 @@ npm run build</pre>
 
         ok = skills.assign_to_agent(
             name, skill_name,
-            assigned_by=req.assigned_by,
+            assigned_by=effective_assigned_by,
             config_overrides=req.config_overrides,
         )
         if not ok:
