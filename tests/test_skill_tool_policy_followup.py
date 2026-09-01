@@ -9,11 +9,63 @@ from pathlib import Path
 import pytest
 from fastapi.testclient import TestClient
 
-from pinky_daemon.api import create_api
+from pinky_daemon.api import _seed_core_skills, create_api
 from pinky_daemon.auth import build_internal_auth_headers
 from pinky_daemon.routes import skills as skill_routes
+from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.skill_tool_policy import (
+    filter_skill_tool_grants,
+    has_privileged_tool_grant,
+)
 
 pytestmark = pytest.mark.real_auth
+
+
+def test_seeded_core_skill_tool_patterns_are_non_privileged(tmp_path):
+    store = SkillStore(str(tmp_path / "skills.db"))
+    try:
+        _seed_core_skills(store)
+
+        core_skills = store.list(category="core")
+        assert core_skills
+        for skill in core_skills:
+            assert has_privileged_tool_grant(
+                skill.tool_patterns,
+                skill_name=skill.name,
+                mcp_server_config=skill.mcp_server_config,
+                skill_type=skill.skill_type,
+            ) is False, skill.name
+    finally:
+        store.close()
+
+
+def test_seeded_shared_core_patterns_materialize_without_policy_warnings(tmp_path):
+    store = SkillStore(str(tmp_path / "skills.db"))
+    agent_name = "fresh-agent"
+    try:
+        _seed_core_skills(store)
+        assert store._db.execute(
+            "SELECT 1 FROM agent_skills WHERE agent_name=?",
+            (agent_name,),
+        ).fetchone() is None
+
+        core_skills = store.list(category="core")
+        expected_patterns = [
+            pattern
+            for skill in core_skills
+            for pattern in skill.tool_patterns
+        ]
+        materialized = store.materialize_for_agent(agent_name)
+        warnings: list[str] = []
+
+        assert filter_skill_tool_grants(
+            materialized["tool_grants"],
+            agent_name=agent_name,
+            warn=warnings.append,
+        ) == expected_patterns
+        assert warnings == []
+    finally:
+        store.close()
 
 
 def _make_client(monkeypatch, tmp_path) -> TestClient:
