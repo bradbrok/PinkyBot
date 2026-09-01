@@ -250,23 +250,39 @@ def test_merge_self_privileged_grant_is_gated_by_persisted_opt_in():
         assert bool(warnings) is (not opt_in)
 
 
-def test_merge_preserves_non_self_privileged_grants():
+@pytest.mark.parametrize(
+    ("assigned_by", "opt_in", "expected"),
+    [
+        ("user", False, ["Bash"]),
+        ("self", False, []),
+        ("peer-agent", False, []),
+        ("SELF", False, []),
+        ("system", False, []),
+        ("shared", False, []),
+        ("", False, []),
+        (None, False, []),
+        ("self", True, ["Bash"]),
+        ("peer-agent", True, ["Bash"]),
+    ],
+)
+def test_merge_requires_user_provenance_or_opt_in_for_privileged_grants(
+    assigned_by, opt_in, expected
+):
     from pinky_daemon.skill_tool_policy import filter_skill_tool_grants
 
-    for assigned_by in ("user", "system", "peer-agent"):
-        assert filter_skill_tool_grants(
-            [
-                {
-                    "skill_name": "operator-probe",
-                    "pattern": "Bash",
-                    "assigned_by": assigned_by,
-                    "privileged_tool_opt_in": False,
-                    "mcp_server_config": {},
-                    "skill_type": "skill",
-                }
-            ],
-            agent_name="alice",
-        ) == ["Bash"]
+    assert filter_skill_tool_grants(
+        [
+            {
+                "skill_name": "provenance-probe",
+                "pattern": "Bash",
+                "assigned_by": assigned_by,
+                "privileged_tool_opt_in": opt_in,
+                "mcp_server_config": {},
+                "skill_type": "skill",
+            }
+        ],
+        agent_name="alice",
+    ) == expected
 
 
 def test_discovery_repairs_patterns_even_when_body_is_unchanged(store):
@@ -295,7 +311,7 @@ def test_discovery_repairs_patterns_even_when_body_is_unchanged(store):
     assert store.get("project-management").tool_patterns == repaired
 
 
-def test_discovery_preserves_existing_operator_opt_in_but_never_creates_one(store):
+def test_discovery_invalidates_opt_in_when_privileged_patterns_change(store):
     store.register(
         "operator-reviewed",
         description="before",
@@ -328,10 +344,37 @@ def test_discovery_preserves_existing_operator_opt_in_but_never_creates_one(stor
 
     assert result["updated"] == ["operator-reviewed"]
     assert result["registered"] == ["fresh-privileged"]
-    assert reviewed.self_assignable is True
-    assert reviewed.privileged_tool_opt_in is True
+    assert reviewed.self_assignable is False
+    assert reviewed.privileged_tool_opt_in is False
     assert discovered.self_assignable is False
     assert discovered.privileged_tool_opt_in is False
+
+
+def test_register_inherits_opt_in_only_for_unchanged_pattern_set(store):
+    store.register(
+        "operator-reviewed",
+        tool_patterns=["Bash"],
+        self_assignable=True,
+        privileged_tool_opt_in=True,
+    )
+
+    unchanged = store.register(
+        "operator-reviewed",
+        tool_patterns=["Bash"],
+        self_assignable=True,
+        privileged_tool_opt_in=None,
+    )
+    widened = store.register(
+        "operator-reviewed",
+        tool_patterns=["Bash", "Write"],
+        self_assignable=True,
+        privileged_tool_opt_in=None,
+    )
+
+    assert unchanged.self_assignable is True
+    assert unchanged.privileged_tool_opt_in is True
+    assert widened.self_assignable is False
+    assert widened.privileged_tool_opt_in is False
 
 
 def _create_legacy_policy_database(path):

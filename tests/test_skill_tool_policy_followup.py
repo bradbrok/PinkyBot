@@ -73,6 +73,32 @@ def _skill_md(name: str) -> str:
     )
 
 
+def _register_agent(client: TestClient, tmp_path: Path, name: str) -> None:
+    client.app.state.agents.register(
+        name,
+        model="opus",
+        working_dir=str(tmp_path / name),
+    )
+
+
+def _stub_git_clone(monkeypatch) -> None:
+    def fake_git_run(args, **kwargs):
+        target = Path(args[2]) if "-C" in args else Path(args[-1])
+        target.mkdir(parents=True, exist_ok=True)
+        (target / "SKILL.md").write_text(_skill_md(target.name), encoding="utf-8")
+        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_git_run)
+
+
+def _assignment_row(agent_name: str, skill_name: str):
+    return skill_routes._skills._db.execute(
+        """SELECT agent_name, skill_name, enabled, assigned_by, config_overrides
+           FROM agent_skills WHERE agent_name=? AND skill_name=?""",
+        (agent_name, skill_name),
+    ).fetchone()
+
+
 def _upload_skill(client: TestClient, source: str, name: str):
     if source == "from-md":
         return client.post("/skills/from-md", json={"content": _skill_md(name)})
@@ -88,14 +114,7 @@ def test_operator_upload_requires_separate_privileged_self_assignment_opt_in(
     monkeypatch, tmp_path, source
 ):
     client = _make_client(monkeypatch, tmp_path)
-
-    def fake_git_run(args, **kwargs):
-        target = Path(args[2]) if "-C" in args else Path(args[-1])
-        target.mkdir(parents=True, exist_ok=True)
-        (target / "SKILL.md").write_text(_skill_md(target.name), encoding="utf-8")
-        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
-
-    monkeypatch.setattr(subprocess, "run", fake_git_run)
+    _stub_git_clone(monkeypatch)
     try:
         new_name = f"{source.removeprefix('from-')}-new-privileged"
         uploaded = _upload_skill(client, source, new_name)
@@ -134,11 +153,7 @@ def test_imported_privileged_skill_accepts_only_operator_self_assignment_opt_in(
     client = _make_client(monkeypatch, tmp_path)
     skill_name = "md-explicit-opt-in"
     try:
-        client.app.state.agents.register(
-            "internal",
-            model="opus",
-            working_dir=str(tmp_path / "internal"),
-        )
+        _register_agent(client, tmp_path, "internal")
         uploaded = _upload_skill(client, "from-md", skill_name)
 
         assert uploaded.status_code == 200, uploaded.text
@@ -163,9 +178,274 @@ def test_imported_privileged_skill_accepts_only_operator_self_assignment_opt_in(
             agent_name="internal",
         )
 
-        assert internal_opt_in.status_code == 200, internal_opt_in.text
-        assert internal_opt_in.json()["self_assignable"] is False
-        assert internal_opt_in.json()["privileged_tool_opt_in"] is False
+        assert internal_opt_in.status_code == 403, internal_opt_in.text
+        assert internal_opt_in.json()["detail"] == "operator-owned skill"
+        unchanged = client.get(f"/skills/{skill_name}").json()
+        assert unchanged["self_assignable"] is True
+        assert unchanged["privileged_tool_opt_in"] is True
+    finally:
+        client.close()
+
+
+def test_peer_signed_assignment_cannot_spoof_user_provenance_for_restricted_skill(
+    monkeypatch, tmp_path
+):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "target")
+        _register_agent(client, tmp_path, "requester")
+        skill_name = "peer-restricted"
+        created = client.post(
+            "/skills",
+            json={"name": skill_name, "tool_patterns": ["Bash"]},
+        )
+        assert created.status_code == 200, created.text
+
+        denied = _signed_request(
+            client,
+            "POST",
+            f"/agents/target/skills/{skill_name}",
+            {"assigned_by": "user"},
+            agent_name="requester",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == "signed agents may only assign self-assignable skills"
+        assert _assignment_row("target", skill_name) is None
+    finally:
+        client.close()
+
+
+def test_peer_signed_assignment_records_verified_peer_provenance(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "target")
+        _register_agent(client, tmp_path, "requester")
+        skill_name = "peer-allowed"
+        created = client.post(
+            "/skills",
+            json={
+                "name": skill_name,
+                "tool_patterns": ["Bash"],
+                "self_assignable": True,
+            },
+        )
+        assert created.status_code == 200, created.text
+
+        assigned = _signed_request(
+            client,
+            "POST",
+            f"/agents/target/skills/{skill_name}",
+            {"assigned_by": "user"},
+            agent_name="requester",
+        )
+
+        assert assigned.status_code == 200, assigned.text
+        assert _assignment_row("target", skill_name)[3] == "requester"
+    finally:
+        client.close()
+
+
+def test_self_signed_assignment_keeps_self_provenance(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "target")
+        skill_name = "self-allowed"
+        created = client.post(
+            "/skills",
+            json={"name": skill_name, "tool_patterns": ["Read"], "self_assignable": True},
+        )
+        assert created.status_code == 200, created.text
+
+        assigned = _signed_request(
+            client,
+            "POST",
+            f"/agents/target/skills/{skill_name}",
+            {"assigned_by": "user"},
+            agent_name="target",
+        )
+
+        assert assigned.status_code == 200, assigned.text
+        assert _assignment_row("target", skill_name)[3] == "self"
+    finally:
+        client.close()
+
+
+def test_operator_assignment_ignores_body_provenance(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "target")
+        skill_name = "operator-assigned"
+        created = client.post(
+            "/skills",
+            json={"name": skill_name, "tool_patterns": ["Read"], "self_assignable": True},
+        )
+        assert created.status_code == 200, created.text
+
+        assigned = client.post(
+            f"/agents/target/skills/{skill_name}",
+            json={"assigned_by": "self"},
+        )
+
+        assert assigned.status_code == 200, assigned.text
+        assert _assignment_row("target", skill_name)[3] == "user"
+    finally:
+        client.close()
+
+
+@pytest.mark.parametrize("write_route", ["post", "put", "from-md", "from-git"])
+def test_agent_catalog_write_routes_preserve_operator_owned_rows(
+    monkeypatch, tmp_path, write_route
+):
+    client = _make_client(monkeypatch, tmp_path)
+    _stub_git_clone(monkeypatch)
+    try:
+        _register_agent(client, tmp_path, "target")
+        _register_agent(client, tmp_path, "writer")
+        skill_name = f"protected-{write_route}"
+        created = client.post(
+            "/skills",
+            json={
+                "name": skill_name,
+                "description": "operator-owned",
+                "tool_patterns": ["Bash"],
+                "self_assignable": True,
+                "shared": True,
+            },
+        )
+        assert created.status_code == 200, created.text
+        assigned = _signed_request(
+            client,
+            "POST",
+            f"/agents/target/skills/{skill_name}",
+            {"assigned_by": "user"},
+            agent_name="target",
+        )
+        assert assigned.status_code == 200, assigned.text
+        before_catalog = client.get(f"/skills/{skill_name}").json()
+        before_assignment = _assignment_row("target", skill_name)
+
+        if write_route == "post":
+            response = _signed_request(
+                client,
+                "POST",
+                "/skills",
+                {"name": skill_name, "description": "changed"},
+                agent_name="writer",
+            )
+        elif write_route == "put":
+            response = _signed_request(
+                client,
+                "PUT",
+                f"/skills/{skill_name}",
+                {"description": "changed"},
+                agent_name="writer",
+            )
+        elif write_route == "from-md":
+            response = _signed_request(
+                client,
+                "POST",
+                "/skills/from-md",
+                {"content": _skill_md(skill_name)},
+                agent_name="writer",
+            )
+        else:
+            response = _signed_request(
+                client,
+                "POST",
+                "/skills/from-git",
+                {"url": f"https://github.com/test/{skill_name}"},
+                agent_name="writer",
+            )
+
+        assert response.status_code == 403, response.text
+        assert response.json()["detail"] == "operator-owned skill"
+        assert client.get(f"/skills/{skill_name}").json() == before_catalog
+        assert _assignment_row("target", skill_name) == before_assignment
+    finally:
+        client.close()
+
+
+def test_agent_put_rejects_shared_skill_without_privileged_opt_in(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "writer")
+        skill_name = "shared-catalog-row"
+        created = client.post(
+            "/skills",
+            json={
+                "name": skill_name,
+                "tool_patterns": ["Read"],
+                "self_assignable": True,
+                "shared": True,
+            },
+        )
+        assert created.status_code == 200, created.text
+        assert created.json()["privileged_tool_opt_in"] is False
+        before = client.get(f"/skills/{skill_name}").json()
+
+        denied = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {"description": "changed"},
+            agent_name="writer",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == "operator-owned skill"
+        assert client.get(f"/skills/{skill_name}").json() == before
+    finally:
+        client.close()
+
+
+def test_agent_put_rejects_core_skill(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "writer")
+        before = client.get("/skills/pinky-self").json()
+
+        denied = _signed_request(
+            client,
+            "PUT",
+            "/skills/pinky-self",
+            {"description": "changed"},
+            agent_name="writer",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == "operator-owned skill"
+        assert client.get("/skills/pinky-self").json() == before
+    finally:
+        client.close()
+
+
+def test_agent_can_create_and_update_plain_catalog_draft(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    try:
+        _register_agent(client, tmp_path, "writer")
+        skill_name = "plain-draft"
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {"name": skill_name, "description": "before"},
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+
+        updated = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {"description": "after"},
+            agent_name="writer",
+        )
+
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["description"] == "after"
+        assert updated.json()["shared"] is False
+        assert updated.json()["privileged_tool_opt_in"] is False
     finally:
         client.close()
 
@@ -263,6 +543,12 @@ def test_baseline_classifier_matches_default_streaming_allowlist():
     )
     from pinky_daemon.streaming_session import DEFAULT_STREAMING_ALLOWED_TOOLS
 
+    dead_alias = "mcp__memory__*"
+    # No client-visible MCP server is named "memory", so this legacy default
+    # must not become a classifier exemption for a skill claiming that name.
+    baseline_patterns = [
+        pattern for pattern in DEFAULT_STREAMING_ALLOWED_TOOLS if pattern != dead_alias
+    ]
     classifications = [
         classify_tool_pattern(
             pattern,
@@ -270,10 +556,19 @@ def test_baseline_classifier_matches_default_streaming_allowlist():
             mcp_server_config={},
             skill_type="custom",
         )
-        for pattern in DEFAULT_STREAMING_ALLOWED_TOOLS
+        for pattern in baseline_patterns
     ]
 
     assert all(not classification.privileged for classification in classifications)
+    assert (
+        classify_tool_pattern(
+            dead_alias,
+            skill_name="memory",
+            mcp_server_config={},
+            skill_type="custom",
+        ).privileged
+        is True
+    )
     assert len(_BASELINE_TOOLS) + len(_BASELINE_MCP_PREFIXES) == len(
-        DEFAULT_STREAMING_ALLOWED_TOOLS
+        baseline_patterns
     )
