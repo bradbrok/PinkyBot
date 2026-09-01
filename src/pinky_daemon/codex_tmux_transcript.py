@@ -320,6 +320,11 @@ class CodexTmuxTranscriptTailer:
     directly to a rollout filename, allowing exact binding without a glob.
     The cwd-based glob is the self-heal fallback when that notification
     never arrives (mirrors PR #515's ``path_discovery`` pattern).
+
+    Textless close markers use a frozen replay boundary for constructor
+    binds, default EOF-seek swaps, and ``set_offset`` resumes. Bytes this
+    process has never consumed after a self-heal repoint or truncation
+    replacement are live instead.
     """
 
     def __init__(
@@ -346,9 +351,10 @@ class CodexTmuxTranscriptTailer:
         self._on_entry = on_entry
 
         self._offset: int = 0
-        # Frozen replay boundary for this bind. Existing bytes are historical;
-        # appended close markers are live. Snapshot before any possible read so
-        # initial binds and seek-to-start self-heal repoints share the rule.
+        # Frozen replay boundary for the constructor bind. Existing bytes are
+        # historical; appended close markers are live. Default EOF-seek swaps
+        # take the same snapshot, while unseen self-heal/truncation bytes are
+        # live and reset their boundary to zero.
         try:
             self._historical_high_water: int = (
                 self._path.stat().st_size if self._path.exists() else 0
@@ -424,7 +430,8 @@ class CodexTmuxTranscriptTailer:
 
         ``seek_to_start=True``: seek to byte 0. Used by the self-heal
         discovery path when transitioning from a placeholder to a freshly-
-        discovered rollout (created seconds ago; daemon has never read it).
+        discovered rollout. Every byte is live because this process has never
+        consumed the file.
 
         Also drains the in-memory buffer (mirrors #496 Case 2' fix) to
         prevent partial text from a killed session leaking into a fresh one.
@@ -438,12 +445,13 @@ class CodexTmuxTranscriptTailer:
                 )
             except OSError:
                 bind_size = 0
-            self._historical_high_water = bind_size
             self.model_context_window = 0
             if seek_to_start:
                 self._offset = 0
+                self._historical_high_water = 0
             else:
                 self._offset = bind_size
+                self._historical_high_water = bind_size
             self._buffer.drain()    # silent drain; we're not at a boundary
             self._stats["rotations"] += 1
             self._wake_event.set()
@@ -612,14 +620,15 @@ class CodexTmuxTranscriptTailer:
 
         size = self._path.stat().st_size
         if size < self._offset or size < self._historical_high_water:
-            # File truncated / rotated. Reset and replay from 0.
+            # File truncated / replaced. Reset and consume from 0; every byte
+            # in the replacement is live because this process has not read it.
             _log(
                 f"codex_tailer[{self._agent_name}]: file shrank "
                 f"({size} < offset={self._offset} / "
                 f"high_water={self._historical_high_water}); resetting to 0"
             )
             self._offset = 0
-            self._historical_high_water = size
+            self._historical_high_water = 0
             self.model_context_window = 0
             self._buffer.drain()
             self._stats["rotations"] += 1

@@ -8489,7 +8489,7 @@ class TmuxSession(TransportReplacementMixin):
             # skew), and a turn's own idle always postdates its own paste, so
             # an idle that predates the paste cannot belong to this turn.
             idle_floor = min(self._head_started_at, head.dispatched_at)
-            if last_updated >= idle_floor:
+            if live_timestamp_is_numeric and last_updated >= idle_floor:
                 return "idle"
             # (#592) Secondary: the Stop hook may have fired for this turn
             # but failed to advance live_status.last_updated (concurrent-
