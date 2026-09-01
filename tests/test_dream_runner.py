@@ -136,18 +136,18 @@ class TestDreamRunner:
 
 @pytest.mark.real_auth
 @pytest.mark.parametrize(
-    ("isolated", "force_global_fallback"),
-    [(False, True), (True, False)],
+    ("isolated", "force_global_fallback", "expected_created"),
+    [(False, True, 1), (True, False, 0)],
     ids=("global-fallback", "isolated-agent-key"),
 )
 def test_skill_proposal_uses_signed_headers_against_auth_gate(
-    tmp_path, monkeypatch, isolated, force_global_fallback
+    tmp_path, monkeypatch, isolated, force_global_fallback, expected_created
 ):
-    """Dream-created skills authenticate; the same bare API POST is denied.
+    """Dream-created skills authenticate unless the dreaming agent is isolated.
 
     Non-isolated agents retain the shared-secret fallback. Isolated agents use
-    their per-agent key because the auth gate deliberately rejects that shared
-    secret for isolated identities.
+    neither signing lane: their proposals must be skipped before the fleet
+    catalog API can be called.
     """
     monkeypatch.setenv("PINKY_SESSION_SECRET", "dream-test-session-secret")
     app = create_api(
@@ -190,7 +190,10 @@ def test_skill_proposal_uses_signed_headers_against_auth_gate(
         def read(self) -> bytes:
             return self._content
 
+    api_requests = []
+
     def _urlopen(req, timeout=None):
+        api_requests.append(req)
         response = client.request(
             req.get_method(),
             urlsplit(req.full_url).path,
@@ -201,9 +204,13 @@ def test_skill_proposal_uses_signed_headers_against_auth_gate(
         return _UrlResponse(response.content)
 
     monkeypatch.setattr(urllib.request, "urlopen", _urlopen)
+    logs = []
+    monkeypatch.setattr(dream_runner_module, "_log", logs.append)
     runner = app.state.dream_runner
     if force_global_fallback:
         runner._signing_key_provider = lambda _agent_name: None
+    agent_config = app.state.agents.get("test-agent")
+    assert agent_config is not None
     dream_output = """<proposed_skills>
     [{
       "skill_name": "test-dream-skill",
@@ -213,9 +220,21 @@ def test_skill_proposal_uses_signed_headers_against_auth_gate(
     }]
     </proposed_skills>"""
 
-    assert runner._extract_proposed_skills(dream_output, "test-agent") == 1
+    assert (
+        runner._extract_proposed_skills(dream_output, "test-agent", agent_config)
+        == expected_created
+    )
 
-    assert (tmp_path / "skills" / "test-dream-skill" / "SKILL.md").exists()
+    skill_file = tmp_path / "skills" / "test-dream-skill" / "SKILL.md"
+    if isolated:
+        assert api_requests == []
+        assert not skill_file.exists()
+        assert logs == [
+            "dream-runner: skipped 1 proposed skill(s) for isolated agent 'test-agent'"
+        ]
+    else:
+        assert len(api_requests) == 1
+        assert skill_file.exists()
 
 
 class TestBuildKGLLMCaller:

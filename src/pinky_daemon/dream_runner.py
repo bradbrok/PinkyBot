@@ -1318,7 +1318,7 @@ class DreamRunner:
         # it POSTs to the daemon's own API, which can only be served while the
         # event loop is free.
         skills_created = await asyncio.to_thread(
-            self._extract_proposed_skills, summary, agent_name
+            self._extract_proposed_skills, summary, agent_name, agent_config
         )
         if skills_created:
             _log(f"dream-runner: '{agent_name}' created {skills_created} skill draft(s)")
@@ -1837,11 +1837,14 @@ class DreamRunner:
 
     # ── Skill extraction ────────────────────────────────────
 
-    def _extract_proposed_skills(self, dream_output: str, agent_name: str) -> int:
+    def _extract_proposed_skills(
+        self, dream_output: str, agent_name: str, agent_config
+    ) -> int:
         """Parse <proposed_skills> JSON from dream output and create skill drafts.
 
-        Skills are created via the /skills/from-md API endpoint. Each proposed
-        skill becomes a SKILL.md and is assigned to the agent that dreamed it.
+        Proposals from isolated agents are skipped. For other agents, skills
+        are created via the /skills/from-md API endpoint, written as SKILL.md,
+        and assigned to the agent that dreamed them.
 
         Returns the number of skills successfully created.
         """
@@ -1860,6 +1863,13 @@ class DreamRunner:
             return 0
 
         if not skills_data:
+            return 0
+
+        if getattr(agent_config, "isolated", False):
+            _log(
+                f"dream-runner: skipped {len(skills_data)} proposed skill(s) "
+                f"for isolated agent '{agent_name}'"
+            )
             return 0
 
         count = 0
