@@ -733,6 +733,7 @@ class SkillStore:
                         "skill_name": skill_data["name"],
                         "pattern": p,
                         "assigned_by": skill_data.get("assigned_by"),
+                        "origin_agent": skill_data.get("origin_agent", ""),
                         "privileged_tool_opt_in": skill_data.get(
                             "privileged_tool_opt_in", False
                         ),

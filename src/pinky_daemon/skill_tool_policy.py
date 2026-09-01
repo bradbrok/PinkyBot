@@ -147,7 +147,7 @@ def filter_skill_tool_grants(
     """Apply provenance and opt-in policy to stored skill tool grants.
 
     Unknown legacy rows fail closed only when they would elevate access.
-    Privileged grants require an operator assignment or explicit catalog opt-in.
+    Privileged grants require operator ownership or an exact-set catalog opt-in.
     """
 
     accepted: list[str] = []
@@ -169,13 +169,24 @@ def filter_skill_tool_grants(
 
         assigned_by_raw = grant.get("assigned_by")
         assigned_by = assigned_by_raw.strip() if isinstance(assigned_by_raw, str) else ""
+        origin_agent = str(grant.get("origin_agent") or "")
+        privileged_tool_opt_in = bool(grant.get("privileged_tool_opt_in"))
+        if classification.privileged and origin_agent and not privileged_tool_opt_in:
+            _warn_drop(
+                warn,
+                agent_name,
+                skill_name,
+                pattern,
+                "agent-originated skill lacks operator opt-in",
+            )
+            continue
         if classification.privileged and assigned_by in _ABSENT_PROVENANCE:
             _warn_drop(warn, agent_name, skill_name, pattern, "missing assignment provenance")
             continue
         if (
             classification.privileged
             and assigned_by != "user"
-            and not bool(grant.get("privileged_tool_opt_in"))
+            and not privileged_tool_opt_in
         ):
             _warn_drop(warn, agent_name, skill_name, pattern, "grant lacks operator opt-in")
             continue
