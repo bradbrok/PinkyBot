@@ -300,6 +300,11 @@ class AnalyticsStore:
         ("anthropic", "claude-sonnet-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
         # Opus 5 (2026-07-24): same durable $5/$25 standard tier as Opus 4.8.
         ("anthropic", "claude-opus-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
+        # Fable / Mythos 5.1 (2026-09-01): same $10/$50 as Fable 5, cache reads
+        # 4× cheaper ($0.25). Mirrors pricing.RATE_TABLE (_FABLE_51), parity-
+        # pinned by test_seed_pricing_matches_rate_table.
+        ("anthropic", "claude-fable-5-1", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 0.25, "seed"),
+        ("anthropic", "claude-mythos-5-1", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 0.25, "seed"),
     ]
 
     def _seed_default_pricing(self, conn) -> None:

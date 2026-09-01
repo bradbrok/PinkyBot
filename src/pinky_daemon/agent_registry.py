@@ -8143,6 +8143,8 @@ except Exception as exc:
 
     _MODEL_SEEDS = [
         # Anthropic
+        ("anthropic", "claude-fable-5-1", "Claude Fable 5.1", "Anthropic's most capable model (2026-09-01). Extends Fable 5 at the same $10/$50 price with stronger long-horizon agentic coding, multistep research, and document work; cache reads 4× cheaper. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 1),
+        ("anthropic", "claude-mythos-5-1", "Claude Mythos 5.1", "Claude Fable 5.1 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 0.25, 1, 2),
         ("anthropic", "claude-fable-5", "Claude Fable 5", "Anthropic's most capable widely-released model (2026-06-09). Demanding reasoning + long-horizon agentic work. 1M context; adaptive thinking always on (use effort to control depth).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 1),
         ("anthropic", "claude-mythos-5", "Claude Mythos 5", "Claude Fable 5 capabilities without the safety classifiers. Limited availability via Project Glasswing (approved customers only).", "fable", 1_000_000, 1, 10.0, 50.0, 1.0, 1, 2),
         ("anthropic", "claude-opus-5", "Claude Opus 5", "For complex agentic coding + enterprise work. 1M context; effort defaults high; adaptive thinking. Knowledge cutoff May 2026.", "opus", 1_000_000, 1, 5.0, 25.0, 0.5, 1, 2),

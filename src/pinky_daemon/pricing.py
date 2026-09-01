@@ -63,6 +63,16 @@ _FABLE = {
     "cache_write_5m": 12.50,
     "cache_write_1h": 20.00,
 }
+# Fable / Mythos 5.1 (2026-09-01): extends Fable 5 at the same $10/$50 per
+# Mtok, but cache reads are 4× cheaper ($0.25 vs $1.00). 1M context, 128K
+# output. Mythos 5.1 shares Fable 5.1's pricing.
+_FABLE_51 = {
+    "input": 10.00,
+    "output": 50.00,
+    "cache_read": 0.25,
+    "cache_write_5m": 12.50,
+    "cache_write_1h": 20.00,
+}
 # Pre-4.5 Opus (4, 4.1): the old 3×-more-expensive tier. Kept for
 # historical-transcript pricing accuracy.
 _OPUS_LEGACY = {
@@ -131,6 +141,8 @@ _GPT_53_CODEX = {
 RATE_TABLE: dict[str, dict[str, float]] = {
     "claude-fable-5": _FABLE,
     "claude-mythos-5": _FABLE,
+    "claude-fable-5-1": _FABLE_51,
+    "claude-mythos-5-1": _FABLE_51,
     "claude-opus-5": _OPUS_STD,
     "claude-opus-4-8": _OPUS_STD,
     "claude-opus-4-7": _OPUS_STD,

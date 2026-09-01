@@ -1762,6 +1762,42 @@ class TestModelSeeds:
         assert resolve_context_window("gpt-daybreak-blue-latest") == \
             resolve_context_window("gpt-5.6-sol") == 200_000
 
+    def test_fable_5_1_seeded_at_fable_parity(self, registry):
+        """Claude Fable 5.1 (2026-09-01) extends Fable 5 at the same in/out
+        price but with a 4× cheaper cache read ($0.25 vs $1.00). Pin the
+        catalog + RATE_TABLE + 1M-set so a half-updated table fails loud."""
+        models = {
+            m["model_id"]: m
+            for m in registry.list_models(provider="anthropic", active_only=False)
+        }
+        assert "claude-fable-5-1" in models
+        assert "claude-mythos-5-1" in models
+        f51 = models["claude-fable-5-1"]
+        fable = models["claude-fable-5"]
+        # Same input/output as Fable 5; cheaper cache read is the deliberate diff.
+        assert f51["input_price"] == fable["input_price"] == 10.0
+        assert f51["output_price"] == fable["output_price"] == 50.0
+        assert f51["cached_input_price"] == 0.25
+        assert f51["cached_input_price"] != fable["cached_input_price"]
+        assert f51["context_window"] == 1_000_000
+        assert f51["is_1m"] == 1
+        assert f51["supports_thinking"] == 1
+        # Mythos 5.1 shares Fable 5.1's pricing/specs.
+        assert models["claude-mythos-5-1"]["input_price"] == 10.0
+        assert models["claude-mythos-5-1"]["cached_input_price"] == 0.25
+        # 1M-context set (SDK 200k-report correction path).
+        assert "claude-fable-5-1" in registry.get_1m_models()
+        # The live cost path reads pricing.RATE_TABLE; the parity guards skip a
+        # catalog row absent from RATE_TABLE, so require the entry here at the
+        # right rates — that forces the analytics seed via
+        # test_seed_pricing_matches_rate_table, closing the three-table chain.
+        from pinky_daemon.pricing import _FABLE_51, RATE_TABLE
+        assert RATE_TABLE.get("claude-fable-5-1") is _FABLE_51
+        assert RATE_TABLE.get("claude-mythos-5-1") is _FABLE_51
+        assert _FABLE_51["input"] == 10.0
+        assert _FABLE_51["output"] == 50.0
+        assert _FABLE_51["cache_read"] == 0.25
+
     def test_openai_seed_prices_match_pricing_rate_table(self, registry):
         """#860 extends the #741 invariant to the OpenAI family: catalog
         display prices must agree with pricing.py (the actual cost engine)
