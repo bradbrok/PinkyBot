@@ -581,6 +581,113 @@ class TestTailerReadOnce:
         assert cb2.responses == []  # empty buffer → no spurious callback
 
     @pytest.mark.asyncio
+    async def test_initial_bind_and_self_heal_snapshot_historical_high_water(
+        self, tmp_path
+    ):
+        """A bind snapshots history before reading it, while later empty closes fire.
+
+        Exercise both production seek-to-start binds: the initial session bind and
+        the self-heal repoint.  Historical text still replays, historical textless
+        turns do not, and a live textless turn appended beyond the frozen boundary
+        fires once with Codex's own usage/window report.
+
+        The bare close after the historical scan pins the silent-close drain reset:
+        an observed historical ``task_started`` must not leak into the next marker.
+        The explicit ``drain_buffer`` case pins the other lifecycle reset path.
+        """
+
+        async def exercise_bind(*, bind_name: str, self_heal: bool) -> None:
+            rollout = tmp_path / f"rollout-{bind_name}.jsonl"
+            _write_jsonl(
+                rollout,
+                [
+                    _task_started("historical-text"),
+                    _task_complete(
+                        "historical-text", last_agent_message="Historical reply."
+                    ),
+                    # Keep the silently-drained turn last so the next bare
+                    # marker specifically proves that branch reset its observed
+                    # task_started state (a later normal drain cannot mask it).
+                    _task_started("historical-empty"),
+                    _agent_message(""),
+                    _task_complete("historical-empty", last_agent_message=""),
+                ],
+            )
+            cb = _Captor()
+            if self_heal:
+                tailer = CodexTmuxTranscriptTailer(
+                    tmp_path / f"placeholder-{bind_name}.jsonl", cb
+                )
+                tailer.set_transcript_path(rollout, seek_to_start=True)
+            else:
+                # Initial session/resume bind: the high-water must be captured in
+                # the constructor, before read_once() sees any existing bytes.
+                tailer = CodexTmuxTranscriptTailer(rollout, cb)
+
+            await tailer.read_once()
+            assert [response.text for response in cb.responses] == [
+                "Historical reply."
+            ]
+
+            # No task_started after the prior silent drain: this remains replay
+            # noise even though the marker itself is beyond the bind boundary.
+            _append_jsonl(
+                rollout,
+                [_task_complete("bare-after-history", last_agent_message="")],
+            )
+            await tailer.read_once()
+            assert [response.text for response in cb.responses] == [
+                "Historical reply."
+            ]
+
+            _append_jsonl(
+                rollout,
+                [
+                    _task_started("live-empty"),
+                    _agent_message(""),
+                    _token_count(total_tokens=75_591),
+                    _task_complete("live-empty", last_agent_message=""),
+                ],
+            )
+            await tailer.read_once()
+            assert [response.text for response in cb.responses] == [
+                "Historical reply.",
+                "",
+            ]
+            assert cb.responses[-1].usage["total_tokens"] == 75_591
+            assert cb.responses[-1].usage["model_context_window"] == 258_400
+
+            # A lifecycle drain after a start marker must clear the observed-live
+            # bit; the following bare marker cannot inherit it and fire.
+            _append_jsonl(rollout, [_task_started("discarded-live-start")])
+            await tailer.read_once()
+            tailer.drain_buffer()
+            _append_jsonl(
+                rollout,
+                [_task_complete("discarded-live-start", last_agent_message="")],
+            )
+            await tailer.read_once()
+            assert len(cb.responses) == 2
+
+        await exercise_bind(bind_name="initial", self_heal=False)
+        await exercise_bind(bind_name="self-heal", self_heal=True)
+
+        # The close marker, not the start marker, owns the replay boundary.  A
+        # turn that began below the bind high-water but completes above it is
+        # live and must fire.
+        straddle = tmp_path / "rollout-straddled-boundary.jsonl"
+        _write_jsonl(straddle, [_task_started("straddled")])
+        cb = _Captor()
+        tailer = CodexTmuxTranscriptTailer(straddle, cb)
+        await tailer.read_once()
+        _append_jsonl(
+            straddle,
+            [_task_complete("straddled", last_agent_message="")],
+        )
+        await tailer.read_once()
+        assert [response.text for response in cb.responses] == [""]
+
+    @pytest.mark.asyncio
     async def test_callback_exception_swallowed(self, transcript):
         """A misbehaving callback does not strand the tailer."""
         cb = _Captor()
