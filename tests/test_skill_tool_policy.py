@@ -581,7 +581,8 @@ def test_streaming_merge_enforces_provenance_and_opt_in_effects(
             ("self-opted-in", "Write", "self", 1),
             ("unknown-denied", "Edit", "unknown", 1),
             ("operator-pass", "mcp__operator-probe__*", "user", 0),
-            ("peer-pass", "mcp__peer-probe__*", "peer-agent", 0),
+            ("peer-denied", "mcp__peer-probe__*", "peer-agent", 0),
+            ("peer-opted-in", "mcp__peer-opt-probe__*", "peer-agent", 1),
             ("baseline-self-pass", "mcp__pinky-self__create_task", "self", 0),
             ("malformed-denied", "['mcp__bad__*',", "user", 0),
         ]
@@ -615,7 +616,8 @@ def test_streaming_merge_enforces_provenance_and_opt_in_effects(
         assert "Write" in effective
         assert "Edit" not in effective
         assert "mcp__operator-probe__*" in effective
-        assert "mcp__peer-probe__*" in effective
+        assert "mcp__peer-probe__*" not in effective
+        assert "mcp__peer-opt-probe__*" in effective
         assert "mcp__pinky-self__create_task" in effective
         assert "['mcp__bad__*'," not in effective
 
@@ -623,6 +625,7 @@ def test_streaming_merge_enforces_provenance_and_opt_in_effects(
         for skill_name, pattern in [
             ("self-denied", "Bash"),
             ("unknown-denied", "Edit"),
+            ("peer-denied", "mcp__peer-probe__*"),
             ("malformed-denied", "['mcp__bad__*',"),
         ]:
             assert "policy-agent" in warnings
