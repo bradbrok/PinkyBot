@@ -1102,8 +1102,17 @@ class TestAgentIsolationScoping:
         def disable(self, name):
             return True
 
-        def register_in_skill_store(self, skills, name):
-            return None
+        def register_in_skill_store(self, skills, name, *, agent_originated=False):
+            return skills.register(
+                name,
+                description="plugin capability fixture",
+                skill_type="plugin",
+                mcp_server_config={"command": "plugin-fixture"},
+                tool_patterns=[f"mcp__plugin-{name}__*", f"plugin_{name}_run"],
+                self_assignable=True,
+                category="plugin",
+                agent_originated=agent_originated,
+            )
 
     def _make_skill_catalog_client(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
@@ -1447,6 +1456,68 @@ class TestAgentIsolationScoping:
                 assert response.status_code == 200, (
                     f"{method} {target_path}: {response.status_code} {response.text}"
                 )
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_plugin_enable_cannot_mint_self_materializing_capability(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "catalog-plugin"
+        patterns = [f"mcp__plugin-{skill_name}__*", f"plugin_{skill_name}_run"]
+        try:
+            enabled = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/plugins/{skill_name}/enable",
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            applied = self._apply_snapshot(client, "other")
+
+            assert enabled.status_code == 200, enabled.text
+            assert catalog["shared"] is False
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert skill_name not in applied["mcp_servers"]
+            assert all(pattern not in applied["tool_patterns"] for pattern in patterns)
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_operator_plugin_enable_keeps_own_namespace_self_assignable(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "catalog-plugin"
+        patterns = [f"mcp__plugin-{skill_name}__*", f"plugin_{skill_name}_run"]
+        try:
+            self._setup_operator(client)
+            enabled = client.post(f"/plugins/{skill_name}/enable")
+            assigned = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "tenant", skill_name)
+            applied = self._apply_snapshot(client, "tenant")
+
+            assert enabled.status_code == 200, enabled.text
+            assert catalog["self_assignable"] is True
+            assert catalog["privileged_tool_opt_in"] is False
+            assert assigned.status_code == 200, assigned.text
+            assert skill_name in applied["mcp_servers"]
+            assert all(pattern in applied["tool_patterns"] for pattern in patterns)
         finally:
             client.close()
             os.unlink(path)
