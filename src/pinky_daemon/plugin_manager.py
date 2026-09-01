@@ -606,7 +606,13 @@ class PluginManager:
 
     # ── SkillStore Registration ───────────────────────────
 
-    def register_in_skill_store(self, skill_store, name: str) -> bool:
+    def register_in_skill_store(
+        self,
+        skill_store,
+        name: str,
+        *,
+        agent_originated: bool = False,
+    ) -> bool:
         """Register a plugin as a skill in the SkillStore."""
         info = self._plugins.get(name)
         if not info:
@@ -638,6 +644,7 @@ class PluginManager:
             requires=m.requires,
             self_assignable=True,
             category="plugin",
+            agent_originated=agent_originated,
         )
         return True
 

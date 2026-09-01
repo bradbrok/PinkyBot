@@ -30,6 +30,7 @@ from pinky_daemon.skill_loader import (
     discover_all_skills,
     register_discovered_skills,
 )
+from pinky_daemon.skill_tool_policy import ToolPatternValidationError, validate_tool_patterns
 
 router = APIRouter(tags=["skills"])
 
@@ -88,6 +89,24 @@ def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
     }
 
 
+def _validate_catalog_tool_patterns(
+    patterns: list[str],
+    *,
+    skill_name: str,
+    mcp_server_config: dict,
+    skill_type: str,
+) -> None:
+    try:
+        validate_tool_patterns(
+            patterns,
+            skill_name=skill_name,
+            mcp_server_config=mcp_server_config,
+            skill_type=skill_type,
+        )
+    except ToolPatternValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 # ── Skill Management ──────────────────────────────────────────────────────────
 
 
@@ -95,6 +114,12 @@ def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
 async def register_skill(req: RegisterSkillRequest, request: Request):
     """Register a new skill or update an existing one."""
     internal_caller = getattr(request.state, "internal_caller", "")
+    _validate_catalog_tool_patterns(
+        req.tool_patterns,
+        skill_name=req.name,
+        mcp_server_config=req.mcp_server_config,
+        skill_type=req.skill_type,
+    )
     skill = _skills.register(
         req.name,
         description=req.description,
@@ -107,6 +132,7 @@ async def register_skill(req: RegisterSkillRequest, request: Request):
         directive=req.directive,
         requires=req.requires,
         self_assignable=req.self_assignable,
+        privileged_tool_opt_in=req.self_assignable and not bool(internal_caller),
         category=req.category,
         shared=req.shared,
         file_templates=req.file_templates,
@@ -167,18 +193,35 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         raise HTTPException(404, f"Skill '{name}' not found")
 
     internal_caller = getattr(request.state, "internal_caller", "")
+    skill_type = req.skill_type if req.skill_type is not None else existing.skill_type
+    mcp_server_config = (
+        req.mcp_server_config
+        if req.mcp_server_config is not None
+        else existing.mcp_server_config
+    )
+    tool_patterns = req.tool_patterns if req.tool_patterns is not None else existing.tool_patterns
+    _validate_catalog_tool_patterns(
+        tool_patterns,
+        skill_name=name,
+        mcp_server_config=mcp_server_config,
+        skill_type=skill_type,
+    )
+    privileged_tool_opt_in = existing.privileged_tool_opt_in
+    if req.self_assignable is not None:
+        privileged_tool_opt_in = req.self_assignable and not bool(internal_caller)
     skill = _skills.register(
         name,
         description=req.description if req.description is not None else existing.description,
-        skill_type=req.skill_type if req.skill_type is not None else existing.skill_type,
+        skill_type=skill_type,
         version=req.version if req.version is not None else existing.version,
         enabled=req.enabled if req.enabled is not None else existing.enabled,
         config=req.config if req.config is not None else existing.config,
-        mcp_server_config=req.mcp_server_config if req.mcp_server_config is not None else existing.mcp_server_config,
-        tool_patterns=req.tool_patterns if req.tool_patterns is not None else existing.tool_patterns,
+        mcp_server_config=mcp_server_config,
+        tool_patterns=tool_patterns,
         directive=req.directive if req.directive is not None else existing.directive,
         requires=req.requires if req.requires is not None else existing.requires,
         self_assignable=req.self_assignable if req.self_assignable is not None else existing.self_assignable,
+        privileged_tool_opt_in=privileged_tool_opt_in,
         category=req.category if req.category is not None else existing.category,
         shared=req.shared if req.shared is not None else existing.shared,
         file_templates=req.file_templates if req.file_templates is not None else existing.file_templates,
@@ -283,6 +326,13 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
     if not parsed:
         raise HTTPException(400, "Failed to parse SKILL.md — check frontmatter (name and description required)")
 
+    _validate_catalog_tool_patterns(
+        parsed.allowed_tools,
+        skill_name=parsed.name,
+        mcp_server_config={},
+        skill_type="skill",
+    )
+
     # The skill name becomes a directory under skills/, so enforce the naming
     # convention (reject, not warn) and assert containment — a crafted
     # frontmatter name must not be able to traverse out of skills/ and write
@@ -325,6 +375,7 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
         tool_patterns=parsed.allowed_tools,
         directive=parsed.body,
         self_assignable=True,
+        privileged_tool_opt_in=not bool(internal_caller),
         category="skill",
         shared=False,
         agent_originated=bool(internal_caller),
@@ -442,6 +493,7 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         found,
         overwrite=True,
         agent_originated=bool(internal_caller),
+        privileged_tool_opt_in=not bool(internal_caller),
     )
 
     # Auto-assign to agent if specified
@@ -513,7 +565,7 @@ async def discover_plugins_endpoint():
 
 
 @router.post("/plugins/{name}/enable")
-async def enable_plugin(name: str):
+async def enable_plugin(name: str, request: Request):
     """Enable a discovered plugin."""
     info = _plugins.get(name)
     if not info:
@@ -521,7 +573,12 @@ async def enable_plugin(name: str):
     ok = _plugins.enable(name)
     if not ok:
         raise HTTPException(500, f"Failed to enable plugin: {info.error}")
-    _plugins.register_in_skill_store(_skills, name)
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _plugins.register_in_skill_store(
+        _skills,
+        name,
+        agent_originated=bool(internal_caller),
+    )
     return {"enabled": True, "name": name}
 
 

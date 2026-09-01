@@ -3834,7 +3834,15 @@ def create_api(
         if agent.allowed_tools:
             effective_tools.extend(agent.allowed_tools)
         materialized = skills.materialize_for_agent(agent_name)
-        effective_tools.extend(materialized.get("tool_patterns", []))
+        from pinky_daemon.skill_tool_policy import filter_skill_tool_grants
+
+        effective_tools.extend(
+            filter_skill_tool_grants(
+                materialized.get("tool_grants", []),
+                agent_name=agent_name,
+                warn=_log,
+            )
+        )
         # Deduplicate preserving order
         _seen: set[str] = set()
         effective_tools = [t for t in effective_tools if not (t in _seen or _seen.add(t))]  # type: ignore[func-returns-value]

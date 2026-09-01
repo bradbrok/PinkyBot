@@ -23,6 +23,12 @@ from pathlib import Path
 
 import yaml
 
+from pinky_daemon.skill_tool_policy import (
+    ToolPatternValidationError,
+    split_tool_pattern_scalar,
+    validate_tool_patterns,
+)
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -130,9 +136,17 @@ def parse_skill_md(path: str | Path) -> ParsedSkill | None:
     if not isinstance(metadata, dict):
         metadata = {}
 
-    # allowed-tools (space-delimited string → list)
-    allowed_tools_raw = str(fm.get("allowed-tools", "")).strip()
-    allowed_tools = allowed_tools_raw.split() if allowed_tools_raw else []
+    # allowed-tools accepts either the standard scalar form or a YAML list.
+    allowed_tools_raw = fm.get("allowed-tools", "")
+    if isinstance(allowed_tools_raw, list):
+        allowed_tools = [str(pattern) for pattern in allowed_tools_raw]
+    elif isinstance(allowed_tools_raw, str):
+        allowed_tools = split_tool_pattern_scalar(allowed_tools_raw.strip())
+    elif allowed_tools_raw in (None, ""):
+        allowed_tools = []
+    else:
+        _log(f"skill_loader: invalid allowed-tools value in {path}")
+        return None
 
     # Discover bundled resources
     base_dir = path.parent
@@ -298,6 +312,7 @@ def register_discovered_skills(
     *,
     overwrite: bool = False,
     agent_originated: bool = False,
+    privileged_tool_opt_in: bool = False,
 ) -> dict:
     """Register discovered SKILL.md skills into the SkillStore.
 
@@ -316,6 +331,18 @@ def register_discovered_skills(
     for skill in skills:
         existing = skill_store.get(skill.name)
 
+        try:
+            validate_tool_patterns(
+                skill.allowed_tools,
+                skill_name=skill.name,
+                mcp_server_config={},
+                skill_type="skill",
+            )
+        except ToolPatternValidationError as exc:
+            _log(f"skill_loader: skipping '{skill.name}' — {exc}")
+            skipped.append(skill.name)
+            continue
+
         if existing and not overwrite:
             # Don't overwrite skills registered via API/UI
             if existing.skill_type != "skill":
@@ -323,7 +350,11 @@ def register_discovered_skills(
                 continue
             # Update if it was previously discovered (same type)
             # but check if content changed
-            if existing.directive == skill.body and existing.description == skill.description:
+            if (
+                existing.directive == skill.body
+                and existing.description == skill.description
+                and existing.tool_patterns == skill.allowed_tools
+            ):
                 skipped.append(skill.name)
                 continue
 
@@ -352,6 +383,11 @@ def register_discovered_skills(
             tool_patterns=tool_patterns,
             directive=skill.body,  # Full SKILL.md body as directive
             self_assignable=True,  # Agents can add filesystem skills to themselves
+            privileged_tool_opt_in=(
+                existing.privileged_tool_opt_in
+                if existing is not None
+                else privileged_tool_opt_in
+            ),
             category="skill",  # Distinct from core/development/productivity
             shared=False,  # Not auto-applied; agents opt in
             agent_originated=agent_originated,
