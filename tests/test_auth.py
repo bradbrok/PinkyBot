@@ -1622,6 +1622,194 @@ class TestAgentIsolationScoping:
 
     # ── #1197/#1198: agent-originated skill capability boundaries ─────
 
+    def test_signed_post_shared_capability_mint_cannot_auto_apply_to_peer(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "shared-capability-mint"
+        try:
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed shared capability probe",
+                    "shared": True,
+                    "self_assignable": True,
+                    "mcp_server_config": {
+                        "command": "/bin/sh",
+                        "args": ["-c", "true"],
+                    },
+                    "tool_patterns": [self._MINT_TOOL_PATTERN],
+                },
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            peer_apply = self._apply_snapshot(client, "tenant")
+
+            assert registered.status_code == 200, registered.text
+            assert skill_name not in peer_apply["mcp_servers"]
+            assert self._MINT_TOOL_PATTERN not in peer_apply["tool_patterns"]
+            assert catalog["shared"] is False
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_mcp_server_without_tools_cannot_self_materialize(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "mcp-only-self-mint"
+        try:
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed MCP-only mint probe",
+                    "self_assignable": True,
+                    "mcp_server_config": {
+                        "command": "/bin/sh",
+                        "args": ["-c", "true"],
+                    },
+                    "tool_patterns": [],
+                },
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_apply = self._apply_snapshot(client, "other")
+
+            assert registered.status_code == 200, registered.text
+            assert skill_name not in after_apply["mcp_servers"]
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_file_template_without_tools_cannot_self_materialize(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "template-only-self-mint"
+        template_path = tmp_path / "other" / "PWNED.md"
+        try:
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed template-only mint probe",
+                    "self_assignable": True,
+                    "file_templates": {"PWNED.md": "template boundary probe"},
+                },
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            self._apply_snapshot(client, "other")
+
+            assert registered.status_code == 200, registered.text
+            assert not template_path.exists()
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_shared_directive_and_template_cannot_auto_apply(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "shared-content-mint"
+        template_path = tmp_path / "tenant" / "FLEET-PWNED.md"
+        try:
+            before_apply = self._apply_snapshot(client, "tenant")
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed shared content probe",
+                    "shared": True,
+                    "directive": f"{self._MINT_DIRECTIVE}: fleet",
+                    "file_templates": {
+                        "FLEET-PWNED.md": "fleet template boundary probe"
+                    },
+                },
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_apply = self._apply_snapshot(client, "tenant")
+
+            assert registered.status_code == 200, registered.text
+            assert after_apply["directives_count"] == before_apply["directives_count"]
+            assert not template_path.exists()
+            assert catalog["shared"] is False
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_operator_post_shared_tool_skill_preserves_materialization(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "operator-shared-tools"
+        tool_pattern = "mcp__operator-shared__run"
+        try:
+            self._setup_operator(client)
+            registered = client.post(
+                "/skills",
+                json={
+                    "name": skill_name,
+                    "description": "operator shared control",
+                    "shared": True,
+                    "self_assignable": True,
+                    "tool_patterns": [tool_pattern],
+                },
+            )
+            catalog = self._catalog_skill(client, "tenant", skill_name)
+            peer_apply = self._apply_snapshot(client, "tenant")
+
+            assert registered.status_code == 200, registered.text
+            assert catalog["shared"] is True
+            assert catalog["self_assignable"] is True
+            assert tool_pattern in peer_apply["tool_patterns"]
+        finally:
+            client.close()
+            os.unlink(path)
+
     def test_signed_post_skill_tool_mint_cannot_materialize(
         self, monkeypatch, tmp_path
     ):
