@@ -1038,6 +1038,8 @@ class TestAgentIsolationScoping:
         "— requires your mesh_outbound_allowlist to include the target"
     )
     _CATALOG_DENIAL = "isolated agent 'tenant' cannot modify the fleet skill catalog"
+    _SELF_ASSIGNABLE_SKILL = "catalog-probe"
+    _RESTRICTED_SKILL = "catalog-restricted"
 
     def _make_client_with_agents(self, monkeypatch, tmp_path):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -1120,23 +1122,35 @@ class TestAgentIsolationScoping:
 
         monkeypatch.setattr(subprocess, "run", fake_git_run)
 
-        seeded = self._signed_request(
-            client,
-            "other",
-            "POST",
-            "/skills",
-            {
-                "name": "catalog-probe",
-                "description": "isolation fixture",
-                "self_assignable": True,
-            },
-        )
-        assert seeded.status_code == 200, seeded.text
+        for skill_name, self_assignable in (
+            (self._SELF_ASSIGNABLE_SKILL, True),
+            (self._RESTRICTED_SKILL, False),
+        ):
+            seeded = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "isolation fixture",
+                    "self_assignable": self_assignable,
+                },
+            )
+            assert seeded.status_code == 200, seeded.text
         client.app.state.manager.create(
             session_id="catalog-session",
             working_dir=str(tmp_path),
         )
         return client, path
+
+    def _assigned_skill(self, client, agent_name, skill_name, *, caller="tenant"):
+        response = self._signed_get(client, caller, f"/agents/{agent_name}/skills")
+        assert response.status_code == 200, response.text
+        return next(
+            (skill for skill in response.json()["skills"] if skill["name"] == skill_name),
+            None,
+        )
 
     def _assert_catalog_denied(self, response):
         assert response.status_code == 403, response.text
@@ -1303,6 +1317,136 @@ class TestAgentIsolationScoping:
             assert read.status_code == 200, read.text
             assert add.status_code == 200, add.text
             assert remove.status_code == 200, remove.text
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "body",
+        [
+            {"assigned_by": "user"},
+            {},
+            {"assigned_by": "self"},
+        ],
+        ids=["user-body", "omitted-body", "explicit-self"],
+    )
+    def test_internal_self_assignment_cannot_bypass_non_self_assignable_skill(
+        self, monkeypatch, tmp_path, body
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            assert self._assigned_skill(
+                client, "tenant", self._RESTRICTED_SKILL
+            ) is None
+
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{self._RESTRICTED_SKILL}",
+                body,
+            )
+
+            assert response.status_code == 403, response.text
+            assert response.json()["detail"] == (
+                f"Skill '{self._RESTRICTED_SKILL}' is not self-assignable"
+            )
+            assert self._assigned_skill(
+                client, "tenant", self._RESTRICTED_SKILL
+            ) is None
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_internal_self_assignment_records_derived_self_provenance(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{self._SELF_ASSIGNABLE_SKILL}",
+                {"assigned_by": "user"},
+            )
+
+            assert response.status_code == 200, response.text
+            assigned = self._assigned_skill(
+                client, "tenant", self._SELF_ASSIGNABLE_SKILL
+            )
+            assert assigned is not None
+            assert assigned["assigned_by"] == "self"
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_operator_assignment_preserves_body_provenance_for_restricted_skill(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            setup = client.post(
+                "/auth/setup", json={"password": "hunter22", "next": "/"}
+            )
+            assert setup.status_code == 200, setup.text
+
+            control = client.post(
+                f"/agents/tenant/skills/{self._SELF_ASSIGNABLE_SKILL}",
+                json={"assigned_by": "user"},
+            )
+            candidate = client.post(
+                f"/agents/tenant/skills/{self._RESTRICTED_SKILL}",
+                json={"assigned_by": "user"},
+            )
+
+            assert control.status_code == 200, control.text
+            assert candidate.status_code == control.status_code, candidate.text
+            normalized_control = {**control.json(), "skill": "<skill>"}
+            normalized_candidate = {**candidate.json(), "skill": "<skill>"}
+            assert normalized_candidate == normalized_control
+
+            control_row = self._assigned_skill(
+                client, "tenant", self._SELF_ASSIGNABLE_SKILL
+            )
+            candidate_row = self._assigned_skill(
+                client, "tenant", self._RESTRICTED_SKILL
+            )
+            assert control_row is not None
+            assert candidate_row is not None
+            metadata_keys = (
+                "assigned_by",
+                "agent_enabled",
+                "effective_enabled",
+                "config_overrides",
+            )
+            assert {key: candidate_row[key] for key in metadata_keys} == {
+                key: control_row[key] for key in metadata_keys
+            }
+            assert candidate_row["assigned_by"] == "user"
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_cross_agent_internal_assignment_preserves_body_provenance(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            response = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/tenant/skills/{self._RESTRICTED_SKILL}",
+                {"assigned_by": "user"},
+            )
+
+            assert response.status_code == 200, response.text
+            assigned = self._assigned_skill(
+                client, "tenant", self._RESTRICTED_SKILL, caller="other"
+            )
+            assert assigned is not None
+            assert assigned["assigned_by"] == "user"
         finally:
             client.close()
             os.unlink(path)
