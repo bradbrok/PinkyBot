@@ -28,6 +28,7 @@ from pinky_daemon.auth import (
     verify_session_cookie,
 )
 from pinky_daemon.routes import skills as skill_routes
+from pinky_daemon.skill_tool_policy import filter_skill_tool_grants
 
 # Tests in this module exercise the real auth flow (redirects, 401s,
 # cookie issuance). The conftest auto-injects a valid session cookie
@@ -2033,7 +2034,7 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_signed_tool_upgrade_cannot_mutate_operator_owned_grant(
+    def test_signed_tool_upgrade_of_operator_owned_skill_is_refused(
         self, monkeypatch, tmp_path
     ):
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
@@ -2052,8 +2053,14 @@ class TestAgentIsolationScoping:
             )
             assert assigned.status_code == 200, assigned.text
             before_catalog = self._catalog_skill(client, "other", skill_name)
-            before_apply = self._apply_snapshot(client, "other")
-            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+            before_assignment = self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            assert before_assignment is not None
 
             updated = self._signed_request(
                 client,
@@ -2073,13 +2080,14 @@ class TestAgentIsolationScoping:
                 caller="other",
                 enabled_only=False,
             )
-            assert after_assignment is not None
-            assert after_assignment["assigned_by"] == "user"
-            assert after_assignment["agent_enabled"] is True
-            assert after_assignment["effective_enabled"] is True
-            assert self._MINT_TOOL_PATTERN not in self._apply_snapshot(
-                client, "other"
-            )["tool_patterns"]
+            assert after_assignment == before_assignment
+            materialized = skill_routes._skills.materialize_for_agent("other")
+            warnings: list[str] = []
+            assert self._MINT_TOOL_PATTERN not in filter_skill_tool_grants(
+                materialized["tool_grants"],
+                agent_name="other",
+                warn=warnings.append,
+            )
         finally:
             client.close()
             os.unlink(path)
