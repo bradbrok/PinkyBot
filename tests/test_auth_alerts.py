@@ -3,9 +3,9 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+import pytest
+
 from pinky_daemon.auth_alerts import (
-    CODEX_PROXY_AUTH_PROBLEM,
-    CODEX_PROXY_AUTH_REMEDY,
     DEFAULT_AUTH_REMEDY,
     TRANSPORT_FAILURE_POLICIES,
     AuthFailureTracker,
@@ -388,17 +388,22 @@ def test_format_alert_uses_no_markdown_so_plain_text_renders_clean():
     assert "authentication_failed" in msg
 
 
-def test_auth_alert_copy_for_local_codex_proxy_uses_proxy_oauth_remedy():
-    for url in (
+@pytest.mark.parametrize(
+    "provider_url",
+    (
         "http://localhost:18765",
         "http://127.0.0.1:18765/v1",
-        "http://[::1]:18765",
-    ):
-        problem, remedy = auth_alert_copy_for_provider(url)
-        assert problem == CODEX_PROXY_AUTH_PROBLEM
-        assert remedy == CODEX_PROXY_AUTH_REMEDY
-        assert "ChatGPT subscription OAuth" in remedy
-        assert "Do NOT run 'claude /login'" in remedy
+        "https://[::1]:18765",
+    ),
+)
+def test_auth_alert_copy_for_retired_loopback_proxy_uses_default_copy(
+    provider_url: str,
+) -> None:
+    """A loopback translation-proxy URL is no longer special-cased."""
+    assert auth_alert_copy_for_provider(provider_url) == (
+        "Claude auth broken",
+        DEFAULT_AUTH_REMEDY,
+    )
 
 
 def test_auth_alert_copy_does_not_misclassify_other_or_spoofed_providers():

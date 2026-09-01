@@ -592,70 +592,44 @@ def test_build_repl_env_expects_resolved_effort_for_ultracode() -> None:
     assert env["PINKY_EXPECTED_EFFORT"] == "xhigh"
 
 
-def test_build_repl_env_caps_autocompact_for_codex_sub_proxy(monkeypatch) -> None:
-    """gpt-5.6-sol on the ChatGPT-sub proxy (trusted loopback :18765) gets
-    CLAUDE_CODE_AUTO_COMPACT_WINDOW=150000 so CC compacts below the sub's real
-    ~167k cap — the old 272k value overflowed and wedged solik for 13 hours on
-    2026-07-16. Tier-suffix tolerant; loopback host + path OK."""
+@pytest.mark.parametrize(
+    "provider_url",
+    (
+        "http://localhost:18765",
+        "http://127.0.0.1:18765/v1",
+        "https://paid-api-gateway.example/anthropic",
+        "",
+    ),
+)
+def test_build_repl_env_does_not_emit_retired_proxy_autocompact_cap(
+    monkeypatch,
+    provider_url: str,
+) -> None:
+    """A loopback translation-proxy URL is no longer special-cased."""
     monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
     ss, _ = _make_session()
-    ss._config.provider_url = "http://localhost:18765"
+    ss._config.provider_url = provider_url
     ss._config.model = "gpt-5.6-sol[1m]"
-    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
-    ss._config.model = "gpt-5.6-sol"  # bare id too
-    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
-    ss._config.provider_url = "http://127.0.0.1:18765/v1"  # 127.0.0.1 + path
-    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
+
+    env = ss._build_repl_env()
+
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
+    if provider_url:
+        assert env["ANTHROPIC_BASE_URL"] == provider_url
 
 
-def test_build_repl_env_does_not_cap_paid_api_or_claude(monkeypatch) -> None:
-    """The 150k cap is scoped to the ChatGPT-sub proxy route ONLY. The SAME
-    gpt-5.6-sol slug on a paid API gateway does not inherit that override;
-    real 1M Claude agents are never capped."""
-    monkeypatch.delenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", raising=False)
-    ss, _ = _make_session()
-    ss._config.model = "gpt-5.6-sol[1m]"
-    ss._config.provider_url = "https://paid-api-gateway.example/anthropic"
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
-    ss._config.provider_url = ""  # no provider → not the sub proxy
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
-    ss._config.provider_url = "http://localhost:18765"  # on the proxy, but...
-    ss._config.model = "claude-opus-4-8"  # ...real 1M Claude → NOT capped
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
-    ss._config.model = "claude-opus-4-8[1m]"
-    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in ss._build_repl_env()
-
-
-def test_build_repl_env_autocompact_allows_only_safer_ambient_override(
+def test_build_repl_env_drops_ambient_autocompact_for_retired_proxy(
     monkeypatch,
 ) -> None:
-    """An ambient override can compact earlier but cannot raise the 150k cap."""
+    """A loopback translation-proxy URL is no longer special-cased."""
+    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "120000")
     ss, _ = _make_session()
     ss._config.provider_url = "http://localhost:18765"
     ss._config.model = "gpt-5.6-sol[1m]"
-    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "120000")
-    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "120000"
-    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "240000")
-    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
-    monkeypatch.setenv("CLAUDE_CODE_AUTO_COMPACT_WINDOW", "not-a-number")
-    assert ss._build_repl_env()["CLAUDE_CODE_AUTO_COMPACT_WINDOW"] == "150000"
 
+    env = ss._build_repl_env()
 
-def test_is_codex_sub_proxy_classifier_is_total() -> None:
-    """The route classifier matches only the trusted http(s) loopback :18765 and
-    is total — malformed / non-numeric / out-of-range ports fail closed (return
-    False) rather than raising (parsed.port raises ValueError only on access)."""
-    match = TmuxSession._is_codex_sub_proxy
-    assert match("http://localhost:18765") is True
-    assert match("http://127.0.0.1:18765/v1") is True
-    assert match("https://[::1]:18765") is True
-    assert match("https://paid-api-gateway.example/anthropic") is False
-    assert match("http://localhost:9999") is False
-    assert match("http://localhost.example:18765") is False  # subdomain
-    assert match("") is False
-    assert match("http://localhost:not-a-port") is False  # non-numeric port
-    assert match("http://localhost:99999") is False  # out-of-range port
-    assert match("ftp://localhost:18765") is False  # wrong scheme
+    assert "CLAUDE_CODE_AUTO_COMPACT_WINDOW" not in env
 
 
 def test_build_repl_env_fails_closed_on_malformed_provider_url() -> None:
