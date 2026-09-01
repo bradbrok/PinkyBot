@@ -267,6 +267,7 @@ class SkillStore:
         shared: bool = False,
         file_templates: dict | None = None,
         default_config: dict | None = None,
+        agent_originated: bool = False,
     ) -> Skill:
         """Register a new skill or update an existing one."""
         now = time.time()
@@ -278,33 +279,50 @@ class SkillStore:
         default_config = default_config or {}
 
         existing = self.get(name)
-        if existing:
-            self._db.execute(
-                """UPDATE skills
-                   SET description=?, skill_type=?, version=?, enabled=?, config=?,
-                       mcp_server_config=?, tool_patterns=?, directive=?, requires=?,
-                       self_assignable=?, category=?, shared=?, file_templates=?,
-                       default_config=?, updated_at=?
-                   WHERE name=?""",
-                (
-                    description, skill_type, version, int(enabled), json.dumps(config),
-                    json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
-                    json.dumps(requires), int(self_assignable), category, int(shared),
-                    json.dumps(file_templates), json.dumps(default_config), now, name,
-                ),
-            )
-        else:
-            self._db.execute(
-                f"""INSERT INTO skills ({_SKILL_COLS})
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
-                (
-                    name, description, skill_type, version, int(enabled), json.dumps(config),
-                    json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
-                    json.dumps(requires), int(self_assignable), category, int(shared),
-                    json.dumps(file_templates), json.dumps(default_config), now, now,
-                ),
-            )
-        self._db.commit()
+        with self._db:
+            # Stage 1 capability guard (#1197): a remotely agent-originated
+            # skill is retained for operator review but cannot auto-apply to
+            # peers, and capability-bearing skills cannot be self-assigned.
+            # Stage 2 replaces this coarse predicate with the central
+            # tool-pattern classifier.
+            if agent_originated:
+                shared = False
+                if tool_patterns or mcp_server_config or file_templates:
+                    self_assignable = False
+                    # Fail safe fleet-wide so a name collision revokes every enabled self-grant.
+                    self._db.execute(
+                        """UPDATE agent_skills
+                           SET enabled=0
+                           WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
+                        (name,),
+                    )
+
+            if existing:
+                self._db.execute(
+                    """UPDATE skills
+                       SET description=?, skill_type=?, version=?, enabled=?, config=?,
+                           mcp_server_config=?, tool_patterns=?, directive=?, requires=?,
+                           self_assignable=?, category=?, shared=?, file_templates=?,
+                           default_config=?, updated_at=?
+                       WHERE name=?""",
+                    (
+                        description, skill_type, version, int(enabled), json.dumps(config),
+                        json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
+                        json.dumps(requires), int(self_assignable), category, int(shared),
+                        json.dumps(file_templates), json.dumps(default_config), now, name,
+                    ),
+                )
+            else:
+                self._db.execute(
+                    f"""INSERT INTO skills ({_SKILL_COLS})
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    (
+                        name, description, skill_type, version, int(enabled), json.dumps(config),
+                        json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
+                        json.dumps(requires), int(self_assignable), category, int(shared),
+                        json.dumps(file_templates), json.dumps(default_config), now, now,
+                    ),
+                )
 
         _log(f"skill_store: {'updated' if existing else 'registered'} {name}")
         return self.get(name)  # type: ignore
@@ -389,6 +407,7 @@ class SkillStore:
         *,
         assigned_by: str = "user",
         config_overrides: dict | None = None,
+        enabled: bool = True,
     ) -> bool:
         """Assign a skill to an agent. Returns False if skill doesn't exist."""
         skill = self.get(skill_name)
@@ -396,17 +415,24 @@ class SkillStore:
             return False
 
         # Check self-assignable constraint
-        if assigned_by == "self" and not skill.self_assignable:
+        if enabled and assigned_by == "self" and not skill.self_assignable:
             return False
 
         now = time.time()
         self._db.execute(
             """INSERT INTO agent_skills (agent_name, skill_name, enabled, assigned_by, config_overrides, assigned_at)
-               VALUES (?, ?, 1, ?, ?, ?)
+               VALUES (?, ?, ?, ?, ?, ?)
                ON CONFLICT (agent_name, skill_name)
-               DO UPDATE SET enabled=1, assigned_by=excluded.assigned_by,
+               DO UPDATE SET enabled=excluded.enabled, assigned_by=excluded.assigned_by,
                              config_overrides=excluded.config_overrides, assigned_at=excluded.assigned_at""",
-            (agent_name, skill_name, assigned_by, json.dumps(config_overrides or {}), now),
+            (
+                agent_name,
+                skill_name,
+                int(enabled),
+                assigned_by,
+                json.dumps(config_overrides or {}),
+                now,
+            ),
         )
         self._db.commit()
         _log(f"skill_store: assigned {skill_name} to {agent_name} (by {assigned_by})")

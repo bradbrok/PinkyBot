@@ -17,6 +17,7 @@ from pinky_daemon.api import create_api
 from pinky_daemon.auth import (
     build_internal_auth_headers,
     create_session_cookie,
+    derive_skill_assignment_actor,
     hash_password,
     make_db_signing_key_resolver,
     password_source,
@@ -1040,6 +1041,8 @@ class TestAgentIsolationScoping:
     _CATALOG_DENIAL = "isolated agent 'tenant' cannot modify the fleet skill catalog"
     _SELF_ASSIGNABLE_SKILL = "catalog-probe"
     _RESTRICTED_SKILL = "catalog-restricted"
+    _MINT_TOOL_PATTERN = "mcp__mint-probe__run"
+    _MINT_DIRECTIVE = "PR-A mint directive marker"
 
     def _make_client_with_agents(self, monkeypatch, tmp_path):
         fd, path = tempfile.mkstemp(suffix=".db")
@@ -1105,6 +1108,27 @@ class TestAgentIsolationScoping:
     def _make_skill_catalog_client(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
 
+        # The static /skills/apply route is currently declared after the
+        # /skills/{skill_name} POST route, so FastAPI otherwise dispatches
+        # "apply" as a skill name and returns a missing-body 422. Route-order
+        # repair is tracked in #1202 and outside this PR; promote the existing
+        # static route in this fixture so signed effect checks exercise its
+        # real handler.
+        routes = client.app.router.routes
+        apply_route = next(
+            route
+            for route in routes
+            if getattr(route, "path", "") == "/agents/{name}/skills/apply"
+        )
+        assignment_index = next(
+            index
+            for index, route in enumerate(routes)
+            if getattr(route, "path", "") == "/agents/{name}/skills/{skill_name}"
+                and "POST" in (getattr(route, "methods", set()) or set())
+        )
+        routes.remove(apply_route)
+        routes.insert(assignment_index, apply_route)
+
         # /skills/from-md and /skills/from-git persist under _pinky_root. Keep
         # every effect test inside pytest's external scratch tree so a RED run
         # on the vulnerable base cannot clobber the live checkout (#1078).
@@ -1114,8 +1138,18 @@ class TestAgentIsolationScoping:
         def fake_git_run(args, **kwargs):
             target = Path(args[-1])
             target.mkdir(parents=True, exist_ok=True)
+            allowed_tools = (
+                f"allowed-tools: {self._MINT_TOOL_PATTERN}\n"
+                if target.name.endswith("-tools")
+                else ""
+            )
             (target / "SKILL.md").write_text(
-                "---\nname: git-positive\ndescription: positive control\n---\nbody\n",
+                "---\n"
+                f"name: {target.name}\n"
+                "description: git fixture\n"
+                f"{allowed_tools}"
+                "---\n"
+                f"{self._MINT_DIRECTIVE}: {target.name}\n",
                 encoding="utf-8",
             )
             return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
@@ -1144,13 +1178,116 @@ class TestAgentIsolationScoping:
         )
         return client, path
 
-    def _assigned_skill(self, client, agent_name, skill_name, *, caller="tenant"):
-        response = self._signed_get(client, caller, f"/agents/{agent_name}/skills")
+    def _assigned_skill(
+        self,
+        client,
+        agent_name,
+        skill_name,
+        *,
+        caller="tenant",
+        enabled_only=True,
+    ):
+        query = "" if enabled_only else "?enabled_only=false"
+        response = self._signed_get(
+            client,
+            caller,
+            f"/agents/{agent_name}/skills{query}",
+        )
         assert response.status_code == 200, response.text
         return next(
             (skill for skill in response.json()["skills"] if skill["name"] == skill_name),
             None,
         )
+
+    def _catalog_skill(self, client, caller, skill_name):
+        response = self._signed_get(client, caller, f"/skills/{skill_name}")
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def _apply_snapshot(self, client, agent_name):
+        response = self._signed_request(
+            client,
+            agent_name,
+            "POST",
+            f"/agents/{agent_name}/skills/apply",
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
+
+    def _install_skill(
+        self,
+        client,
+        *,
+        source,
+        skill_name,
+        agent_name,
+        caller=None,
+        tool_bearing=False,
+    ):
+        if source == "from-md":
+            allowed_tools = (
+                f"allowed-tools: {self._MINT_TOOL_PATTERN}\n" if tool_bearing else ""
+            )
+            body = {
+                "content": (
+                    "---\n"
+                    f"name: {skill_name}\n"
+                    "description: markdown fixture\n"
+                    f"{allowed_tools}"
+                    "---\n"
+                    f"{self._MINT_DIRECTIVE}: {skill_name}\n"
+                ),
+                "agent_name": agent_name,
+            }
+        else:
+            assert source == "from-git"
+            assert tool_bearing == skill_name.endswith("-tools")
+            body = {
+                "url": f"https://github.com/test/{skill_name}",
+                "agent_name": agent_name,
+            }
+
+        if caller is None:
+            return client.post(f"/skills/{source}", json=body)
+        return self._signed_request(
+            client,
+            caller,
+            "POST",
+            f"/skills/{source}",
+            body,
+        )
+
+    @staticmethod
+    def _setup_operator(client):
+        response = client.post(
+            "/auth/setup",
+            json={"password": "hunter22", "next": "/"},
+        )
+        assert response.status_code == 200, response.text
+
+    def _register_operator_skill(
+        self,
+        client,
+        skill_name,
+        *,
+        self_assignable=False,
+        shared=False,
+        directive="",
+        tool_pattern="",
+    ):
+        response = client.post(
+            "/skills",
+            json={
+                "name": skill_name,
+                "description": "PR-A mutation fixture",
+                "self_assignable": self_assignable,
+                "shared": shared,
+                "directive": directive,
+                "tool_patterns": [tool_pattern] if tool_pattern else [],
+            },
+        )
+        assert response.status_code == 200, response.text
+        return response.json()
 
     def _assert_catalog_denied(self, response):
         assert response.status_code == 403, response.text
@@ -1180,6 +1317,26 @@ class TestAgentIsolationScoping:
         resp = self._signed_get(client, "other", "/agents/tenant")
         assert resp.status_code != 403
         os.unlink(path)
+
+    def test_skill_apply_route_shadowing_documents_1202(self, monkeypatch, tmp_path):
+        """DOCUMENTS #1202: the earlier assignment route shadows static /apply."""
+        client, path = self._make_client_with_agents(monkeypatch, tmp_path)
+        try:
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                "/agents/tenant/skills/apply",
+            )
+
+            assert response.status_code == 422, response.text
+            assert any(
+                error["type"] == "missing" and error["loc"] == ["body"]
+                for error in response.json()["detail"]
+            )
+        finally:
+            client.close()
+            os.unlink(path)
 
     # ── #1187: isolated callers cannot mutate the fleet skill catalog ────
 
@@ -1459,6 +1616,927 @@ class TestAgentIsolationScoping:
             )
             assert assigned is not None
             assert assigned["assigned_by"] == "user"
+        finally:
+            client.close()
+            os.unlink(path)
+
+    # ── #1197/#1198: agent-originated skill capability boundaries ─────
+
+    def test_signed_post_shared_capability_mint_cannot_auto_apply_to_peer(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "shared-capability-mint"
+        try:
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed shared capability probe",
+                    "shared": True,
+                    "self_assignable": True,
+                    "mcp_server_config": {
+                        "command": "/bin/sh",
+                        "args": ["-c", "true"],
+                    },
+                    "tool_patterns": [self._MINT_TOOL_PATTERN],
+                },
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            peer_apply = self._apply_snapshot(client, "tenant")
+
+            assert registered.status_code == 200, registered.text
+            assert skill_name not in peer_apply["mcp_servers"]
+            assert self._MINT_TOOL_PATTERN not in peer_apply["tool_patterns"]
+            assert catalog["shared"] is False
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_mcp_server_without_tools_cannot_self_materialize(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "mcp-only-self-mint"
+        try:
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed MCP-only mint probe",
+                    "self_assignable": True,
+                    "mcp_server_config": {
+                        "command": "/bin/sh",
+                        "args": ["-c", "true"],
+                    },
+                    "tool_patterns": [],
+                },
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_apply = self._apply_snapshot(client, "other")
+
+            assert registered.status_code == 200, registered.text
+            assert skill_name not in after_apply["mcp_servers"]
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_file_template_without_tools_cannot_self_materialize(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "template-only-self-mint"
+        template_path = tmp_path / "other" / "PWNED.md"
+        try:
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed template-only mint probe",
+                    "self_assignable": True,
+                    "file_templates": {"PWNED.md": "template boundary probe"},
+                },
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            self._apply_snapshot(client, "other")
+
+            assert registered.status_code == 200, registered.text
+            assert not template_path.exists()
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_shared_directive_and_template_cannot_auto_apply(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "shared-content-mint"
+        template_path = tmp_path / "tenant" / "FLEET-PWNED.md"
+        try:
+            before_apply = self._apply_snapshot(client, "tenant")
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed shared content probe",
+                    "shared": True,
+                    "directive": f"{self._MINT_DIRECTIVE}: fleet",
+                    "file_templates": {
+                        "FLEET-PWNED.md": "fleet template boundary probe"
+                    },
+                },
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_apply = self._apply_snapshot(client, "tenant")
+
+            assert registered.status_code == 200, registered.text
+            assert after_apply["directives_count"] == before_apply["directives_count"]
+            assert not template_path.exists()
+            assert catalog["shared"] is False
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_operator_post_shared_tool_skill_preserves_materialization(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "operator-shared-tools"
+        tool_pattern = "mcp__operator-shared__run"
+        try:
+            self._setup_operator(client)
+            registered = client.post(
+                "/skills",
+                json={
+                    "name": skill_name,
+                    "description": "operator shared control",
+                    "shared": True,
+                    "self_assignable": True,
+                    "tool_patterns": [tool_pattern],
+                },
+            )
+            catalog = self._catalog_skill(client, "tenant", skill_name)
+            peer_apply = self._apply_snapshot(client, "tenant")
+
+            assert registered.status_code == 200, registered.text
+            assert catalog["shared"] is True
+            assert catalog["self_assignable"] is True
+            assert tool_pattern in peer_apply["tool_patterns"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_post_skill_tool_mint_cannot_materialize(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "post-self-tools"
+        try:
+            before_apply = self._apply_snapshot(client, "other")
+            registered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills",
+                {
+                    "name": skill_name,
+                    "description": "signed POST mint probe",
+                    "self_assignable": True,
+                    "tool_patterns": [self._MINT_TOOL_PATTERN],
+                    "directive": f"{self._MINT_DIRECTIVE}: {skill_name}",
+                },
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_apply = self._apply_snapshot(client, "other")
+
+            assert registered.status_code == 200, registered.text
+            assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+            assert after_apply["directives_count"] == before_apply["directives_count"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_put_cannot_upgrade_self_assignment_to_tool_capability(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "put-self-tools"
+        try:
+            pre_mint_apply = self._apply_snapshot(client, "other")
+            minted = self._install_skill(
+                client,
+                source="from-md",
+                skill_name=skill_name,
+                agent_name="other",
+                caller="other",
+            )
+            assert minted.status_code == 200, minted.text
+            before_assignment = self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            assert before_assignment is not None
+            assert before_assignment["assigned_by"] == "self"
+            assert before_assignment["effective_enabled"] is True
+            before_apply = self._apply_snapshot(client, "other")
+            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+            assert (
+                before_apply["directives_count"]
+                == pre_mint_apply["directives_count"] + 1
+            )
+
+            updated = self._signed_request(
+                client,
+                "other",
+                "PUT",
+                f"/skills/{skill_name}",
+                {"tool_patterns": [self._MINT_TOOL_PATTERN]},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_assignment = self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            after_apply = self._apply_snapshot(client, "other")
+
+            assert updated.status_code == 200, updated.text
+            assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+            assert catalog["self_assignable"] is False
+            assert after_assignment is not None
+            assert after_assignment["assigned_by"] == "self"
+            assert after_assignment["agent_enabled"] is False
+            assert after_assignment["effective_enabled"] is False
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_discover_tool_mint_cannot_materialize(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "discover-self-tools"
+        skill_dir = tmp_path / "skills" / skill_name
+        skill_dir.mkdir(parents=True)
+        (skill_dir / "SKILL.md").write_text(
+            "---\n"
+            f"name: {skill_name}\n"
+            "description: signed discover mint probe\n"
+            f"allowed-tools: {self._MINT_TOOL_PATTERN}\n"
+            "---\n"
+            f"{self._MINT_DIRECTIVE}: {skill_name}\n",
+            encoding="utf-8",
+        )
+        try:
+            before_apply = self._apply_snapshot(client, "other")
+            discovered = self._signed_request(
+                client,
+                "other",
+                "POST",
+                "/skills/discover",
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            after_apply = self._apply_snapshot(client, "other")
+
+            assert discovered.status_code == 200, discovered.text
+            assert skill_name in discovered.json()["registered"]
+            assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+            assert after_apply["directives_count"] == before_apply["directives_count"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_agent_originated_tool_upgrade_keeps_operator_grant_live(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "operator-grant-upgrade"
+        try:
+            self._setup_operator(client)
+            self._register_operator_skill(
+                client,
+                skill_name,
+                self_assignable=True,
+                directive=f"{self._MINT_DIRECTIVE}: {skill_name}",
+            )
+            assigned = client.post(
+                f"/agents/other/skills/{skill_name}",
+                json={"assigned_by": "user"},
+            )
+            assert assigned.status_code == 200, assigned.text
+            before_apply = self._apply_snapshot(client, "other")
+            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+
+            updated = self._signed_request(
+                client,
+                "other",
+                "PUT",
+                f"/skills/{skill_name}",
+                {"tool_patterns": [self._MINT_TOOL_PATTERN]},
+            )
+
+            assert updated.status_code == 200, updated.text
+            after_assignment = self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            assert after_assignment is not None
+            assert after_assignment["assigned_by"] == "user"
+            assert after_assignment["agent_enabled"] is True
+            assert after_assignment["effective_enabled"] is True
+            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
+                client, "other"
+            )["tool_patterns"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_agent_originated_tool_upgrade_keeps_peer_grant_live(
+        self, monkeypatch, tmp_path
+    ):
+        """DOCUMENTS #638: verified peer grants are not revoked by PR-A."""
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "peer-grant-upgrade"
+        try:
+            minted = self._install_skill(
+                client,
+                source="from-md",
+                skill_name=skill_name,
+                agent_name="tenant",
+                caller="other",
+            )
+            assert minted.status_code == 200, minted.text
+            before_assignment = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            assert before_assignment is not None
+            assert before_assignment["assigned_by"] == "other"
+            assert before_assignment["effective_enabled"] is True
+            before_apply = self._apply_snapshot(client, "tenant")
+            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+
+            updated = self._signed_request(
+                client,
+                "other",
+                "PUT",
+                f"/skills/{skill_name}",
+                {"tool_patterns": [self._MINT_TOOL_PATTERN]},
+            )
+
+            assert updated.status_code == 200, updated.text
+            after_assignment = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            assert after_assignment is not None
+            assert after_assignment["assigned_by"] == "other"
+            assert after_assignment["agent_enabled"] is True
+            assert after_assignment["effective_enabled"] is True
+            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
+                client, "tenant"
+            )["tool_patterns"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize("caller", ["user", "self"])
+    def test_cross_agent_reserved_caller_has_unambiguous_provenance(self, caller):
+        assert derive_skill_assignment_actor(caller, "target") == f"agent:{caller}"
+
+    @pytest.mark.parametrize(
+        ("source", "skill_name"),
+        [
+            ("from-md", "md-self-tools"),
+            ("from-git", "git-self-tools"),
+        ],
+    )
+    def test_signed_self_tool_bearing_mint_is_restricted_and_loud(
+        self, monkeypatch, tmp_path, source, skill_name
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            before_apply = self._apply_snapshot(client, "other")
+            response = self._install_skill(
+                client,
+                source=source,
+                skill_name=skill_name,
+                agent_name="other",
+                caller="other",
+                tool_bearing=True,
+            )
+
+            assert response.status_code == 200, response.text
+            result = response.json()
+            refusal_value = result["assignment_refused"]
+            refusals = refusal_value if isinstance(refusal_value, list) else [refusal_value]
+            assert len(refusals) == 1
+            refusal = refusals[0]
+            assert refusal["skill"] == skill_name
+            reason = refusal["reason"].lower()
+            assert "tool" in reason
+            assert "operator" in reason
+            assert f"/agents/other/skills/{skill_name}" in refusal["reason"]
+            assert "assigned_to" not in result
+            if source == "from-git":
+                assert result["assigned_skills"] == []
+
+            catalog = self._catalog_skill(client, "other", skill_name)
+            assert catalog["self_assignable"] is False
+            assert catalog["tool_patterns"] == [self._MINT_TOOL_PATTERN]
+            assert self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
+
+            after_apply = self._apply_snapshot(client, "other")
+            assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+            assert after_apply["directives_count"] == before_apply["directives_count"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        ("source", "skill_name"),
+        [
+            ("from-md", "md-self-directive"),
+            ("from-git", "git-self-directive"),
+        ],
+    )
+    def test_signed_self_directive_only_mint_records_self_provenance(
+        self, monkeypatch, tmp_path, source, skill_name
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            before_apply = self._apply_snapshot(client, "other")
+            response = self._install_skill(
+                client,
+                source=source,
+                skill_name=skill_name,
+                agent_name="other",
+                caller="other",
+            )
+
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert "assignment_refused" not in result
+            assert result["assigned_to"] == "other"
+            if source == "from-git":
+                assert result["assigned_skills"] == [skill_name]
+
+            catalog = self._catalog_skill(client, "other", skill_name)
+            assert catalog["self_assignable"] is True
+            assert catalog["tool_patterns"] == []
+            assert self._MINT_DIRECTIVE in catalog["directive"]
+            assigned = self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+            )
+            assert assigned is not None
+            assert assigned["assigned_by"] == "self"
+
+            after_apply = self._apply_snapshot(client, "other")
+            assert after_apply["directives_count"] == before_apply["directives_count"] + 1
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        ("source", "skill_name"),
+        [
+            ("from-md", "md-operator-tools"),
+            ("from-git", "git-operator-tools"),
+        ],
+    )
+    def test_operator_tool_bearing_mint_preserves_assignment_and_materialization(
+        self, monkeypatch, tmp_path, source, skill_name
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            self._setup_operator(client)
+            before_apply = self._apply_snapshot(client, "tenant")
+            response = self._install_skill(
+                client,
+                source=source,
+                skill_name=skill_name,
+                agent_name="tenant",
+                tool_bearing=True,
+            )
+
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert "assignment_refused" not in result
+            assert result["assigned_to"] == "tenant"
+            if source == "from-git":
+                assert result["assigned_skills"] == [skill_name]
+
+            catalog = self._catalog_skill(client, "tenant", skill_name)
+            assert catalog["self_assignable"] is True
+            assigned = self._assigned_skill(client, "tenant", skill_name)
+            assert assigned is not None
+            assert assigned["assigned_by"] == "user"
+
+            after_apply = self._apply_snapshot(client, "tenant")
+            assert self._MINT_TOOL_PATTERN in after_apply["tool_patterns"]
+            assert after_apply["directives_count"] == before_apply["directives_count"] + 1
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        ("source", "skill_name"),
+        [
+            ("from-md", "md-cross-tools"),
+            ("from-git", "git-cross-tools"),
+        ],
+    )
+    def test_cross_agent_mint_documents_638_residual(
+        self, monkeypatch, tmp_path, source, skill_name
+    ):
+        """DOCUMENTS #638: peer-signed fleet grants remain intentionally possible."""
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        try:
+            before_apply = self._apply_snapshot(client, "tenant")
+            response = self._install_skill(
+                client,
+                source=source,
+                skill_name=skill_name,
+                agent_name="tenant",
+                caller="other",
+                tool_bearing=True,
+            )
+
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert "assignment_refused" not in result
+            assert result["assigned_to"] == "tenant"
+            if source == "from-git":
+                assert result["assigned_skills"] == [skill_name]
+
+            catalog = self._catalog_skill(client, "tenant", skill_name)
+            assert catalog["self_assignable"] is False
+            assigned = self._assigned_skill(client, "tenant", skill_name)
+            assert assigned is not None
+            assert assigned["assigned_by"] == "other"
+
+            after_apply = self._apply_snapshot(client, "tenant")
+            assert self._MINT_TOOL_PATTERN in after_apply["tool_patterns"]
+            assert after_apply["directives_count"] == before_apply["directives_count"] + 1
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize("action", ["enable", "disable", "remove"])
+    def test_signed_cross_agent_skill_mutation_is_denied_without_effect(
+        self, monkeypatch, tmp_path, action
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = f"cross-mutation-{action}"
+        try:
+            self._setup_operator(client)
+            self._register_operator_skill(
+                client,
+                skill_name,
+                tool_pattern=self._MINT_TOOL_PATTERN,
+            )
+            assigned = client.post(
+                f"/agents/tenant/skills/{skill_name}",
+                json={"assigned_by": "user"},
+            )
+            assert assigned.status_code == 200, assigned.text
+            if action == "enable":
+                disabled = client.post(f"/agents/tenant/skills/{skill_name}/disable")
+                assert disabled.status_code == 200, disabled.text
+
+            before_catalog = self._catalog_skill(client, "tenant", skill_name)
+            before_assignment = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            )
+            before_apply = self._apply_snapshot(client, "tenant")
+
+            target_path = f"/agents/tenant/skills/{skill_name}"
+            method = "DELETE" if action == "remove" else "POST"
+            if action != "remove":
+                target_path += f"/{action}"
+            response = self._signed_request(
+                client,
+                "other",
+                method,
+                target_path,
+            )
+
+            assert response.status_code == 403, response.text
+            assert self._catalog_skill(client, "tenant", skill_name) == before_catalog
+            assert self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            ) == before_assignment
+            assert self._apply_snapshot(client, "tenant") == before_apply
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_self_enable_requires_self_assignable_without_effect_on_denial(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        candidate = "self-enable-restricted"
+        control = "self-enable-control"
+        try:
+            self._setup_operator(client)
+            self._register_operator_skill(
+                client,
+                candidate,
+                tool_pattern=self._MINT_TOOL_PATTERN,
+            )
+            self._register_operator_skill(
+                client,
+                control,
+                self_assignable=True,
+                directive="self-enable control directive",
+            )
+            for skill_name in (candidate, control):
+                assigned = client.post(
+                    f"/agents/tenant/skills/{skill_name}",
+                    json={"assigned_by": "user"},
+                )
+                assert assigned.status_code == 200, assigned.text
+                disabled = client.post(f"/agents/tenant/skills/{skill_name}/disable")
+                assert disabled.status_code == 200, disabled.text
+
+            before_candidate = self._assigned_skill(
+                client,
+                "tenant",
+                candidate,
+                enabled_only=False,
+            )
+            before_apply = self._apply_snapshot(client, "tenant")
+            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+
+            denied = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{candidate}/enable",
+            )
+
+            assert denied.status_code == 403, denied.text
+            assert denied.json()["detail"] == f"Skill '{candidate}' is not self-assignable"
+            assert self._assigned_skill(
+                client,
+                "tenant",
+                candidate,
+                enabled_only=False,
+            ) == before_candidate
+            assert self._apply_snapshot(client, "tenant") == before_apply
+
+            allowed = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{control}/enable",
+            )
+            assert allowed.status_code == 200, allowed.text
+            control_row = self._assigned_skill(client, "tenant", control)
+            assert control_row is not None
+            assert control_row["effective_enabled"] is True
+            after_control = self._apply_snapshot(client, "tenant")
+            assert after_control["directives_count"] == before_apply["directives_count"] + 1
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_signed_self_shared_disable_records_disabled_self_opt_out(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "self-shared-opt-out"
+        try:
+            self._setup_operator(client)
+            self._register_operator_skill(
+                client,
+                skill_name,
+                shared=True,
+                tool_pattern=self._MINT_TOOL_PATTERN,
+            )
+            before = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            )
+            assert before is not None
+            assert before["assigned_by"] == "shared"
+            assert before["agent_enabled"] is None
+            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
+                client, "tenant"
+            )["tool_patterns"]
+
+            response = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{skill_name}/disable",
+            )
+
+            assert response.status_code == 200, response.text
+            assert response.json()["opted_out"] is True
+            after = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            )
+            assert after is not None
+            assert after["assigned_by"] == "self"
+            assert after["agent_enabled"] is False
+            assert after["effective_enabled"] is False
+            assert self._MINT_TOOL_PATTERN not in self._apply_snapshot(
+                client, "tenant"
+            )["tool_patterns"]
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize("action", ["disable", "remove"])
+    def test_signed_self_core_skill_mutation_keeps_core_guard_precedence(
+        self, monkeypatch, tmp_path, action
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "pinky-self"
+        try:
+            before_assignment = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            )
+            before_apply = self._apply_snapshot(client, "tenant")
+            target_path = f"/agents/tenant/skills/{skill_name}"
+            method = "DELETE" if action == "remove" else "POST"
+            if action == "disable":
+                target_path += "/disable"
+
+            response = self._signed_request(
+                client,
+                "tenant",
+                method,
+                target_path,
+            )
+
+            assert response.status_code == 400, response.text
+            assert "core skill" in response.text
+            assert self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            ) == before_assignment
+            assert self._apply_snapshot(client, "tenant") == before_apply
+        finally:
+            client.close()
+            os.unlink(path)
+
+    @pytest.mark.parametrize(
+        "action",
+        ["enable", "disable", "disable-shared", "remove"],
+    )
+    def test_operator_skill_mutations_preserve_cross_target_behavior(
+        self, monkeypatch, tmp_path, action
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = f"operator-{action}"
+        shared = action == "disable-shared"
+        try:
+            self._setup_operator(client)
+            self._register_operator_skill(
+                client,
+                skill_name,
+                shared=shared,
+                tool_pattern=self._MINT_TOOL_PATTERN,
+            )
+            if not shared:
+                assigned = client.post(
+                    f"/agents/tenant/skills/{skill_name}",
+                    json={"assigned_by": "user"},
+                )
+                assert assigned.status_code == 200, assigned.text
+            if action == "enable":
+                disabled = client.post(f"/agents/tenant/skills/{skill_name}/disable")
+                assert disabled.status_code == 200, disabled.text
+
+            before_apply = self._apply_snapshot(client, "tenant")
+            target_path = f"/agents/tenant/skills/{skill_name}"
+            method = "DELETE" if action == "remove" else "POST"
+            if action != "remove":
+                suffix = "disable" if action == "disable-shared" else action
+                target_path += f"/{suffix}"
+            response = client.request(method, target_path)
+
+            assert response.status_code == 200, response.text
+            after = self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                enabled_only=False,
+            )
+            after_apply = self._apply_snapshot(client, "tenant")
+            if action == "enable":
+                assert after is not None and after["effective_enabled"] is True
+                assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+                assert self._MINT_TOOL_PATTERN in after_apply["tool_patterns"]
+            elif action in ("disable", "disable-shared"):
+                assert after is not None and after["agent_enabled"] is False
+                assert after["effective_enabled"] is False
+                assert self._MINT_TOOL_PATTERN in before_apply["tool_patterns"]
+                assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+                if action == "disable-shared":
+                    assert response.json()["opted_out"] is True
+                    assert after["assigned_by"] == "user"
+            else:
+                assert after is None
+                assert self._MINT_TOOL_PATTERN in before_apply["tool_patterns"]
+                assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
         finally:
             client.close()
             os.unlink(path)

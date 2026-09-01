@@ -141,6 +141,7 @@ from pinky_daemon.auth import (
     INTERNAL_TIMESTAMP_HEADER,
     SESSION_COOKIE_NAME,
     create_session_cookie,
+    derive_skill_assignment_actor,
     hash_password,
     is_browser_json_request,
     password_source,
@@ -1108,6 +1109,18 @@ def _isolation_path_target(path: str) -> str | None:
         if m:
             return m.group(1)
     return None
+
+
+def _authorize_skill_assignment_mutation(request: Request, target_agent: str) -> str:
+    """Return derived provenance or reject a signed peer mutating another agent."""
+    internal_caller = getattr(request.state, "internal_caller", "")
+    actor = derive_skill_assignment_actor(internal_caller, target_agent)
+    if internal_caller and actor != "self":
+        raise HTTPException(
+            403,
+            "signed agents may only mutate their own skill assignments",
+        )
+    return actor
 
 
 def _clean_group_set(groups) -> set[str]:
@@ -6504,11 +6517,12 @@ npm run build</pre>
         return {"assigned": True, "agent": name, "skill": skill_name}
 
     @app.delete("/agents/{name}/skills/{skill_name}")
-    async def remove_agent_skill(name: str, skill_name: str):
+    async def remove_agent_skill(name: str, skill_name: str, request: Request):
         """Remove a skill from an agent."""
         agent = agents.get(name)
         if not agent:
             raise HTTPException(404, f"Agent '{name}' not found")
+        _authorize_skill_assignment_mutation(request, name)
         # Prevent removing core skills
         skill = skills.get(skill_name)
         if skill and skill.category == "core":
@@ -6519,15 +6533,20 @@ npm run build</pre>
         return {"removed": True, "agent": name, "skill": skill_name}
 
     @app.post("/agents/{name}/skills/{skill_name}/enable")
-    async def enable_agent_skill(name: str, skill_name: str):
+    async def enable_agent_skill(name: str, skill_name: str, request: Request):
         """Enable an assigned skill for an agent."""
+        actor = _authorize_skill_assignment_mutation(request, name)
+        skill = skills.get(skill_name)
+        if actor == "self" and skill and not skill.self_assignable:
+            raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
         if not skills.set_agent_skill_enabled(name, skill_name, True):
             raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
         return {"enabled": True, "agent": name, "skill": skill_name}
 
     @app.post("/agents/{name}/skills/{skill_name}/disable")
-    async def disable_agent_skill(name: str, skill_name: str):
+    async def disable_agent_skill(name: str, skill_name: str, request: Request):
         """Disable an assigned skill for an agent (opt-out)."""
+        actor = _authorize_skill_assignment_mutation(request, name)
         # Core skills (self-management, memory, messaging, file access) are
         # foundational — mirror the DELETE guard so a single toggle can't
         # opt an agent out of them (e.g. stripping its own pinky-self).
@@ -6537,8 +6556,13 @@ npm run build</pre>
         if not skills.set_agent_skill_enabled(name, skill_name, False):
             # For shared skills, create a disabled assignment to opt out
             if skill and skill.shared:
-                skills.assign_to_agent(name, skill_name, assigned_by="user")
-                skills.set_agent_skill_enabled(name, skill_name, False)
+                if not skills.assign_to_agent(
+                    name,
+                    skill_name,
+                    assigned_by=actor,
+                    enabled=False,
+                ):
+                    raise HTTPException(500, "Failed to record shared skill opt-out")
                 return {"disabled": True, "agent": name, "skill": skill_name, "opted_out": True}
             raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
         return {"disabled": True, "agent": name, "skill": skill_name}

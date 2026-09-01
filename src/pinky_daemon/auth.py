@@ -23,6 +23,23 @@ _SESSION_TTL_SECONDS = 7 * 24 * 3600
 _INTERNAL_TTL_SECONDS = 300
 
 
+def derive_skill_assignment_actor(internal_caller: str, target_agent: str) -> str:
+    """Derive skill-assignment provenance from verified request identity.
+
+    Browser/operator requests have no internal caller and retain ``user``
+    provenance. A signed agent acting on itself is ``self``; a signed peer
+    acting on another agent records the verified peer name. Peer names that
+    collide with reserved provenance literals are prefixed with ``agent:``.
+    """
+    if not internal_caller:
+        return "user"
+    if internal_caller == target_agent:
+        return "self"
+    if internal_caller in {"user", "self"}:
+        return f"agent:{internal_caller}"
+    return internal_caller
+
+
 def _b64encode(data: bytes) -> str:
     return base64.urlsafe_b64encode(data).decode("ascii").rstrip("=")
 
