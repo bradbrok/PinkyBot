@@ -958,6 +958,99 @@ def test_failed_from_git_clone_removes_staging_files(monkeypatch, tmp_path):
         client.close()
 
 
+@pytest.mark.parametrize(
+    "url",
+    [
+        pytest.param(
+            "https://github.com/org/repo/tree/main/../../escape",
+            id="parent-traversal",
+        ),
+        pytest.param(
+            "https://github.com/org/repo/tree/main//tmp/x",
+            id="absolute-subdir",
+        ),
+    ],
+)
+def test_from_git_rejects_invalid_subdirectory_before_clone(monkeypatch, tmp_path, url):
+    client = _make_client(monkeypatch, tmp_path)
+
+    def unexpected_git_run(*args, **kwargs):
+        raise AssertionError("invalid subdirectory reached git")
+
+    monkeypatch.setattr(subprocess, "run", unexpected_git_run)
+    skills_root = tmp_path / "skills"
+    try:
+        refused = client.post("/skills/from-git", json={"url": url})
+
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["detail"] == "Invalid subdirectory"
+        assert not skills_root.exists()
+        assert list(skills_root.glob(".*-staging-*")) == []
+    finally:
+        client.close()
+
+
+def test_from_git_rejects_symlinked_subdirectory_outside_clone(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "symlink-escape-skill"
+    outside = tmp_path / "outside-clone"
+    outside.mkdir()
+    (outside / "SKILL.md").write_text(
+        _skill_md(skill_name, allowed_tools="Read"),
+        encoding="utf-8",
+    )
+
+    def fake_git_run(args, **kwargs):
+        target = Path(args[-1])
+        target.mkdir(parents=True)
+        (target / "legit").symlink_to(outside, target_is_directory=True)
+        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_git_run)
+    skills_root = tmp_path / "skills"
+    try:
+        refused = client.post(
+            "/skills/from-git",
+            json={"url": "https://github.com/org/repo/tree/main/legit"},
+        )
+
+        assert refused.status_code == 400, refused.text
+        assert refused.json()["detail"] == "Invalid subdirectory"
+        assert skill_routes._skills.get(skill_name) is None
+        assert not (skills_root / "repo").exists()
+        assert list(skills_root.glob(".*-staging-*")) == []
+    finally:
+        client.close()
+
+
+def test_from_git_imports_legitimate_nested_subdirectory(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "nested-subdirectory-skill"
+
+    def fake_git_run(args, **kwargs):
+        target = Path(args[-1])
+        nested = target / "a" / "b"
+        nested.mkdir(parents=True)
+        (nested / "SKILL.md").write_text(
+            _skill_md(skill_name, allowed_tools="Read"),
+            encoding="utf-8",
+        )
+        return subprocess.CompletedProcess(args, 0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(subprocess, "run", fake_git_run)
+    try:
+        installed = client.post(
+            "/skills/from-git",
+            json={"url": "https://github.com/org/repo/tree/main/a/b"},
+        )
+
+        assert installed.status_code == 200, installed.text
+        assert installed.json()["registered"] == [skill_name]
+        assert skill_routes._skills.get(skill_name) is not None
+    finally:
+        client.close()
+
+
 def test_signed_from_git_origin_and_clamps_survive_boot_discovery(monkeypatch, tmp_path):
     client = _make_client(monkeypatch, tmp_path)
     skill_name = "signed-git-skill"
