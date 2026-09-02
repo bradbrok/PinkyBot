@@ -12,7 +12,7 @@ from __future__ import annotations
 import os
 import shutil
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
@@ -470,6 +470,16 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         # Plain repo URL: github.com/org/repo (no tree/blob)
         url = url.rstrip("/") + ".git" if not url.endswith(".git") else url
 
+    if subdir:
+        subdir_path = PurePosixPath(subdir)
+        if (
+            subdir_path.is_absolute()
+            or ".." in subdir_path.parts
+            or "\\" in subdir
+            or "" in subdir.split("/")
+        ):
+            raise HTTPException(400, "Invalid subdirectory")
+
     # Derive a directory name from the URL
     repo_name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
     skills_root = (_pinky_root / "skills").resolve()
@@ -515,7 +525,12 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         except sp.TimeoutExpired as e:
             raise HTTPException(504, "Git clone timed out") from e
 
-        staging_scan_root = staging_dir / subdir if subdir else staging_dir
+        resolved_staging_dir = staging_dir.resolve()
+        staging_scan_root = (
+            (staging_dir / subdir).resolve() if subdir else resolved_staging_dir
+        )
+        if not staging_scan_root.is_relative_to(resolved_staging_dir):
+            raise HTTPException(400, "Invalid subdirectory")
         if not staging_scan_root.is_dir():
             raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
         staged_skills = scan_skills_directory(staging_scan_root)
@@ -532,7 +547,12 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         staging_dir.rename(target_dir)
         promoted = True
 
-        final_scan_root = target_dir / subdir if subdir else target_dir
+        resolved_target_dir = target_dir.resolve()
+        final_scan_root = (
+            (target_dir / subdir).resolve() if subdir else resolved_target_dir
+        )
+        if not final_scan_root.is_relative_to(resolved_target_dir):
+            raise HTTPException(400, "Invalid subdirectory")
         found = scan_skills_directory(final_scan_root)
         if not found:
             raise HTTPException(400, "Promoted repository contains no readable skills")
