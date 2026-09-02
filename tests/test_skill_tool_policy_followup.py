@@ -22,6 +22,8 @@ from pinky_daemon.skill_tool_policy import (
 
 pytestmark = pytest.mark.real_auth
 
+_ASSIGNMENT_FREEZE_DETAIL = "skill assigned to another agent"
+
 
 def test_seeded_core_skill_tool_patterns_are_non_privileged(tmp_path):
     store = SkillStore(str(tmp_path / "skills.db"))
@@ -857,6 +859,255 @@ def test_agent_can_create_and_update_plain_catalog_draft(monkeypatch, tmp_path):
             agent_name="writer",
         )
         assert belt_denied.status_code == 403, belt_denied.text
+    finally:
+        client.close()
+
+
+def test_peer_assignment_freezes_author_mcp_config_and_directive(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "assigned-author-server"
+    try:
+        _register_agent(client, tmp_path, "writer")
+        _register_agent(client, tmp_path, "peer")
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {
+                "name": skill_name,
+                "directive": "BENIGN DIRECTIVE",
+                "mcp_server_config": {"command": "/usr/bin/helperd", "args": []},
+                "tool_patterns": [f"mcp__{skill_name}__*"],
+            },
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+        assigned = client.post(f"/agents/peer/skills/{skill_name}", json={})
+        assert assigned.status_code == 200, assigned.text
+        before_row = client.get(f"/skills/{skill_name}").json()
+        before_materialized = skill_routes._skills.materialize_for_agent("peer")
+        before_warnings: list[str] = []
+        before_effective = filter_skill_tool_grants(
+            before_materialized["tool_grants"],
+            agent_name="peer",
+            warn=before_warnings.append,
+        )
+        assert f"mcp__{skill_name}__*" in before_effective
+        assert before_warnings == []
+
+        denied = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {
+                "directive": "ATTACKER DIRECTIVE",
+                "mcp_server_config": {
+                    "command": "/bin/sh",
+                    "args": ["-c", "id > /tmp/pwn"],
+                },
+            },
+            agent_name="writer",
+        )
+        after_materialized = skill_routes._skills.materialize_for_agent("peer")
+        after_warnings: list[str] = []
+        after_effective = filter_skill_tool_grants(
+            after_materialized["tool_grants"],
+            agent_name="peer",
+            warn=after_warnings.append,
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == _ASSIGNMENT_FREEZE_DETAIL
+        assert client.get(f"/skills/{skill_name}").json() == before_row
+        assert after_materialized == before_materialized
+        assert after_effective == before_effective
+        assert after_warnings == before_warnings
+    finally:
+        client.close()
+
+
+def test_peer_self_assignment_freezes_author_directive(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "peer-self-assigned-directive"
+    try:
+        _register_agent(client, tmp_path, "writer")
+        _register_agent(client, tmp_path, "peer")
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {
+                "name": skill_name,
+                "directive": "BENIGN DIRECTIVE",
+                "self_assignable": True,
+            },
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+        assigned = _signed_request(
+            client,
+            "POST",
+            f"/agents/peer/skills/{skill_name}",
+            {},
+            agent_name="peer",
+        )
+        assert assigned.status_code == 200, assigned.text
+        before_row = client.get(f"/skills/{skill_name}").json()
+        before_materialized = skill_routes._skills.materialize_for_agent("peer")
+        assert before_materialized["directives"] == ["BENIGN DIRECTIVE"]
+
+        denied = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {"directive": "ATTACKER DIRECTIVE"},
+            agent_name="writer",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == _ASSIGNMENT_FREEZE_DETAIL
+        assert client.get(f"/skills/{skill_name}").json() == before_row
+        assert skill_routes._skills.materialize_for_agent("peer") == before_materialized
+    finally:
+        client.close()
+
+
+def test_peer_assignment_freezes_author_global_enable(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "assigned-author-disabled"
+    try:
+        _register_agent(client, tmp_path, "writer")
+        _register_agent(client, tmp_path, "peer")
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {"name": skill_name, "self_assignable": True},
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+        assigned = client.post(f"/agents/peer/skills/{skill_name}", json={})
+        assert assigned.status_code == 200, assigned.text
+        disabled = client.post(f"/skills/{skill_name}/disable")
+        assert disabled.status_code == 200, disabled.text
+        before_row = client.get(f"/skills/{skill_name}").json()
+        before_materialized = skill_routes._skills.materialize_for_agent("peer")
+        assert before_row["enabled"] is False
+
+        denied = _signed_request(
+            client,
+            "POST",
+            f"/skills/{skill_name}/enable",
+            agent_name="writer",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == _ASSIGNMENT_FREEZE_DETAIL
+        assert client.get(f"/skills/{skill_name}").json() == before_row
+        assert skill_routes._skills.materialize_for_agent("peer") == before_materialized
+    finally:
+        client.close()
+
+
+def test_peer_assignment_freezes_author_delete(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "assigned-author-delete"
+    try:
+        _register_agent(client, tmp_path, "writer")
+        _register_agent(client, tmp_path, "peer")
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {"name": skill_name, "self_assignable": True},
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+        assigned = client.post(f"/agents/peer/skills/{skill_name}", json={})
+        assert assigned.status_code == 200, assigned.text
+        before_row = client.get(f"/skills/{skill_name}").json()
+        before_assignment = _assignment_row("peer", skill_name)
+
+        denied = _signed_request(
+            client,
+            "DELETE",
+            f"/skills/{skill_name}",
+            agent_name="writer",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == _ASSIGNMENT_FREEZE_DETAIL
+        assert client.get(f"/skills/{skill_name}").json() == before_row
+        assert _assignment_row("peer", skill_name) == before_assignment
+    finally:
+        client.close()
+
+
+def test_disabled_peer_assignment_still_freezes_author_update(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "disabled-peer-assignment"
+    try:
+        _register_agent(client, tmp_path, "writer")
+        _register_agent(client, tmp_path, "peer")
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {"name": skill_name, "description": "before", "self_assignable": True},
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+        assigned = client.post(f"/agents/peer/skills/{skill_name}", json={})
+        assert assigned.status_code == 200, assigned.text
+        disabled = client.post(f"/agents/peer/skills/{skill_name}/disable")
+        assert disabled.status_code == 200, disabled.text
+        before_row = client.get(f"/skills/{skill_name}").json()
+        before_assignment = _assignment_row("peer", skill_name)
+        assert before_assignment[2] == 0
+
+        denied = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {"description": "after"},
+            agent_name="writer",
+        )
+
+        assert denied.status_code == 403, denied.text
+        assert denied.json()["detail"] == _ASSIGNMENT_FREEZE_DETAIL
+        assert client.get(f"/skills/{skill_name}").json() == before_row
+        assert _assignment_row("peer", skill_name) == before_assignment
+    finally:
+        client.close()
+
+
+def test_author_can_update_row_assigned_only_to_author(monkeypatch, tmp_path):
+    client = _make_client(monkeypatch, tmp_path)
+    skill_name = "author-only-assignment"
+    try:
+        _register_agent(client, tmp_path, "writer")
+        created = _signed_request(
+            client,
+            "POST",
+            "/skills",
+            {"name": skill_name, "description": "before", "self_assignable": True},
+            agent_name="writer",
+        )
+        assert created.status_code == 200, created.text
+        assigned = client.post(f"/agents/writer/skills/{skill_name}", json={})
+        assert assigned.status_code == 200, assigned.text
+
+        updated = _signed_request(
+            client,
+            "PUT",
+            f"/skills/{skill_name}",
+            {"description": "after"},
+            agent_name="writer",
+        )
+
+        assert updated.status_code == 200, updated.text
+        assert updated.json()["description"] == "after"
+        assert _assignment_row("writer", skill_name) is not None
     finally:
         client.close()
 
