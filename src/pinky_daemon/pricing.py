@@ -215,13 +215,15 @@ def lookup_rate(model_id: str) -> dict[str, float] | None:
             return static
         raise
     if row is not None:
-        return {
+        runtime_rate = {
             "input": float(row["input_price"]),
             "output": float(row["output_price"]),
             "cache_read": float(row["cached_input_price"]),
             "cache_write_5m": float(row["cache_write_5m_price"]),
             "cache_write_1h": float(row["cache_write_1h_price"]),
         }
+        static = RATE_TABLE.get(base)
+        return static if runtime_rate == static else runtime_rate
     return RATE_TABLE.get(base)
 
 
