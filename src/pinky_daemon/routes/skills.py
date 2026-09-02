@@ -84,13 +84,17 @@ def _reject_agent_catalog_overwrite(name: str, internal_caller: str) -> None:
     if not internal_caller:
         return
     skill = _skills.get(name)
-    if skill and (
+    if not skill:
+        return
+    if (
         skill.origin_agent != internal_caller
         or skill.category == "core"
         or skill.shared
         or skill.privileged_tool_opt_in
     ):
         raise HTTPException(403, "operator-owned skill")
+    if any(agent_name != internal_caller for agent_name in _skills.assigned_agents(name)):
+        raise HTTPException(403, "skill assigned to another agent")
 
 
 def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:

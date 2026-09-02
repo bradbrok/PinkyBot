@@ -589,6 +589,15 @@ class SkillStore:
         ).fetchone()
         return row is not None
 
+    def assigned_agents(self, skill_name: str) -> list[str]:
+        """Return every agent with an assignment row, including disabled rows."""
+        rows = self._db.execute(
+            """SELECT DISTINCT agent_name FROM agent_skills
+               WHERE skill_name=? ORDER BY agent_name""",
+            (skill_name,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
+
     def set_agent_skill_enabled(self, agent_name: str, skill_name: str, enabled: bool) -> bool:
         """Enable or disable a skill for a specific agent."""
         cursor = self._db.execute(
