@@ -39,11 +39,11 @@ class AddModelRequest(BaseModel):
     tier: str = ""
     context_window: int = Field(default=200_000, gt=0)
     is_1m: bool = False
-    input_price: float = Field(ge=0)
-    output_price: float = Field(ge=0)
-    cached_input_price: float = Field(ge=0)
-    cache_write_5m_price: float = Field(ge=0)
-    cache_write_1h_price: float = Field(ge=0)
+    input_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    output_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    cached_input_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    cache_write_5m_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    cache_write_1h_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
     supports_thinking: bool = True
     sort_order: int = 100
 

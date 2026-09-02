@@ -3,7 +3,6 @@
 from __future__ import annotations
 
 import math
-import re
 import sys
 import threading
 from typing import Protocol
@@ -32,7 +31,6 @@ _RATE_FIELDS = (
     "cache_write_5m_price",
     "cache_write_1h_price",
 )
-_TIER_RE = re.compile(r"\[[^\]]+\]\s*$")
 _LOCK = threading.RLock()
 _registry: _Registry | None = None
 _rate_cache: dict[str, dict | None] = {}
@@ -42,7 +40,17 @@ _one_million_loaded = False
 
 def strip_tier(model_id: str) -> str:
     """Return a model id without a trailing context-tier suffix."""
-    return _TIER_RE.sub("", (model_id or "").strip())
+    base = (model_id or "").strip()
+    if not base.endswith("]"):
+        return base
+    opening = base.rfind("[")
+    if (
+        opening < 0
+        or opening >= len(base) - 2
+        or "]" in base[opening + 1 : -1]
+    ):
+        return base
+    return base[:opening]
 
 
 def incoherent_fields(model: dict) -> list[str]:
@@ -117,8 +125,11 @@ def lookup_model(model_id: str) -> dict | None:
             _rate_cache[base] = dict(row) if row is not None else None
             row = _rate_cache[base]
 
-        if row is None or not row.get("active", 1):
+        if row is None:
             return None
+        if not row.get("active", 1):
+            full_id = row.get("id") or base
+            raise ModelCatalogError(f"{full_id} is inactive")
         invalid = incoherent_fields(row)
         if invalid:
             full_id = row.get("id") or base

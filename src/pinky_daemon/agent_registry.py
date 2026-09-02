@@ -8222,22 +8222,27 @@ except Exception as exc:
         columns = {
             row[1] for row in self._db.execute("PRAGMA table_info(models)").fetchall()
         }
+        added_columns = []
         for column_name in ("cache_write_5m_price", "cache_write_1h_price"):
             if column_name not in columns:
                 self._db.execute(
                     f"ALTER TABLE models ADD COLUMN {column_name} REAL"
                 )
+                added_columns.append(column_name)
                 _log(f"agent_registry: migrated — added column {column_name}")
 
+        if not added_columns:
+            return
+        rate_keys = {
+            "cache_write_5m_price": "cache_write_5m",
+            "cache_write_1h_price": "cache_write_1h",
+        }
         for model_id, rate in RATE_TABLE.items():
+            assignments = ", ".join(f"{column_name}=?" for column_name in added_columns)
             self._db.execute(
-                """UPDATE models
-                   SET cache_write_5m_price=COALESCE(cache_write_5m_price, ?),
-                       cache_write_1h_price=COALESCE(cache_write_1h_price, ?)
-                   WHERE model_id=?
-                     AND (cache_write_5m_price IS NULL
-                          OR cache_write_1h_price IS NULL)""",
-                (rate["cache_write_5m"], rate["cache_write_1h"], model_id),
+                f"UPDATE models SET {assignments} WHERE model_id=?",
+                tuple(rate[rate_keys[column_name]] for column_name in added_columns)
+                + (model_id,),
             )
 
     def _migrate_agent_costs_schema(self) -> None:

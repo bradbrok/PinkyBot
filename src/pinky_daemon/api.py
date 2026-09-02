@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
@@ -1798,18 +1800,38 @@ def create_api(
         storage_observability.enable_runtime()
         return await call_next(request)
 
+    def _has_non_finite(obj: Any) -> bool:
+        if isinstance(obj, float):
+            return not math.isfinite(obj)
+        if isinstance(obj, dict):
+            return any(_has_non_finite(value) for value in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(_has_non_finite(value) for value in obj)
+        return False
+
     @app.exception_handler(RequestValidationError)
     async def _request_validation_response(
         request: Request,
         error: RequestValidationError,
     ):
+        validation_errors = error.errors()
         if request.method == "POST" and request.url.path == "/agents" and any(
             tuple(item.get("loc", ()))[:2] == ("body", "name")
-            for item in error.errors()
+            for item in validation_errors
         ):
             return JSONResponse(
                 status_code=400,
                 content={"detail": {"code": "invalid_agent_name"}},
+            )
+        if any(_has_non_finite(item.get("input")) for item in validation_errors):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": jsonable_encoder(
+                        validation_errors,
+                        exclude={"input"},
+                    )
+                },
             )
         return await request_validation_exception_handler(request, error)
 
