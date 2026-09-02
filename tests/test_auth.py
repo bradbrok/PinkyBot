@@ -28,6 +28,7 @@ from pinky_daemon.auth import (
     verify_session_cookie,
 )
 from pinky_daemon.routes import skills as skill_routes
+from pinky_daemon.skill_tool_policy import filter_skill_tool_grants
 
 # Tests in this module exercise the real auth flow (redirects, 401s,
 # cookie issuance). The conftest auto-injects a valid session cookie
@@ -1102,8 +1103,17 @@ class TestAgentIsolationScoping:
         def disable(self, name):
             return True
 
-        def register_in_skill_store(self, skills, name):
-            return None
+        def register_in_skill_store(self, skills, name, *, agent_originated=False):
+            return skills.register(
+                name,
+                description="plugin capability fixture",
+                skill_type="plugin",
+                mcp_server_config={"command": "plugin-fixture"},
+                tool_patterns=[f"mcp__plugin-{name}__*", f"plugin_{name}_run"],
+                self_assignable=True,
+                category="plugin",
+                agent_originated=agent_originated,
+            )
 
     def _make_skill_catalog_client(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
@@ -1451,6 +1461,68 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
+    def test_signed_plugin_enable_cannot_mint_self_materializing_capability(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "catalog-plugin"
+        patterns = [f"mcp__plugin-{skill_name}__*", f"plugin_{skill_name}_run"]
+        try:
+            enabled = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/plugins/{skill_name}/enable",
+            )
+            assigned = self._signed_request(
+                client,
+                "other",
+                "POST",
+                f"/agents/other/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "other", skill_name)
+            applied = self._apply_snapshot(client, "other")
+
+            assert enabled.status_code == 200, enabled.text
+            assert catalog["shared"] is False
+            assert catalog["self_assignable"] is False
+            assert assigned.status_code == 403, assigned.text
+            assert skill_name not in applied["mcp_servers"]
+            assert all(pattern not in applied["tool_patterns"] for pattern in patterns)
+        finally:
+            client.close()
+            os.unlink(path)
+
+    def test_operator_plugin_enable_keeps_own_namespace_self_assignable(
+        self, monkeypatch, tmp_path
+    ):
+        client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
+        skill_name = "catalog-plugin"
+        patterns = [f"mcp__plugin-{skill_name}__*", f"plugin_{skill_name}_run"]
+        try:
+            self._setup_operator(client)
+            enabled = client.post(f"/plugins/{skill_name}/enable")
+            assigned = self._signed_request(
+                client,
+                "tenant",
+                "POST",
+                f"/agents/tenant/skills/{skill_name}",
+                {"assigned_by": "self"},
+            )
+            catalog = self._catalog_skill(client, "tenant", skill_name)
+            applied = self._apply_snapshot(client, "tenant")
+
+            assert enabled.status_code == 200, enabled.text
+            assert catalog["self_assignable"] is True
+            assert catalog["privileged_tool_opt_in"] is False
+            assert assigned.status_code == 200, assigned.text
+            assert skill_name in applied["mcp_servers"]
+            assert all(pattern in applied["tool_patterns"] for pattern in patterns)
+        finally:
+            client.close()
+            os.unlink(path)
+
     def test_isolated_agent_catalog_read_and_self_assignment_still_work(
         self, monkeypatch, tmp_path
     ):
@@ -1506,7 +1578,7 @@ class TestAgentIsolationScoping:
 
             assert response.status_code == 403, response.text
             assert response.json()["detail"] == (
-                f"Skill '{self._RESTRICTED_SKILL}' is not self-assignable"
+                "signed agents may only assign self-assignable skills"
             )
             assert self._assigned_skill(
                 client, "tenant", self._RESTRICTED_SKILL
@@ -1585,20 +1657,13 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_cross_agent_internal_assignment_documents_638_residual(
+    def test_cross_agent_internal_assignment_is_refused_for_restricted_skill(
         self, monkeypatch, tmp_path
     ):
-        """DOCUMENTS THE #638 RESIDUAL — this 200 is NOT enforcement.
+        """#638 residual closed: assignment provenance comes from the verified caller.
 
-        A non-isolated caller ("other") assigns a RESTRICTED skill to another
-        agent with body assigned_by="user": caller != target, so the derivation
-        falls to the body value and the self_assignable gate is skipped. Because
-        a non-isolated agent holds the fleetwide global secret (which
-        authenticates as any non-isolated peer), this is also the shape of the
-        self-grant BYPASS — an attacker signs as a peer to grant a restricted
-        skill to itself. #1192's fix does NOT close this; only the isolated
-        self-grant path is closed. Kept as a characterization pin: if #638 is
-        ever resolved, this assertion should flip and prompt revisiting.
+        The request body's assigned_by field is ignored, and signed callers may
+        only assign self-assignable skills.
         """
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         try:
@@ -1610,12 +1675,14 @@ class TestAgentIsolationScoping:
                 {"assigned_by": "user"},
             )
 
-            assert response.status_code == 200, response.text
+            assert response.status_code == 403, response.text
+            assert response.json()["detail"] == (
+                "signed agents may only assign self-assignable skills"
+            )
             assigned = self._assigned_skill(
                 client, "tenant", self._RESTRICTED_SKILL, caller="other"
             )
-            assert assigned is not None
-            assert assigned["assigned_by"] == "user"
+            assert assigned is None
         finally:
             client.close()
             os.unlink(path)
@@ -1967,7 +2034,7 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_agent_originated_tool_upgrade_keeps_operator_grant_live(
+    def test_signed_tool_upgrade_of_operator_owned_skill_is_refused(
         self, monkeypatch, tmp_path
     ):
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
@@ -1985,8 +2052,15 @@ class TestAgentIsolationScoping:
                 json={"assigned_by": "user"},
             )
             assert assigned.status_code == 200, assigned.text
-            before_apply = self._apply_snapshot(client, "other")
-            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+            before_catalog = self._catalog_skill(client, "other", skill_name)
+            before_assignment = self._assigned_skill(
+                client,
+                "other",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            )
+            assert before_assignment is not None
 
             updated = self._signed_request(
                 client,
@@ -1996,7 +2070,9 @@ class TestAgentIsolationScoping:
                 {"tool_patterns": [self._MINT_TOOL_PATTERN]},
             )
 
-            assert updated.status_code == 200, updated.text
+            assert updated.status_code == 403, updated.text
+            assert updated.json()["detail"] == "operator-owned skill"
+            assert self._catalog_skill(client, "other", skill_name) == before_catalog
             after_assignment = self._assigned_skill(
                 client,
                 "other",
@@ -2004,21 +2080,22 @@ class TestAgentIsolationScoping:
                 caller="other",
                 enabled_only=False,
             )
-            assert after_assignment is not None
-            assert after_assignment["assigned_by"] == "user"
-            assert after_assignment["agent_enabled"] is True
-            assert after_assignment["effective_enabled"] is True
-            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
-                client, "other"
-            )["tool_patterns"]
+            assert after_assignment == before_assignment
+            materialized = skill_routes._skills.materialize_for_agent("other")
+            warnings: list[str] = []
+            assert self._MINT_TOOL_PATTERN not in filter_skill_tool_grants(
+                materialized["tool_grants"],
+                agent_name="other",
+                warn=warnings.append,
+            )
         finally:
             client.close()
             os.unlink(path)
 
-    def test_agent_originated_tool_upgrade_keeps_peer_grant_live(
+    def test_agent_originated_tool_upgrade_is_frozen_after_peer_assignment(
         self, monkeypatch, tmp_path
     ):
-        """DOCUMENTS #638: verified peer grants are not revoked by PR-A."""
+        """A peer assignment freezes later catalog mutation by the author."""
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         skill_name = "peer-grant-upgrade"
         try:
@@ -2040,8 +2117,15 @@ class TestAgentIsolationScoping:
             assert before_assignment is not None
             assert before_assignment["assigned_by"] == "other"
             assert before_assignment["effective_enabled"] is True
-            before_apply = self._apply_snapshot(client, "tenant")
-            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+            before_catalog = self._catalog_skill(client, "other", skill_name)
+            before_materialized = skill_routes._skills.materialize_for_agent("tenant")
+            before_warnings: list[str] = []
+            before_effective = filter_skill_tool_grants(
+                before_materialized["tool_grants"],
+                agent_name="tenant",
+                warn=before_warnings.append,
+            )
+            assert self._MINT_TOOL_PATTERN not in before_effective
 
             updated = self._signed_request(
                 client,
@@ -2051,7 +2135,9 @@ class TestAgentIsolationScoping:
                 {"tool_patterns": [self._MINT_TOOL_PATTERN]},
             )
 
-            assert updated.status_code == 200, updated.text
+            assert updated.status_code == 403, updated.text
+            assert updated.json()["detail"] == "skill assigned to another agent"
+            assert self._catalog_skill(client, "other", skill_name) == before_catalog
             after_assignment = self._assigned_skill(
                 client,
                 "tenant",
@@ -2059,13 +2145,18 @@ class TestAgentIsolationScoping:
                 caller="other",
                 enabled_only=False,
             )
-            assert after_assignment is not None
-            assert after_assignment["assigned_by"] == "other"
-            assert after_assignment["agent_enabled"] is True
-            assert after_assignment["effective_enabled"] is True
-            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
-                client, "tenant"
-            )["tool_patterns"]
+            assert after_assignment == before_assignment
+            after_materialized = skill_routes._skills.materialize_for_agent("tenant")
+            after_warnings: list[str] = []
+            after_effective = filter_skill_tool_grants(
+                after_materialized["tool_grants"],
+                agent_name="tenant",
+                warn=after_warnings.append,
+            )
+            assert after_materialized == before_materialized
+            assert after_effective == before_effective
+            assert self._MINT_TOOL_PATTERN not in after_effective
+            assert after_warnings == before_warnings
         finally:
             client.close()
             os.unlink(path)
@@ -2206,7 +2297,8 @@ class TestAgentIsolationScoping:
                 assert result["assigned_skills"] == [skill_name]
 
             catalog = self._catalog_skill(client, "tenant", skill_name)
-            assert catalog["self_assignable"] is True
+            assert catalog["self_assignable"] is False
+            assert catalog["privileged_tool_opt_in"] is False
             assigned = self._assigned_skill(client, "tenant", skill_name)
             assert assigned is not None
             assert assigned["assigned_by"] == "user"
@@ -2225,10 +2317,10 @@ class TestAgentIsolationScoping:
             ("from-git", "git-cross-tools"),
         ],
     )
-    def test_cross_agent_mint_documents_638_residual(
+    def test_cross_agent_tool_bearing_mint_refuses_assignment(
         self, monkeypatch, tmp_path, source, skill_name
     ):
-        """DOCUMENTS #638: peer-signed fleet grants remain intentionally possible."""
+        """#638 residual closed: peer-signed imports cannot auto-assign restricted skills."""
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         try:
             before_apply = self._apply_snapshot(client, "tenant")
@@ -2243,20 +2335,32 @@ class TestAgentIsolationScoping:
 
             assert response.status_code == 200, response.text
             result = response.json()
-            assert "assignment_refused" not in result
-            assert result["assigned_to"] == "tenant"
+            refusal_value = result["assignment_refused"]
+            refusals = refusal_value if isinstance(refusal_value, list) else [refusal_value]
+            assert len(refusals) == 1
+            refusal = refusals[0]
+            assert refusal["skill"] == skill_name
+            reason = refusal["reason"].lower()
+            assert "tool" in reason
+            assert "operator" in reason
+            assert f"/agents/tenant/skills/{skill_name}" in refusal["reason"]
+            assert "assigned_to" not in result
             if source == "from-git":
-                assert result["assigned_skills"] == [skill_name]
+                assert result["assigned_skills"] == []
 
             catalog = self._catalog_skill(client, "tenant", skill_name)
             assert catalog["self_assignable"] is False
-            assigned = self._assigned_skill(client, "tenant", skill_name)
-            assert assigned is not None
-            assert assigned["assigned_by"] == "other"
+            assert self._assigned_skill(
+                client,
+                "tenant",
+                skill_name,
+                caller="other",
+                enabled_only=False,
+            ) is None
 
             after_apply = self._apply_snapshot(client, "tenant")
-            assert self._MINT_TOOL_PATTERN in after_apply["tool_patterns"]
-            assert after_apply["directives_count"] == before_apply["directives_count"] + 1
+            assert self._MINT_TOOL_PATTERN not in after_apply["tool_patterns"]
+            assert after_apply["directives_count"] == before_apply["directives_count"]
         finally:
             client.close()
             os.unlink(path)

@@ -846,6 +846,7 @@ def _seed_core_skills(skill_store) -> None:
     """Pre-register core and optional skills on startup.
 
     Core skills (shared=True) auto-apply to all agents.
+    Core tool patterns are code-defined and converge at boot.
     Optional skills can be assigned manually or by agents themselves.
     Uses register() which is idempotent — safe to call every startup.
     """
@@ -858,7 +859,7 @@ def _seed_core_skills(skill_store) -> None:
             "category": "core",
             "shared": True,
             "self_assignable": False,
-            "tool_patterns": ["mcp__pinky-memory__*", "mcp__memory__*"],
+            "tool_patterns": ["mcp__pinky-memory__*"],
             "mcp_server_config": {
                 "command": sys.executable,
                 "args": ["-m", "pinky_memory", "--db", "data/memory.db"],
@@ -905,9 +906,17 @@ def _seed_core_skills(skill_store) -> None:
     ]
 
     for skill_def in _core:
-        # Only seed if skill doesn't exist yet (preserve user edits)
-        if not skill_store.get(skill_def["name"]):
+        existing = skill_store.get(skill_def["name"])
+        if existing is None:
             skill_store.register(**skill_def)
+        elif (
+            skill_def["category"] == "core"
+            and set(existing.tool_patterns) != set(skill_def["tool_patterns"])
+        ):
+            skill_store.set_tool_patterns(
+                skill_def["name"],
+                skill_def["tool_patterns"],
+            )
 
 
 # ── MCP Config ──────────────────────────────────────────────
@@ -3834,7 +3843,15 @@ def create_api(
         if agent.allowed_tools:
             effective_tools.extend(agent.allowed_tools)
         materialized = skills.materialize_for_agent(agent_name)
-        effective_tools.extend(materialized.get("tool_patterns", []))
+        from pinky_daemon.skill_tool_policy import filter_skill_tool_grants
+
+        effective_tools.extend(
+            filter_skill_tool_grants(
+                materialized.get("tool_grants", []),
+                agent_name=agent_name,
+                warn=_log,
+            )
+        )
         # Deduplicate preserving order
         _seen: set[str] = set()
         effective_tools = [t for t in effective_tools if not (t in _seen or _seen.add(t))]  # type: ignore[func-returns-value]
@@ -6480,23 +6497,20 @@ npm run build</pre>
         skill = skills.get(skill_name)
         if not skill:
             raise HTTPException(404, f"Skill '{skill_name}' not found")
+        if not skill.enabled:
+            raise HTTPException(400, f"Skill '{skill_name}' is globally disabled")
 
         # Derive provenance from the signature-verified caller, never the
-        # caller-controlled body. This closes the ISOLATED-tenant self-grant
-        # path (#1192): an isolated agent can only sign as itself, so
-        # caller == name forces "self" and the self_assignable gate applies.
-        # RESIDUAL (#638): a non-isolated agent holds the fleetwide global
-        # secret, which authenticates as any non-isolated peer — so it can
-        # sign as a peer (caller != name), fall to the body value, and skip
-        # the gate. self_assignable is therefore NOT a security boundary
-        # against non-isolated agents; fully closing that needs the
-        # global-secret drop (#638), tracked separately.
+        # caller-controlled body. Browser requests are operator assignments;
+        # self and peer signatures retain their verified provenance.
         internal_caller = getattr(request.state, "internal_caller", "")
-        effective_assigned_by = "self" if internal_caller == name else req.assigned_by
+        actor = derive_skill_assignment_actor(internal_caller, name)
 
-        # Check self-assignable constraint
-        if effective_assigned_by == "self" and not skill.self_assignable:
-            raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
+        if internal_caller and not skills.effective_self_assignable(skill):
+            raise HTTPException(
+                403,
+                "signed agents may only assign self-assignable skills",
+            )
 
         # Check dependencies
         missing = skills.check_dependencies(skill_name, name)
@@ -6509,10 +6523,13 @@ npm run build</pre>
 
         ok = skills.assign_to_agent(
             name, skill_name,
-            assigned_by=effective_assigned_by,
+            assigned_by=actor,
             config_overrides=req.config_overrides,
         )
         if not ok:
+            current = skills.get(skill_name)
+            if current and not current.enabled:
+                raise HTTPException(400, f"Skill '{skill_name}' is globally disabled")
             raise HTTPException(500, "Failed to assign skill")
         return {"assigned": True, "agent": name, "skill": skill_name}
 
@@ -6537,7 +6554,7 @@ npm run build</pre>
         """Enable an assigned skill for an agent."""
         actor = _authorize_skill_assignment_mutation(request, name)
         skill = skills.get(skill_name)
-        if actor == "self" and skill and not skill.self_assignable:
+        if actor == "self" and skill and not skills.effective_self_assignable(skill):
             raise HTTPException(403, f"Skill '{skill_name}' is not self-assignable")
         if not skills.set_agent_skill_enabled(name, skill_name, True):
             raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")

@@ -10,8 +10,9 @@ live in api.py until the agents domain is also extracted.
 from __future__ import annotations
 
 import os
+import shutil
 import tempfile
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from fastapi import APIRouter, HTTPException, Request
@@ -30,6 +31,7 @@ from pinky_daemon.skill_loader import (
     discover_all_skills,
     register_discovered_skills,
 )
+from pinky_daemon.skill_tool_policy import ToolPatternValidationError, validate_tool_patterns
 
 router = APIRouter(tags=["skills"])
 
@@ -77,6 +79,39 @@ def _reject_if_core(name: str, action: str) -> None:
         raise HTTPException(400, f"Cannot {action} core skill '{name}'")
 
 
+def _contained_scan_root(base: Path, subdir: str) -> Path:
+    """Return base/subdir, refusing anything that escapes base lexically or via symlinks."""
+    resolved_base = base.resolve()
+    if not subdir:
+        return resolved_base
+    base_str = str(resolved_base)
+    candidate = os.path.normpath(os.path.join(base_str, subdir))
+    if not candidate.startswith(base_str + os.sep):
+        raise HTTPException(400, "Invalid subdirectory")
+    scan_root = Path(candidate).resolve()
+    if not scan_root.is_relative_to(resolved_base):
+        raise HTTPException(400, "Invalid subdirectory")
+    return scan_root
+
+
+def _reject_agent_catalog_overwrite(name: str, internal_caller: str) -> None:
+    """Keep signed catalog writes from replacing operator-owned rows."""
+    if not internal_caller:
+        return
+    skill = _skills.get(name)
+    if not skill:
+        return
+    if (
+        skill.origin_agent != internal_caller
+        or skill.category == "core"
+        or skill.shared
+        or skill.privileged_tool_opt_in
+    ):
+        raise HTTPException(403, "operator-owned skill")
+    if any(agent_name != internal_caller for agent_name in _skills.assigned_agents(name)):
+        raise HTTPException(403, "skill assigned to another agent")
+
+
 def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
     operator_path = f"/agents/{agent_name}/skills/{skill_name}"
     return {
@@ -88,6 +123,24 @@ def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
     }
 
 
+def _validate_catalog_tool_patterns(
+    patterns: list[str],
+    *,
+    skill_name: str,
+    mcp_server_config: dict,
+    skill_type: str,
+) -> None:
+    try:
+        validate_tool_patterns(
+            patterns,
+            skill_name=skill_name,
+            mcp_server_config=mcp_server_config,
+            skill_type=skill_type,
+        )
+    except ToolPatternValidationError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
+
+
 # ── Skill Management ──────────────────────────────────────────────────────────
 
 
@@ -95,6 +148,13 @@ def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
 async def register_skill(req: RegisterSkillRequest, request: Request):
     """Register a new skill or update an existing one."""
     internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(req.name, internal_caller)
+    _validate_catalog_tool_patterns(
+        req.tool_patterns,
+        skill_name=req.name,
+        mcp_server_config=req.mcp_server_config,
+        skill_type=req.skill_type,
+    )
     skill = _skills.register(
         req.name,
         description=req.description,
@@ -107,10 +167,12 @@ async def register_skill(req: RegisterSkillRequest, request: Request):
         directive=req.directive,
         requires=req.requires,
         self_assignable=req.self_assignable,
+        privileged_tool_opt_in=req.self_assignable and not bool(internal_caller),
         category=req.category,
         shared=req.shared,
         file_templates=req.file_templates,
         default_config=req.default_config,
+        origin_agent=internal_caller,
         agent_originated=bool(internal_caller),
     )
     return skill.to_dict()
@@ -167,18 +229,38 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         raise HTTPException(404, f"Skill '{name}' not found")
 
     internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
+    skill_type = req.skill_type if req.skill_type is not None else existing.skill_type
+    mcp_server_config = (
+        req.mcp_server_config
+        if req.mcp_server_config is not None
+        else existing.mcp_server_config
+    )
+    tool_patterns = req.tool_patterns if req.tool_patterns is not None else existing.tool_patterns
+    _validate_catalog_tool_patterns(
+        tool_patterns,
+        skill_name=name,
+        mcp_server_config=mcp_server_config,
+        skill_type=skill_type,
+    )
+    privileged_tool_opt_in = (
+        None
+        if req.self_assignable is None
+        else req.self_assignable and not bool(internal_caller)
+    )
     skill = _skills.register(
         name,
         description=req.description if req.description is not None else existing.description,
-        skill_type=req.skill_type if req.skill_type is not None else existing.skill_type,
+        skill_type=skill_type,
         version=req.version if req.version is not None else existing.version,
         enabled=req.enabled if req.enabled is not None else existing.enabled,
         config=req.config if req.config is not None else existing.config,
-        mcp_server_config=req.mcp_server_config if req.mcp_server_config is not None else existing.mcp_server_config,
-        tool_patterns=req.tool_patterns if req.tool_patterns is not None else existing.tool_patterns,
+        mcp_server_config=mcp_server_config,
+        tool_patterns=tool_patterns,
         directive=req.directive if req.directive is not None else existing.directive,
         requires=req.requires if req.requires is not None else existing.requires,
         self_assignable=req.self_assignable if req.self_assignable is not None else existing.self_assignable,
+        privileged_tool_opt_in=privileged_tool_opt_in,
         category=req.category if req.category is not None else existing.category,
         shared=req.shared if req.shared is not None else existing.shared,
         file_templates=req.file_templates if req.file_templates is not None else existing.file_templates,
@@ -189,8 +271,10 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
 
 
 @router.delete("/skills/{name}")
-async def delete_skill(name: str):
+async def delete_skill(name: str, request: Request):
     """Unregister a skill."""
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     _reject_if_core(name, "delete")
     deleted = _skills.delete(name)
     if not deleted:
@@ -199,16 +283,20 @@ async def delete_skill(name: str):
 
 
 @router.post("/skills/{name}/enable")
-async def enable_skill(name: str):
+async def enable_skill(name: str, request: Request):
     """Enable a skill globally."""
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     if not _skills.enable(name):
         raise HTTPException(404, f"Skill '{name}' not found")
     return {"enabled": True, "name": name}
 
 
 @router.post("/skills/{name}/disable")
-async def disable_skill(name: str):
+async def disable_skill(name: str, request: Request):
     """Disable a skill globally."""
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     _reject_if_core(name, "disable")
     if not _skills.disable(name):
         raise HTTPException(404, f"Skill '{name}' not found")
@@ -283,6 +371,16 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
     if not parsed:
         raise HTTPException(400, "Failed to parse SKILL.md — check frontmatter (name and description required)")
 
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(parsed.name, internal_caller)
+
+    _validate_catalog_tool_patterns(
+        parsed.allowed_tools,
+        skill_name=parsed.name,
+        mcp_server_config={},
+        skill_type="skill",
+    )
+
     # The skill name becomes a directory under skills/, so enforce the naming
     # convention (reject, not warn) and assert containment — a crafted
     # frontmatter name must not be able to traverse out of skills/ and write
@@ -314,7 +412,6 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
     if parsed.metadata:
         config["metadata"] = parsed.metadata
 
-    internal_caller = getattr(request.state, "internal_caller", "")
     skill = _skills.register(
         parsed.name,
         description=parsed.description,
@@ -325,8 +422,10 @@ async def create_skill_from_md(req: CreateSkillFromMdRequest, request: Request):
         tool_patterns=parsed.allowed_tools,
         directive=parsed.body,
         self_assignable=True,
+        privileged_tool_opt_in=None,
         category="skill",
         shared=False,
+        origin_agent=internal_caller,
         agent_originated=bool(internal_caller),
     )
 
@@ -390,59 +489,100 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         # Plain repo URL: github.com/org/repo (no tree/blob)
         url = url.rstrip("/") + ".git" if not url.endswith(".git") else url
 
+    if subdir:
+        subdir_path = PurePosixPath(subdir)
+        if (
+            subdir_path.is_absolute()
+            or ".." in subdir_path.parts
+            or "\\" in subdir
+            or "" in subdir.split("/")
+        ):
+            raise HTTPException(400, "Invalid subdirectory")
+
     # Derive a directory name from the URL
     repo_name = url.rstrip("/").rsplit("/", 1)[-1].removesuffix(".git")
-    target_dir = _pinky_root / "skills" / repo_name
-
-    try:
-        if target_dir.exists():
-            # Pull latest
-            sp.run(
-                ["git", "-C", str(target_dir), "pull", "--ff-only"],
-                capture_output=True, timeout=60, check=True,
-            )
-            _log(f"api: updated skill repo {repo_name}")
-        else:
-            # Clone
-            sp.run(
-                ["git", "clone", "--depth", "1", url, str(target_dir)],
-                capture_output=True, timeout=120, check=True,
-            )
-            _log(f"api: cloned skill repo {repo_name} to {target_dir}")
-    except sp.CalledProcessError as e:
-        stderr = e.stderr.decode() if e.stderr else str(e)
-        raise HTTPException(400, f"Git clone failed: {stderr.strip()}") from e
-    except sp.TimeoutExpired as e:
-        raise HTTPException(504, "Git clone timed out") from e
-
-    # Scan the cloned directory (or subdirectory) for SKILL.md files
-    scan_root = target_dir / subdir if subdir else target_dir
-    if not scan_root.is_dir():
-        raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
+    skills_root = (_pinky_root / "skills").resolve()
+    skills_root.mkdir(parents=True, exist_ok=True)
+    target_dir = (skills_root / repo_name).resolve()
+    if (
+        not repo_name
+        or repo_name in {".", ".."}
+        or not target_dir.is_relative_to(skills_root)
+    ):
+        raise HTTPException(400, "Invalid repository name")
 
     from pinky_daemon.skill_loader import register_discovered_skills as _register
     from pinky_daemon.skill_loader import scan_skills_directory
 
-    # Check if scan_root itself has a SKILL.md (repo IS a skill)
-    found = scan_skills_directory(scan_root)
-
-    # If nothing found in subdirs, check root-level SKILL.md
-    if not found and (scan_root / "SKILL.md").is_file():
-        from pinky_daemon.skill_loader import parse_skill_md
-        parsed = parse_skill_md(scan_root / "SKILL.md")
-        if parsed:
-            found = [parsed]
-
-    if not found:
-        raise HTTPException(400, f"No SKILL.md files found in {repo_name}" + (f"/{subdir}" if subdir else ""))
-
-    internal_caller = getattr(request.state, "internal_caller", "")
-    result = _register(
-        _skills,
-        found,
-        overwrite=True,
-        agent_originated=bool(internal_caller),
+    staging_root = Path(
+        tempfile.mkdtemp(prefix=f".{repo_name}-staging-", dir=skills_root)
     )
+    staging_dir = staging_root / repo_name
+    previous_dir = staging_root / "previous"
+    promoted = False
+    had_target = target_dir.exists()
+    try:
+        try:
+            if had_target:
+                shutil.copytree(target_dir, staging_dir, symlinks=True)
+                sp.run(
+                    ["git", "-C", str(staging_dir), "pull", "--ff-only"],
+                    capture_output=True,
+                    timeout=60,
+                    check=True,
+                )
+            else:
+                sp.run(
+                    ["git", "clone", "--depth", "1", url, str(staging_dir)],
+                    capture_output=True,
+                    timeout=120,
+                    check=True,
+                )
+        except sp.CalledProcessError as e:
+            stderr = e.stderr.decode() if e.stderr else str(e)
+            raise HTTPException(400, f"Git clone failed: {stderr.strip()}") from e
+        except sp.TimeoutExpired as e:
+            raise HTTPException(504, "Git clone timed out") from e
+
+        staging_scan_root = _contained_scan_root(staging_dir, subdir)
+        if not staging_scan_root.is_dir():
+            raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
+        staged_skills = scan_skills_directory(staging_scan_root)
+        if not staged_skills:
+            suffix = f"/{subdir}" if subdir else ""
+            raise HTTPException(400, f"No SKILL.md files found in {repo_name}{suffix}")
+
+        internal_caller = getattr(request.state, "internal_caller", "")
+        for parsed in staged_skills:
+            _reject_agent_catalog_overwrite(parsed.name, internal_caller)
+
+        if had_target:
+            target_dir.rename(previous_dir)
+        staging_dir.rename(target_dir)
+        promoted = True
+
+        final_scan_root = _contained_scan_root(target_dir, subdir)
+        found = scan_skills_directory(final_scan_root)
+        if not found:
+            raise HTTPException(400, "Promoted repository contains no readable skills")
+        result = _register(
+            _skills,
+            found,
+            overwrite=True,
+            agent_originated=bool(internal_caller),
+            privileged_tool_opt_in=None,
+            origin_agent=internal_caller,
+        )
+        shutil.rmtree(previous_dir, ignore_errors=True)
+        _log(f"api: {'updated' if had_target else 'cloned'} skill repo {repo_name}")
+    except Exception:
+        if promoted:
+            shutil.rmtree(target_dir, ignore_errors=True)
+            if previous_dir.exists():
+                previous_dir.rename(target_dir)
+        raise
+    finally:
+        shutil.rmtree(staging_root, ignore_errors=True)
 
     # Auto-assign to agent if specified
     assigned = []
@@ -486,11 +626,33 @@ async def discover_skills_endpoint(request: Request):
     """Re-scan filesystem for SKILL.md files and register new skills."""
     internal_caller = getattr(request.state, "internal_caller", "")
     found = discover_all_skills(project_root=str(_pinky_root))
+    for parsed in found:
+        existing = _skills.get(parsed.name)
+        if existing is None:
+            continue
+        content_changed = (
+            existing.skill_type == "skill"
+            and (
+                existing.directive != parsed.body
+                or existing.description != parsed.description
+                or existing.tool_patterns != parsed.allowed_tools
+            )
+        )
+        clamp_needed = existing.skill_type == "skill" and bool(
+            existing.origin_agent
+        ) and (
+            existing.shared
+            or existing.privileged_tool_opt_in
+            or (bool(parsed.allowed_tools) and existing.self_assignable)
+        )
+        if content_changed or clamp_needed:
+            _reject_agent_catalog_overwrite(parsed.name, internal_caller)
     result = register_discovered_skills(
         _skills,
         found,
         overwrite=False,
         agent_originated=bool(internal_caller),
+        origin_agent=internal_caller,
     )
     return {
         "discovered": len(found),
@@ -513,21 +675,36 @@ async def discover_plugins_endpoint():
 
 
 @router.post("/plugins/{name}/enable")
-async def enable_plugin(name: str):
+async def enable_plugin(name: str, request: Request):
     """Enable a discovered plugin."""
     info = _plugins.get(name)
     if not info:
         raise HTTPException(404, f"Plugin '{name}' not found")
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     ok = _plugins.enable(name)
     if not ok:
         raise HTTPException(500, f"Failed to enable plugin: {info.error}")
-    _plugins.register_in_skill_store(_skills, name)
+    if internal_caller and _skills.get(name) is None:
+        _skills.register(
+            name,
+            skill_type="plugin",
+            origin_agent=internal_caller,
+            agent_originated=True,
+        )
+    _plugins.register_in_skill_store(
+        _skills,
+        name,
+        agent_originated=bool(internal_caller),
+    )
     return {"enabled": True, "name": name}
 
 
 @router.post("/plugins/{name}/disable")
-async def disable_plugin(name: str):
+async def disable_plugin(name: str, request: Request):
     """Disable an active plugin."""
+    internal_caller = getattr(request.state, "internal_caller", "")
+    _reject_agent_catalog_overwrite(name, internal_caller)
     info = _plugins.get(name)
     if not info:
         raise HTTPException(404, f"Plugin '{name}' not found")

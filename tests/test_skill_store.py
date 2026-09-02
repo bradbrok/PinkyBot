@@ -48,6 +48,122 @@ class TestSkillStore:
         assert skill.description == "v2"
         assert skill.version == "0.2.0"
 
+    def test_origin_agent_round_trips_and_operator_update_preserves_owner(self, store):
+        created = store.register(
+            "owned-draft",
+            description="created by a signed caller",
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert created.origin_agent == "writer"
+        assert created.to_dict()["origin_agent"] == "writer"
+
+        updated = store.register(
+            "owned-draft",
+            description="updated by an operator",
+        )
+        assert updated.origin_agent == "writer"
+
+    def test_origin_agent_is_immutable_after_insert(self, store):
+        operator_owned = store.register("operator-owned")
+        assert operator_owned.origin_agent == ""
+        attempted_claim = store.register(
+            "operator-owned",
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert attempted_claim.origin_agent == ""
+
+        signed_owned = store.register(
+            "signed-owned",
+            origin_agent="writer",
+            agent_originated=True,
+        )
+        assert signed_owned.origin_agent == "writer"
+        attempted_transfer = store.register(
+            "signed-owned",
+            origin_agent="peer",
+            agent_originated=True,
+        )
+        assert attempted_transfer.origin_agent == "writer"
+
+    def test_origin_agent_migration_marks_legacy_rows_operator_owned(self, tmp_path):
+        db_path = tmp_path / "legacy-skills.db"
+        legacy = sqlite3.connect(db_path)
+        legacy.execute(
+            """CREATE TABLE skills (
+                   name TEXT PRIMARY KEY,
+                   description TEXT NOT NULL DEFAULT '',
+                   skill_type TEXT NOT NULL DEFAULT 'custom',
+                   version TEXT NOT NULL DEFAULT '0.1.0',
+                   enabled INTEGER NOT NULL DEFAULT 1,
+                   config TEXT NOT NULL DEFAULT '{}',
+                   created_at REAL NOT NULL,
+                   updated_at REAL NOT NULL
+               )"""
+        )
+        legacy.execute(
+            """INSERT INTO skills
+               (name, description, skill_type, version, enabled, config, created_at, updated_at)
+               VALUES ('legacy-skill', 'legacy row', 'custom', '0.1.0', 1, '{}', 1.0, 1.0)"""
+        )
+        legacy.commit()
+        legacy.close()
+
+        migrated = SkillStore(str(db_path))
+        try:
+            columns = {
+                row[1]
+                for row in migrated._db.execute("PRAGMA table_info(skills)").fetchall()
+            }
+            skill = migrated.get("legacy-skill")
+
+            assert "origin_agent" in columns
+            assert skill is not None
+            assert skill.origin_agent == ""
+        finally:
+            migrated.close()
+
+    def test_set_tool_patterns_invalidates_privileged_opt_in_on_change(self, store):
+        mcp_server_config = {
+            "command": "custom-server",
+            "args": ["--marker", "preserved"],
+        }
+        original = store.register(
+            "operator-tools",
+            skill_type="mcp_tool",
+            mcp_server_config=mcp_server_config,
+            tool_patterns=["Bash"],
+            self_assignable=True,
+            privileged_tool_opt_in=True,
+        )
+        assert original.privileged_tool_opt_in is True
+        assert original.self_assignable is True
+
+        updated = store.set_tool_patterns("operator-tools", ["Bash", "Write"])
+
+        assert updated is not None
+        assert updated.tool_patterns == ["Bash", "Write"]
+        assert updated.privileged_tool_opt_in is False
+        assert updated.self_assignable is False
+        assert updated.mcp_server_config == mcp_server_config
+
+    def test_set_tool_patterns_same_set_is_noop(self, store):
+        original = store.register(
+            "operator-tools",
+            tool_patterns=["Bash", "Write"],
+            self_assignable=True,
+            privileged_tool_opt_in=True,
+        )
+
+        unchanged = store.set_tool_patterns("operator-tools", ["Write", "Bash"])
+
+        assert unchanged == original
+        assert unchanged.updated_at == original.updated_at
+
+    def test_set_tool_patterns_missing_returns_none(self, store):
+        assert store.set_tool_patterns("missing", ["Bash"]) is None
+
     def test_get(self, store):
         store.register("test-skill")
         skill = store.get("test-skill")
@@ -247,6 +363,32 @@ class TestSessionSkills:
 
 
 class TestAgentSkills:
+    def test_enabled_assignment_refuses_globally_disabled_skill(self, store):
+        store.register(
+            "disabled-catalog-skill",
+            enabled=False,
+            tool_patterns=["Read"],
+            self_assignable=True,
+        )
+
+        assert (
+            store.assign_to_agent(
+                "target",
+                "disabled-catalog-skill",
+                assigned_by="user",
+                enabled=True,
+            )
+            is False
+        )
+        assert store.get_agent_skills("target", enabled_only=False) == []
+
+        assert store.assign_to_agent(
+            "target",
+            "disabled-catalog-skill",
+            assigned_by="user",
+            enabled=False,
+        )
+
     def test_shared_skill_optout_overrides_when_enabled_only(self, store):
         # The POST /agents/{name}/skills/{skill}/disable opt-out flow: a shared
         # skill is opted out via a disabled assignment row, which must override

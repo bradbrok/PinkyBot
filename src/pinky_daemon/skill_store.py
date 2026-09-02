@@ -29,6 +29,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from pathlib import Path
 
+from pinky_daemon.skill_tool_policy import has_privileged_tool_grant
 from pinky_daemon.store_catalog import (
     StoreCatalog,
     apply_store_connection_policy,
@@ -62,10 +63,12 @@ class Skill:
     directive: str = ""
     requires: list[str] = field(default_factory=list)
     self_assignable: bool = False
+    privileged_tool_opt_in: bool = False
     category: str = "general"
     shared: bool = False
     file_templates: dict = field(default_factory=dict)
     default_config: dict = field(default_factory=dict)
+    origin_agent: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -82,10 +85,12 @@ class Skill:
             "directive": self.directive,
             "requires": self.requires,
             "self_assignable": self.self_assignable,
+            "privileged_tool_opt_in": self.privileged_tool_opt_in,
             "category": self.category,
             "shared": self.shared,
             "file_templates": self.file_templates,
             "default_config": self.default_config,
+            "origin_agent": self.origin_agent,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -117,8 +122,8 @@ class AgentSkill:
 _SKILL_COLS = (
     "name, description, skill_type, version, enabled, config, "
     "mcp_server_config, tool_patterns, directive, requires, "
-    "self_assignable, category, shared, file_templates, default_config, "
-    "created_at, updated_at"
+    "self_assignable, privileged_tool_opt_in, category, shared, file_templates, default_config, "
+    "origin_agent, created_at, updated_at"
 )
 
 
@@ -136,12 +141,14 @@ def _row_to_skill(row: tuple) -> Skill:
         directive=row[8],
         requires=json.loads(row[9]),
         self_assignable=bool(row[10]),
-        category=row[11],
-        shared=bool(row[12]),
-        file_templates=json.loads(row[13]),
-        default_config=json.loads(row[14]),
-        created_at=row[15],
-        updated_at=row[16],
+        privileged_tool_opt_in=bool(row[11]),
+        category=row[12],
+        shared=bool(row[13]),
+        file_templates=json.loads(row[14]),
+        default_config=json.loads(row[15]),
+        origin_agent=row[16],
+        created_at=row[17],
+        updated_at=row[18],
     )
 
 
@@ -223,9 +230,9 @@ class SkillStore:
             );
         """)
         self._db.commit()
-        self._migrate()
+        self._ensure_columns()
 
-    def _migrate(self) -> None:
+    def _ensure_columns(self) -> None:
         """Add new columns to existing skills table."""
         existing = {
             row[1] for row in self._db.execute("PRAGMA table_info(skills)").fetchall()
@@ -236,16 +243,61 @@ class SkillStore:
             ("directive", "TEXT NOT NULL DEFAULT ''"),
             ("requires", "TEXT NOT NULL DEFAULT '[]'"),
             ("self_assignable", "INTEGER NOT NULL DEFAULT 0"),
+            ("privileged_tool_opt_in", "INTEGER NOT NULL DEFAULT 0"),
             ("category", "TEXT NOT NULL DEFAULT 'general'"),
             ("shared", "INTEGER NOT NULL DEFAULT 0"),
             ("file_templates", "TEXT NOT NULL DEFAULT '{}'"),
             ("default_config", "TEXT NOT NULL DEFAULT '{}'"),
+            ("origin_agent", "TEXT NOT NULL DEFAULT ''"),
         ]
+        added_privileged_opt_in = "privileged_tool_opt_in" not in existing
         for col, typedef in migrations:
             if col not in existing:
                 self._db.execute(f"ALTER TABLE skills ADD COLUMN {col} {typedef}")
                 _log(f"skill_store: migrated — added column {col}")
+        if added_privileged_opt_in:
+            self._migrate_privileged_tool_grants()
         self._db.commit()
+
+    def _migrate_privileged_tool_grants(self) -> None:
+        """Fail closed once for privileged rows created before the opt-in column."""
+        rows = self._db.execute(
+            "SELECT name, skill_type, mcp_server_config, tool_patterns FROM skills"
+        ).fetchall()
+        migrated: list[str] = []
+        for name, skill_type, mcp_raw, patterns_raw in rows:
+            try:
+                mcp_server_config = json.loads(mcp_raw)
+                patterns = json.loads(patterns_raw)
+                if not isinstance(mcp_server_config, dict) or not isinstance(patterns, list):
+                    raise ValueError("invalid stored tool policy shape")
+                privileged = has_privileged_tool_grant(
+                    patterns,
+                    skill_name=name,
+                    mcp_server_config=mcp_server_config,
+                    skill_type=skill_type,
+                )
+            except (TypeError, ValueError, json.JSONDecodeError):
+                privileged = True
+            if not privileged:
+                continue
+
+            self._db.execute(
+                "UPDATE skills SET self_assignable=0, privileged_tool_opt_in=0 WHERE name=?",
+                (name,),
+            )
+            self._db.execute(
+                """UPDATE agent_skills
+                   SET enabled=0
+                   WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
+                (name,),
+            )
+            migrated.append(name)
+        if migrated:
+            _log(
+                "skill_store: migrated privileged tool policy for "
+                f"{len(migrated)} skill(s): {', '.join(sorted(migrated))}"
+            )
 
     # ── Skill Catalog (CRUD) ──────────────────────────────────
 
@@ -263,10 +315,12 @@ class SkillStore:
         directive: str = "",
         requires: list[str] | None = None,
         self_assignable: bool = False,
+        privileged_tool_opt_in: bool | None = None,
         category: str = "general",
         shared: bool = False,
         file_templates: dict | None = None,
         default_config: dict | None = None,
+        origin_agent: str = "",
         agent_originated: bool = False,
     ) -> Skill:
         """Register a new skill or update an existing one."""
@@ -277,9 +331,27 @@ class SkillStore:
         requires = requires or []
         file_templates = file_templates or {}
         default_config = default_config or {}
+        origin_agent = origin_agent.strip()
 
         existing = self.get(name)
         with self._db:
+            privileged = has_privileged_tool_grant(
+                tool_patterns,
+                skill_name=name,
+                mcp_server_config=mcp_server_config,
+                skill_type=skill_type,
+            )
+            if privileged_tool_opt_in is None:
+                privileged_tool_opt_in = (
+                    existing.privileged_tool_opt_in
+                    if existing is not None
+                    and set(existing.tool_patterns) == set(tool_patterns)
+                    else False
+                )
+            privileged_tool_opt_in = bool(privileged and privileged_tool_opt_in)
+            if privileged and not privileged_tool_opt_in:
+                self_assignable = False
+
             # Stage 1 capability guard (#1197): a remotely agent-originated
             # skill is retained for operator review but cannot auto-apply to
             # peers, and capability-bearing skills cannot be self-assigned.
@@ -287,6 +359,7 @@ class SkillStore:
             # tool-pattern classifier.
             if agent_originated:
                 shared = False
+                privileged_tool_opt_in = False
                 if tool_patterns or mcp_server_config or file_templates:
                     self_assignable = False
                     # Fail safe fleet-wide so a name collision revokes every enabled self-grant.
@@ -300,32 +373,66 @@ class SkillStore:
             if existing:
                 self._db.execute(
                     """UPDATE skills
-                       SET description=?, skill_type=?, version=?, enabled=?, config=?,
+                           SET description=?, skill_type=?, version=?, enabled=?, config=?,
                            mcp_server_config=?, tool_patterns=?, directive=?, requires=?,
-                           self_assignable=?, category=?, shared=?, file_templates=?,
+                           self_assignable=?, privileged_tool_opt_in=?, category=?, shared=?, file_templates=?,
                            default_config=?, updated_at=?
                        WHERE name=?""",
                     (
                         description, skill_type, version, int(enabled), json.dumps(config),
                         json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
-                        json.dumps(requires), int(self_assignable), category, int(shared),
+                        json.dumps(requires), int(self_assignable), int(privileged_tool_opt_in),
+                        category, int(shared),
                         json.dumps(file_templates), json.dumps(default_config), now, name,
                     ),
                 )
             else:
                 self._db.execute(
                     f"""INSERT INTO skills ({_SKILL_COLS})
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         name, description, skill_type, version, int(enabled), json.dumps(config),
                         json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
-                        json.dumps(requires), int(self_assignable), category, int(shared),
-                        json.dumps(file_templates), json.dumps(default_config), now, now,
+                        json.dumps(requires), int(self_assignable), int(privileged_tool_opt_in),
+                        category, int(shared),
+                        json.dumps(file_templates), json.dumps(default_config), origin_agent, now, now,
                     ),
                 )
 
         _log(f"skill_store: {'updated' if existing else 'registered'} {name}")
         return self.get(name)  # type: ignore
+
+    def set_tool_patterns(self, name: str, tool_patterns: list[str]) -> Skill | None:
+        """Converge one stored pattern set without replacing unrelated skill fields."""
+        existing = self.get(name)
+        if existing is None:
+            return None
+        if set(existing.tool_patterns) == set(tool_patterns):
+            return existing
+
+        privileged = has_privileged_tool_grant(
+            tool_patterns,
+            skill_name=name,
+            mcp_server_config=existing.mcp_server_config,
+            skill_type=existing.skill_type,
+        )
+        self_assignable = False if privileged else existing.self_assignable
+        with self._db:
+            self._db.execute(
+                """UPDATE skills
+                   SET tool_patterns=?, updated_at=?, privileged_tool_opt_in=0,
+                       self_assignable=?
+                   WHERE name=?""",
+                (
+                    json.dumps(tool_patterns),
+                    time.time(),
+                    int(self_assignable),
+                    name,
+                ),
+            )
+
+        _log(f"skill_store: converged tool_patterns for {name}")
+        return self.get(name)
 
     def get(self, name: str) -> Skill | None:
         """Get a skill by name."""
@@ -400,6 +507,18 @@ class SkillStore:
 
     # ── Agent Skill Assignment ────────────────────────────────
 
+    def effective_self_assignable(self, skill: Skill) -> bool:
+        """Return whether persisted policy permits an enabled self assignment."""
+        if not skill.self_assignable:
+            return False
+        privileged = has_privileged_tool_grant(
+            skill.tool_patterns,
+            skill_name=skill.name,
+            mcp_server_config=skill.mcp_server_config,
+            skill_type=skill.skill_type,
+        )
+        return not privileged or skill.privileged_tool_opt_in
+
     def assign_to_agent(
         self,
         agent_name: str,
@@ -413,9 +532,13 @@ class SkillStore:
         skill = self.get(skill_name)
         if not skill:
             return False
+        if enabled and not skill.enabled:
+            return False
 
-        # Check self-assignable constraint
-        if enabled and assigned_by == "self" and not skill.self_assignable:
+        # Recompute privilege from persisted patterns.  The catalog flag alone
+        # is not a security boundary because legacy or hostile rows can set it.
+        operator_assigned = assigned_by.strip() == "user"
+        if enabled and not operator_assigned and not self.effective_self_assignable(skill):
             return False
 
         now = time.time()
@@ -465,6 +588,15 @@ class SkillStore:
             (skill_name,),
         ).fetchone()
         return row is not None
+
+    def assigned_agents(self, skill_name: str) -> list[str]:
+        """Return every agent with an assignment row, including disabled rows."""
+        rows = self._db.execute(
+            """SELECT DISTINCT agent_name FROM agent_skills
+               WHERE skill_name=? ORDER BY agent_name""",
+            (skill_name,),
+        ).fetchall()
+        return [str(row[0]) for row in rows]
 
     def set_agent_skill_enabled(self, agent_name: str, skill_name: str, enabled: bool) -> bool:
         """Enable or disable a skill for a specific agent."""
@@ -586,6 +718,7 @@ class SkillStore:
 
         mcp_servers: dict = {}
         tool_patterns: list[str] = []
+        tool_grants: list[dict] = []
         directives: list[str] = []
         file_templates: dict = {}
 
@@ -604,6 +737,19 @@ class SkillStore:
             # Tool patterns
             patterns = skill_data.get("tool_patterns", [])
             for p in patterns:
+                tool_grants.append(
+                    {
+                        "skill_name": skill_data["name"],
+                        "pattern": p,
+                        "assigned_by": skill_data.get("assigned_by"),
+                        "origin_agent": skill_data.get("origin_agent", ""),
+                        "privileged_tool_opt_in": skill_data.get(
+                            "privileged_tool_opt_in", False
+                        ),
+                        "mcp_server_config": skill_data.get("mcp_server_config", {}),
+                        "skill_type": skill_data.get("skill_type", "custom"),
+                    }
+                )
                 if p not in tool_patterns:
                     tool_patterns.append(p)
 
@@ -627,6 +773,7 @@ class SkillStore:
         return {
             "mcp_servers": mcp_servers,
             "tool_patterns": tool_patterns,
+            "tool_grants": tool_grants,
             "directives": directives,
             "file_templates": file_templates,
             "catalog": catalog,
