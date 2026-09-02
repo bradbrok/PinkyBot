@@ -7562,12 +7562,21 @@ async def test_incomplete_catalog_turn_marks_usage_without_zero_cost_callback(
             cost_cb=cost_callback,
             model="runtime-partial-model",
         )
+        total_cost_before = session.usage.total_cost_usd
         _seed_inflight(session)
         await session._handle_turn_complete(
             _usage_turn_response(model="runtime-partial-model")
         )
 
-        cost_callback.assert_not_called()
+        cost_callback.assert_called_once_with(
+            "dymok",
+            None,
+            10_000,
+            500,
+            session.resume_handle,
+            pricing_error="runtime-partial-model missing cache_write_1h_price",
+        )
+        assert session.usage.total_cost_usd == total_cost_before
         analytics.log_turn_usage.assert_called_once()
         usage = analytics.log_turn_usage.call_args.kwargs
         assert usage["provider"] == provider

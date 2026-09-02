@@ -409,6 +409,7 @@ def test_truly_unknown_model_stays_zero_with_registry_bound(
 
 def test_unbound_or_unavailable_registry_uses_static_fallback(
     bound_runtime_catalog,
+    capsys,
 ) -> None:
     static = lookup_rate("claude-opus-4-8")
     assert static is not None and static["input"] == 5.0
@@ -420,6 +421,56 @@ def test_unbound_or_unavailable_registry_uses_static_fallback(
     bound_runtime_catalog.bind_registry(UnavailableRegistry())
     fallback = lookup_rate("claude-opus-4-8")
     assert fallback is not None and fallback["input"] == 5.0
+    stderr = capsys.readouterr().err
+    assert "ERROR" in stderr
+    assert "claude-opus-4-8" in stderr
+    assert "registry unavailable" in stderr
+
+
+def test_unavailable_registry_without_static_rate_raises_catalog_error(
+    bound_runtime_catalog,
+) -> None:
+    class UnavailableRegistry:
+        def get_model(self, _model_id):
+            raise RuntimeError("registry unavailable")
+
+    bound_runtime_catalog.bind_registry(UnavailableRegistry())
+    with pytest.raises(
+        bound_runtime_catalog.ModelCatalogError,
+        match="runtime-only-unreachable-model.*registry unavailable",
+    ):
+        lookup_rate("runtime-only-unreachable-model")
+
+
+def test_registry_read_failure_does_not_poison_rate_cache(
+    bound_runtime_catalog,
+) -> None:
+    class RecoveringRegistry:
+        calls = 0
+
+        def get_model(self, model_id):
+            self.calls += 1
+            if self.calls == 1:
+                raise RuntimeError("registry unavailable")
+            return {
+                "id": f"custom/{model_id}",
+                "provider": "custom",
+                "model_id": model_id,
+                "input_price": 7.0,
+                "output_price": 8.0,
+                "cached_input_price": 0.5,
+                "cache_write_5m_price": 1.0,
+                "cache_write_1h_price": 2.0,
+                "pricing_status": "complete",
+            }
+
+    registry = RecoveringRegistry()
+    bound_runtime_catalog.bind_registry(registry)
+    with pytest.raises(bound_runtime_catalog.ModelCatalogError):
+        lookup_rate("runtime-only-unreachable-model")
+    recovered = lookup_rate("runtime-only-unreachable-model")
+    assert recovered is not None and recovered["input"] == 7.0
+    assert registry.calls == 2
 
 
 def test_binding_second_registry_discards_first_registry_snapshot(

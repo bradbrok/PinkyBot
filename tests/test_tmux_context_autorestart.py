@@ -250,7 +250,9 @@ def test_unlisted_codex_model_stays_200k() -> None:
     assert ss._raw_max_tokens_for_model() == 200_000
 
 
-def test_bound_empty_1m_set_is_authoritative_and_read_failure_uses_fallback() -> None:
+def test_bound_empty_1m_set_is_authoritative_and_read_failure_uses_fallback(
+    capsys,
+) -> None:
     from pinky_daemon import runtime_model_catalog
     from pinky_daemon.streaming_session import is_1m_model
 
@@ -268,6 +270,9 @@ def test_bound_empty_1m_set_is_authoritative_and_read_failure_uses_fallback() ->
         assert is_1m_model("claude-opus-4-8") is False
         runtime_model_catalog.bind_registry(UnavailableRegistry())
         assert is_1m_model("claude-opus-4-8") is True
+        stderr = capsys.readouterr().err
+        assert "ERROR" in stderr
+        assert "registry unavailable" in stderr
     finally:
         runtime_model_catalog.reset_for_tests()
 

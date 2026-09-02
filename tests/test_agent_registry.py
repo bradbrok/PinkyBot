@@ -2194,6 +2194,20 @@ class TestRuntimeEditableModelCatalog:
         ).fetchone()
         assert row == (None, 123, 45, "incomplete model pricing")
 
+    def test_null_cost_without_pricing_error_is_rejected(self, registry, tmp_path):
+        registry.register(
+            "catalog-test-agent",
+            working_dir=str(tmp_path / "catalog-test-agent"),
+        )
+        with pytest.raises(ValueError, match="pricing_error"):
+            registry.record_cost(
+                "catalog-test-agent",
+                None,
+                input_tokens=123,
+                output_tokens=45,
+                session_id="catalog-session",
+            )
+
     def test_legacy_cost_ledger_migrates_to_nullable_cost_and_marker(self, tmp_path):
         db_path = tmp_path / "legacy-cost-ledger.db"
         initial = AgentRegistry(db_path=str(db_path))
