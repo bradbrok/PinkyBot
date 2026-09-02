@@ -249,3 +249,89 @@ class TestApproveUserDisplayName:
 
         user = registry.approve_user("appr", "12345", "Bob", "owner")
         assert user.display_name == "Bob"
+
+
+class TestRuntimeModelSync:
+    @pytest.mark.asyncio
+    async def test_sync_adds_only_complete_fallbacks_and_preserves_operator_rates(
+        self,
+        registry,
+        monkeypatch,
+    ):
+        class Response:
+            def raise_for_status(self):
+                return None
+
+            def json(self):
+                return {
+                    "data": [
+                        {
+                            "id": "claude-opus-4-8",
+                            "display_name": "Existing",
+                        },
+                        {
+                            "id": "claude-opus-4-1",
+                            "display_name": "Complete fallback",
+                        },
+                        {
+                            "id": "claude-unpriced-new",
+                            "display_name": "Needs pricing",
+                        },
+                    ]
+                }
+
+        class Client:
+            async def __aenter__(self):
+                return self
+
+            async def __aexit__(self, *_args):
+                return False
+
+            async def get(self, *_args, **_kwargs):
+                return Response()
+
+        columns = {
+            row[1]
+            for row in registry._db.execute("PRAGMA table_info(models)").fetchall()
+        }
+        for field in ("cache_write_5m_price", "cache_write_1h_price"):
+            if field not in columns:
+                registry._db.execute(f"ALTER TABLE models ADD COLUMN {field} REAL")
+        registry._db.execute(
+            "UPDATE models SET input_price=91.0, output_price=92.0, "
+            "cached_input_price=93.0, cache_write_5m_price=94.0, "
+            "cache_write_1h_price=95.0 WHERE id='anthropic/claude-opus-4-8'"
+        )
+        registry._db.commit()
+
+        monkeypatch.setenv("ANTHROPIC_API_KEY", "test-key")
+        monkeypatch.setattr("httpx.AsyncClient", Client)
+        providers_routes.set_dependencies(agents=registry)
+
+        result = await providers_routes.sync_models()
+
+        assert result == {
+            "synced": 1,
+            "new_models": ["claude-opus-4-1"],
+            "requires_pricing": ["claude-unpriced-new"],
+        }
+        complete = registry.get_model("claude-opus-4-1")
+        assert complete is not None
+        assert (
+            complete["input_price"],
+            complete["output_price"],
+            complete["cached_input_price"],
+            complete["cache_write_5m_price"],
+            complete["cache_write_1h_price"],
+        ) == (15.0, 75.0, 1.5, 18.75, 30.0)
+        assert registry.get_model("claude-unpriced-new") is None
+
+        existing = registry.get_model("claude-opus-4-8")
+        assert existing is not None
+        assert (
+            existing["input_price"],
+            existing["output_price"],
+            existing["cached_input_price"],
+            existing["cache_write_5m_price"],
+            existing["cache_write_1h_price"],
+        ) == (91.0, 92.0, 93.0, 94.0, 95.0)

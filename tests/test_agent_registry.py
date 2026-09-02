@@ -1911,3 +1911,326 @@ class TestModelSeeds:
         )
         assert sol["context_window"] == 400_000
         assert sol["is_1m"] == 0
+
+
+class TestRuntimeEditableModelCatalog:
+    """Runtime catalog schema, coherence status, and usage-ledger contracts."""
+
+    _WRITE_FIELDS = ("cache_write_5m_price", "cache_write_1h_price")
+    _RATE_FIELDS = (
+        "input_price",
+        "output_price",
+        "cached_input_price",
+        *_WRITE_FIELDS,
+    )
+
+    @staticmethod
+    def _ensure_write_columns(db_path) -> None:
+        with sqlite3.connect(db_path) as db:
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(models)").fetchall()
+            }
+            for field in TestRuntimeEditableModelCatalog._WRITE_FIELDS:
+                if field not in columns:
+                    db.execute(f"ALTER TABLE models ADD COLUMN {field} REAL")
+
+    def test_legacy_schema_adds_and_backfills_write_rates_without_flipping_1m(
+        self,
+        tmp_path,
+    ):
+        from pinky_daemon.pricing import RATE_TABLE
+
+        db_path = tmp_path / "legacy-models.db"
+        original = AgentRegistry(db_path=str(db_path))
+        before_1m = original.get_1m_models()
+        original.close()
+
+        # Model the deployed schema even after this test runs against the new
+        # CREATE TABLE definition: remove only the two additive columns.
+        with sqlite3.connect(db_path) as db:
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(models)").fetchall()
+            }
+            for field in self._WRITE_FIELDS:
+                if field in columns:
+                    db.execute(f"ALTER TABLE models DROP COLUMN {field}")
+
+        migrated = AgentRegistry(db_path=str(db_path))
+        try:
+            columns = {
+                row[1]
+                for row in migrated._db.execute("PRAGMA table_info(models)").fetchall()
+            }
+            assert set(self._WRITE_FIELDS) <= columns
+            assert migrated.get_1m_models() == before_1m
+
+            for model_id in ("claude-opus-4-8", "gpt-5.6-sol"):
+                row = migrated.get_model(model_id)
+                assert row is not None
+                assert row["cache_write_5m_price"] == RATE_TABLE[model_id][
+                    "cache_write_5m"
+                ]
+                assert row["cache_write_1h_price"] == RATE_TABLE[model_id][
+                    "cache_write_1h"
+                ]
+        finally:
+            migrated.close()
+
+    def test_explicit_write_rates_survive_reopen_and_second_boot_is_no_write(
+        self,
+        tmp_path,
+    ):
+        db_path = tmp_path / "operator-rates.db"
+        seeded = AgentRegistry(db_path=str(db_path))
+        seeded._db.execute(
+            "UPDATE models SET cache_write_5m_price=?, cache_write_1h_price=? "
+            "WHERE id='anthropic/claude-opus-4-8'",
+            (71.0, 72.0),
+        )
+        seeded._db.commit()
+        before = seeded.get_model("claude-opus-4-8")
+        seeded.close()
+
+        reopened = AgentRegistry(db_path=str(db_path))
+        try:
+            after = reopened.get_model("claude-opus-4-8")
+            assert after is not None and before is not None
+            assert after["cache_write_5m_price"] == 71.0
+            assert after["cache_write_1h_price"] == 72.0
+            assert after["updated_at"] == before["updated_at"]
+            assert reopened._db.total_changes == 0
+        finally:
+            reopened.close()
+
+    def test_boot_serves_and_marks_incomplete_pricing(self, tmp_path, capsys):
+        db_path = tmp_path / "incomplete-model.db"
+        initial = AgentRegistry(db_path=str(db_path))
+        initial.add_model(
+            provider="custom",
+            model_id="runtime-partial-model",
+            input_price=1.0,
+            output_price=2.0,
+            cached_input_price=0.25,
+        )
+        initial.close()
+        self._ensure_write_columns(db_path)
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE models SET cache_write_5m_price=1.25, "
+                "cache_write_1h_price=NULL "
+                "WHERE id='custom/runtime-partial-model'"
+            )
+
+        capsys.readouterr()
+        reopened = AgentRegistry(db_path=str(db_path))
+        try:
+            row = reopened.get_model("runtime-partial-model")
+            assert row is not None
+            assert row["pricing_status"] == "incomplete"
+            listed = {
+                item["id"]: item["pricing_status"]
+                for item in reopened.list_models(active_only=False)
+            }
+            assert listed["custom/runtime-partial-model"] == "incomplete"
+            stderr = capsys.readouterr().err
+            assert "ERROR" in stderr
+            assert "custom/runtime-partial-model" in stderr
+            assert "cache_write_1h_price" in stderr
+        finally:
+            reopened.close()
+
+    @pytest.mark.parametrize(
+        ("field", "invalid"),
+        [
+            ("input_price", -0.01),
+            ("output_price", -0.01),
+            ("cached_input_price", -0.01),
+            ("cache_write_5m_price", -0.01),
+            ("cache_write_1h_price", -0.01),
+            ("input_price", float("inf")),
+            ("output_price", float("inf")),
+            ("cached_input_price", float("inf")),
+            ("cache_write_5m_price", float("inf")),
+            ("cache_write_1h_price", float("inf")),
+            ("cache_write_5m_price", None),
+            ("cache_write_1h_price", None),
+            ("cache_write_5m_price", float("nan")),
+            ("cache_write_1h_price", float("nan")),
+        ],
+    )
+    def test_boot_marks_every_invalid_rate_shape_incomplete(
+        self,
+        tmp_path,
+        capsys,
+        field,
+        invalid,
+    ):
+        db_path = tmp_path / "invalid-rate.db"
+        initial = AgentRegistry(db_path=str(db_path))
+        initial.add_model(
+            provider="custom",
+            model_id="runtime-invalid-model",
+            input_price=1.0,
+            output_price=2.0,
+            cached_input_price=0.25,
+        )
+        initial.close()
+        self._ensure_write_columns(db_path)
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE models SET cache_write_5m_price=1.25, "
+                "cache_write_1h_price=2.0 WHERE id='custom/runtime-invalid-model'"
+            )
+            db.execute(
+                f"UPDATE models SET {field}=? WHERE id='custom/runtime-invalid-model'",
+                (invalid,),
+            )
+
+        capsys.readouterr()
+        reopened = AgentRegistry(db_path=str(db_path))
+        try:
+            row = reopened.get_model("runtime-invalid-model")
+            assert row is not None
+            assert row["pricing_status"] == "incomplete"
+            stderr = capsys.readouterr().err
+            assert "ERROR" in stderr
+            assert "custom/runtime-invalid-model" in stderr
+            assert field in stderr
+        finally:
+            reopened.close()
+
+    def test_explicit_zero_rates_are_complete_for_any_provider(self, registry):
+        row = registry.add_model(
+            provider="custom",
+            model_id="runtime-zero-priced-model",
+            input_price=0.0,
+            output_price=0.0,
+            cached_input_price=0.0,
+            cache_write_5m_price=0.0,
+            cache_write_1h_price=0.0,
+        )
+        assert row["pricing_status"] == "complete"
+        assert tuple(row[field] for field in self._RATE_FIELDS) == (0.0,) * 5
+
+    def test_gpt_54_fallbacks_have_explicit_zero_write_tariffs(self, registry):
+        from pinky_daemon.pricing import RATE_TABLE
+
+        for model_id in ("gpt-5.4", "gpt-5.4-mini", "gpt-5.4-nano"):
+            rate = RATE_TABLE[model_id]
+            assert set(rate) == {
+                "input",
+                "output",
+                "cache_read",
+                "cache_write_5m",
+                "cache_write_1h",
+            }
+            assert rate["cache_write_5m"] == 0.0
+            assert rate["cache_write_1h"] == 0.0
+            row = registry.get_model(model_id)
+            assert row is not None
+            assert row["cache_write_5m_price"] == 0.0
+            assert row["cache_write_1h_price"] == 0.0
+            assert row["pricing_status"] == "complete"
+
+    def test_every_static_model_seed_has_five_explicit_fallback_rates(self, registry):
+        from pinky_daemon.pricing import RATE_TABLE
+
+        for row in registry.list_models(active_only=False):
+            rate = RATE_TABLE[row["model_id"]]
+            assert set(rate) == {
+                "input",
+                "output",
+                "cache_read",
+                "cache_write_5m",
+                "cache_write_1h",
+            }
+            assert tuple(row[field] for field in self._RATE_FIELDS) == (
+                rate["input"],
+                rate["output"],
+                rate["cache_read"],
+                rate["cache_write_5m"],
+                rate["cache_write_1h"],
+            )
+
+    def test_add_model_persists_all_five_rates_and_complete_status(self, registry):
+        row = registry.add_model(
+            provider="custom",
+            model_id="runtime-priced-model",
+            input_price=1.0,
+            output_price=2.0,
+            cached_input_price=0.25,
+            cache_write_5m_price=1.25,
+            cache_write_1h_price=2.0,
+        )
+        assert tuple(row[field] for field in self._RATE_FIELDS) == (
+            1.0,
+            2.0,
+            0.25,
+            1.25,
+            2.0,
+        )
+        assert row["pricing_status"] == "complete"
+
+    def test_pricing_error_usage_ledger_uses_null_cost_and_marker(
+        self,
+        registry,
+        tmp_path,
+    ):
+        registry.register(
+            "catalog-test-agent",
+            working_dir=str(tmp_path / "catalog-test-agent"),
+        )
+        registry.record_cost(
+            "catalog-test-agent",
+            None,
+            input_tokens=123,
+            output_tokens=45,
+            session_id="catalog-session",
+            pricing_error="incomplete model pricing",
+        )
+        row = registry._db.execute(
+            "SELECT cost_usd, input_tokens, output_tokens, pricing_error "
+            "FROM agent_costs WHERE session_id='catalog-session'"
+        ).fetchone()
+        assert row == (None, 123, 45, "incomplete model pricing")
+
+    def test_legacy_cost_ledger_migrates_to_nullable_cost_and_marker(self, tmp_path):
+        db_path = tmp_path / "legacy-cost-ledger.db"
+        initial = AgentRegistry(db_path=str(db_path))
+        initial.register(
+            "catalog-ledger-agent",
+            working_dir=str(tmp_path / "catalog-ledger-agent"),
+        )
+        initial.close()
+        with sqlite3.connect(db_path) as db:
+            db.execute("ALTER TABLE agent_costs RENAME TO agent_costs_new")
+            db.execute(
+                """CREATE TABLE agent_costs (
+                    agent_name TEXT NOT NULL,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    turns INTEGER NOT NULL DEFAULT 0,
+                    timestamp REAL NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT ''
+                )"""
+            )
+            db.execute("DROP TABLE agent_costs_new")
+
+        migrated = AgentRegistry(db_path=str(db_path))
+        try:
+            migrated.record_cost(
+                "catalog-ledger-agent",
+                None,
+                input_tokens=10,
+                output_tokens=20,
+                session_id="legacy-unpriced-session",
+                pricing_error="incomplete model pricing",
+            )
+            row = migrated._db.execute(
+                "SELECT cost_usd, input_tokens, output_tokens, pricing_error "
+                "FROM agent_costs WHERE session_id='legacy-unpriced-session'"
+            ).fetchone()
+            assert row == (None, 10, 20, "incomplete model pricing")
+        finally:
+            migrated.close()

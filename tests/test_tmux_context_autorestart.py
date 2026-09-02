@@ -248,3 +248,81 @@ def test_unlisted_codex_model_stays_200k() -> None:
     is verified — the fix must not silently move every codex model's gauge."""
     ss = _make_session(model="gpt-5.6-terra")
     assert ss._raw_max_tokens_for_model() == 200_000
+
+
+def test_bound_empty_1m_set_is_authoritative_and_read_failure_uses_fallback() -> None:
+    from pinky_daemon import runtime_model_catalog
+    from pinky_daemon.streaming_session import is_1m_model
+
+    class EmptyRegistry:
+        def get_1m_models(self):
+            return set()
+
+    class UnavailableRegistry:
+        def get_1m_models(self):
+            raise RuntimeError("registry unavailable")
+
+    runtime_model_catalog.reset_for_tests()
+    try:
+        runtime_model_catalog.bind_registry(EmptyRegistry())
+        assert is_1m_model("claude-opus-4-8") is False
+        runtime_model_catalog.bind_registry(UnavailableRegistry())
+        assert is_1m_model("claude-opus-4-8") is True
+    finally:
+        runtime_model_catalog.reset_for_tests()
+
+
+def test_db_1m_lookup_strips_tier_without_fabricating_membership() -> None:
+    from pinky_daemon import runtime_model_catalog
+    from pinky_daemon.streaming_session import is_1m_model
+
+    class Registry:
+        def get_1m_models(self):
+            return {"runtime-million-model"}
+
+    runtime_model_catalog.reset_for_tests()
+    try:
+        runtime_model_catalog.bind_registry(Registry())
+        assert is_1m_model("runtime-million-model[1m]") is True
+        assert is_1m_model("runtime-ordinary-model[1m]") is False
+    finally:
+        runtime_model_catalog.reset_for_tests()
+
+
+def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
+    from pinky_daemon import runtime_model_catalog
+    from pinky_daemon.agent_registry import AgentRegistry
+
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    runtime_model_catalog.reset_for_tests()
+    try:
+        model = {
+            "provider": "custom",
+            "model_id": "runtime-window-model",
+            "input_price": 1.0,
+            "output_price": 2.0,
+            "cached_input_price": 0.25,
+            "cache_write_5m_price": 1.25,
+            "cache_write_1h_price": 2.0,
+        }
+        registry.add_model(
+            **model,
+            context_window=200_000,
+            is_1m=False,
+        )
+        runtime_model_catalog.bind_registry(registry)
+        session = _make_session(model="runtime-window-model[1m]")
+        assert session._raw_max_tokens_for_model() == 200_000
+
+        registry.add_model(
+            **model,
+            context_window=1_000_000,
+            is_1m=True,
+        )
+        assert session._raw_max_tokens_for_model() == 1_000_000
+
+        assert registry.delete_model("runtime-window-model") is True
+        assert session._raw_max_tokens_for_model() == 200_000
+    finally:
+        runtime_model_catalog.reset_for_tests()
+        registry.close()

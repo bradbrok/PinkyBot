@@ -7525,6 +7525,65 @@ def _make_usage_session_of(
 
 
 @pytest.mark.asyncio
+async def test_incomplete_catalog_turn_marks_usage_without_zero_cost_callback(
+    monkeypatch,
+    capsys,
+) -> None:
+    from pinky_daemon.codex_tmux_session import CodexTmuxSession
+
+    class CatalogPricingError(RuntimeError):
+        pass
+
+    monkeypatch.setattr(
+        tmux_session,
+        "ModelCatalogError",
+        CatalogPricingError,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        tmux_session,
+        "compute_cost_from_usage",
+        MagicMock(
+            side_effect=CatalogPricingError(
+                "runtime-partial-model missing cache_write_1h_price"
+            )
+        ),
+    )
+
+    for session_class, provider in (
+        (TmuxSession, "anthropic"),
+        (CodexTmuxSession, "codex_cli"),
+    ):
+        cost_callback = MagicMock()
+        analytics = MagicMock()
+        session = _make_usage_session_of(
+            session_class,
+            analytics=analytics,
+            cost_cb=cost_callback,
+            model="runtime-partial-model",
+        )
+        _seed_inflight(session)
+        await session._handle_turn_complete(
+            _usage_turn_response(model="runtime-partial-model")
+        )
+
+        cost_callback.assert_not_called()
+        analytics.log_turn_usage.assert_called_once()
+        usage = analytics.log_turn_usage.call_args.kwargs
+        assert usage["provider"] == provider
+        assert usage["input_tokens"] == 10_000
+        assert usage["output_tokens"] == 500
+        assert usage["cached_input_tokens"] == 2_000
+        assert usage["pricing_error"] == (
+            "runtime-partial-model missing cache_write_1h_price"
+        )
+
+    stderr = capsys.readouterr().err
+    assert "runtime-partial-model" in stderr
+    assert "cache_write_1h_price" in stderr
+
+
+@pytest.mark.asyncio
 async def test_analytics_provider_comes_from_class_attr() -> None:
     """#860: the provider on analytics rows must read _ANALYTICS_PROVIDER —
     not a hardcoded literal — so transport subclasses (CodexTmuxSession)
