@@ -818,3 +818,210 @@ class TestLegacyDottedIdMigration:
                 "WHERE model='claude-opus-4.1' AND notes='operator'"
             ).fetchone()
         assert row is not None and row[0] == 9.99
+
+
+class TestRuntimeCatalogPricing:
+    def test_runtime_rate_add_and_edit_reprice_without_store_recreation(self, tmp_path):
+        from pinky_daemon import runtime_model_catalog
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        runtime_model_catalog.reset_for_tests()
+        try:
+            registry.add_model(
+                provider="anthropic",
+                model_id="runtime-analytics-model",
+                input_price=2.0,
+                output_price=4.0,
+                cached_input_price=0.2,
+                cache_write_5m_price=2.5,
+                cache_write_1h_price=4.0,
+            )
+            runtime_model_catalog.bind_registry(registry)
+            store = AnalyticsStore(str(tmp_path / "analytics.db"))
+            store.ensure_session_fact(
+                session_id="runtime-session",
+                agent_name="catalog-test-agent",
+                session_label="main",
+                provider="anthropic",
+                model="runtime-analytics-model",
+            )
+            store.log_turn_usage(
+                session_id="runtime-session",
+                agent_name="catalog-test-agent",
+                turn_seq=1,
+                provider="anthropic",
+                model="runtime-analytics-model",
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cached_input_tokens=0,
+            )
+            assert store.get_overview(range_name="7d")["totals"]["cost_usd"] == 2.0
+
+            registry.add_model(
+                provider="anthropic",
+                model_id="runtime-analytics-model",
+                input_price=7.0,
+                output_price=4.0,
+                cached_input_price=0.2,
+                cache_write_5m_price=2.5,
+                cache_write_1h_price=4.0,
+            )
+            assert store.get_overview(range_name="7d")["totals"]["cost_usd"] == 7.0
+        finally:
+            runtime_model_catalog.reset_for_tests()
+            registry.close()
+
+    def test_runtime_catalog_wins_over_stale_analytics_seed(self, tmp_path):
+        from pinky_daemon import runtime_model_catalog
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        runtime_model_catalog.reset_for_tests()
+        try:
+            registry.add_model(
+                provider="anthropic",
+                model_id="claude-opus-4-8",
+                input_price=11.0,
+                output_price=25.0,
+                cached_input_price=0.5,
+                cache_write_5m_price=6.25,
+                cache_write_1h_price=10.0,
+            )
+            runtime_model_catalog.bind_registry(registry)
+            store = AnalyticsStore(str(tmp_path / "analytics.db"))
+            store.log_turn_usage(
+                session_id="runtime-over-seed-session",
+                agent_name="catalog-test-agent",
+                turn_seq=1,
+                provider="anthropic",
+                model="claude-opus-4-8",
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cached_input_tokens=0,
+            )
+            assert store.get_overview(range_name="7d")["totals"]["cost_usd"] == 11.0
+        finally:
+            runtime_model_catalog.reset_for_tests()
+            registry.close()
+
+    def test_current_seed_rows_are_derived_without_latest_additions_list(self, tmp_path):
+        assert not hasattr(AnalyticsStore, "_LATEST_PRICING_ADDITIONS")
+        store = _store(tmp_path)
+        with store._connect() as conn:
+            rows = conn.execute(
+                "SELECT provider, model, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok FROM analytics_model_pricing"
+            ).fetchall()
+        seeded = {(row["provider"], row["model"]): row for row in rows}
+        for model_id, rate in RATE_TABLE.items():
+            provider = "anthropic" if model_id.startswith("claude-") else "openai"
+            row = seeded[(provider, model_id)]
+            assert (
+                row["input_usd_per_mtok"],
+                row["output_usd_per_mtok"],
+                row["cached_input_usd_per_mtok"],
+            ) == (rate["input"], rate["output"], rate["cache_read"])
+
+        before = {
+            (row["provider"], row["model"]): tuple(row)
+            for row in rows
+        }
+        AnalyticsStore(str(tmp_path / "analytics.db"))
+        with store._connect() as conn:
+            after_rows = conn.execute(
+                "SELECT provider, model, input_usd_per_mtok, output_usd_per_mtok, "
+                "cached_input_usd_per_mtok FROM analytics_model_pricing"
+            ).fetchall()
+        after = {
+            (row["provider"], row["model"]): tuple(row)
+            for row in after_rows
+        }
+        assert after == before
+
+    def test_pricing_error_marker_is_persisted_with_usage(self, tmp_path):
+        store = _store(tmp_path)
+        store.log_turn_usage(
+            session_id="unpriced-session",
+            agent_name="catalog-test-agent",
+            turn_seq=1,
+            provider="anthropic",
+            model="runtime-partial-model",
+            input_tokens=123,
+            output_tokens=45,
+            cached_input_tokens=6,
+            pricing_error="incomplete model pricing",
+        )
+        with store._connect() as conn:
+            row = conn.execute(
+                "SELECT input_tokens, output_tokens, cached_input_tokens, pricing_error "
+                "FROM analytics_turn_usage WHERE session_id='unpriced-session'"
+            ).fetchone()
+        assert tuple(row) == (123, 45, 6, "incomplete model pricing")
+
+    def test_legacy_turn_usage_adds_pricing_error_column(self, tmp_path):
+        db_path = tmp_path / "legacy-analytics.db"
+        initial = AnalyticsStore(str(db_path))
+        with initial._connect() as conn:
+            columns = {
+                row[1]
+                for row in conn.execute(
+                    "PRAGMA table_info(analytics_turn_usage)"
+                ).fetchall()
+            }
+            if "pricing_error" in columns:
+                conn.execute(
+                    "ALTER TABLE analytics_turn_usage DROP COLUMN pricing_error"
+                )
+
+        migrated = AnalyticsStore(str(db_path))
+        migrated.log_turn_usage(
+            session_id="legacy-unpriced-session",
+            agent_name="catalog-test-agent",
+            turn_seq=1,
+            provider="custom",
+            model="runtime-partial-model",
+            input_tokens=7,
+            output_tokens=8,
+            cached_input_tokens=9,
+            pricing_error="incomplete model pricing",
+        )
+        with migrated._connect() as conn:
+            row = conn.execute(
+                "SELECT input_tokens, output_tokens, cached_input_tokens, pricing_error "
+                "FROM analytics_turn_usage WHERE session_id='legacy-unpriced-session'"
+            ).fetchone()
+        assert tuple(row) == (7, 8, 9, "incomplete model pricing")
+
+    def test_soft_deleted_model_does_not_use_static_analytics_fallback(
+        self,
+        tmp_path,
+    ):
+        from pinky_daemon import runtime_model_catalog
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        runtime_model_catalog.reset_for_tests()
+        try:
+            runtime_model_catalog.bind_registry(registry)
+            assert registry.delete_model("claude-opus-4-8") is True
+            store = AnalyticsStore(str(tmp_path / "analytics.db"))
+            store.log_turn_usage(
+                session_id="inactive-model-session",
+                agent_name="catalog-test-agent",
+                turn_seq=1,
+                provider="anthropic",
+                model="claude-opus-4-8",
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cached_input_tokens=0,
+            )
+            with store._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM analytics_turn_usage "
+                    "WHERE session_id='inactive-model-session'"
+                ).fetchone()
+            assert store._compute_usage_cost(row) is None
+        finally:
+            runtime_model_catalog.reset_for_tests()
+            registry.close()

@@ -1725,12 +1725,13 @@ class AgentRegistry:
 
             CREATE TABLE IF NOT EXISTS agent_costs (
                 agent_name TEXT NOT NULL,
-                cost_usd REAL NOT NULL DEFAULT 0,
+                cost_usd REAL,
                 input_tokens INTEGER NOT NULL DEFAULT 0,
                 output_tokens INTEGER NOT NULL DEFAULT 0,
                 turns INTEGER NOT NULL DEFAULT 0,
                 timestamp REAL NOT NULL,
                 session_id TEXT NOT NULL DEFAULT '',
+                pricing_error TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
             );
 
@@ -1851,6 +1852,8 @@ class AgentRegistry:
                 input_price REAL NOT NULL DEFAULT 0,
                 output_price REAL NOT NULL DEFAULT 0,
                 cached_input_price REAL NOT NULL DEFAULT 0,
+                cache_write_5m_price REAL,
+                cache_write_1h_price REAL,
                 supports_thinking INTEGER NOT NULL DEFAULT 1,
                 active INTEGER NOT NULL DEFAULT 1,
                 sort_order INTEGER NOT NULL DEFAULT 100,
@@ -2301,6 +2304,9 @@ class AgentRegistry:
             "ON buzz_identities(tos_receipt) WHERE tos_receipt != ''"
         )
 
+        self._migrate_model_catalog_schema()
+        self._migrate_agent_costs_schema()
+
         # Deployment seed for the explicitly verified owner principal in #545.
         # The registry and all runtime lookups remain agent-keyed; this is only
         # the caller-specified bootstrap row and never auto-learns from traffic.
@@ -2324,6 +2330,7 @@ class AgentRegistry:
 
         # Seed default models
         self._seed_models()
+        self._validate_model_catalog()
 
     def _seed_verified_contacts(self, *, _commit: bool = True) -> None:
         """Install caller-specified contacts for a finalized registration."""
@@ -8208,6 +8215,118 @@ except Exception as exc:
         ("openai/gpt-5.6-sol", (1_000_000, 1), (200_000, 0)),
     ]
 
+    def _migrate_model_catalog_schema(self) -> None:
+        """Add nullable write-rate columns and fill only known static gaps."""
+        from pinky_daemon.pricing import RATE_TABLE
+
+        columns = {
+            row[1] for row in self._db.execute("PRAGMA table_info(models)").fetchall()
+        }
+        added_columns = []
+        for column_name in ("cache_write_5m_price", "cache_write_1h_price"):
+            if column_name not in columns:
+                self._db.execute(
+                    f"ALTER TABLE models ADD COLUMN {column_name} REAL"
+                )
+                added_columns.append(column_name)
+                _log(f"agent_registry: migrated — added column {column_name}")
+
+        if not added_columns:
+            return
+        rate_keys = {
+            "cache_write_5m_price": "cache_write_5m",
+            "cache_write_1h_price": "cache_write_1h",
+        }
+        for model_id, rate in RATE_TABLE.items():
+            assignments = ", ".join(f"{column_name}=?" for column_name in added_columns)
+            self._db.execute(
+                f"UPDATE models SET {assignments} WHERE model_id=?",
+                tuple(rate[rate_keys[column_name]] for column_name in added_columns)
+                + (model_id,),
+            )
+
+    def _migrate_agent_costs_schema(self) -> None:
+        """Rebuild the usage ledger with nullable costs and an error marker."""
+        info = self._db.execute("PRAGMA table_info(agent_costs)").fetchall()
+        columns = {row[1]: row for row in info}
+        cost_column = columns.get("cost_usd")
+        if (
+            cost_column is not None
+            and cost_column[3] == 0
+            and "pricing_error" in columns
+        ):
+            return
+
+        self._db.commit()
+        self._db.execute("PRAGMA foreign_keys=OFF")
+        started = False
+        try:
+            self._db.execute("BEGIN IMMEDIATE")
+            started = True
+            self._db.execute(
+                """CREATE TABLE agent_costs_catalog_new (
+                    agent_name TEXT NOT NULL,
+                    cost_usd REAL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    turns INTEGER NOT NULL DEFAULT 0,
+                    timestamp REAL NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    pricing_error TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+                )"""
+            )
+            pricing_error = "pricing_error" if "pricing_error" in columns else "''"
+            self._db.execute(
+                f"""INSERT INTO agent_costs_catalog_new
+                    (agent_name, cost_usd, input_tokens, output_tokens, turns,
+                     timestamp, session_id, pricing_error)
+                    SELECT agent_name, cost_usd, input_tokens, output_tokens, turns,
+                           timestamp, session_id, {pricing_error}
+                    FROM agent_costs"""
+            )
+            self._db.execute("DROP TABLE agent_costs")
+            self._db.execute(
+                "ALTER TABLE agent_costs_catalog_new RENAME TO agent_costs"
+            )
+            self._db.commit()
+            started = False
+        except Exception:
+            if started:
+                self._db.rollback()
+            raise
+        finally:
+            self._db.execute("PRAGMA foreign_keys=ON")
+
+        violations = self._db.execute("PRAGMA foreign_key_check(agent_costs)").fetchall()
+        if violations:
+            _log(
+                "ERROR agent_registry: agent_costs rebuild found "
+                f"{len(violations)} pre-existing foreign-key violations (rows kept)"
+            )
+        _log("agent_registry: rebuilt agent_costs for nullable pricing")
+
+    @staticmethod
+    def _with_pricing_status(row: dict) -> dict:
+        from pinky_daemon.runtime_model_catalog import incoherent_fields
+
+        result = dict(row)
+        result["pricing_status"] = (
+            "incomplete" if incoherent_fields(result) else "complete"
+        )
+        return result
+
+    def _validate_model_catalog(self) -> None:
+        """Report incoherent rows without making registry boot fail."""
+        from pinky_daemon.runtime_model_catalog import incoherent_fields
+
+        for row in self.list_models(active_only=False):
+            for column_name in incoherent_fields(row):
+                _log(
+                    "ERROR agent_registry: incomplete model pricing "
+                    f"{row['id']}: {column_name}"
+                )
+
     def _seed_models(self) -> None:
         """Ensure default models exist (idempotent).
 
@@ -8217,20 +8336,25 @@ except Exception as exc:
         fresh DB. (Previously this early-returned when the table was
         non-empty, so a newly-added model never reached running deployments.)
         """
+        from pinky_daemon.pricing import RATE_TABLE
+
         now = time.time()
         added = 0
         for (provider, model_id, display, desc, tier, ctx, is_1m,
              inp, out, cached, thinking, sort) in self._MODEL_SEEDS:
             mid = f"{provider}/{model_id}"
+            rate = RATE_TABLE[model_id]
             cur = self._db.execute(
                 """INSERT OR IGNORE INTO models
                    (id, provider, model_id, display_name, description, tier,
                     context_window, is_1m, input_price, output_price,
-                    cached_input_price, supports_thinking, sort_order,
+                    cached_input_price, cache_write_5m_price,
+                    cache_write_1h_price, supports_thinking, sort_order,
                     created_at, updated_at)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (mid, provider, model_id, display, desc, tier, ctx, is_1m,
-                 inp, out, cached, thinking, sort, now, now),
+                 inp, out, cached, rate["cache_write_5m"],
+                 rate["cache_write_1h"], thinking, sort, now, now),
             )
             added += cur.rowcount
         corrected = 0
@@ -8284,7 +8408,7 @@ except Exception as exc:
         if not rows:
             return []
         cols = [d[0] for d in cursor.description]
-        return [dict(zip(cols, row)) for row in rows]
+        return [self._with_pricing_status(dict(zip(cols, row))) for row in rows]
 
     def get_model(self, model_id: str) -> dict | None:
         """Get a model by its full ID (provider/model_id) or just model_id."""
@@ -8295,7 +8419,7 @@ except Exception as exc:
         if not row:
             return None
         cols = [r[1] for r in self._db.execute("PRAGMA table_info(models)").fetchall()]
-        return dict(zip(cols, row))
+        return self._with_pricing_status(dict(zip(cols, row)))
 
     def add_model(
         self,
@@ -8310,6 +8434,8 @@ except Exception as exc:
         input_price: float = 0,
         output_price: float = 0,
         cached_input_price: float = 0,
+        cache_write_5m_price: float | None = None,
+        cache_write_1h_price: float | None = None,
         supports_thinking: bool = True,
         sort_order: int = 100,
     ) -> dict:
@@ -8320,9 +8446,10 @@ except Exception as exc:
             """INSERT INTO models
                (id, provider, model_id, display_name, description, tier,
                 context_window, is_1m, input_price, output_price,
-                cached_input_price, supports_thinking, sort_order,
+                cached_input_price, cache_write_5m_price,
+                cache_write_1h_price, supports_thinking, sort_order,
                 created_at, updated_at)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                ON CONFLICT(id) DO UPDATE SET
                 display_name=excluded.display_name,
                 description=excluded.description,
@@ -8332,6 +8459,8 @@ except Exception as exc:
                 input_price=excluded.input_price,
                 output_price=excluded.output_price,
                 cached_input_price=excluded.cached_input_price,
+                cache_write_5m_price=excluded.cache_write_5m_price,
+                cache_write_1h_price=excluded.cache_write_1h_price,
                 supports_thinking=excluded.supports_thinking,
                 sort_order=excluded.sort_order,
                 active=1,
@@ -8339,10 +8468,14 @@ except Exception as exc:
             (full_id, provider, model_id,
              display_name or model_id, description, tier,
              context_window, int(is_1m), input_price, output_price,
-             cached_input_price, int(supports_thinking), sort_order,
+             cached_input_price, cache_write_5m_price, cache_write_1h_price,
+             int(supports_thinking), sort_order,
              now, now),
         )
         self._db.commit()
+        from pinky_daemon import runtime_model_catalog
+
+        runtime_model_catalog.invalidate()
         _log(f"agent_registry: added/updated model {full_id}")
         return self.get_model(full_id) or {}
 
@@ -8353,6 +8486,9 @@ except Exception as exc:
             (time.time(), model_id, model_id),
         )
         self._db.commit()
+        from pinky_daemon import runtime_model_catalog
+
+        runtime_model_catalog.invalidate()
         return cursor.rowcount > 0
 
     def get_1m_models(self) -> set[str]:
@@ -8466,15 +8602,28 @@ except Exception as exc:
 
     # ── Cost Tracking ──────────────────────────────────────
 
-    def record_cost(self, agent_name: str, cost_usd: float,
+    def record_cost(self, agent_name: str, cost_usd: float | None,
                     input_tokens: int = 0, output_tokens: int = 0,
-                    turns: int = 1, session_id: str = "") -> None:
+                    turns: int = 1, session_id: str = "",
+                    pricing_error: str = "") -> None:
         """Record a cost entry for an agent (called after each turn)."""
+        if cost_usd is None and not pricing_error.strip():
+            raise ValueError("pricing_error is required when cost_usd is NULL")
         self._db.execute(
             """INSERT INTO agent_costs
-               (agent_name, cost_usd, input_tokens, output_tokens, turns, timestamp, session_id)
-               VALUES (?, ?, ?, ?, ?, ?, ?)""",
-            (agent_name, cost_usd, input_tokens, output_tokens, turns, time.time(), session_id),
+               (agent_name, cost_usd, input_tokens, output_tokens, turns,
+                timestamp, session_id, pricing_error)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (
+                agent_name,
+                cost_usd,
+                input_tokens,
+                output_tokens,
+                turns,
+                time.time(),
+                session_id,
+                pricing_error,
+            ),
         )
         self._db.commit()
 
@@ -8494,7 +8643,7 @@ except Exception as exc:
         return [
             {
                 "agent_name": r[0],
-                "total_cost_usd": round(r[1], 6),
+                "total_cost_usd": round(r[1] or 0, 6),
                 "total_input_tokens": r[2],
                 "total_output_tokens": r[3],
                 "total_turns": r[4],

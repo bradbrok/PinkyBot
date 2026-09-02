@@ -29,12 +29,11 @@ Cache-*read* tokens are billed at the cheap ``cache_read`` rate.
 
 from __future__ import annotations
 
-import re
-
-# Strip a trailing context-window tier from a model id
-# ("claude-opus-4-8[1m]" → "claude-opus-4-8"). The live transcript model
-# field is bare, but be defensive in case a tiered id reaches us.
-_TIER_RE = re.compile(r"\[[^\]]+\]\s*$")
+from pinky_daemon.runtime_model_catalog import (
+    ModelCatalogReadError,
+    lookup_model,
+    strip_tier,
+)
 
 _M = 1_000_000
 
@@ -136,6 +135,30 @@ _GPT_53_CODEX = {
     "cache_write_5m": 0.0,
     "cache_write_1h": 0.0,
 }
+# OpenAI publishes no separate cache-write tariff for the GPT-5.4 family.
+# Writes therefore carry no premium; cached reads use the published
+# cached-input rate.
+_GPT_54 = {
+    "input": 1.75,
+    "output": 14.00,
+    "cache_read": 0.175,
+    "cache_write_5m": 0.0,
+    "cache_write_1h": 0.0,
+}
+_GPT_54_MINI = {
+    "input": 0.25,
+    "output": 2.00,
+    "cache_read": 0.025,
+    "cache_write_5m": 0.0,
+    "cache_write_1h": 0.0,
+}
+_GPT_54_NANO = {
+    "input": 0.05,
+    "output": 0.40,
+    "cache_read": 0.005,
+    "cache_write_5m": 0.0,
+    "cache_write_1h": 0.0,
+}
 
 # Bare-model-id → rate dict. Add new model ids here on each release.
 RATE_TABLE: dict[str, dict[str, float]] = {
@@ -174,20 +197,34 @@ RATE_TABLE: dict[str, dict[str, float]] = {
     # analytics seeds when OpenAI repoints the alias.
     "gpt-daybreak-blue-latest": _GPT_56_SOL,
     "gpt-5.5": _GPT_55,
+    "gpt-5.4": _GPT_54,
+    "gpt-5.4-mini": _GPT_54_MINI,
+    "gpt-5.4-nano": _GPT_54_NANO,
     "gpt-5.3-codex": _GPT_53_CODEX,
 }
 
 
-def strip_tier(model_id: str) -> str:
-    """Strip a trailing ``[tier]`` suffix (e.g. ``gpt-5.6-sol[1m]`` →
-    ``gpt-5.6-sol``). Public so other modules (e.g. streaming_session's
-    1M-window check) share this one canonical suffix rule."""
-    return _TIER_RE.sub("", (model_id or "").strip())
-
-
 def lookup_rate(model_id: str) -> dict[str, float] | None:
-    """Resolve a (possibly tiered) model id to its rate dict, or None."""
-    return RATE_TABLE.get(strip_tier(model_id))
+    """Resolve a model through the runtime catalog, then the static fallback."""
+    base = strip_tier(model_id)
+    try:
+        row = lookup_model(base)
+    except ModelCatalogReadError:
+        static = RATE_TABLE.get(base)
+        if static is not None:
+            return static
+        raise
+    if row is not None:
+        runtime_rate = {
+            "input": float(row["input_price"]),
+            "output": float(row["output_price"]),
+            "cache_read": float(row["cached_input_price"]),
+            "cache_write_5m": float(row["cache_write_5m_price"]),
+            "cache_write_1h": float(row["cache_write_1h_price"]),
+        }
+        static = RATE_TABLE.get(base)
+        return static if runtime_rate == static else runtime_rate
+    return RATE_TABLE.get(base)
 
 
 def compute_turn_cost_usd(

@@ -15,6 +15,9 @@ import uuid
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel, ConfigDict, Field
+
+from pinky_daemon.pricing import RATE_TABLE
 
 router = APIRouter(tags=["providers"])
 
@@ -22,6 +25,27 @@ router = APIRouter(tags=["providers"])
 # ── Shared dependency state ───────────────────────────────────────────────────
 
 _agents: Any = None
+
+
+class AddModelRequest(BaseModel):
+    """Complete runtime model definition used for both create and update."""
+
+    model_config = ConfigDict(allow_inf_nan=False)
+
+    provider: str
+    model_id: str
+    display_name: str = ""
+    description: str = ""
+    tier: str = ""
+    context_window: int = Field(default=200_000, gt=0)
+    is_1m: bool = False
+    input_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    output_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    cached_input_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    cache_write_5m_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    cache_write_1h_price: float = Field(ge=0, strict=True, allow_inf_nan=False)
+    supports_thinking: bool = True
+    sort_order: int = 100
 
 
 def set_dependencies(*, agents) -> None:
@@ -157,25 +181,27 @@ async def get_model(model_id: str):
 
 
 @router.post("/models")
-async def add_model(req: dict):
+async def add_model(req: AddModelRequest):
     """Add or update a model in the registry."""
-    provider = (req.get("provider") or "").strip()
-    model_id = (req.get("model_id") or "").strip()
+    provider = req.provider.strip()
+    model_id = req.model_id.strip()
     if not provider or not model_id:
         raise HTTPException(400, "provider and model_id are required")
     return _agents.add_model(
         provider=provider,
         model_id=model_id,
-        display_name=req.get("display_name", ""),
-        description=req.get("description", ""),
-        tier=req.get("tier", ""),
-        context_window=req.get("context_window", 200_000),
-        is_1m=req.get("is_1m", False),
-        input_price=req.get("input_price", 0),
-        output_price=req.get("output_price", 0),
-        cached_input_price=req.get("cached_input_price", 0),
-        supports_thinking=req.get("supports_thinking", True),
-        sort_order=req.get("sort_order", 100),
+        display_name=req.display_name,
+        description=req.description,
+        tier=req.tier,
+        context_window=req.context_window,
+        is_1m=req.is_1m,
+        input_price=req.input_price,
+        output_price=req.output_price,
+        cached_input_price=req.cached_input_price,
+        cache_write_5m_price=req.cache_write_5m_price,
+        cache_write_1h_price=req.cache_write_1h_price,
+        supports_thinking=req.supports_thinking,
+        sort_order=req.sort_order,
     )
 
 
@@ -210,6 +236,7 @@ async def sync_models():
         raise HTTPException(502, f"Failed to fetch models from Anthropic: {e}") from e
 
     added = []
+    requires_pricing = []
     for m in data.get("data", []):
         mid = m.get("id", "")
         if not mid:
@@ -229,6 +256,10 @@ async def sync_models():
         existing = _agents.get_model(mid)
         if existing:
             continue
+        rate = RATE_TABLE.get(mid)
+        if rate is None:
+            requires_pricing.append(mid)
+            continue
         # Determine display name
         display = m.get("display_name", mid)
         _agents.add_model(
@@ -239,12 +270,21 @@ async def sync_models():
             tier=tier,
             context_window=200_000,
             is_1m=False,
+            input_price=rate["input"],
+            output_price=rate["output"],
+            cached_input_price=rate["cache_read"],
+            cache_write_5m_price=rate["cache_write_5m"],
+            cache_write_1h_price=rate["cache_write_1h"],
             supports_thinking=True,
             sort_order=100,
         )
         added.append(mid)
 
-    return {"synced": len(added), "new_models": added}
+    return {
+        "synced": len(added),
+        "new_models": added,
+        "requires_pricing": requires_pricing,
+    }
 
 
 # ── Global Bot Tokens ─────────────────────────────────────────────────────────

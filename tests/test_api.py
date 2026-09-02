@@ -9279,3 +9279,376 @@ class TestAgentIsDreamer:
         from pinky_daemon.api import _agent_is_dreamer
 
         assert _agent_is_dreamer(SimpleNamespace(groups=["dreamer"])) is False
+
+
+class TestRuntimeModelCatalogAPI:
+    _RATE_FIELDS = (
+        "input_price",
+        "output_price",
+        "cached_input_price",
+        "cache_write_5m_price",
+        "cache_write_1h_price",
+    )
+
+    @pytest.fixture(autouse=True)
+    def _isolated_runtime_catalog(self):
+        from pinky_daemon import runtime_model_catalog
+
+        runtime_model_catalog.reset_for_tests()
+        yield
+        runtime_model_catalog.reset_for_tests()
+
+    @staticmethod
+    def _model_body(*, provider: str, model_id: str, price: float = 1.0) -> dict:
+        return {
+            "provider": provider,
+            "model_id": model_id,
+            "input_price": price,
+            "output_price": 2.0,
+            "cached_input_price": 0.25,
+            "cache_write_5m_price": 1.25,
+            "cache_write_1h_price": 2.0,
+        }
+
+    @staticmethod
+    def _make_app(tmp_path):
+        from pinky_daemon.api import create_api
+
+        return create_api(
+            max_sessions=5,
+            default_working_dir=str(tmp_path),
+            db_path=str(tmp_path / "catalog-api.db"),
+        )
+
+    def test_complete_post_and_get_expose_all_rates_and_status(self, tmp_path):
+        app = self._make_app(tmp_path)
+        with TestClient(app) as client:
+            response = client.post(
+                "/models",
+                json=self._model_body(
+                    provider="custom",
+                    model_id="runtime-api-model",
+                ),
+            )
+            assert response.status_code == 200, response.text
+            assert tuple(response.json()[field] for field in self._RATE_FIELDS) == (
+                1.0,
+                2.0,
+                0.25,
+                1.25,
+                2.0,
+            )
+            assert response.json()["pricing_status"] == "complete"
+            fetched = client.get("/models/runtime-api-model")
+            assert fetched.status_code == 200
+            assert fetched.json()["pricing_status"] == "complete"
+
+            zero = client.post(
+                "/models",
+                json=self._model_body(
+                    provider="batch",
+                    model_id="runtime-zero-api-model",
+                    price=0.0,
+                )
+                | {
+                    "output_price": 0.0,
+                    "cached_input_price": 0.0,
+                    "cache_write_5m_price": 0.0,
+                    "cache_write_1h_price": 0.0,
+                },
+            )
+            assert zero.status_code == 200, zero.text
+            assert tuple(zero.json()[field] for field in self._RATE_FIELDS) == (
+                0.0,
+            ) * 5
+
+    def test_omitted_or_null_rate_is_422_for_every_provider(self, tmp_path):
+        app = self._make_app(tmp_path)
+        observed = {}
+        with TestClient(app) as client:
+            for provider in ("anthropic", "openai", "custom"):
+                for field in self._RATE_FIELDS:
+                    for shape in ("omitted", "null"):
+                        model_id = f"runtime-{provider}-{field}-{shape}"
+                        body = self._model_body(provider=provider, model_id=model_id)
+                        if shape == "omitted":
+                            body.pop(field)
+                        else:
+                            body[field] = None
+                        response = client.post("/models", json=body)
+                        observed[(provider, field, shape)] = response.status_code
+                        assert app.state.agents.get_model(model_id) is None
+        assert set(observed.values()) == {422}
+
+    def test_incomplete_catalog_boots_logs_and_serves_status(
+        self,
+        tmp_path,
+        capsys,
+    ):
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        base_path = tmp_path / "catalog-api.db"
+        registry_path = Path(str(base_path).replace(".db", "_agents.db"))
+        initial = AgentRegistry(db_path=str(registry_path))
+        initial.add_model(
+            provider="custom",
+            model_id="runtime-partial-api-model",
+            input_price=1.0,
+            output_price=2.0,
+            cached_input_price=0.25,
+        )
+        initial.close()
+        with sqlite3.connect(registry_path) as db:
+            columns = {
+                row[1] for row in db.execute("PRAGMA table_info(models)").fetchall()
+            }
+            for field in ("cache_write_5m_price", "cache_write_1h_price"):
+                if field not in columns:
+                    db.execute(f"ALTER TABLE models ADD COLUMN {field} REAL")
+            db.execute(
+                "UPDATE models SET cache_write_5m_price=1.25, "
+                "cache_write_1h_price=NULL "
+                "WHERE id='custom/runtime-partial-api-model'"
+            )
+
+        capsys.readouterr()
+        app = self._make_app(tmp_path)
+        with TestClient(app) as client:
+            response = client.get("/models/runtime-partial-api-model")
+            assert response.status_code == 200
+            assert response.json()["pricing_status"] == "incomplete"
+        stderr = capsys.readouterr().err
+        assert "ERROR" in stderr
+        assert "custom/runtime-partial-api-model" in stderr
+        assert "cache_write_1h_price" in stderr
+
+    def test_post_update_and_delete_invalidate_pricing_and_1m_caches(self, tmp_path):
+        from pinky_daemon import runtime_model_catalog
+        from pinky_daemon.pricing import lookup_rate
+        from pinky_daemon.streaming_session import is_1m_model
+
+        runtime_model_catalog.reset_for_tests()
+        app = self._make_app(tmp_path)
+        try:
+            with TestClient(app) as client:
+                initial = self._model_body(
+                    provider="custom",
+                    model_id="runtime-cache-api-model",
+                    price=3.0,
+                ) | {"is_1m": True, "context_window": 1_000_000}
+                assert client.post("/models", json=initial).status_code == 200
+                assert lookup_rate("runtime-cache-api-model")["input"] == 3.0
+                assert is_1m_model("runtime-cache-api-model[1m]") is True
+
+                updated = initial | {
+                    "input_price": 8.0,
+                    "is_1m": False,
+                    "context_window": 200_000,
+                }
+                assert client.post("/models", json=updated).status_code == 200
+                assert lookup_rate("runtime-cache-api-model")["input"] == 8.0
+                assert is_1m_model("runtime-cache-api-model[1m]") is False
+
+                deleted = client.delete("/models/runtime-cache-api-model")
+                assert deleted.status_code == 200
+                with pytest.raises(
+                    runtime_model_catalog.ModelCatalogError, match="is inactive"
+                ):
+                    lookup_rate("runtime-cache-api-model")
+                assert is_1m_model("runtime-cache-api-model") is False
+        finally:
+            runtime_model_catalog.reset_for_tests()
+
+    def test_composition_binds_registry_before_analytics_initializes(self):
+        from pinky_daemon.api import create_api
+
+        source = inspect.getsource(create_api)
+        registry_init = source.index("agents = AgentRegistry(")
+        catalog_bind = source.index("runtime_model_catalog.bind_registry(agents)")
+        analytics_init = source.index("analytics = AnalyticsStore(")
+        assert registry_init < catalog_bind < analytics_init
+
+    @pytest.mark.parametrize("operation", ("create", "update"))
+    @pytest.mark.parametrize(
+        ("invalid_kind", "invalid_value"),
+        (
+            ("missing", None),
+            ("negative", -0.01),
+            ("nan", float("nan")),
+            ("infinity", float("inf")),
+            ("boolean", True),
+        ),
+    )
+    def test_create_and_update_reject_every_invalid_rate_shape(
+        self,
+        tmp_path,
+        operation,
+        invalid_kind,
+        invalid_value,
+    ):
+        app = self._make_app(tmp_path)
+        with TestClient(app) as client:
+            for field in self._RATE_FIELDS:
+                model_id = f"runtime-{operation}-{invalid_kind}-{field}"
+                valid = self._model_body(provider="custom", model_id=model_id)
+                if operation == "update":
+                    created = client.post("/models", json=valid)
+                    assert created.status_code == 200, created.text
+
+                invalid = dict(valid)
+                if invalid_kind == "missing":
+                    invalid.pop(field)
+                else:
+                    invalid[field] = invalid_value
+                if invalid_kind in {"nan", "infinity"}:
+                    raw_json = json.dumps(
+                        invalid,
+                        allow_nan=True,
+                        separators=(",", ":"),
+                    ).encode()
+                    expected_token = b"NaN" if invalid_kind == "nan" else b"Infinity"
+                    assert expected_token in raw_json
+                    response = client.post(
+                        "/models",
+                        content=raw_json,
+                        headers={"Content-Type": "application/json"},
+                    )
+                else:
+                    response = client.post("/models", json=invalid)
+                assert response.status_code == 422, (
+                    operation,
+                    invalid_kind,
+                    field,
+                    response.text,
+                )
+
+                stored = app.state.agents.get_model(model_id)
+                if operation == "create":
+                    assert stored is None
+                else:
+                    assert stored is not None
+                    assert tuple(stored[name] for name in self._RATE_FIELDS) == (
+                        1.0,
+                        2.0,
+                        0.25,
+                        1.25,
+                        2.0,
+                    )
+
+    def test_create_and_update_accept_ints_and_finite_non_negative_floats(
+        self,
+        tmp_path,
+    ):
+        app = self._make_app(tmp_path)
+        model_id = "runtime-valid-numeric-rates"
+        with TestClient(app) as client:
+            created = client.post(
+                "/models",
+                json={
+                    "provider": "custom",
+                    "model_id": model_id,
+                    "input_price": 1,
+                    "output_price": 2,
+                    "cached_input_price": 0,
+                    "cache_write_5m_price": 3,
+                    "cache_write_1h_price": 4,
+                },
+            )
+            assert created.status_code == 200, created.text
+            updated = client.post(
+                "/models",
+                json={
+                    "provider": "custom",
+                    "model_id": model_id,
+                    "input_price": 0.5,
+                    "output_price": 2.5,
+                    "cached_input_price": 0.125,
+                    "cache_write_5m_price": 0.0,
+                    "cache_write_1h_price": 3.75,
+                },
+            )
+            assert updated.status_code == 200, updated.text
+            assert tuple(updated.json()[field] for field in self._RATE_FIELDS) == (
+                0.5,
+                2.5,
+                0.125,
+                0.0,
+                3.75,
+            )
+
+    def test_nested_non_finite_validation_inputs_are_sanitized(self, tmp_path):
+        app = self._make_app(tmp_path)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            nested_infinity = client.post(
+                "/models",
+                content=(
+                    b'{"provider":"custom","model_id":"runtime-nested-infinity",'
+                    b'"output_price":2.0,"cached_input_price":0.25,'
+                    b'"cache_write_5m_price":1.25,"cache_write_1h_price":2.0,'
+                    b'"extra":{"deep":[Infinity]}}'
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            assert nested_infinity.status_code == 422, nested_infinity.text
+            nested_detail = nested_infinity.json()["detail"]
+            assert any(
+                item["type"] == "missing"
+                and item["loc"] == ["body", "input_price"]
+                for item in nested_detail
+            )
+            assert all("input" not in item for item in nested_detail)
+
+            nan_and_missing = client.post(
+                "/models",
+                content=(
+                    b'{"provider":"custom","model_id":"runtime-nan-and-missing",'
+                    b'"input_price":NaN,"cached_input_price":0.25,'
+                    b'"cache_write_5m_price":1.25,"cache_write_1h_price":2.0}'
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            assert nan_and_missing.status_code == 422, nan_and_missing.text
+            combined_detail = nan_and_missing.json()["detail"]
+            assert {item["type"] for item in combined_detail} >= {
+                "finite_number",
+                "missing",
+            }
+            assert all("input" not in item for item in combined_detail)
+
+    def test_cost_callback_adapter_forwards_pricing_error(self, tmp_path):
+        async def fake_connect(self):
+            from pinky_daemon.transport_state import SessionState
+
+            self._state_machine._state = SessionState.CONNECTED
+
+        agent_name = "r2-cost-adapter"
+        marker = "anthropic/some-model is inactive"
+        with patch(
+            "pinky_daemon.streaming_session.StreamingSession.connect",
+            new=fake_connect,
+        ):
+            app = self._make_app(tmp_path)
+            with TestClient(app) as client:
+                created = client.post(
+                    "/agents",
+                    json={"name": agent_name, "model": "sonnet"},
+                )
+                assert created.status_code == 200, created.text
+                woken = client.post(f"/agents/{agent_name}/wake?prompt=Wake")
+                assert woken.status_code == 200, woken.text
+
+                session = app.state.broker._streaming[agent_name]["main"]
+                session._cost_callback(
+                    agent_name,
+                    None,
+                    10_000,
+                    500,
+                    "",
+                    pricing_error=marker,
+                )
+                row = app.state.agents._db.execute(
+                    "SELECT cost_usd, input_tokens, output_tokens, pricing_error "
+                    "FROM agent_costs WHERE agent_name=?",
+                    (agent_name,),
+                ).fetchone()
+                assert tuple(row) == (None, 10_000, 500, marker)

@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import math
 import os
 import re
 import shutil
@@ -41,6 +42,7 @@ from fastapi import (
     UploadFile,
     WebSocket,
 )
+from fastapi.encoders import jsonable_encoder
 from fastapi.exception_handlers import request_validation_exception_handler
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import (
@@ -52,6 +54,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
+from pinky_daemon import runtime_model_catalog
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
@@ -218,7 +221,7 @@ from pinky_daemon.store_snapshot import (
     StoreSnapshotSelectionError,
     StoreSnapshotService,
 )
-from pinky_daemon.streaming_session import _1M_MODELS, is_1m_model
+from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
 
 # Alias: pinky_daemon.sessions.SessionState (imported above) is the
@@ -538,17 +541,6 @@ PRIORITY_LEVELS = Literal[0, 1, 2]
 
 
 # ── Agent Models ─────────────────────────────────────────────
-
-
-def _refresh_1m_models(registry) -> None:
-    """Refresh the 1M model set from the registry."""
-    global _1M_MODELS
-    try:
-        db_set = registry.get_1m_models()
-        if db_set:
-            _1M_MODELS = db_set
-    except Exception:
-        pass  # Keep fallback
 
 
 _GRANDFATHER_MARKER = "migration:grandfather_approved_users"
@@ -1808,18 +1800,38 @@ def create_api(
         storage_observability.enable_runtime()
         return await call_next(request)
 
+    def _has_non_finite(obj: Any) -> bool:
+        if isinstance(obj, float):
+            return not math.isfinite(obj)
+        if isinstance(obj, dict):
+            return any(_has_non_finite(value) for value in obj.values())
+        if isinstance(obj, (list, tuple)):
+            return any(_has_non_finite(value) for value in obj)
+        return False
+
     @app.exception_handler(RequestValidationError)
     async def _request_validation_response(
         request: Request,
         error: RequestValidationError,
     ):
+        validation_errors = error.errors()
         if request.method == "POST" and request.url.path == "/agents" and any(
             tuple(item.get("loc", ()))[:2] == ("body", "name")
-            for item in error.errors()
+            for item in validation_errors
         ):
             return JSONResponse(
                 status_code=400,
                 content={"detail": {"code": "invalid_agent_name"}},
+            )
+        if any(_has_non_finite(item.get("input")) for item in validation_errors):
+            return JSONResponse(
+                status_code=422,
+                content={
+                    "detail": jsonable_encoder(
+                        validation_errors,
+                        exclude={"input"},
+                    )
+                },
             )
         return await request_validation_exception_handler(request, error)
 
@@ -1869,8 +1881,10 @@ def create_api(
         db_path=store_manifest["session_events"].path, catalog=store_catalog
     )
     store = ConversationStore(db_path=store_manifest["conversations"].path, catalog=store_catalog)
-    analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
     agents = AgentRegistry(db_path=store_manifest["agents"].path, catalog=store_catalog)
+    runtime_model_catalog.bind_registry(agents)
+    runtime_model_catalog.warm()
+    analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
     tenant_store_catalogs: dict[str, StoreCatalog] = {}
     tenant_catalog: StoreCatalog | None = None
     try:
@@ -1922,7 +1936,6 @@ def create_api(
     app.state.tenant_store_catalogs = tenant_store_catalogs
     app.state.store_catalog = store_catalog
     _run_grandfather_approved_users_migration(store, agents)
-    _refresh_1m_models(agents)
     audit = AuditStore(db_path=store_manifest["audit"].path, catalog=store_catalog)
     app.state.audit = audit
     hooks = HookManager(audit_store=audit)
@@ -2783,13 +2796,22 @@ def create_api(
 
     def _make_cost_callback(registry):
         """Create a sync callback to persist per-turn cost data and fire cost milestones."""
-        def _record_cost(agent_name, cost_usd, input_tokens, output_tokens, session_id):
+        def _record_cost(
+            agent_name,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            session_id,
+            *,
+            pricing_error="",
+        ):
             registry.record_cost(
                 agent_name,
                 cost_usd,
                 input_tokens,
                 output_tokens,
                 session_id=session_id,
+                pricing_error=pricing_error,
             )
             # Check cost milestones for this session
             sessions_map = broker._streaming.get(agent_name, {})
@@ -10393,13 +10415,13 @@ npm run build</pre>
         except Exception:
             pass
 
-        new_is_1m = is_1m_model(req.model, _1M_MODELS)
+        new_is_1m = is_1m_model(req.model)
         if old_max > 0:
             old_is_1m = old_max > 500_000  # Current window is 1M-class
         else:
             # Usage fetch failed: fall back to the configured model class so a
             # 1M -> 200k switch still forces the context-window restart.
-            old_is_1m = is_1m_model(ss._config.model or "", _1M_MODELS)
+            old_is_1m = is_1m_model(ss._config.model or "")
 
         needs_restart = new_is_1m != old_is_1m
 
