@@ -340,6 +340,7 @@ def test_delete_invalidates_cached_runtime_rate(
     bound_runtime_catalog,
 ) -> None:
     from pinky_daemon.agent_registry import AgentRegistry
+    from pinky_daemon.runtime_model_catalog import ModelCatalogError
 
     registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
     try:
@@ -347,7 +348,8 @@ def test_delete_invalidates_cached_runtime_rate(
         bound_runtime_catalog.bind_registry(registry)
         assert lookup_rate("runtime-deleted-model")["input"] == 3.0
         assert registry.delete_model("runtime-deleted-model") is True
-        assert lookup_rate("runtime-deleted-model") is None
+        with pytest.raises(ModelCatalogError, match="is inactive"):
+            lookup_rate("runtime-deleted-model")
     finally:
         registry.close()
 
@@ -491,3 +493,108 @@ def test_binding_second_registry_discards_first_registry_snapshot(
         assert lookup_rate("runtime-rebind-model")["input"] == 8.0
     finally:
         second.close()
+
+
+@pytest.mark.parametrize(
+    ("model_id", "runtime_only"),
+    (
+        ("claude-opus-4-8", False),
+        ("runtime-deleted-model", True),
+    ),
+)
+def test_soft_deleted_model_is_known_inactive_after_cache_invalidation(
+    tmp_path,
+    bound_runtime_catalog,
+    model_id,
+    runtime_only,
+) -> None:
+    from pinky_daemon.agent_registry import AgentRegistry
+
+    registry = AgentRegistry(db_path=str(tmp_path / "deleted-models.db"))
+    try:
+        if runtime_only:
+            _add_runtime_model(registry, model_id, input_price=7.0)
+        bound_runtime_catalog.bind_registry(registry)
+        assert lookup_rate(model_id) is not None
+        assert registry.delete_model(model_id) is True
+        full_id = f"anthropic/{model_id}"
+        with pytest.raises(
+            bound_runtime_catalog.ModelCatalogError,
+            match=rf"{full_id} is inactive",
+        ):
+            lookup_rate(model_id)
+    finally:
+        registry.close()
+
+
+def test_bound_absent_model_keeps_static_or_unknown_fallback(
+    tmp_path,
+    bound_runtime_catalog,
+) -> None:
+    from pinky_daemon.agent_registry import AgentRegistry
+    from pinky_daemon.pricing import RATE_TABLE
+
+    registry = AgentRegistry(db_path=str(tmp_path / "absent-models.db"))
+    try:
+        bound_runtime_catalog.bind_registry(registry)
+        assert registry.get_model("gpt-5.3-codex") is None
+        assert lookup_rate("gpt-5.3-codex") == RATE_TABLE["gpt-5.3-codex"]
+        assert lookup_rate("runtime-never-known-model") is None
+        assert compute_turn_cost_usd(
+            "runtime-never-known-model",
+            input_tokens=1_000_000,
+            output_tokens=1_000_000,
+            cache_read_tokens=0,
+            cache_creation_5m_tokens=0,
+            cache_creation_1h_tokens=0,
+        ) == 0.0
+    finally:
+        registry.close()
+
+
+@pytest.mark.parametrize(
+    ("model_id", "expected"),
+    (
+        ("claude-opus-4-8[1m]", "claude-opus-4-8"),
+        ("x[1M]  ", "x"),
+        ("x", "x"),
+        ("", ""),
+        (None, ""),
+        ("[1m]", ""),
+        ("a]", "a]"),
+        ("a[", "a["),
+        ("a[]", "a[]"),
+        ("a[b]c]", "a[b]c]"),
+        ("a[b][1m]", "a[b]"),
+    ),
+)
+def test_strip_tier_preserves_last_non_empty_bracket_group_semantics(
+    model_id,
+    expected,
+) -> None:
+    from pinky_daemon.runtime_model_catalog import strip_tier
+
+    assert strip_tier(model_id) == expected
+
+
+def test_strip_tier_handles_long_open_bracket_input_within_50ms() -> None:
+    import signal
+    import time
+
+    from pinky_daemon.runtime_model_catalog import strip_tier
+
+    model_id = "[" * 200_000
+
+    def fail_if_slow(_signum, _frame):
+        raise TimeoutError("strip_tier exceeded 50 ms")
+
+    previous_handler = signal.signal(signal.SIGALRM, fail_if_slow)
+    signal.setitimer(signal.ITIMER_REAL, 0.05)
+    started = time.perf_counter()
+    try:
+        assert strip_tier(model_id) == model_id
+        elapsed = time.perf_counter() - started
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+    assert elapsed < 0.05

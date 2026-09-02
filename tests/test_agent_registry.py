@@ -2248,3 +2248,184 @@ class TestRuntimeEditableModelCatalog:
             assert row == (None, 10, 20, "incomplete model pricing")
         finally:
             migrated.close()
+
+    def test_new_shape_null_static_rate_stays_incomplete_on_reopen(
+        self,
+        tmp_path,
+        capsys,
+    ):
+        db_path = tmp_path / "new-shape-null-rate.db"
+        initial = AgentRegistry(db_path=str(db_path))
+        initial.close()
+        with sqlite3.connect(db_path) as db:
+            db.execute(
+                "UPDATE models SET cache_write_1h_price=NULL "
+                "WHERE id='anthropic/claude-opus-4-8'"
+            )
+
+        capsys.readouterr()
+        reopened = AgentRegistry(db_path=str(db_path))
+        try:
+            row = reopened.get_model("claude-opus-4-8")
+            assert row is not None
+            assert row["cache_write_1h_price"] is None
+            assert row["pricing_status"] == "incomplete"
+            stderr = capsys.readouterr().err
+            assert "ERROR agent_registry: incomplete model pricing" in stderr
+            assert "anthropic/claude-opus-4-8" in stderr
+            assert "cache_write_1h_price" in stderr
+        finally:
+            reopened.close()
+
+    def test_populated_legacy_ledger_preserves_rows_aggregates_fk_and_orphan(
+        self,
+        tmp_path,
+        capsys,
+    ):
+        db_path = tmp_path / "populated-legacy-ledger.db"
+        initial = AgentRegistry(db_path=str(db_path))
+        initial.register("ledger-agent-a", working_dir=str(tmp_path / "agent-a"))
+        initial.register("ledger-agent-b", working_dir=str(tmp_path / "agent-b"))
+        initial.record_cost(
+            "ledger-agent-a",
+            1.25,
+            input_tokens=101,
+            output_tokens=11,
+            turns=2,
+            session_id="ledger-a",
+        )
+        initial.record_cost(
+            "ledger-agent-b",
+            2.75,
+            input_tokens=202,
+            output_tokens=22,
+            turns=3,
+            session_id="ledger-b",
+        )
+        initial.close()
+
+        with sqlite3.connect(db_path) as db:
+            db.execute("PRAGMA foreign_keys=OFF")
+            db.execute("ALTER TABLE agent_costs RENAME TO agent_costs_current")
+            db.execute(
+                """CREATE TABLE agent_costs (
+                    agent_name TEXT NOT NULL,
+                    cost_usd REAL NOT NULL DEFAULT 0,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    turns INTEGER NOT NULL DEFAULT 0,
+                    timestamp REAL NOT NULL,
+                    session_id TEXT NOT NULL DEFAULT '',
+                    FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE
+                )"""
+            )
+            db.execute(
+                """INSERT INTO agent_costs
+                    (agent_name, cost_usd, input_tokens, output_tokens, turns,
+                     timestamp, session_id)
+                    SELECT agent_name, cost_usd, input_tokens, output_tokens, turns,
+                           timestamp, session_id
+                    FROM agent_costs_current"""
+            )
+            db.execute("DROP TABLE agent_costs_current")
+            db.execute(
+                """INSERT INTO agent_costs
+                    (agent_name, cost_usd, input_tokens, output_tokens, turns,
+                     timestamp, session_id)
+                    VALUES ('orphan-agent', 3.5, 303, 33, 4, 1.0, 'orphan')"""
+            )
+            before = db.execute(
+                "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "SUM(cost_usd), SUM(turns) FROM agent_costs"
+            ).fetchone()
+
+        capsys.readouterr()
+        migrated = AgentRegistry(db_path=str(db_path))
+        try:
+            after = migrated._db.execute(
+                "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "SUM(cost_usd), SUM(turns) FROM agent_costs"
+            ).fetchone()
+            assert after == before
+            assert migrated._db.execute(
+                "SELECT COUNT(*) FROM agent_costs WHERE agent_name='orphan-agent'"
+            ).fetchone()[0] == 1
+            foreign_keys = migrated._db.execute(
+                "PRAGMA foreign_key_list(agent_costs)"
+            ).fetchall()
+            assert any(
+                (row[2], row[3], row[4], row[6])
+                == ("agents", "agent_name", "name", "CASCADE")
+                for row in foreign_keys
+            )
+            assert len(
+                migrated._db.execute(
+                    "PRAGMA foreign_key_check(agent_costs)"
+                ).fetchall()
+            ) == 1
+            assert migrated._db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            stderr = capsys.readouterr().err
+            assert "ERROR agent_registry: agent_costs rebuild found 1" in stderr
+            assert "pre-existing foreign-key violations (rows kept)" in stderr
+        finally:
+            migrated.close()
+
+        second_boot = AgentRegistry(db_path=str(db_path))
+        try:
+            assert second_boot._db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+            assert second_boot._db.total_changes == 0
+        finally:
+            second_boot.close()
+
+    def test_agent_costs_rebuild_restores_foreign_keys_after_copy_failure(
+        self,
+        tmp_path,
+    ):
+        registry = AgentRegistry(db_path=str(tmp_path / "failed-ledger-rebuild.db"))
+        try:
+            registry.register(
+                "copy-failure-agent",
+                working_dir=str(tmp_path / "copy-failure-agent"),
+            )
+            registry.record_cost(
+                "copy-failure-agent",
+                4.5,
+                input_tokens=123,
+                output_tokens=45,
+                turns=6,
+                session_id="copy-failure-session",
+            )
+            registry._db.execute("ALTER TABLE agent_costs DROP COLUMN pricing_error")
+            registry._db.commit()
+            before = registry._db.execute(
+                "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "SUM(cost_usd), SUM(turns) FROM agent_costs"
+            ).fetchone()
+
+            def deny_catalog_copy(action, table, _column, _database, _source):
+                if (
+                    action == sqlite3.SQLITE_INSERT
+                    and table == "agent_costs_catalog_new"
+                ):
+                    return sqlite3.SQLITE_DENY
+                return sqlite3.SQLITE_OK
+
+            registry._db.set_authorizer(deny_catalog_copy)
+            try:
+                with pytest.raises(sqlite3.DatabaseError, match="not authorized"):
+                    registry._migrate_agent_costs_schema()
+            finally:
+                registry._db.set_authorizer(None)
+
+            after = registry._db.execute(
+                "SELECT COUNT(*), SUM(input_tokens), SUM(output_tokens), "
+                "SUM(cost_usd), SUM(turns) FROM agent_costs"
+            ).fetchone()
+            assert after == before
+            assert registry._db.execute(
+                "SELECT COUNT(*) FROM sqlite_master "
+                "WHERE type='table' AND name='agent_costs_catalog_new'"
+            ).fetchone()[0] == 0
+            assert registry._db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        finally:
+            registry.close()

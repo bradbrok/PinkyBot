@@ -992,3 +992,36 @@ class TestRuntimeCatalogPricing:
                 "FROM analytics_turn_usage WHERE session_id='legacy-unpriced-session'"
             ).fetchone()
         assert tuple(row) == (7, 8, 9, "incomplete model pricing")
+
+    def test_soft_deleted_model_does_not_use_static_analytics_fallback(
+        self,
+        tmp_path,
+    ):
+        from pinky_daemon import runtime_model_catalog
+        from pinky_daemon.agent_registry import AgentRegistry
+
+        registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+        runtime_model_catalog.reset_for_tests()
+        try:
+            runtime_model_catalog.bind_registry(registry)
+            assert registry.delete_model("claude-opus-4-8") is True
+            store = AnalyticsStore(str(tmp_path / "analytics.db"))
+            store.log_turn_usage(
+                session_id="inactive-model-session",
+                agent_name="catalog-test-agent",
+                turn_seq=1,
+                provider="anthropic",
+                model="claude-opus-4-8",
+                input_tokens=1_000_000,
+                output_tokens=0,
+                cached_input_tokens=0,
+            )
+            with store._connect() as conn:
+                row = conn.execute(
+                    "SELECT * FROM analytics_turn_usage "
+                    "WHERE session_id='inactive-model-session'"
+                ).fetchone()
+            assert store._compute_usage_cost(row) is None
+        finally:
+            runtime_model_catalog.reset_for_tests()
+            registry.close()

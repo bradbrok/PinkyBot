@@ -13072,3 +13072,70 @@ def test_scheduler_drain_busy_unstamped_spawn_keeps_fail_closed() -> None:
     }
 
     assert ss.scheduler_drain_busy() is True
+
+
+@pytest.mark.parametrize(
+    ("model_id", "runtime_only"),
+    (
+        ("claude-opus-4-8", False),
+        ("runtime-deleted-turn-model", True),
+    ),
+)
+@pytest.mark.asyncio
+async def test_soft_deleted_model_turn_keeps_tokens_with_pricing_error(
+    tmp_path,
+    capsys,
+    model_id,
+    runtime_only,
+) -> None:
+    from pinky_daemon import runtime_model_catalog
+    from pinky_daemon.agent_registry import AgentRegistry
+    from pinky_daemon.pricing import lookup_rate
+
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    runtime_model_catalog.reset_for_tests()
+    try:
+        registry.register("dymok", working_dir=str(tmp_path / "dymok"))
+        if runtime_only:
+            registry.add_model(
+                provider="anthropic",
+                model_id=model_id,
+                input_price=7.0,
+                output_price=8.0,
+                cached_input_price=0.5,
+                cache_write_5m_price=1.0,
+                cache_write_1h_price=2.0,
+            )
+        runtime_model_catalog.bind_registry(registry)
+        assert lookup_rate(model_id) is not None
+        assert registry.delete_model(model_id) is True
+
+        analytics = MagicMock()
+        session = _make_usage_session_of(
+            TmuxSession,
+            analytics=analytics,
+            cost_cb=registry.record_cost,
+            model=model_id,
+        )
+        total_cost_before = session.usage.total_cost_usd
+        _seed_inflight(session)
+        capsys.readouterr()
+        await session._handle_turn_complete(_usage_turn_response(model=model_id))
+
+        full_id = f"anthropic/{model_id}"
+        row = registry._db.execute(
+            "SELECT cost_usd, input_tokens, output_tokens, pricing_error "
+            "FROM agent_costs WHERE agent_name='dymok'"
+        ).fetchone()
+        assert row == (None, 10_000, 500, f"{full_id} is inactive")
+        assert session.usage.total_cost_usd == total_cost_before
+        usage = analytics.log_turn_usage.call_args.kwargs
+        assert usage["input_tokens"] == 10_000
+        assert usage["output_tokens"] == 500
+        assert usage["pricing_error"] == f"{full_id} is inactive"
+        stderr = capsys.readouterr().err
+        assert "ERROR" in stderr
+        assert f"{full_id} is inactive" in stderr
+    finally:
+        runtime_model_catalog.reset_for_tests()
+        registry.close()

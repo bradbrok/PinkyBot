@@ -9290,6 +9290,14 @@ class TestRuntimeModelCatalogAPI:
         "cache_write_1h_price",
     )
 
+    @pytest.fixture(autouse=True)
+    def _isolated_runtime_catalog(self):
+        from pinky_daemon import runtime_model_catalog
+
+        runtime_model_catalog.reset_for_tests()
+        yield
+        runtime_model_catalog.reset_for_tests()
+
     @staticmethod
     def _model_body(*, provider: str, model_id: str, price: float = 1.0) -> dict:
         return {
@@ -9443,7 +9451,10 @@ class TestRuntimeModelCatalogAPI:
 
                 deleted = client.delete("/models/runtime-cache-api-model")
                 assert deleted.status_code == 200
-                assert lookup_rate("runtime-cache-api-model") is None
+                with pytest.raises(
+                    runtime_model_catalog.ModelCatalogError, match="is inactive"
+                ):
+                    lookup_rate("runtime-cache-api-model")
                 assert is_1m_model("runtime-cache-api-model") is False
         finally:
             runtime_model_catalog.reset_for_tests()
@@ -9456,3 +9467,111 @@ class TestRuntimeModelCatalogAPI:
         catalog_bind = source.index("runtime_model_catalog.bind_registry(agents)")
         analytics_init = source.index("analytics = AnalyticsStore(")
         assert registry_init < catalog_bind < analytics_init
+
+    @pytest.mark.parametrize("operation", ("create", "update"))
+    @pytest.mark.parametrize(
+        ("invalid_kind", "invalid_value"),
+        (
+            ("missing", None),
+            ("negative", -0.01),
+            ("nan", float("nan")),
+            ("infinity", float("inf")),
+            ("boolean", True),
+        ),
+    )
+    def test_create_and_update_reject_every_invalid_rate_shape(
+        self,
+        tmp_path,
+        operation,
+        invalid_kind,
+        invalid_value,
+    ):
+        app = self._make_app(tmp_path)
+        with TestClient(app) as client:
+            for field in self._RATE_FIELDS:
+                model_id = f"runtime-{operation}-{invalid_kind}-{field}"
+                valid = self._model_body(provider="custom", model_id=model_id)
+                if operation == "update":
+                    created = client.post("/models", json=valid)
+                    assert created.status_code == 200, created.text
+
+                invalid = dict(valid)
+                if invalid_kind == "missing":
+                    invalid.pop(field)
+                else:
+                    invalid[field] = invalid_value
+                if invalid_kind in {"nan", "infinity"}:
+                    raw_json = json.dumps(
+                        invalid,
+                        allow_nan=True,
+                        separators=(",", ":"),
+                    ).encode()
+                    expected_token = b"NaN" if invalid_kind == "nan" else b"Infinity"
+                    assert expected_token in raw_json
+                    response = client.post(
+                        "/models",
+                        content=raw_json,
+                        headers={"Content-Type": "application/json"},
+                    )
+                else:
+                    response = client.post("/models", json=invalid)
+                assert response.status_code == 422, (
+                    operation,
+                    invalid_kind,
+                    field,
+                    response.text,
+                )
+
+                stored = app.state.agents.get_model(model_id)
+                if operation == "create":
+                    assert stored is None
+                else:
+                    assert stored is not None
+                    assert tuple(stored[name] for name in self._RATE_FIELDS) == (
+                        1.0,
+                        2.0,
+                        0.25,
+                        1.25,
+                        2.0,
+                    )
+
+    def test_create_and_update_accept_ints_and_finite_non_negative_floats(
+        self,
+        tmp_path,
+    ):
+        app = self._make_app(tmp_path)
+        model_id = "runtime-valid-numeric-rates"
+        with TestClient(app) as client:
+            created = client.post(
+                "/models",
+                json={
+                    "provider": "custom",
+                    "model_id": model_id,
+                    "input_price": 1,
+                    "output_price": 2,
+                    "cached_input_price": 0,
+                    "cache_write_5m_price": 3,
+                    "cache_write_1h_price": 4,
+                },
+            )
+            assert created.status_code == 200, created.text
+            updated = client.post(
+                "/models",
+                json={
+                    "provider": "custom",
+                    "model_id": model_id,
+                    "input_price": 0.5,
+                    "output_price": 2.5,
+                    "cached_input_price": 0.125,
+                    "cache_write_5m_price": 0.0,
+                    "cache_write_1h_price": 3.75,
+                },
+            )
+            assert updated.status_code == 200, updated.text
+            assert tuple(updated.json()[field] for field in self._RATE_FIELDS) == (
+                0.5,
+                2.5,
+                0.125,
+                0.0,
+                3.75,
+            )
