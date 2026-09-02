@@ -219,7 +219,7 @@ from pinky_daemon.store_snapshot import (
     StoreSnapshotSelectionError,
     StoreSnapshotService,
 )
-from pinky_daemon.streaming_session import _1M_MODELS, is_1m_model
+from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
 
 # Alias: pinky_daemon.sessions.SessionState (imported above) is the
@@ -539,17 +539,6 @@ PRIORITY_LEVELS = Literal[0, 1, 2]
 
 
 # ── Agent Models ─────────────────────────────────────────────
-
-
-def _refresh_1m_models(registry) -> None:
-    """Refresh the 1M model set from the registry."""
-    global _1M_MODELS
-    try:
-        db_set = registry.get_1m_models()
-        if db_set:
-            _1M_MODELS = db_set
-    except Exception:
-        pass  # Keep fallback
 
 
 _GRANDFATHER_MARKER = "migration:grandfather_approved_users"
@@ -1925,7 +1914,6 @@ def create_api(
     app.state.tenant_store_catalogs = tenant_store_catalogs
     app.state.store_catalog = store_catalog
     _run_grandfather_approved_users_migration(store, agents)
-    _refresh_1m_models(agents)
     audit = AuditStore(db_path=store_manifest["audit"].path, catalog=store_catalog)
     app.state.audit = audit
     hooks = HookManager(audit_store=audit)
@@ -10405,13 +10393,13 @@ npm run build</pre>
         except Exception:
             pass
 
-        new_is_1m = is_1m_model(req.model, _1M_MODELS)
+        new_is_1m = is_1m_model(req.model)
         if old_max > 0:
             old_is_1m = old_max > 500_000  # Current window is 1M-class
         else:
             # Usage fetch failed: fall back to the configured model class so a
             # 1M -> 200k switch still forces the context-window restart.
-            old_is_1m = is_1m_model(ss._config.model or "", _1M_MODELS)
+            old_is_1m = is_1m_model(ss._config.model or "")
 
         needs_restart = new_is_1m != old_is_1m
 

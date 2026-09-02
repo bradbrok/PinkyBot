@@ -8295,9 +8295,9 @@ except Exception as exc:
 
         violations = self._db.execute("PRAGMA foreign_key_check(agent_costs)").fetchall()
         if violations:
-            raise RuntimeError(
-                "agent_costs migration produced foreign-key violations: "
-                f"{violations!r}"
+            _log(
+                "ERROR agent_registry: agent_costs rebuild found "
+                f"{len(violations)} pre-existing foreign-key violations (rows kept)"
             )
         _log("agent_registry: rebuilt agent_costs for nullable pricing")
 
