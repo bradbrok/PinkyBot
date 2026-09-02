@@ -566,6 +566,8 @@ def test_bound_absent_model_keeps_static_or_unknown_fallback(
         ("a[]", "a[]"),
         ("a[b]c]", "a[b]c]"),
         ("a[b][1m]", "a[b]"),
+        ("a[[b]", "a["),
+        ("a[[]", "a[[]"),
     ),
 )
 def test_strip_tier_preserves_last_non_empty_bracket_group_semantics(

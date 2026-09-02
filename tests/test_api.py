@@ -9575,3 +9575,80 @@ class TestRuntimeModelCatalogAPI:
                 0.0,
                 3.75,
             )
+
+    def test_nested_non_finite_validation_inputs_are_sanitized(self, tmp_path):
+        app = self._make_app(tmp_path)
+        with TestClient(app, raise_server_exceptions=False) as client:
+            nested_infinity = client.post(
+                "/models",
+                content=(
+                    b'{"provider":"custom","model_id":"runtime-nested-infinity",'
+                    b'"output_price":2.0,"cached_input_price":0.25,'
+                    b'"cache_write_5m_price":1.25,"cache_write_1h_price":2.0,'
+                    b'"extra":{"deep":[Infinity]}}'
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            assert nested_infinity.status_code == 422, nested_infinity.text
+            nested_detail = nested_infinity.json()["detail"]
+            assert any(
+                item["type"] == "missing"
+                and item["loc"] == ["body", "input_price"]
+                for item in nested_detail
+            )
+            assert all("input" not in item for item in nested_detail)
+
+            nan_and_missing = client.post(
+                "/models",
+                content=(
+                    b'{"provider":"custom","model_id":"runtime-nan-and-missing",'
+                    b'"input_price":NaN,"cached_input_price":0.25,'
+                    b'"cache_write_5m_price":1.25,"cache_write_1h_price":2.0}'
+                ),
+                headers={"Content-Type": "application/json"},
+            )
+            assert nan_and_missing.status_code == 422, nan_and_missing.text
+            combined_detail = nan_and_missing.json()["detail"]
+            assert {item["type"] for item in combined_detail} >= {
+                "finite_number",
+                "missing",
+            }
+            assert all("input" not in item for item in combined_detail)
+
+    def test_cost_callback_adapter_forwards_pricing_error(self, tmp_path):
+        async def fake_connect(self):
+            from pinky_daemon.transport_state import SessionState
+
+            self._state_machine._state = SessionState.CONNECTED
+
+        agent_name = "r2-cost-adapter"
+        marker = "anthropic/some-model is inactive"
+        with patch(
+            "pinky_daemon.streaming_session.StreamingSession.connect",
+            new=fake_connect,
+        ):
+            app = self._make_app(tmp_path)
+            with TestClient(app) as client:
+                created = client.post(
+                    "/agents",
+                    json={"name": agent_name, "model": "sonnet"},
+                )
+                assert created.status_code == 200, created.text
+                woken = client.post(f"/agents/{agent_name}/wake?prompt=Wake")
+                assert woken.status_code == 200, woken.text
+
+                session = app.state.broker._streaming[agent_name]["main"]
+                session._cost_callback(
+                    agent_name,
+                    None,
+                    10_000,
+                    500,
+                    "",
+                    pricing_error=marker,
+                )
+                row = app.state.agents._db.execute(
+                    "SELECT cost_usd, input_tokens, output_tokens, pricing_error "
+                    "FROM agent_costs WHERE agent_name=?",
+                    (agent_name,),
+                ).fetchone()
+                assert tuple(row) == (None, 10_000, 500, marker)
