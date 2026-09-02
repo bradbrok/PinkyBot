@@ -2092,10 +2092,10 @@ class TestAgentIsolationScoping:
             client.close()
             os.unlink(path)
 
-    def test_agent_originated_tool_upgrade_keeps_peer_grant_live(
+    def test_agent_originated_tool_upgrade_is_frozen_after_peer_assignment(
         self, monkeypatch, tmp_path
     ):
-        """DOCUMENTS #638: verified peer grants are not revoked by PR-A."""
+        """A peer assignment freezes later catalog mutation by the author."""
         client, path = self._make_skill_catalog_client(monkeypatch, tmp_path)
         skill_name = "peer-grant-upgrade"
         try:
@@ -2117,8 +2117,15 @@ class TestAgentIsolationScoping:
             assert before_assignment is not None
             assert before_assignment["assigned_by"] == "other"
             assert before_assignment["effective_enabled"] is True
-            before_apply = self._apply_snapshot(client, "tenant")
-            assert self._MINT_TOOL_PATTERN not in before_apply["tool_patterns"]
+            before_catalog = self._catalog_skill(client, "other", skill_name)
+            before_materialized = skill_routes._skills.materialize_for_agent("tenant")
+            before_warnings: list[str] = []
+            before_effective = filter_skill_tool_grants(
+                before_materialized["tool_grants"],
+                agent_name="tenant",
+                warn=before_warnings.append,
+            )
+            assert self._MINT_TOOL_PATTERN not in before_effective
 
             updated = self._signed_request(
                 client,
@@ -2128,7 +2135,9 @@ class TestAgentIsolationScoping:
                 {"tool_patterns": [self._MINT_TOOL_PATTERN]},
             )
 
-            assert updated.status_code == 200, updated.text
+            assert updated.status_code == 403, updated.text
+            assert updated.json()["detail"] == "skill assigned to another agent"
+            assert self._catalog_skill(client, "other", skill_name) == before_catalog
             after_assignment = self._assigned_skill(
                 client,
                 "tenant",
@@ -2136,13 +2145,18 @@ class TestAgentIsolationScoping:
                 caller="other",
                 enabled_only=False,
             )
-            assert after_assignment is not None
-            assert after_assignment["assigned_by"] == "other"
-            assert after_assignment["agent_enabled"] is True
-            assert after_assignment["effective_enabled"] is True
-            assert self._MINT_TOOL_PATTERN in self._apply_snapshot(
-                client, "tenant"
-            )["tool_patterns"]
+            assert after_assignment == before_assignment
+            after_materialized = skill_routes._skills.materialize_for_agent("tenant")
+            after_warnings: list[str] = []
+            after_effective = filter_skill_tool_grants(
+                after_materialized["tool_grants"],
+                agent_name="tenant",
+                warn=after_warnings.append,
+            )
+            assert after_materialized == before_materialized
+            assert after_effective == before_effective
+            assert self._MINT_TOOL_PATTERN not in after_effective
+            assert after_warnings == before_warnings
         finally:
             client.close()
             os.unlink(path)
