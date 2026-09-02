@@ -81,6 +81,7 @@ from pinky_daemon.command_runner import (
 )
 from pinky_daemon.effort import EFFORT_LEVELS, is_ultracode, resolve_cli_effort
 from pinky_daemon.pricing import compute_cost_from_usage
+from pinky_daemon.runtime_model_catalog import ModelCatalogError
 from pinky_daemon.sessions import SessionUsage
 from pinky_daemon.streaming_session import (
     StreamingSessionConfig,
@@ -5811,12 +5812,25 @@ class TmuxSession(TransportReplacementMixin):
         except (TypeError, ValueError):
             input_tokens = output_tokens = cached_input_tokens = 0
 
-        cost_usd = 0.0
+        cost_usd: float | None = 0.0
+        pricing_error = ""
         try:
             cost_usd = compute_cost_from_usage(model, u)
+        except ModelCatalogError as exc:
+            cost_usd = None
+            pricing_error = str(exc)
+            _log(
+                f"ERROR tmux[{self.agent_name}]: model pricing unavailable: "
+                f"{pricing_error}"
+            )
         except Exception as e:  # pragma: no cover - defensive
             _log(f"tmux[{self.agent_name}]: turn cost compute failed: {e}")
-        if model and cost_usd == 0.0 and (input_tokens or output_tokens):
+        if (
+            not pricing_error
+            and model
+            and cost_usd == 0.0
+            and (input_tokens or output_tokens)
+        ):
             # Non-empty turn but zero cost ⇒ no rate row for this model.
             # Surface once so a new model id gets added to the table.
             _log(
@@ -5828,13 +5842,20 @@ class TmuxSession(TransportReplacementMixin):
             self.usage.total_cost_usd += cost_usd
         if self._cost_callback:
             try:
-                self._cost_callback(
+                callback_args = (
                     self.agent_name,
                     cost_usd,
                     input_tokens,
                     output_tokens,
                     self.resume_handle or "",
                 )
+                if pricing_error:
+                    self._cost_callback(
+                        *callback_args,
+                        pricing_error=pricing_error,
+                    )
+                else:
+                    self._cost_callback(*callback_args)
             except Exception as e:
                 _log(f"tmux[{self.agent_name}]: cost callback error: {e}")
 
@@ -5855,6 +5876,7 @@ class TmuxSession(TransportReplacementMixin):
                     output_tokens=output_tokens,
                     cached_input_tokens=cached_input_tokens,
                     error=False,
+                    pricing_error=pricing_error,
                 )
             except Exception as e:
                 _log(f"tmux[{self.agent_name}]: analytics usage failed: {e}")

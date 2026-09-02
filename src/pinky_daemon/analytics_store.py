@@ -6,6 +6,13 @@ import sqlite3
 from contextlib import contextmanager
 from datetime import UTC, datetime, timedelta
 
+from pinky_daemon.pricing import RATE_TABLE
+from pinky_daemon.runtime_model_catalog import (
+    ModelCatalogError,
+    ModelCatalogReadError,
+    lookup_model,
+    strip_tier,
+)
 from pinky_daemon.store_catalog import StoreCatalog, open_store_connection
 
 # Providers to include in analytics dashboards.
@@ -127,6 +134,7 @@ class AnalyticsStore:
                   output_tokens INTEGER NOT NULL DEFAULT 0,
                   cached_input_tokens INTEGER NOT NULL DEFAULT 0,
                   error INTEGER NOT NULL DEFAULT 0,
+                  pricing_error TEXT NOT NULL DEFAULT '',
                   source_event_id TEXT,
                   UNIQUE(session_id, turn_seq)
                 );
@@ -243,6 +251,11 @@ class AnalyticsStore:
                 conn.execute(
                     "ALTER TABLE analytics_turn_usage ADD COLUMN user_message_snippet TEXT"
                 )
+            if "pricing_error" not in cols:
+                conn.execute(
+                    "ALTER TABLE analytics_turn_usage "
+                    "ADD COLUMN pricing_error TEXT NOT NULL DEFAULT ''"
+                )
             # Schema migration: add status enum to tool_calls
             tc_cols = {
                 r[1] for r in conn.execute("PRAGMA table_info(analytics_tool_calls)").fetchall()
@@ -275,43 +288,28 @@ class AnalyticsStore:
                     owner=type(self).__name__,
                 )
 
-    # Pricing rows added AFTER the original seed batch. _seed_default_pricing
-    # only fires on an empty table, so these reach already-seeded production
-    # DBs via the idempotent _ensure_pricing_rows below (insert-if-absent,
-    # never clobbering an operator-set price). Verified official 2026 rates.
-    _LATEST_PRICING_ADDITIONS = [
-        ("openai", "gpt-5.5", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
-        ("openai", "gpt-5.3-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
-        # gpt-5.6-sol (#860): codex fleet model since 2026-07-09. Official
-        # rates identical to gpt-5.5 (developers.openai.com, verified
-        # 2026-07-10). Mirrors pricing.RATE_TABLE (_GPT_FRONTIER), parity-pinned
-        # by test_seed_pricing_matches_rate_table.
-        ("openai", "gpt-5.6-sol", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
-        # gpt-daybreak-blue-latest: Daybreak Access alias currently pointing
-        # to gpt-5.6-sol — rates mirror sol / pricing.RATE_TABLE, parity-
-        # pinned by test_seed_pricing_matches_rate_table. Re-verify when
-        # OpenAI repoints the alias.
-        ("openai", "gpt-daybreak-blue-latest", "2020-01-01T00:00:00Z", None, 5.00, 30.00, 0.50, "seed"),
-        # Sonnet 5 (2026-06): the current Sonnet tier. Standard $3/$15 (cached
-        # $0.30) — mirrors pinky_daemon.pricing.RATE_TABLE (_SONNET), pinned by
-        # test_seed_pricing_matches_rate_table. Introductory $2/$10 runs through
-        # 2026-08-31, then reverts; we seed the durable standard rate (see the
-        # RATE_TABLE comment for the rationale).
-        ("anthropic", "claude-sonnet-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-        # Opus 5 (2026-07-24): same durable $5/$25 standard tier as Opus 4.8.
-        ("anthropic", "claude-opus-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
-        # Fable / Mythos 5.1 (2026-09-01): same $10/$50 as Fable 5, cache reads
-        # 4× cheaper ($0.25). Mirrors pricing.RATE_TABLE (_FABLE_51), parity-
-        # pinned by test_seed_pricing_matches_rate_table.
-        ("anthropic", "claude-fable-5-1", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 0.25, "seed"),
-        ("anthropic", "claude-mythos-5-1", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 0.25, "seed"),
-    ]
+    @staticmethod
+    def _current_pricing_rows() -> list[tuple]:
+        """Derive current Analytics seed rows from the canonical rate table."""
+        return [
+            (
+                "anthropic" if model.startswith("claude-") else "openai",
+                model,
+                "2020-01-01T00:00:00Z",
+                None,
+                rate["input"],
+                rate["output"],
+                rate["cache_read"],
+                "seed",
+            )
+            for model, rate in RATE_TABLE.items()
+        ]
 
     def _seed_default_pricing(self, conn) -> None:
         row = conn.execute("SELECT COUNT(*) AS count FROM analytics_model_pricing").fetchone()
         if row and row["count"]:
             return
-        seed_rows = [
+        legacy_rows = [
             # OpenAI / Codex-family defaults seeded with current official rates.
             ("openai", "gpt-5", "2020-01-01T00:00:00Z", None, 1.25, 10.00, 0.125, "seed"),
             ("openai", "gpt-5-chat-latest", "2020-01-01T00:00:00Z", None, 1.25, 10.00, 0.125, "seed"),
@@ -325,31 +323,10 @@ class AnalyticsStore:
             ("openai", "gpt-5.2", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             ("openai", "gpt-5.2-chat-latest", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
             ("openai", "gpt-5.2-codex", "2020-01-01T00:00:00Z", None, 1.75, 14.00, 0.175, "seed"),
-            # Anthropic defaults seeded for future provider expansion.
-            # NOTE: these rates must mirror pinky_daemon.pricing.RATE_TABLE — the
-            # live per-turn cost path reads that table, this Analytics path reads
-            # this seed, and the two must agree on the same turn's dollar figure.
-            # test_seed_pricing_matches_rate_table pins them together (#669).
-            ("anthropic", "claude-fable-5", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 1.00, "seed"),
-            ("anthropic", "claude-mythos-5", "2020-01-01T00:00:00Z", None, 10.00, 50.00, 1.00, "seed"),
-            # Opus 4.5+ is the standard $5/$25 tier (flat across 4.5→4.8), not the
-            # pre-4.5 legacy $15/$75 tier. Mispriced as legacy until #669.
-            ("anthropic", "claude-opus-4-8", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
-            ("anthropic", "claude-opus-4-7", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
-            ("anthropic", "claude-opus-4-6", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
-            ("anthropic", "claude-opus-4-5", "2020-01-01T00:00:00Z", None, 5.00, 25.00, 0.50, "seed"),
-            # Pre-4.5 Opus stays on the legacy $15/$75 tier.
-            ("anthropic", "claude-opus-4-1", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
-            ("anthropic", "claude-opus-4", "2020-01-01T00:00:00Z", None, 15.00, 75.00, 1.50, "seed"),
-            ("anthropic", "claude-sonnet-4-6", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            ("anthropic", "claude-sonnet-4-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            ("anthropic", "claude-sonnet-4", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
+            # Historical rows absent from the current runtime table remain
+            # available only as effective-date fallbacks.
             ("anthropic", "claude-sonnet-3-7", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
             ("anthropic", "claude-sonnet-3-5", "2020-01-01T00:00:00Z", None, 3.00, 15.00, 0.30, "seed"),
-            # Haiku 4.5 is the $1/$5 tier; 0.80/4.00/0.08 was the old Haiku 3.5
-            # price. Corrected in #669.
-            ("anthropic", "claude-haiku-4-5", "2020-01-01T00:00:00Z", None, 1.00, 5.00, 0.10, "seed"),
-            ("anthropic", "claude-haiku-3-5", "2020-01-01T00:00:00Z", None, 0.80, 4.00, 0.08, "seed"),
             ("anthropic", "claude-haiku-3", "2020-01-01T00:00:00Z", None, 0.25, 1.25, 0.03, "seed"),
         ]
         conn.executemany(
@@ -359,7 +336,7 @@ class AnalyticsStore:
               input_usd_per_mtok, output_usd_per_mtok, cached_input_usd_per_mtok, notes
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
-            seed_rows + self._LATEST_PRICING_ADDITIONS,
+            legacy_rows + self._current_pricing_rows(),
         )
 
     def _migrate_opus_haiku_seed_pricing(self, conn) -> None:
@@ -486,15 +463,13 @@ class AnalyticsStore:
             self._pricing_cache = None
 
     def _ensure_pricing_rows(self, conn) -> None:
-        """Idempotently backfill pricing rows added after the initial seed.
+        """Idempotently backfill current canonical pricing rows.
 
-        ``_seed_default_pricing`` only populates an empty table, so models
-        introduced in later releases (e.g. gpt-5.5) never reach an
-        already-seeded production DB through it. Insert each addition only
-        when no row exists for that (provider, model) — never overrides an
-        operator-set or already-present price.
+        ``_seed_default_pricing`` only populates an empty table. Insert each
+        current row when absent, without replacing operator or historical
+        effective-date rows.
         """
-        for r in self._LATEST_PRICING_ADDITIONS:
+        for row in self._current_pricing_rows():
             conn.execute(
                 """
                 INSERT INTO analytics_model_pricing (
@@ -508,7 +483,7 @@ class AnalyticsStore:
                   WHERE provider = ? AND model = ?
                 )
                 """,
-                (*r, r[0], r[1]),
+                (*row, row[0], row[1]),
             )
 
     def _migrate_codex_provider_attribution(self, conn) -> None:
@@ -638,6 +613,7 @@ class AnalyticsStore:
         source_event_id: str = "",
         ts: str | None = None,
         user_message_snippet: str = "",
+        pricing_error: str = "",
     ) -> None:
         when = ts or _utcnow()
         # Truncate snippet to 500 chars to keep DB lean
@@ -648,8 +624,8 @@ class AnalyticsStore:
                 INSERT INTO analytics_turn_usage (
                   session_id, agent_name, turn_seq, ts, provider, model,
                   input_tokens, output_tokens, cached_input_tokens, error,
-                  source_event_id, user_message_snippet
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                  source_event_id, user_message_snippet, pricing_error
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(session_id, turn_seq) DO UPDATE SET
                   ts=excluded.ts,
                   provider=excluded.provider,
@@ -659,7 +635,8 @@ class AnalyticsStore:
                   cached_input_tokens=excluded.cached_input_tokens,
                   error=excluded.error,
                   source_event_id=excluded.source_event_id,
-                  user_message_snippet=excluded.user_message_snippet
+                  user_message_snippet=excluded.user_message_snippet,
+                  pricing_error=excluded.pricing_error
                 """,
                 (
                     session_id,
@@ -674,6 +651,7 @@ class AnalyticsStore:
                     1 if error else 0,
                     source_event_id or None,
                     snippet or None,
+                    pricing_error,
                 ),
             )
             self._mark_dirty(conn, agent_name=agent_name, ts=when, reason="turn_usage")
@@ -887,7 +865,8 @@ class AnalyticsStore:
             totals_map["input_tokens"] += int(row["input_tokens"])
             totals_map["output_tokens"] += int(row["output_tokens"])
             totals_map["cached_input_tokens"] += int(row["cached_input_tokens"])
-            totals_map["cost_usd"] += cost_usd
+            if cost_usd is not None:
+                totals_map["cost_usd"] += cost_usd
             session_ids.add(row["session_id"])
             bucket = row["ts"][:10]
             bucket_row = trend_map.setdefault(
@@ -898,13 +877,15 @@ class AnalyticsStore:
                     "sessions": set(),
                 },
             )
-            bucket_row["cost_usd"] += cost_usd
+            if cost_usd is not None:
+                bucket_row["cost_usd"] += cost_usd
             bucket_row["input_tokens"] += int(row["input_tokens"])
             bucket_row["output_tokens"] += int(row["output_tokens"])
             bucket_row["cached_input_tokens"] += int(row["cached_input_tokens"])
             bucket_row["sessions"].add(row["session_id"])
             agent_row = agent_map.setdefault(row["agent_name"], {"agent_name": row["agent_name"], "cost_usd": 0.0, "total_tokens": 0})
-            agent_row["cost_usd"] += cost_usd
+            if cost_usd is not None:
+                agent_row["cost_usd"] += cost_usd
             agent_row["total_tokens"] += int(row["input_tokens"]) + int(row["output_tokens"]) + int(row["cached_input_tokens"])
         active_seconds = self._compute_active_seconds(range_name=range_name)
 
@@ -916,7 +897,9 @@ class AnalyticsStore:
             "cost_usd": 0.0, "sessions": set(), "agents": set(),
         }
         for row in prev_rows:
-            prev_totals["cost_usd"] += self._compute_usage_cost(row)
+            cost_usd = self._compute_usage_cost(row)
+            if cost_usd is not None:
+                prev_totals["cost_usd"] += cost_usd
             prev_totals["input_tokens"] += int(row["input_tokens"])
             prev_totals["output_tokens"] += int(row["output_tokens"])
             prev_totals["cached_input_tokens"] += int(row["cached_input_tokens"])
@@ -984,7 +967,9 @@ class AnalyticsStore:
                     "turns_count": 0,
                 },
             )
-            entry["cost_usd"] += self._compute_usage_cost(row)
+            cost_usd = self._compute_usage_cost(row)
+            if cost_usd is not None:
+                entry["cost_usd"] += cost_usd
             entry["input_tokens"] += int(row["input_tokens"])
             entry["output_tokens"] += int(row["output_tokens"])
             entry["cached_input_tokens"] += int(row["cached_input_tokens"])
@@ -1022,7 +1007,8 @@ class AnalyticsStore:
         trend_map: dict[str, dict] = {}
         for row in usage_rows:
             cost_usd = self._compute_usage_cost(row)
-            totals_map["cost_usd"] += cost_usd
+            if cost_usd is not None:
+                totals_map["cost_usd"] += cost_usd
             totals_map["input_tokens"] += int(row["input_tokens"])
             totals_map["output_tokens"] += int(row["output_tokens"])
             totals_map["cached_input_tokens"] += int(row["cached_input_tokens"])
@@ -1033,7 +1019,8 @@ class AnalyticsStore:
                 bucket,
                 {"bucket": bucket, "cost_usd": 0.0, "input_tokens": 0, "output_tokens": 0, "cached_input_tokens": 0},
             )
-            bucket_row["cost_usd"] += cost_usd
+            if cost_usd is not None:
+                bucket_row["cost_usd"] += cost_usd
             bucket_row["input_tokens"] += int(row["input_tokens"])
             bucket_row["output_tokens"] += int(row["output_tokens"])
             bucket_row["cached_input_tokens"] += int(row["cached_input_tokens"])
@@ -1302,7 +1289,8 @@ class AnalyticsStore:
         usage_query = f"""
             SELECT u.session_id, u.agent_name, u.turn_seq, u.ts,
                    u.input_tokens, u.output_tokens, u.cached_input_tokens,
-                   u.provider, u.model, u.user_message_snippet
+                   u.provider, u.model, u.user_message_snippet,
+                   u.pricing_error
             FROM analytics_turn_usage u
             WHERE u.ts >= ? AND u.ts <= ?
               AND u.provider IN ({provider_placeholders})
@@ -1383,7 +1371,9 @@ class AnalyticsStore:
             entry["input_tokens"] += int(turn["input_tokens"])
             entry["output_tokens"] += int(turn["output_tokens"])
             entry["cached_input_tokens"] += int(turn["cached_input_tokens"])
-            entry["cost_usd"] += self._compute_usage_cost(turn)
+            cost_usd = self._compute_usage_cost(turn)
+            if cost_usd is not None:
+                entry["cost_usd"] += cost_usd
             entry["turns"] += 1
 
         result = sorted(
@@ -1521,7 +1511,8 @@ class AnalyticsStore:
         costed_only: bool = True,
     ) -> list[sqlite3.Row]:
         query = """
-            SELECT session_id, agent_name, ts, provider, model, input_tokens, output_tokens, cached_input_tokens
+            SELECT session_id, agent_name, ts, provider, model, input_tokens,
+                   output_tokens, cached_input_tokens, pricing_error
             FROM analytics_turn_usage
             WHERE ts >= ? AND ts <= ?
         """
@@ -1537,14 +1528,48 @@ class AnalyticsStore:
         with self._connect() as conn:
             return conn.execute(query, params).fetchall()
 
-    def _compute_usage_cost(self, row: sqlite3.Row) -> float:
+    def _compute_usage_cost(self, row: sqlite3.Row) -> float | None:
+        if "pricing_error" in row.keys() and row["pricing_error"]:
+            return None
+        model_id = strip_tier(row["model"])
+        provider = self._provider_alias(row["provider"])
+        try:
+            runtime_model = lookup_model(model_id)
+        except ModelCatalogReadError:
+            runtime_model = None
+        except ModelCatalogError:
+            return None
+        runtime_rate = None
+        if runtime_model is not None:
+            if runtime_model.get("provider") == provider:
+                runtime_rate = {
+                    "input": float(runtime_model["input_price"]),
+                    "output": float(runtime_model["output_price"]),
+                    "cache_read": float(runtime_model["cached_input_price"]),
+                }
+        else:
+            static_provider = "anthropic" if model_id.startswith("claude-") else "openai"
+            if static_provider == provider:
+                runtime_rate = RATE_TABLE.get(model_id)
+        if runtime_rate is not None:
+            input_cost = (
+                int(row["input_tokens"]) / 1_000_000
+            ) * runtime_rate["input"]
+            output_cost = (
+                int(row["output_tokens"]) / 1_000_000
+            ) * runtime_rate["output"]
+            cached_cost = (
+                int(row["cached_input_tokens"]) / 1_000_000
+            ) * runtime_rate["cache_read"]
+            return input_cost + output_cost + cached_cost
+
         pricing = self._lookup_pricing(
             provider=row["provider"],
             model=row["model"],
             ts=row["ts"],
         )
         if not pricing:
-            return 0.0
+            return None
         input_cost = (int(row["input_tokens"]) / 1_000_000) * float(pricing["input_usd_per_mtok"])
         output_cost = (int(row["output_tokens"]) / 1_000_000) * float(pricing["output_usd_per_mtok"])
         cached_cost = (int(row["cached_input_tokens"]) / 1_000_000) * float(pricing["cached_input_usd_per_mtok"])

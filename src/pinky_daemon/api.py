@@ -52,6 +52,7 @@ from fastapi.responses import (
 )
 from fastapi.staticfiles import StaticFiles
 
+from pinky_daemon import runtime_model_catalog
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
@@ -1869,8 +1870,10 @@ def create_api(
         db_path=store_manifest["session_events"].path, catalog=store_catalog
     )
     store = ConversationStore(db_path=store_manifest["conversations"].path, catalog=store_catalog)
-    analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
     agents = AgentRegistry(db_path=store_manifest["agents"].path, catalog=store_catalog)
+    runtime_model_catalog.bind_registry(agents)
+    runtime_model_catalog.warm()
+    analytics = AnalyticsStore(db_path=store_manifest["analytics"].path, catalog=store_catalog)
     tenant_store_catalogs: dict[str, StoreCatalog] = {}
     tenant_catalog: StoreCatalog | None = None
     try:
@@ -2783,13 +2786,22 @@ def create_api(
 
     def _make_cost_callback(registry):
         """Create a sync callback to persist per-turn cost data and fire cost milestones."""
-        def _record_cost(agent_name, cost_usd, input_tokens, output_tokens, session_id):
+        def _record_cost(
+            agent_name,
+            cost_usd,
+            input_tokens,
+            output_tokens,
+            session_id,
+            *,
+            pricing_error="",
+        ):
             registry.record_cost(
                 agent_name,
                 cost_usd,
                 input_tokens,
                 output_tokens,
                 session_id=session_id,
+                pricing_error=pricing_error,
             )
             # Check cost milestones for this session
             sessions_map = broker._streaming.get(agent_name, {})
