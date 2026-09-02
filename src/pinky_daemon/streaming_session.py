@@ -64,8 +64,13 @@ def is_1m_model(model_id: str, model_set: "set[str] | None" = None) -> bool:
     their DB-refreshed set.
     """
     from pinky_daemon.pricing import strip_tier
+    from pinky_daemon.runtime_model_catalog import get_1m_models
+
     base = strip_tier(model_id or "")
-    return base in (_1M_MODELS if model_set is None else model_set)
+    if model_set is not None:
+        return base in model_set
+    runtime_models = get_1m_models()
+    return base in (_1M_MODELS if runtime_models is None else runtime_models)
 
 
 DEFAULT_STREAMING_ALLOWED_TOOLS = [
