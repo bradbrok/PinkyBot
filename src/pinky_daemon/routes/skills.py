@@ -79,6 +79,21 @@ def _reject_if_core(name: str, action: str) -> None:
         raise HTTPException(400, f"Cannot {action} core skill '{name}'")
 
 
+def _contained_scan_root(base: Path, subdir: str) -> Path:
+    """Return base/subdir, refusing anything that escapes base lexically or via symlinks."""
+    resolved_base = base.resolve()
+    if not subdir:
+        return resolved_base
+    base_str = str(resolved_base)
+    candidate = os.path.normpath(os.path.join(base_str, subdir))
+    if not candidate.startswith(base_str + os.sep):
+        raise HTTPException(400, "Invalid subdirectory")
+    scan_root = Path(candidate).resolve()
+    if not scan_root.is_relative_to(resolved_base):
+        raise HTTPException(400, "Invalid subdirectory")
+    return scan_root
+
+
 def _reject_agent_catalog_overwrite(name: str, internal_caller: str) -> None:
     """Keep signed catalog writes from replacing operator-owned rows."""
     if not internal_caller:
@@ -529,12 +544,7 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         except sp.TimeoutExpired as e:
             raise HTTPException(504, "Git clone timed out") from e
 
-        resolved_staging_dir = staging_dir.resolve()
-        staging_scan_root = (
-            (staging_dir / subdir).resolve() if subdir else resolved_staging_dir
-        )
-        if not staging_scan_root.is_relative_to(resolved_staging_dir):
-            raise HTTPException(400, "Invalid subdirectory")
+        staging_scan_root = _contained_scan_root(staging_dir, subdir)
         if not staging_scan_root.is_dir():
             raise HTTPException(400, f"Subdirectory '{subdir}' not found in cloned repo")
         staged_skills = scan_skills_directory(staging_scan_root)
@@ -551,12 +561,7 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
         staging_dir.rename(target_dir)
         promoted = True
 
-        resolved_target_dir = target_dir.resolve()
-        final_scan_root = (
-            (target_dir / subdir).resolve() if subdir else resolved_target_dir
-        )
-        if not final_scan_root.is_relative_to(resolved_target_dir):
-            raise HTTPException(400, "Invalid subdirectory")
+        final_scan_root = _contained_scan_root(target_dir, subdir)
         found = scan_skills_directory(final_scan_root)
         if not found:
             raise HTTPException(400, "Promoted repository contains no readable skills")
