@@ -8,6 +8,7 @@ newest source actually included in the prompt.
 
 from __future__ import annotations
 
+import json
 import time
 
 import pytest
@@ -22,10 +23,12 @@ class _StubSDKRunner:
 
     result = None
     prompts: list = []
+    last_config = None
 
     def __init__(self, config, agent_name=""):
         self.config = config
         self.agent_name = agent_name
+        type(self).last_config = config
 
     async def run(self, prompt):
         type(self).prompts.append(prompt)
@@ -51,6 +54,7 @@ def runner(kb, tmp_path):
 @pytest.fixture
 def stub_sdk(monkeypatch):
     _StubSDKRunner.prompts = []
+    _StubSDKRunner.last_config = None
     monkeypatch.setattr("pinky_daemon.librarian_runner.SDKRunner", _StubSDKRunner)
     return _StubSDKRunner
 
@@ -141,3 +145,39 @@ class TestLibrarianTruncationWatermark:
         assert stats["source_ids"] == [big.id]
         assert runner._get_last_run_at("ivan") == big.filed_at
         assert runner.has_new_sources("ivan") is False
+
+
+class TestLibrarianMcpServersWiring:
+    """Without an explicit mcp_servers config, SDKRunner never forwards it to
+    the SDK's ClaudeAgentOptions (it only sets the attribute when the dict is
+    truthy) — so the librarian session needs to load .mcp.json itself, the
+    same fallback streaming_session.py uses. Regression coverage: a librarian
+    session with an empty mcp_servers dict has zero MCP tools available, so
+    it can never call kb_search / kb_save_wiki / etc.
+    """
+
+    @pytest.mark.asyncio
+    async def test_loads_mcp_servers_from_mcp_json(self, kb, runner, tmp_path, stub_sdk):
+        fake_servers = {"pinky-self": {"type": "sse", "url": "http://x"}}
+        (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": fake_servers}))
+
+        kb.ingest(title="Note", content="hello world", filed_by="brad")
+        cfg = _AgentConfig(str(tmp_path))
+        stub_sdk.result = RunResult(output="Curated.", exit_code=0)
+
+        await runner.run("ivan", cfg)
+
+        assert stub_sdk.last_config is not None
+        assert stub_sdk.last_config.mcp_servers == fake_servers
+
+    @pytest.mark.asyncio
+    async def test_no_mcp_json_yields_empty_mcp_servers(self, kb, runner, tmp_path, stub_sdk):
+        # No .mcp.json written into the working dir.
+        kb.ingest(title="Note", content="hello world", filed_by="brad")
+        cfg = _AgentConfig(str(tmp_path))
+        stub_sdk.result = RunResult(output="Curated.", exit_code=0)
+
+        await runner.run("ivan", cfg)
+
+        assert stub_sdk.last_config is not None
+        assert not stub_sdk.last_config.mcp_servers
