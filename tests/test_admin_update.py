@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+import sqlite3
 import subprocess as sp
 import sys
 import tempfile
@@ -13,6 +14,7 @@ import pytest
 from fastapi.testclient import TestClient
 
 from pinky_daemon.self_update import DeployDecision
+from pinky_daemon.store_catalog import DaemonStoreCatalog, StoreCatalog, StoreIntegrityTarget
 
 _REAL_PATH_EXISTS = Path.exists
 
@@ -38,6 +40,26 @@ def _make_client():
     os.close(fd)
     app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=path)
     return TestClient(app)
+
+
+def _make_private_client(tmp_path: Path, *, seed_wal: bool = False) -> tuple[TestClient, Path]:
+    from pinky_daemon.api import create_api
+
+    data_dir = Path(tempfile.mkdtemp(prefix="pinky-update-preflight-", dir=tmp_path))
+    data_dir.chmod(0o700)
+    db_path = data_dir / "conversations.db"
+    if seed_wal:
+        connection = sqlite3.connect(db_path)
+        try:
+            assert connection.execute("PRAGMA journal_mode=wal").fetchone() == ("wal",)
+            connection.execute("CREATE TABLE seed (value TEXT NOT NULL)")
+            connection.execute("INSERT INTO seed VALUES ('ready')")
+            connection.commit()
+        finally:
+            connection.close()
+    app = create_api(max_sessions=10, default_working_dir="/tmp", db_path=os.fspath(db_path))
+    assert app.state.store_catalog.expected_root == os.path.realpath(data_dir)
+    return TestClient(app), data_dir
 
 
 class _GitMock:
@@ -268,6 +290,132 @@ class TestAdminUpdateBaseline:
         body = r.json()
         assert "error" in body
         assert "git checkout" in body["error"] and "failed" in body["error"]
+
+
+class TestAdminUpdateStoragePreflight:
+    def test_update_uses_exact_boot_verifier_for_every_catalog_and_dedupes_chains(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        real_verifier = DaemonStoreCatalog._verified_daemon_owned_path
+        phase = "boot"
+        calls: list[tuple[str, StoreCatalog, str]] = []
+
+        def shared_verifier(catalog: StoreCatalog, absolute_path: str) -> str:
+            calls.append(
+                (
+                    phase,
+                    catalog,
+                    os.path.dirname(os.path.realpath(absolute_path)),
+                )
+            )
+            return real_verifier(catalog, absolute_path)
+
+        monkeypatch.setattr(
+            DaemonStoreCatalog,
+            "_verified_daemon_owned_path",
+            shared_verifier,
+        )
+        client, data_dir = _make_private_client(tmp_path, seed_wal=True)
+        fleet_catalog = client.app.state.store_catalog
+        assert fleet_catalog._verified_daemon_owned_path.__func__ is shared_verifier
+        assert any(call_phase == "boot" for call_phase, _catalog, _path in calls)
+
+        tenant_root = data_dir / "tenant"
+        tenant_root.mkdir(mode=0o700)
+        tenant_manifest = {
+            "tenant_keys": StoreIntegrityTarget(
+                logical_name="tenant_keys",
+                path=os.fspath(tenant_root / "keys.db"),
+            ),
+            "tenant_alias": StoreIntegrityTarget(
+                logical_name="tenant_alias",
+                path=os.fspath(tenant_root / "alias.db"),
+            ),
+        }
+        tenant_catalog = StoreCatalog(
+            expected_root=tenant_root,
+            silence_allowlist={},
+            manifest=tenant_manifest,
+        )
+        client.app.state.tenant_store_catalogs["tenant"] = tenant_catalog
+        phase = "update"
+        gm = _GitMock(dirty_files=[])
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            response = client.post("/admin/update?branch=main")
+
+        assert response.status_code == 200
+        update_calls = [call for call in calls if call[0] == "update"]
+        assert any(catalog is fleet_catalog for _phase, catalog, _path in update_calls)
+        tenant_calls = [
+            path for _phase, catalog, path in update_calls if catalog is tenant_catalog
+        ]
+        assert tenant_calls == [os.path.realpath(tenant_root)]
+
+    def test_force_cannot_bypass_writable_storage_ancestor_preflight(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        client, data_dir = _make_private_client(tmp_path)
+        chmod_target = Path(client.app.state.store_catalog.expected_root)
+        assert chmod_target == data_dir.resolve()
+        assert os.path.commonpath((chmod_target, tmp_path.resolve())) == os.fspath(
+            tmp_path.resolve()
+        )
+
+        repo_root = Path(__file__).resolve().parents[1]
+        head_ref_output = sp.check_output(
+            ["git", "rev-parse", "--git-path", "HEAD"],
+            cwd=repo_root,
+            text=True,
+        ).strip()
+        head_ref = Path(head_ref_output)
+        if not head_ref.is_absolute():
+            head_ref = repo_root / head_ref
+        head_before = head_ref.read_bytes()
+
+        original_mode = chmod_target.stat().st_mode & 0o777
+        unsafe_mode = original_mode | 0o020
+        logs: list[str] = []
+        gm = _GitMock(dirty_files=["src/pinky_daemon/api.py"])
+        chmod_target.chmod(unsafe_mode)
+        try:
+            with (
+                patch("subprocess.check_output", side_effect=gm),
+                patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+                patch("pinky_daemon.api._log", side_effect=logs.append),
+                patch("shutil.which", return_value=None),
+                patch("os.kill"),
+            ):
+                response = client.post("/admin/update?branch=main&force=true")
+        finally:
+            chmod_target.chmod(original_mode)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "error": (
+                "storage ancestor preflight failed: "
+                f"path={os.fspath(chmod_target)!r} mode={unsafe_mode:04o}"
+            ),
+            "staying_on_version": "abc1234",
+            "preflight": {
+                "path": os.fspath(chmod_target),
+                "mode": f"{unsafe_mode:04o}",
+            },
+        }
+        assert head_ref.read_bytes() == head_before
+        assert not gm.did_force_reset()
+        assert not gm.did_deploy_checkout()
+        assert logs == [
+            "ERROR admin update refused by storage ancestor preflight: "
+            f"path={os.fspath(chmod_target)!r} mode={unsafe_mode:04o}; "
+            "staying on current release abc1234"
+        ]
 
     def test_successful_frontend_rebuild_writes_manifest_and_status(self):
         """When npm build succeeds, /admin/update writes and returns the build manifest."""
