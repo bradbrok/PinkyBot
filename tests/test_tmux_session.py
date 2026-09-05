@@ -20,7 +20,10 @@ import json as _json
 import os
 import re
 import shlex
+import threading
 import time as _time
+from collections.abc import Iterator
+from contextlib import contextmanager, nullcontext, suppress
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
@@ -29,6 +32,7 @@ import pytest
 
 from pinky_daemon import tmux_session
 from pinky_daemon.agent_registry import AgentRegistry
+from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.scheduler import AgentScheduler, ScheduleWakeReceipt
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
@@ -41,11 +45,60 @@ from pinky_daemon.tmux_session import (
 from pinky_daemon.tmux_transcript import TmuxTranscriptTailer, TurnResponse
 from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 
+_REAL_ASYNCIO_SLEEP = asyncio.sleep
+
 
 @pytest.fixture(autouse=True)
 def _skip_post_spawn_liveness_delay(monkeypatch) -> None:
     """Keep unit tests fast while preserving the production 150 ms gate."""
     monkeypatch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0)
+
+
+@pytest.fixture(autouse=True)
+def _global_asyncio_sleep_guard(monkeypatch) -> Iterator[None]:
+    """Check before monkeypatch teardown can hide a global sleep replacement."""
+    assert asyncio.sleep is _REAL_ASYNCIO_SLEEP
+    yield
+    assert asyncio.sleep is _REAL_ASYNCIO_SLEEP
+
+
+@pytest.fixture(autouse=True)
+def _isolate_spawn_cleanup_debt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(TmuxSession, "_spawn_cleanup_state_dir", lambda self: tmp_path)
+
+
+@contextmanager
+def _foreign_loop_sleeper() -> Iterator[None]:
+    """Run one sleep on another loop before allowing the test loop to proceed."""
+    loop = asyncio.new_event_loop()
+    entered = threading.Event()
+    errors: list[BaseException] = []
+
+    def run() -> None:
+        asyncio.set_event_loop(loop)
+        task = loop.create_task(asyncio.sleep(0))
+        # This callback runs after the sleep task's first step, so a globally
+        # patched Event.wait has already bound its waiter to the foreign loop.
+        loop.call_soon(entered.set)
+        try:
+            loop.run_forever()
+        finally:
+            task.cancel()
+            result = loop.run_until_complete(asyncio.gather(task, return_exceptions=True))[0]
+            if isinstance(result, BaseException) and not isinstance(result, asyncio.CancelledError):
+                errors.append(result)
+            loop.close()
+
+    helper = threading.Thread(target=run, name="tmux-sleep-probe")
+    helper.start()
+    try:
+        assert entered.wait(timeout=5), "foreign sleep did not start"
+        yield
+    finally:
+        loop.call_soon_threadsafe(loop.stop)
+        helper.join(timeout=5)
+        assert not helper.is_alive(), "foreign sleep thread did not stop"
+    assert not errors, errors
 
 
 def _seed_inflight(
@@ -132,6 +185,10 @@ def _make_mock_tmux(*, has_session_initial: bool = False) -> MagicMock:
     """
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "pinky-test"
+    tmux.socket_name = ""
+    tmux.tmux_binary = "tmux"
+    tmux._runner = LocalCommandRunner()
+    tmux._local_socket_path = MagicMock(return_value=None)
     # Every successful spawn now verifies that the detached session survived
     # long enough to still exist. Alternate pre-spawn/post-spawn answers so
     # the default mock models a healthy tmux lifecycle across reconnects.
@@ -324,31 +381,62 @@ async def test_cold_start_liveness_probe_error_reaps_spawned_session() -> None:
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("use_foreign_loop", [False, True], ids=["local", "foreign-loop"])
 async def test_cold_start_cancellation_during_liveness_delay_reaps_session(
     monkeypatch,
+    tmp_path,
+    use_foreign_loop,
 ) -> None:
     """Cancellation after spawn success rolls back the unmanaged REPL."""
     delay_started = asyncio.Event()
     release_delay = asyncio.Event()
 
-    async def blocking_sleep(_delay: float) -> None:
-        delay_started.set()
-        await release_delay.wait()
-
-    monkeypatch.setattr(tmux_session.asyncio, "sleep", blocking_sleep)
+    test_loop = asyncio.get_running_loop()
     tmux = _make_mock_tmux()
     ss, _ = _make_session(tmux=tmux)
+    log = MagicMock()
+    monkeypatch.setattr(tmux_session, "_log", log)
+    debt_seen: list[dict] = []
+
+    async def kill_and_observe() -> TmuxCommandResult:
+        debt_seen.extend(
+            _json.loads(path.read_text())
+            for path in (tmp_path / "tmux-spawn-cleanup-debt").glob("*.json")
+        )
+        return _ok()
+
+    tmux.kill_session = AsyncMock(side_effect=kill_and_observe)
+
+    async def blocking_sleep(_delay: float) -> None:
+        assert asyncio.get_running_loop() is test_loop, "blocking_sleep called from a foreign loop"
+        if asyncio.current_task() is connect_task:
+            delay_started.set()
+        await release_delay.wait()
+
+    monkeypatch.setattr(tmux_session, "_async_sleep", blocking_sleep)
     ss._start_tailer = AsyncMock()
 
     connect_task = asyncio.create_task(ss.connect())
-    await delay_started.wait()
-    connect_task.cancel()
-
-    with pytest.raises(asyncio.CancelledError):
-        await connect_task
+    try:
+        with _foreign_loop_sleeper() if use_foreign_loop else nullcontext():
+            await asyncio.wait_for(delay_started.wait(), timeout=5)
+            assert not connect_task.done(), "connect did not block at the liveness delay"
+            connect_task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await connect_task
+    finally:
+        connect_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await connect_task
 
     tmux.new_session.assert_awaited_once()
     tmux.kill_session.assert_awaited_once()
+    assert len(debt_seen) == 1
+    assert debt_seen[0]["session_name"] == tmux.session_name
+    assert debt_seen[0]["site"] == "post-spawn liveness"
+    assert debt_seen[0]["runner"] == {"kind": "local"}
+    assert not list((tmp_path / "tmux-spawn-cleanup-debt").glob("*.json"))
+    assert not any("could not persist" in call.args[0] for call in log.call_args_list)
     ss._start_tailer.assert_not_awaited()
     assert ss.state == SessionState.DEAD
 
@@ -1248,7 +1336,7 @@ async def test_paste_text_short_circuits_on_paste_failure() -> None:
 
 
 @pytest.mark.asyncio
-async def test_paste_text_waits_enter_delay_between_paste_and_enter() -> None:
+async def test_paste_text_waits_enter_delay_between_paste_and_enter(monkeypatch) -> None:
     """The Enter delay between paste and Enter is the mechanism that
     lets claude's cold-start splash UI dismiss itself before the
     submit Enter arrives. Pinning so the sleep can't be accidentally
@@ -1268,13 +1356,8 @@ async def test_paste_text_waits_enter_delay_between_paste_and_enter() -> None:
         return _ok()
 
     tmux._run = fake_run
-    # Patch asyncio.sleep IN the module under test, not globally.
-    original = tmux_session.asyncio.sleep
-    tmux_session.asyncio.sleep = tracked_sleep
-    try:
-        await tmux.paste_text("hello", enter_delay_ms=250)
-    finally:
-        tmux_session.asyncio.sleep = original
+    monkeypatch.setattr(tmux_session, "_async_sleep", tracked_sleep)
+    await tmux.paste_text("hello", enter_delay_ms=250)
 
     assert 0.25 in sleep_durations
 
@@ -1296,7 +1379,7 @@ async def test_paste_text_default_uses_adaptive_delay(monkeypatch) -> None:
     tmux = _TmuxControl("pinky-test")
     tmux._run = AsyncMock(return_value=_ok())
     sleep = AsyncMock()
-    monkeypatch.setattr(tmux_session.asyncio, "sleep", sleep)
+    monkeypatch.setattr(tmux_session, "_async_sleep", sleep)
     prompt = "x" * 6_207
 
     await tmux.paste_text(prompt)

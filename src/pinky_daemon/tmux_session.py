@@ -108,6 +108,10 @@ from pinky_daemon.wake_prompt import (
 )
 from pinky_daemon.watchdog_log import log_watchdog_decision
 
+# Narrow test seam for engine-controlled delays. Keep the asyncio module's
+# global sleep untouched so independent event loops cannot interfere.
+_async_sleep = asyncio.sleep
+
 # Soft context-watermark default (#614) — used when an agent's
 # ``context_nudge_threshold_pct`` is unset (0). Sits well below the
 # hard ``restart_threshold_pct`` (default 80) so the agent gets an
@@ -926,7 +930,7 @@ class _TmuxControl:
         if enter_delay_ms is None:
             enter_delay_ms = _adaptive_paste_enter_delay_ms(text)
         if enter_delay_ms > 0:
-            await asyncio.sleep(enter_delay_ms / 1000.0)
+            await _async_sleep(enter_delay_ms / 1000.0)
 
         return await self._run("send-keys", "-t", self.session_name, "Enter")
 
@@ -1237,7 +1241,7 @@ async def _strict_owned_tmux_cleanup(
                 diagnostics.append(f"attempt {attempt} verify found session live")
 
             if attempt < _SPAWN_ROLLBACK_ATTEMPTS:
-                await asyncio.sleep(_SPAWN_ROLLBACK_RETRY_DELAY_SEC)
+                await _async_sleep(_SPAWN_ROLLBACK_RETRY_DELAY_SEC)
 
         message = (
             f"tmux[{agent_name}]: {action} could not prove teardown after "
@@ -3933,7 +3937,7 @@ class TmuxSession(TransportReplacementMixin):
         # session after ``new-session`` has already returned 0. Without this
         # delayed check the transport proceeds to CONNECTED against no REPL.
         try:
-            await asyncio.sleep(_POST_SPAWN_LIVENESS_DELAY_SEC)
+            await _async_sleep(_POST_SPAWN_LIVENESS_DELAY_SEC)
             if not await self._tmux.has_session():
                 raise RuntimeError(
                     f"tmux[{self.agent_name}]: session died immediately after "
