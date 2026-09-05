@@ -58,7 +58,7 @@ class FakeStuckAdapter:
         self.recycle_calls = 0
         self._delivered = False
 
-    def get_me(self) -> dict:
+    def get_me(self, *, http_timeout=None) -> dict:
         return {"username": "watchdog_test_bot"}
 
     def get_updates(self, *, timeout: int = 0, limit: int = 100):
@@ -95,7 +95,7 @@ class FakeHardStuckAdapter:
         self.recycle_calls = 0
         self._delivered = False
 
-    def get_me(self) -> dict:
+    def get_me(self, *, http_timeout=None) -> dict:
         return {"username": "hardstuck_test_bot"}
 
     def get_updates(self, *, timeout: int = 0, limit: int = 100):
@@ -133,7 +133,7 @@ class FakeLateCompletionAdapter:
         self._calls = 0
         self.recycle_calls = 0
 
-    def get_me(self) -> dict:
+    def get_me(self, *, http_timeout=None) -> dict:
         return {"username": "late_test_bot"}
 
     def get_updates(self, *, timeout: int = 0, limit: int = 100):

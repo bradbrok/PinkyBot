@@ -12,6 +12,55 @@ from pinky_outreach.discord import DiscordError, DiscordRateLimited
 from pinky_outreach.types import Chat, Message, Platform
 
 
+@pytest.mark.parametrize("failure", ["api", "transport", "unknown", "rate_limit"])
+async def test_discord_connect_retries_transient_then_polls(mock_adapter, mock_broker, failure):
+    """T10: transport and unknown failures must survive the connect boundary."""
+    import httpx
+
+    from pinky_daemon.pollers import BrokerDiscordPoller
+
+    errors = {
+        "api": DiscordError("gateway", 502),
+        "transport": httpx.ConnectError("offline"),
+        "unknown": RuntimeError("unexpected"),
+        "rate_limit": DiscordRateLimited(0.03),
+    }
+    mock_adapter.get_me.side_effect = [errors[failure], {"id": "test-bot", "username": "test"}]
+    poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    poller._backoff_for = lambda _: 0.01
+    task = asyncio.create_task(poller.start())
+    try:
+        async with asyncio.timeout(0.8):
+            while poller.poll_count == 0:
+                await asyncio.sleep(0.005)
+        assert mock_adapter.get_me.call_count == 2
+        mock_adapter.get_me.assert_called_with(http_timeout=10.0)
+        assert poller.connect_attempts == 0
+        assert poller.is_running
+    finally:
+        poller.stop()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+async def test_discord_terminal_credential_error_alerts_and_stops(mock_adapter, mock_broker):
+    """T10: a bad Discord token alerts immediately without retrying."""
+    from pinky_daemon.pollers import BrokerDiscordPoller
+
+    notify = AsyncMock(return_value=True)
+    mock_adapter.get_me.side_effect = DiscordError("Unauthorized", 401)
+    poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    poller._owner_notify = notify  # T9 separately pins constructor wiring
+    try:
+        await asyncio.wait_for(poller.start(), 0.8)
+        assert mock_adapter.get_me.call_count == 1
+        assert not poller.is_running
+        notify.assert_awaited_once()
+        assert "retry-test" in notify.call_args.args[1]
+        assert "bad token" in notify.call_args.args[1]
+    finally:
+        poller.stop()
+
+
 @pytest.fixture
 def mock_adapter():
     """A mock DiscordAdapter with sensible defaults."""
