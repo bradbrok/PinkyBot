@@ -1992,7 +1992,6 @@ class DaemonStoreCatalog(StoreCatalog):
 
     def preflight_ancestor_chains(self) -> None:
         """Verify the directory chains boot checks, skipping boot-absent targets."""
-        verified_parents: set[str] = set()
         for target in self.configured_integrity_targets():
             raw_path = os.fspath(target.path)
             if self._is_memory_path(raw_path):
@@ -2013,7 +2012,7 @@ class DaemonStoreCatalog(StoreCatalog):
                 if path_state != "same":
                     bound_file.require_path_unchanged()
                 try:
-                    resolved_path = self._verify_bound_wal_target(bound_file, absolute_path)
+                    self._verify_bound_wal_target(bound_file, absolute_path)
                 except OSError:
                     if bound_file.path_state() == "absent":
                         continue
@@ -2023,10 +2022,6 @@ class DaemonStoreCatalog(StoreCatalog):
                     continue
                 if path_state != "same":
                     bound_file.require_path_unchanged()
-                resolved_parent = os.path.dirname(resolved_path)
-                if resolved_parent in verified_parents:
-                    continue
-                verified_parents.add(resolved_parent)
             finally:
                 bound_file.close()
 
