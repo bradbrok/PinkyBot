@@ -1,0 +1,33 @@
+{
+  "working_dir": "<work_dir>",
+  "model": "sonnet",
+  "mcp_servers": {
+    "pinky-self": {
+      "type": "sse",
+      "url": "http://self.invalid/sse"
+    },
+    "unrelated": {
+      "command": "unused"
+    }
+  },
+  "allowed_tools": [
+    "Read",
+    "Glob",
+    "Grep",
+    "ToolSearch",
+    "mcp__pinky-self__kb_search",
+    "mcp__pinky-self__kb_get_wiki",
+    "mcp__pinky-self__kb_stats",
+    "mcp__pinky-self__kb_save_wiki",
+    "mcp__pinky-self__kb_delete_wiki"
+  ],
+  "max_turns": 50,
+  "permission_mode": "bypassPermissions",
+  "system_prompt": "snapshot system prompt",
+  "agents": {},
+  "disallowed_tools": [],
+  "thinking_effort": "medium",
+  "strict_effort_enforcement": false,
+  "provider_url": "",
+  "provider_key": ""
+}

@@ -186,6 +186,35 @@ class LibrarianRunner:
         """Check if the librarian should run (has new sources since last run)."""
         return self.has_new_sources(agent_name or "_default")
 
+    @staticmethod
+    def _build_sdk_config(work_dir: str, system_prompt: str) -> SDKRunnerConfig:
+        """Build the one-shot session configuration."""
+        # Load MCP servers from .mcp.json. SDKRunnerConfig.mcp_servers defaults
+        # to {}, and SDKRunner only forwards it to ClaudeAgentOptions when
+        # truthy — so without this fallback the librarian session gets no MCP
+        # config at all and every mcp__pinky-self__kb_* tool is unavailable.
+        # Mirrors the fallback streaming_session.py uses for the same reason.
+        mcp_servers: dict = {}
+        mcp_json_path = Path(work_dir) / ".mcp.json"
+        if mcp_json_path.exists():
+            try:
+                mcp_data = json.loads(mcp_json_path.read_text())
+                mcp_servers = mcp_data.get("mcpServers", {})
+                _log(f"librarian: loaded {len(mcp_servers)} MCP servers from .mcp.json")
+            except Exception as e:
+                _log(f"librarian: failed to read .mcp.json: {e}")
+
+        return SDKRunnerConfig(
+            working_dir=work_dir,
+            model="sonnet",  # Cost-efficient for curation
+            allowed_tools=_LIBRARIAN_ALLOWED_TOOLS,
+            permission_mode="bypassPermissions",
+            system_prompt=system_prompt,
+            max_turns=50,
+            mcp_servers=mcp_servers,
+        )
+
+
     async def run(self, agent_name: str, agent_config) -> dict:
         """Run the librarian — process new sources and update wiki.
 
@@ -295,30 +324,7 @@ class LibrarianRunner:
         if getattr(agent_config, "working_dir", ""):
             work_dir = str(Path(agent_config.working_dir).resolve())
 
-        # Load MCP servers from .mcp.json. SDKRunnerConfig.mcp_servers defaults
-        # to {}, and SDKRunner only forwards it to ClaudeAgentOptions when
-        # truthy — so without this fallback the librarian session gets no MCP
-        # config at all and every mcp__pinky-self__kb_* tool is unavailable.
-        # Mirrors the fallback streaming_session.py uses for the same reason.
-        mcp_servers: dict = {}
-        mcp_json_path = Path(work_dir) / ".mcp.json"
-        if mcp_json_path.exists():
-            try:
-                mcp_data = json.loads(mcp_json_path.read_text())
-                mcp_servers = mcp_data.get("mcpServers", {})
-                _log(f"librarian: loaded {len(mcp_servers)} MCP servers from .mcp.json")
-            except Exception as e:
-                _log(f"librarian: failed to read .mcp.json: {e}")
-
-        config = SDKRunnerConfig(
-            working_dir=work_dir,
-            model="sonnet",  # Cost-efficient for curation
-            allowed_tools=_LIBRARIAN_ALLOWED_TOOLS,
-            permission_mode="bypassPermissions",
-            system_prompt=system_prompt,
-            max_turns=50,
-            mcp_servers=mcp_servers,
-        )
+        config = self._build_sdk_config(work_dir, system_prompt)
 
         runner = SDKRunner(config, agent_name=f"{agent_name}-librarian")
 
