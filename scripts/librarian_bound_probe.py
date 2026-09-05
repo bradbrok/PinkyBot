@@ -49,6 +49,10 @@ EXPECTED_TOOLS = frozenset({
 def evaluate(receipt: dict, expectation: str) -> dict[str, bool]:
     """Separate attempted calls, explicit denials, and successful tool results."""
     results = {item["tool_use_id"]: item for item in receipt["tool_results"]}
+    denial_keys = {
+        (item.get("tool_use_id"), item.get("tool_name"))
+        for item in receipt.get("permission_denials", [])
+    }
     executed = []
     denied = []
     unresolved = []
@@ -57,12 +61,12 @@ def evaluate(receipt: dict, expectation: str) -> dict[str, bool]:
         if result is None:
             unresolved.append(attempt)
             continue
-        text = json.dumps(result["content"])
-        lower = text.lower()
+        # A handler may execute and then return an error saying "permission
+        # denied". Only the SDK's correlated permission record proves denial;
+        # tool-result text is retained as explanation, never as evidence.
         is_denial = result["is_error"] and (
-            "Outside librarian tool set" in text
-            or ("permission" in lower and ("denied" in lower or "not allowed" in lower))
-        )
+            attempt["id"], attempt["name"]
+        ) in denial_keys
         if is_denial:
             denied.append({**attempt, "reason": result["content"]})
         elif not result["is_error"]:
