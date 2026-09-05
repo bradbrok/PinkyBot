@@ -134,6 +134,10 @@ _INBOUND_STALL_ALERT_AFTER = 300.0
 _OWNER_NOTIFY_TIMEOUT = 30.0
 
 
+class _MalformedIdentityError(ValueError):
+    """A successful HTTP probe returned something other than a bot identity."""
+
+
 class _InboundConnectRetry:
     """Connect supervision and outage accounting shared by inbound pollers."""
 
@@ -142,6 +146,8 @@ class _InboundConnectRetry:
         self._inbound_platform = platform
         self._inbound_agent = agent_name
         self._owner_notify = owner_notify
+        self._pending_owner_notify = None
+        self._inbound_epoch = 0
         self._inbound_started = None
         self._last_inbound_ok = None
         self._connect_attempts = 0
@@ -175,18 +181,38 @@ class _InboundConnectRetry:
                 f"{self.inbound_stalled_s or 0:.0f}s (attempts {self._connect_attempts})"
             )
         self._last_inbound_ok = time.monotonic()
+        # Detach notification delivery from the recovered outage, but retain
+        # the physical worker guard: a sync call can remain wedged indefinitely.
+        self._inbound_epoch += 1
         self._connect_attempts = 0
         self._stall_alerted = False
         self._next_stall_notify_at = 0.0
+
+    def _owner_notify_done(self, done: asyncio.Task) -> None:
+        # A timed-out worker may eventually return or raise. Its result must
+        # never mark a later outage as alerted or produce an unhandled exception.
+        if not done.cancelled():
+            done.exception()
+        if self._pending_owner_notify is done:
+            self._pending_owner_notify = None
 
     async def _notify_inbound(self, message: str, timeout: float | None = None) -> bool:
         if self._owner_notify is None:
             return True  # Legacy --mode poll has log-only owner alerts.
 
+        is_async = inspect.iscoroutinefunction(self._owner_notify)
+        if not is_async and self._pending_owner_notify is not None:
+            if not self._pending_owner_notify.done():
+                _log(
+                    f"{self._inbound_label}: owner-notify still pending "
+                    "from previous attempt; skipping"
+                )
+                return False
+
         async def deliver():
             # A synchronous notifier must not block the event loop (and thus
             # defeat wait_for); callbacks returning awaitables work too.
-            if inspect.iscoroutinefunction(self._owner_notify):
+            if is_async:
                 result = self._owner_notify(self._inbound_agent, message)
             else:
                 result = await asyncio.to_thread(
@@ -196,7 +222,16 @@ class _InboundConnectRetry:
 
         try:
             budget = _OWNER_NOTIFY_TIMEOUT if timeout is None else min(timeout, _OWNER_NOTIFY_TIMEOUT)
-            if await asyncio.wait_for(deliver(), budget):
+            if is_async:
+                delivery = deliver()
+            else:
+                pending = asyncio.create_task(deliver())
+                self._pending_owner_notify = pending
+                pending.add_done_callback(self._owner_notify_done)
+                # Cancelling to_thread's await does not stop the worker. Keep
+                # tracking it after the deadline instead of spawning another.
+                delivery = asyncio.shield(pending)
+            if await asyncio.wait_for(delivery, budget):
                 return True
             _log(f"{self._inbound_label}: owner-notify failed (delivery not confirmed)")
         except Exception as exc:
@@ -238,7 +273,10 @@ class _InboundConnectRetry:
         _log(message)
         # Like Buzz, only confirmed delivery suppresses subsequent attempts.
         # Connect/poll/watchdog failures are serialized by this poller's loop.
-        self._stall_alerted = await self._notify_inbound(message, notify_timeout)
+        epoch = self._inbound_epoch
+        delivered = await self._notify_inbound(message, notify_timeout)
+        if self._inbound_epoch == epoch:
+            self._stall_alerted = delivered
 
     async def _connect_probe(self):
         executor = getattr(self, "_poll_executor", None)
@@ -271,6 +309,9 @@ class _InboundConnectRetry:
             self._connect_attempts += 1
             try:
                 me = await self._connect_probe()
+                identity_keys = {"id"} if self._inbound_platform == "discord" else {"id", "username"}
+                if not isinstance(me, dict) or not identity_keys.intersection(me):
+                    raise _MalformedIdentityError(f"malformed identity: {type(me).__name__}")
             except Exception as exc:
                 if self._stop_requested:
                     break
@@ -287,9 +328,13 @@ class _InboundConnectRetry:
                     # Honor the server's hint even when it exceeds the normal
                     # 60s backoff cap, rather than hammering a rate-limited API.
                     delay = max(delay, exc.retry_after)
+                error = (
+                    str(exc) if isinstance(exc, _MalformedIdentityError)
+                    else f"{type(exc).__name__}: {exc}"
+                )
                 _log(
                     f"{self._inbound_label}: connect attempt {self._connect_attempts} failed "
-                    f"({type(exc).__name__}: {exc}); retrying in {delay:g}s"
+                    f"({error}); retrying in {delay:g}s"
                 )
                 # Owner notification consumes this backoff budget; an outbound
                 # outage must not add up to 30s to every inbound retry cycle.
