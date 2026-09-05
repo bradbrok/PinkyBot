@@ -325,3 +325,65 @@ async def test_failed_alert_delivery_is_retried_until_confirmed(make_poller, mon
         assert notify.call_count == 2
     finally:
         await finish(poller, adapter, task)
+
+
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+@pytest.mark.parametrize("notification", ["hang", "false"])
+async def test_hanging_owner_notify_respects_cooldown_and_connect_cadence(
+    kind,
+    notification,
+    monkeypatch,
+):
+    """T7: an outbound outage must not lengthen every inbound retry cycle."""
+    interval = 0.2
+    delay = 0.04
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.5)
+    attempts = []
+    cancellations = []
+
+    async def notify(*_):
+        attempts.append(time.monotonic())
+        try:
+            if notification == "false":
+                return False
+            await asyncio.Event().wait()
+        finally:
+            cancellations.append(time.monotonic())
+
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    if kind == "legacy":
+        poller = pollers.TelegramPoller(adapter, FakeHandler(), owner_notify=notify)
+    elif kind == "broker":
+        poller = pollers.BrokerTelegramPoller(
+            adapter, "retry-test", FakeBroker(), owner_notify=notify
+        )
+    else:
+        poller = pollers.BrokerDiscordPoller(
+            adapter, "retry-test", FakeBroker(), owner_notify=notify
+        )
+    poller._backoff_for = lambda _: delay
+    original_sleep = pollers._sleep_until_stopped
+    post_alert_sleeps = []
+
+    async def observe_remaining_backoff(event, remaining):
+        if len(attempts) == 1:
+            post_alert_sleeps.append(remaining)
+        await original_sleep(event, remaining)
+
+    monkeypatch.setattr(pollers, "_sleep_until_stopped", observe_remaining_backoff)
+    task = asyncio.create_task(poller.start())
+    try:
+        await until(lambda: len(attempts) == 1)
+        first_connect_count = adapter.connect_calls
+        # Three more probes must run while a 0.5s notification is still hung.
+        # Each cycle consumes one delay, including notification wait time.
+        await until(lambda: adapter.connect_calls >= first_connect_count + 3, timeout=0.18)
+        assert len(attempts) == 1, "failed notification must honor the outage cooldown"
+        assert cancellations and cancellations[0] - attempts[0] < 0.1
+        if notification == "hang":
+            assert post_alert_sleeps[0] < delay / 4, "notify wait consumes the backoff budget"
+        await until(lambda: len(attempts) == 2)
+        assert attempts[1] - attempts[0] >= interval
+    finally:
+        await finish(poller, adapter, task)

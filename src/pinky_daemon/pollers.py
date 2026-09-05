@@ -146,6 +146,7 @@ class _InboundConnectRetry:
         self._last_inbound_ok = None
         self._connect_attempts = 0
         self._stall_alerted = False
+        self._next_stall_notify_at = 0.0
         self._connect_suffix = ""
 
     @staticmethod
@@ -176,8 +177,9 @@ class _InboundConnectRetry:
         self._last_inbound_ok = time.monotonic()
         self._connect_attempts = 0
         self._stall_alerted = False
+        self._next_stall_notify_at = 0.0
 
-    async def _notify_inbound(self, message: str) -> bool:
+    async def _notify_inbound(self, message: str, timeout: float | None = None) -> bool:
         if self._owner_notify is None:
             return True  # Legacy --mode poll has log-only owner alerts.
 
@@ -193,19 +195,28 @@ class _InboundConnectRetry:
             return bool(await result) if inspect.isawaitable(result) else bool(result)
 
         try:
-            if await asyncio.wait_for(deliver(), _OWNER_NOTIFY_TIMEOUT):
+            budget = _OWNER_NOTIFY_TIMEOUT if timeout is None else min(timeout, _OWNER_NOTIFY_TIMEOUT)
+            if await asyncio.wait_for(deliver(), budget):
                 return True
             _log(f"{self._inbound_label}: owner-notify failed (delivery not confirmed)")
         except Exception as exc:
             _log(f"{self._inbound_label}: owner-notify failed ({type(exc).__name__}: {exc})")
         return False
 
-    async def _maybe_alert_inbound_stall(self, last_error: Exception, *, terminal=False) -> None:
+    async def _maybe_alert_inbound_stall(
+        self, last_error: Exception, *, terminal=False, notify_timeout: float | None = None,
+    ) -> None:
         age = self.inbound_stalled_s or 0.0
         if self._stop_requested:
             return
-        if not terminal and (self._stall_alerted or age < _INBOUND_STALL_ALERT_AFTER):
+        now = time.monotonic()
+        if not terminal and (
+            self._stall_alerted
+            or age < _INBOUND_STALL_ALERT_AFTER
+            or now < self._next_stall_notify_at
+        ):
             return
+        self._next_stall_notify_at = now + _INBOUND_STALL_ALERT_AFTER
         platform = self._inbound_platform
         agent = self._inbound_agent
         error = " ".join(str(last_error).split())[:120]
@@ -227,7 +238,7 @@ class _InboundConnectRetry:
         _log(message)
         # Like Buzz, only confirmed delivery suppresses subsequent attempts.
         # Connect/poll/watchdog failures are serialized by this poller's loop.
-        self._stall_alerted = await self._notify_inbound(message)
+        self._stall_alerted = await self._notify_inbound(message, notify_timeout)
 
     async def _connect_probe(self):
         executor = getattr(self, "_poll_executor", None)
@@ -280,8 +291,13 @@ class _InboundConnectRetry:
                     f"{self._inbound_label}: connect attempt {self._connect_attempts} failed "
                     f"({type(exc).__name__}: {exc}); retrying in {delay:g}s"
                 )
-                await self._maybe_alert_inbound_stall(exc)
-                await _sleep_until_stopped(self._stop_event, delay)
+                # Owner notification consumes this backoff budget; an outbound
+                # outage must not add up to 30s to every inbound retry cycle.
+                retry_at = time.monotonic() + delay
+                await self._maybe_alert_inbound_stall(exc, notify_timeout=delay)
+                await _sleep_until_stopped(
+                    self._stop_event, max(0.0, retry_at - time.monotonic()),
+                )
                 continue
             if self._stop_requested:
                 break
