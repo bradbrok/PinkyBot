@@ -417,6 +417,62 @@ class TestAdminUpdateStoragePreflight:
             "staying on current release abc1234"
         ]
 
+    def test_missing_storage_ancestor_refuses_update_without_moving_head(
+        self,
+        tmp_path: Path,
+    ) -> None:
+        client, data_dir = _make_private_client(tmp_path)
+        missing_root = Path(client.app.state.store_catalog.expected_root)
+        assert missing_root == data_dir.resolve()
+        assert os.path.commonpath((missing_root, tmp_path.resolve())) == os.fspath(
+            tmp_path.resolve()
+        )
+        renamed_root = missing_root.with_name(f"{missing_root.name}-renamed")
+        assert not renamed_root.exists()
+
+        repo_root = Path(__file__).resolve().parents[1]
+        head_ref_output = sp.check_output(
+            ["git", "rev-parse", "--git-path", "HEAD"],
+            cwd=repo_root,
+            text=True,
+        ).strip()
+        head_ref = Path(head_ref_output)
+        if not head_ref.is_absolute():
+            head_ref = repo_root / head_ref
+        head_before = head_ref.read_bytes()
+
+        logs: list[str] = []
+        gm = _GitMock(dirty_files=["src/pinky_daemon/api.py"])
+        missing_root.rename(renamed_root)
+        try:
+            with (
+                patch("subprocess.check_output", side_effect=gm),
+                patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+                patch("pinky_daemon.api._log", side_effect=logs.append),
+                patch("shutil.which", return_value=None),
+                patch("os.kill"),
+            ):
+                response = client.post("/admin/update?branch=main&force=true")
+        finally:
+            renamed_root.rename(missing_root)
+
+        assert response.status_code == 200
+        body = response.json()
+        assert set(body) == {"error", "staying_on_version", "preflight"}
+        assert body["staying_on_version"] == "abc1234"
+        assert body["preflight"] == {"path": os.fspath(missing_root)}
+        assert body["error"].startswith("storage ancestor preflight failed: ")
+        assert repr(os.fspath(missing_root)) in body["error"]
+        assert "FileNotFoundError" in body["error"]
+        assert head_ref.read_bytes() == head_before
+        assert not gm.did_force_reset()
+        assert not gm.did_deploy_checkout()
+        assert len(logs) == 1
+        assert logs[0].startswith("ERROR admin update refused by storage ancestor preflight: ")
+        assert repr(os.fspath(missing_root)) in logs[0]
+        assert "FileNotFoundError" in logs[0]
+        assert logs[0].endswith("staying on current release abc1234")
+
     def test_successful_frontend_rebuild_writes_manifest_and_status(self):
         """When npm build succeeds, /admin/update writes and returns the build manifest."""
         gm = _GitMock(dirty_files=[])
