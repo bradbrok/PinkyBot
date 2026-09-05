@@ -1999,16 +1999,21 @@ class DaemonStoreCatalog(StoreCatalog):
                 continue
             absolute_path = os.path.abspath(raw_path)
             try:
-                os.stat(absolute_path, follow_symlinks=False)
+                bound_file = BoundSQLiteFile.open(absolute_path)
             except OSError as exc:
                 if self._is_missing_path_error(exc):
                     continue
                 raise
-            resolved_parent = os.path.dirname(os.path.realpath(absolute_path))
-            if resolved_parent in verified_parents:
-                continue
-            verified_parents.add(resolved_parent)
-            self._verified_daemon_owned_path(absolute_path)
+            try:
+                if bound_file.header_journal_mode() != "wal":
+                    continue
+                resolved_parent = os.path.dirname(os.path.realpath(absolute_path))
+                if resolved_parent in verified_parents:
+                    continue
+                verified_parents.add(resolved_parent)
+                self._verified_daemon_owned_path(absolute_path)
+            finally:
+                bound_file.close()
 
     def _connect_wal_for_preflight(
         self,
