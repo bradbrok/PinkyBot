@@ -9,7 +9,7 @@ from __future__ import annotations
 import asyncio
 import socket
 import time
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock
 
 import httpx
 import pytest
@@ -28,13 +28,14 @@ class ConnectAdapter(FakeHardStuckAdapter):
         self.probe_timeouts = []
         self.poll_error = None
         self.connected_at = None
+        self.monotonic = time.monotonic
 
     def get_me(self, *, http_timeout=None):
         self.connect_calls += 1
         self.probe_timeouts.append(http_timeout)
         if self.failures:
             raise self.failures.pop(0)
-        self.connected_at = time.monotonic()
+        self.connected_at = self.monotonic()
         return {"username": "retry_test_bot"}
 
     def get_updates(self, **kwargs):
@@ -67,17 +68,46 @@ def make_poller(request):
     return make
 
 
-async def until(predicate, timeout=1.5):
+async def until(predicate, timeout=5):
     async with asyncio.timeout(timeout):
         while not predicate():
             await asyncio.sleep(0.005)
+
+
+class InboundClock:
+    """Advance outage age explicitly without changing asyncio's real deadlines.
+
+    Sleep arrivals are loop-side checkpoints after failure/notification handling.
+    Merely observing a worker or notifier call does not provide that ordering.
+    """
+
+    def __init__(self, monkeypatch):
+        self.now = time.monotonic()
+        self.sleeps = 0
+        self.real_sleep = pollers._sleep_until_stopped
+        monkeypatch.setattr(pollers, "time", self)
+        monkeypatch.setattr(pollers, "_sleep_until_stopped", self.sleep)
+
+    def monotonic(self):
+        return self.now
+
+    def advance(self, seconds):
+        self.now += seconds
+
+    async def sleep(self, event, delay):
+        self.sleeps += 1
+        await self.real_sleep(event, min(delay, 0.01))
+
+    async def cycles(self, count=10):
+        target = self.sleeps + count
+        await until(lambda: self.sleeps >= target)
 
 
 async def finish(poller, adapter, task):
     poller.stop()
     adapter.release()
     # Retrieve base-version failures too, without replacing the useful assertion.
-    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 1)
+    await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
 
 
 async def test_connect_retries_transient_then_enters_poll_loop(make_poller, capsys):
@@ -93,7 +123,7 @@ async def test_connect_retries_transient_then_enters_poll_loop(make_poller, caps
     poller._backoff_for = lambda n: 0.01 * 2 ** (n - 1)
     task = asyncio.create_task(poller.start())
     try:
-        await asyncio.wait_for(sink.delivered.wait(), 1)
+        await asyncio.wait_for(sink.delivered.wait(), 5)
         assert adapter.connect_calls == 5
         assert adapter.probe_timeouts == [10.0] * 5
         assert poller.connect_attempts == 0
@@ -109,13 +139,21 @@ async def test_connect_retries_transient_then_enters_poll_loop(make_poller, caps
         await finish(poller, adapter, task)
 
 
-async def test_stop_during_backoff_exits_promptly(make_poller):
+async def test_stop_during_backoff_exits_promptly(make_poller, monkeypatch):
     adapter = ConnectAdapter([httpx.ConnectError("offline")])
     poller, _ = make_poller(adapter)
     poller._backoff_for = lambda _: 60
+    backoff_entered = asyncio.Event()
+    original_sleep = pollers._sleep_until_stopped
+
+    async def observe_backoff(event, delay):
+        backoff_entered.set()
+        await original_sleep(event, delay)
+
+    monkeypatch.setattr(pollers, "_sleep_until_stopped", observe_backoff)
     task = asyncio.create_task(poller.start())
     try:
-        await asyncio.sleep(0.05)
+        await asyncio.wait_for(backoff_entered.wait(), 5)
         assert not task.done(), "must remain alive in backoff before stop"
         poller.stop()
         await asyncio.wait_for(task, 1)
@@ -139,7 +177,7 @@ async def test_outer_deadline_recycles_executor_so_next_attempt_runs(make_poller
     original_executor = poller._poll_executor
     task = asyncio.create_task(poller.start())
     try:
-        await asyncio.wait_for(sink.delivered.wait(), 0.8)
+        await asyncio.wait_for(sink.delivered.wait(), 5)
         assert not adapter._release.is_set()
         assert adapter.connect_calls >= 2
         assert adapter.recycle_calls >= 1
@@ -156,7 +194,7 @@ async def test_terminal_credential_error_alerts_and_stops(make_poller, code):
     poller, _ = make_poller(adapter, owner_notify=notify)
     task = asyncio.create_task(poller.start())
     try:
-        await asyncio.wait_for(task, 1)
+        await asyncio.wait_for(task, 5)
         assert adapter.connect_calls == 1
         assert not poller.is_running
         notify.assert_called_once()
@@ -205,14 +243,14 @@ async def test_connect_only_credential_errors_are_terminal(kind, code, terminal,
     task = asyncio.create_task(poller.start())
     try:
         if terminal:
-            await asyncio.wait_for(task, 0.8)
+            await asyncio.wait_for(task, 5)
             assert adapter.connect_calls == 1
             assert not poller.is_running
             assert poller.poll_count == 0
             notify.assert_called_once()
             assert "bad token" in notify.call_args.args[1]
         else:
-            await until(lambda: poller.poll_count > 0, timeout=0.8)
+            await until(lambda: poller.poll_count > 0)
             assert adapter.connect_calls == 2
             assert poller.is_running and not task.done()
             notify.assert_not_called()
@@ -222,33 +260,43 @@ async def test_connect_only_credential_errors_are_terminal(kind, code, terminal,
 
 
 async def test_stall_alert_fires_once_per_outage_and_resets(make_poller, monkeypatch, capsys):
-    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0.06, raising=False)
-    notify = MagicMock(return_value=True)
+    interval = 300
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    clock = InboundClock(monkeypatch)
+    notify = AsyncMock(return_value=True)
     adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    adapter.monotonic = clock.monotonic
     poller, _ = make_poller(adapter, owner_notify=notify)
-    original_sleep = pollers._sleep_until_stopped
-
-    async def fast_sleep(event, delay):
-        await original_sleep(event, min(delay, 0.01))
-
-    monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
+    poller._backoff_for = lambda _: 1
     task = asyncio.create_task(poller.start())
-    started = time.monotonic()
+    started = clock.monotonic()
     try:
-        await until(lambda: notify.call_count == 1)
-        assert time.monotonic() - started >= 0.06
-        await asyncio.sleep(0.12)
+        await clock.cycles()
+        notify.assert_not_called()
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        assert clock.monotonic() - started >= interval
+        clock.advance(5 * interval)
+        await clock.cycles()
         assert notify.call_count == 1
         assert poller.stall_alerted
         assert poller.connect_attempts > 1
         adapter.poll_error = TelegramError("Bad Gateway", 502)
         adapter.failures.clear()
-        await until(lambda: adapter.connected_at is not None)
+        await until(
+            lambda: poller._last_inbound_ok is not None
+            and adapter.connected_at is not None
+            and poller._last_inbound_ok >= adapter.connected_at
+        )
         assert poller._last_inbound_ok >= adapter.connected_at
         assert not poller.stall_alerted
         assert poller.connect_attempts == 0
-        await until(lambda: notify.call_count == 2)
-        await asyncio.sleep(0.1)
+        await clock.cycles()
+        assert notify.call_count == 1
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        clock.advance(5 * interval)
+        await clock.cycles()
         assert notify.call_count == 2
         assert "inbound recovered after " in capsys.readouterr().err
     finally:
@@ -261,8 +309,10 @@ async def test_poll_loop_error_stall_alerts_keyed_on_last_success(
     monkeypatch,
     failure,
 ):
-    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0.06, raising=False)
-    notify = MagicMock(return_value=True)
+    interval = 300
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    clock = InboundClock(monkeypatch)
+    notify = AsyncMock(return_value=True)
 
     class PollFailure(ConnectAdapter):
         def get_updates(self, **kwargs):
@@ -274,19 +324,18 @@ async def test_poll_loop_error_stall_alerts_keyed_on_last_success(
             raise httpx.ConnectError("poll offline")
 
     adapter = PollFailure()
+    adapter.monotonic = clock.monotonic
     poller, _ = make_poller(adapter, owner_notify=notify, poll_timeout=0, watchdog_grace=0.02)
-    original_sleep = pollers._sleep_until_stopped
-
-    async def fast_sleep(event, delay):
-        await original_sleep(event, min(delay, 0.01))
-
-    monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
     task = asyncio.create_task(poller.start())
     try:
-        await until(lambda: notify.call_count == 1)
+        await clock.cycles()
+        notify.assert_not_called()
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
         assert poller._last_inbound_ok >= adapter.connected_at
-        assert poller.inbound_stalled_s >= 0.06
-        await asyncio.sleep(0.08)
+        assert poller.inbound_stalled_s >= interval
+        clock.advance(5 * interval)
+        await clock.cycles()
         assert notify.call_count == 1
         assert poller.last_poll_ok == 0
         if failure == "watchdog":
@@ -298,7 +347,7 @@ async def test_poll_loop_error_stall_alerts_keyed_on_last_success(
 @pytest.mark.parametrize("failure", ["raise", "hang", "false"])
 async def test_owner_notify_failure_never_breaks_retry(make_poller, monkeypatch, failure, capsys):
     monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0, raising=False)
-    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.05, raising=False)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.5, raising=False)
     calls = []
 
     async def notify(*args):
@@ -311,9 +360,10 @@ async def test_owner_notify_failure_never_breaks_retry(make_poller, monkeypatch,
 
     adapter = ConnectAdapter([httpx.ConnectError("offline")])
     poller, sink = make_poller(adapter, owner_notify=notify)
+    poller._backoff_for = lambda _: 0.1
     task = asyncio.create_task(poller.start())
     try:
-        await asyncio.wait_for(sink.delivered.wait(), 0.8)
+        await asyncio.wait_for(sink.delivered.wait(), 5)
         assert len(calls) == 1
         assert adapter.connect_calls == 2
         assert "owner-notify failed" in capsys.readouterr().err
@@ -373,9 +423,10 @@ async def test_failed_alert_delivery_is_retried_until_confirmed(make_poller, mon
     notify = MagicMock(side_effect=[False, True])
     adapter = ConnectAdapter([httpx.ConnectError("offline")] * 4)
     poller, sink = make_poller(adapter, owner_notify=notify)
+    poller._backoff_for = lambda _: 0.2
     task = asyncio.create_task(poller.start())
     try:
-        await asyncio.wait_for(sink.delivered.wait(), 0.8)
+        await asyncio.wait_for(sink.delivered.wait(), 5)
         assert notify.call_count == 2
     finally:
         await finish(poller, adapter, task)
@@ -389,21 +440,27 @@ async def test_hanging_owner_notify_respects_cooldown_and_connect_cadence(
     monkeypatch,
 ):
     """T7: an outbound outage must not lengthen every inbound retry cycle."""
-    interval = 0.2
-    delay = 0.04
+    interval = 300
+    delay = 0.1
+    clock = InboundClock(monkeypatch)
     monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
-    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.5)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 5)
     attempts = []
     cancellations = []
 
     async def notify(*_):
-        attempts.append(time.monotonic())
+        attempts.append(clock.monotonic())
+        started = time.monotonic()
         try:
             if notification == "false":
                 return False
             await asyncio.Event().wait()
         finally:
-            cancellations.append(time.monotonic())
+            elapsed = time.monotonic() - started
+            cancellations.append(elapsed)
+            # Charge the actual notification wait to the injected clock too.
+            # Ordinary scheduler delays cannot expire the outage cooldown.
+            clock.advance(elapsed)
 
     adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
     if kind == "legacy":
@@ -417,27 +474,37 @@ async def test_hanging_owner_notify_respects_cooldown_and_connect_cadence(
             adapter, "retry-test", FakeBroker(), owner_notify=notify
         )
     poller._backoff_for = lambda _: delay
-    original_sleep = pollers._sleep_until_stopped
     post_alert_sleeps = []
+    completed_calls = []
 
     async def observe_remaining_backoff(event, remaining):
+        clock.sleeps += 1
+        completed_calls.append(adapter.connect_calls)
         if len(attempts) == 1:
             post_alert_sleeps.append(remaining)
-        await original_sleep(event, remaining)
+        await clock.real_sleep(event, remaining)
 
     monkeypatch.setattr(pollers, "_sleep_until_stopped", observe_remaining_backoff)
     task = asyncio.create_task(poller.start())
     try:
-        await until(lambda: len(attempts) == 1)
-        first_connect_count = adapter.connect_calls
-        # Three more probes must run while a 0.5s notification is still hung.
-        # Each cycle consumes one delay, including notification wait time.
-        await until(lambda: adapter.connect_calls >= first_connect_count + 3, timeout=0.18)
+        await clock.cycles(3)
+        assert not attempts
+        clock.advance(interval)
+        # Allow both the preceding backoff and the notification budget, each
+        # with 5x slack; the separate notifier timeout is still much longer.
+        await until(lambda: bool(post_alert_sleeps), timeout=5 * 2 * delay)
+        first_connect_count = completed_calls[-1]
+        completed = clock.sleeps
+        # Three completed retries, each with 5x real scheduling slack. The
+        # unbounded notifier would still be hung at its separate 5s timeout.
+        await until(lambda: clock.sleeps >= completed + 3, timeout=5 * 3 * delay)
+        assert completed_calls[-1] >= first_connect_count + 3
         assert len(attempts) == 1, "failed notification must honor the outage cooldown"
-        assert cancellations and cancellations[0] - attempts[0] < 0.1
+        assert cancellations and cancellations[0] < 5 * delay
         if notification == "hang":
             assert post_alert_sleeps[0] < delay / 4, "notify wait consumes the backoff budget"
-        await until(lambda: len(attempts) == 2)
+        clock.advance(interval)
+        await until(lambda: len(attempts) >= 2)
         assert attempts[1] - attempts[0] >= interval
     finally:
         await finish(poller, adapter, task)

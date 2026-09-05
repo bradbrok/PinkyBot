@@ -10,6 +10,7 @@ import pytest
 
 from pinky_outreach.discord import DiscordError, DiscordRateLimited
 from pinky_outreach.types import Chat, Message, Platform
+from tests.test_poller_connect_retry import InboundClock, until
 
 
 @pytest.mark.parametrize("failure", ["api", "transport", "unknown", "rate_limit"])
@@ -30,7 +31,7 @@ async def test_discord_connect_retries_transient_then_polls(mock_adapter, mock_b
     poller._backoff_for = lambda _: 0.01
     task = asyncio.create_task(poller.start())
     try:
-        async with asyncio.timeout(0.8):
+        async with asyncio.timeout(5):
             while poller.poll_count == 0:
                 await asyncio.sleep(0.005)
         assert mock_adapter.get_me.call_count == 2
@@ -39,7 +40,7 @@ async def test_discord_connect_retries_transient_then_polls(mock_adapter, mock_b
         assert poller.is_running
     finally:
         poller.stop()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
 
 
 async def test_discord_terminal_credential_error_alerts_and_stops(mock_adapter, mock_broker):
@@ -51,7 +52,7 @@ async def test_discord_terminal_credential_error_alerts_and_stops(mock_adapter, 
     poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
     poller._owner_notify = notify  # T9 separately pins constructor wiring
     try:
-        await asyncio.wait_for(poller.start(), 0.8)
+        await asyncio.wait_for(poller.start(), 5)
         assert mock_adapter.get_me.call_count == 1
         assert not poller.is_running
         notify.assert_awaited_once()
@@ -72,22 +73,23 @@ async def test_discord_initial_discovery_transport_failure_retries(
     poller = pollers.BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
     poller._poll_interval = 0.005
     original_sleep = pollers._sleep_until_stopped
+    sweep_finished = asyncio.Event()
 
     async def fast_sleep(event, delay):
+        if poller.poll_count:
+            sweep_finished.set()
         await original_sleep(event, min(delay, 0.01))
 
     monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
     task = asyncio.create_task(poller.start())
     try:
-        async with asyncio.timeout(0.8):
-            while not poller.poll_count:
-                await asyncio.sleep(0.005)
+        await asyncio.wait_for(sweep_finished.wait(), 5)
         assert mock_adapter.discover_text_channels.call_count == 2
         assert mock_adapter.get_messages.call_count >= 2
         assert poller.is_running
     finally:
         poller.stop()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
 
 
 @pytest.mark.parametrize("failure", ["api", "transport", "rate_limit"])
@@ -104,33 +106,29 @@ async def test_discord_poll_error_stall_alerts_once(
         "rate_limit": DiscordRateLimited(0.01),
     }
     notify = AsyncMock(return_value=True)
-    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0.04)
+    interval = 300
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    clock = InboundClock(monkeypatch)
     mock_adapter.get_messages.side_effect = [[], *([errors[failure]] * 1000)]
     poller = pollers.BrokerDiscordPoller(
         mock_adapter, "retry-test", mock_broker, owner_notify=notify
     )
     poller._poll_interval = 0.005
-    original_sleep = pollers._sleep_until_stopped
-
-    async def fast_sleep(event, delay):
-        await original_sleep(event, min(delay, 0.01))
-
-    monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
     task = asyncio.create_task(poller.start())
     try:
-        async with asyncio.timeout(0.8):
-            while notify.await_count == 0:
-                await asyncio.sleep(0.005)
-        assert poller.inbound_stalled_s >= 0.04
-        await asyncio.sleep(0.08)
+        await clock.cycles()
+        notify.assert_not_awaited()
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        assert poller.inbound_stalled_s >= interval
+        clock.advance(5 * interval)
+        await clock.cycles()
         notify.assert_awaited_once()
         mock_adapter.get_messages.side_effect = None
-        async with asyncio.timeout(0.8):
-            while poller.stall_alerted:
-                await asyncio.sleep(0.005)
+        await until(lambda: not poller.stall_alerted)
     finally:
         poller.stop()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
 
 
 @pytest.fixture
