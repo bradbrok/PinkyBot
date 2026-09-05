@@ -147,6 +147,7 @@ class _InboundConnectRetry:
         self._inbound_agent = agent_name
         self._owner_notify = owner_notify
         self._pending_owner_notify = None
+        self._owner_notify_delivery = None
         self._inbound_epoch = 0
         self._inbound_started = None
         self._last_inbound_ok = None
@@ -196,6 +197,23 @@ class _InboundConnectRetry:
         if self._pending_owner_notify is done:
             self._pending_owner_notify = None
 
+    @staticmethod
+    def _discard_owner_notify_result(done: asyncio.Task) -> None:
+        if done.cancelled() or done.exception() is not None:
+            return
+        result = done.result()
+        # The caller timed out or stopped before receiving this raw result.
+        # Never start a late coroutine or leave it to warn at collection time.
+        if inspect.iscoroutine(result):
+            result.close()
+        elif isinstance(result, asyncio.Future):
+            result.cancel()
+            result.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+
+    def _stop_owner_notify(self) -> None:
+        if self._owner_notify_delivery is not None:
+            self._owner_notify_delivery.cancel()
+
     async def _notify_inbound(self, message: str, timeout: float | None = None) -> bool:
         if self._owner_notify is None:
             return True  # Legacy --mode poll has log-only owner alerts.
@@ -209,33 +227,48 @@ class _InboundConnectRetry:
                 )
                 return False
 
+        pending = None
+        claimed = False
+        if not is_async:
+            # Track only the physical thread. A deadline cannot stop it, and
+            # recovery must not allow another worker while it is still alive.
+            pending = asyncio.create_task(asyncio.to_thread(
+                self._owner_notify, self._inbound_agent, message,
+            ))
+            self._pending_owner_notify = pending
+            pending.add_done_callback(self._owner_notify_done)
+
         async def deliver():
-            # A synchronous notifier must not block the event loop (and thus
-            # defeat wait_for); callbacks returning awaitables work too.
+            nonlocal claimed
             if is_async:
                 result = self._owner_notify(self._inbound_agent, message)
             else:
-                result = await asyncio.to_thread(
-                    self._owner_notify, self._inbound_agent, message,
-                )
+                result = await asyncio.shield(pending)
+                claimed = True
+            # A sync factory (including async __call__ objects) can return an
+            # awaitable. This phase must remain cancellable on deadline/stop.
             return bool(await result) if inspect.isawaitable(result) else bool(result)
 
+        delivery = asyncio.create_task(deliver())
+        self._owner_notify_delivery = delivery
         try:
             budget = _OWNER_NOTIFY_TIMEOUT if timeout is None else min(timeout, _OWNER_NOTIFY_TIMEOUT)
-            if is_async:
-                delivery = deliver()
-            else:
-                pending = asyncio.create_task(deliver())
-                self._pending_owner_notify = pending
-                pending.add_done_callback(self._owner_notify_done)
-                # Cancelling to_thread's await does not stop the worker. Keep
-                # tracking it after the deadline instead of spawning another.
-                delivery = asyncio.shield(pending)
+            # One budget covers both phases, including time in the worker.
             if await asyncio.wait_for(delivery, budget):
                 return True
             _log(f"{self._inbound_label}: owner-notify failed (delivery not confirmed)")
+        except asyncio.CancelledError:
+            if not self._stop_requested:
+                raise
         except Exception as exc:
             _log(f"{self._inbound_label}: owner-notify failed ({type(exc).__name__}: {exc})")
+        finally:
+            if pending is not None and not claimed:
+                # Also handles cancellation before deliver() first runs and
+                # completion racing the deadline: exactly one side owns raw.
+                pending.add_done_callback(self._discard_owner_notify_result)
+            if self._owner_notify_delivery is delivery:
+                self._owner_notify_delivery = None
         return False
 
     async def _maybe_alert_inbound_stall(
@@ -631,6 +664,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
+        self._stop_owner_notify()
         self._shutdown_watchdog()
         _log("telegram-poller: stopping")
 
@@ -795,6 +829,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
+        self._stop_owner_notify()
         self._shutdown_watchdog()
         _log(f"broker-poller[{self._agent_name}]: stopping")
 
@@ -1319,6 +1354,7 @@ class BrokerDiscordPoller(_InboundConnectRetry):
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
+        self._stop_owner_notify()
         _log(f"discord-poller[{self._agent_name}]: stopping")
 
 
