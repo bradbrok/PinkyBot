@@ -433,6 +433,47 @@ def test_non_daemon_owner_remedy_names_uid_before_chmod(
     assert "snapshot" not in message.lower()
 
 
+def test_writable_non_daemon_owner_uses_ownership_remedy_first(
+    daemon_store_root: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = daemon_store_root / "foreign-owned-writable-ancestor.db"
+    authority = _create_database(source, journal_mode="wal")
+    authority.close()
+    original_mode = daemon_store_root.stat().st_mode & 0o777
+    unsafe_mode = original_mode | 0o020
+    foreign_uid = os.geteuid() + 1
+    real_stat = os.stat
+
+    def stat_with_foreign_owned_component(
+        path: str | os.PathLike[str],
+        *args: Any,
+        **kwargs: Any,
+    ) -> os.stat_result:
+        result = real_stat(path, *args, **kwargs)
+        if os.path.abspath(os.fspath(path)) == os.path.abspath(daemon_store_root):
+            values = list(result)
+            values[4] = foreign_uid
+            return os.stat_result(values)
+        return result
+
+    daemon_store_root.chmod(unsafe_mode)
+    monkeypatch.setattr(store_catalog_module.os, "stat", stat_with_foreign_owned_component)
+    catalog = DaemonStoreCatalog(expected_root=daemon_store_root, silence_allowlist={})
+    try:
+        with pytest.raises(StoreCatalogError) as exc_info:
+            _preflight(catalog, [_target("authority", source, journal_mode="wal")])
+    finally:
+        daemon_store_root.chmod(original_mode)
+
+    message = str(exc_info.value)
+    assert os.fspath(daemon_store_root) in message
+    assert f"mode={unsafe_mode:04o}" in message
+    assert f"uid={foreign_uid}" in message
+    assert message.index("fix ownership first") < message.index("chmod g-w")
+    assert "snapshot" not in message.lower()
+
+
 def test_daemon_wal_pathname_open_requires_pinned_identity_corroboration(
     daemon_store_root: Path,
     monkeypatch: pytest.MonkeyPatch,

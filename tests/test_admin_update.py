@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import errno
 import os
 import sqlite3
 import subprocess as sp
@@ -293,7 +294,7 @@ class TestAdminUpdateBaseline:
 
 
 class TestAdminUpdateStoragePreflight:
-    def test_update_uses_exact_boot_verifier_for_every_catalog_and_dedupes_chains(
+    def test_update_uses_boot_verifier_for_fleet_dedupes_and_skips_plain_tenant(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -340,22 +341,70 @@ class TestAdminUpdateStoragePreflight:
             manifest=tenant_manifest,
         )
         client.app.state.tenant_store_catalogs["tenant"] = tenant_catalog
+        real_stat = os.stat
+        foreign_uid = os.geteuid() + 1
+
+        def stat_with_tenant_owner(path, *args, **kwargs):
+            result = real_stat(path, *args, **kwargs)
+            if os.path.realpath(path) == os.path.realpath(tenant_root):
+                values = list(result)
+                values[4] = foreign_uid
+                return os.stat_result(values)
+            return result
+
         phase = "update"
         gm = _GitMock(dirty_files=[])
         with (
             patch("subprocess.check_output", side_effect=gm),
+            patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+            patch("pinky_daemon.store_catalog.os.stat", side_effect=stat_with_tenant_owner),
             patch("shutil.which", return_value=None),
             patch("os.kill"),
         ):
             response = client.post("/admin/update?branch=main")
 
         assert response.status_code == 200
+        assert response.json()["updated"] is True
+        assert gm.did_deploy_checkout()
         update_calls = [call for call in calls if call[0] == "update"]
-        assert any(catalog is fleet_catalog for _phase, catalog, _path in update_calls)
+        fleet_calls = [
+            path for _phase, catalog, path in update_calls if catalog is fleet_catalog
+        ]
+        assert fleet_calls
+        assert len(fleet_calls) == len(set(fleet_calls))
         tenant_calls = [
             path for _phase, catalog, path in update_calls if catalog is tenant_catalog
         ]
-        assert tenant_calls == [os.path.realpath(tenant_root)]
+        assert tenant_calls == []
+
+    def test_absent_plain_tenant_store_does_not_block_update(self, tmp_path: Path) -> None:
+        client, data_dir = _make_private_client(tmp_path)
+        tenant_root = data_dir / "absent-tenant"
+        assert not tenant_root.exists()
+        tenant_catalog = StoreCatalog(
+            expected_root=tenant_root,
+            silence_allowlist={},
+            manifest={
+                "tenant_keys": StoreIntegrityTarget(
+                    logical_name="tenant_keys",
+                    path=os.fspath(tenant_root / "keys.db"),
+                )
+            },
+        )
+        client.app.state.tenant_store_catalogs["tenant"] = tenant_catalog
+        gm = _GitMock(dirty_files=[])
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            response = client.post("/admin/update?branch=main")
+
+        assert response.status_code == 200
+        assert response.json()["updated"] is True
+        assert gm.did_deploy_checkout()
+        assert not gm.did_force_reset()
 
     def test_force_cannot_bypass_writable_storage_ancestor_preflight(
         self,
@@ -417,7 +466,7 @@ class TestAdminUpdateStoragePreflight:
             "staying on current release abc1234"
         ]
 
-    def test_missing_storage_ancestor_refuses_update_without_moving_head(
+    def test_absent_fleet_store_root_matches_boot_skip_and_update_proceeds(
         self,
         tmp_path: Path,
     ) -> None:
@@ -452,25 +501,70 @@ class TestAdminUpdateStoragePreflight:
                 patch("shutil.which", return_value=None),
                 patch("os.kill"),
             ):
-                response = client.post("/admin/update?branch=main&force=true")
+                response = client.post("/admin/update?branch=main")
         finally:
             renamed_root.rename(missing_root)
+
+        assert response.status_code == 200
+        assert response.json()["updated"] is True
+        assert head_ref.read_bytes() == head_before
+        assert not gm.did_force_reset()
+        assert gm.did_deploy_checkout()
+        assert not any(line.startswith("ERROR") for line in logs)
+
+    def test_plain_os_error_from_present_fleet_ancestor_refuses_without_moving_head(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client, data_dir = _make_private_client(tmp_path)
+        failed_path = os.fspath(data_dir.resolve())
+
+        repo_root = Path(__file__).resolve().parents[1]
+        head_ref_output = sp.check_output(
+            ["git", "rev-parse", "--git-path", "HEAD"],
+            cwd=repo_root,
+            text=True,
+        ).strip()
+        head_ref = Path(head_ref_output)
+        if not head_ref.is_absolute():
+            head_ref = repo_root / head_ref
+        head_before = head_ref.read_bytes()
+
+        def deny_ancestor_stat(_catalog: StoreCatalog, _absolute_path: str) -> str:
+            raise PermissionError(errno.EACCES, "ancestor stat denied", failed_path)
+
+        monkeypatch.setattr(
+            DaemonStoreCatalog,
+            "_verified_daemon_owned_path",
+            deny_ancestor_stat,
+        )
+        logs: list[str] = []
+        gm = _GitMock(dirty_files=["src/pinky_daemon/api.py"])
+        with (
+            patch("subprocess.check_output", side_effect=gm),
+            patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+            patch("pinky_daemon.api._log", side_effect=logs.append),
+            patch("shutil.which", return_value=None),
+            patch("os.kill"),
+        ):
+            response = client.post("/admin/update?branch=main&force=true")
 
         assert response.status_code == 200
         body = response.json()
         assert set(body) == {"error", "staying_on_version", "preflight"}
         assert body["staying_on_version"] == "abc1234"
-        assert body["preflight"] == {"path": os.fspath(missing_root)}
+        assert body["preflight"] == {"path": failed_path}
         assert body["error"].startswith("storage ancestor preflight failed: ")
-        assert repr(os.fspath(missing_root)) in body["error"]
-        assert "FileNotFoundError" in body["error"]
+        assert repr(failed_path) in body["error"]
+        assert "PermissionError" in body["error"]
         assert head_ref.read_bytes() == head_before
         assert not gm.did_force_reset()
         assert not gm.did_deploy_checkout()
         assert len(logs) == 1
         assert logs[0].startswith("ERROR admin update refused by storage ancestor preflight: ")
-        assert repr(os.fspath(missing_root)) in logs[0]
-        assert "FileNotFoundError" in logs[0]
+        assert repr(failed_path) in logs[0]
+        assert "PermissionError" in logs[0]
         assert logs[0].endswith("staying on current release abc1234")
 
     def test_successful_frontend_rebuild_writes_manifest_and_status(self):
