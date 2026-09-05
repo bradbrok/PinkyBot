@@ -274,6 +274,9 @@ def test_one_step_bind_configures_inbound_gates_and_starts_native_poller(
                 # Buzz pollers carry no telegram watchdog (#1145)
                 "watchdog_fires": None,
                 "last_poll_ok_age_s": None,
+                "connect_attempts": 0,
+                "inbound_stalled_s": None,
+                "stall_alerted": False,
             }
         ]
 
@@ -418,6 +421,9 @@ def test_daemon_restart_resumes_configured_native_buzz_poller(
                 "running": True,
                 "watchdog_fires": None,
                 "last_poll_ok_age_s": None,
+                "connect_attempts": 0,
+                "inbound_stalled_s": None,
+                "stall_alerted": False,
             }
         ]
         assert app.state.agents._db.execute(

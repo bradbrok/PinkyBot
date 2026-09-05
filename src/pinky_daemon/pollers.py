@@ -1036,7 +1036,7 @@ class BrokerDiscordPoller(_InboundConnectRetry):
         # Per-channel state
         self._channels: list[str] = []
         self._last_id: dict[str, str] = {}
-        self._last_discovery: float = 0.0
+        self._last_discovery: float | None = None
         # Channel metadata cache — invalidated each discovery cycle (~60s by
         # default). Avoids fanning out get_channel() calls across every message
         # in a burst on the same channel.
@@ -1084,7 +1084,10 @@ class BrokerDiscordPoller(_InboundConnectRetry):
                 # Periodic re-discovery (cheap — one /users/@me/guilds + one
                 # /guilds/{id}/channels per guild per discovery_interval).
                 import time as _time
-                if _time.monotonic() - self._last_discovery >= self._discovery_interval:
+                if (
+                    self._last_discovery is None
+                    or _time.monotonic() - self._last_discovery >= self._discovery_interval
+                ):
                     await self._refresh_channels(verbose=self._poll_count == 0)
 
                 await self._poll_once()

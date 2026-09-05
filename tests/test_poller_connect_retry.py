@@ -10,6 +10,7 @@ import asyncio
 import gc
 import inspect
 import json
+import math
 import socket
 import threading
 import time
@@ -86,8 +87,8 @@ class InboundClock:
     Merely observing a worker or notifier call does not provide that ordering.
     """
 
-    def __init__(self, monkeypatch, *, origin=None):
-        self.now = time.monotonic() if origin is None else origin
+    def __init__(self, monkeypatch, *, origin=1000.0):
+        self.now = origin
         self.sleeps = 0
         self.real_sleep = pollers._sleep_until_stopped
         monkeypatch.setattr(pollers, "time", self)
@@ -97,7 +98,12 @@ class InboundClock:
         return self.now
 
     def advance(self, seconds):
+        previous = self.now
         self.now += seconds
+        # Advancing by a duration means at least that much elapsed time. A
+        # fractional origin can otherwise round 299 + 1 seconds below 300.
+        if self.now - previous < seconds:
+            self.now = math.nextafter(self.now, math.inf)
 
     async def sleep(self, event, delay):
         self.sleeps += 1
