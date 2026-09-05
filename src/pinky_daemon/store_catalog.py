@@ -2006,22 +2006,12 @@ class DaemonStoreCatalog(StoreCatalog):
             try:
                 if bound_file.header_journal_mode() != "wal":
                     continue
-                path_state = bound_file.path_state()
-                if path_state == "absent":
-                    continue
-                if path_state != "same":
-                    bound_file.require_path_unchanged()
                 try:
                     self._verify_bound_wal_target(bound_file, absolute_path)
                 except OSError:
                     if bound_file.path_state() == "absent":
                         continue
                     raise
-                path_state = bound_file.path_state()
-                if path_state == "absent":
-                    continue
-                if path_state != "same":
-                    bound_file.require_path_unchanged()
             finally:
                 bound_file.close()
 
