@@ -86,8 +86,8 @@ class InboundClock:
     Merely observing a worker or notifier call does not provide that ordering.
     """
 
-    def __init__(self, monkeypatch):
-        self.now = time.monotonic()
+    def __init__(self, monkeypatch, *, origin=None):
+        self.now = time.monotonic() if origin is None else origin
         self.sleeps = 0
         self.real_sleep = pollers._sleep_until_stopped
         monkeypatch.setattr(pollers, "time", self)
@@ -113,6 +113,33 @@ async def finish(poller, adapter, task):
     adapter.release()
     # Retrieve base-version failures too, without replacing the useful assertion.
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+
+
+@pytest.mark.parametrize("origin", [800.0004, 5.0, 123456.7891])
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+async def test_alert_boundary_at_fractional_and_small_clock_origins(kind, origin, monkeypatch):
+    clock = InboundClock(monkeypatch, origin=origin)
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 300)
+    notify = AsyncMock(return_value=True)
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    poller = inbound_poller(kind, adapter, owner_notify=notify)
+    poller._backoff_for = lambda _: 1
+    task = asyncio.create_task(poller.start())
+    try:
+        await clock.cycles(3)
+        clock.advance(299)
+        await clock.cycles(3)
+        notify.assert_not_awaited()
+        assert not poller.stall_alerted
+        clock.advance(1)
+        await until(lambda: poller.stall_alerted)
+        assert poller.inbound_stalled_s >= 300
+        notify.assert_awaited_once()
+        clock.advance(300)
+        await clock.cycles(3)
+        notify.assert_awaited_once()
+    finally:
+        await finish(poller, adapter, task)
 
 
 def inbound_poller(kind, adapter, **kwargs):

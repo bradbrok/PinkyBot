@@ -92,6 +92,61 @@ async def test_discord_initial_discovery_transport_failure_retries(
         await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
 
 
+async def test_discord_discovers_and_primes_before_first_poll_at_small_origin(
+    mock_adapter, mock_broker, monkeypatch
+):
+    import time
+
+    from pinky_daemon.pollers import BrokerDiscordPoller
+
+    # Discord imports time locally. Keep asyncio deadlines on the real clock
+    # while exposing a freshly booted host's uptime to the poller.
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", time.monotonic)
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    events = []
+    first_poll_done = asyncio.Event()
+    release = asyncio.Event()
+
+    def discover():
+        events.append("discover")
+        return ["chan-A"]
+
+    def messages(channel, **kwargs):
+        assert channel == "chan-A"
+        if kwargs.get("limit") == 1:
+            events.append("prime")
+            return [_msg(msg_id="100", content="old baseline")]
+        events.append("fetch")
+        assert kwargs["after"] == "100"
+        return []
+
+    mock_adapter.discover_text_channels.side_effect = discover
+    mock_adapter.get_messages.side_effect = messages
+    poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    real_poll_once = poller._poll_once
+
+    async def first_poll():
+        events.append("poll")
+        await real_poll_once()
+        first_poll_done.set()
+        await release.wait()
+
+    monkeypatch.setattr(poller, "_poll_once", first_poll)
+    task = asyncio.create_task(poller.start())
+    try:
+        await asyncio.wait_for(first_poll_done.wait(), 5)
+        assert events == ["discover", "prime", "poll", "fetch"]
+        assert poller.watched_channels == ["chan-A"]
+        assert poller._last_id == {"chan-A": "100"}
+        assert poller.poll_count == 1
+        mock_broker.handle_inbound.assert_not_called()
+    finally:
+        release.set()
+        poller.stop()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+
+
 @pytest.mark.parametrize("failure", ["api", "transport", "rate_limit"])
 async def test_discord_poll_error_stall_alerts_once(
     mock_adapter, mock_broker, monkeypatch, failure
