@@ -311,7 +311,7 @@ class TestAdminUpdateBaseline:
 
 
 class TestAdminUpdateStoragePreflight:
-    def test_update_uses_boot_verifier_for_fleet_dedupes_and_skips_plain_tenant(
+    def test_update_checks_each_fleet_wal_target_and_skips_plain_tenant(
         self,
         tmp_path: Path,
         monkeypatch: pytest.MonkeyPatch,
@@ -339,6 +339,21 @@ class TestAdminUpdateStoragePreflight:
         fleet_catalog = client.app.state.store_catalog
         assert fleet_catalog._verified_daemon_owned_path.__func__ is shared_verifier
         assert any(call_phase == "boot" for call_phase, _catalog, _path in calls)
+
+        present_wal_targets = 0
+        for target in fleet_catalog.configured_integrity_targets():
+            raw_path = os.fspath(target.path)
+            if fleet_catalog._is_memory_path(raw_path):
+                continue
+            try:
+                bound_file = BoundSQLiteFile.open(os.path.abspath(raw_path))
+            except FileNotFoundError:
+                continue
+            try:
+                if bound_file.header_journal_mode() == "wal":
+                    present_wal_targets += 1
+            finally:
+                bound_file.close()
 
         tenant_root = data_dir / "tenant"
         tenant_root.mkdir(mode=0o700)
@@ -384,11 +399,15 @@ class TestAdminUpdateStoragePreflight:
         assert response.json()["updated"] is True
         assert gm.did_deploy_checkout()
         update_calls = [call for call in calls if call[0] == "update"]
+        assert all(catalog is fleet_catalog for _phase, catalog, _path in update_calls)
         fleet_calls = [
             path for _phase, catalog, path in update_calls if catalog is fleet_catalog
         ]
-        assert fleet_calls
-        assert len(fleet_calls) == len(set(fleet_calls))
+        assert set(fleet_calls) == {
+            os.path.realpath(data_dir),
+            os.path.realpath(data_dir / "kb"),
+        }
+        assert len(fleet_calls) == present_wal_targets
         tenant_calls = [
             path for _phase, catalog, path in update_calls if catalog is tenant_catalog
         ]
