@@ -455,7 +455,9 @@ async def test_stop_drains_notify_awaitable_before_deadline(kind, callback_kind,
         clock.advance(300)
         await asyncio.wait_for(entered.wait(), 5)
         poller.stop()
-        await asyncio.wait_for(task, 1)
+        # A deadline here must not cancel the poller and accidentally supply
+        # the cancellation that stop() is responsible for initiating.
+        await asyncio.wait_for(asyncio.shield(task), 1)
         assert cancelled.is_set()
         assert notify_tasks and all(t.done() for t in notify_tasks)
         assert poller._pending_owner_notify is None
