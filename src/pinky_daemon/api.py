@@ -13295,17 +13295,10 @@ npm run build</pre>
 
             # The deploy must not move the checkout onto a release that the same
             # storage authority gate would refuse at the next daemon boot.
-            verifier = DaemonStoreCatalog._verified_daemon_owned_path
-            verified_directory_chains: set[tuple[int, str]] = set()
             try:
                 for catalog in (store_catalog, *tenant_store_catalogs.values()):
-                    for integrity_target in catalog.configured_integrity_targets():
-                        resolved_parent = os.path.dirname(os.path.realpath(integrity_target.path))
-                        chain_identity = (id(catalog), resolved_parent)
-                        if chain_identity in verified_directory_chains:
-                            continue
-                        verified_directory_chains.add(chain_identity)
-                        verifier(catalog, integrity_target.path)
+                    if isinstance(catalog, DaemonStoreCatalog):
+                        catalog.preflight_ancestor_chains()
             except OSError as exc:
                 if isinstance(exc, StorePathAuthorityError):
                     failed_path = exc.path
@@ -13316,7 +13309,7 @@ npm run build</pre>
                         preflight = {"path": failed_path, "mode": f"{exc.mode:04o}"}
                         detail = f"path={failed_path!r} mode={exc.mode:04o}"
                 else:
-                    failed_path = os.path.dirname(os.path.realpath(integrity_target.path))
+                    failed_path = os.path.realpath(exc.filename or catalog.expected_root)
                     preflight = {"path": failed_path}
                     detail = f"path={failed_path!r} error={type(exc).__name__}: {exc}"
                 error = f"storage ancestor preflight failed: {detail}"

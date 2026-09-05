@@ -1990,6 +1990,26 @@ class DaemonStoreCatalog(StoreCatalog):
                     if observation not in fulfilled_absences
                 ]
 
+    def preflight_ancestor_chains(self) -> None:
+        """Verify the directory chains boot checks, skipping boot-absent targets."""
+        verified_parents: set[str] = set()
+        for target in self.configured_integrity_targets():
+            raw_path = os.fspath(target.path)
+            if self._is_memory_path(raw_path):
+                continue
+            absolute_path = os.path.abspath(raw_path)
+            try:
+                os.stat(absolute_path, follow_symlinks=False)
+            except OSError as exc:
+                if self._is_missing_path_error(exc):
+                    continue
+                raise
+            resolved_parent = os.path.dirname(os.path.realpath(absolute_path))
+            if resolved_parent in verified_parents:
+                continue
+            verified_parents.add(resolved_parent)
+            self._verified_daemon_owned_path(absolute_path)
+
     def _connect_wal_for_preflight(
         self,
         bound_file: BoundSQLiteFile,
@@ -2050,15 +2070,6 @@ class DaemonStoreCatalog(StoreCatalog):
                     f"WAL preflight path component is not a directory: {current_path!r}"
                 )
             mode = stat.S_IMODE(current_stat.st_mode)
-            if mode & 0o022:
-                raise StorePathAuthorityError(
-                    "WAL preflight path component is writable by a non-daemon uid: "
-                    f"path={current_path!r} mode={mode:04o}",
-                    failure_class="writable",
-                    path=current_path,
-                    mode=mode,
-                    uid=current_stat.st_uid,
-                )
             inside_catalog = DaemonStoreCatalog._path_at_or_below(current_path, expected_root)
             allowed_uids = {daemon_uid} if inside_catalog else {0, daemon_uid}
             if current_stat.st_uid not in allowed_uids:
@@ -2067,6 +2078,15 @@ class DaemonStoreCatalog(StoreCatalog):
                     f"path={current_path!r} mode={mode:04o} "
                     f"uid={current_stat.st_uid} daemon_uid={daemon_uid}",
                     failure_class="owner",
+                    path=current_path,
+                    mode=mode,
+                    uid=current_stat.st_uid,
+                )
+            if mode & 0o022:
+                raise StorePathAuthorityError(
+                    "WAL preflight path component is writable by a non-daemon uid: "
+                    f"path={current_path!r} mode={mode:04o}",
+                    failure_class="writable",
                     path=current_path,
                     mode=mode,
                     uid=current_stat.st_uid,
