@@ -7,6 +7,7 @@ import fnmatch
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -341,6 +342,25 @@ class StoreIntegrityTarget:
 
 class StoreCatalogError(RuntimeError):
     """Raised when the daemon's store layout is unsafe or incoherent."""
+
+
+class StorePathAuthorityError(PermissionError):
+    """Raised when a store ancestor's mode or owner violates daemon authority."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str,
+        path: str,
+        mode: int,
+        uid: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.path = path
+        self.mode = mode
+        self.uid = uid
 
 
 class _ManagedSQLiteConnection(sqlite3.Connection):
@@ -857,6 +877,11 @@ class StoreCatalog:
             if self._entries:
                 raise StoreCatalogError("storage observability cannot change after registration")
             self._observability = observability
+
+    def configured_integrity_targets(self) -> tuple[StoreIntegrityTarget, ...]:
+        """Return the configured boot targets without exposing mutable manifest state."""
+        with self._lock:
+            return tuple(self._manifest.values())
 
     def connection_policy(self, logical_name: str) -> StoreConnectionPolicy:
         """Return the catalog-declared connection policy for one store."""
@@ -1509,7 +1534,20 @@ class StoreCatalog:
         else:
             rendered_detail = detail
 
-        if any(
+        if isinstance(detail, StorePathAuthorityError):
+            command = f"chmod g-w {shlex.quote(detail.path)}"
+            if detail.failure_class == "owner":
+                recovery = (
+                    "Fix the storage directory authority before restarting: "
+                    f"path={detail.path!r} mode={detail.mode:04o} uid={detail.uid}; "
+                    f"fix ownership first, then {command}."
+                )
+            else:
+                recovery = (
+                    "Fix the storage directory permissions before restarting: "
+                    f"path={detail.path!r} mode={detail.mode:04o}; {command}."
+                )
+        elif any(
             target.criticality == "authoritative" or target.recovery == "snapshot"
             for target in targets
         ):
@@ -2013,17 +2051,25 @@ class DaemonStoreCatalog(StoreCatalog):
                 )
             mode = stat.S_IMODE(current_stat.st_mode)
             if mode & 0o022:
-                raise PermissionError(
+                raise StorePathAuthorityError(
                     "WAL preflight path component is writable by a non-daemon uid: "
-                    f"path={current_path!r} mode={mode:04o}"
+                    f"path={current_path!r} mode={mode:04o}",
+                    failure_class="writable",
+                    path=current_path,
+                    mode=mode,
+                    uid=current_stat.st_uid,
                 )
-            inside_catalog = self._path_at_or_below(current_path, expected_root)
+            inside_catalog = DaemonStoreCatalog._path_at_or_below(current_path, expected_root)
             allowed_uids = {daemon_uid} if inside_catalog else {0, daemon_uid}
             if current_stat.st_uid not in allowed_uids:
-                raise PermissionError(
+                raise StorePathAuthorityError(
                     "WAL preflight path component has a non-daemon owner: "
-                    f"path={current_path!r} uid={current_stat.st_uid} "
-                    f"daemon_uid={daemon_uid}"
+                    f"path={current_path!r} mode={mode:04o} "
+                    f"uid={current_stat.st_uid} daemon_uid={daemon_uid}",
+                    failure_class="owner",
+                    path=current_path,
+                    mode=mode,
+                    uid=current_stat.st_uid,
                 )
         return resolved_path
 
