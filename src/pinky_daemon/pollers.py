@@ -423,11 +423,14 @@ class _TelegramPollWatchdog(_InboundConnectRetry):
 
     def _recycle_stuck_thread(self, reason: str) -> None:
         self._watchdog_fires += 1
-        age = time.monotonic() - self._last_poll_ok if self._last_poll_ok else -1.0
+        last_ok = (
+            f"{time.monotonic() - self._last_poll_ok:.0f}s ago"
+            if self._last_poll_ok else "never"
+        )
         _log(
             f"{self._watchdog_label}: WATCHDOG {reason} "
             f"(fire #{self._watchdog_fires}, last successful poll "
-            f"{age:.0f}s ago) — recycling HTTP client + poll thread"
+            f"{last_ok}) — recycling HTTP client + poll thread"
         )
         try:
             self._adapter.recycle()

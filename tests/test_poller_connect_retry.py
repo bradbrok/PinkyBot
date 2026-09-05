@@ -15,7 +15,7 @@ import httpx
 import pytest
 
 from pinky_daemon import pollers
-from pinky_outreach.discord import DiscordAdapter
+from pinky_outreach.discord import DiscordAdapter, DiscordError
 from pinky_outreach.telegram import TelegramAdapter, TelegramError
 from tests.test_poller_watchdog import FakeBroker, FakeHandler, FakeHardStuckAdapter, _fake_msg
 
@@ -163,6 +163,60 @@ async def test_terminal_credential_error_alerts_and_stops(make_poller, code):
         name, message = notify.call_args.args
         assert name in message
         assert "bad token" in message and "not retrying" in message
+    finally:
+        await finish(poller, adapter, task)
+
+
+@pytest.mark.parametrize(
+    ("kind", "code", "terminal"),
+    [
+        *[(kind, code, False) for kind in ("legacy", "broker") for code in (409, 429, 500, 503)],
+        *[(kind, code, True) for kind in ("legacy", "broker") for code in (401, 404)],
+        *[("discord", code, False) for code in (404, 409, 429, 500, 503)],
+        ("discord", 401, True),
+    ],
+)
+async def test_connect_only_credential_errors_are_terminal(kind, code, terminal, capsys):
+    """Conflict, plain 429, and server errors must not become bad-token exits."""
+    error_type = DiscordError if kind == "discord" else TelegramError
+    adapter = ConnectAdapter([error_type("connect failure", code)])
+    notify = MagicMock(return_value=True)
+    if kind == "legacy":
+        poller = pollers.TelegramPoller(adapter, FakeHandler(), owner_notify=notify)
+    elif kind == "broker":
+        poller = pollers.BrokerTelegramPoller(
+            adapter,
+            "retry-test",
+            FakeBroker(),
+            owner_notify=notify,
+        )
+    else:
+        # Keep using the connect fake; empty channel responses prove that a
+        # retried identity probe reaches the real Discord polling loop.
+        adapter.discover_text_channels = lambda: ["test-channel"]
+        adapter.get_messages = lambda *args, **kwargs: []
+        poller = pollers.BrokerDiscordPoller(
+            adapter,
+            "retry-test",
+            FakeBroker(),
+            owner_notify=notify,
+        )
+    poller._backoff_for = lambda _: 0.01
+    task = asyncio.create_task(poller.start())
+    try:
+        if terminal:
+            await asyncio.wait_for(task, 0.8)
+            assert adapter.connect_calls == 1
+            assert not poller.is_running
+            assert poller.poll_count == 0
+            notify.assert_called_once()
+            assert "bad token" in notify.call_args.args[1]
+        else:
+            await until(lambda: poller.poll_count > 0, timeout=0.8)
+            assert adapter.connect_calls == 2
+            assert poller.is_running and not task.done()
+            notify.assert_not_called()
+            assert "terminal:" not in capsys.readouterr().err
     finally:
         await finish(poller, adapter, task)
 
