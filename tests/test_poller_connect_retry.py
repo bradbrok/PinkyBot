@@ -7,10 +7,13 @@ teardown release; test deadlines must fail without hanging interpreter exit.
 from __future__ import annotations
 
 import asyncio
+import gc
+import inspect
 import json
 import socket
 import threading
 import time
+import warnings
 from unittest.mock import AsyncMock, MagicMock
 
 import httpx
@@ -279,6 +282,190 @@ async def test_sync_owner_notify_has_one_worker_across_outages(
         await finish(poller, adapter, task)
         await until(lambda: active == 0)
         loop.set_exception_handler(previous_handler)
+
+
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+@pytest.mark.parametrize("callback_kind", ["sync_factory", "async_callable", "async_function"])
+async def test_returned_notify_coroutine_cancels_and_next_outage_retries(
+    kind, callback_kind, monkeypatch, capsys
+):
+    clock = InboundClock(monkeypatch)
+    interval = 300
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.1)
+    release = asyncio.Event()
+    cancelled = asyncio.Event()
+    calls = []
+
+    async def notify(*args):
+        calls.append(args)
+        if len(calls) == 1:
+            try:
+                await release.wait()
+            finally:
+                cancelled.set()
+        return True
+
+    class AsyncCallable:
+        async def __call__(self, *args):
+            return await notify(*args)
+
+    callback = {
+        "sync_factory": MagicMock(side_effect=lambda *args: notify(*args)),
+        "async_callable": AsyncCallable(),
+        "async_function": notify,
+    }[callback_kind]
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    adapter.monotonic = clock.monotonic
+    adapter.discover_text_channels = lambda: ["test-channel"]
+    adapter.get_messages = lambda *args, **kwargs: adapter.get_updates()
+    poller = inbound_poller(kind, adapter, owner_notify=callback)
+    poller._backoff_for = lambda _: 0.1
+    task = asyncio.create_task(poller.start())
+    try:
+        await clock.cycles(3)
+        clock.advance(interval)
+        await clock.cycles(5)
+        assert len(calls) == 1
+        assert cancelled.is_set(), "the returned coroutine must receive timeout cancellation"
+        assert poller._pending_owner_notify is None, "the completed thread must free its slot"
+        assert not poller.stall_alerted
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        assert len(calls) == 2, "a timed-out awaitable must not suppress subsequent alerts"
+        assert "owner-notify still pending" not in capsys.readouterr().err
+        adapter.poll_error = httpx.ConnectError("poll offline")
+        adapter.failures.clear()
+        await until(lambda: poller._last_inbound_ok is not None and poller.connect_attempts == 0)
+        assert not poller.stall_alerted
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        assert len(calls) == 3, "inbound recovery must permit another outage alert"
+    finally:
+        release.set()
+        await finish(poller, adapter, task)
+        pending = poller._pending_owner_notify
+        if pending is not None:
+            await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
+
+
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+@pytest.mark.parametrize("result_kind", ["coroutine", "future"])
+async def test_late_notify_awaitable_is_disposed_without_unawaited_warning(
+    kind, result_kind, monkeypatch
+):
+    clock = InboundClock(monkeypatch)
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 300)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.1)
+    release_thread = threading.Event()
+    release_coroutine = asyncio.Event()
+    body_started = asyncio.Event()
+    returned = []
+    future = asyncio.get_running_loop().create_future()
+
+    async def late_coroutine():
+        body_started.set()
+        await release_coroutine.wait()
+        return True
+
+    def notify(*_):
+        release_thread.wait()
+        result = late_coroutine() if result_kind == "coroutine" else future
+        returned.append(result)
+        return result
+
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    poller = inbound_poller(kind, adapter, owner_notify=notify)
+    poller._backoff_for = lambda _: 0.1
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        task = asyncio.create_task(poller.start())
+        try:
+            await clock.cycles(3)
+            clock.advance(300)
+            await clock.cycles(5)
+            assert not returned
+            release_thread.set()
+            # The callback must dispose of the raw result without running its
+            # coroutine body. A body start is an immediate RED signal on r4.
+            await until(lambda: poller._pending_owner_notify is None or body_started.is_set())
+            assert len(returned) == 1
+            state = (
+                inspect.getcoroutinestate(returned[0])
+                if result_kind == "coroutine" else None
+            )
+            returned.clear()
+            gc.collect()
+            assert not [w for w in caught if "was never awaited" in str(w.message)]
+            if result_kind == "coroutine":
+                assert state == inspect.CORO_CLOSED, "late coroutine must be closed, not scheduled"
+            else:
+                assert future.cancelled(), "late Future must be cancelled, not awaited"
+            assert not body_started.is_set()
+            assert not poller.stall_alerted
+        finally:
+            release_thread.set()
+            release_coroutine.set()
+            if not future.done():
+                future.set_result(True)
+            await finish(poller, adapter, task)
+            pending = poller._pending_owner_notify
+            if pending is not None:
+                await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
+            for result in returned:
+                if inspect.iscoroutine(result):
+                    result.close()
+
+
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+@pytest.mark.parametrize("callback_kind", ["sync_factory", "async_callable", "async_function"])
+async def test_stop_drains_notify_awaitable_before_deadline(kind, callback_kind, monkeypatch):
+    clock = InboundClock(monkeypatch)
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 300)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 30)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    notify_tasks = []
+
+    async def notify(*_):
+        notify_tasks.append(asyncio.current_task())
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            cancelled.set()
+        return True
+
+    class AsyncCallable:
+        async def __call__(self, *args):
+            return await notify(*args)
+
+    callback = {
+        "sync_factory": MagicMock(side_effect=lambda *args: notify(*args)),
+        "async_callable": AsyncCallable(),
+        "async_function": notify,
+    }[callback_kind]
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    poller = inbound_poller(kind, adapter, owner_notify=callback)
+    poller._backoff_for = lambda _: 30
+    task = asyncio.create_task(poller.start())
+    try:
+        await clock.cycles(3)
+        clock.advance(300)
+        await asyncio.wait_for(entered.wait(), 5)
+        poller.stop()
+        await asyncio.wait_for(task, 1)
+        assert cancelled.is_set()
+        assert notify_tasks and all(t.done() for t in notify_tasks)
+        assert poller._pending_owner_notify is None
+        assert not poller.is_running and not poller.stall_alerted
+    finally:
+        release.set()
+        await finish(poller, adapter, task)
+        pending = poller._pending_owner_notify
+        if pending is not None:
+            await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
 
 
 async def test_connect_retries_transient_then_enters_poll_loop(make_poller, capsys):
