@@ -7,6 +7,7 @@ import fnmatch
 import logging
 import os
 import re
+import shlex
 import sqlite3
 import stat
 import sys
@@ -341,6 +342,25 @@ class StoreIntegrityTarget:
 
 class StoreCatalogError(RuntimeError):
     """Raised when the daemon's store layout is unsafe or incoherent."""
+
+
+class StorePathAuthorityError(PermissionError):
+    """Raised when a store ancestor's mode or owner violates daemon authority."""
+
+    def __init__(
+        self,
+        message: str,
+        *,
+        failure_class: str,
+        path: str,
+        mode: int,
+        uid: int | None = None,
+    ) -> None:
+        super().__init__(message)
+        self.failure_class = failure_class
+        self.path = path
+        self.mode = mode
+        self.uid = uid
 
 
 class _ManagedSQLiteConnection(sqlite3.Connection):
@@ -857,6 +877,11 @@ class StoreCatalog:
             if self._entries:
                 raise StoreCatalogError("storage observability cannot change after registration")
             self._observability = observability
+
+    def configured_integrity_targets(self) -> tuple[StoreIntegrityTarget, ...]:
+        """Return the configured boot targets without exposing mutable manifest state."""
+        with self._lock:
+            return tuple(self._manifest.values())
 
     def connection_policy(self, logical_name: str) -> StoreConnectionPolicy:
         """Return the catalog-declared connection policy for one store."""
@@ -1509,7 +1534,20 @@ class StoreCatalog:
         else:
             rendered_detail = detail
 
-        if any(
+        if isinstance(detail, StorePathAuthorityError):
+            command = f"chmod g-w {shlex.quote(detail.path)}"
+            if detail.failure_class == "owner":
+                recovery = (
+                    "Fix the storage directory authority before restarting: "
+                    f"path={detail.path!r} mode={detail.mode:04o} uid={detail.uid}; "
+                    f"fix ownership first, then {command}."
+                )
+            else:
+                recovery = (
+                    "Fix the storage directory permissions before restarting: "
+                    f"path={detail.path!r} mode={detail.mode:04o}; {command}."
+                )
+        elif any(
             target.criticality == "authoritative" or target.recovery == "snapshot"
             for target in targets
         ):
@@ -1952,6 +1990,41 @@ class DaemonStoreCatalog(StoreCatalog):
                     if observation not in fulfilled_absences
                 ]
 
+    def preflight_ancestor_chains(self) -> None:
+        """Verify the directory chains boot checks, skipping boot-absent targets."""
+        for target in self.configured_integrity_targets():
+            raw_path = os.fspath(target.path)
+            if self._is_memory_path(raw_path):
+                continue
+            absolute_path = os.path.abspath(raw_path)
+            try:
+                bound_file = BoundSQLiteFile.open(absolute_path)
+            except OSError as exc:
+                if self._is_missing_path_error(exc):
+                    continue
+                raise
+            try:
+                if bound_file.header_journal_mode() != "wal":
+                    continue
+                try:
+                    self._verify_bound_wal_target(bound_file, absolute_path)
+                except OSError:
+                    if bound_file.path_state() == "absent":
+                        continue
+                    raise
+            finally:
+                bound_file.close()
+
+    def _verify_bound_wal_target(
+        self,
+        bound_file: BoundSQLiteFile,
+        absolute_path: str,
+    ) -> str:
+        """Verify pathname authority and then reconcile it with the bound file."""
+        resolved_path = self._verified_daemon_owned_path(absolute_path)
+        bound_file.require_path_unchanged()
+        return resolved_path
+
     def _connect_wal_for_preflight(
         self,
         bound_file: BoundSQLiteFile,
@@ -1964,8 +2037,7 @@ class DaemonStoreCatalog(StoreCatalog):
         descriptor for this inode, so finding a matching non-pinned descriptor cannot
         independently prove which pathname SQLite opened.
         """
-        resolved_path = self._verified_daemon_owned_path(absolute_path)
-        bound_file.require_path_unchanged()
+        resolved_path = self._verify_bound_wal_target(bound_file, absolute_path)
         descriptors_before = self._open_descriptor_identities()
         connection = sqlite3.connect(
             Path(resolved_path).as_uri() + "?mode=ro",
@@ -2012,18 +2084,26 @@ class DaemonStoreCatalog(StoreCatalog):
                     f"WAL preflight path component is not a directory: {current_path!r}"
                 )
             mode = stat.S_IMODE(current_stat.st_mode)
-            if mode & 0o022:
-                raise PermissionError(
-                    "WAL preflight path component is writable by a non-daemon uid: "
-                    f"path={current_path!r} mode={mode:04o}"
-                )
-            inside_catalog = self._path_at_or_below(current_path, expected_root)
+            inside_catalog = DaemonStoreCatalog._path_at_or_below(current_path, expected_root)
             allowed_uids = {daemon_uid} if inside_catalog else {0, daemon_uid}
             if current_stat.st_uid not in allowed_uids:
-                raise PermissionError(
+                raise StorePathAuthorityError(
                     "WAL preflight path component has a non-daemon owner: "
-                    f"path={current_path!r} uid={current_stat.st_uid} "
-                    f"daemon_uid={daemon_uid}"
+                    f"path={current_path!r} mode={mode:04o} "
+                    f"uid={current_stat.st_uid} daemon_uid={daemon_uid}",
+                    failure_class="owner",
+                    path=current_path,
+                    mode=mode,
+                    uid=current_stat.st_uid,
+                )
+            if mode & 0o022:
+                raise StorePathAuthorityError(
+                    "WAL preflight path component is writable by a non-daemon uid: "
+                    f"path={current_path!r} mode={mode:04o}",
+                    failure_class="writable",
+                    path=current_path,
+                    mode=mode,
+                    uid=current_stat.st_uid,
                 )
         return resolved_path
 
