@@ -319,10 +319,16 @@ class DiscordAdapter:
 
     # ── Info ─────────────────────────────────────────────────
 
-    def get_me(self) -> dict:
+    def get_me(self, *, http_timeout: float | None = None) -> dict:
         """Get the bot's user info."""
         if not self._bot_user:
-            self._bot_user = self._request("GET", "/users/@me")
+            options = {"timeout": http_timeout} if http_timeout is not None else {}
+            identity = self._request("GET", "/users/@me", **options)
+            # Let the poller classify malformed responses as failed probes;
+            # caching one would prevent subsequent probes from recovering.
+            if isinstance(identity, dict) and "id" in identity:
+                self._bot_user = identity
+            return identity
         return self._bot_user
 
     def get_channel(self, channel_id: str) -> Chat:

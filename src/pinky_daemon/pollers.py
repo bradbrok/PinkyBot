@@ -8,6 +8,7 @@ message handler (legacy) or message broker (new).
 from __future__ import annotations
 
 import asyncio
+import inspect
 import re
 import sys
 import time
@@ -127,9 +128,269 @@ if TYPE_CHECKING:
 # always answers a getUpdates long poll within poll_timeout, so anything this
 # far past it means the connection is dead and the read will never return.
 _POLL_WATCHDOG_GRACE = 30.0
+_CONNECT_PROBE_TIMEOUT = 10.0
+_CONNECT_OUTER_DEADLINE = 30.0
+_INBOUND_STALL_ALERT_AFTER = 300.0
+_OWNER_NOTIFY_TIMEOUT = 30.0
 
 
-class _TelegramPollWatchdog:
+class _MalformedIdentityError(ValueError):
+    """A successful HTTP probe returned something other than a bot identity."""
+
+
+class _InboundConnectRetry:
+    """Connect supervision and outage accounting shared by inbound pollers."""
+
+    def _init_inbound(self, label: str, platform: str, agent_name: str, owner_notify) -> None:
+        self._inbound_label = label
+        self._inbound_platform = platform
+        self._inbound_agent = agent_name
+        self._owner_notify = owner_notify
+        self._pending_owner_notify = None
+        self._owner_notify_delivery = None
+        self._inbound_epoch = 0
+        self._inbound_started = None
+        self._last_inbound_ok = None
+        self._connect_attempts = 0
+        self._stall_alerted = False
+        self._next_stall_notify_at = 0.0
+        self._connect_suffix = ""
+
+    @staticmethod
+    def _backoff_for(attempt: int) -> float:
+        return min(2 ** min(attempt, 6), 60)
+
+    @property
+    def connect_attempts(self) -> int:
+        return self._connect_attempts
+
+    @property
+    def inbound_stalled_s(self) -> float | None:
+        since = self._last_inbound_ok
+        if since is None:
+            since = self._inbound_started
+        return max(0.0, time.monotonic() - since) if since is not None else None
+
+    @property
+    def stall_alerted(self) -> bool:
+        return self._stall_alerted
+
+    def _mark_inbound_ok(self) -> None:
+        if self._stall_alerted:
+            _log(
+                f"{self._inbound_label}: inbound recovered after "
+                f"{self.inbound_stalled_s or 0:.0f}s (attempts {self._connect_attempts})"
+            )
+        self._last_inbound_ok = time.monotonic()
+        # Detach notification delivery from the recovered outage, but retain
+        # the physical worker guard: a sync call can remain wedged indefinitely.
+        self._inbound_epoch += 1
+        self._connect_attempts = 0
+        self._stall_alerted = False
+        self._next_stall_notify_at = 0.0
+
+    def _owner_notify_done(self, done: asyncio.Task) -> None:
+        # A timed-out worker may eventually return or raise. Its result must
+        # never mark a later outage as alerted or produce an unhandled exception.
+        if not done.cancelled():
+            done.exception()
+        if self._pending_owner_notify is done:
+            self._pending_owner_notify = None
+
+    @staticmethod
+    def _discard_owner_notify_result(done: asyncio.Task) -> None:
+        if done.cancelled() or done.exception() is not None:
+            return
+        result = done.result()
+        # The caller timed out or stopped before receiving this raw result.
+        # Never start a late coroutine or leave it to warn at collection time.
+        if inspect.iscoroutine(result):
+            result.close()
+        elif isinstance(result, asyncio.Future):
+            result.cancel()
+            result.add_done_callback(lambda task: None if task.cancelled() else task.exception())
+
+    def _stop_owner_notify(self) -> None:
+        if self._owner_notify_delivery is not None:
+            self._owner_notify_delivery.cancel()
+
+    async def _notify_inbound(self, message: str, timeout: float | None = None) -> bool:
+        if self._owner_notify is None:
+            return True  # Legacy --mode poll has log-only owner alerts.
+
+        is_async = inspect.iscoroutinefunction(self._owner_notify)
+        if not is_async and self._pending_owner_notify is not None:
+            if not self._pending_owner_notify.done():
+                _log(
+                    f"{self._inbound_label}: owner-notify still pending "
+                    "from previous attempt; skipping"
+                )
+                return False
+
+        pending = None
+        claimed = False
+        if not is_async:
+            # Track only the physical thread. A deadline cannot stop it, and
+            # recovery must not allow another worker while it is still alive.
+            pending = asyncio.create_task(asyncio.to_thread(
+                self._owner_notify, self._inbound_agent, message,
+            ))
+            self._pending_owner_notify = pending
+            pending.add_done_callback(self._owner_notify_done)
+
+        async def deliver():
+            nonlocal claimed
+            if is_async:
+                result = self._owner_notify(self._inbound_agent, message)
+            else:
+                result = await asyncio.shield(pending)
+                claimed = True
+            # A sync factory (including async __call__ objects) can return an
+            # awaitable. This phase must remain cancellable on deadline/stop.
+            return bool(await result) if inspect.isawaitable(result) else bool(result)
+
+        delivery = asyncio.create_task(deliver())
+        self._owner_notify_delivery = delivery
+        try:
+            budget = _OWNER_NOTIFY_TIMEOUT if timeout is None else min(timeout, _OWNER_NOTIFY_TIMEOUT)
+            # One budget covers both phases, including time in the worker.
+            if await asyncio.wait_for(delivery, budget):
+                return True
+            _log(f"{self._inbound_label}: owner-notify failed (delivery not confirmed)")
+        except asyncio.CancelledError:
+            if not self._stop_requested:
+                raise
+        except Exception as exc:
+            _log(f"{self._inbound_label}: owner-notify failed ({type(exc).__name__}: {exc})")
+        finally:
+            if pending is not None and not claimed:
+                # Also handles cancellation before deliver() first runs and
+                # completion racing the deadline: exactly one side owns raw.
+                pending.add_done_callback(self._discard_owner_notify_result)
+            if self._owner_notify_delivery is delivery:
+                self._owner_notify_delivery = None
+        return False
+
+    async def _maybe_alert_inbound_stall(
+        self, last_error: Exception, *, terminal=False, notify_timeout: float | None = None,
+    ) -> None:
+        age = self.inbound_stalled_s or 0.0
+        if self._stop_requested:
+            return
+        now = time.monotonic()
+        if not terminal and (
+            self._stall_alerted
+            or age < _INBOUND_STALL_ALERT_AFTER
+            or now < self._next_stall_notify_at
+        ):
+            return
+        self._next_stall_notify_at = now + _INBOUND_STALL_ALERT_AFTER
+        platform = self._inbound_platform
+        agent = self._inbound_agent
+        error = " ".join(str(last_error).split())[:120]
+        state = (
+            "bad token — not retrying"
+            if terminal else "The daemon keeps retrying every ≤60s; outbound is unaffected"
+        )
+        host = "api.telegram.org" if platform == "telegram" else "discord.com"
+        remedy = (
+            "replace the bot token"
+            if terminal else f"check DNS/IPv6 reachability of {host} from the host"
+        )
+        message = (
+            f"{platform.upper()} INBOUND DEAD for {agent}: no successful connect/poll "
+            f"for {age:.0f}s ({self._connect_attempts} connect attempts; last error "
+            f"{type(last_error).__name__}: {error}). {state}. Remedy: {remedy}; "
+            f"PUT /agents/{agent}/tokens/{platform} restarts the poller."
+        )
+        _log(message)
+        # Like Buzz, only confirmed delivery suppresses subsequent attempts.
+        # Connect/poll/watchdog failures are serialized by this poller's loop.
+        epoch = self._inbound_epoch
+        delivered = await self._notify_inbound(message, notify_timeout)
+        if self._inbound_epoch == epoch:
+            self._stall_alerted = delivered
+
+    async def _connect_probe(self):
+        executor = getattr(self, "_poll_executor", None)
+        future = asyncio.get_running_loop().run_in_executor(
+            executor, lambda: self._adapter.get_me(http_timeout=_CONNECT_PROBE_TIMEOUT),
+        )
+        # A timed-out worker can finish later with an exception. Consume it
+        # without treating a late identity response as a healthy connection.
+        future.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        if executor is not None:
+            self._active_poll = future
+        try:
+            return await asyncio.wait_for(asyncio.shield(future), _CONNECT_OUTER_DEADLINE)
+        except TimeoutError:
+            if not future.done() and executor is not None and not self._stop_requested:
+                self._recycle_stuck_thread(
+                    f"connect exceeded {_CONNECT_OUTER_DEADLINE:g}s hard deadline"
+                )
+            # Discord deliberately retains the default pool: a permanently
+            # wedged probe can still consume a shared worker (#1145 class).
+            # Its dedicated executor/watchdog remains a separate change.
+            raise
+        finally:
+            if executor is not None and self._active_poll is future:
+                self._active_poll = None
+
+    async def _connect_with_retry(self):
+        self._inbound_started = time.monotonic()
+        while not self._stop_requested:
+            self._connect_attempts += 1
+            try:
+                me = await self._connect_probe()
+                identity_keys = {"id"} if self._inbound_platform == "discord" else {"id", "username"}
+                if not isinstance(me, dict) or not identity_keys.intersection(me):
+                    raise _MalformedIdentityError(f"malformed identity: {type(me).__name__}")
+            except Exception as exc:
+                if self._stop_requested:
+                    break
+                terminal = (
+                    isinstance(exc, TelegramError) and exc.error_code in {401, 404}
+                ) or (isinstance(exc, DiscordError) and exc.status_code == 401)
+                if terminal:
+                    _log(f"{self._inbound_label}: failed to connect (terminal: {exc})")
+                    self._running = False
+                    await self._maybe_alert_inbound_stall(exc, terminal=True)
+                    return None
+                delay = self._backoff_for(self._connect_attempts)
+                if isinstance(exc, DiscordRateLimited):
+                    # Honor the server's hint even when it exceeds the normal
+                    # 60s backoff cap, rather than hammering a rate-limited API.
+                    delay = max(delay, exc.retry_after)
+                error = (
+                    str(exc) if isinstance(exc, _MalformedIdentityError)
+                    else f"{type(exc).__name__}: {exc}"
+                )
+                _log(
+                    f"{self._inbound_label}: connect attempt {self._connect_attempts} failed "
+                    f"({error}); retrying in {delay:g}s"
+                )
+                # Owner notification consumes this backoff budget; an outbound
+                # outage must not add up to 30s to every inbound retry cycle.
+                retry_at = time.monotonic() + delay
+                await self._maybe_alert_inbound_stall(exc, notify_timeout=delay)
+                await _sleep_until_stopped(
+                    self._stop_event, max(0.0, retry_at - time.monotonic()),
+                )
+                continue
+            if self._stop_requested:
+                break
+            if self._connect_attempts > 1:
+                self._connect_suffix = (
+                    f" (attempt {self._connect_attempts}, "
+                    f"after {time.monotonic() - self._inbound_started:.0f}s)"
+                )
+            self._mark_inbound_ok()
+            return me
+        self._running = False
+        return None
+
+
+class _TelegramPollWatchdog(_InboundConnectRetry):
     """Deadline + recovery for blocking getUpdates calls (#1145).
 
     The 2026-08-23 incident: a network blip left every Telegram poller's
@@ -194,14 +455,19 @@ class _TelegramPollWatchdog:
                     # Completed on the deadline edge (loop scheduled the timeout
                     # callback first) — a healthy poll, not a stuck one.
                     self._last_poll_ok = time.monotonic()
+                    self._mark_inbound_ok()
                     return fut.result()
                 fut.add_done_callback(self._on_abandoned_poll_done)
                 self._recycle_after_stuck_poll(deadline)
+                await self._maybe_alert_inbound_stall(
+                    TimeoutError(f"poll exceeded {deadline:g}s hard deadline")
+                )
                 return []
         finally:
             if self._active_poll is fut:
                 self._active_poll = None
         self._last_poll_ok = time.monotonic()
+        self._mark_inbound_ok()
         return result
 
     def _on_abandoned_poll_done(self, fut) -> None:
@@ -231,12 +497,18 @@ class _TelegramPollWatchdog:
         )
 
     def _recycle_after_stuck_poll(self, deadline: float) -> None:
+        self._recycle_stuck_thread(f"poll exceeded {deadline:.0f}s hard deadline")
+
+    def _recycle_stuck_thread(self, reason: str) -> None:
         self._watchdog_fires += 1
-        age = time.monotonic() - self._last_poll_ok if self._last_poll_ok else -1.0
+        last_ok = (
+            f"{time.monotonic() - self._last_poll_ok:.0f}s ago"
+            if self._last_poll_ok else "never"
+        )
         _log(
-            f"{self._watchdog_label}: WATCHDOG poll exceeded {deadline:.0f}s hard "
-            f"deadline (fire #{self._watchdog_fires}, last successful poll "
-            f"{age:.0f}s ago) — recycling HTTP client + poll thread"
+            f"{self._watchdog_label}: WATCHDOG {reason} "
+            f"(fire #{self._watchdog_fires}, last successful poll "
+            f"{last_ok}) — recycling HTTP client + poll thread"
         )
         try:
             self._adapter.recycle()
@@ -284,6 +556,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         allowed_chat_ids: list[str] | None = None,
         event_callback=None,
         watchdog_grace: float = _POLL_WATCHDOG_GRACE,
+        owner_notify=None,
     ) -> None:
         self._adapter = adapter
         self._handler = handler
@@ -297,6 +570,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._stop_event = asyncio.Event()
         self._poll_count = 0
         self._init_watchdog("telegram-poller", watchdog_grace)
+        self._init_inbound("telegram-poller", "telegram", "legacy", owner_notify)
 
     async def start(self) -> None:
         """Start the polling loop."""
@@ -308,27 +582,21 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._stop_event.clear()
         _log("telegram-poller: starting")
 
-        # Verify bot connection — on the poller's executor, under a deadline,
-        # so a wedged network can't block the event loop or hang startup.
-        loop = asyncio.get_running_loop()
-        try:
-            me = await asyncio.wait_for(
-                loop.run_in_executor(self._poll_executor, self._adapter.get_me),
-                timeout=30,
-            )
-            _log(f"telegram-poller: connected as @{me.get('username', '?')}")
-        except (TelegramError, TimeoutError) as e:
-            _log(f"telegram-poller: failed to connect: {e!r}")
+        me = await self._connect_with_retry()
+        if me is None:
             return
+        _log(f"telegram-poller: connected as @{me.get('username', '?')}{self._connect_suffix}")
 
         while self._running:
             try:
                 await self._poll_once()
             except TelegramError as e:
                 _log(f"telegram-poller: error: {e}")
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"telegram-poller: unexpected error: {e}")
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(self._stop_event, 5)
 
             await _sleep_until_stopped(self._stop_event, self._poll_interval)
@@ -396,6 +664,7 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
+        self._stop_owner_notify()
         self._shutdown_watchdog()
         _log("telegram-poller: stopping")
 
@@ -428,6 +697,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         poll_interval: float = 1.0,
         event_callback=None,
         watchdog_grace: float = _POLL_WATCHDOG_GRACE,
+        owner_notify=None,
     ) -> None:
         from pinky_daemon.broker import BrokerMessage, MessageBroker
         self._BrokerMessage = BrokerMessage
@@ -446,6 +716,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._poll_count = 0
         self._bot_username = ""
         self._init_watchdog(f"broker-poller[{agent_name}]", watchdog_grace)
+        self._init_inbound(f"broker-poller[{agent_name}]", "telegram", agent_name, owner_notify)
 
     async def start(self) -> None:
         """Start the polling loop."""
@@ -457,28 +728,25 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._stop_event.clear()
         _log(f"broker-poller[{self._agent_name}]: starting")
 
-        # On the poller's executor, under a deadline — a wedged network can't
-        # block the event loop or hang startup.
-        loop = asyncio.get_running_loop()
-        try:
-            me = await asyncio.wait_for(
-                loop.run_in_executor(self._poll_executor, self._adapter.get_me),
-                timeout=30,
-            )
-            self._bot_username = me.get("username", "?")
-            _log(f"broker-poller[{self._agent_name}]: connected as @{self._bot_username}")
-        except (TelegramError, TimeoutError) as e:
-            _log(f"broker-poller[{self._agent_name}]: failed to connect: {e!r}")
+        me = await self._connect_with_retry()
+        if me is None:
             return
+        self._bot_username = me.get("username", "?")
+        _log(
+            f"broker-poller[{self._agent_name}]: connected as "
+            f"@{self._bot_username}{self._connect_suffix}"
+        )
 
         while self._running:
             try:
                 await self._poll_once()
             except TelegramError as e:
                 _log(f"broker-poller[{self._agent_name}]: error: {e}")
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"broker-poller[{self._agent_name}]: unexpected error: {e}")
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(self._stop_event, 5)
 
             await _sleep_until_stopped(self._stop_event, self._poll_interval)
@@ -561,6 +829,7 @@ class BrokerTelegramPoller(_TelegramPollWatchdog):
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
+        self._stop_owner_notify()
         self._shutdown_watchdog()
         _log(f"broker-poller[{self._agent_name}]: stopping")
 
@@ -712,7 +981,7 @@ class BrokeriMessagePoller:
         return self._running
 
 
-class BrokerDiscordPoller:
+class BrokerDiscordPoller(_InboundConnectRetry):
     """Polls Discord REST API for a specific agent's bot token, routes through MessageBroker.
 
     This is the Discord analogue of BrokerTelegramPoller, but using REST polling
@@ -744,6 +1013,7 @@ class BrokerDiscordPoller:
         discovery_interval: float = 60.0,
         watched_channels: list[str] | None = None,
         event_callback=None,
+        owner_notify=None,
     ) -> None:
         from pinky_daemon.broker import BrokerMessage, MessageBroker
         self._BrokerMessage = BrokerMessage
@@ -766,11 +1036,12 @@ class BrokerDiscordPoller:
         # Per-channel state
         self._channels: list[str] = []
         self._last_id: dict[str, str] = {}
-        self._last_discovery: float = 0.0
+        self._last_discovery: float | None = None
         # Channel metadata cache — invalidated each discovery cycle (~60s by
         # default). Avoids fanning out get_channel() calls across every message
         # in a burst on the same channel.
         self._channel_info_cache: dict[str, Chat] = {}
+        self._init_inbound(f"discord-poller[{agent_name}]", "discord", agent_name, owner_notify)
 
     @property
     def agent_name(self) -> str:
@@ -798,32 +1069,26 @@ class BrokerDiscordPoller:
         self._stop_event.clear()
         _log(f"discord-poller[{self._agent_name}]: starting")
 
-        # Verify bot connection
-        try:
-            me = await asyncio.get_running_loop().run_in_executor(
-                None, self._adapter.get_me,
-            )
-            self._bot_user_id = me.get("id", "")
-            self._bot_username = me.get("username", "?")
-            _log(
-                f"discord-poller[{self._agent_name}]: connected as "
-                f"{self._bot_username} (id={self._bot_user_id})"
-            )
-        except DiscordError as e:
-            _log(f"discord-poller[{self._agent_name}]: failed to connect: {e}")
-            self._running = False
+        me = await self._connect_with_retry()
+        if me is None:
             return
-
-        # Initial channel discovery + last_id priming
-        await self._refresh_channels(verbose=True)
+        self._bot_user_id = me.get("id", "")
+        self._bot_username = me.get("username", "?")
+        _log(
+            f"discord-poller[{self._agent_name}]: connected as "
+            f"{self._bot_username} (id={self._bot_user_id}){self._connect_suffix}"
+        )
 
         while self._running:
             try:
                 # Periodic re-discovery (cheap — one /users/@me/guilds + one
                 # /guilds/{id}/channels per guild per discovery_interval).
                 import time as _time
-                if _time.monotonic() - self._last_discovery >= self._discovery_interval:
-                    await self._refresh_channels(verbose=False)
+                if (
+                    self._last_discovery is None
+                    or _time.monotonic() - self._last_discovery >= self._discovery_interval
+                ):
+                    await self._refresh_channels(verbose=self._poll_count == 0)
 
                 await self._poll_once()
             except DiscordRateLimited as e:
@@ -831,15 +1096,18 @@ class BrokerDiscordPoller:
                     f"discord-poller[{self._agent_name}]: rate limited, "
                     f"sleeping {e.retry_after:.2f}s"
                 )
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(
                     self._stop_event,
                     min(e.retry_after, 30.0),
                 )
             except DiscordError as e:
                 _log(f"discord-poller[{self._agent_name}]: error: {e}")
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(self._stop_event, 5)
             except Exception as e:
                 _log(f"discord-poller[{self._agent_name}]: unexpected error: {e}")
+                await self._maybe_alert_inbound_stall(e)
                 await _sleep_until_stopped(self._stop_event, 5)
 
             await _sleep_until_stopped(self._stop_event, self._poll_interval)
@@ -865,6 +1133,7 @@ class BrokerDiscordPoller:
                     f"discord-poller[{self._agent_name}]: "
                     f"channel discovery failed: {e}"
                 )
+                await self._maybe_alert_inbound_stall(e)
                 # Keep existing set on transient discovery failure.
                 self._last_discovery = _time.monotonic()
                 return
@@ -887,8 +1156,9 @@ class BrokerDiscordPoller:
                     None,
                     lambda c=ch: self._adapter.get_messages(c, limit=1),
                 )
-            except DiscordError:
+            except DiscordError as e:
                 # Channel might be unreadable; skip it for now, retry next discovery
+                await self._maybe_alert_inbound_stall(e)
                 continue
             if not recent:
                 # Empty channel — start from "0", which sorts before any real snowflake
@@ -998,8 +1268,10 @@ class BrokerDiscordPoller:
                     f"discord-poller[{self._agent_name}]: "
                     f"channel {channel_id} fetch failed: {e}"
                 )
+                await self._maybe_alert_inbound_stall(e)
                 continue
 
+            self._mark_inbound_ok()
             if not self._accepting_deliveries:
                 return
             if not messages:
@@ -1085,6 +1357,7 @@ class BrokerDiscordPoller:
         self._running = False
         self._accepting_deliveries = False
         self._stop_event.set()
+        self._stop_owner_notify()
         _log(f"discord-poller[{self._agent_name}]: stopping")
 
 

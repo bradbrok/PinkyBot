@@ -2782,6 +2782,30 @@ def create_api(
         message_context_store=message_context_store,
     )
     _broker_pollers: list = []  # Track active broker pollers
+
+    def _new_telegram_broker_poller(name, token):
+        from pinky_daemon.pollers import BrokerTelegramPoller
+        from pinky_outreach.telegram import TelegramAdapter
+
+        # Long polls need >30s at the client level; get_me overrides this with
+        # a 10s request budget inside its separate 30s connect deadline.
+        adapter = TelegramAdapter(token, timeout=45.0)
+        return BrokerTelegramPoller(
+            adapter, name, broker, registry=agents, owner_notify=_notify_owner_alert,
+        )
+
+    def _new_discord_broker_poller(name, token, settings=None):
+        from pinky_daemon.pollers import BrokerDiscordPoller
+        from pinky_outreach.discord import DiscordAdapter
+
+        settings = settings or {}
+        return BrokerDiscordPoller(
+            DiscordAdapter(token), name, broker, registry=agents,
+            poll_interval=float(settings.get("poll_interval_sec", 1.0)),
+            watched_channels=settings.get("watched_channels") or None,
+            owner_notify=_notify_owner_alert,
+        )
+
     from pinky_daemon.pollers import quiesce_delivery_tasks, start_poller
 
     app.state.manager = manager
@@ -8775,7 +8799,6 @@ npm run build</pre>
         if platform == "telegram" and raw_token:
             try:
                 from pinky_daemon.pollers import BrokerTelegramPoller
-                from pinky_outreach.telegram import TelegramAdapter
 
                 # Stop any existing poller for this agent
                 for p in list(_broker_pollers):
@@ -8788,10 +8811,7 @@ npm run build</pre>
                         _log(f"api: stopped old telegram poller for {name}")
                         break
 
-                adapter = TelegramAdapter(raw_token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
-                poller = BrokerTelegramPoller(
-                    adapter, name, broker, registry=agents,
-                )
+                poller = _new_telegram_broker_poller(name, raw_token)
                 _broker_pollers.append(poller)
                 start_poller(poller)
                 _log(f"api: started telegram poller for {name}")
@@ -8802,7 +8822,6 @@ npm run build</pre>
         if platform == "discord" and raw_token:
             try:
                 from pinky_daemon.pollers import BrokerDiscordPoller
-                from pinky_outreach.discord import DiscordAdapter
 
                 # Stop any existing poller for this agent
                 for p in list(_broker_pollers):
@@ -8817,15 +8836,9 @@ npm run build</pre>
 
                 # Optional per-token overrides come through token settings.
                 settings = req.settings or {}
-                poll_interval = float(settings.get("poll_interval_sec", 1.0))
-                watched = settings.get("watched_channels") or None
-
-                adapter = DiscordAdapter(raw_token)
-                poller = BrokerDiscordPoller(
-                    adapter, name, broker, registry=agents,
-                    poll_interval=poll_interval,
-                    watched_channels=watched,
-                )
+                poller = _new_discord_broker_poller(name, raw_token, settings)
+                poll_interval = poller._poll_interval
+                watched = poller._configured_channels
                 _broker_pollers.append(poller)
                 start_poller(poller)
                 _log(
@@ -9615,6 +9628,9 @@ npm run build</pre>
                     "agent": p.agent_name,
                     "polls": p.poll_count,
                     "running": p.is_running,
+                    "connect_attempts": getattr(p, "connect_attempts", 0),
+                    "inbound_stalled_s": getattr(p, "inbound_stalled_s", None),
+                    "stall_alerted": getattr(p, "stall_alerted", False),
                     # Watchdog-equipped pollers only (#1145); None elsewhere.
                     "watchdog_fires": getattr(p, "watchdog_fires", None),
                     "last_poll_ok_age_s": (
@@ -12713,8 +12729,6 @@ npm run build</pre>
             BrokerSlackPoller,
             BrokerTelegramPoller,
         )
-        from pinky_outreach.discord import DiscordAdapter
-        from pinky_outreach.telegram import TelegramAdapter
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
         for agent in all_agents:
@@ -12737,10 +12751,7 @@ npm run build</pre>
                 if existing:
                     _log(f"startup: telegram poller already exists for {agent.name}, skipping")
                 else:
-                    adapter = TelegramAdapter(token, timeout=45.0)  # > poll_timeout (30s) to avoid racing
-                    poller = BrokerTelegramPoller(
-                        adapter, agent.name, broker, registry=agents,
-                    )
+                    poller = _new_telegram_broker_poller(agent.name, token)
                     _broker_pollers.append(poller)
                     start_poller(poller)
                     _log(f"startup: broker poller started for {agent.name}")
@@ -12762,15 +12773,9 @@ npm run build</pre>
                             if tok.platform == "discord":
                                 settings = tok.settings or {}
                                 break
-                        poll_interval = float(settings.get("poll_interval_sec", 1.0))
-                        watched = settings.get("watched_channels") or None
-
-                        d_adapter = DiscordAdapter(discord_token)
-                        d_poller = BrokerDiscordPoller(
-                            d_adapter, agent.name, broker, registry=agents,
-                            poll_interval=poll_interval,
-                            watched_channels=watched,
-                        )
+                        d_poller = _new_discord_broker_poller(agent.name, discord_token, settings)
+                        poll_interval = d_poller._poll_interval
+                        watched = d_poller._configured_channels
                         _broker_pollers.append(d_poller)
                         start_poller(d_poller)
                         _log(

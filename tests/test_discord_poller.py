@@ -10,6 +10,180 @@ import pytest
 
 from pinky_outreach.discord import DiscordError, DiscordRateLimited
 from pinky_outreach.types import Chat, Message, Platform
+from tests.test_poller_connect_retry import InboundClock, until
+
+
+@pytest.mark.parametrize("failure", ["api", "transport", "unknown", "rate_limit"])
+async def test_discord_connect_retries_transient_then_polls(mock_adapter, mock_broker, failure):
+    """T10: transport and unknown failures must survive the connect boundary."""
+    import httpx
+
+    from pinky_daemon.pollers import BrokerDiscordPoller
+
+    errors = {
+        "api": DiscordError("gateway", 502),
+        "transport": httpx.ConnectError("offline"),
+        "unknown": RuntimeError("unexpected"),
+        "rate_limit": DiscordRateLimited(0.03),
+    }
+    mock_adapter.get_me.side_effect = [errors[failure], {"id": "test-bot", "username": "test"}]
+    poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    poller._backoff_for = lambda _: 0.01
+    task = asyncio.create_task(poller.start())
+    try:
+        async with asyncio.timeout(5):
+            while poller.poll_count == 0:
+                await asyncio.sleep(0.005)
+        assert mock_adapter.get_me.call_count == 2
+        mock_adapter.get_me.assert_called_with(http_timeout=10.0)
+        assert poller.connect_attempts == 0
+        assert poller.is_running
+    finally:
+        poller.stop()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+
+
+async def test_discord_terminal_credential_error_alerts_and_stops(mock_adapter, mock_broker):
+    """T10: a bad Discord token alerts immediately without retrying."""
+    from pinky_daemon.pollers import BrokerDiscordPoller
+
+    notify = AsyncMock(return_value=True)
+    mock_adapter.get_me.side_effect = DiscordError("Unauthorized", 401)
+    poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    poller._owner_notify = notify  # T9 separately pins constructor wiring
+    try:
+        await asyncio.wait_for(poller.start(), 5)
+        assert mock_adapter.get_me.call_count == 1
+        assert not poller.is_running
+        notify.assert_awaited_once()
+        assert "retry-test" in notify.call_args.args[1]
+        assert "bad token" in notify.call_args.args[1]
+    finally:
+        poller.stop()
+
+
+async def test_discord_initial_discovery_transport_failure_retries(
+    mock_adapter, mock_broker, monkeypatch
+):
+    import httpx
+
+    from pinky_daemon import pollers
+
+    mock_adapter.discover_text_channels.side_effect = [httpx.ConnectError("dns"), ["chan-A"]]
+    poller = pollers.BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    poller._poll_interval = 0.005
+    original_sleep = pollers._sleep_until_stopped
+    sweep_finished = asyncio.Event()
+
+    async def fast_sleep(event, delay):
+        if poller.poll_count:
+            sweep_finished.set()
+        await original_sleep(event, min(delay, 0.01))
+
+    monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
+    task = asyncio.create_task(poller.start())
+    try:
+        await asyncio.wait_for(sweep_finished.wait(), 5)
+        assert mock_adapter.discover_text_channels.call_count == 2
+        assert mock_adapter.get_messages.call_count >= 2
+        assert poller.is_running
+    finally:
+        poller.stop()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+
+
+async def test_discord_discovers_and_primes_before_first_poll_at_small_origin(
+    mock_adapter, mock_broker, monkeypatch
+):
+    import time
+
+    from pinky_daemon.pollers import BrokerDiscordPoller
+
+    # Discord imports time locally. Keep asyncio deadlines on the real clock
+    # while exposing a freshly booted host's uptime to the poller.
+    loop = asyncio.get_running_loop()
+    monkeypatch.setattr(loop, "time", time.monotonic)
+    monkeypatch.setattr(time, "monotonic", lambda: 5.0)
+    events = []
+    first_poll_done = asyncio.Event()
+    release = asyncio.Event()
+
+    def discover():
+        events.append("discover")
+        return ["chan-A"]
+
+    def messages(channel, **kwargs):
+        assert channel == "chan-A"
+        if kwargs.get("limit") == 1:
+            events.append("prime")
+            return [_msg(msg_id="100", content="old baseline")]
+        events.append("fetch")
+        assert kwargs["after"] == "100"
+        return []
+
+    mock_adapter.discover_text_channels.side_effect = discover
+    mock_adapter.get_messages.side_effect = messages
+    poller = BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    real_poll_once = poller._poll_once
+
+    async def first_poll():
+        events.append("poll")
+        await real_poll_once()
+        first_poll_done.set()
+        await release.wait()
+
+    monkeypatch.setattr(poller, "_poll_once", first_poll)
+    task = asyncio.create_task(poller.start())
+    try:
+        await asyncio.wait_for(first_poll_done.wait(), 5)
+        assert events == ["discover", "prime", "poll", "fetch"]
+        assert poller.watched_channels == ["chan-A"]
+        assert poller._last_id == {"chan-A": "100"}
+        assert poller.poll_count == 1
+        mock_broker.handle_inbound.assert_not_called()
+    finally:
+        release.set()
+        poller.stop()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+
+
+@pytest.mark.parametrize("failure", ["api", "transport", "rate_limit"])
+async def test_discord_poll_error_stall_alerts_once(
+    mock_adapter, mock_broker, monkeypatch, failure
+):
+    import httpx
+
+    from pinky_daemon import pollers
+
+    errors = {
+        "api": DiscordError("gateway", 502),
+        "transport": httpx.ConnectError("offline"),
+        "rate_limit": DiscordRateLimited(0.01),
+    }
+    notify = AsyncMock(return_value=True)
+    interval = 300
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    clock = InboundClock(monkeypatch)
+    mock_adapter.get_messages.side_effect = [[], *([errors[failure]] * 1000)]
+    poller = pollers.BrokerDiscordPoller(
+        mock_adapter, "retry-test", mock_broker, owner_notify=notify
+    )
+    poller._poll_interval = 0.005
+    task = asyncio.create_task(poller.start())
+    try:
+        await clock.cycles()
+        notify.assert_not_awaited()
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        assert poller.inbound_stalled_s >= interval
+        clock.advance(5 * interval)
+        await clock.cycles()
+        notify.assert_awaited_once()
+        mock_adapter.get_messages.side_effect = None
+        await until(lambda: not poller.stall_alerted)
+    finally:
+        poller.stop()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
 
 
 @pytest.fixture

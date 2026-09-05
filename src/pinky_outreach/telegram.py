@@ -57,13 +57,14 @@ class TelegramAdapter:
             # because its connection is wedged, so close() may itself fail.
             pass
 
-    def _request(self, method: str, **params) -> dict:
+    def _request(self, method: str, *, http_timeout: float | None = None, **params) -> dict:
         """Make a Telegram Bot API request."""
         # Remove None values
         params = {k: v for k, v in params.items() if v is not None}
 
         url = f"{self._base}/{method}"
-        resp = self._client.post(url, json=params)
+        options = {"timeout": http_timeout} if http_timeout is not None else {}
+        resp = self._client.post(url, json=params, **options)
         data = resp.json()
 
         if not data.get("ok"):
@@ -540,9 +541,9 @@ class TelegramAdapter:
 
     # ── Info ─────────────────────────────────────────────────
 
-    def get_me(self) -> dict:
+    def get_me(self, *, http_timeout: float | None = None) -> dict:
         """Get bot info."""
-        return self._request("getMe")
+        return self._request("getMe", http_timeout=http_timeout)
 
     def get_chat(self, chat_id: str | int) -> Chat:
         """Get chat info."""
