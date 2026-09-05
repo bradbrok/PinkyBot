@@ -7,7 +7,9 @@ teardown release; test deadlines must fail without hanging interpreter exit.
 from __future__ import annotations
 
 import asyncio
+import json
 import socket
+import threading
 import time
 from unittest.mock import AsyncMock, MagicMock
 
@@ -36,7 +38,7 @@ class ConnectAdapter(FakeHardStuckAdapter):
         if self.failures:
             raise self.failures.pop(0)
         self.connected_at = self.monotonic()
-        return {"username": "retry_test_bot"}
+        return {"id": "123", "username": "retry_test_bot"}
 
     def get_updates(self, **kwargs):
         self._calls += 1
@@ -108,6 +110,175 @@ async def finish(poller, adapter, task):
     adapter.release()
     # Retrieve base-version failures too, without replacing the useful assertion.
     await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+
+
+def inbound_poller(kind, adapter, **kwargs):
+    if kind == "legacy":
+        return pollers.TelegramPoller(adapter, FakeHandler(), **kwargs)
+    if kind == "broker":
+        return pollers.BrokerTelegramPoller(adapter, "retry-test", FakeBroker(), **kwargs)
+    return pollers.BrokerDiscordPoller(adapter, "retry-test", FakeBroker(), **kwargs)
+
+
+@pytest.mark.parametrize(
+    ("kind", "malformed"),
+    [
+        (kind, value)
+        for kind in ("legacy", "broker", "discord")
+        for value in (None, ["invalid"], "invalid", {})
+    ] + [("discord", {"username": "missing-id"})],
+)
+async def test_malformed_identity_retries_without_marking_health(kind, malformed, monkeypatch, capsys):
+    """Exercise the real get_me parser/cache, then recover to a valid HTTP response."""
+    clock = InboundClock(monkeypatch)
+    good = {"id": "123", "username": "retry_test_bot"}
+    payload = malformed
+    requests = []
+
+    def respond(request):
+        requests.append(request)
+        result = payload if kind == "discord" else {"ok": True, "result": payload}
+        return httpx.Response(200, content=json.dumps(result), headers={"Content-Type": "application/json"})
+
+    adapter = DiscordAdapter("test") if kind == "discord" else TelegramAdapter("test")
+    adapter._client.close()
+    adapter._client = httpx.Client(
+        base_url="https://example.invalid", transport=httpx.MockTransport(respond)
+    )
+    # Keep identity parsing real; the healthy poll loop only needs an empty result.
+    if kind == "discord":
+        monkeypatch.setattr(adapter, "discover_text_channels", lambda: ["test-channel"])
+        monkeypatch.setattr(adapter, "get_messages", lambda *args, **kwargs: [])
+    else:
+        monkeypatch.setattr(adapter, "get_updates", lambda **kwargs: [])
+    poller = inbound_poller(kind, adapter)
+    poller._backoff_for = lambda _: 0.1
+    poller._poll_interval = 0.005
+    task = asyncio.create_task(poller.start())
+    try:
+        await until(lambda: task.done() or clock.sleeps >= 3)
+        assert not task.done(), "malformed identity must stay in the connect retry loop"
+        assert poller.is_running
+        assert poller._last_inbound_ok is None
+        assert poller.poll_count == 0
+        assert poller.connect_attempts >= 3
+        assert len(requests) >= 3, "malformed identity must not poison the adapter cache"
+        assert (
+            f"connect attempt 1 failed (malformed identity: {type(malformed).__name__})"
+            in capsys.readouterr().err
+        )
+        payload = good
+        await until(lambda: poller.poll_count > 0 and poller._last_inbound_ok is not None)
+        assert poller.is_running and not task.done()
+        assert poller.connect_attempts == 0
+        if kind == "discord":
+            assert adapter.get_me() == good
+    finally:
+        poller.stop()
+        await asyncio.wait_for(asyncio.gather(task, return_exceptions=True), 5)
+        adapter.close()
+
+
+@pytest.mark.parametrize(
+    ("kind", "identity"),
+    [(kind, identity) for kind in ("legacy", "broker")
+     for identity in ({"username": "test"}, {"id": "123"})]
+    + [("discord", {"id": "123"})],
+)
+async def test_minimal_identity_fields_are_accepted(kind, identity):
+    adapter = ConnectAdapter()
+    adapter.get_me = lambda **kwargs: identity
+    adapter.discover_text_channels = lambda: ["test-channel"]
+    adapter.get_messages = lambda *args, **kwargs: []
+    poller = inbound_poller(kind, adapter)
+    task = asyncio.create_task(poller.start())
+    try:
+        await until(lambda: poller.poll_count > 0)
+        assert poller.is_running and poller.connect_attempts == 0
+        assert poller._last_inbound_ok is not None
+    finally:
+        await finish(poller, adapter, task)
+
+
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+@pytest.mark.parametrize("late_result", ["true", "false", "raise"])
+async def test_sync_owner_notify_has_one_worker_across_outages(
+    kind, late_result, monkeypatch, capsys
+):
+    """Timed-out sync workers stay bounded; old results never alert a new outage."""
+    clock = InboundClock(monkeypatch)
+    interval = 300
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", interval)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 0.1)
+    release = threading.Event()
+    lock = threading.Lock()
+    workers = []
+    active = 0
+    peak = 0
+    loop = asyncio.get_running_loop()
+    unhandled = []
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _loop, context: unhandled.append(context))
+
+    def notify(*_):
+        nonlocal active, peak
+        with lock:
+            workers.append(threading.current_thread())
+            call = len(workers)
+            active += 1
+            peak = max(peak, active)
+        try:
+            release.wait()
+            if call == 1 and late_result == "raise":
+                raise RuntimeError("late notification failure")
+            return call > 1 or late_result == "true"
+        finally:
+            with lock:
+                active -= 1
+
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    adapter.monotonic = clock.monotonic
+    adapter.discover_text_channels = lambda: ["test-channel"]
+    adapter.get_messages = lambda *args, **kwargs: adapter.get_updates()
+    poller = inbound_poller(kind, adapter, owner_notify=notify)
+    poller._backoff_for = lambda _: 0.1
+    poller._poll_interval = 0.005
+    task = asyncio.create_task(poller.start())
+    try:
+        await clock.cycles(3)
+        for _ in range(3):
+            clock.advance(interval)
+            await clock.cycles(5)
+        assert len(workers) == 1, "cooldown must not allocate another hung notify worker"
+        assert active == peak == 1
+        assert workers[0].is_alive()
+        assert poller._last_inbound_ok is None and not poller.stall_alerted
+        assert poller.is_running and not task.done()
+        assert "owner-notify still pending from previous attempt; skipping" in capsys.readouterr().err
+
+        # Real connect recovery, immediately followed by a failed poll outage.
+        adapter.poll_error = httpx.ConnectError("poll offline")
+        adapter.failures.clear()
+        await until(lambda: poller._last_inbound_ok is not None and poller.connect_attempts == 0)
+        assert not poller.stall_alerted
+        clock.advance(interval)
+        await clock.cycles(5)
+        assert len(workers) == 1, "recovery must retain the physical in-flight worker guard"
+        release.set()
+        await until(lambda: active == 0)
+        await clock.cycles(5)
+        assert not poller.stall_alerted, "late completion belongs to the old outage"
+        assert not unhandled, "late worker exceptions must be consumed"
+
+        # Once the old worker finishes, a new outage can make a fresh attempt.
+        clock.advance(interval)
+        await until(lambda: poller.stall_alerted)
+        assert len(workers) == 2 and peak == 1
+    finally:
+        release.set()
+        await finish(poller, adapter, task)
+        await until(lambda: active == 0)
+        loop.set_exception_handler(previous_handler)
 
 
 async def test_connect_retries_transient_then_enters_poll_loop(make_poller, capsys):

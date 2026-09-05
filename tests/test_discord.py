@@ -309,6 +309,26 @@ class TestDiscordAdapter:
         assert adapter._bot_user is not None
         adapter.close()
 
+    @pytest.mark.parametrize("malformed", [None, ["invalid"], "invalid", {}, {"username": "no-id"}])
+    def test_get_me_does_not_cache_malformed_identity(self, malformed):
+        adapter = self._make_adapter()
+        good = {"id": "123", "username": "valid"}
+        responses = []
+        for payload in (malformed, good):
+            response = MagicMock()
+            response.status_code = 200
+            response.json.return_value = payload
+            responses.append(response)
+        adapter._client.request = MagicMock(side_effect=responses)
+        try:
+            assert adapter.get_me() == malformed
+            assert adapter.get_me() == good
+            assert adapter.get_me() == good
+            assert adapter._bot_user == good
+            assert adapter._client.request.call_count == 2
+        finally:
+            adapter.close()
+
     def test_get_me_caches(self):
         adapter = self._make_adapter()
         adapter._bot_user = {"id": "111", "username": "cached"}
