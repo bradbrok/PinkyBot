@@ -48,6 +48,9 @@ def kb(tmp_path):
 
 @pytest.fixture
 def runner(kb, tmp_path):
+    (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {
+        "pinky-self": {"type": "sse", "url": "http://self.invalid/sse"},
+    }}))
     return LibrarianRunner(kb, db_path=tmp_path / "librarian_state.db")
 
 
@@ -159,7 +162,9 @@ class TestLibrarianMcpServersWiring:
     @pytest.mark.asyncio
     async def test_loads_mcp_servers_from_mcp_json(self, kb, runner, tmp_path, stub_sdk):
         fake_servers = {"pinky-self": {"type": "sse", "url": "http://x"}}
-        (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": fake_servers}))
+        (tmp_path / ".mcp.json").write_text(json.dumps({"mcpServers": {
+            **fake_servers, "unrelated": {"command": "must-not-run"},
+        }}))
 
         kb.ingest(title="Note", content="hello world", filed_by="brad")
         cfg = _AgentConfig(str(tmp_path))
@@ -171,13 +176,15 @@ class TestLibrarianMcpServersWiring:
         assert stub_sdk.last_config.mcp_servers == fake_servers
 
     @pytest.mark.asyncio
-    async def test_no_mcp_json_yields_empty_mcp_servers(self, kb, runner, tmp_path, stub_sdk):
-        # No .mcp.json written into the working dir.
+    async def test_no_mcp_json_skips_run(self, kb, runner, tmp_path, stub_sdk):
+        (tmp_path / ".mcp.json").unlink()
         kb.ingest(title="Note", content="hello world", filed_by="brad")
         cfg = _AgentConfig(str(tmp_path))
         stub_sdk.result = RunResult(output="Curated.", exit_code=0)
 
-        await runner.run("ivan", cfg)
+        stats = await runner.run("ivan", cfg)
 
-        assert stub_sdk.last_config is not None
-        assert not stub_sdk.last_config.mcp_servers
+        assert stats["skipped"] is True
+        assert "cannot bound MCP surface" in stats["error"]
+        assert stub_sdk.last_config is None
+        assert stub_sdk.prompts == []

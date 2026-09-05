@@ -38,14 +38,25 @@ _MAX_SOURCE_CHARS = 150_000
 # Tools the librarian SDK session can use (MCP tools from pinky-self + file read)
 # ToolSearch is required because MCP_CONNECTION_NONBLOCKING=true makes MCP tools
 # deferred — the LLM must call ToolSearch to load their schemas before using them.
-_LIBRARIAN_ALLOWED_TOOLS = [
+_LIBRARIAN_ALLOWED_TOOLS = (
     "Read", "Glob", "Grep", "ToolSearch",
     "mcp__pinky-self__kb_search",
     "mcp__pinky-self__kb_get_wiki",
     "mcp__pinky-self__kb_stats",
     "mcp__pinky-self__kb_save_wiki",
     "mcp__pinky-self__kb_delete_wiki",
-]
+)
+
+
+async def _librarian_pretooluse_guard(input_data, tool_use_id, context) -> dict:
+    """Reject every tool outside the exact curation set before permission rules."""
+    if input_data.get("tool_name", "") not in _LIBRARIAN_ALLOWED_TOOLS:
+        return {"hookSpecificOutput": {
+            "hookEventName": "PreToolUse",
+            "permissionDecision": "deny",
+            "permissionDecisionReason": "Outside librarian tool set",
+        }}
+    return {}
 
 
 class LibrarianRunner:
@@ -187,31 +198,43 @@ class LibrarianRunner:
         return self.has_new_sources(agent_name or "_default")
 
     @staticmethod
-    def _build_sdk_config(work_dir: str, system_prompt: str) -> SDKRunnerConfig:
-        """Build the one-shot session configuration."""
-        # Load MCP servers from .mcp.json. SDKRunnerConfig.mcp_servers defaults
-        # to {}, and SDKRunner only forwards it to ClaudeAgentOptions when
-        # truthy — so without this fallback the librarian session gets no MCP
-        # config at all and every mcp__pinky-self__kb_* tool is unavailable.
-        # Mirrors the fallback streaming_session.py uses for the same reason.
-        mcp_servers: dict = {}
+    def _build_sdk_config(work_dir: str, system_prompt: str) -> SDKRunnerConfig | None:
+        """Build a bounded session, or refuse a missing/invalid MCP surface."""
+        from claude_agent_sdk import HookMatcher
+
         mcp_json_path = Path(work_dir) / ".mcp.json"
-        if mcp_json_path.exists():
-            try:
-                mcp_data = json.loads(mcp_json_path.read_text())
-                mcp_servers = mcp_data.get("mcpServers", {})
-                _log(f"librarian: loaded {len(mcp_servers)} MCP servers from .mcp.json")
-            except Exception as e:
-                _log(f"librarian: failed to read .mcp.json: {e}")
+        try:
+            mcp_data = json.loads(mcp_json_path.read_text())
+            if not isinstance(mcp_data, dict):
+                raise ValueError(".mcp.json must contain an object")
+            servers = mcp_data.get("mcpServers")
+            if not isinstance(servers, dict):
+                raise ValueError("mcpServers must contain an object")
+            entry = servers.get("pinky-self")
+            if not isinstance(entry, dict) or not entry:
+                raise ValueError("pinky-self entry is missing or invalid")
+        except (OSError, UnicodeError, ValueError) as exc:
+            _log(
+                f"ERROR librarian[{Path(work_dir).name}]: cannot bound MCP surface "
+                f"({exc}); skipping run"
+            )
+            return None
+
+        mcp_servers = {"pinky-self": entry}
+        _log(f"librarian: loaded {len(mcp_servers)} MCP servers from .mcp.json")
 
         return SDKRunnerConfig(
             working_dir=work_dir,
             model="sonnet",  # Cost-efficient for curation
-            allowed_tools=_LIBRARIAN_ALLOWED_TOOLS,
-            permission_mode="bypassPermissions",
+            tools=["Read", "Glob", "Grep", "ToolSearch"],
+            allowed_tools=list(_LIBRARIAN_ALLOWED_TOOLS),
+            permission_mode="dontAsk",
             system_prompt=system_prompt,
             max_turns=50,
             mcp_servers=mcp_servers,
+            strict_mcp_config=True,
+            setting_sources=[],
+            hooks={"PreToolUse": [HookMatcher(matcher=None, hooks=[_librarian_pretooluse_guard])]},
         )
 
 
@@ -325,6 +348,8 @@ class LibrarianRunner:
             work_dir = str(Path(agent_config.working_dir).resolve())
 
         config = self._build_sdk_config(work_dir, system_prompt)
+        if config is None:
+            return {"error": "cannot bound MCP surface; skipping run", "skipped": True}
 
         runner = SDKRunner(config, agent_name=f"{agent_name}-librarian")
 
