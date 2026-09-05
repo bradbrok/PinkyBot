@@ -63,6 +63,18 @@ def _make_private_client(tmp_path: Path, *, seed_wal: bool = False) -> tuple[Tes
     return TestClient(app), data_dir
 
 
+def _seed_sqlite_header(path: Path, *, journal_mode: str) -> None:
+    connection = sqlite3.connect(path)
+    try:
+        observed_mode = connection.execute(f"PRAGMA journal_mode={journal_mode}").fetchone()
+        assert observed_mode == (journal_mode,)
+        connection.execute("CREATE TABLE header_seed (value TEXT NOT NULL)")
+        connection.execute("INSERT INTO header_seed VALUES ('ready')")
+        connection.commit()
+    finally:
+        connection.close()
+
+
 class _GitMock:
     """Programmable subprocess.check_output side_effect for git commands.
 
@@ -566,6 +578,116 @@ class TestAdminUpdateStoragePreflight:
         assert repr(failed_path) in logs[0]
         assert "PermissionError" in logs[0]
         assert logs[0].endswith("staying on current release abc1234")
+
+    @pytest.mark.parametrize("header_kind", ["rollback", "empty"])
+    def test_present_non_wal_store_under_writable_ancestor_does_not_block_update(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+        header_kind: str,
+    ) -> None:
+        client, data_dir = _make_private_client(tmp_path)
+        authority_root = data_dir / f"{header_kind}-only"
+        authority_root.mkdir(mode=0o700)
+        assert os.path.commonpath((authority_root, tmp_path.resolve())) == os.fspath(
+            tmp_path.resolve()
+        )
+        store_path = authority_root / "store.db"
+        if header_kind == "rollback":
+            _seed_sqlite_header(store_path, journal_mode="delete")
+        else:
+            store_path.touch()
+        target = StoreIntegrityTarget(logical_name="synthetic", path=os.fspath(store_path))
+        monkeypatch.setattr(
+            client.app.state.store_catalog,
+            "configured_integrity_targets",
+            lambda: (target,),
+        )
+
+        original_mode = authority_root.stat().st_mode & 0o777
+        unsafe_mode = original_mode | 0o020
+        logs: list[str] = []
+        gm = _GitMock(dirty_files=[])
+        authority_root.chmod(unsafe_mode)
+        try:
+            with (
+                patch("subprocess.check_output", side_effect=gm),
+                patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+                patch("pinky_daemon.api._log", side_effect=logs.append),
+                patch("shutil.which", return_value=None),
+                patch("os.kill"),
+            ):
+                response = client.post("/admin/update?branch=main")
+        finally:
+            authority_root.chmod(original_mode)
+
+        assert response.status_code == 200
+        assert response.json()["updated"] is True
+        assert gm.did_deploy_checkout()
+        assert not gm.did_force_reset()
+        assert not any(line.startswith("ERROR") for line in logs)
+
+    def test_non_wal_sibling_does_not_suppress_wal_ancestor_refusal(
+        self,
+        tmp_path: Path,
+        monkeypatch: pytest.MonkeyPatch,
+    ) -> None:
+        client, data_dir = _make_private_client(tmp_path)
+        authority_root = data_dir / "mixed-headers"
+        authority_root.mkdir(mode=0o700)
+        assert os.path.commonpath((authority_root, tmp_path.resolve())) == os.fspath(
+            tmp_path.resolve()
+        )
+        rollback_path = authority_root / "first-rollback.db"
+        wal_path = authority_root / "second-wal.db"
+        _seed_sqlite_header(rollback_path, journal_mode="delete")
+        _seed_sqlite_header(wal_path, journal_mode="wal")
+        targets = (
+            StoreIntegrityTarget(logical_name="rollback", path=os.fspath(rollback_path)),
+            StoreIntegrityTarget(logical_name="wal", path=os.fspath(wal_path)),
+        )
+        monkeypatch.setattr(
+            client.app.state.store_catalog,
+            "configured_integrity_targets",
+            lambda: targets,
+        )
+
+        original_mode = authority_root.stat().st_mode & 0o777
+        unsafe_mode = original_mode | 0o020
+        logs: list[str] = []
+        gm = _GitMock(dirty_files=["src/pinky_daemon/api.py"])
+        authority_root.chmod(unsafe_mode)
+        try:
+            with (
+                patch("subprocess.check_output", side_effect=gm),
+                patch.dict(os.environ, {"PINKYBOT_CHANNEL": "stable"}),
+                patch("pinky_daemon.api._log", side_effect=logs.append),
+                patch("shutil.which", return_value=None),
+                patch("os.kill"),
+            ):
+                response = client.post("/admin/update?branch=main&force=true")
+        finally:
+            authority_root.chmod(original_mode)
+
+        assert response.status_code == 200
+        assert response.json() == {
+            "error": (
+                "storage ancestor preflight failed: "
+                f"path={os.fspath(authority_root)!r} mode={unsafe_mode:04o}"
+            ),
+            "staying_on_version": "abc1234",
+            "preflight": {
+                "path": os.fspath(authority_root),
+                "mode": f"{unsafe_mode:04o}",
+            },
+        }
+        assert not gm.did_force_reset()
+        assert not gm.did_deploy_checkout()
+        assert logs == [
+            "ERROR admin update refused by storage ancestor preflight: "
+            f"path={os.fspath(authority_root)!r} mode={unsafe_mode:04o}; "
+            "staying on current release abc1234"
+        ]
 
     def test_successful_frontend_rebuild_writes_manifest_and_status(self):
         """When npm build succeeds, /admin/update writes and returns the build manifest."""
