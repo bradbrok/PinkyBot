@@ -81,10 +81,14 @@ async def finish(poller, adapter, task):
 
 
 async def test_connect_retries_transient_then_enters_poll_loop(make_poller, capsys):
-    adapter = ConnectAdapter([
-        TimeoutError("probe"), httpx.ConnectError("boom"),
-        socket.gaierror("dns"), TelegramError("Bad Gateway", 502),
-    ])
+    adapter = ConnectAdapter(
+        [
+            TimeoutError("probe"),
+            httpx.ConnectError("boom"),
+            socket.gaierror("dns"),
+            TelegramError("Bad Gateway", 502),
+        ]
+    )
     poller, sink = make_poller(adapter)
     poller._backoff_for = lambda n: 0.01 * 2 ** (n - 1)
     task = asyncio.create_task(poller.start())
@@ -199,7 +203,9 @@ async def test_stall_alert_fires_once_per_outage_and_resets(make_poller, monkeyp
 
 @pytest.mark.parametrize("failure", ["api", "transport", "watchdog"])
 async def test_poll_loop_error_stall_alerts_keyed_on_last_success(
-    make_poller, monkeypatch, failure,
+    make_poller,
+    monkeypatch,
+    failure,
 ):
     monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0.06, raising=False)
     notify = MagicMock(return_value=True)
@@ -277,7 +283,8 @@ def test_connect_probe_uses_per_request_timeout_below_outer_deadline(platform, h
         call.return_value.status_code = 200
         call.return_value.json.return_value = (
             {"ok": True, "result": {"username": "test"}}
-            if platform == "telegram" else {"username": "test"}
+            if platform == "telegram"
+            else {"username": "test"}
         )
         assert adapter.get_me(http_timeout=http_timeout)["username"] == "test"
         if http_timeout is None:
@@ -304,3 +311,17 @@ def test_connect_backoff_is_capped_and_unbounded(make_poller):
     finally:
         poller.stop()
         adapter.release()
+
+
+async def test_failed_alert_delivery_is_retried_until_confirmed(make_poller, monkeypatch):
+    """A failed owner route must not mark an undelivered alert as delivered."""
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0)
+    notify = MagicMock(side_effect=[False, True])
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 4)
+    poller, sink = make_poller(adapter, owner_notify=notify)
+    task = asyncio.create_task(poller.start())
+    try:
+        await asyncio.wait_for(sink.delivered.wait(), 0.8)
+        assert notify.call_count == 2
+    finally:
+        await finish(poller, adapter, task)

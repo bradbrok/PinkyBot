@@ -161,7 +161,7 @@ async def test_review_poller_stop_is_a_delivery_publication_barrier() -> None:
 
     class Adapter:
         @staticmethod
-        def get_me():
+        def get_me(*, http_timeout=None):
             return {"username": "review"}
 
         @staticmethod

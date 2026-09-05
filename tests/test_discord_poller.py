@@ -61,6 +61,78 @@ async def test_discord_terminal_credential_error_alerts_and_stops(mock_adapter, 
         poller.stop()
 
 
+async def test_discord_initial_discovery_transport_failure_retries(
+    mock_adapter, mock_broker, monkeypatch
+):
+    import httpx
+
+    from pinky_daemon import pollers
+
+    mock_adapter.discover_text_channels.side_effect = [httpx.ConnectError("dns"), ["chan-A"]]
+    poller = pollers.BrokerDiscordPoller(mock_adapter, "retry-test", mock_broker)
+    poller._poll_interval = 0.005
+    original_sleep = pollers._sleep_until_stopped
+
+    async def fast_sleep(event, delay):
+        await original_sleep(event, min(delay, 0.01))
+
+    monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
+    task = asyncio.create_task(poller.start())
+    try:
+        async with asyncio.timeout(0.8):
+            while not poller.poll_count:
+                await asyncio.sleep(0.005)
+        assert mock_adapter.discover_text_channels.call_count == 2
+        assert mock_adapter.get_messages.call_count >= 2
+        assert poller.is_running
+    finally:
+        poller.stop()
+        await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("failure", ["api", "transport", "rate_limit"])
+async def test_discord_poll_error_stall_alerts_once(
+    mock_adapter, mock_broker, monkeypatch, failure
+):
+    import httpx
+
+    from pinky_daemon import pollers
+
+    errors = {
+        "api": DiscordError("gateway", 502),
+        "transport": httpx.ConnectError("offline"),
+        "rate_limit": DiscordRateLimited(0.01),
+    }
+    notify = AsyncMock(return_value=True)
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 0.04)
+    mock_adapter.get_messages.side_effect = [[], *([errors[failure]] * 1000)]
+    poller = pollers.BrokerDiscordPoller(
+        mock_adapter, "retry-test", mock_broker, owner_notify=notify
+    )
+    poller._poll_interval = 0.005
+    original_sleep = pollers._sleep_until_stopped
+
+    async def fast_sleep(event, delay):
+        await original_sleep(event, min(delay, 0.01))
+
+    monkeypatch.setattr(pollers, "_sleep_until_stopped", fast_sleep)
+    task = asyncio.create_task(poller.start())
+    try:
+        async with asyncio.timeout(0.8):
+            while notify.await_count == 0:
+                await asyncio.sleep(0.005)
+        assert poller.inbound_stalled_s >= 0.04
+        await asyncio.sleep(0.08)
+        notify.assert_awaited_once()
+        mock_adapter.get_messages.side_effect = None
+        async with asyncio.timeout(0.8):
+            while poller.stall_alerted:
+                await asyncio.sleep(0.005)
+    finally:
+        poller.stop()
+        await asyncio.gather(task, return_exceptions=True)
+
+
 @pytest.fixture
 def mock_adapter():
     """A mock DiscordAdapter with sensible defaults."""

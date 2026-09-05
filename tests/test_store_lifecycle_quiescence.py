@@ -32,7 +32,7 @@ async def test_stop_before_scheduled_start_is_sticky_for_every_other_poller(
         can_receive = False
 
         @staticmethod
-        def get_me():
+        def get_me(*, http_timeout=None):
             nonlocal startup_calls
             startup_calls += 1
             return {"username": "quiescence"}
@@ -88,7 +88,7 @@ async def test_stop_promptly_unblocks_an_inflight_telegram_poll() -> None:
 
     class Adapter:
         @staticmethod
-        def get_me():
+        def get_me(*, http_timeout=None):
             return {"username": "quiescence"}
 
         @staticmethod
@@ -149,7 +149,7 @@ async def test_quiescence_drains_an_already_fetched_telegram_batch() -> None:
 
     class Adapter:
         @staticmethod
-        def get_me():
+        def get_me(*, http_timeout=None):
             return {"username": "quiescence"}
 
         @staticmethod
@@ -206,7 +206,7 @@ def test_abandoned_telegram_batch_drop_after_stop_is_loud(capsys) -> None:
 
     class Adapter:
         @staticmethod
-        def get_me():
+        def get_me(*, http_timeout=None):
             return {"username": "quiescence"}
 
     poller = pollers.TelegramPoller(Adapter(), object())

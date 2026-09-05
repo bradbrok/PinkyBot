@@ -99,7 +99,7 @@ async def test_discord_stop_before_scheduled_start_keeps_ingress_closed() -> Non
 
     class Adapter:
         @staticmethod
-        def get_me() -> dict[str, str]:
+        def get_me(*, http_timeout=None) -> dict[str, str]:
             return {"id": "BOT", "username": "review"}
 
         @staticmethod

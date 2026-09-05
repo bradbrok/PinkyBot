@@ -319,10 +319,11 @@ class DiscordAdapter:
 
     # ── Info ─────────────────────────────────────────────────
 
-    def get_me(self) -> dict:
+    def get_me(self, *, http_timeout: float | None = None) -> dict:
         """Get the bot's user info."""
         if not self._bot_user:
-            self._bot_user = self._request("GET", "/users/@me")
+            options = {"timeout": http_timeout} if http_timeout is not None else {}
+            self._bot_user = self._request("GET", "/users/@me", **options)
         return self._bot_user
 
     def get_channel(self, channel_id: str) -> Chat:
