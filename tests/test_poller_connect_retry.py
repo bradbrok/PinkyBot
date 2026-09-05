@@ -470,6 +470,80 @@ async def test_stop_drains_notify_awaitable_before_deadline(kind, callback_kind,
             await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
 
 
+@pytest.mark.parametrize("kind", ["legacy", "broker", "discord"])
+async def test_foreign_cancellation_propagates_during_notify_awaitable(kind, monkeypatch):
+    clock = InboundClock(monkeypatch)
+    monkeypatch.setattr(pollers, "_INBOUND_STALL_ALERT_AFTER", 300)
+    monkeypatch.setattr(pollers, "_OWNER_NOTIFY_TIMEOUT", 30)
+    entered = asyncio.Event()
+    cancelled = asyncio.Event()
+    release = asyncio.Event()
+    returned = []
+    unhandled = []
+    loop = asyncio.get_running_loop()
+    previous_handler = loop.get_exception_handler()
+    loop.set_exception_handler(lambda _, context: unhandled.append(context))
+
+    async def deliver():
+        entered.set()
+        try:
+            await release.wait()
+        finally:
+            cancelled.set()
+        return True
+
+    def notify(*_):
+        result = deliver()
+        returned.append(result)
+        return result
+
+    adapter = ConnectAdapter([httpx.ConnectError("offline")] * 1000)
+    poller = inbound_poller(kind, adapter, owner_notify=notify)
+    poller._backoff_for = lambda _: 30
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always", RuntimeWarning)
+        task = asyncio.create_task(poller.start())
+        try:
+            await clock.cycles(3)
+            clock.advance(300)
+            await asyncio.wait_for(entered.wait(), 5)
+            delivery = poller._owner_notify_delivery
+            assert delivery is not None and not delivery.done()
+            assert poller._pending_owner_notify is None, "the physical worker has finished"
+            assert not poller._stop_requested
+            calls = (adapter.connect_calls, adapter._calls, poller.poll_count)
+
+            task.cancel()  # Foreign cancellation: stop() must not supply or swallow it.
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(asyncio.shield(task), 1)
+            assert task.cancelled() and not poller._stop_requested
+            assert cancelled.is_set() and delivery.cancelled()
+            assert poller._owner_notify_delivery is None
+            assert poller._pending_owner_notify is None
+            assert len(returned) == 1 and inspect.getcoroutinestate(returned[0]) == inspect.CORO_CLOSED
+            returned.clear()
+
+            # Make recovery possible and flush queued completion callbacks;
+            # cancellation must leave no loop that reconnects or polls again.
+            adapter.failures.clear()
+            clock.advance(300)
+            release.set()
+            for _ in range(10):
+                await asyncio.sleep(0)
+            gc.collect()
+            assert (adapter.connect_calls, adapter._calls, poller.poll_count) == calls
+            assert not poller.stall_alerted
+            assert not unhandled, "notification completion must be consumed quietly"
+            assert not [w for w in caught if "was never awaited" in str(w.message)]
+        finally:
+            release.set()
+            await finish(poller, adapter, task)
+            pending = poller._pending_owner_notify
+            if pending is not None:
+                await asyncio.wait_for(asyncio.gather(pending, return_exceptions=True), 5)
+            loop.set_exception_handler(previous_handler)
+
+
 async def test_connect_retries_transient_then_enters_poll_loop(make_poller, capsys):
     adapter = ConnectAdapter(
         [
