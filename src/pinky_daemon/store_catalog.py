@@ -2007,13 +2007,38 @@ class DaemonStoreCatalog(StoreCatalog):
             try:
                 if bound_file.header_journal_mode() != "wal":
                     continue
-                resolved_parent = os.path.dirname(os.path.realpath(absolute_path))
+                path_state = bound_file.path_state()
+                if path_state == "absent":
+                    continue
+                if path_state != "same":
+                    bound_file.require_path_unchanged()
+                try:
+                    resolved_path = self._verify_bound_wal_target(bound_file, absolute_path)
+                except OSError:
+                    if bound_file.path_state() == "absent":
+                        continue
+                    raise
+                path_state = bound_file.path_state()
+                if path_state == "absent":
+                    continue
+                if path_state != "same":
+                    bound_file.require_path_unchanged()
+                resolved_parent = os.path.dirname(resolved_path)
                 if resolved_parent in verified_parents:
                     continue
                 verified_parents.add(resolved_parent)
-                self._verified_daemon_owned_path(absolute_path)
             finally:
                 bound_file.close()
+
+    def _verify_bound_wal_target(
+        self,
+        bound_file: BoundSQLiteFile,
+        absolute_path: str,
+    ) -> str:
+        """Verify pathname authority and then reconcile it with the bound file."""
+        resolved_path = self._verified_daemon_owned_path(absolute_path)
+        bound_file.require_path_unchanged()
+        return resolved_path
 
     def _connect_wal_for_preflight(
         self,
@@ -2027,8 +2052,7 @@ class DaemonStoreCatalog(StoreCatalog):
         descriptor for this inode, so finding a matching non-pinned descriptor cannot
         independently prove which pathname SQLite opened.
         """
-        resolved_path = self._verified_daemon_owned_path(absolute_path)
-        bound_file.require_path_unchanged()
+        resolved_path = self._verify_bound_wal_target(bound_file, absolute_path)
         descriptors_before = self._open_descriptor_identities()
         connection = sqlite3.connect(
             Path(resolved_path).as_uri() + "?mode=ro",
