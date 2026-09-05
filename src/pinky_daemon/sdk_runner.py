@@ -36,6 +36,12 @@ class SDKRunnerConfig:
     # MCP servers (dict of name -> config, or an explicit --mcp-config path)
     mcp_servers: dict | str = field(default_factory=dict)
 
+    # Optional session bounds; unset fields retain the SDK's defaults.
+    tools: list[str] | None = None
+    strict_mcp_config: bool = False
+    setting_sources: list[str] | None = None
+    hooks: dict | None = None
+
     # Tool permissions (outreach removed — broker handles messaging)
     allowed_tools: list[str] = field(default_factory=lambda: [
         "Read", "Glob", "Grep",
@@ -150,6 +156,18 @@ class SDKRunner:
 
         if self._config.mcp_servers:
             options.mcp_servers = self._config.mcp_servers
+
+        if self._config.tools is not None:
+            options.tools = self._config.tools
+
+        if self._config.strict_mcp_config:
+            options.strict_mcp_config = self._config.strict_mcp_config
+
+        if self._config.setting_sources is not None:
+            options.setting_sources = self._config.setting_sources
+
+        if self._config.hooks is not None:
+            options.hooks = self._config.hooks
 
         if self._config.disallowed_tools:
             options.disallowed_tools = self._config.disallowed_tools

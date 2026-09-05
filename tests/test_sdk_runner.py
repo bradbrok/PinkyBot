@@ -14,6 +14,56 @@ OLD_SESSION_ID = "11111111-1111-4111-8111-111111111111"
 NEW_SESSION_ID = "22222222-2222-4222-8222-222222222222"
 
 
+@pytest.mark.parametrize("mcp_servers", [{}, {"pinky-self": {"type": "sse", "url": "http://x"}}])
+@pytest.mark.parametrize("empty_fields", [False, True])
+async def test_sdk_runner_forwards_bound_fields(monkeypatch, mcp_servers, empty_fields):
+    import claude_agent_sdk
+    from claude_agent_sdk import ClaudeAgentOptions, HookMatcher
+
+    async def guard(input_data, tool_use_id, context):
+        return {}
+
+    cfg = SDKRunnerConfig(
+        tools=[] if empty_fields else ["Read", "Glob", "Grep", "ToolSearch"],
+        permission_mode="dontAsk",
+        allowed_tools=["Read", "mcp__pinky-self__kb_stats"],
+        mcp_servers=mcp_servers,
+        strict_mcp_config=True,
+        setting_sources=[],
+        hooks={} if empty_fields else {"PreToolUse": [HookMatcher(hooks=[guard])]},
+    )
+    captured = {}
+
+    def options_factory(**kwargs):
+        options = ClaudeAgentOptions(**kwargs)
+        captured["default_mcp_servers"] = options.mcp_servers
+        return options
+
+    async def fake_query(*, prompt, options):
+        captured["options"] = options
+        if False:
+            yield
+
+    monkeypatch.setattr(claude_agent_sdk, "ClaudeAgentOptions", options_factory)
+    monkeypatch.setattr(claude_agent_sdk, "query", fake_query)
+    result = await SDKRunner(cfg).run("test")
+
+    assert result.ok
+    options = captured["options"]
+    for name in ("tools", "allowed_tools", "setting_sources", "hooks"):
+        assert getattr(options, name) is getattr(cfg, name)
+    assert options.permission_mode == "dontAsk"
+    assert options.strict_mcp_config is True
+    if mcp_servers:
+        assert options.mcp_servers is cfg.mcp_servers
+    else:
+        # Preserve the SDK-owned default, rather than overwriting it with an
+        # empty caller-owned dict. This pins the conditional forwarding gate.
+        assert options.mcp_servers is captured["default_mcp_servers"]
+        assert options.mcp_servers is not cfg.mcp_servers
+        assert options.mcp_servers == {}
+
+
 class TestSDKAvailable:
     def test_sdk_is_installed(self):
         assert sdk_available() is True
