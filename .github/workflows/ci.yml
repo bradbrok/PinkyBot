@@ -23,6 +23,12 @@ jobs:
           python-version: "3.11"
           cache: pip
 
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+
+      - name: Lock matches pyproject
+        run: uv lock --check
+
       - name: Install ruff
         run: pip install "ruff>=0.15.8"
 
@@ -44,15 +50,33 @@ jobs:
         uses: actions/setup-python@v6
         with:
           python-version: ${{ matrix.python-version }}
-          cache: pip
+
+      - name: Set up uv
+        uses: astral-sh/setup-uv@v10
+        with:
+          enable-cache: true
+          cache-dependency-glob: uv.lock
 
       - name: Install dependencies
-        run: pip install -e ".[dev,acp]"
+        env:
+          UV_PYTHON: ${{ matrix.python-version }}
+        run: uv sync --locked --extra dev --extra acp
+
+      - name: Resolved versions
+        run: |
+          uv run --no-sync python - <<'PY'
+          import platform
+          from importlib.metadata import version
+
+          print(f"Python {platform.python_version()}")
+          for package in ("pytest", "pytest-asyncio", "anyio", "starlette"):
+              print(f"{package} {version(package)}")
+          PY
 
       - name: Run tests
         run: |
           install -d -m 700 "$RUNNER_TEMP/pinky-pytest"
-          TMPDIR="$RUNNER_TEMP/pinky-pytest" pytest
+          TMPDIR="$RUNNER_TEMP/pinky-pytest" uv run --no-sync pytest
 
   frontend:
     name: Frontend (build + i18n)
