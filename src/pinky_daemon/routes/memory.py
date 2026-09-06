@@ -17,7 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any, Callable
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request
 
 try:
     from pinky_memory.store import ReflectionStore
@@ -230,6 +230,7 @@ async def search_agent_chat_history(
                 "timestamp": m.timestamp,
                 "platform": m.platform,
                 "duration_ms": getattr(m, "duration_ms", 0),
+                "truncated": len(m.content) > 500,
             }
             for m in results
         ],
@@ -237,6 +238,76 @@ async def search_agent_chat_history(
         "count": len(results),
         "sessions_searched": len(agent_session_ids),
     }
+
+
+@router.get("/agents/{agent_name}/chat-history/{message_id}")
+async def get_chat_message(agent_name: str, message_id: int):
+    """Get a single chat message with full content (not truncated)."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+    # Verify message belongs to this agent's sessions
+    agent_session_ids = _collect_agent_session_ids(agent_name)
+    message = _store.get_message(message_id)
+    if not message:
+        raise HTTPException(404, f"Message {message_id} not found")
+    if message.session_id not in agent_session_ids and not message.session_id.startswith(f"{agent_name}-"):
+        raise HTTPException(403, "Access denied")
+
+    return {
+        "id": message.id,
+        "session_id": message.session_id,
+        "role": message.role,
+        "content": message.content,
+        "timestamp": message.timestamp,
+        "platform": message.platform,
+        "chat_id": message.chat_id,
+    }
+
+
+@router.patch("/agents/{agent_name}/chat-history/{message_id}")
+async def edit_chat_message(agent_name: str, message_id: int, req: Request):
+    """Edit a chat message's content."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+    body = await req.json()
+    content = body.get("content", "")
+    if not content.strip():
+        raise HTTPException(400, "Content cannot be empty")
+
+    # Verify message belongs to this agent's sessions (#489)
+    agent_session_ids = _collect_agent_session_ids(agent_name)
+    message = _store.get_message(message_id)
+    if not message:
+        raise HTTPException(404, f"Message {message_id} not found")
+    if message.session_id not in agent_session_ids and not message.session_id.startswith(f"{agent_name}-"):
+        raise HTTPException(403, "Access denied")
+
+    if not _store.edit_message(message_id, content):
+        raise HTTPException(404, f"Message {message_id} not found")
+    return {"ok": True}
+
+
+@router.delete("/agents/{agent_name}/chat-history/{message_id}")
+async def delete_chat_message(agent_name: str, message_id: int):
+    """Delete a chat message."""
+    agent = _agents.get(agent_name)
+    if not agent:
+        raise HTTPException(404, f"Agent '{agent_name}' not found")
+
+    # Verify message belongs to this agent's sessions (#489)
+    agent_session_ids = _collect_agent_session_ids(agent_name)
+    message = _store.get_message(message_id)
+    if not message:
+        raise HTTPException(404, f"Message {message_id} not found")
+    if message.session_id not in agent_session_ids and not message.session_id.startswith(f"{agent_name}-"):
+        raise HTTPException(403, "Access denied")
+
+    if not _store.delete_message(message_id):
+        raise HTTPException(404, f"Message {message_id} not found")
+    return {"ok": True}
 
 
 @router.get("/agents/{agent_name}/memories/stats")

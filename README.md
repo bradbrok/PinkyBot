@@ -199,3 +199,4 @@ The durable dream-receipts migration is one-way. Rolling back below PinkyBot
 26.08.020 after this migration is unsupported: pre-gate builds may start with
 stale watermark semantics beside v1 receipt rows. Builds at or above 26.08.020
 fail closed if they encounter a future dream schema version.
+

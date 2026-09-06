@@ -1788,6 +1788,15 @@ def create_api(
         title="Pinky",
         description="Stateful Claude Code session API",
         version="0.1.0",
+        # #510: the interactive docs and the OpenAPI schema are FastAPI-generated
+        # plain Starlette routes — they are NOT under any protected prefix, so they
+        # fall through the auth gate and served an unauthenticated map of every
+        # registered route (verified reachable from the public internet). Nothing
+        # in the daemon, the frontend or the tests consumes them; disable outright
+        # rather than trying to classify them.
+        docs_url=None,
+        redoc_url=None,
+        openapi_url=None,
     )
     app.state.store_snapshot_service = store_snapshot_service
     app.state.storage_observability = storage_observability
@@ -4764,6 +4773,13 @@ def create_api(
         "/auth/setup",
         "/favicon.svg",
         "/icons.svg",
+        # Aiena admin approve endpoint (#510). It has no pinky session: the admin
+        # UI calls it through nginx (admin.aiena.it, auth_basic at server level)
+        # which proxies to 127.0.0.1:8888. Its own control is the loopback peer
+        # guard on the handler — a non-loopback peer is 403'd before the body is
+        # read. Declared public here so the classification matches reality and so
+        # flipping PINKY_AUTH_DENY_DEFAULT=enforce does not 401 the admin UI.
+        "/api/aiena/approve-article",
     }
     _public_prefixes = (
         "/assets/", "/static/", "/p/", "/hooks/",
@@ -11552,6 +11568,26 @@ npm run build</pre>
         states = dream_runner.list_states()
         return {"dream_states": states, "count": len(states)}
 
+    @app.patch("/agents/{agent_name}/dream")
+    async def update_dream_summary(agent_name: str, req: Request):
+        """Edit the dream summary for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        body = await req.json()
+        summary = body.get("summary", "")
+        if not dream_runner.update_summary(agent_name, summary):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
+    @app.delete("/agents/{agent_name}/dream")
+    async def delete_dream_state(agent_name: str):
+        """Delete dream state for an agent."""
+        if not agents.get(agent_name):
+            raise HTTPException(404, f"Agent '{agent_name}' not found")
+        if not dream_runner.delete_state(agent_name):
+            raise HTTPException(404, "No dream state found for this agent")
+        return {"ok": True}
+
     # ── Agent Context (continuation state) ──────────────────
 
     @app.put("/agents/{agent_name}/context")
@@ -14337,6 +14373,115 @@ npm run build</pre>
 
     _apps_set_deps(app_store=app_store)
     app.include_router(_apps_router)
+
+    # ── AIena Article Approval ────────────────────────────────────────────
+    # admin.aiena.it → POST /api/aiena/approve-article
+    # Inserts into Supabase article_approvals + updates pipeline.json.
+    # Reachable ONLY from loopback: the sole legitimate caller is the admin UI,
+    # which goes through admin.aiena.it (server-level basic-auth) and is then
+    # proxied to 127.0.0.1:8888. Anyone able to reach the daemon port directly
+    # would otherwise bypass that basic-auth entirely.
+
+    def _is_loopback_peer(request: Request) -> bool:
+        # Only the real socket peer counts: X-Real-IP / X-Forwarded-For are
+        # attacker-controlled when the request does not come through nginx.
+        import ipaddress
+
+        host = (request.client.host if request.client else "") or ""
+        if not host:
+            return False
+        try:
+            addr = ipaddress.ip_address(host)
+        except ValueError:
+            return False
+        mapped = getattr(addr, "ipv4_mapped", None)
+        if mapped is not None:
+            addr = mapped
+        return addr.is_loopback
+
+    @app.post("/api/aiena/approve-article")
+    async def aiena_approve_article(request: Request):
+        import urllib.request as _ureq
+        from datetime import datetime, timezone
+
+        if not _is_loopback_peer(request):
+            peer = request.client.host if request.client else "?"
+            _log(f"aiena approve-article: rejected non-loopback caller {peer}")
+            return JSONResponse({"error": "forbidden"}, status_code=403)
+
+        body = await request.json()
+        slug = (body.get("slug") or "").strip()
+        title = body.get("title", "")
+        category = body.get("category", "")
+        if not slug:
+            return JSONResponse({"error": "slug required"}, status_code=400)
+
+        # ── Load secrets (same source as aiena scripts) ──
+        secrets_file = Path("/home/pinky/.pinkybot/scripts/.aiena_secrets")
+        sb_key = ""
+        if secrets_file.exists():
+            for line in secrets_file.read_text().splitlines():
+                line = line.strip()
+                if line.startswith("SB_SERVICE_KEY="):
+                    sb_key = line.split("=", 1)[1].strip()
+                    break
+        if not sb_key:
+            return JSONResponse({"error": "Supabase key not configured"}, status_code=500)
+
+        sb_url = "https://fwyjxolljcogblvwvfca.supabase.co"
+        now_iso = datetime.now(timezone.utc).isoformat()
+
+        # ── Upsert into Supabase article_approvals ──
+        payload = json.dumps({
+            "slug": slug,
+            "title": title or slug,
+            "category": category,
+            "status": "pending",
+            "approved_at": now_iso,
+        }).encode()
+        sb_req = _ureq.Request(
+            f"{sb_url}/rest/v1/article_approvals",
+            data=payload,
+            method="POST",
+            headers={
+                "apikey": sb_key,
+                "Authorization": f"Bearer {sb_key}",
+                "Content-Type": "application/json",
+                "Prefer": "resolution=merge-duplicates,return=representation",
+            },
+        )
+        try:
+            with _ureq.urlopen(sb_req, timeout=15) as resp:
+                # la risposta viene letta e validata: un JSON malformato è un errore di upsert
+                json.loads(resp.read().decode())
+        except Exception as exc:
+            _log(f"aiena approve-article: Supabase error for {slug}: {exc}")
+            return JSONResponse(
+                {"error": f"Supabase upsert failed: {exc}"}, status_code=502
+            )
+
+        # ── Update pipeline.json ──
+        pipeline_path = Path("/var/www/aiena.it/data/pipeline.json")
+        try:
+            pipeline = json.loads(pipeline_path.read_text(encoding="utf-8"))
+            updated = False
+            for item in pipeline.get("investigations", []):
+                if item.get("slug") == slug:
+                    item["approved"] = True
+                    item["approved_at"] = now_iso
+                    updated = True
+                    break
+            if updated:
+                pipeline_path.write_text(
+                    json.dumps(pipeline, ensure_ascii=False, indent=2),
+                    encoding="utf-8",
+                )
+        except Exception as exc:
+            _log(f"aiena approve-article: pipeline.json update failed for {slug}: {exc}")
+            # Non-fatal — Supabase is the source of truth
+
+        _log(f"aiena approve-article: approved '{slug}'")
+        return {"ok": True, "slug": slug, "status": "pending"}
 
     # Voice ConversationRelay WebSocket
     try:
