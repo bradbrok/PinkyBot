@@ -19,6 +19,7 @@ def rate_limit_file(tmp_path, monkeypatch):
     path = tmp_path / "rate-limits.json"
     monkeypatch.setattr(scheduler_module, "_RATE_LIMIT_FILE", str(path))
     monkeypatch.setattr(scheduler_module.time, "time", lambda: NOW)
+    monkeypatch.setattr(scheduler_module, "_rate_limit_last_warned_at", None, raising=False)
     path.write_text(
         json.dumps(
             {
@@ -104,7 +105,7 @@ def test_rate_limits_ok_unknown_windows(rate_limit_file, five_hour, seven_day, a
     assert scheduler_module._rate_limits_ok() is expected
 
 
-@pytest.mark.parametrize("unknown", [None, "85", [], {}])
+@pytest.mark.parametrize("unknown", [None, "85", [], {}, float("nan"), True])
 @pytest.mark.parametrize("window", ["five_hour", "seven_day"])
 def test_rate_limits_ok_checks_known_sibling(rate_limit_file, unknown, window):
     data = {
@@ -337,3 +338,146 @@ async def test_clock_wake_gate_exception_continues_same_tick(clock_registry, mon
     await scheduler._tick()
     assert queued == ["worker-next", "worker"]
     assert scheduler._last_clock_slot == {"worker-next": 720, "worker": 720}
+
+
+async def test_clock_wake_legacy_read_exception_continues_same_tick(
+    clock_registry, monkeypatch, capsys
+):
+    clock_registry.list.return_value.insert(
+        0,
+        SimpleNamespace(
+            name="legacy",
+            runtime="claude_sdk",
+            wake_interval=3600,
+            clock_aligned=False,
+            dream_timezone="UTC",
+        ),
+    )
+    clock_registry.get_latest_heartbeat.side_effect = RuntimeError("database is locked")
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: NOW)
+    wake = AsyncMock()
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+    for method in (
+        "_run_outbox_reaper_if_due",
+        "_warn_oversized_schedule_prompts",
+        "_check_pending_wake_liveness",
+        "_cleanup_expired_messages",
+    ):
+        monkeypatch.setattr(scheduler, method, Mock())
+    other_checks = {}
+    for method in (
+        "_check_schedules",
+        "_check_heartbeats",
+        "_check_auto_sleep",
+        "_check_idle_sessions",
+        "_check_dreams",
+        "_check_librarian",
+        "_check_url_watchers",
+    ):
+        other_checks[method] = AsyncMock()
+        monkeypatch.setattr(scheduler, method, other_checks[method])
+
+    await scheduler._tick()
+
+    wake.assert_awaited_once()
+    assert wake.await_args.args[0] == "worker"
+    assert scheduler._last_clock_slot == {"worker": 720}
+    assert "clock-aligned wake failed for legacy: database is locked" in capsys.readouterr().err
+    for check in other_checks.values():
+        check.assert_awaited_once_with(NOW)
+
+
+async def test_clock_wake_persistent_failure_stops_after_three_attempts(
+    clock_registry, monkeypatch, capsys
+):
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    wake = AsyncMock(side_effect=RuntimeError("queue unavailable"))
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+
+    for index in range(5):
+        await scheduler._check_clock_aligned_wakes(NOW + index * 30)
+        assert wake.await_count == min(index + 1, 3)
+        if index < 2:
+            assert "worker" not in scheduler._last_clock_slot
+        else:
+            assert scheduler._last_clock_slot == {"worker": 720}
+
+    error_log = capsys.readouterr().err
+    assert error_log.count("clock-aligned wake for 'worker'") == 1
+    assert error_log.count("clock-aligned wake failed for worker") == 3
+    assert error_log.count("giving up on this slot") == 1
+    for attempt in range(1, 4):
+        assert f"attempt {attempt}/3" in error_log
+
+
+async def test_clock_wake_attempt_budget_resets_next_slot(clock_registry, monkeypatch, capsys):
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    wake = AsyncMock(side_effect=RuntimeError("queue unavailable"))
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+    for index in range(3):
+        await scheduler._check_clock_aligned_wakes(NOW + index * 30)
+    capsys.readouterr()
+
+    await scheduler._check_clock_aligned_wakes(NOW + 3600)
+
+    assert wake.await_count == 4
+    assert scheduler._last_clock_slot == {"worker": 720}
+    error_log = capsys.readouterr().err
+    assert "attempt 1/3" in error_log
+    assert error_log.count("clock-aligned wake for 'worker'") == 1
+    assert "giving up" not in error_log
+
+
+async def test_clock_wake_success_resets_attempt_budget(clock_registry, monkeypatch, capsys):
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    wake = AsyncMock(
+        side_effect=[RuntimeError("queue unavailable"), None, RuntimeError("queue unavailable")]
+    )
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+    await scheduler._check_clock_aligned_wakes(NOW)
+    await scheduler._check_clock_aligned_wakes(NOW + 30)
+    assert scheduler._clock_wake_attempts == {}
+    capsys.readouterr()
+
+    await scheduler._check_clock_aligned_wakes(NOW + 3600)
+
+    assert "attempt 1/3" in capsys.readouterr().err
+    assert scheduler._clock_wake_attempts == {"worker": (780, 1)}
+
+
+@pytest.mark.parametrize("age, expected_calls", [(30, 0), (3601, 1)])
+async def test_legacy_wake_respects_heartbeat_without_clock_slot(
+    clock_registry, monkeypatch, age, expected_calls
+):
+    clock_registry.list.return_value[0].clock_aligned = False
+    clock_registry.get_latest_heartbeat.return_value = SimpleNamespace(timestamp=NOW - age)
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    wake = AsyncMock()
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+
+    await scheduler._check_clock_aligned_wakes(NOW)
+
+    assert wake.await_count == expected_calls
+    assert scheduler._last_clock_slot == {}
+
+
+async def test_mixed_wake_roster_records_only_clock_slot(clock_registry, monkeypatch):
+    clock_registry.list.return_value.append(
+        SimpleNamespace(
+            name="legacy",
+            runtime="claude_sdk",
+            wake_interval=3600,
+            clock_aligned=False,
+            dream_timezone="UTC",
+        )
+    )
+    clock_registry.get_latest_heartbeat.return_value = SimpleNamespace(timestamp=NOW - 3601)
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    wake = AsyncMock()
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+
+    await scheduler._check_clock_aligned_wakes(NOW)
+
+    assert [call.args[0] for call in wake.await_args_list] == ["worker", "legacy"]
+    assert scheduler._last_clock_slot == {"worker": 720}
