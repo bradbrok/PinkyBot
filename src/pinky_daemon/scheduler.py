@@ -187,15 +187,14 @@ def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
 class RateLimitStatus:
     """Normalized window percentages shared by the scheduler and status endpoint."""
 
-    five_hour_pct: float | None = None
-    seven_day_pct: float | None = None
+    five_hour_pct: int | float | None = None
+    seven_day_pct: int | float | None = None
     stale: bool = False
     error: str | None = None
 
 
 def read_rate_limit_status() -> RateLimitStatus:
-    """Read shared status data, retaining known windows and throttling read errors."""
-    global _rate_limit_last_warned_at
+    """Read shared status data, retaining known numbers and reporting errors quietly."""
     try:
         with open(_RATE_LIMIT_FILE) as f:
             data = json.loads(f.read())
@@ -207,7 +206,7 @@ def read_rate_limit_status() -> RateLimitStatus:
         if not math.isfinite(updated_at):
             raise ValueError("updated_at must be a finite number")
 
-        def percentage(window_name: str) -> float | None:
+        def percentage(window_name: str) -> int | float | None:
             window = data.get(window_name)
             if not isinstance(window, dict):
                 return None
@@ -217,7 +216,7 @@ def read_rate_limit_status() -> RateLimitStatus:
                 and not isinstance(value, bool)
                 and math.isfinite(value)
             ):
-                return float(value)
+                return value
             return None
 
         return RateLimitStatus(
@@ -228,17 +227,18 @@ def read_rate_limit_status() -> RateLimitStatus:
     except FileNotFoundError as exc:
         return RateLimitStatus(error=f"{type(exc).__name__}: {exc}")
     except Exception as exc:
-        error = f"{type(exc).__name__}: {exc}"
-        now = time.time()
-        if _rate_limit_last_warned_at is None or now - _rate_limit_last_warned_at >= 300:
-            _rate_limit_last_warned_at = now
-            _log(f"scheduler: rate-limit file unreadable, failing open: {error}")
-        return RateLimitStatus(error=error)
+        return RateLimitStatus(error=f"{type(exc).__name__}: {exc}")
 
 
 def _rate_limits_ok() -> bool:
     """Fail open for unavailable/stale data; enforce each known window independently."""
+    global _rate_limit_last_warned_at
     status = read_rate_limit_status()
+    if status.error and not status.error.startswith("FileNotFoundError:"):
+        now = time.time()
+        if _rate_limit_last_warned_at is None or now - _rate_limit_last_warned_at >= 300:
+            _rate_limit_last_warned_at = now
+            _log(f"scheduler: rate-limit file unreadable, failing open: {status.error}")
     if status.error or status.stale:
         return True
     return not any(
@@ -3361,7 +3361,12 @@ class AgentScheduler:
             _log(f"scheduler: expired message cleanup failed: {e}")
 
     async def _check_clock_aligned_wakes(self, now: float) -> None:
-        """Check wake intervals, bounding clock-slot retries after exceptions."""
+        """Check wake intervals, bounding clock-slot retries after exceptions.
+
+        For a 30m interval, wakes at :00 and :30 each hour.
+        For a 60m interval, wakes at :00 each hour.
+        For a 15m interval, wakes at :00, :15, :30, and :45 each hour.
+        """
         agents = self._registry.list(enabled_only=True)
         try:
             clock_tz = ZoneInfo("America/Los_Angeles")
@@ -3424,6 +3429,8 @@ class AgentScheduler:
                 self._clock_wake_attempts.pop(agent.name, None)
             except Exception as exc:
                 if current_slot is None:
+                    # Pre-slot failures are deliberately uncounted; this also guards legacy
+                    # wakes, while pre-slot clock-aligned failures are unreachable today.
                     _log(f"scheduler: clock-aligned wake failed for {agent.name}: {exc}")
                     continue
                 attempts += 1
