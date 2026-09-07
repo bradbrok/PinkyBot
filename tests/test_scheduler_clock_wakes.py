@@ -200,6 +200,21 @@ async def test_clock_wake_without_callback_preserves_slot(clock_registry, monkey
     assert scheduler._last_clock_slot == {}
 
 
+async def test_clock_wake_false_callback_result_consumes_slot(clock_registry, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    wake = AsyncMock(return_value=False)
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+
+    await scheduler._check_clock_aligned_wakes(NOW)
+
+    wake.assert_awaited_once()
+    assert scheduler._last_clock_slot == {"worker": 720}
+
+    await scheduler._check_clock_aligned_wakes(NOW + 30)
+
+    wake.assert_awaited_once()
+
+
 async def test_clock_wake_callback_failure_retries_same_slot(clock_registry, monkeypatch, capsys):
     monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
     queued = []
