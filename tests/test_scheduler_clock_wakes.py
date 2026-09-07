@@ -104,6 +104,57 @@ def test_rate_limits_ok_unknown_windows(rate_limit_file, five_hour, seven_day, a
     assert scheduler_module._rate_limits_ok() is expected
 
 
+@pytest.mark.parametrize("unknown", [None, "85", [], {}])
+@pytest.mark.parametrize("window", ["five_hour", "seven_day"])
+def test_rate_limits_ok_checks_known_sibling(rate_limit_file, unknown, window):
+    data = {
+        "five_hour": {"used_percentage": 85},
+        "seven_day": {"used_percentage": 85},
+        "updated_at": NOW,
+    }
+    data[window] = {"used_percentage": unknown}
+    rate_limit_file.write_text(json.dumps(data))
+
+    assert scheduler_module._rate_limits_ok() is False
+
+
+@pytest.mark.parametrize(
+    "data",
+    [None, [], "invalid", {}, {"updated_at": None}, {"updated_at": "invalid"}],
+)
+def test_rate_limits_ok_malformed_data_fails_open(rate_limit_file, data):
+    rate_limit_file.write_text(json.dumps(data))
+
+    assert scheduler_module._rate_limits_ok() is True
+
+
+@pytest.mark.parametrize("window", ["five_hour", "seven_day"])
+@pytest.mark.parametrize("malformed", [None, [], "invalid"])
+def test_rate_limits_ok_malformed_window_preserves_known_limit(rate_limit_file, window, malformed):
+    data = {
+        "five_hour": {"used_percentage": 85},
+        "seven_day": {"used_percentage": 85},
+        "updated_at": NOW,
+    }
+    data[window] = malformed
+    rate_limit_file.write_text(json.dumps(data))
+
+    assert scheduler_module._rate_limits_ok() is False
+
+
+@pytest.mark.parametrize("content", [b"{", b"\xff"])
+def test_rate_limits_ok_unreadable_data_fails_open(rate_limit_file, content):
+    rate_limit_file.write_bytes(content)
+
+    assert scheduler_module._rate_limits_ok() is True
+
+
+def test_rate_limits_ok_missing_file_fails_open(rate_limit_file):
+    rate_limit_file.unlink()
+
+    assert scheduler_module._rate_limits_ok() is True
+
+
 async def test_clock_wake_queues_with_null_window(rate_limit_file, clock_registry):
     queued = []
 
@@ -120,6 +171,33 @@ async def test_clock_wake_queues_with_null_window(rate_limit_file, clock_registr
 
     await scheduler._check_clock_aligned_wakes(NOW + 30)
     assert len(queued) == 1
+
+
+async def test_clock_wake_rate_limit_skip_retries_same_slot(clock_registry, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", Mock(side_effect=[False, True]))
+    queued = []
+
+    async def wake(name, session_id, prompt):
+        queued.append(name)
+
+    scheduler = AgentScheduler(clock_registry, wake_callback=wake)
+    await scheduler._check_clock_aligned_wakes(NOW)
+
+    assert queued == []
+    assert scheduler._last_clock_slot == {}
+
+    await scheduler._check_clock_aligned_wakes(NOW + 30)
+    assert queued == ["worker"]
+    assert scheduler._last_clock_slot == {"worker": 720}
+
+
+async def test_clock_wake_without_callback_preserves_slot(clock_registry, monkeypatch):
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+    scheduler = AgentScheduler(clock_registry)
+
+    await scheduler._check_clock_aligned_wakes(NOW)
+
+    assert scheduler._last_clock_slot == {}
 
 
 async def test_clock_wake_callback_failure_retries_same_slot(clock_registry, monkeypatch, capsys):

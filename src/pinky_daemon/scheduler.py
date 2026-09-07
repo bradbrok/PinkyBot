@@ -191,18 +191,22 @@ def _rate_limits_ok() -> bool:
     try:
         with open(_RATE_LIMIT_FILE) as f:
             data = json.loads(f.read())
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return True  # fail-open
 
-    # Stale data (>5min) — don't gate on outdated info
-    if time.time() - data.get("updated_at", 0) > 300:
-        return True
+        # Stale data (>5min) — don't gate on outdated info
+        if time.time() - data.get("updated_at", 0) > 300:
+            return True
 
-    five_pct = data.get("five_hour", {}).get("used_percentage", 0)
-    seven_pct = data.get("seven_day", {}).get("used_percentage", 0)
+        for window_name in ("five_hour", "seven_day"):
+            window = data.get(window_name)
+            if not isinstance(window, dict):
+                continue
+            percentage = window.get("used_percentage")
+            # Unknown values must not hide a known limit in the other window.
+            if isinstance(percentage, (int, float)) and percentage >= _RATE_LIMIT_THRESHOLD:
+                return False
 
-    if five_pct >= _RATE_LIMIT_THRESHOLD or seven_pct >= _RATE_LIMIT_THRESHOLD:
-        return False
+    except Exception:
+        return True  # fail-open for unreadable or malformed rate-limit data
     return True
 
 
@@ -3352,7 +3356,6 @@ class AgentScheduler:
                 if current_slot == last_slot:
                     continue  # Already fired this slot
 
-                self._last_clock_slot[agent.name] = current_slot
                 _log(f"scheduler: clock-aligned wake for '{agent.name}' at :{dt.minute:02d} (slot {current_slot}, interval {interval_minutes}m)")
             else:
                 # Legacy: interval-based from last activity
@@ -3361,16 +3364,16 @@ class AgentScheduler:
                 if last_active > 0 and (now - last_active) < agent.wake_interval:
                     continue
 
-            # Gate heartbeats on CC rate limits — skip CC agents when usage ≥ 80%
-            if _is_claude_code_agent(agent, self._registry) and not _rate_limits_ok():
-                _log(
-                    f"scheduler: skipping heartbeat for '{agent.name}'"
-                    f" — CC rate limit ≥ {_RATE_LIMIT_THRESHOLD}%"
-                )
-                continue
+            try:
+                # Gate heartbeats on CC rate limits — skip CC agents when usage ≥ 80%
+                if _is_claude_code_agent(agent, self._registry) and not _rate_limits_ok():
+                    _log(
+                        f"scheduler: skipping heartbeat for '{agent.name}'"
+                        f" — CC rate limit ≥ {_RATE_LIMIT_THRESHOLD}%"
+                    )
+                    continue
 
-            if self._wake_callback:
-                try:
+                if self._wake_callback:
                     session_id = f"{agent.name}-main"
                     prompt = self._registry.get_heartbeat_prompt()
                     tz_name = agent.dream_timezone or self._registry.get_default_timezone() or "UTC"
@@ -3381,8 +3384,10 @@ class AgentScheduler:
                         agent.name, session_id,
                         prompt,
                     )
-                except Exception as e:
-                    _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")
+                    if agent.clock_aligned:
+                        self._last_clock_slot[agent.name] = current_slot
+            except Exception as e:
+                _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")
 
     async def _check_auto_sleep(self, now: float) -> None:
         """Auto-sleep agents that have been idle beyond their auto_sleep_hours threshold."""
