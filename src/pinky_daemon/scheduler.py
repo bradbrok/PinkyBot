@@ -3371,9 +3371,7 @@ class AgentScheduler:
                         f"scheduler: skipping heartbeat for '{agent.name}'"
                         f" — CC rate limit ≥ {_RATE_LIMIT_THRESHOLD}%"
                     )
-                    continue
-
-                if self._wake_callback:
+                elif self._wake_callback:
                     session_id = f"{agent.name}-main"
                     prompt = self._registry.get_heartbeat_prompt()
                     tz_name = agent.dream_timezone or self._registry.get_default_timezone() or "UTC"
@@ -3384,8 +3382,10 @@ class AgentScheduler:
                         agent.name, session_id,
                         prompt,
                     )
-                    if agent.clock_aligned:
-                        self._last_clock_slot[agent.name] = current_slot
+                # Record every handled outcome (queued, False return, rate-limit skip, or no
+                # callback); only an exception leaves the slot available for retry.
+                if agent.clock_aligned:
+                    self._last_clock_slot[agent.name] = current_slot
             except Exception as e:
                 _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")
 
