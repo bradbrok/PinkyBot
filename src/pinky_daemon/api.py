@@ -177,7 +177,7 @@ from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
 from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
-from pinky_daemon.scheduler import AgentScheduler
+from pinky_daemon.scheduler import AgentScheduler, read_rate_limit_status
 from pinky_daemon.session_store import SessionEventStore, SessionStore
 from pinky_daemon.session_watchdog import (
     FrozenLoginPane,
@@ -5521,25 +5521,11 @@ def create_api(
 
         return response
 
-    # ── Rate Limit Status ──────────────────────────────────
-    _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"  # noqa: N806 — module-like constant inside factory
-
-    def _read_rate_limits() -> dict:
-        """Read CC rate limits from shared file (written by statusline script)."""
-        try:
-            with open(_RATE_LIMIT_FILE) as f:
-                data = json.loads(f.read())
-            if time.time() - data.get("updated_at", 0) < 300:
-                return data
-            return {**data, "stale": True}
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-
     @app.get("/api")
     async def api_info():
         """Health check and server info (JSON)."""
         channel = os.environ.get("PINKYBOT_CHANNEL", "stable")
-        rate_limits = _read_rate_limits()
+        rate_limits = read_rate_limit_status()
         info = {
             "name": "pinky",
             "version": _pinky_version,
@@ -5551,13 +5537,11 @@ def create_api(
             "started_at": _server_started_at,
         }
         # Include rate limit summary if available
-        five_pct = rate_limits.get("five_hour", {}).get("used_percentage")
+        five_pct = rate_limits.five_hour_pct
         if five_pct is not None:
             info["rate_limits"] = {
                 "five_hour_pct": five_pct,
-                "seven_day_pct": rate_limits.get("seven_day", {}).get(
-                    "used_percentage"
-                ),
+                "seven_day_pct": rate_limits.seven_day_pct,
             }
         return info
 

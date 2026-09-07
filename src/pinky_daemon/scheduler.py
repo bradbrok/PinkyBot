@@ -47,6 +47,8 @@ _PROVEN_LIVE_HEARTBEAT_STATUSES = frozenset(
 
 _RATE_LIMIT_FILE = "/tmp/claude-rate-limits.json"
 _RATE_LIMIT_THRESHOLD = 80  # percent — skip heartbeats above this
+_rate_limit_last_warned_at: float | None = None
+_CLOCK_WAKE_MAX_ATTEMPTS = 3
 
 # #1029 transport-health guard. tmux builds can reject command argvs around
 # 8–16 KiB; prompts now travel over stdin, but surfacing large enabled rows
@@ -181,33 +183,68 @@ def _is_claude_code_agent(agent, registry: AgentRegistry) -> bool:
         return True  # fail-safe: assume CC
 
 
-def _rate_limits_ok() -> bool:
-    """Return True if CC rate limits are below threshold (or unavailable).
+@dataclass(frozen=True)
+class RateLimitStatus:
+    """Normalized window percentages shared by the scheduler and status endpoint."""
 
-    Reads the shared rate limit file written by the statusline script.
-    If the file is missing, stale (>5min), or unreadable, returns True
-    (fail-open — don't skip heartbeats when we can't check).
-    """
+    five_hour_pct: float | None = None
+    seven_day_pct: float | None = None
+    stale: bool = False
+    error: str | None = None
+
+
+def read_rate_limit_status() -> RateLimitStatus:
+    """Read shared status data, retaining known windows and throttling read errors."""
+    global _rate_limit_last_warned_at
     try:
         with open(_RATE_LIMIT_FILE) as f:
             data = json.loads(f.read())
+        if not isinstance(data, dict):
+            raise TypeError("rate-limit data must be an object")
+        updated_at = data.get("updated_at", 0)
+        if not isinstance(updated_at, (int, float)) or isinstance(updated_at, bool):
+            raise TypeError("updated_at must be a finite number")
+        if not math.isfinite(updated_at):
+            raise ValueError("updated_at must be a finite number")
 
-        # Stale data (>5min) — don't gate on outdated info
-        if time.time() - data.get("updated_at", 0) > 300:
-            return True
-
-        for window_name in ("five_hour", "seven_day"):
+        def percentage(window_name: str) -> float | None:
             window = data.get(window_name)
             if not isinstance(window, dict):
-                continue
-            percentage = window.get("used_percentage")
-            # Unknown values must not hide a known limit in the other window.
-            if isinstance(percentage, (int, float)) and percentage >= _RATE_LIMIT_THRESHOLD:
-                return False
+                return None
+            value = window.get("used_percentage")
+            if (
+                isinstance(value, (int, float))
+                and not isinstance(value, bool)
+                and math.isfinite(value)
+            ):
+                return float(value)
+            return None
 
-    except Exception:
-        return True  # fail-open for unreadable or malformed rate-limit data
-    return True
+        return RateLimitStatus(
+            five_hour_pct=percentage("five_hour"),
+            seven_day_pct=percentage("seven_day"),
+            stale=time.time() - updated_at > 300,
+        )
+    except FileNotFoundError as exc:
+        return RateLimitStatus(error=f"{type(exc).__name__}: {exc}")
+    except Exception as exc:
+        error = f"{type(exc).__name__}: {exc}"
+        now = time.time()
+        if _rate_limit_last_warned_at is None or now - _rate_limit_last_warned_at >= 300:
+            _rate_limit_last_warned_at = now
+            _log(f"scheduler: rate-limit file unreadable, failing open: {error}")
+        return RateLimitStatus(error=error)
+
+
+def _rate_limits_ok() -> bool:
+    """Fail open for unavailable/stale data; enforce each known window independently."""
+    status = read_rate_limit_status()
+    if status.error or status.stale:
+        return True
+    return not any(
+        percentage is not None and percentage >= _RATE_LIMIT_THRESHOLD
+        for percentage in (status.five_hour_pct, status.seven_day_pct)
+    )
 
 
 # ── Cron Parser ──────────────────────────────────────────────
@@ -526,6 +563,7 @@ class AgentScheduler:
         self._running = False
         self._task: asyncio.Task | None = None
         self._last_clock_slot: dict[str, int] = {}  # agent_name -> last fired clock slot (minutes since midnight)
+        self._clock_wake_attempts: dict[str, tuple[int, int]] = {}
         self._last_dream_check: dict[str, tuple] = {}  # agent_name -> (date_str, cron-minute) dedup key
         # In-flight dream/librarian runs (#702). These run as background tasks
         # so a long dream (~1h with KG extraction) can't freeze the tick loop —
@@ -3323,49 +3361,46 @@ class AgentScheduler:
             _log(f"scheduler: expired message cleanup failed: {e}")
 
     async def _check_clock_aligned_wakes(self, now: float) -> None:
-        """Check agents with clock-aligned wake intervals and fire if a new slot is due.
-
-        For a 30m interval, wakes at :00 and :30 each hour.
-        For a 60m interval, wakes at :00 each hour.
-        For a 15m interval, wakes at :00, :15, :30, :45.
-        """
+        """Check wake intervals, bounding clock-slot retries after exceptions."""
         agents = self._registry.list(enabled_only=True)
+        try:
+            clock_tz = ZoneInfo("America/Los_Angeles")
+        except (KeyError, ValueError):
+            clock_tz = ZoneInfo("UTC")
 
         for agent in agents:
-            if agent.wake_interval <= 0:
-                continue
-
-            interval_minutes = agent.wake_interval // 60
-            if interval_minutes <= 0:
-                continue
-
-            # Get current time in a reasonable timezone
+            current_slot: int | None = None
+            attempts = 0
             try:
-                tz = ZoneInfo("America/Los_Angeles")
-            except (KeyError, ValueError):
-                tz = ZoneInfo("UTC")
-
-            dt = datetime.fromtimestamp(now, tz=tz)
-            current_minutes = dt.hour * 60 + dt.minute
-
-            if agent.clock_aligned:
-                # Clock-aligned: fire at wall-clock boundaries
-                current_slot = (current_minutes // interval_minutes) * interval_minutes
-                last_slot = self._last_clock_slot.get(agent.name, -1)
-
-                if current_slot == last_slot:
-                    continue  # Already fired this slot
-
-                _log(f"scheduler: clock-aligned wake for '{agent.name}' at :{dt.minute:02d} (slot {current_slot}, interval {interval_minutes}m)")
-            else:
-                # Legacy: interval-based from last activity
-                hb = self._registry.get_latest_heartbeat(agent.name)
-                last_active = hb.timestamp if hb else 0
-                if last_active > 0 and (now - last_active) < agent.wake_interval:
+                if agent.wake_interval <= 0:
                     continue
 
-            try:
-                # Gate heartbeats on CC rate limits — skip CC agents when usage ≥ 80%
+                interval_minutes = agent.wake_interval // 60
+                if interval_minutes <= 0:
+                    continue
+
+                dt = datetime.fromtimestamp(now, tz=clock_tz)
+                current_minutes = dt.hour * 60 + dt.minute
+
+                if agent.clock_aligned:
+                    current_slot = (current_minutes // interval_minutes) * interval_minutes
+                    previous_slot, attempts = self._clock_wake_attempts.get(
+                        agent.name, (current_slot, 0)
+                    )
+                    if previous_slot != current_slot:
+                        self._clock_wake_attempts.pop(agent.name, None)
+                        attempts = 0
+                    if current_slot == self._last_clock_slot.get(agent.name, -1):
+                        continue
+                    if attempts == 0:
+                        _log(f"scheduler: clock-aligned wake for '{agent.name}' at :{dt.minute:02d} (slot {current_slot}, interval {interval_minutes}m)")
+                else:
+                    # Legacy: interval-based from last activity.
+                    hb = self._registry.get_latest_heartbeat(agent.name)
+                    last_active = hb.timestamp if hb else 0
+                    if last_active > 0 and (now - last_active) < agent.wake_interval:
+                        continue
+
                 if _is_claude_code_agent(agent, self._registry) and not _rate_limits_ok():
                     _log(
                         f"scheduler: skipping heartbeat for '{agent.name}'"
@@ -3375,19 +3410,31 @@ class AgentScheduler:
                     session_id = f"{agent.name}-main"
                     prompt = self._registry.get_heartbeat_prompt()
                     tz_name = agent.dream_timezone or self._registry.get_default_timezone() or "UTC"
-                    tz = ZoneInfo(tz_name)
-                    ts = datetime.now(tz).strftime("%Y-%m-%d %H:%M %Z")
+                    prompt_tz = ZoneInfo(tz_name)
+                    ts = datetime.now(prompt_tz).strftime("%Y-%m-%d %H:%M %Z")
                     prompt = f"[{ts}] {prompt}"
                     await self._wake_callback(
                         agent.name, session_id,
                         prompt,
                     )
                 # Record every handled outcome (queued, False return, rate-limit skip, or no
-                # callback); only an exception leaves the slot available for retry.
-                if agent.clock_aligned:
+                # callback); exceptions retry only until this slot's attempt limit is reached.
+                if current_slot is not None:
                     self._last_clock_slot[agent.name] = current_slot
-            except Exception as e:
-                _log(f"scheduler: clock-aligned wake failed for {agent.name}: {e}")
+                self._clock_wake_attempts.pop(agent.name, None)
+            except Exception as exc:
+                if current_slot is None:
+                    _log(f"scheduler: clock-aligned wake failed for {agent.name}: {exc}")
+                    continue
+                attempts += 1
+                self._clock_wake_attempts[agent.name] = (current_slot, attempts)
+                _log(
+                    f"scheduler: clock-aligned wake failed for {agent.name}: {exc}"
+                    f" (attempt {attempts}/{_CLOCK_WAKE_MAX_ATTEMPTS})"
+                )
+                if attempts >= _CLOCK_WAKE_MAX_ATTEMPTS:
+                    self._last_clock_slot[agent.name] = current_slot
+                    _log(f"scheduler: giving up on this slot for {agent.name} (slot {current_slot})")
 
     async def _check_auto_sleep(self, now: float) -> None:
         """Auto-sleep agents that have been idle beyond their auto_sleep_hours threshold."""
