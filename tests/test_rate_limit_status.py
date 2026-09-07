@@ -1,6 +1,5 @@
 """Shared rate-limit parsing, diagnostics, and HTTP response regressions."""
 
-import builtins
 import json
 from datetime import datetime, timezone
 
@@ -22,15 +21,10 @@ def rate_limit_file(tmp_path, monkeypatch):
 
 
 @pytest.fixture
-def api_client(tmp_path, rate_limit_file, monkeypatch):
+def api_client(tmp_path, rate_limit_file):
     import pinky_daemon.api as api_module
 
-    def isolated_open(file, *args, **kwargs):
-        if file == "/tmp/claude-rate-limits.json":
-            file = rate_limit_file
-        return builtins.open(file, *args, **kwargs)
-
-    monkeypatch.setattr(api_module, "open", isolated_open, raising=False)
+    assert scheduler_module._RATE_LIMIT_FILE != "/tmp/claude-rate-limits.json"
     app = api_module.create_api(
         default_working_dir=str(tmp_path),
         db_path=str(tmp_path / "test.db"),
@@ -74,6 +68,36 @@ def test_api_info_reports_both_rate_limit_percentages(api_client, rate_limit_fil
 
     assert response.status_code == 200
     assert response.json()["rate_limits"] == {"five_hour_pct": 23, "seven_day_pct": 85}
+    assert b'"five_hour_pct":23,"seven_day_pct":85' in response.content
+
+
+def test_rate_limit_status_preserves_numbers_without_logging(rate_limit_file, capsys):
+    rate_limit_file.write_text('{"updated_at": "invalid"}')
+
+    status = scheduler_module.read_rate_limit_status()
+
+    assert status.error.startswith("TypeError:")
+    assert capsys.readouterr().err == ""
+    assert scheduler_module._rate_limit_last_warned_at is None
+
+    rate_limit_file.write_text(
+        json.dumps(
+            {
+                "updated_at": NOW,
+                "five_hour": {"used_percentage": 23},
+                "seven_day": {"used_percentage": 85.5},
+            }
+        )
+    )
+
+    status = scheduler_module.read_rate_limit_status()
+
+    assert status.error is None
+    assert type(status.five_hour_pct) is int
+    assert status.five_hour_pct == 23
+    assert type(status.seven_day_pct) is float
+    assert status.seven_day_pct == 85.5
+    assert capsys.readouterr().err == ""
 
 
 @pytest.mark.parametrize("percentage", [float("nan"), float("inf"), -float("inf"), True, False])
