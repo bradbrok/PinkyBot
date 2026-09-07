@@ -173,8 +173,20 @@ async def test_clock_wake_queues_with_null_window(rate_limit_file, clock_registr
     assert len(queued) == 1
 
 
-async def test_clock_wake_rate_limit_skip_retries_same_slot(clock_registry, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", Mock(side_effect=[False, True]))
+async def test_clock_wake_rate_limit_skip_consumes_slot(
+    rate_limit_file, clock_registry, monkeypatch, capsys
+):
+    rate_limit_file.write_text(
+        json.dumps(
+            {
+                "five_hour": {"used_percentage": 85},
+                "seven_day": {"used_percentage": 23},
+                "updated_at": NOW,
+            }
+        )
+    )
+    gate = Mock(wraps=scheduler_module._rate_limits_ok)
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", gate)
     queued = []
 
     async def wake(name, session_id, prompt):
@@ -182,22 +194,54 @@ async def test_clock_wake_rate_limit_skip_retries_same_slot(clock_registry, monk
 
     scheduler = AgentScheduler(clock_registry, wake_callback=wake)
     await scheduler._check_clock_aligned_wakes(NOW)
+    await scheduler._check_clock_aligned_wakes(NOW + 30)
 
     assert queued == []
-    assert scheduler._last_clock_slot == {}
-
-    await scheduler._check_clock_aligned_wakes(NOW + 30)
-    assert queued == ["worker"]
     assert scheduler._last_clock_slot == {"worker": 720}
+    assert gate.call_count == 1
+    assert capsys.readouterr().err.count("skipping heartbeat") == 1
+
+    rate_limit_file.write_text(
+        json.dumps(
+            {
+                "five_hour": {"used_percentage": 23},
+                "seven_day": {"used_percentage": 23},
+                "updated_at": NOW + 60,
+            }
+        )
+    )
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: NOW + 60)
+    await scheduler._check_clock_aligned_wakes(NOW + 60)
+    assert queued == []
+    assert gate.call_count == 1
+
+    rate_limit_file.write_text(
+        json.dumps(
+            {
+                "five_hour": {"used_percentage": 23},
+                "seven_day": {"used_percentage": 23},
+                "updated_at": NOW + 3600,
+            }
+        )
+    )
+    monkeypatch.setattr(scheduler_module.time, "time", lambda: NOW + 3600)
+    await scheduler._check_clock_aligned_wakes(NOW + 3600)
+    assert queued == ["worker"]
+    assert gate.call_count == 2
+    assert scheduler._last_clock_slot == {"worker": 780}
 
 
-async def test_clock_wake_without_callback_preserves_slot(clock_registry, monkeypatch):
-    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", lambda: True)
+async def test_clock_wake_without_callback_consumes_slot(clock_registry, monkeypatch, capsys):
+    gate = Mock(return_value=True)
+    monkeypatch.setattr(scheduler_module, "_rate_limits_ok", gate)
     scheduler = AgentScheduler(clock_registry)
 
     await scheduler._check_clock_aligned_wakes(NOW)
+    await scheduler._check_clock_aligned_wakes(NOW + 30)
 
-    assert scheduler._last_clock_slot == {}
+    assert scheduler._last_clock_slot == {"worker": 720}
+    assert gate.call_count == 1
+    assert capsys.readouterr().err.count("clock-aligned wake for") == 1
 
 
 async def test_clock_wake_false_callback_result_consumes_slot(clock_registry, monkeypatch):
