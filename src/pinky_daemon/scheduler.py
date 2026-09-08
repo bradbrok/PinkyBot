@@ -598,6 +598,7 @@ class AgentScheduler:
         self._drain_probe_futures: dict[str, asyncio.Future] = {}
         self._receipt_extension_alerted: set[tuple[int, float]] = set()
         self._receipt_extension_last_page: dict[int, float] = {}
+        self._outbox_drain_notified_through: dict[str, float] = {}
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
@@ -2080,6 +2081,26 @@ class AgentScheduler:
         self._queue_owner_alert(agent_name, message)
         return True
 
+    def _queue_drain_extension_owner_alert(
+        self,
+        agent_name: str,
+        message: str,
+        *,
+        oldest_fired_at: float,
+        newest_fired_at: float,
+    ) -> None:
+        """Remember paged cohorts independently of park/unpark budget state."""
+        notified_through = self._outbox_drain_notified_through.get(agent_name)
+        if notified_through is not None and oldest_fired_at <= notified_through:
+            _log(
+                "scheduler: OUTBOX_DRAIN_EXTENSION_PAGE_DEDUP "
+                f"agent='{agent_name}' oldest_fired_at={oldest_fired_at} "
+                f"notified_through={notified_through}; cohort already reported"
+            )
+            return
+        if self._queue_receipt_extension_owner_alert(agent_name, message):
+            self._outbox_drain_notified_through[agent_name] = newest_fired_at
+
     def _queue_owner_alert(self, agent_name: str, message: str) -> None:
         """Start one owner alert with a strong task reference and loud failure."""
         if self._owner_notify_callback is None:
@@ -2316,7 +2337,7 @@ class AgentScheduler:
                 f"unverified={state.unverified_checks} bound={bound_reason!r} "
                 f"parked={parked}/{targeted}"
             )
-            self._queue_receipt_extension_owner_alert(
+            self._queue_drain_extension_owner_alert(
                 agent_name,
                 (
                     "🚨 OUTBOX DRAIN EXTENSION EXPIRED: agent "
@@ -2331,6 +2352,8 @@ class AgentScheduler:
                     "the normal replay-age policy). Inspect the transport "
                     "and wake ledger before intervening."
                 ),
+                oldest_fired_at=oldest_fired_at,
+                newest_fired_at=float(summary["newest_fired_at"]),
             )
         # Settle or re-key the budget from DURABLE state: a failed park
         # write does not prove its row is still active (a second writer may

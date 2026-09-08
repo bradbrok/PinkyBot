@@ -281,3 +281,79 @@ async def test_codex_real_stale_one_shot_and_dead_letter_still_page(registry):
         assert registry.get_schedule_wake_by_fire(schedule.id, pending.fired_at).parked_at > 0
     finally:
         await scheduler.stop()
+
+
+@pytest.mark.parametrize("release", ["confirmed-delivery", "verified-idle"])
+@pytest.mark.asyncio
+async def test_claude_drain_cohort_repark_does_not_page_again(
+    registry, monkeypatch, capsys, release
+):
+    registry.register("worker", runtime="claude_sdk", transport="tmux")
+    clock = [1_800_000_000.0]
+    monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: clock[0])
+    busy = [True]
+    alerts = []
+
+    def pending(name, fired_at):
+        schedule = registry.add_schedule("worker", "* * * * *", name=name, prompt="work")
+        return registry.persist_schedule_wake(
+            schedule.id,
+            agent_name="worker",
+            schedule_name=name,
+            prompt="work",
+            fired_at=fired_at,
+        )[0]
+
+    async def wake(*args):
+        return False
+
+    async def notify(agent, message):
+        alerts.append(message)
+        return True
+
+    rows = [pending("first", clock[0] - 30), pending("second", clock[0] - 20)]
+    scheduler = AgentScheduler(
+        registry,
+        wake_callback=wake,
+        delivery_drain_busy_fn=lambda _: busy[0],
+        owner_notify_callback=notify,
+        outbox_drain_extension_attempt_cap=1,
+    )
+
+    def row_state(row):
+        return registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at)
+
+    try:
+        await scheduler._replay_pending_locked("worker", drain_recheck=True)
+        await flush_alerts(scheduler)
+        assert len(alerts) == 1, "a genuine Claude drain expiry must still page"
+        assert all(row_state(row).drain_parked_at > 0 for row in rows)
+
+        if release == "confirmed-delivery":
+            # Settling the oldest fire releases the remaining member of the
+            # already-notified cohort, whose new oldest timestamp differs.
+            first = rows.pop(0)
+            assert registry.confirm_pending_schedule_wake_by_fire(first.schedule_id, first.fired_at)
+        else:
+            busy[0] = False
+            await scheduler._replay_pending_locked("worker", drain_recheck=True)
+        assert all(row_state(row).drain_parked_at == 0 for row in rows)
+
+        busy[0] = True
+        clock[0] += 60
+        await scheduler._replay_pending_locked("worker", drain_recheck=True)
+        await flush_alerts(scheduler)
+        assert all(row_state(row).drain_parked_at > 0 for row in rows)
+        assert len(alerts) == 1, "re-parking the notified cohort must not page again"
+        assert "OUTBOX_DRAIN_EXTENSION_PAGE_DEDUP" in capsys.readouterr().err
+
+        for row in rows:
+            assert registry.confirm_pending_schedule_wake_by_fire(row.schedule_id, row.fired_at)
+        newer = pending("new-cohort", clock[0])
+        clock[0] += 60
+        await scheduler._replay_pending_locked("worker", drain_recheck=True)
+        await flush_alerts(scheduler)
+        assert row_state(newer).drain_parked_at > 0
+        assert len(alerts) == 2, "a genuinely newer cohort must earn its first page"
+    finally:
+        await scheduler.stop()
