@@ -67,6 +67,7 @@ _RECEIPT_EXTENSION_ATTEMPT_CAP_ENV = (
     "PINKY_SCHEDULE_RECEIPT_EXTENSION_ATTEMPT_CAP"
 )
 _RECEIPT_EXTENSION_ATTEMPT_CAP = 3
+_RECEIPT_EXTENSION_PAGE_INTERVAL_SEC = 60 * 60
 _ABANDONED_RECEIPT_OBSERVER_INTERVAL_SEC = 1.0
 _PENDING_WAKE_LIVENESS_DRAIN_INTERVAL_SEC = 60
 _OUTBOX_DRAIN_EXTENSION_ATTEMPT_CAP_ENV = (
@@ -596,6 +597,7 @@ class AgentScheduler:
         # thread per agent (see _agent_busy_for_drain).
         self._drain_probe_futures: dict[str, asyncio.Future] = {}
         self._receipt_extension_alerted: set[tuple[int, float]] = set()
+        self._receipt_extension_last_page: dict[int, float] = {}
         self._owner_alert_tasks: set[asyncio.Task] = set()
         self._last_schedule_prompt_warn_at: float | None = None
         self._last_pending_wake_liveness_drain_at: float | None = None
@@ -1758,7 +1760,7 @@ class AgentScheduler:
         bound_reason: str,
         wait_attempts: int | None,
     ) -> None:
-        """Emit one durable-fire alert after its generous wait budget expires."""
+        """Keep exact-fire diagnostics while bounding recurring owner pages."""
         schedule_id = self._schedule_id(schedule)
         fired_at = self._schedule_fired_at(schedule)
         alert_key = (schedule_id, fired_at)
@@ -1777,9 +1779,21 @@ class AgentScheduler:
             f"scheduler: RECEIPT_EXTENSION_EXPIRED schedule "
             f"'{schedule.name}' (#{schedule_id}) for agent "
             f"'{schedule.agent_name}' fired_at={fired_at} age_s={age:.1f} "
-            f"bound={bound_reason!r} wait_attempts={attempts}; owner alert queued"
+            f"bound={bound_reason!r} wait_attempts={attempts}"
         )
-        self._queue_owner_alert(
+        now = time.time()
+        last_page = self._receipt_extension_last_page.get(schedule_id)
+        if (
+            last_page is not None
+            and now - last_page < _RECEIPT_EXTENSION_PAGE_INTERVAL_SEC
+        ):
+            _log(
+                "scheduler: RECEIPT_EXTENSION_PAGE_COOLDOWN "
+                f"schedule=#{schedule_id} agent='{schedule.agent_name}' "
+                f"fired_at={fired_at}; exact-fire diagnostic retained"
+            )
+            return
+        if self._queue_receipt_extension_owner_alert(
             schedule.agent_name,
             (
                 "🚨 RECEIPT EXTENSION EXPIRED: schedule "
@@ -1790,7 +1804,8 @@ class AgentScheduler:
                 "an already-pasted delivery retains one late-receipt authority. "
                 "Inspect the transport and wake ledger before intervening."
             ),
-        )
+        ):
+            self._receipt_extension_last_page[schedule_id] = now
 
     def _abandon_inflight_replay(
         self,
@@ -2038,6 +2053,33 @@ class AgentScheduler:
                 return True, False
         return True, False
 
+    def _queue_receipt_extension_owner_alert(self, agent_name: str, message: str) -> bool:
+        """Demote only receipt/drain extension diagnostics on Codex runtimes.
+
+        Codex does not supply the delivered-turn/fold acceptance evidence these
+        expiry detectors consume. Keep their ledger transitions and logs, but
+        do not page the owner about structurally missing receipt evidence.
+        Unknown runtime information must never silence a potentially real alert.
+        """
+        try:
+            agent = self._registry.get(agent_name)
+        except Exception as exc:
+            _log(
+                "scheduler: OWNER_NOTIFY_RUNTIME_LOOKUP_FAILURE "
+                f"agent='{agent_name}': {type(exc).__name__}: {exc}; "
+                "retaining owner alert"
+            )
+        else:
+            if agent is not None and agent.runtime == "codex_cli":
+                _log(
+                    "scheduler: OWNER_NOTIFY_DEMOTED "
+                    f"agent='{agent_name}' runtime=codex_cli; "
+                    "receipt/drain extension diagnostic is operator-log only"
+                )
+                return False
+        self._queue_owner_alert(agent_name, message)
+        return True
+
     def _queue_owner_alert(self, agent_name: str, message: str) -> None:
         """Start one owner alert with a strong task reference and loud failure."""
         if self._owner_notify_callback is None:
@@ -2272,9 +2314,9 @@ class AgentScheduler:
                 f"'{agent_name}' oldest_fired_at={oldest_fired_at} "
                 f"oldest_age_s={oldest_age:.1f} attempts={state.attempts} "
                 f"unverified={state.unverified_checks} bound={bound_reason!r} "
-                f"parked={parked}/{targeted}; owner alert queued"
+                f"parked={parked}/{targeted}"
             )
-            self._queue_owner_alert(
+            self._queue_receipt_extension_owner_alert(
                 agent_name,
                 (
                     "🚨 OUTBOX DRAIN EXTENSION EXPIRED: agent "
