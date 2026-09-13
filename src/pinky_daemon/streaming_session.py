@@ -1366,7 +1366,7 @@ class StreamingSession(TransportReplacementMixin):
 
     def _context_window(self, *, reported_max: int | None = None) -> int:
         """Use the same effective window for the gauge and restart ceiling."""
-        if reported_max is not None:
+        if type(reported_max) is int and reported_max > 0:
             self._reported_context_max_tokens = reported_max
         return resolve_context_window(
             self._config.model or "", reported_max=self._reported_context_max_tokens

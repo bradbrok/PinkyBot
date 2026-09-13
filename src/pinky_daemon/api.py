@@ -3800,11 +3800,14 @@ def create_api(
 
         ctx = await _streaming_context_info(ss)
         pct = ctx.get("percentage", 0.0)
-        effective_threshold = getattr(ss, "_effective_restart_threshold_pct", None)
-        restart_pct = (
-            effective_threshold() if callable(effective_threshold)
-            else ss._config.context_restart_pct
-        )
+        try:
+            effective_threshold = getattr(ss, "_effective_restart_threshold_pct", None)
+            restart_pct = (
+                effective_threshold() if callable(effective_threshold)
+                else ss._config.context_restart_pct
+            )
+        except Exception:
+            restart_pct = ss._config.context_restart_pct
         return {
             "id": f"{agent_name}-{label}",
             "state": "connected" if ss.state == TransportSessionState.CONNECTED else "idle",
