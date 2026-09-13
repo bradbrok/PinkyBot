@@ -1452,3 +1452,34 @@ async def test_concurrent_attempt_reconnect_coalesces_to_single_cycle() -> None:
     )
     assert ss.state == SessionState.CONNECTED
     assert ss._reconnect_task is None, "in-flight marker must clear when done"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cap,reported_max,should_restart,warning_pct", [
+    (550_000, 967_000, True, "56.8769"), (0, 967_000, False, "80"),
+    (550_000, 200_000, False, "80"), (100_000, 167_000, True, "59.8802"),
+])
+async def test_restart_tokens_cap_sdk_force_restart(cap, reported_max, should_restart, warning_pct):
+    ss = _make_session()
+    ss._config.model = "claude-opus-4-8"
+    ss._config.restart_tokens_cap = cap
+    _stub_ctx(ss, pct=65, max_tokens=reported_max)
+    await ss._check_context()
+    assert ss.force_restart.await_count == int(should_restart)
+    assert f"before hitting {warning_pct}%" in ss._client.query.await_args.args[0]
+    assert ss._config.context_restart_pct == 80
+    assert ss._config.context_warn_pct == 40
+    assert ss._effective_restart_threshold_pct() == pytest.approx(
+        min(80, cap / reported_max * 100) if cap else 80
+    )
+
+
+@pytest.mark.parametrize("cap", [True, False, -5, 10**12, "550000", 550_000.0, None])
+def test_restart_tokens_cap_sdk_invalid_warns_once(cap, capsys):
+    ss = _make_session()
+    ss._config.restart_tokens_cap = cap
+    for _ in range(3):
+        assert ss._effective_restart_threshold_pct() == 80
+    warnings = [line for line in capsys.readouterr().err.splitlines()
+                if "WARNING" in line and "restart_tokens_cap" in line]
+    assert len(warnings) == 1

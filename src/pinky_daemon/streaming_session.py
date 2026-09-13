@@ -18,6 +18,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon.agent_registry import validate_restart_tokens_cap
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
 from pinky_daemon.sessions import SessionUsage
@@ -140,6 +141,7 @@ class StreamingSessionConfig:
     watchdog_enabled_fn: object = None  # Callable() -> bool; whether this agent's watchdog_config.enabled is set. The tmux inflight watchdog reads it per tick so watchdog_config.enabled=false is an operator kill-switch for BOTH the daemon SessionWatchdog and per-session inflight recovery (#846). None → treated as enabled (default True).
     context_warn_pct: int = 40  # Warn agent to save state at this %
     context_restart_pct: int = 80  # Force restart at this %
+    restart_tokens_cap: int = 0  # Explicit absolute ceiling; 0 keeps percentage-only behavior.
     restart_guard_cooldown_sec: int = 60  # Minimum gap between restart-block warnings
     idle_timeout: int = 0  # Auto-sleep after this many seconds idle (0 = disabled); set from agent.auto_sleep_hours
     timezone: str = "America/Los_Angeles"  # IANA timezone for wake timestamp
@@ -303,6 +305,8 @@ class StreamingSession(TransportReplacementMixin):
         auth_success_callback=None,  # fn(agent_name) — fires on a successful turn (clears auth fail state)
     ) -> None:
         self._config = config
+        self._reported_context_max_tokens = 0
+        self._restart_tokens_cap_warned = False
         self._response_callback = response_callback
         self._cost_callback = cost_callback  # Sync callback to persist costs
         self._conversation_store = conversation_store
@@ -1360,6 +1364,32 @@ class StreamingSession(TransportReplacementMixin):
             self._state_machine._state = SessionState.RECONNECTING
             await self.attempt_reconnect()
 
+    def _context_window(self, *, reported_max: int | None = None) -> int:
+        """Use the same effective window for the gauge and restart ceiling."""
+        if type(reported_max) is int and reported_max > 0:
+            self._reported_context_max_tokens = reported_max
+        return resolve_context_window(
+            self._config.model or "", reported_max=self._reported_context_max_tokens
+        )
+
+    def _effective_restart_threshold_pct(self) -> float:
+        """Apply an explicit valid ceiling without changing configured percentages."""
+        pct = self._config.context_restart_pct
+        try:
+            cap = validate_restart_tokens_cap(self._config.restart_tokens_cap)
+        except ValueError:
+            if not self._restart_tokens_cap_warned:
+                self._restart_tokens_cap_warned = True
+                _log(
+                    f"streaming[{self.agent_name}]: WARNING invalid restart_tokens_cap; "
+                    "using the configured restart percentage"
+                )
+            return pct
+        if cap == 0:
+            return pct
+        max_tokens = self._context_window()
+        return min(pct, cap / max_tokens * 100) if max_tokens > 0 else pct
+
     async def _check_context(self) -> None:
         """Check context usage after each turn. Warn or force restart."""
         if not self._client or self.state != SessionState.CONNECTED:
@@ -1372,9 +1402,8 @@ class StreamingSession(TransportReplacementMixin):
 
             # Single source of truth for the window: trust the harness-reported
             # cap (reported_max), falling back to the configurable per-model map.
-            max_t = resolve_context_window(
-                self._config.model or "", reported_max=reported_max
-            )
+            max_t = self._context_window(reported_max=reported_max)
+            restart_pct = self._effective_restart_threshold_pct()
 
             pct = round(total / max_t * 100) if max_t > 0 else 0
 
@@ -1387,7 +1416,7 @@ class StreamingSession(TransportReplacementMixin):
                 warn_msg = (
                     f"[SYSTEM] Context at {pct}% ({total:,}/{max_t:,} tokens). "
                     f"~{remaining:,} tokens remaining. "
-                    f"Save your state with save_my_context before hitting {self._config.context_restart_pct}%, "
+                    f"Save your state with save_my_context before hitting {restart_pct:g}%, "
                     f"or call context_restart when ready."
                 )
                 try:
@@ -1400,7 +1429,7 @@ class StreamingSession(TransportReplacementMixin):
                         f"— will retry next turn"
                     )
 
-            if pct >= self._config.context_restart_pct:
+            if pct >= restart_pct:
                 # Force restart
                 _log(f"streaming[{self.agent_name}]: context at {pct}% — force restarting")
                 restarted = await self.force_restart()

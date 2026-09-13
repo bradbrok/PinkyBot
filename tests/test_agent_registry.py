@@ -2429,3 +2429,68 @@ class TestRuntimeEditableModelCatalog:
             assert registry._db.execute("PRAGMA foreign_keys").fetchone()[0] == 1
         finally:
             registry.close()
+
+
+class TestRestartTokensCap:
+    def test_restart_tokens_cap_roundtrip(self, registry, tmp_path):
+        agent = registry.register("cap-test", working_dir=str(tmp_path / "agent"))
+        assert agent.restart_tokens_cap == 0
+        registry.register("cap-test", restart_tokens_cap=550_000)
+        restored = registry.get("cap-test")
+        assert restored.restart_tokens_cap == 550_000
+        assert restored.to_dict()["restart_tokens_cap"] == 550_000
+        registry.register("cap-test", display_name="Updated")
+        assert registry.get("cap-test").restart_tokens_cap == 550_000
+        registry.register("cap-test", restart_tokens_cap=0)
+        assert registry.get("cap-test").restart_tokens_cap == 0
+
+    def test_restart_tokens_cap_create(self, registry, tmp_path):
+        agent = registry.register(
+            "cap-test", working_dir=str(tmp_path / "agent"), restart_tokens_cap=550_000
+        )
+        assert agent.restart_tokens_cap == 550_000
+        assert registry.get("cap-test").to_dict()["restart_tokens_cap"] == 550_000
+
+    def test_restart_tokens_cap_migration(self, tmp_path):
+        db_path = tmp_path / "agents.db"
+        legacy = AgentRegistry(db_path=str(db_path))
+        try:
+            legacy.register(
+                "cap-test", display_name="cap-test", working_dir=str(tmp_path / "agent")
+            )
+        finally:
+            legacy.close()
+        with sqlite3.connect(db_path) as db:
+            columns = {row[1] for row in db.execute("PRAGMA table_info(agents)")}
+            if "restart_tokens_cap" in columns:
+                db.execute("ALTER TABLE agents DROP COLUMN restart_tokens_cap")
+            assert "restart_tokens_cap" not in {
+                row[1] for row in db.execute("PRAGMA table_info(agents)")
+            }
+        upgraded = AgentRegistry(db_path=str(db_path))
+        try:
+            columns = {row[1]: row for row in upgraded._db.execute("PRAGMA table_info(agents)")}
+            assert "restart_tokens_cap" in columns
+            column = columns["restart_tokens_cap"]
+            assert column[2:5] == ("INTEGER", 1, "0")
+            assert upgraded.get("cap-test").restart_tokens_cap == 0
+            assert upgraded.get("cap-test").display_name == "cap-test"
+        finally:
+            upgraded.close()
+
+
+    @pytest.mark.parametrize("method", ["register", "reregister", "update"])
+    @pytest.mark.parametrize("cap", [1, True, -5, 10**12, 550_000.0, "550000", None])
+    def test_restart_tokens_cap_rejects_invalid_writes(self, registry, tmp_path, method, cap):
+        work_dir = tmp_path / "agent"
+        if method != "register":
+            registry.register("cap-test", working_dir=str(work_dir), restart_tokens_cap=550_000)
+        writer = registry.update if method == "update" else registry.register
+        with pytest.raises(ValueError, match="restart_tokens_cap"):
+            writer("cap-test", restart_tokens_cap=cap, display_name="Must not persist")
+        if method == "register":
+            assert registry.get("cap-test") is None
+        else:
+            agent = registry.get("cap-test")
+            assert agent.restart_tokens_cap == 550_000
+            assert agent.display_name == ""

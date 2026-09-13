@@ -3094,6 +3094,8 @@ def create_api(
         else:
             model = provider_model or agent.model
         effort = agent.thinking_effort or "medium"
+        if ss._config.model != model:
+            ss._reported_context_max_tokens = 0
         ss._config.model = model
         ss._config.provider_url = provider_url
         ss._config.provider_key = provider_key
@@ -3761,8 +3763,11 @@ def create_api(
             ctx = await asyncio.wait_for(ss._client.get_context_usage(), timeout=3.0)
             total = ctx.get("totalTokens", 0)
             reported_max = ctx.get("maxTokens", 0)
-            actual_max = resolve_context_window(
-                ss._config.model or "", reported_max=reported_max
+            context_window = getattr(ss, "_context_window", None)
+            actual_max = (
+                context_window(reported_max=reported_max)
+                if callable(context_window)
+                else resolve_context_window(ss._config.model or "", reported_max=reported_max)
             )
             # rawMaxTokens (SDK ≥ 0.1.x) is the raw model cap; maxTokens
             # is effective (autocompact buffer subtracted). Pass both
@@ -3797,12 +3802,21 @@ def create_api(
 
         ctx = await _streaming_context_info(ss)
         pct = ctx.get("percentage", 0.0)
+        try:
+            effective_threshold = getattr(ss, "_effective_restart_threshold_pct", None)
+            restart_pct = (
+                effective_threshold() if callable(effective_threshold)
+                else ss._config.context_restart_pct
+            )
+        except Exception as exc:
+            _log(f"api: effective restart threshold unavailable for {agent_name}: {type(exc).__name__}")
+            restart_pct = ss._config.context_restart_pct
         return {
             "id": f"{agent_name}-{label}",
             "state": "connected" if ss.state == TransportSessionState.CONNECTED else "idle",
             "context_used_pct": pct,
             "message_count": ss._stats.get("messages_sent", 0) + ss._stats.get("turns", 0),
-            "needs_restart": bool(ctx) and pct >= ss._config.context_restart_pct,
+            "needs_restart": bool(ctx) and pct >= restart_pct,
             "streaming": True,
             "label": label,
             "connected": ss.state == TransportSessionState.CONNECTED,
@@ -4078,6 +4092,7 @@ def create_api(
             watchdog_enabled_fn=lambda _agent_name=agent_name: _get_watchdog_config(_agent_name).enabled,
             context_warn_pct=warn_pct,
             context_restart_pct=restart_pct,
+            restart_tokens_cap=agent.restart_tokens_cap,
             timezone=agents.get_owner_profile().get("timezone", "America/Los_Angeles"),
             subagents=subagents,
             provider_url=resolved_provider_url,
@@ -7141,6 +7156,7 @@ npm run build</pre>
                 allowed_tools=req.allowed_tools,
                 max_turns=req.max_turns,
                 timeout=req.timeout,
+                restart_tokens_cap=req.restart_tokens_cap,
                 max_sessions=req.max_sessions,
                 plain_text_fallback=req.plain_text_fallback,
                 groups=req.groups,

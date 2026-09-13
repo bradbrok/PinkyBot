@@ -12,6 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from pinky_daemon.agent_registry import validate_restart_tokens_cap
+
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character
 # class to prevent path-traversal and arbitrary-write taint — see CodeQL
@@ -331,6 +333,13 @@ class RegisterAgentRequest(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     disallowed_tools: list[str] = Field(default_factory=list)
     max_turns: int = 0
+    restart_tokens_cap: int = 0
+
+    @field_validator("restart_tokens_cap", mode="before")
+    @classmethod
+    def _restart_tokens_cap_valid(cls, value: object) -> int:
+        return validate_restart_tokens_cap(value)
+
     timeout: float = 300.0
     max_sessions: int = 5
     plain_text_fallback: bool = False
@@ -413,6 +422,15 @@ class UpdateAgentRequest(BaseModel):
     plain_text_fallback: bool | None = None
     restart_threshold_pct: float | None = None
     context_nudge_threshold_pct: float | None = None  # Soft nudge %; 0=use global default (#614)
+    restart_tokens_cap: int | None = None
+
+    @field_validator("restart_tokens_cap", mode="before")
+    @classmethod
+    def _restart_tokens_cap_valid(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return validate_restart_tokens_cap(value)
+
     heartbeat_interval: int | None = None  # Seconds between heartbeats (0=disabled → demand-woken)
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
     clock_aligned: bool | None = None  # Align to wall clock boundaries
