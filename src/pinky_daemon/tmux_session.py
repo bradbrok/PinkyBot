@@ -70,7 +70,10 @@ from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
 
-from pinky_daemon.agent_registry import CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS
+from pinky_daemon.agent_registry import (
+    CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
+    validate_restart_tokens_cap,
+)
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
 from pinky_daemon.command_runner import (
@@ -5679,8 +5682,18 @@ class TmuxSession(TransportReplacementMixin):
         try:
             agent = self._registry.get(self.agent_name) if self._registry else None
             override = getattr(agent, "restart_tokens_cap", 0) if agent else 0
-            if isinstance(override, int) and override > 0:
-                cap = override
+            try:
+                override = validate_restart_tokens_cap(override)
+            except ValueError:
+                if not getattr(self, "_restart_tokens_cap_warned", False):
+                    self._restart_tokens_cap_warned = True
+                    _log(
+                        f"tmux[{self.agent_name}]: WARNING invalid restart_tokens_cap; "
+                        "using the default restart ceiling"
+                    )
+            else:
+                if override > 0:
+                    cap = override
         except Exception:
             pass
         cap_pct = cap / max_tokens * 100.0

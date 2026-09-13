@@ -488,6 +488,22 @@ _OWNER_FIELD_LABELS = {
 }
 
 
+MIN_RESTART_TOKENS_CAP = 50_000
+MAX_RESTART_TOKENS_CAP = 2_000_000
+
+
+def validate_restart_tokens_cap(value: object) -> int:
+    """Validate an absolute restart ceiling before it reaches durable config."""
+    if type(value) is not int or (
+        value != 0 and not MIN_RESTART_TOKENS_CAP <= value <= MAX_RESTART_TOKENS_CAP
+    ):
+        raise ValueError(
+            "restart_tokens_cap must be an integer: 0 or "
+            f"{MIN_RESTART_TOKENS_CAP} through {MAX_RESTART_TOKENS_CAP}"
+        )
+    return value
+
+
 @dataclass
 class Agent:
     """A named agent with persistent identity."""
@@ -3163,6 +3179,8 @@ except Exception as exc:
         agent or reset fields omitted from a PATCH-like request.
         """
         name = _validate_agent_name(name)
+        if "restart_tokens_cap" in kwargs:
+            validate_restart_tokens_cap(kwargs["restart_tokens_cap"])
         force_soul = bool(kwargs.pop("force_soul", False))
         soul_source = str(kwargs.pop("soul_source", "registry-update") or "registry-update")
         with self._rmw_lock:
@@ -3401,6 +3419,8 @@ except Exception as exc:
     def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
         """Register atomically, including cross-agent workspace ownership."""
         name = _validate_agent_name(name)
+        if "restart_tokens_cap" in kwargs:
+            validate_restart_tokens_cap(kwargs["restart_tokens_cap"])
         with self._rmw_lock:
             return self._register_locked(name, create_only=create_only, **kwargs)
 

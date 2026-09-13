@@ -12,6 +12,8 @@ from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
+from pinky_daemon.agent_registry import validate_restart_tokens_cap
+
 # Agent names appear in filesystem paths (data/agents/{name}/, hook scripts,
 # settings.json, .mcp.json) and database queries. Restrict to a safe character
 # class to prevent path-traversal and arbitrary-write taint — see CodeQL
@@ -307,12 +309,6 @@ class SetDefaultProviderRequest(BaseModel):
 # ── Agent Models ─────────────────────────────────────────────
 
 
-def _validate_restart_tokens_cap(value: object) -> int:
-    if type(value) is not int or (value != 0 and not 50_000 <= value <= 2_000_000):
-        raise ValueError("restart_tokens_cap must be an integer: 0 or 50000 through 2000000")
-    return value
-
-
 class RegisterAgentRequest(BaseModel):
     """Register a named agent."""
 
@@ -342,7 +338,7 @@ class RegisterAgentRequest(BaseModel):
     @field_validator("restart_tokens_cap", mode="before")
     @classmethod
     def _restart_tokens_cap_valid(cls, value: object) -> int:
-        return _validate_restart_tokens_cap(value)
+        return validate_restart_tokens_cap(value)
 
     timeout: float = 300.0
     max_sessions: int = 5
@@ -430,8 +426,10 @@ class UpdateAgentRequest(BaseModel):
 
     @field_validator("restart_tokens_cap", mode="before")
     @classmethod
-    def _restart_tokens_cap_valid(cls, value: object) -> int:
-        return _validate_restart_tokens_cap(value)
+    def _restart_tokens_cap_valid(cls, value: object) -> int | None:
+        if value is None:
+            return None
+        return validate_restart_tokens_cap(value)
 
     heartbeat_interval: int | None = None  # Seconds between heartbeats (0=disabled → demand-woken)
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
