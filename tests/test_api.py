@@ -6097,6 +6097,37 @@ class TestAgentCRUD:
         assert response.json()["session"]["needs_restart"] is False
         assert ss._effective_restart_threshold_pct() == 80
 
+    def test_restart_tokens_cap_sdk_model_switch_invalidates_window(self, tmp_path, monkeypatch):
+        client = self._make_restart_cap_client(tmp_path)
+        registry = client.app.state.agents
+        registry.register(
+            "cap-test", working_dir=str(tmp_path / "agent"),
+            model="claude-opus-4-8", restart_tokens_cap=550_000,
+        )
+        ss = self._wake_restart_cap_sdk(client, monkeypatch)
+        ss._client = SimpleNamespace(get_context_usage=AsyncMock(side_effect=[
+            {"totalTokens": 650_000, "maxTokens": 967_000},
+            {"totalTokens": 170_000},
+        ]))
+        response = client.get("/agents/cap-test/health")
+        assert response.status_code == 200
+        assert ss._effective_restart_threshold_pct() == pytest.approx(550_000 / 967_000 * 100)
+        # A same-model refresh must preserve the valid reported window.
+        client.app.state._refresh_streaming_launch_config("cap-test", ss)
+        assert ss._effective_restart_threshold_pct() == pytest.approx(550_000 / 967_000 * 100)
+        registry.update("cap-test", model="claude-haiku-4-5")
+        client.app.state._refresh_streaming_launch_config("cap-test", ss)
+        assert ss._config.model == "claude-haiku-4-5"
+        assert ss._effective_restart_threshold_pct() == 80
+        ss.resume_handle = "after-model-switch"
+        response = client.get("/agents/cap-test/health")
+        assert response.status_code == 200
+        health = response.json()["session"]
+        assert health["context_used_pct"] == 85.0  # 170k / model-map fallback 200k.
+        assert health["needs_restart"] is True
+        assert ss._effective_restart_threshold_pct() == 80
+        assert ss._client.get_context_usage.await_count == 2
+
     @pytest.mark.parametrize("error", [RuntimeError, TypeError])
     @pytest.mark.parametrize("total,needs_restart", [(650_000, False), (850_000, True)])
     def test_restart_tokens_cap_health_threshold_error_falls_back(
