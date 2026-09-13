@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -175,6 +176,7 @@ from pinky_daemon.mesh_store import MeshStore
 from pinky_daemon.message_context_store import MessageContextStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
+from pinky_daemon.poller_status import PollerStatus
 from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler, read_rate_limit_status
@@ -2781,7 +2783,7 @@ def create_api(
         activity_store=activity,
         message_context_store=message_context_store,
     )
-    _broker_pollers: list = []  # Track active broker pollers
+    _broker_pollers: list[PollerStatus] = []  # Track active broker pollers
 
     def _new_telegram_broker_poller(name, token):
         from pinky_daemon.pollers import BrokerTelegramPoller
@@ -9621,11 +9623,13 @@ npm run build</pre>
     async def broker_status():
         """Get message broker status."""
         now = time.monotonic()
-        return {
-            "stats": broker.stats,
-            "active_pollers": [
-                {
-                    "agent": p.agent_name,
+        rows = []
+        for p in _broker_pollers:
+            agent_name = "?"
+            try:
+                agent_name = p.agent_name or "?"
+                row = {
+                    "agent": agent_name,
                     "polls": p.poll_count,
                     "running": p.is_running,
                     "connect_attempts": getattr(p, "connect_attempts", 0),
@@ -9639,9 +9643,14 @@ npm run build</pre>
                         else None
                     ),
                 }
-                for p in _broker_pollers
-            ],
-        }
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                logging.getLogger(__name__).error(
+                    "broker status: %s: %s", type(p).__name__, error,
+                )
+                row = {"agent": agent_name, "error": error}
+            rows.append(row)
+        return {"stats": broker.stats, "active_pollers": rows}
 
     @app.post("/broker/send")
     async def broker_send_message(req: dict, request: Request):
