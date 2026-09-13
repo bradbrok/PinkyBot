@@ -95,7 +95,14 @@ def test_discovery_includes_future_poller(module, monkeypatch):
         pass
 
     monkeypatch.setattr(module, "FuturePoller", FuturePoller, raising=False)
-    assert FuturePoller in _discover_pollers()
+    discovered = _discover_pollers()
+    assert FuturePoller in discovered
+    # A minimum inventory prevents a discovery filter from silently dropping
+    # an existing transport. Collection above still includes future classes.
+    assert {
+        "TelegramPoller", "BrokerTelegramPoller", "BrokeriMessagePoller",
+        "BrokerDiscordPoller", "BrokerSlackPoller", "BrokerBuzzPoller",
+    } <= {cls.__name__ for cls in discovered}
 
 
 @pytest.mark.parametrize("broken_field", ["poll_count", "agent_name", "last_poll_ok"])
