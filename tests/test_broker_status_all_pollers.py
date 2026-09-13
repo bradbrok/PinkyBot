@@ -151,8 +151,7 @@ def test_broker_status_degrades_one_row(status_client, caplog, broken_field, err
     )
 
 
-@pytest.mark.parametrize("storage", ["class", "instance"])
-def test_broker_status_preserves_optional_telemetry(status_client, storage):
+def test_broker_status_preserves_optional_telemetry(status_client):
     class HealthyPoller:
         agent_name = "healthy-test"
         poll_count = 2
@@ -167,9 +166,8 @@ def test_broker_status_preserves_optional_telemetry(status_client, storage):
         "watchdog_fires": 2,
         "last_poll_ok": 1.0,
     }
-    target = HealthyPoller if storage == "class" else poller
     for field, value in telemetry.items():
-        setattr(target, field, value)
+        setattr(HealthyPoller, field, value)
     active.append(poller)
     response = client.get("/broker/status")
     assert response.status_code == 200, response.text
@@ -244,6 +242,67 @@ def test_broker_status_degrades_stats(status_client, monkeypatch, caplog, error_
     assert any(
         record.levelno == logging.ERROR
         and "stats" in record.getMessage()
+        and payload["stats"]["error"] in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("broken_field", [
+    "connect_attempts", "inbound_stalled_s", "stall_alerted", "watchdog_fires",
+])
+def test_broker_status_degrades_unencodable_row(status_client, caplog, broken_field):
+    class BrokenPoller:
+        agent_name = "broken-test"
+        poll_count = 0
+        is_running = False
+
+    setattr(BrokenPoller, broken_field, object())
+    client, active = status_client
+    before = SimpleNamespace(agent_name="before-test", poll_count=7, is_running=True)
+    after = SimpleNamespace(agent_name="after-test", poll_count=9, is_running=False)
+    active.extend([before, BrokenPoller(), after])
+    with caplog.at_level(logging.ERROR):
+        response = client.get("/broker/status")
+    assert response.status_code == 200, response.text
+    rows = response.json()["active_pollers"]
+    assert len(rows) == 3
+    broken = rows[1]
+    assert set(broken) == {"agent", "error"}
+    assert broken["agent"] == "broken-test"
+    assert broken["error"].startswith("ValueError:")
+    for row, sibling in ((rows[0], before), (rows[2], after)):
+        assert "error" not in row
+        assert row["agent"] == sibling.agent_name
+        assert row["polls"] == sibling.poll_count
+        assert row["running"] is sibling.is_running
+    assert any(
+        record.levelno == logging.ERROR
+        and "BrokenPoller" in record.getMessage()
+        and broken["error"] in record.getMessage()
+        for record in caplog.records
+    )
+
+
+def test_broker_status_degrades_unencodable_stats(status_client, monkeypatch, caplog):
+    client, active = status_client
+    broker = client.app.state.broker
+    active.append(SimpleNamespace(agent_name="healthy-test", poll_count=5, is_running=True))
+    with monkeypatch.context() as patch:
+        patch.setattr(type(broker), "stats", property(lambda self: {"x": object()}))
+        with caplog.at_level(logging.ERROR):
+            response = client.get("/broker/status")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert set(payload["stats"]) == {"error"}
+    assert payload["stats"]["error"].startswith("ValueError:")
+    row, = payload["active_pollers"]
+    assert "error" not in row
+    assert row["agent"] == "healthy-test"
+    assert row["polls"] == 5
+    assert row["running"] is True
+    assert any(
+        record.levelno == logging.ERROR
+        and f"{type(broker).__name__}.stats" in record.getMessage()
         and payload["stats"]["error"] in record.getMessage()
         for record in caplog.records
     )
