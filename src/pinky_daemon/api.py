@@ -18,6 +18,7 @@ import hashlib
 import hmac
 import inspect
 import json
+import logging
 import math
 import os
 import re
@@ -175,6 +176,7 @@ from pinky_daemon.mesh_store import MeshStore
 from pinky_daemon.message_context_store import MessageContextStore
 from pinky_daemon.outreach_config import OutreachConfigStore
 from pinky_daemon.plugin_manager import PluginManager
+from pinky_daemon.poller_status import PollerStatus
 from pinky_daemon.presentation_store import PresentationStore
 from pinky_daemon.research_store import ResearchStore
 from pinky_daemon.scheduler import AgentScheduler, read_rate_limit_status
@@ -2781,7 +2783,7 @@ def create_api(
         activity_store=activity,
         message_context_store=message_context_store,
     )
-    _broker_pollers: list = []  # Track active broker pollers
+    _broker_pollers: list[PollerStatus] = []  # Track active broker pollers
 
     def _new_telegram_broker_poller(name, token):
         from pinky_daemon.pollers import BrokerTelegramPoller
@@ -9617,31 +9619,67 @@ npm run build</pre>
 
     # ── Broker Status ──────────────────────────────────────
 
+    def _optional_poller_status(poller: PollerStatus, name: str, default: Any) -> Any:
+        """Default only when the name is not defined on the poller's class.
+
+        A class attribute/property that raises AttributeError propagates. An
+        unset __slots__ field therefore reads as broken, not absent.
+        """
+        try:
+            return getattr(poller, name)
+        except AttributeError:
+            if hasattr(type(poller), name):
+                raise
+            return default
+
     @app.get("/broker/status")
     async def broker_status():
         """Get message broker status."""
         now = time.monotonic()
-        return {
-            "stats": broker.stats,
-            "active_pollers": [
-                {
-                    "agent": p.agent_name,
-                    "polls": p.poll_count,
-                    "running": p.is_running,
-                    "connect_attempts": getattr(p, "connect_attempts", 0),
-                    "inbound_stalled_s": getattr(p, "inbound_stalled_s", None),
-                    "stall_alerted": getattr(p, "stall_alerted", False),
+        rows = []
+        for p in _broker_pollers:
+            agent_name = "?"
+            try:
+                name = p.agent_name
+                if not isinstance(name, str):
+                    raise TypeError(f"agent_name must be str, got {type(name).__name__}")
+                agent_name = name or "?"
+                count = p.poll_count
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"poll_count must be int, got {type(count).__name__}")
+                running = p.is_running
+                if not isinstance(running, bool):
+                    raise TypeError(f"is_running must be bool, got {type(running).__name__}")
+                last_poll_ok = _optional_poller_status(p, "last_poll_ok", 0.0)
+                row = {
+                    "agent": agent_name,
+                    "polls": count,
+                    "running": running,
+                    "connect_attempts": _optional_poller_status(p, "connect_attempts", 0),
+                    "inbound_stalled_s": _optional_poller_status(p, "inbound_stalled_s", None),
+                    "stall_alerted": _optional_poller_status(p, "stall_alerted", False),
                     # Watchdog-equipped pollers only (#1145); None elsewhere.
-                    "watchdog_fires": getattr(p, "watchdog_fires", None),
-                    "last_poll_ok_age_s": (
-                        round(now - p.last_poll_ok, 1)
-                        if getattr(p, "last_poll_ok", 0.0)
-                        else None
-                    ),
+                    "watchdog_fires": _optional_poller_status(p, "watchdog_fires", None),
+                    "last_poll_ok_age_s": round(now - last_poll_ok, 1) if last_poll_ok else None,
                 }
-                for p in _broker_pollers
-            ],
-        }
+                row = jsonable_encoder(row)
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                logging.getLogger(__name__).error(
+                    "broker status: %s: %s", type(p).__name__, error,
+                )
+                row = {"agent": agent_name, "error": error}
+            rows.append(row)
+        try:
+            stats = broker.stats
+            stats = jsonable_encoder(stats)
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).error(
+                "broker status: %s.stats: %s", type(broker).__name__, error,
+            )
+            stats = {"error": error}
+        return {"stats": stats, "active_pollers": rows}
 
     @app.post("/broker/send")
     async def broker_send_message(req: dict, request: Request):

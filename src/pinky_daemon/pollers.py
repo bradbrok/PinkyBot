@@ -2,7 +2,8 @@
 
 Each poller runs as an async task in the daemon's event loop,
 periodically checking for new messages and feeding them to the
-message handler (legacy) or message broker (new).
+message handler (legacy) or message broker (new). All expose the shared
+``pinky_daemon.poller_status.PollerStatus`` contract.
 """
 
 from __future__ import annotations
@@ -667,6 +668,10 @@ class TelegramPoller(_TelegramPollWatchdog):
         self._stop_owner_notify()
         self._shutdown_watchdog()
         _log("telegram-poller: stopping")
+
+    @property
+    def agent_name(self) -> str:
+        return self._inbound_agent
 
     @property
     def poll_count(self) -> int:
@@ -1464,6 +1469,7 @@ class BrokerSlackPoller:
         self._app_token = app_token
         self._event_callback = event_callback
         self._running = False
+        self._poll_count = 0
         self._stop_requested = False
         self._accepting_deliveries = True
         self._bot_user_id = ""
@@ -1481,6 +1487,14 @@ class BrokerSlackPoller:
     @property
     def agent_name(self) -> str:
         return self._agent_name
+
+    @property
+    def poll_count(self) -> int:
+        """Count incoming envelope deliveries, including filtered/unsupported types.
+
+        A redelivery after a failed ACK counts again; envelope IDs are not deduplicated.
+        """
+        return self._poll_count
 
     @property
     def is_running(self) -> bool:
@@ -1570,6 +1584,9 @@ class BrokerSlackPoller:
                     )
                 except Exception as e:
                     _log(f"slack-poller[{self._agent_name}]: ack failed: {e}")
+                # Count the incoming envelope once, even if its ACK failed or
+                # dispatch filters it out. Connections/control frames do not count.
+                self._poll_count += 1
             # After the prompt ACK, atomically fence or transfer the whole
             # request into the delivery-task set. slack_sdk does not retain its
             # own listener tasks, so this tracked child is the publication
