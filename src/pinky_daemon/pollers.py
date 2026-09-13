@@ -1490,7 +1490,10 @@ class BrokerSlackPoller:
 
     @property
     def poll_count(self) -> int:
-        """Socket Mode envelopes processed, including filtered or unsupported types."""
+        """Count incoming envelope deliveries, including filtered/unsupported types.
+
+        A redelivery after a failed ACK counts again; envelope IDs are not deduplicated.
+        """
         return self._poll_count
 
     @property

@@ -9619,6 +9619,15 @@ npm run build</pre>
 
     # ── Broker Status ──────────────────────────────────────
 
+    def _optional_poller_status(poller: PollerStatus, name: str, default: Any) -> Any:
+        """Default only for absent fields, never a broken status property."""
+        try:
+            return getattr(poller, name)
+        except AttributeError:
+            if hasattr(type(poller), name) or name in getattr(poller, "__dict__", {}):
+                raise
+            return default
+
     @app.get("/broker/status")
     async def broker_status():
         """Get message broker status."""
@@ -9627,21 +9636,27 @@ npm run build</pre>
         for p in _broker_pollers:
             agent_name = "?"
             try:
-                agent_name = p.agent_name or "?"
+                name = p.agent_name
+                if not isinstance(name, str):
+                    raise TypeError(f"agent_name must be str, got {type(name).__name__}")
+                agent_name = name or "?"
+                count = p.poll_count
+                if not isinstance(count, int) or isinstance(count, bool):
+                    raise TypeError(f"poll_count must be int, got {type(count).__name__}")
+                running = p.is_running
+                if not isinstance(running, bool):
+                    raise TypeError(f"is_running must be bool, got {type(running).__name__}")
+                last_poll_ok = _optional_poller_status(p, "last_poll_ok", 0.0)
                 row = {
                     "agent": agent_name,
-                    "polls": p.poll_count,
-                    "running": p.is_running,
-                    "connect_attempts": getattr(p, "connect_attempts", 0),
-                    "inbound_stalled_s": getattr(p, "inbound_stalled_s", None),
-                    "stall_alerted": getattr(p, "stall_alerted", False),
+                    "polls": count,
+                    "running": running,
+                    "connect_attempts": _optional_poller_status(p, "connect_attempts", 0),
+                    "inbound_stalled_s": _optional_poller_status(p, "inbound_stalled_s", None),
+                    "stall_alerted": _optional_poller_status(p, "stall_alerted", False),
                     # Watchdog-equipped pollers only (#1145); None elsewhere.
-                    "watchdog_fires": getattr(p, "watchdog_fires", None),
-                    "last_poll_ok_age_s": (
-                        round(now - p.last_poll_ok, 1)
-                        if getattr(p, "last_poll_ok", 0.0)
-                        else None
-                    ),
+                    "watchdog_fires": _optional_poller_status(p, "watchdog_fires", None),
+                    "last_poll_ok_age_s": round(now - last_poll_ok, 1) if last_poll_ok else None,
                 }
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
@@ -9650,7 +9665,15 @@ npm run build</pre>
                 )
                 row = {"agent": agent_name, "error": error}
             rows.append(row)
-        return {"stats": broker.stats, "active_pollers": rows}
+        try:
+            stats = broker.stats
+        except Exception as exc:
+            error = f"{type(exc).__name__}: {exc}"
+            logging.getLogger(__name__).error(
+                "broker status: %s.stats: %s", type(broker).__name__, error,
+            )
+            stats = {"error": error}
+        return {"stats": stats, "active_pollers": rows}
 
     @app.post("/broker/send")
     async def broker_send_message(req: dict, request: Request):
