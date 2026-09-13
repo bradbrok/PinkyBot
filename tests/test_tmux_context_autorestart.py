@@ -402,7 +402,7 @@ def test_restart_tokens_cap_tmux_corrupt_row(tmp_path, capsys):
         registry._db.execute("UPDATE agents SET restart_tokens_cap=1 WHERE name='cap-test'")
         registry._db.commit()
         ss = _make_session(model=_MODEL_1M)
-        ss._config.agent_name = "cap-test"
+        ss.agent_name = "cap-test"
         ss._registry = registry
         for _ in range(3):
             assert ss._effective_restart_threshold_pct() == pytest.approx(

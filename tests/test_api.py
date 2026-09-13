@@ -6009,16 +6009,19 @@ class TestAgentCRUD:
         assert response.status_code == 200
         return client.app.state.broker._streaming["cap-test"]["main"]
 
-    @pytest.mark.parametrize("model,cap,reported_max,initial,expected", [
-        ("claude-opus-4-8", 550_000, 967_000, 55.0, 550_000 / 967_000 * 100),
-        ("claude-opus-4-8", 0, 967_000, 80.0, 80.0),
-        ("claude-haiku-4-5", 550_000, 167_000, 80.0, 80.0),
-        ("claude-haiku-4-5", 100_000, 167_000, 50.0, 100_000 / 167_000 * 100),
-        ("claude-opus-4-8", 550_000, 200_000, 55.0, 80.0),
+    @pytest.mark.parametrize("model,cap,reported_max,initial,expected,configured_max", [
+        ("claude-opus-4-8", 550_000, 967_000, 80.0, 550_000 / 967_000 * 100, 0),
+        ("claude-opus-4-8", 0, 967_000, 80.0, 80.0, 0),
+        ("claude-haiku-4-5", 550_000, 167_000, 80.0, 80.0, 0),
+        ("claude-haiku-4-5", 100_000, 167_000, 50.0, 100_000 / 167_000 * 100, 0),
+        ("claude-opus-4-8", 550_000, 200_000, 55.0, 80.0, 1_000_000),
+        ("claude-opus-4-8", 550_000, 967_000, 55.0, 550_000 / 967_000 * 100, 1_000_000),
     ])
     def test_restart_tokens_cap_sdk_config_and_health(
-        self, tmp_path, monkeypatch, model, cap, reported_max, initial, expected
+        self, tmp_path, monkeypatch, model, cap, reported_max, initial, expected, configured_max
     ):
+        if configured_max:
+            monkeypatch.setenv("PINKY_MODEL_CONTEXT_SIZES", json.dumps({model: configured_max}))
         client = self._make_restart_cap_client(tmp_path)
         client.app.state.agents.register(
             "cap-test", working_dir=str(tmp_path / "agent"), model=model,
