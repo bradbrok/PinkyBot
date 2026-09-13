@@ -5547,6 +5547,7 @@ class TmuxSession(TransportReplacementMixin):
     # headroom on a 1M vs a 200k window. Only bites when it is *below*
     # the percentage-based threshold (always true on 1M, never on 200k
     # since 400k exceeds that window entirely).
+    # Default ceiling; restart_tokens_cap overrides it per agent.
     _RESTART_TOKENS_CAP_1M = 400_000
 
     def _raw_max_tokens_for_model(self) -> int:
@@ -5663,27 +5664,26 @@ class TmuxSession(TransportReplacementMixin):
         return 80.0
 
     def _effective_restart_threshold_pct(self) -> float:
-        """Restart threshold as a percentage, with the 1M absolute cap applied.
+        """Combine the percentage threshold with the agent's absolute ceiling.
 
-        Combines the per-agent percentage threshold
-        (``_restart_threshold_pct``) with the absolute
-        ``_RESTART_TOKENS_CAP_1M`` ceiling, returning whichever fires
-        *earlier* (the lower percentage). The cap is expressed against
-        the **effective** max tokens so it lines up with the percentage
-        the gauge reports — i.e. crossing the returned percentage means
-        the real token total has reached ``min(pct·max, 400k)``.
-
-        On a 200k window the 400k cap exceeds the whole window, so the
-        ``min`` is always the configured percentage and behaviour is
-        unchanged. On a 1M window 400k ≈ 41% of the ~967k effective cap,
-        so the threshold drops from the default 80% to ~41% — Brad's
-        restart-around-400k-for-sanity preference.
+        A positive restart_tokens_cap overrides the default absolute ceiling.
+        Express the ceiling against effective max tokens to match the gauge;
+        the lower threshold wins. Caps above the window leave the configured
+        percentage unchanged. Registry failures use the default ceiling.
         """
         pct_threshold = self._restart_threshold_pct()
         max_tokens = self._max_tokens_for_model()
         if max_tokens <= 0:
             return pct_threshold
-        cap_pct = self._RESTART_TOKENS_CAP_1M / max_tokens * 100.0
+        cap = self._RESTART_TOKENS_CAP_1M
+        try:
+            agent = self._registry.get(self.agent_name) if self._registry else None
+            override = getattr(agent, "restart_tokens_cap", 0) if agent else 0
+            if isinstance(override, int) and override > 0:
+                cap = override
+        except Exception:
+            pass
+        cap_pct = cap / max_tokens * 100.0
         return min(pct_threshold, cap_pct)
 
     def _soft_nudge_threshold_pct(self) -> float:

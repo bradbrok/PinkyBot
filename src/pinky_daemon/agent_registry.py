@@ -511,6 +511,7 @@ class Agent:
     # at a natural break. 0.0 = use the global default. Must sit below
     # restart_threshold_pct (the hard safety net).
     context_nudge_threshold_pct: float = 0.0
+    restart_tokens_cap: int = 0  # Unset uses the default absolute restart ceiling.
     auto_restart: bool = True
     parent: str = ""  # Parent agent name (for hierarchy)
     groups: list[str] = field(default_factory=list)
@@ -618,6 +619,7 @@ class Agent:
             "timeout": self.timeout,
             "restart_threshold_pct": self.restart_threshold_pct,
             "context_nudge_threshold_pct": self.context_nudge_threshold_pct,
+            "restart_tokens_cap": self.restart_tokens_cap,
             "auto_restart": self.auto_restart,
             "parent": self.parent,
             "groups": self.groups,
@@ -1514,6 +1516,7 @@ class AgentRegistry:
                 timeout REAL NOT NULL DEFAULT 300.0,
                 restart_threshold_pct REAL NOT NULL DEFAULT 80.0,
                 context_nudge_threshold_pct REAL NOT NULL DEFAULT 0.0,
+                restart_tokens_cap INTEGER NOT NULL DEFAULT 0,
                 auto_restart INTEGER NOT NULL DEFAULT 1,
                 parent TEXT NOT NULL DEFAULT '',
                 groups TEXT NOT NULL DEFAULT '[]',
@@ -2034,6 +2037,7 @@ class AgentRegistry:
             ("mesh_outbound_allowlist", "TEXT NOT NULL DEFAULT '[]'"),
             # Soft context-watermark nudge (#614); 0 = use global default.
             ("context_nudge_threshold_pct", "REAL NOT NULL DEFAULT 0.0"),
+            ("restart_tokens_cap", "INTEGER NOT NULL DEFAULT 0"),
             # #149 tenant isolation: when 1, this agent is a hard-isolated
             # tenant (Counterpart) — scoped to ITSELF only. The daemon denies
             # it cross-agent actions (acting on a different agent's resources)
@@ -3174,7 +3178,7 @@ except Exception as exc:
             for key in ("display_name", "model", "soul", "users", "boundaries",
                         "system_prompt",
                         "permission_mode", "max_turns", "timeout", "restart_threshold_pct",
-                        "context_nudge_threshold_pct",
+                        "context_nudge_threshold_pct", "restart_tokens_cap",
                         "auto_restart", "parent", "max_sessions", "enabled",
                         "auto_start", "heartbeat_interval", "wake_interval",
                         "clock_aligned", "auto_sleep_hours", "plain_text_fallback", "voice_config", "role",
@@ -3461,6 +3465,7 @@ except Exception as exc:
                 timeout=kwargs.get("timeout", 300.0),
                 restart_threshold_pct=kwargs.get("restart_threshold_pct", 80.0),
                 context_nudge_threshold_pct=kwargs.get("context_nudge_threshold_pct", 0.0),
+                restart_tokens_cap=kwargs.get("restart_tokens_cap", 0),
                 auto_restart=kwargs.get("auto_restart", True),
                 parent=kwargs.get("parent", ""),
                 groups=kwargs.get("groups", []),
@@ -3505,7 +3510,7 @@ except Exception as exc:
                    (name, display_name, model, soul, users, boundaries,
                     system_prompt, working_dir,
                     permission_mode, allowed_tools, disallowed_tools, max_turns, timeout,
-                    restart_threshold_pct, context_nudge_threshold_pct, auto_restart, parent, groups,
+                    restart_threshold_pct, context_nudge_threshold_pct, restart_tokens_cap, auto_restart, parent, groups,
                     max_sessions, enabled, registration_finalized, auto_start,
                     heartbeat_interval, plain_text_fallback,
                     wake_interval, clock_aligned, auto_sleep_hours, voice_config, role, isolated,
@@ -3517,13 +3522,14 @@ except Exception as exc:
                     thinking_effort, strict_effort_enforcement, dedicated_config_dir,
                     watchdog_config,
                     created_at, updated_at)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (agent.name, agent.display_name, agent.model, agent.soul,
                  agent.users, agent.boundaries,
                  agent.system_prompt, agent.working_dir, agent.permission_mode,
                  json.dumps(agent.allowed_tools), json.dumps(agent.disallowed_tools),
                  agent.max_turns, agent.timeout,
                  agent.restart_threshold_pct, agent.context_nudge_threshold_pct,
+                 agent.restart_tokens_cap,
                  int(agent.auto_restart),
                  agent.parent, json.dumps(agent.groups), agent.max_sessions,
                  int(agent.enabled), int(not create_only), int(agent.auto_start),
@@ -3592,7 +3598,7 @@ except Exception as exc:
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
-        "isolation_mode, container_image, dedicated_config_dir, codex_home"
+        "isolation_mode, container_image, dedicated_config_dir, codex_home, restart_tokens_cap"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -8598,6 +8604,7 @@ except Exception as exc:
             container_image=row[53] if len(row) > 53 and row[53] else "",
             dedicated_config_dir=bool(row[54]) if len(row) > 54 else False,
             codex_home=row[55] if len(row) > 55 and row[55] else "",
+            restart_tokens_cap=row[56] if len(row) > 56 else 0,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

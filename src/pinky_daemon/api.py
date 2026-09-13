@@ -7141,6 +7141,7 @@ npm run build</pre>
                 allowed_tools=req.allowed_tools,
                 max_turns=req.max_turns,
                 timeout=req.timeout,
+                restart_tokens_cap=req.restart_tokens_cap,
                 max_sessions=req.max_sessions,
                 plain_text_fallback=req.plain_text_fallback,
                 groups=req.groups,

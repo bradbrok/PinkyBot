@@ -307,6 +307,12 @@ class SetDefaultProviderRequest(BaseModel):
 # ── Agent Models ─────────────────────────────────────────────
 
 
+def _validate_restart_tokens_cap(value: object) -> int:
+    if type(value) is not int or (value != 0 and not 50_000 <= value <= 2_000_000):
+        raise ValueError("restart_tokens_cap must be an integer: 0 or 50000 through 2000000")
+    return value
+
+
 class RegisterAgentRequest(BaseModel):
     """Register a named agent."""
 
@@ -331,6 +337,13 @@ class RegisterAgentRequest(BaseModel):
     allowed_tools: list[str] = Field(default_factory=list)
     disallowed_tools: list[str] = Field(default_factory=list)
     max_turns: int = 0
+    restart_tokens_cap: int = 0
+
+    @field_validator("restart_tokens_cap", mode="before")
+    @classmethod
+    def _restart_tokens_cap_valid(cls, value: object) -> int:
+        return _validate_restart_tokens_cap(value)
+
     timeout: float = 300.0
     max_sessions: int = 5
     plain_text_fallback: bool = False
@@ -413,6 +426,13 @@ class UpdateAgentRequest(BaseModel):
     plain_text_fallback: bool | None = None
     restart_threshold_pct: float | None = None
     context_nudge_threshold_pct: float | None = None  # Soft nudge %; 0=use global default (#614)
+    restart_tokens_cap: int | None = None
+
+    @field_validator("restart_tokens_cap", mode="before")
+    @classmethod
+    def _restart_tokens_cap_valid(cls, value: object) -> int:
+        return _validate_restart_tokens_cap(value)
+
     heartbeat_interval: int | None = None  # Seconds between heartbeats (0=disabled → demand-woken)
     wake_interval: int | None = None  # Seconds (0=disabled, 1800=30m, 3600=1h)
     clock_aligned: bool | None = None  # Align to wall clock boundaries
