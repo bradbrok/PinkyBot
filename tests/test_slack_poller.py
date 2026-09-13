@@ -258,7 +258,7 @@ class TestBrokerSlackPoller:
         )
 
     @pytest.mark.asyncio
-    async def test_start_connects_registers_listener_and_acks(self, monkeypatch, mock_broker):
+    async def test_socket_envelope_poll_count(self, monkeypatch, mock_broker):
         """Happy path: start() resolves identity, builds the client, registers the
         listener, connects; the listener ACKs an events_api envelope and routes it."""
         captured = {}
@@ -313,6 +313,8 @@ class TestBrokerSlackPoller:
         assert captured["web_token"] == "xoxb-test"  # AsyncWebClient(token=adapter.bot_token)
         assert len(poller._client.socket_mode_request_listeners) == 1
 
+        assert poller.poll_count == 0  # Connecting does not process an envelope.
+
         # Drive a fake events_api request through the listener -> ACK + _handle_event.
         listener = poller._client.socket_mode_request_listeners[0]
         req = MagicMock()
@@ -327,6 +329,32 @@ class TestBrokerSlackPoller:
         assert len(poller._client.responses) == 1
         assert poller._client.responses[0].envelope_id == "env-123"  # ACKed
         mock_broker.handle_inbound.assert_called_once()
+        assert poller.poll_count == 1
+
+        # Count all envelope types, including filtered events and unsupported
+        # requests, once each. Delivery and ACK success are separate metrics.
+        for count, (req_type, payload) in enumerate([
+            ("events_api", _event({"type": "reaction_added", "user": "U123"})),
+            ("events_api", _event({"type": "message", "user": "UBOT"})),
+            ("interactive", {"type": "block_actions", "actions": []}),
+            ("slash_commands", {}),
+        ], start=2):
+            req = types.SimpleNamespace(
+                type=req_type, envelope_id=f"env-{count}", payload=payload,
+            )
+            await listener(poller._client, req)
+            assert poller.poll_count == count
+        assert len(poller._client.responses) == 5
+        mock_broker.handle_inbound.assert_called_once()
+
+        poller._client.send_socket_mode_response = AsyncMock(side_effect=RuntimeError("ack failed"))
+        await listener(poller._client, types.SimpleNamespace(
+            type="events_api", envelope_id="env-6", payload=_event({"type": "reaction_added"}),
+        ))
+        assert poller.poll_count == 6
+        # Control frames normally bypass this listener and must not count.
+        await listener(poller._client, types.SimpleNamespace(type="hello", envelope_id=None))
+        assert poller.poll_count == 6
 
     # ── Identity resolution (users:read / channels:read) ──────────────
 
