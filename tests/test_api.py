@@ -6059,6 +6059,68 @@ class TestAgentCRUD:
                     if "WARNING" in line and "restart_tokens_cap" in line]
         assert len(warnings) == 1
 
+    @pytest.mark.parametrize("reported_max", ["missing", "967000", True, False, 0, -1, 500_000.0, None])
+    def test_restart_tokens_cap_sdk_health_keeps_valid_window(
+        self, tmp_path, monkeypatch, reported_max
+    ):
+        client = self._make_restart_cap_client(tmp_path)
+        client.app.state.agents.register(
+            "cap-test", working_dir=str(tmp_path / "agent"),
+            model="claude-opus-4-8", restart_tokens_cap=550_000,
+        )
+        ss = self._wake_restart_cap_sdk(client, monkeypatch)
+        bad_report = {"totalTokens": 650_000}
+        if reported_max != "missing":
+            bad_report["maxTokens"] = reported_max
+        ss._client = SimpleNamespace(get_context_usage=AsyncMock(side_effect=[
+            {"totalTokens": 650_000, "maxTokens": 967_000},
+            bad_report,
+            {"totalTokens": 100_000, "maxTokens": 200_000},
+        ]))
+        for handle in ("good-window", "invalid-window"):
+            # A new handle forces a fresh SDK read past the HTTP context cache.
+            ss.resume_handle = handle
+            response = client.get("/agents/cap-test/health")
+            assert response.status_code == 200
+            health = response.json()["session"]
+            assert health["context_used_pct"] == pytest.approx(67.2)
+            assert health["needs_restart"] is True
+            assert ss._effective_restart_threshold_pct() == pytest.approx(
+                550_000 / 967_000 * 100
+            )
+        assert ss._client.get_context_usage.await_count == 2
+        # A later valid report must still replace the previous window.
+        ss.resume_handle = "new-valid-window"
+        response = client.get("/agents/cap-test/health")
+        assert response.status_code == 200
+        assert response.json()["session"]["context_used_pct"] == 50.0
+        assert response.json()["session"]["needs_restart"] is False
+        assert ss._effective_restart_threshold_pct() == 80
+
+    @pytest.mark.parametrize("error", [RuntimeError, TypeError])
+    @pytest.mark.parametrize("total,needs_restart", [(650_000, False), (850_000, True)])
+    def test_restart_tokens_cap_health_threshold_error_falls_back(
+        self, tmp_path, monkeypatch, error, total, needs_restart
+    ):
+        client = self._make_restart_cap_client(tmp_path)
+        client.app.state.agents.register(
+            "cap-test", working_dir=str(tmp_path / "agent"),
+            model="claude-opus-4-8", restart_tokens_cap=550_000,
+        )
+        ss = self._wake_restart_cap_sdk(client, monkeypatch)
+        ss._client = SimpleNamespace(get_context_usage=AsyncMock(return_value={
+            "totalTokens": total, "maxTokens": 967_000,
+        }))
+
+        def broken_threshold():
+            raise error("threshold unavailable")
+
+        monkeypatch.setattr(ss, "_effective_restart_threshold_pct", broken_threshold)
+        response = client.get("/agents/cap-test/health")
+        assert response.status_code == 200
+        assert response.json()["session"]["needs_restart"] is needs_restart
+        assert ss._config.context_restart_pct == 80
+
     def test_restart_tokens_cap_tmux_health_uses_effective_threshold(self, tmp_path, monkeypatch):
         from pinky_daemon.streaming_session import StreamingSessionConfig
         from pinky_daemon.tmux_session import TmuxSession

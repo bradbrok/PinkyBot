@@ -1455,17 +1455,18 @@ async def test_concurrent_attempt_reconnect_coalesces_to_single_cycle() -> None:
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("cap,reported_max,should_restart", [
-    (550_000, 967_000, True), (0, 967_000, False),
-    (550_000, 200_000, False), (100_000, 167_000, True),
+@pytest.mark.parametrize("cap,reported_max,should_restart,warning_pct", [
+    (550_000, 967_000, True, "56.8769"), (0, 967_000, False, "80"),
+    (550_000, 200_000, False, "80"), (100_000, 167_000, True, "59.8802"),
 ])
-async def test_restart_tokens_cap_sdk_force_restart(cap, reported_max, should_restart):
+async def test_restart_tokens_cap_sdk_force_restart(cap, reported_max, should_restart, warning_pct):
     ss = _make_session()
     ss._config.model = "claude-opus-4-8"
     ss._config.restart_tokens_cap = cap
     _stub_ctx(ss, pct=65, max_tokens=reported_max)
     await ss._check_context()
     assert ss.force_restart.await_count == int(should_restart)
+    assert f"before hitting {warning_pct}%" in ss._client.query.await_args.args[0]
     assert ss._config.context_restart_pct == 80
     assert ss._config.context_warn_pct == 40
     assert ss._effective_restart_threshold_pct() == pytest.approx(
