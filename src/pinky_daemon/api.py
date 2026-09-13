@@ -9620,11 +9620,15 @@ npm run build</pre>
     # ── Broker Status ──────────────────────────────────────
 
     def _optional_poller_status(poller: PollerStatus, name: str, default: Any) -> Any:
-        """Default only for absent fields, never a broken status property."""
+        """Default only when the name is not defined on the poller's class.
+
+        A class attribute/property that raises AttributeError propagates. An
+        unset __slots__ field therefore reads as broken, not absent.
+        """
         try:
             return getattr(poller, name)
         except AttributeError:
-            if hasattr(type(poller), name) or name in getattr(poller, "__dict__", {}):
+            if hasattr(type(poller), name):
                 raise
             return default
 
@@ -9658,6 +9662,7 @@ npm run build</pre>
                     "watchdog_fires": _optional_poller_status(p, "watchdog_fires", None),
                     "last_poll_ok_age_s": round(now - last_poll_ok, 1) if last_poll_ok else None,
                 }
+                row = jsonable_encoder(row)
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
                 logging.getLogger(__name__).error(
@@ -9667,6 +9672,7 @@ npm run build</pre>
             rows.append(row)
         try:
             stats = broker.stats
+            stats = jsonable_encoder(stats)
         except Exception as exc:
             error = f"{type(exc).__name__}: {exc}"
             logging.getLogger(__name__).error(
