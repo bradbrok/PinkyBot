@@ -2455,7 +2455,9 @@ class TestRestartTokensCap:
         db_path = tmp_path / "agents.db"
         legacy = AgentRegistry(db_path=str(db_path))
         try:
-            legacy.register("cap-test", working_dir=str(tmp_path / "agent"))
+            legacy.register(
+                "cap-test", display_name="cap-test", working_dir=str(tmp_path / "agent")
+            )
         finally:
             legacy.close()
         with sqlite3.connect(db_path) as db:
