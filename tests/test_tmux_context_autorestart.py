@@ -16,6 +16,7 @@ Mirrors test_tmux_session.py's mock strategy — never shells out to tmux.
 
 from __future__ import annotations
 
+from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -331,3 +332,48 @@ def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
     finally:
         runtime_model_catalog.reset_for_tests()
         registry.close()
+
+
+@pytest.mark.parametrize(
+    "model,cap,pct",
+    [
+        (_MODEL_1M, 0, 80.0),
+        (_MODEL_1M, 550_000, 80.0),
+        (_MODEL_1M, 2_000_000, 65.0),
+        (_MODEL_1M, 550_000, 25.0),
+        (_MODEL_200K, 550_000, 65.0),
+    ],
+)
+def test_restart_tokens_cap_threshold(model, cap, pct, monkeypatch):
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    ss = _make_session(model=model)
+    ss._registry = MagicMock()
+    ss._registry.get.return_value = SimpleNamespace(
+        restart_threshold_pct=pct, restart_tokens_cap=cap
+    )
+    expected_cap = cap or ss._RESTART_TOKENS_CAP_1M
+    assert ss._effective_restart_threshold_pct() == pytest.approx(
+        min(pct, expected_cap / ss._max_tokens_for_model() * 100.0)
+    )
+    ss._registry.get.assert_called_with(ss.agent_name)
+
+
+@pytest.mark.parametrize("failure", ["unwired", "missing", "raises", "cap_read_raises"])
+def test_restart_tokens_cap_registry_fallback(failure, monkeypatch):
+    monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+    ss = _make_session(model=_MODEL_1M)
+    ss._registry = MagicMock()
+    if failure == "unwired":
+        ss._registry = None
+    elif failure == "missing":
+        ss._registry.get.return_value = None
+    elif failure == "raises":
+        ss._registry.get.side_effect = RuntimeError("registry unavailable")
+    else:
+        ss._registry.get.side_effect = [
+            SimpleNamespace(restart_threshold_pct=80.0),
+            RuntimeError("registry unavailable"),
+        ]
+    assert ss._effective_restart_threshold_pct() == pytest.approx(
+        min(80.0, ss._RESTART_TOKENS_CAP_1M / ss._max_tokens_for_model() * 100.0)
+    )

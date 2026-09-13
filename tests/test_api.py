@@ -5932,6 +5932,64 @@ class TestAgentCRUD:
             main_agent_before,
         )
 
+    @staticmethod
+    def _make_restart_cap_client(tmp_path):
+        from pinky_daemon.api import create_api
+
+        app = create_api(
+            max_sessions=10, default_working_dir=str(tmp_path),
+            db_path=str(tmp_path / "test.db"),
+        )
+        return TestClient(app)
+
+    @pytest.mark.parametrize("method", ["post", "put"])
+    @pytest.mark.parametrize(
+        "cap", [-1, 10, "abc", 5_000_000, 49_999, 2_000_001, 550_000.0, "550000", True, None]
+    )
+    def test_restart_tokens_cap_api_rejects_invalid(self, method, cap, tmp_path):
+        client = self._make_restart_cap_client(tmp_path)
+        payload = {"name": "cap-test", "working_dir": str(tmp_path / "agent")}
+        if method == "put":
+            assert client.post("/agents", json=payload).status_code == 200
+            response = client.put("/agents/cap-test", json={"restart_tokens_cap": cap})
+        else:
+            response = client.post("/agents", json={**payload, "restart_tokens_cap": cap})
+        assert response.status_code == 422
+        assert "restart_tokens_cap" in response.text
+        if method == "put":
+            assert client.app.state.agents.get("cap-test").restart_tokens_cap == 0
+        else:
+            assert client.app.state.agents.get("cap-test") is None
+
+    @pytest.mark.parametrize("cap", [0, 50_000, 550_000, 2_000_000])
+    def test_restart_tokens_cap_api_create(self, cap, tmp_path):
+        client = self._make_restart_cap_client(tmp_path)
+        response = client.post("/agents", json={
+            "name": "cap-test", "working_dir": str(tmp_path / "agent"),
+            "restart_tokens_cap": cap,
+        })
+        assert response.status_code == 200
+        assert response.json()["restart_tokens_cap"] == cap
+        assert client.app.state.agents.get("cap-test").restart_tokens_cap == cap
+        assert client.get("/agents/cap-test").json()["restart_tokens_cap"] == cap
+
+    def test_restart_tokens_cap_api_update_and_reset(self, tmp_path):
+        client = self._make_restart_cap_client(tmp_path)
+        response = client.post("/agents", json={
+            "name": "cap-test", "working_dir": str(tmp_path / "agent"),
+        })
+        assert response.status_code == 200
+        assert response.json()["restart_tokens_cap"] == 0
+        for cap in (550_000, 50_000, 2_000_000, 0):
+            response = client.put("/agents/cap-test", json={"restart_tokens_cap": cap})
+            assert response.status_code == 200
+            assert response.json()["restart_tokens_cap"] == cap
+            assert client.app.state.agents.get("cap-test").restart_tokens_cap == cap
+            response = client.put("/agents/cap-test", json={"display_name": "Updated"})
+            assert response.status_code == 200
+            assert response.json()["restart_tokens_cap"] == cap
+            assert client.get("/agents/cap-test").json()["restart_tokens_cap"] == cap
+
     def test_register_agent(self):
         client = self._make_client()
         resp = client.post("/agents", json={
