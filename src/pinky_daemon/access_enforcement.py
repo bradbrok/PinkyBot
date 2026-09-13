@@ -190,9 +190,11 @@ def resolve_allowed_emails(model, section, key, field, admins=None):
     explicit individuals. ``configured`` is True iff at least one non-admin
     member resolved to a usable email. ``misconfigured`` is True iff any
     container or element had a bad shape, a scope named a group that does not
-    exist, or a named member/individual could not be resolved to an email; it is
-    independent of ``configured``. Never raises: a value is used as a dict key
-    only when it is a string. Pass ``admins`` to avoid recomputing it.
+    exist (including a group whose value is null or is not a member list, such as
+    a bare string or object), or a named member/individual could not be resolved
+    to an email; it is independent of ``configured``. Never raises: a value is
+    used as a dict key only when it is a string. Pass ``admins`` to avoid
+    recomputing it.
     """
     if admins is None:
         admins = _admins(model)
