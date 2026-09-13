@@ -3,8 +3,8 @@
 Covers the two halves of the feature:
 
 1. ``_effective_restart_threshold_pct`` — the percentage threshold with
-   the absolute ``_RESTART_TOKENS_CAP_1M`` (400k) ceiling folded in.
-   Bites on 1M-context models (drops 80%→~41%), no-ops on 200k.
+   the per-agent absolute ceiling (default ``_RESTART_TOKENS_CAP_1M``)
+   folded in. Explicit caps can lower the threshold on either window size.
 2. ``_emit_context_usage_event`` — on crossing it must now ALSO drive the
    agent via ``_enqueue_internal_prompt`` (the "dead wire" the SSE-only
    ``restart_nudge`` left disconnected), one-shot per crossing, re-arming
@@ -335,26 +335,24 @@ def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
 
 
 @pytest.mark.parametrize(
-    "model,cap,pct",
+    "model,cap,pct,expected",
     [
-        (_MODEL_1M, 0, 80.0),
-        (_MODEL_1M, 550_000, 80.0),
-        (_MODEL_1M, 2_000_000, 65.0),
-        (_MODEL_1M, 550_000, 25.0),
-        (_MODEL_200K, 550_000, 65.0),
+        (_MODEL_1M, 0, 80.0, 400_000 / (1_000_000 - 33_000) * 100),
+        (_MODEL_1M, 550_000, 80.0, 550_000 / (1_000_000 - 33_000) * 100),
+        (_MODEL_1M, 2_000_000, 65.0, 65.0),
+        (_MODEL_1M, 550_000, 25.0, 25.0),
+        (_MODEL_200K, 550_000, 65.0, 65.0),
+        (_MODEL_200K, 100_000, 80.0, 100_000 / (200_000 - 33_000) * 100),
     ],
 )
-def test_restart_tokens_cap_threshold(model, cap, pct, monkeypatch):
+def test_restart_tokens_cap_threshold(model, cap, pct, expected, monkeypatch):
     monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
     ss = _make_session(model=model)
     ss._registry = MagicMock()
     ss._registry.get.return_value = SimpleNamespace(
         restart_threshold_pct=pct, restart_tokens_cap=cap
     )
-    expected_cap = cap or ss._RESTART_TOKENS_CAP_1M
-    assert ss._effective_restart_threshold_pct() == pytest.approx(
-        min(pct, expected_cap / ss._max_tokens_for_model() * 100.0)
-    )
+    assert ss._effective_restart_threshold_pct() == pytest.approx(expected)
     ss._registry.get.assert_called_with(ss.agent_name)
 
 
@@ -375,5 +373,43 @@ def test_restart_tokens_cap_registry_fallback(failure, monkeypatch):
             RuntimeError("registry unavailable"),
         ]
     assert ss._effective_restart_threshold_pct() == pytest.approx(
-        min(80.0, ss._RESTART_TOKENS_CAP_1M / ss._max_tokens_for_model() * 100.0)
+        400_000 / (1_000_000 - 33_000) * 100
     )
+
+
+@pytest.mark.parametrize("cap", [1, True, False, -5, 10**12, "550000", 550_000.0, None])
+def test_restart_tokens_cap_tmux_invalid_warns_once(cap, capsys):
+    ss = _make_session(model=_MODEL_1M)
+    ss._registry = MagicMock()
+    ss._registry.get.return_value = SimpleNamespace(
+        restart_threshold_pct=80.0, restart_tokens_cap=cap
+    )
+    for _ in range(3):
+        assert ss._effective_restart_threshold_pct() == pytest.approx(
+            400_000 / (1_000_000 - 33_000) * 100
+        )
+    warnings = [line for line in capsys.readouterr().err.splitlines()
+                if "WARNING" in line and "restart_tokens_cap" in line]
+    assert len(warnings) == 1
+
+
+def test_restart_tokens_cap_tmux_corrupt_row(tmp_path, capsys):
+    from pinky_daemon.agent_registry import AgentRegistry
+
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    try:
+        registry.register("cap-test", working_dir=str(tmp_path / "agent"))
+        registry._db.execute("UPDATE agents SET restart_tokens_cap=1 WHERE name='cap-test'")
+        registry._db.commit()
+        ss = _make_session(model=_MODEL_1M)
+        ss._config.agent_name = "cap-test"
+        ss._registry = registry
+        for _ in range(3):
+            assert ss._effective_restart_threshold_pct() == pytest.approx(
+                400_000 / (1_000_000 - 33_000) * 100
+            )
+        warnings = [line for line in capsys.readouterr().err.splitlines()
+                    if "WARNING" in line and "restart_tokens_cap" in line]
+        assert len(warnings) == 1
+    finally:
+        registry.close()

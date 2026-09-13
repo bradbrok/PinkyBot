@@ -5944,7 +5944,7 @@ class TestAgentCRUD:
 
     @pytest.mark.parametrize("method", ["post", "put"])
     @pytest.mark.parametrize(
-        "cap", [-1, 10, "abc", 5_000_000, 49_999, 2_000_001, 550_000.0, "550000", True, None]
+        "cap", [-1, 10, "abc", 5_000_000, 49_999, 2_000_001, 550_000.0, "550000", True]
     )
     def test_restart_tokens_cap_api_rejects_invalid(self, method, cap, tmp_path):
         client = self._make_restart_cap_client(tmp_path)
@@ -5972,6 +5972,113 @@ class TestAgentCRUD:
         assert response.json()["restart_tokens_cap"] == cap
         assert client.app.state.agents.get("cap-test").restart_tokens_cap == cap
         assert client.get("/agents/cap-test").json()["restart_tokens_cap"] == cap
+
+    def test_restart_tokens_cap_api_create_rejects_null(self, tmp_path):
+        client = self._make_restart_cap_client(tmp_path)
+        response = client.post("/agents", json={
+            "name": "cap-test", "working_dir": str(tmp_path / "agent"),
+            "restart_tokens_cap": None,
+        })
+        assert response.status_code == 422
+        assert "restart_tokens_cap" in response.text
+        assert client.app.state.agents.get("cap-test") is None
+
+    def test_restart_tokens_cap_api_null_update_is_unchanged(self, tmp_path):
+        client = self._make_restart_cap_client(tmp_path)
+        client.app.state.agents.register(
+            "cap-test", working_dir=str(tmp_path / "agent"), restart_tokens_cap=550_000
+        )
+        response = client.put("/agents/cap-test", json={"restart_tokens_cap": None})
+        assert response.status_code == 200
+        assert response.json()["restart_tokens_cap"] == 550_000
+        assert client.app.state.agents.get("cap-test").restart_tokens_cap == 550_000
+        assert client.get("/agents/cap-test").json()["restart_tokens_cap"] == 550_000
+
+    @staticmethod
+    def _wake_restart_cap_sdk(client, monkeypatch):
+        from pinky_daemon.streaming_session import StreamingSession
+        from pinky_daemon.transport_state import SessionState
+
+        async def connect(session):
+            session._state_machine._state = SessionState.CONNECTED
+            session.resume_handle = "cap-test-sdk"
+
+        monkeypatch.setattr(StreamingSession, "connect", connect)
+        monkeypatch.setattr(StreamingSession, "send", AsyncMock(return_value=True))
+        response = client.post("/agents/cap-test/wake?prompt=Test")
+        assert response.status_code == 200
+        return client.app.state.broker._streaming["cap-test"]["main"]
+
+    @pytest.mark.parametrize("model,cap,reported_max,initial,expected", [
+        ("claude-opus-4-8", 550_000, 967_000, 55.0, 550_000 / 967_000 * 100),
+        ("claude-opus-4-8", 0, 967_000, 80.0, 80.0),
+        ("claude-haiku-4-5", 550_000, 167_000, 80.0, 80.0),
+        ("claude-haiku-4-5", 100_000, 167_000, 50.0, 100_000 / 167_000 * 100),
+        ("claude-opus-4-8", 550_000, 200_000, 55.0, 80.0),
+    ])
+    def test_restart_tokens_cap_sdk_config_and_health(
+        self, tmp_path, monkeypatch, model, cap, reported_max, initial, expected
+    ):
+        client = self._make_restart_cap_client(tmp_path)
+        client.app.state.agents.register(
+            "cap-test", working_dir=str(tmp_path / "agent"), model=model,
+            transport="sdk", restart_tokens_cap=cap,
+        )
+        ss = self._wake_restart_cap_sdk(client, monkeypatch)
+        assert ss._config.restart_tokens_cap == cap
+        assert ss._config.context_restart_pct == 80
+        assert ss._config.context_warn_pct == 40
+        assert ss._effective_restart_threshold_pct() == pytest.approx(initial)
+        ss._client = SimpleNamespace(get_context_usage=AsyncMock(return_value={
+            "totalTokens": int(reported_max * 0.65), "maxTokens": reported_max,
+        }))
+        response = client.get("/agents/cap-test/health")
+        assert response.status_code == 200
+        health = response.json()["session"]
+        assert health["context_used_pct"] == pytest.approx(65.0)
+        assert health["needs_restart"] is (65.0 >= expected)
+        assert ss._effective_restart_threshold_pct() == pytest.approx(expected)
+        assert ss._config.context_restart_pct == 80
+        assert ss._config.context_warn_pct == 40
+
+    def test_restart_tokens_cap_sdk_corrupt_row_warns_once(self, tmp_path, monkeypatch, capsys):
+        client = self._make_restart_cap_client(tmp_path)
+        registry = client.app.state.agents
+        registry.register(
+            "cap-test", working_dir=str(tmp_path / "agent"), model="claude-opus-4-8"
+        )
+        registry._db.execute("UPDATE agents SET restart_tokens_cap=1 WHERE name='cap-test'")
+        registry._db.commit()
+        ss = self._wake_restart_cap_sdk(client, monkeypatch)
+        for _ in range(3):
+            assert ss._effective_restart_threshold_pct() == 80
+        warnings = [line for line in capsys.readouterr().err.splitlines()
+                    if "WARNING" in line and "restart_tokens_cap" in line]
+        assert len(warnings) == 1
+
+    def test_restart_tokens_cap_tmux_health_uses_effective_threshold(self, tmp_path, monkeypatch):
+        from pinky_daemon.streaming_session import StreamingSessionConfig
+        from pinky_daemon.tmux_session import TmuxSession
+        from pinky_daemon.transport_state import SessionState
+
+        monkeypatch.delenv("CLAUDE_AUTOCOMPACT_PCT_OVERRIDE", raising=False)
+        client = self._make_restart_cap_client(tmp_path)
+        registry = client.app.state.agents
+        registry.register(
+            "cap-test", working_dir=str(tmp_path / "agent"),
+            model="claude-haiku-4-5", restart_tokens_cap=100_000,
+        )
+        ss = TmuxSession(StreamingSessionConfig(
+            agent_name="cap-test", model="claude-haiku-4-5", context_restart_pct=80,
+        ), registry=registry)
+        ss._state_machine._state = SessionState.CONNECTED
+        ss.usage.last_usage = {"input_tokens": 110_000}
+        client.app.state.broker.register_streaming("cap-test", ss, label="main")
+        response = client.get("/agents/cap-test/health")
+        assert response.status_code == 200
+        health = response.json()["session"]
+        assert 100_000 / 167_000 * 100 < health["context_used_pct"] < 80
+        assert health["needs_restart"] is True
 
     def test_restart_tokens_cap_api_update_and_reset(self, tmp_path):
         client = self._make_restart_cap_client(tmp_path)

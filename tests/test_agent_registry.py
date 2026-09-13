@@ -2477,3 +2477,20 @@ class TestRestartTokensCap:
             assert upgraded.get("cap-test").display_name == "cap-test"
         finally:
             upgraded.close()
+
+
+    @pytest.mark.parametrize("method", ["register", "reregister", "update"])
+    @pytest.mark.parametrize("cap", [1, True, -5, 10**12, 550_000.0, "550000", None])
+    def test_restart_tokens_cap_rejects_invalid_writes(self, registry, tmp_path, method, cap):
+        work_dir = tmp_path / "agent"
+        if method != "register":
+            registry.register("cap-test", working_dir=str(work_dir), restart_tokens_cap=550_000)
+        writer = registry.update if method == "update" else registry.register
+        with pytest.raises(ValueError, match="restart_tokens_cap"):
+            writer("cap-test", restart_tokens_cap=cap, display_name="Must not persist")
+        if method == "register":
+            assert registry.get("cap-test") is None
+        else:
+            agent = registry.get("cap-test")
+            assert agent.restart_tokens_cap == 550_000
+            assert agent.display_name == ""
