@@ -3094,6 +3094,8 @@ def create_api(
         else:
             model = provider_model or agent.model
         effort = agent.thinking_effort or "medium"
+        if ss._config.model != model:
+            ss._reported_context_max_tokens = 0
         ss._config.model = model
         ss._config.provider_url = provider_url
         ss._config.provider_key = provider_key
@@ -3806,7 +3808,8 @@ def create_api(
                 effective_threshold() if callable(effective_threshold)
                 else ss._config.context_restart_pct
             )
-        except Exception:
+        except Exception as exc:
+            _log(f"api: effective restart threshold unavailable for {agent_name}: {type(exc).__name__}")
             restart_pct = ss._config.context_restart_pct
         return {
             "id": f"{agent_name}-{label}",

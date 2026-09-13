@@ -527,7 +527,7 @@ class Agent:
     # at a natural break. 0.0 = use the global default. Must sit below
     # restart_threshold_pct (the hard safety net).
     context_nudge_threshold_pct: float = 0.0
-    restart_tokens_cap: int = 0  # Unset uses the default absolute restart ceiling.
+    restart_tokens_cap: int = 0  # Unset keeps the transport default (tmux: 400k absolute ceiling; SDK: percentage only).
     auto_restart: bool = True
     parent: str = ""  # Parent agent name (for hierarchy)
     groups: list[str] = field(default_factory=list)
