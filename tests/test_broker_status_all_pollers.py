@@ -105,15 +105,24 @@ def test_discovery_includes_future_poller(module, monkeypatch):
     } <= {cls.__name__ for cls in discovered}
 
 
-@pytest.mark.parametrize("broken_field", ["poll_count", "agent_name", "last_poll_ok"])
-def test_broker_status_degrades_one_row(status_client, caplog, broken_field):
+@pytest.mark.parametrize("broken_field, error_type", [
+    ("poll_count", RuntimeError),
+    ("agent_name", RuntimeError),
+    ("last_poll_ok", RuntimeError),
+    ("connect_attempts", AttributeError),
+    ("inbound_stalled_s", AttributeError),
+    ("stall_alerted", AttributeError),
+    ("watchdog_fires", AttributeError),
+    ("last_poll_ok", AttributeError),
+])
+def test_broker_status_degrades_one_row(status_client, caplog, broken_field, error_type):
     class BrokenPoller:
         agent_name = "broken-test"
         poll_count = 0
         is_running = False
 
         def fail(self):
-            raise RuntimeError("status unavailable")
+            raise error_type("status unavailable")
 
     setattr(BrokenPoller, broken_field, property(BrokenPoller.fail))
     client, active = status_client
@@ -127,7 +136,7 @@ def test_broker_status_degrades_one_row(status_client, caplog, broken_field):
     assert len(rows) == 3
     assert rows[1] == {
         "agent": "?" if broken_field == "agent_name" else "broken-test",
-        "error": "RuntimeError: status unavailable",
+        "error": f"{error_type.__name__}: status unavailable",
     }
     for row, sibling in ((rows[0], before), (rows[2], after)):
         assert "error" not in row
@@ -137,6 +146,104 @@ def test_broker_status_degrades_one_row(status_client, caplog, broken_field):
     assert any(
         record.levelno == logging.ERROR
         and "BrokenPoller" in record.getMessage()
-        and "RuntimeError: status unavailable" in record.getMessage()
+        and f"{error_type.__name__}: status unavailable" in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("storage", ["class", "instance"])
+def test_broker_status_preserves_optional_telemetry(status_client, storage):
+    class HealthyPoller:
+        agent_name = "healthy-test"
+        poll_count = 2
+        is_running = True
+
+    client, active = status_client
+    poller = HealthyPoller()
+    telemetry = {
+        "connect_attempts": 3,
+        "inbound_stalled_s": 12.5,
+        "stall_alerted": True,
+        "watchdog_fires": 2,
+        "last_poll_ok": 1.0,
+    }
+    target = HealthyPoller if storage == "class" else poller
+    for field, value in telemetry.items():
+        setattr(target, field, value)
+    active.append(poller)
+    response = client.get("/broker/status")
+    assert response.status_code == 200, response.text
+    row, = response.json()["active_pollers"]
+    assert "error" not in row
+    for field in telemetry.keys() - {"last_poll_ok"}:
+        assert row[field] == telemetry[field]
+    assert isinstance(row["last_poll_ok_age_s"], float)
+    assert row["last_poll_ok_age_s"] > 0
+
+
+@pytest.mark.parametrize("broken_field, value", [
+    pytest.param("agent_name", object(), id="agent_name-object"),
+    pytest.param("poll_count", object(), id="poll_count-object"),
+    pytest.param("poll_count", "5", id="poll_count-str"),
+    pytest.param("poll_count", True, id="poll_count-bool"),
+    pytest.param("is_running", 1, id="is_running-int"),
+])
+def test_broker_status_rejects_invalid_types(status_client, caplog, broken_field, value):
+    class BrokenPoller:
+        agent_name = "broken-test"
+        poll_count = 0
+        is_running = False
+
+    setattr(BrokenPoller, broken_field, value)
+    client, active = status_client
+    active.extend([
+        BrokenPoller(),
+        SimpleNamespace(agent_name="healthy-test", poll_count=3, is_running=True),
+    ])
+    with caplog.at_level(logging.ERROR):
+        response = client.get("/broker/status")
+    assert response.status_code == 200, response.text
+    broken, healthy = response.json()["active_pollers"]
+    assert set(broken) == {"agent", "error"}
+    assert broken["agent"] == ("?" if broken_field == "agent_name" else "broken-test")
+    assert broken["error"].startswith("TypeError:")
+    assert broken_field in broken["error"]
+    assert type(value).__name__ in broken["error"]
+    assert healthy["agent"] == "healthy-test"
+    assert healthy["polls"] == 3
+    assert healthy["running"] is True
+    assert any(
+        record.levelno == logging.ERROR
+        and "BrokenPoller" in record.getMessage()
+        and broken["error"] in record.getMessage()
+        for record in caplog.records
+    )
+
+
+@pytest.mark.parametrize("error_type", [RuntimeError, AttributeError])
+def test_broker_status_degrades_stats(status_client, monkeypatch, caplog, error_type):
+    client, active = status_client
+    broker = client.app.state.broker
+    active.append(SimpleNamespace(agent_name="healthy-test", poll_count=5, is_running=True))
+
+    def fail(self):
+        raise error_type("stats unavailable")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(type(broker), "stats", property(fail))
+        with caplog.at_level(logging.ERROR):
+            response = client.get("/broker/status")
+    assert response.status_code == 200, response.text
+    payload = response.json()
+    assert payload["stats"] == {"error": f"{error_type.__name__}: stats unavailable"}
+    row, = payload["active_pollers"]
+    assert "error" not in row
+    assert row["agent"] == "healthy-test"
+    assert row["polls"] == 5
+    assert row["running"] is True
+    assert any(
+        record.levelno == logging.ERROR
+        and "stats" in record.getMessage()
+        and payload["stats"]["error"] in record.getMessage()
         for record in caplog.records
     )
