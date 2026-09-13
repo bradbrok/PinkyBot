@@ -740,15 +740,29 @@ def test_key_length_boundaries(model, n, expect_malformed):
 def test_null_valued_group_reads_like_missing_group():
     m = {
         "admins": [],
-        "departments": {"NullGroup": None},
+        "departments": {"NullGroup": None, "StrGroup": "support1@example.com"},
         "access": {
             "nullg": {"use": {"scopes": ["NullGroup"], "individuals": []}},
             "missg": {"use": {"scopes": ["NopeNotThere"], "individuals": []}},
+            # A group whose value is a bare string (not a member list) must read
+            # like a missing group too: it must never be iterated character by
+            # character into single-letter "emails" that could grant.
+            "strg": {"use": {"scopes": ["StrGroup"], "individuals": []}},
         },
     }
     r_null = is_tool_allowed(m, "someone@example.com", "nullg").reason
     r_miss = is_tool_allowed(m, "someone@example.com", "missg").reason
+    r_str = is_tool_allowed(m, "someone@example.com", "strg").reason
     # Same classification (the reasons differ only by their distinct key segment).
     assert r_null.endswith(":misconfigured")
     assert r_miss.endswith(":misconfigured")
-    assert r_null.split("/", 1)[0] == r_miss.split("/", 1)[0] == "denied:access"
+    assert r_str.endswith(":misconfigured")
+    assert (
+        r_null.split("/", 1)[0]
+        == r_miss.split("/", 1)[0]
+        == r_str.split("/", 1)[0]
+        == "denied:access"
+    )
+    # And the bare-string group grants no one: even a substring of it is denied.
+    assert is_tool_allowed(m, "s", "strg").allow is False
+    assert groups_for_email(m, "support1@example.com") == []
