@@ -6894,6 +6894,7 @@ npm run build</pre>
         ".claude/hook_working.py",
         ".claude/hook_idle.py",
         ".claude/hook_verify_effort.py",
+        ".claude/hook_tool_policy.py",
         ".claude/hook_tmux_wake.py",
         ".claude/hook_tmux_session_start.py",
         ".claude/hook_tmux_pre_tool.py",

@@ -406,7 +406,7 @@ def test_serving_endpoint_adds_exact_runtime_and_corruption_keys_but_starts_idle
         "busy_streak": 3,
         "lock_wait_upper_bound_ms": 250,
     }
-    assert len(runtime["stores"]) == 24
+    assert len(runtime["stores"]) == 25
     assert set(runtime["stores"]) == set(api_module._derive_api_store_manifest(base))
 
     cohort_ids = set()
@@ -433,7 +433,7 @@ def test_serving_endpoint_adds_exact_runtime_and_corruption_keys_but_starts_idle
         assert isinstance(depth["cohort_id"], str) and depth["cohort_id"]
         cohort_ids.add(depth["cohort_id"])
 
-    assert len(cohort_ids) == 22
+    assert len(cohort_ids) == 23
     assert (
         runtime["stores"]["sessions"]["writer_queue_depth"]
         == runtime["stores"]["session_events"]["writer_queue_depth"]
@@ -824,14 +824,15 @@ def test_snapshot_destination_quick_check_failure_is_counted_live_without_json(
     assert list(tmp_path.rglob("*.json")) == []
 
 
-# H: Lane A policy/retry behavior and the 24-name manifest remain exact.
+# H: Lane A policy/retry behavior and the 25-name manifest remain exact.
 def test_manifest_cardinality_alias_origin_and_connection_policy_are_unchanged(
     tmp_path: Path,
 ) -> None:
     fleet = derive_fleet_store_manifest(tmp_path / "conversations.db")
     tenant = derive_standalone_tenant_store_manifest(tmp_path / "tenant-keys.db")
 
-    assert len(fleet) == 24
+    assert fleet["tool_policy"].criticality == "authority"
+    assert len(fleet) == 25
     assert set(fleet).intersection(tenant) == {"agent_signing_keys"}
     assert fleet["agents"].path == fleet["agent_signing_keys"].path
     assert fleet["sessions"].path == fleet["session_events"].path
@@ -841,7 +842,7 @@ def test_manifest_cardinality_alias_origin_and_connection_policy_are_unchanged(
         )
         for timeout_ms in (5_000, 30_000)
     }
-    assert timeout_counts == {5_000: 9, 30_000: 15}
+    assert timeout_counts == {5_000: 10, 30_000: 15}
     assert {target.connection_policy.rollback_retries for target in fleet.values()} == {6}
     assert {target.connection_policy.rollback_retry_delay_seconds for target in fleet.values()} == {
         0.2
