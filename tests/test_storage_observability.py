@@ -103,7 +103,8 @@ def test_admin_watchdog_exposes_bounded_boot_preflight_inventory_and_reconcile_m
     data_root = tmp_path / "data"
     base = data_root / "conversations.db"
     manifest_names = _manifest_names(base)
-    assert len(manifest_names) == 24
+    assert "tool_policy" in manifest_names
+    assert len(manifest_names) == 25
 
     app = api_module.create_api(
         max_sessions=10,
@@ -134,13 +135,13 @@ def test_admin_watchdog_exposes_bounded_boot_preflight_inventory_and_reconcile_m
     assert storage["reconcile_warning_count"] == expected_warning_count
 
     # The preflight runs before constructors: a brand-new data root is absent,
-    # then constructors create all 24 logical / 22 physical stores.
+    # then constructors create all 25 logical / 23 physical stores.
     assert storage["preflight"] == {
         logical_name: "skipped-absent" for logical_name in manifest_names
     }
     inventory = storage["inventory"]
-    assert inventory["logical_count"] == 24
-    assert inventory["physical_count"] == 22
+    assert inventory["logical_count"] == 25
+    assert inventory["physical_count"] == 23
     assert set(inventory["stores"]) == manifest_names
     assert {details["criticality"] for details in inventory["stores"].values()} == {
         "delivery",

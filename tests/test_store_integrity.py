@@ -618,6 +618,7 @@ def test_manifest_preserves_every_legacy_inline_path_byte_for_byte(tmp_path: Pat
         "librarian_state": base.replace(".db", "_librarian_state.db"),
         "voice": os.fspath(data_dir / "voice_calls.db"),
         "user_profiles": os.fspath(data_dir / "user_profiles.db"),
+        "tool_policy": os.fspath(data_dir / "tool_policy.db"),
     }
 
     assert set(manifest) == set(expected)

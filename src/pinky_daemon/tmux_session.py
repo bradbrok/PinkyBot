@@ -4368,6 +4368,19 @@ class TmuxSession(TransportReplacementMixin):
         # the runtime $CLAUDE_EFFORT, which reports xhigh under ultracode — so
         # expect xhigh, not the literal "ultracode", to avoid false drift.
         effort = resolve_cli_effort(self.effective_effort)
+        policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
+        try:
+            policy_agent = self._registry.get(self.agent_name) if self._registry and self.agent_name else None
+            policy_flag = getattr(policy_agent, "tool_policy_enabled", None)
+            if policy_flag is False:
+                policy_mode = "off"
+            elif policy_flag is not True:
+                raise ValueError("agent policy flag is unknown")
+        except Exception as exc:
+            # A cache miss must consult server authority instead of disarming.
+            _log(f"WARNING tool policy flag lookup failed for {self.agent_name}: {exc}; "
+                 f"exporting armed, server-authoritative (configured mode={policy_mode})")
+        env["PINKY_TOOL_POLICY"] = policy_mode
         if effort:
             env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:

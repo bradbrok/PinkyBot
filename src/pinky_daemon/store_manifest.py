@@ -59,6 +59,9 @@ def derive_fleet_store_manifest(
             criticality="authority",
             journal_mode="truncate",
         ),
+        "tool_policy": _store(
+            "tool_policy", str(data_dir / "tool_policy.db"), criticality="authority"
+        ),
         "audit": _store("audit", base.replace(".db", "_audit.db"), criticality="memory"),
         "agent_comms": _store(
             "agent_comms", base.replace(".db", "_agent_comms.db"), criticality="delivery"

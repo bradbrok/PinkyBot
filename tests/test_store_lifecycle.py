@@ -26,6 +26,7 @@ _EXPECTED_CRITICALITY = {
     "analytics": "telemetry",
     "agents": "delivery",
     "agent_signing_keys": "authority",
+    "tool_policy": "authority",
     "audit": "memory",
     "agent_comms": "delivery",
     "activity": "telemetry",

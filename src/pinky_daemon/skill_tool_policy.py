@@ -66,15 +66,8 @@ def split_tool_pattern_scalar(value: str) -> list[str]:
     return patterns
 
 
-def classify_tool_pattern(
-    pattern: str,
-    *,
-    skill_name: str,
-    mcp_server_config: Mapping[str, Any] | None,
-    skill_type: str,
-) -> ToolPatternClassification:
-    """Validate and classify one skill-contributed tool allowlist pattern."""
-
+def parse_tool_pattern(pattern: str) -> tuple[str, str | None]:
+    """Validate the shared exact/glob/argument pattern grammar."""
     if not isinstance(pattern, str) or not pattern or pattern != pattern.strip():
         raise ToolPatternValidationError(f"invalid tool pattern: {pattern!r}")
     if any(ord(char) < 32 or ord(char) == 0x7F for char in pattern):
@@ -84,7 +77,19 @@ def classify_tool_pattern(
     if match is None:
         raise ToolPatternValidationError(f"invalid tool pattern: {pattern!r}")
 
-    tool_name = match.group(1)
+    return match.group(1), match.group(2)
+
+
+def classify_tool_pattern(
+    pattern: str,
+    *,
+    skill_name: str,
+    mcp_server_config: Mapping[str, Any] | None,
+    skill_type: str,
+) -> ToolPatternClassification:
+    """Validate and classify one skill-contributed tool allowlist pattern."""
+
+    tool_name, _argument = parse_tool_pattern(pattern)
     privileged = not _is_baseline_or_own_tool(
         tool_name,
         skill_name=skill_name,
