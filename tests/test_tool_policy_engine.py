@@ -350,6 +350,9 @@ def test_reason_code_vocabulary_covers_all_default_rules():
 def _package_source(package, filename):
     spec = importlib.util.find_spec(package)
     assert spec is not None and spec.origin, f"cannot resolve installed package {package}"
+    daemon = importlib.util.find_spec("pinky_daemon")
+    assert daemon is not None and daemon.origin
+    assert Path(spec.origin).resolve().parent.parent == Path(daemon.origin).resolve().parent.parent
     return Path(spec.origin).parent / filename
 
 
@@ -446,7 +449,7 @@ def _handler_effects(handler, tree, store_tree=None):
                 if not call.args or not isinstance(call.args[0], ast.Constant) or (
                     call.args[0].value != "GET"
                 ):
-                    effects.append(location + " daemon mutation")
+                    effects.append(("daemon_mutation", location))
                 def is_path(value, seen_names=frozenset()):
                     if isinstance(value, ast.Name) and value.id not in seen_names:
                         sources = bindings.get(value.id, [])
@@ -463,34 +466,34 @@ def _handler_effects(handler, tree, store_tree=None):
                     return False
 
                 if len(call.args) < 2 or not is_path(call.args[1]):
-                    effects.append(location + " non-path daemon destination")
+                    effects.append(("daemon_destination", location))
                 if call.keywords or len(call.args) > 2:
-                    effects.append(location + " unexpected daemon arguments")
+                    effects.append(("daemon_arguments", location))
                 continue
             if name.startswith(_WRITE_PREFIXES) or name in {
                 "execute_write", "system", "popen", "Popen", "run", "exec", "eval",
                 "update", "create", "delete", "save", "insert", "log",
             }:
-                effects.append(location + " write/process verb")
+                effects.append(("write_verb", location))
             if re.search(r"(?:urllib|httpx|requests|openai|socket|http\.client)(?:\.|$)", expanded):
                 # urllib.parse formats query strings locally; it is not a client.
                 if not expanded.startswith("urllib.parse."):
-                    effects.append(location + " network client")
+                    effects.append(("network_client", location))
             if name in {"urlopen", "request", "post", "put", "patch", "delete", "connect"} or (
                 any(part in expanded.lower() for part in ("client.", "embeddings.", "embedder."))
             ):
-                effects.append(location + " network/client path")
+                effects.append(("network_client", location))
             if name in {"open", "fdopen"}:
                 mode = next((k.value for k in call.keywords if k.arg == "mode"),
                             call.args[1] if len(call.args) > 1 else ast.Constant("r"))
                 if not isinstance(mode, ast.Constant) or mode.value not in {"r", "rb", "rt"}:
-                    effects.append(location + " writable file")
+                    effects.append(("file_write", location))
             if name in {"execute", "executemany"}:
                 sql = " ".join(strings(call.args[0])) if call.args else ""
                 if not sql.lstrip().upper().startswith("SELECT") or re.search(
                     r"\b(?:UPDATE|INSERT|DELETE|REPLACE|CREATE|ALTER|DROP|ATTACH)\b", sql, re.I
                 ):
-                    effects.append(location + " SQL write/unresolved SQL")
+                    effects.append(("sql_write", location))
             if isinstance(call.func, ast.Name) and name in functions and name != "_get_store":
                 visit(functions[name], (*chain, name))
             elif isinstance(call.func, ast.Attribute) and name in methods:
@@ -534,42 +537,45 @@ def test_every_static_mcp_handler_has_no_unexcepted_effects():
         store_path = _package_source(package, "store.py")
         store_tree = ast.parse(store_path.read_text()) if store_path.exists() else None
         effects = _handler_effects(handlers[name], tree, store_tree)
-        if tool not in api.STATIC_ALLOW_EXCEPTIONS:
+        if tool in api.STATIC_ALLOW_EXCEPTIONS:
+            assert effects, f"{tool}: effect traversal became vacuous"
+            assert {kind for kind, _ in effects} <= {"write_verb", "sql_write", "network_client"}
+        else:
             assert effects == [], f"{tool}: {effects}"
 
 
-@pytest.mark.parametrize("sink", [
-    'Path("file").write_text("payload")',
-    'open("file", "w")',
-    'db.execute("UPDATE rows SET value=1")',
-    '_api("POST", "/tasks", {})',
-    'urllib.request.urlopen("https://example.test")',
-    'httpx.get("https://example.test")',
-    'requests.get("https://example.test")',
-    'client.embeddings.create(input="payload")',
-    'store.reflect("payload")',
-    '_api("GET", url)',
-    '_api("GET", "https://example.test/path")',
-    '_api("GET", "//example.test/path")',
-    '_api(method, "/tasks")',
+@pytest.mark.parametrize("sink,expected", [
+    ('Path("file").write_text("payload")', {"write_verb"}),
+    ('open("file", "w")', {"file_write"}),
+    ('db.execute("UPDATE rows SET value=1")', {"sql_write"}),
+    ('_api("POST", "/tasks", {})', {"daemon_mutation", "daemon_arguments"}),
+    ('urllib.request.urlopen("https://example.test")', {"network_client"}),
+    ('httpx.get("https://example.test")', {"network_client"}),
+    ('requests.get("https://example.test")', {"network_client"}),
+    ('client.embeddings.create(input="payload")', {"write_verb", "network_client"}),
+    ('store.reflect("payload")', {"write_verb"}),
+    ('_api("GET", url)', {"daemon_destination"}),
+    ('_api("GET", "https://example.test/path")', {"daemon_destination"}),
+    ('_api("GET", "//example.test/path")', {"daemon_destination"}),
+    ('_api(method, "/tasks")', {"daemon_mutation"}),
 ])
 @pytest.mark.parametrize("indirect", [False, True])
-def test_static_effect_audit_detects_injected_writes_and_clients(sink, indirect):
+def test_static_effect_audit_detects_injected_writes_and_clients(sink, expected, indirect):
     # No engine import: these controls must pass even on a feature-absent RED head.
     body = f"def helper():\n    {sink}\n\ndef read_tool():\n    helper()\n" if indirect else (
         f"def read_tool():\n    {sink}\n"
     )
     tree = ast.parse(body)
     handler = next(n for n in tree.body if n.name == "read_tool")
-    assert _handler_effects(handler, tree), sink
+    assert {kind for kind, _ in _handler_effects(handler, tree)} == expected, sink
 
 
 def test_static_effect_audit_follows_store_methods_and_import_aliases():
     tree = ast.parse("def read_tool():\n    s.read_records()\n")
     store = ast.parse('def read_records(self):\n    self._conn.execute("DELETE FROM rows")\n')
-    assert _handler_effects(tree.body[0], tree, store)
+    assert {kind for kind, _ in _handler_effects(tree.body[0], tree, store)} == {"sql_write"}
     tree = ast.parse('from urllib.request import urlopen as fetch\ndef read_tool():\n    fetch(url)\n')
-    assert _handler_effects(tree.body[1], tree)
+    assert {kind for kind, _ in _handler_effects(tree.body[1], tree)} == {"network_client"}
 
 
 def test_daemon_read_adapter_uses_configured_base_and_accepts_only_path_arguments():
@@ -630,19 +636,24 @@ def _expected_static_tools():
 
 def test_static_audit_controls_cover_existing_handlers_without_engine():
     for tool in sorted(_expected_static_tools()):
-        if not tool.startswith("mcp__") or tool in STATIC_EXCEPTIONS:
+        if not tool.startswith("mcp__"):
             continue
         _, namespace, name = tool.split("__", 2)
         package = namespace.replace("-", "_")
         tree, handlers = _registered_handlers(package)
         store_path = _package_source(package, "store.py")
         store_tree = ast.parse(store_path.read_text()) if store_path.exists() else None
-        assert _handler_effects(handlers[name], tree, store_tree) == [], tool
+        effects = _handler_effects(handlers[name], tree, store_tree)
+        if tool in STATIC_EXCEPTIONS:
+            assert effects, f"{tool}: effect traversal became vacuous"
+            assert {kind for kind, _ in effects} <= {"write_verb", "sql_write", "network_client"}
+        else:
+            assert effects == [], tool
 
 
 def test_static_effect_audit_tracks_assigned_store_and_path_branches():
     tree = ast.parse("def read_tool():\n    db = _get_store()\n    db.read_records()\n")
     store = ast.parse('def read_records(self):\n    self._conn.execute("UPDATE rows SET value=1")\n')
-    assert _handler_effects(tree.body[0], tree, store)
+    assert {kind for kind, _ in _handler_effects(tree.body[0], tree, store)} == {"sql_write"}
     tree = ast.parse('def read_tool(url):\n    path = "/tasks" if safe else url\n    _api("GET", path)\n')
-    assert _handler_effects(tree.body[0], tree)
+    assert {kind for kind, _ in _handler_effects(tree.body[0], tree)} == {"daemon_destination"}

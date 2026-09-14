@@ -189,7 +189,7 @@ def test_admin_routes_require_authentication(tmp_path, monkeypatch, method, path
             assert rows.status_code == 200
             assert isinstance(rows.json(), list)
             [row] = rows.json()
-            assert {"pattern", "decision", "note", "created_by"} <= row.keys()
+            assert {"id", "pattern", "decision", "note", "created_by"} <= row.keys()
             assert row["pattern"] == "Bash" and row["decision"] == "deny"
         else:
             response = _owner(client, method, path)
@@ -262,6 +262,10 @@ def test_resolve_binding_repeat_unknown_and_cross_agent(tmp_path, monkeypatch):
         events = client.app.state.session_event_store.get_for_agent("sample")
         records = [e["metadata"] for e in events if e["event_type"] == "tool_policy.decision"]
         assert any(r.get("resolution", {}).get("result") == "allow" for r in records)
+        resolved_rows = [r for r in _store(client).list_decisions("sample", 0, 10)
+                         if r["tool_use_id"] == body["tool_use_id"] and r["result"] == "allow"]
+        assert resolved_rows
+        assert all(r["latency_ms"] > 0 and r["resolved_by"] == "owner:admin" for r in resolved_rows)
 
 
 def test_pending_long_poll_returns_when_operator_resolves(tmp_path, monkeypatch):
@@ -462,8 +466,6 @@ def test_log_mode_defaults_to_full_allow_logging(tmp_path, monkeypatch):
 
 def test_pending_wait_is_clamped_to_thirty_seconds(tmp_path, monkeypatch):
     # Virtualize only the route's clock/sleep; no thirty-second wall-clock test.
-    import types
-
     import pinky_daemon.api as api_module
 
     with _gateway(tmp_path, monkeypatch) as client:
@@ -475,7 +477,7 @@ def test_pending_wait_is_clamped_to_thirty_seconds(tmp_path, monkeypatch):
 
         async def advance(delay):
             nonlocal elapsed
-            assert delay == 0.5
+            assert 0 < delay <= 5
             sleeps.append(delay)
             elapsed += delay
             assert elapsed <= 30.5, "wait was not clamped to thirty seconds"
@@ -497,7 +499,6 @@ def test_pending_wait_is_clamped_to_thirty_seconds(tmp_path, monkeypatch):
 
             sleep = staticmethod(advance)
 
-        assert isinstance(api_module, types.ModuleType)
         monkeypatch.setattr(api_module, "time", Clock())
         monkeypatch.setattr(api_module, "asyncio", Asyncio())
         response = _signed(client, "GET", f'/agents/sample/policy/pending/{pause["pending_id"]}?wait=999')

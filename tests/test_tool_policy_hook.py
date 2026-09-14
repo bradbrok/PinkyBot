@@ -311,6 +311,9 @@ def test_hook_is_importable_and_deadline_override_can_only_shorten(tmp_path, mon
     tree = ast.parse(path.read_text())
     assert any(isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'"
                for node in tree.body)
+    main = next(n for n in tree.body if isinstance(n, ast.FunctionDef) and n.name == "main")
+    assert any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+               and n.func.id == "effective_deadline" for n in ast.walk(main))
     spec = importlib.util.spec_from_file_location("generated_policy_hook", path)
     module = importlib.util.module_from_spec(spec)
 

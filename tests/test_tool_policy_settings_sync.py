@@ -193,13 +193,11 @@ def test_exported_deadline_and_settings_timeout_constants(tmp_path):
     timeout = getattr(agent_registry, "TOOL_POLICY_HOOK_TIMEOUT_SEC", None)
     assert deadline == 600
     assert timeout == 660
-    assert 570 < deadline < timeout
     _, entry, _ = _installed(tmp_path)
     assert entry["timeout"] == timeout
 
 
 def test_settings_sync_uses_exported_timeout_constant(tmp_path, monkeypatch):
-    assert getattr(agent_registry, "TOOL_POLICY_HOOK_TIMEOUT_SEC", None) == 660
     monkeypatch.setattr(agent_registry, "TOOL_POLICY_HOOK_TIMEOUT_SEC", 661)
     directory, entry, settings = _installed(tmp_path)
     assert entry["timeout"] == 661
