@@ -5,7 +5,8 @@ Lexical path checks do not resolve symlinks. Native tool denials, signed daemon
 boundaries and process isolation remain the hard enforcement boundaries.
 Precedence: tamper/unavailable, static, non-overridable self.modify_guard,
 scoped overrides, remaining rules, default allow. Bash argument overrides admit
-exactly one non-empty segment; trailing separators may leave empty segments.
+exactly one non-empty segment, without comment collapse or command/process
+substitution. Comments are tokens; trailing separators may leave empty segments.
 """
 
 from __future__ import annotations
@@ -118,6 +119,7 @@ def primary_input_field(tool_name: str) -> str | None:
 
 def _bash_segments(command: str) -> list[list[str]]:
     lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n<>")
+    lexer.commenters = ""
     lexer.whitespace = " \t\r"
     lexer.whitespace_split = True
     segments: list[list[str]] = [[]]
@@ -145,6 +147,8 @@ def matches_tool_pattern(pattern: str, tool_name: str, tool_input: dict | None =
     if value != argument and value[len(argument)] not in " \t\n;&|/":
         return False
     if tool_name == "Bash":
+        if any(marker in value for marker in ("$(", "`", "<(", ">(")):
+            return False
         try:
             return len(_bash_segments(value)) == 1
         except ValueError:
