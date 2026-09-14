@@ -250,3 +250,53 @@ async def test_registry_lookup_failure_defers_policy_to_server(
     assert "tool policy flag lookup failed" in warning
     assert "sample" in warning and "test registry unavailable" in warning
     assert "exporting armed, server-authoritative" in warning
+
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["tmux", "sdk"])
+@pytest.mark.parametrize("mode", ["off", "log", "enforce"])
+@pytest.mark.parametrize("lookup", ["no_registry", "absent_row", "missing_flag", "none_flag",
+                                   "integer_flag", "string_flag", "exception", "false", "true"])
+async def test_unknown_registry_state_does_not_disarm(tmp_path, monkeypatch, capsys, transport, mode, lookup):
+    from types import SimpleNamespace
+
+    monkeypatch.setenv("PINKY_TOOL_POLICY", mode)
+    registry = MagicMock()
+    registry.get_signing_key.return_value = "test-agent-key"
+    rows = {"absent_row": None, "missing_flag": SimpleNamespace(),
+            "none_flag": SimpleNamespace(tool_policy_enabled=None),
+            "integer_flag": SimpleNamespace(tool_policy_enabled=0),
+            "string_flag": SimpleNamespace(tool_policy_enabled="false"),
+            "false": SimpleNamespace(tool_policy_enabled=False),
+            "true": SimpleNamespace(tool_policy_enabled=True)}
+    if lookup == "no_registry":
+        registry = None
+    elif lookup == "exception":
+        registry.get.side_effect = RuntimeError("test flag unavailable")
+    else:
+        registry.get.return_value = rows[lookup]
+    config = StreamingSessionConfig(agent_name="sample", working_dir=str(tmp_path))
+    if transport == "tmux":
+        env = TmuxSession(config, registry=registry, tmux_control=MagicMock())._build_repl_env()
+    else:
+        captured = []
+
+        class StopBeforeConnectError(Exception):
+            pass
+
+        def capture(options):
+            captured.append(options)
+            raise StopBeforeConnectError
+
+        monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", capture)
+        with pytest.raises(StopBeforeConnectError):
+            await StreamingSession(config, registry=registry).connect()
+        env = captured[0].env
+    assert env["PINKY_TOOL_POLICY"] == ("off" if lookup == "false" else mode)
+    warning = capsys.readouterr().err
+    if lookup not in {"false", "true"}:
+        assert "tool policy flag lookup failed" in warning and "sample" in warning
+        assert "exporting armed, server-authoritative" in warning
+    else:
+        assert "tool policy flag lookup failed" not in warning

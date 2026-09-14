@@ -20,7 +20,7 @@ from pinky_daemon.auth import (
 
 pytestmark = pytest.mark.real_auth
 SECRET = "policy-api-test-secret-not-for-runtime"
-SYSTEM_KEYS = {"mode", "armed_agents", "pending_count", "tamper_count_24h"}
+SYSTEM_KEYS = {"mode", "armed_agents", "pending_count", "tamper_count_24h", "trust_principal_body"}
 DECISION_KEYS = {
     "id", "agent_name", "session_id", "tool_use_id", "tool_name", "evaluated_permission",
     "eval_type", "rule_id", "reason_code", "principal_class", "input_sha256", "result",
@@ -29,7 +29,7 @@ DECISION_KEYS = {
 
 
 @contextmanager
-def _gateway(tmp_path, monkeypatch, *, mode="enforce", enabled=True, isolated=False, trust=True):
+def _gateway(tmp_path, monkeypatch, *, mode="enforce", enabled=True, isolated=False, trust=None):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PINKY_SESSION_SECRET", SECRET)
     if mode is None:
@@ -80,6 +80,10 @@ def _store(client):
 
 
 def _pause(client):
+    response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+        "pattern": "mcp__pinky-messaging__broadcast", "decision": "pause",
+    })
+    assert response.status_code == 200, response.text
     body = _body()
     response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
     assert response.status_code == 200, response.text
@@ -96,10 +100,10 @@ def _binding(body):
 @pytest.mark.parametrize("mode,enabled,principal,decision", [
     ("off", True, "owner", "allow"), ("enforce", False, "owner", "allow"),
     ("log", True, "owner", "allow"), ("log", True, "group", "allow"),
-    ("enforce", True, "owner", "pause"), ("enforce", True, "group", "deny"),
+    ("enforce", True, "owner", "deny"), ("enforce", True, "group", "deny"),
 ])
 def test_mode_matrix_and_decision_receipts(tmp_path, monkeypatch, mode, enabled, principal, decision):
-    with _gateway(tmp_path, monkeypatch, mode=mode, enabled=enabled) as client:
+    with _gateway(tmp_path, monkeypatch, mode=mode, enabled=enabled, trust=(mode == "log")) as client:
         response = _signed(client, "POST", "/agents/sample/policy/evaluate",
                            body=_body(principal=principal))
         assert response.status_code == 200, response.text
@@ -238,10 +242,13 @@ def test_operator_can_enable_but_registration_never_enables(tmp_path, monkeypatc
 def test_principal_body_requires_test_gate_and_isolation_still_wins(
     tmp_path, monkeypatch, trusted, isolated, principal, expected
 ):
-    with _gateway(tmp_path, monkeypatch, trust=trusted, isolated=isolated) as client:
+    with _gateway(tmp_path, monkeypatch, trust=trusted, isolated=isolated,
+                  mode="log" if trusted else "enforce") as client:
         response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=_body(principal=principal))
         assert response.status_code == 200, response.text
-        assert response.json()["decision"] == expected
+        assert response.json()["decision"] == ("allow" if trusted else expected)
+        [record] = _store(client).list_decisions("sample", 0, 10)
+        assert record["evaluated_permission"] == expected
         if trusted is not True:
             [row] = _store(client).list_decisions("sample", 0, 10)
             assert row["principal_class"] == "group"
@@ -314,7 +321,7 @@ def test_operator_override_and_read_surfaces(tmp_path, monkeypatch):
         assert decision.status_code == 200 and decision.json()["decision"] == "allow"
         assert _owner(client, "GET", path).status_code == 200
         assert _signed(client, "GET", "/agents/sample/policy/decisions").status_code == 200
-        system = _signed(client, "GET", "/system/tool-policy")
+        system = _owner(client, "GET", "/system/tool-policy")
         assert system.status_code == 200
         assert system.json()["mode"] == "enforce"
         assert system.json()["armed_agents"] == ["sample"]
@@ -330,8 +337,8 @@ def test_session_cookie_is_not_a_signed_evaluate_request(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("platform,recipient,decision", [
     ("telegram", "owner-chat", "allow"), ("telegram", "approved-chat", "allow"),
-    ("slack", "approved-chat", "allow"), ("telegram", "other-only", "pause"),
-    ("ferry", "peer", "pause"),
+    ("slack", "approved-chat", "allow"), ("telegram", "other-only", "deny"),
+    ("ferry", "peer", "deny"),
 ])
 def test_registry_recipient_scope_is_authoritative(tmp_path, monkeypatch, platform, recipient, decision):
     with _gateway(tmp_path, monkeypatch) as client:
@@ -409,7 +416,7 @@ def test_armed_boot_line_sorts_only_enabled_agents(tmp_path, monkeypatch):
     monkeypatch.setattr("pinky_daemon.api._log", messages.append)
     app = create_api(db_path=str(tmp_path / "memory.db"), default_working_dir=str(tmp_path))
     try:
-        assert "TOOL_POLICY ARMED mode=log agents=[sample-a,sample-z]" in messages
+        assert "TOOL_POLICY ARMED mode=log agents=[sample-a,sample-z] trust_principal_body=false" in messages
     finally:
         app.state.store_catalog.close()
 
@@ -607,3 +614,257 @@ def test_operator_pause_override_reaches_approval_without_trusted_principal(tmp_
         assert polled.json()["state"] == "resolved"
         assert polled.json()["result"] == "allow"
         assert polled.json()["resolved_by"] == "owner:admin"
+
+
+
+def test_signed_api_description_cannot_expand_owner_grant(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch, trust=None) as client:
+        response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "Bash(git log)", "decision": "allow",
+        })
+        assert response.status_code == 200, response.text
+        body = _body(tool="Bash", principal="unknown")
+        body["tool_input"] = {"command": "rm -rf /outside"}
+        before = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert before.status_code == 200 and before.json()["decision"] == "deny"
+        body["tool_use_id"] = "tool-with-description"
+        body["tool_input"]["description"] = "Cleanup before git log"
+        after = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert after.status_code == 200 and after.json()["decision"] == "deny"
+
+
+@pytest.mark.parametrize("pattern,status", [
+    ("Unmapped(payload)", 422), ("Agent(payload)", 422), ("B*(git log)", 422),
+    ("Bash(git log)", 200), ("mcp__pinky-messaging__send_*(peer-1)", 200),
+    ("mcp__pinky-messaging__thread(message-1)", 200), ("Unmapped", 200),
+])
+def test_override_argument_constraints_require_a_mapped_tool(tmp_path, monkeypatch, pattern, status):
+    with _gateway(tmp_path, monkeypatch) as client:
+        response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": pattern, "decision": "allow",
+        })
+        assert response.status_code == status, response.text
+        if status == 422:
+            assert _store(client).list_overrides("sample", time.time()) == []
+
+
+def test_resolution_preserves_evaluation_after_1001_other_decisions(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch, trust=None) as client:
+        store = _store(client)
+        response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "mcp__pinky-messaging__broadcast", "decision": "pause",
+        })
+        assert response.status_code == 200
+        pause, body = _pause(client)
+        original = store.list_decisions("sample", 0, 1)[0]
+        other = {"evaluated_permission": "allow", "evaluation": {
+            "type": "default", "reason_code": "default_allow", "principal_class": "group",
+            "input_sha256": "d" * 64,
+        }}
+        for i in range(1001):
+            store.record_decision(agent_name="sample", session_id="other-session",
+                                  tool_use_id=f"other-{i}", tool_name="LocalComputation", evaluation=other)
+        list_decisions = store.list_decisions
+
+        def forbid_dashboard_scan(*_args, **_kwargs):
+            raise AssertionError("resolution provenance must not use dashboard pagination")
+
+        with monkeypatch.context() as patch:
+            patch.setattr(store, "list_decisions", forbid_dashboard_scan)
+            response = _owner(client, "POST", f'/agents/sample/policy/pending/{pause["pending_id"]}/resolve',
+                              body=_binding(body))
+        assert response.status_code == 200, response.text
+        resolved = list_decisions("sample", 0, 1)[0]
+        fields = ("eval_type", "rule_id", "reason_code", "principal_class", "input_sha256",
+                  "hook_sha256", "settings_sha256")
+        assert {k: resolved[k] for k in fields} == {k: original[k] for k in fields}
+
+
+def test_expiry_inside_resolve_still_records_timeout(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, body = _pause(client)
+        store = _store(client)
+        resolve = store.resolve_pending
+
+        def delayed(*args, **kwargs):
+            # The route's first expiry sweep has already run; cross the deadline now.
+            assert store.get_pending(pause["pending_id"])["state"] == "pending"
+            deadline = time.time() + 0.1
+            store._db.execute("UPDATE tool_policy_pending SET deadline_ts=? WHERE pending_id=?",
+                              (deadline, pause["pending_id"]))
+            store._db.commit()
+            time.sleep(max(0, deadline - time.time()) + 0.05)
+            return resolve(*args, **kwargs)
+
+        monkeypatch.setattr(store, "resolve_pending", delayed)
+        path = f'/agents/sample/policy/pending/{pause["pending_id"]}'
+        response = _owner(client, "POST", path + "/resolve", body=_binding(body))
+        assert response.status_code == 409, response.text
+        assert store.get_pending(pause["pending_id"])["resolved_by"] == "timeout"
+        assert _signed(client, "GET", path).json()["result"] == "deny"
+        records = store.list_decisions("sample", 0, 10)
+        timeouts = [r for r in records if r["resolved_by"] == "timeout"]
+        assert len(timeouts) == 1 and timeouts[0]["result"] == "deny"
+        events = client.app.state.session_event_store.get_for_agent("sample")
+        resolutions = [e["metadata"]["resolution"] for e in events
+                       if e["event_type"] == "tool_policy.decision" and "resolution" in e["metadata"]]
+        assert len(resolutions) == 1
+        assert resolutions[0] == {"result": "deny", "by": "timeout",
+                                  "reason": "no owner decision within the approval window",
+                                  "latency_ms": timeouts[0]["latency_ms"]}
+
+
+def test_resolution_event_contains_reason_and_latency(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, body = _pause(client)
+        events = client.app.state.session_event_store.get_for_agent("sample")
+        original = next(e["metadata"] for e in events if e["event_type"] == "tool_policy.decision")
+        response = _owner(client, "POST", f'/agents/sample/policy/pending/{pause["pending_id"]}/resolve',
+                          body=_binding(body))
+        assert response.status_code == 200
+        events = client.app.state.session_event_store.get_for_agent("sample")
+        metadata = next(e["metadata"] for e in events
+                        if e["event_type"] == "tool_policy.decision" and "resolution" in e["metadata"])
+        resolved = _store(client).list_decisions("sample", 0, 1)[0]
+        assert resolved["latency_ms"] > 0
+        assert metadata == {**original, "resolution": {
+            "result": "allow", "by": "owner:admin", "reason": "reviewed",
+            "latency_ms": resolved["latency_ms"],
+        }}
+
+
+@pytest.mark.parametrize("fallback", ["pending", "legacy"])
+def test_resolution_missing_audit_uses_saved_provenance_or_loud_integrity_failure(
+    tmp_path, monkeypatch, caplog, fallback
+):
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, body = _pause(client)
+        store = _store(client)
+        original = store.list_decisions("sample", 0, 1)[0]
+        row = store.get_pending(pause["pending_id"])
+        for field in ("eval_type", "reason_code", "principal_class", "rule_id"):
+            assert row[field] == original[field]
+        store._db.execute("DELETE FROM tool_policy_decisions")
+        if fallback == "legacy":
+            store._db.execute("UPDATE tool_policy_pending SET eval_type=NULL, reason_code=NULL, "
+                              "principal_class=NULL, rule_id=NULL")
+        store._db.commit()
+        response = _owner(client, "POST", f'/agents/sample/policy/pending/{pause["pending_id"]}/resolve',
+                          body=_binding(body))
+        assert response.status_code == 200, response.text
+        [record] = store.list_decisions("sample", 0, 10)
+        assert record["hook_sha256"] is record["settings_sha256"] is None
+        events = client.app.state.session_event_store.get_for_agent("sample")
+        metadata = next(e["metadata"] for e in events
+                        if e["event_type"] == "tool_policy.decision" and "resolution" in e["metadata"])
+        expected_level = "WARNING" if fallback == "pending" else "ERROR"
+        assert any(r.levelname == expected_level and "sample" in r.message
+                   and pause["pending_id"] in r.message for r in caplog.records)
+        if fallback == "pending":
+            for field in ("eval_type", "reason_code", "principal_class", "rule_id"):
+                assert record[field] == original[field]
+            assert "provenance" not in metadata
+        else:
+            assert record["eval_type"] == "unavailable"
+            assert record["reason_code"] == "policy_unavailable"
+            assert record["rule_id"] is None
+            assert metadata["provenance"] == "missing"
+
+
+def test_enforce_refuses_trusted_body_principals_at_boot(tmp_path, monkeypatch):
+    with pytest.raises(ValueError, match="PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY"):
+        with _gateway(tmp_path, monkeypatch, mode="enforce", trust=True):
+            pass
+
+
+@pytest.mark.parametrize("trust", [None, False, True])
+def test_log_boot_and_status_expose_body_trust(tmp_path, monkeypatch, trust):
+    messages = []
+    monkeypatch.setattr("pinky_daemon.api._log", messages.append)
+    with _gateway(tmp_path, monkeypatch, mode="log", trust=trust) as client:
+        response = _owner(client, "GET", "/system/tool-policy")
+        assert response.status_code == 200
+        assert response.json()["trust_principal_body"] is (trust is True)
+        assert any("TOOL_POLICY" in line and f"trust_principal_body={str(trust is True).lower()}" in line
+                   for line in messages)
+
+
+@pytest.mark.parametrize("suffix", ["overrides", "decisions"])
+def test_policy_reads_are_bound_to_the_agent_or_owner(tmp_path, monkeypatch, suffix):
+    with _gateway(tmp_path, monkeypatch) as client:
+        for agent in ("sample", "other"):
+            path = f"/agents/{agent}/policy/{suffix}"
+            assert _signed(client, "GET", path).status_code == (200 if agent == "sample" else 403)
+            assert _owner(client, "GET", path).status_code == 200
+        assert _signed(client, "GET", "/system/tool-policy").status_code == 403
+        assert _owner(client, "GET", "/system/tool-policy").status_code == 200
+
+
+@pytest.mark.parametrize("name,note,status", [
+    ("unknown", "", 404), ("bad!name", "", 400), ("sample", "n" * 500, 200),
+    ("sample", "n" * 501, 422),
+])
+def test_overrides_validate_agent_and_note(tmp_path, monkeypatch, name, note, status):
+    with _gateway(tmp_path, monkeypatch) as client:
+        response = _owner(client, "PUT", f"/agents/{name}/policy/overrides", body={
+            "pattern": "Bash", "decision": "allow", "note": note,
+        })
+        assert response.status_code == status, response.text
+        if status != 200:
+            assert _store(client).list_overrides(name, 0) == []
+
+
+def test_exact_static_overrides_are_rejected_but_globs_are_supported(tmp_path, monkeypatch):
+    from pinky_daemon.tool_policy import STATIC_ALLOW_TOOLS
+
+    with _gateway(tmp_path, monkeypatch) as client:
+        for tool in sorted(STATIC_ALLOW_TOOLS):
+            response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+                "pattern": tool, "decision": "deny",
+            })
+            assert response.status_code == 422, (tool, response.text)
+        response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "mcp__pinky-self__*", "decision": "deny",
+        })
+        assert response.status_code == 200, response.text
+
+
+@pytest.mark.parametrize("field", ["tool_name", "session_id", "tool_use_id"])
+@pytest.mark.parametrize("value,status", [("n" * 200, 200), ("n" * 201, 422), ("", 422),
+                                         ("name\n", 422), ("na\x00me", 422), ("name\x7f", 422)])
+def test_evaluate_identifiers_have_bounded_control_free_shape(tmp_path, monkeypatch, field, value, status):
+    with _gateway(tmp_path, monkeypatch) as client:
+        body = _body(tool="LocalComputation")
+        body[field] = value
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert response.status_code == status, response.text
+
+
+@pytest.mark.parametrize("due", [False, True])
+def test_pending_poll_throttles_global_writes_but_expires_due_row(tmp_path, monkeypatch, due):
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, _ = _pause(client)
+        store = _store(client)
+        calls = []
+        expire = store.expire_due
+
+        def observed(now):
+            calls.append(now)
+            return expire(now)
+
+        monkeypatch.setattr(store, "expire_due", observed)
+        if due:
+            store._db.execute("UPDATE tool_policy_pending SET deadline_ts=? WHERE pending_id=?",
+                              (time.time() + 0.1, pause["pending_id"]))
+            store._db.commit()
+        started = time.monotonic()
+        response = _signed(client, "GET", f'/agents/sample/policy/pending/{pause["pending_id"]}?wait=3')
+        elapsed = time.monotonic() - started
+        assert response.status_code == 200
+        if due:
+            assert response.json()["resolved_by"] == "timeout"
+            assert elapsed < 1.5
+        else:
+            assert response.json() == {"state": "pending"}
+            assert 3 <= elapsed < 5
+            assert len(calls) <= 1

@@ -134,7 +134,10 @@ def test_expired_unpolled_pending_cannot_be_approved(tmp_path):
     store = _store(tmp_path)
     try:
         due = _pending(store, created_at=1, deadline_ts=2)
-        assert _resolve(store, due) == "already_resolved"
+        assert _resolve(store, due) == "expired"
+        assert store.get_pending(due)["state"] == "pending"
+        assert store.get_pending(due)["result"] is None
+        assert store.expire_due(time.time()) == [due]
         assert store.get_pending(due)["result"] == "deny"
     finally:
         store.close()
@@ -329,5 +332,79 @@ def test_pending_transition_is_one_conditional_update_without_state_preread(
                 assert value in values
         assert not any(sql.startswith("select ") and "tool_policy_pending" in sql
                        for sql, _ in normalized[:index]), normalized
+    finally:
+        store.close()
+
+
+
+def test_resolution_checks_deadline_after_waiting_for_write_lock(tmp_path):
+    store = _store(tmp_path)
+    ready, start, sql_started = (threading.Event() for _ in range(3))
+
+    def resolve():
+        connection = store._db
+        connection.set_trace_callback(lambda sql: sql_started.set() if sql.upper().startswith(
+            ("BEGIN IMMEDIATE", "UPDATE TOOL_POLICY_PENDING")
+        ) else None)
+        ready.set()
+        try:
+            assert start.wait(3)
+            return _resolve(store, pending_id)
+        finally:
+            store.close()
+
+    try:
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            future = pool.submit(resolve)
+            assert ready.wait(3)
+            deadline = time.time() + 0.4
+            pending_id = _pending(store, deadline_ts=deadline)
+            with closing(sqlite3.connect(tmp_path / "tool_policy.db")) as lock:
+                lock.execute("BEGIN IMMEDIATE")
+                start.set()
+                try:
+                    assert sql_started.wait(3)
+                    time.sleep(max(0, deadline - time.time()) + 0.1)
+                finally:
+                    lock.commit()
+            status = future.result(3)
+        row = store.get_pending(pending_id)
+        assert status == "expired"
+        assert row["state"] == "pending" and row["result"] is None
+        assert row["resolved_at"] is None
+        assert store.expire_due(time.time()) == [pending_id]
+        assert store.get_pending(pending_id)["resolved_at"] >= deadline
+    finally:
+        start.set()
+        store.close()
+
+
+@pytest.mark.parametrize("legacy", [False, True])
+def test_pending_provenance_columns_and_index_migrate_without_hashes(tmp_path, legacy):
+    if legacy:
+        with closing(sqlite3.connect(tmp_path / "tool_policy.db")) as db:
+            db.executescript("""CREATE TABLE tool_policy_pending (
+                pending_id TEXT PRIMARY KEY, agent_name TEXT NOT NULL, session_id TEXT NOT NULL,
+                tool_use_id TEXT NOT NULL, tool_name TEXT NOT NULL, input_sha256 TEXT NOT NULL,
+                summary TEXT NOT NULL, created_at REAL NOT NULL, deadline_ts REAL NOT NULL,
+                state TEXT NOT NULL DEFAULT 'pending', result TEXT, resolved_by TEXT, reason TEXT,
+                resolved_at REAL, UNIQUE(agent_name,tool_use_id));
+                INSERT INTO tool_policy_pending (pending_id,agent_name,session_id,tool_use_id,
+                tool_name,input_sha256,summary,created_at,deadline_ts)
+                VALUES('tp_old','sample','s','t','Bash','hash','summary',1,2);""")
+    store = _store(tmp_path)
+    try:
+        columns = {row[1]: row for row in store._db.execute("PRAGMA table_info(tool_policy_pending)")}
+        for column in ("eval_type", "reason_code", "principal_class", "rule_id"):
+            assert column in columns
+            assert columns[column][2].upper() == "TEXT" and columns[column][3] == 0
+            if legacy:
+                assert store.get_pending("tp_old")[column] is None
+        assert not {"hook_sha256", "settings_sha256"} & columns.keys()
+        index = store._db.execute("SELECT sql FROM sqlite_master WHERE name=?",
+                                 ("idx_tool_policy_decisions_agent_tool_use",)).fetchone()
+        assert index is not None
+        assert [row[2] for row in store._db.execute(
+            "PRAGMA index_info(idx_tool_policy_decisions_agent_tool_use)")] == ["agent_name", "tool_use_id"]
     finally:
         store.close()

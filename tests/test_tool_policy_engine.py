@@ -673,3 +673,120 @@ def test_selected_override_id_is_metadata_outside_the_frozen_audit_shape():
     assert set(record["evaluation"]) == {"type", "reason_code", "principal_class", "input_sha256"}
     assert record["evaluation"]["type"] == "override"
     assert record["evaluated_permission"] == "deny"
+
+
+
+def test_bash_allow_override_must_not_match_description():
+    api = _policy()
+    ctx = _context(api, tool_input={"command": "rm -rf /outside",
+                                   "description": "Cleanup before git log"}, principal_class="group")
+    result = api.evaluate(ctx, now=100, overrides=[{"pattern": "Bash(git log)", "decision": "allow"}])
+    assert result.evaluated_permission == "deny"
+
+
+def test_recipient_override_must_not_match_message_text():
+    api = _policy()
+    ctx = _context(api, "mcp__pinky-messaging__send", {
+        "platform": "telegram", "chat_id": "stranger", "text": "peer-1 sent this",
+    }, principal_class="group")
+    result = api.evaluate(ctx, now=100, overrides=[{
+        "pattern": "mcp__pinky-messaging__send(peer-1)", "decision": "allow",
+        "rule_id": "outbound.third_party",
+    }])
+    assert result.evaluated_permission == "deny"
+
+
+@pytest.mark.parametrize("tool,field,argument", [
+    ("Bash", "command", "git log"), ("Read", "file_path", "/tmp/foo"),
+    ("Write", "file_path", "/tmp/foo"), ("Edit", "file_path", "/tmp/foo"),
+    ("NotebookEdit", "notebook_path", "/tmp/foo"), ("Glob", "pattern", "src"),
+    ("Grep", "pattern", "needle"), ("mcp__pinky-messaging__send", "chat_id", "peer-1"),
+    ("mcp__pinky-messaging__send_photo", "chat_id", "peer-1"),
+    ("mcp__pinky-messaging__send_voice", "chat_id", "peer-1"),
+    ("mcp__pinky-messaging__thread", "message_id", "message-1"),
+])
+def test_argument_patterns_use_only_the_primary_field_at_a_boundary(tool, field, argument):
+    api = _policy()
+    pattern = f"{tool}({argument})"
+    assert api.matches_tool_pattern(pattern, tool, {field: argument})
+    for boundary in (" \t/" if tool == "Bash" else " \t\n;&|/"):
+        assert api.matches_tool_pattern(pattern, tool, {field: argument + boundary + "suffix"})
+    for value in (argument + "s", argument + "bar", "before " + argument, " " + argument):
+        assert not api.matches_tool_pattern(pattern, tool, {field: value})
+    assert not api.matches_tool_pattern(pattern, tool, {field: "other", "description": argument})
+    assert not api.matches_tool_pattern(pattern, tool, {"description": argument})
+    assert not api.matches_tool_pattern(pattern, tool, {field: [argument]})
+
+
+def test_unmapped_tool_argument_constraint_never_matches():
+    api = _policy()
+    assert not api.matches_tool_pattern("Unmapped(payload)", "Unmapped", {"text": "payload"})
+    assert api.matches_tool_pattern("Unmapped", "Unmapped", {"text": "payload"})
+
+
+def test_money_rule_requires_the_mcp_prefix_at_the_start():
+    api = _policy()
+    valid = api.evaluate(_context(api, "mcp__billing__charge", principal_class="group"), now=100)
+    assert valid.rule_id == "money.*" and valid.evaluated_permission == "deny"
+    invalid = api.evaluate(_context(api, "prefixmcp__billing__charge", principal_class="group"), now=100)
+    assert invalid.evaluated_permission == "allow" and invalid.type == "default"
+
+
+@pytest.mark.parametrize("command,allowed", [
+    ("git log", True), ("git log\n", True), ("git log;", True), ("git log &", True),
+    ("git log --oneline", True), ("git log; rm -rf /", False),
+    ("git log\nrm -rf /", False), ("git log | rm -rf /", False),
+    ("git log && rm -rf /", False), ("git logs", False), ("echo git log", False),
+])
+def test_bash_argument_override_requires_one_nonempty_segment(command, allowed):
+    api = _policy()
+    assert api.matches_tool_pattern("Bash(git log)", "Bash", {"command": command}) is allowed
+
+
+@pytest.mark.parametrize("path", [
+    ".Claude/settings.json", ".CLAUDE/hook_tool_policy.py", ".MCP.json",
+    "/WORK/SAMPLE/.claude/hook.py", "/HOME/TEST/.CLAUDE/Settings.json",
+    "/home/test/.claude/Settings.local.JSON",
+])
+@pytest.mark.parametrize("tool", ["Write", "Edit", "Bash"])
+def test_protected_paths_fail_closed_across_filesystem_case_variants(path, tool):
+    api = _policy()
+    values = {"command": f": > {path}"} if tool == "Bash" else {"file_path": path}
+    result = api.evaluate(_context(api, tool, values), now=100)
+    assert result.rule_id == "self.modify_guard"
+    assert result.evaluated_permission == "deny"
+
+
+@pytest.mark.parametrize("tool", ["Write", "Edit", "NotebookEdit", "Bash"])
+def test_self_modification_cannot_be_granted_by_owner_override(tool):
+    api = _policy()
+    field = "notebook_path" if tool == "NotebookEdit" else "file_path"
+    values = {field: "/work/sample/.claude/settings.json"}
+    if tool == "Bash":
+        values = {"command": ": > /work/sample/.claude/settings.json"}
+    result = api.evaluate(_context(api, tool, values), now=100, overrides=[
+        {"pattern": "*", "decision": "allow"},
+        {"pattern": tool if tool == "Bash" else f"{tool}(/work/sample)", "decision": "allow"},
+    ])
+    assert result.evaluated_permission == "deny"
+    assert result.rule_id == "self.modify_guard"
+    assert result.reason_code == "self_modification"
+    assert result.type == "rule"
+
+
+@pytest.mark.parametrize("path", ["$HOME/.claude/settings.json", "${HOME}/.claude/settings.json"])
+def test_home_variables_expand_in_path_classifier(path):
+    api = _policy()
+    ctx = _context(api)
+    assert api._path(path, ctx) == "/home/test/.claude/settings.json"
+    assert "self.modify_guard" in api.classify_bash(f": > {path}", ctx)
+
+
+@pytest.mark.parametrize("command", [
+    ": > $ROOT/.Claude/settings.json", ": > ${ROOT}/.MCP.json",
+    ": > `echo root`/.claude/settings.json", ": > $ROOT/Settings.json",
+])
+def test_dynamic_protected_shell_tokens_fail_closed(command):
+    api = _policy()
+    result = api.evaluate(_context(api, tool_input={"command": command}), now=100)
+    assert result.rule_id == "self.modify_guard" and result.evaluated_permission == "deny"
