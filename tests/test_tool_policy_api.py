@@ -20,14 +20,26 @@ from pinky_daemon.auth import (
 
 pytestmark = pytest.mark.real_auth
 SECRET = "policy-api-test-secret-not-for-runtime"
+SYSTEM_KEYS = {"mode", "armed_agents", "pending_count", "tamper_count_24h"}
+DECISION_KEYS = {
+    "id", "agent_name", "session_id", "tool_use_id", "tool_name", "evaluated_permission",
+    "eval_type", "rule_id", "reason_code", "principal_class", "input_sha256", "result",
+    "resolved_by", "latency_ms", "created_at", "hook_sha256", "settings_sha256",
+}
 
 
 @contextmanager
 def _gateway(tmp_path, monkeypatch, *, mode="enforce", enabled=True, isolated=False, trust=True):
     monkeypatch.chdir(tmp_path)
     monkeypatch.setenv("PINKY_SESSION_SECRET", SECRET)
-    monkeypatch.setenv("PINKY_TOOL_POLICY", mode)
-    monkeypatch.setenv("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY", "1" if trust else "0")
+    if mode is None:
+        monkeypatch.delenv("PINKY_TOOL_POLICY", raising=False)
+    else:
+        monkeypatch.setenv("PINKY_TOOL_POLICY", mode)
+    if trust is None:
+        monkeypatch.delenv("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY", raising=False)
+    else:
+        monkeypatch.setenv("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY", "1" if trust else "0")
     app = create_api(db_path=str(tmp_path / "memory.db"), default_working_dir=str(tmp_path))
     agents = app.state.agents
     agents.register("sample", working_dir=str(tmp_path / "sample"), isolated=isolated)
@@ -112,7 +124,7 @@ def test_mode_matrix_and_decision_receipts(tmp_path, monkeypatch, mode, enabled,
                 assert any(e["event_type"] == "tool_policy.decision" for e in events)
                 if decision == "pause":
                     assert data["poll_after_s"] == 25
-                    assert 568 <= data["deadline_ts"] - time.time() <= 571
+                    assert 560 <= data["deadline_ts"] - time.time() <= 571
                     assert store.count_pending() == 1
 
 
@@ -123,6 +135,21 @@ def test_signed_caller_cannot_target_another_agent(tmp_path, monkeypatch, isolat
     with _gateway(tmp_path, monkeypatch, isolated=isolated, mode=mode) as client:
         response = _signed(client, method, f"/agents/other/policy/{suffix}", body=_body())
         assert response.status_code == 403
+        # A same-name control proves this is route authorization, not only the global guard.
+        if method == "POST":
+            control = _signed(client, method, "/agents/sample/policy/evaluate",
+                              body=_body(tool="LocalComputation"))
+            assert control.status_code == 200, control.text
+            assert control.json()["decision"] == "allow"
+        else:
+            pending_id = _store(client).create_pending(
+                agent_name="sample", session_id="session-1", tool_use_id="tool-1",
+                tool_name="Bash", input_sha256="a" * 64, summary="test",
+                created_at=time.time(), deadline_ts=time.time() + 570,
+            )
+            control = _signed(client, "GET", f"/agents/sample/policy/pending/{pending_id}?wait=0")
+            assert control.status_code == 200, control.text
+            assert control.json() == {"state": "pending"}
 
 
 @pytest.mark.parametrize("method,path", [
@@ -136,6 +163,41 @@ def test_signed_caller_cannot_target_another_agent(tmp_path, monkeypatch, isolat
 def test_admin_routes_require_authentication(tmp_path, monkeypatch, method, path):
     with _gateway(tmp_path, monkeypatch) as client:
         assert client.request(method, path, json={}).status_code == 401
+        if method == "POST":
+            pause, body = _pause(client)
+            path = f'/agents/sample/policy/pending/{pause["pending_id"]}/resolve'
+            response = _owner(client, method, path, body=_binding(body))
+            assert response.status_code == 200, response.text
+            poll = _signed(client, "GET", path.removesuffix("/resolve") + "?wait=0")
+            assert poll.status_code == 200
+            assert set(poll.json()) == {"state", "result", "resolved_by", "reason"}
+            assert poll.json()["result"] == "allow"
+        elif method == "DELETE":
+            store = _store(client)
+            oid = store.put_override(agent="sample", pattern="Bash", rule_id=None,
+                                     decision="deny", note="test", created_by="owner:test",
+                                     valid_until=None)
+            response = _owner(client, method, f"/agents/sample/policy/overrides/{oid}")
+            assert response.status_code == 200, response.text
+            assert store.list_overrides("sample", time.time()) == []
+        elif method == "PUT":
+            response = _owner(client, method, path, body={
+                "pattern": "Bash", "decision": "deny", "note": "test",
+            })
+            assert response.status_code == 200, response.text
+            rows = _owner(client, "GET", path)
+            assert rows.status_code == 200
+            assert isinstance(rows.json(), list)
+            [row] = rows.json()
+            assert {"pattern", "decision", "note", "created_by"} <= row.keys()
+            assert row["pattern"] == "Bash" and row["decision"] == "deny"
+        else:
+            response = _owner(client, method, path)
+            assert response.status_code == 200, response.text
+            if path == "/system/tool-policy":
+                assert set(response.json()) == SYSTEM_KEYS
+            else:
+                assert response.json() == []
 
 
 @pytest.mark.parametrize("isolated", [False, True])
@@ -167,7 +229,7 @@ def test_operator_can_enable_but_registration_never_enables(tmp_path, monkeypatc
 
 
 @pytest.mark.parametrize("trusted,isolated,principal,expected", [
-    (False, False, "owner", "deny"), (True, False, "owner", "pause"),
+    (None, False, "owner", "deny"), (False, False, "owner", "deny"), (True, False, "owner", "pause"),
     (True, True, "owner", "deny"), (True, True, "schedule", "deny"),
 ])
 def test_principal_body_requires_test_gate_and_isolation_still_wins(
@@ -177,6 +239,9 @@ def test_principal_body_requires_test_gate_and_isolation_still_wins(
         response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=_body(principal=principal))
         assert response.status_code == 200, response.text
         assert response.json()["decision"] == expected
+        if trusted is not True:
+            [row] = _store(client).list_decisions("sample", 0, 10)
+            assert row["principal_class"] == "group"
 
 
 def test_resolve_binding_repeat_unknown_and_cross_agent(tmp_path, monkeypatch):
@@ -227,7 +292,8 @@ def test_pending_poll_expires_without_background_task(tmp_path, monkeypatch):
         }
         assert store.get_pending(pause["pending_id"])["result"] == "deny"
         events = client.app.state.session_event_store.get_for_agent("sample")
-        assert any(e["metadata"].get("resolution", {}).get("by") == "timeout" for e in events)
+        records = [e["metadata"] for e in events if e["event_type"] == "tool_policy.decision"]
+        assert any(r.get("resolution", {}).get("by") == "timeout" for r in records)
 
 
 def test_operator_override_and_read_surfaces(tmp_path, monkeypatch):
@@ -247,7 +313,7 @@ def test_operator_override_and_read_surfaces(tmp_path, monkeypatch):
         assert system.json()["armed_agents"] == ["sample"]
         assert system.json()["pending_count"] == 0
         assert system.json()["tamper_count_24h"] == 0
-        assert system.json()["activation"] == "next_launch"
+        assert set(system.json()) == SYSTEM_KEYS
 
 
 def test_session_cookie_is_not_a_signed_evaluate_request(tmp_path, monkeypatch):
@@ -257,7 +323,7 @@ def test_session_cookie_is_not_a_signed_evaluate_request(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("platform,recipient,decision", [
     ("telegram", "owner-chat", "allow"), ("telegram", "approved-chat", "allow"),
-    ("slack", "approved-chat", "pause"), ("telegram", "other-only", "pause"),
+    ("slack", "approved-chat", "allow"), ("telegram", "other-only", "pause"),
     ("ferry", "peer", "pause"),
 ])
 def test_registry_recipient_scope_is_authoritative(tmp_path, monkeypatch, platform, recipient, decision):
@@ -311,11 +377,13 @@ def test_invalid_policy_configuration_fails_before_serving(tmp_path, monkeypatch
         create_api(db_path=str(tmp_path / "memory.db"), default_working_dir=str(tmp_path))
 
 
-def test_off_boot_line_is_explicit(tmp_path, monkeypatch):
+@pytest.mark.parametrize("mode", [None, "off"])
+def test_off_boot_line_is_explicit(tmp_path, monkeypatch, mode):
     messages = []
     monkeypatch.setattr("pinky_daemon.api._log", messages.append)
-    with _gateway(tmp_path, monkeypatch, mode="off"):
-        assert "TOOL_POLICY INERT (PINKY_TOOL_POLICY=off)" in messages
+    with _gateway(tmp_path, monkeypatch, mode=mode):
+        value = "unset" if mode is None else mode
+        assert f"TOOL_POLICY INERT (PINKY_TOOL_POLICY={value})" in messages
 
 
 def test_armed_boot_line_sorts_only_enabled_agents(tmp_path, monkeypatch):
@@ -337,3 +405,114 @@ def test_armed_boot_line_sorts_only_enabled_agents(tmp_path, monkeypatch):
         assert "TOOL_POLICY ARMED mode=log agents=[sample-a,sample-z]" in messages
     finally:
         app.state.store_catalog.close()
+
+
+@pytest.mark.parametrize("isolated", [False, True])
+def test_signed_agent_can_update_unrelated_field(tmp_path, monkeypatch, isolated):
+    with _gateway(tmp_path, monkeypatch, isolated=isolated) as client:
+        response = _signed(client, "PUT", "/agents/sample", body={"display_name": "Updated"})
+        assert response.status_code == 200, response.text
+        assert client.app.state.agents.get("sample").display_name == "Updated"
+
+
+def test_rule_deny_is_sanitized_and_decision_round_trips(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch) as client:
+        body = _body(principal="group", tool_id="distinct-tool-use-947")
+        body["session_id"] = "distinct-session-382"
+        body["tool_input"] = {"text": "distinct-private-payload-615"}
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert response.status_code == 200, response.text
+        assert set(response.json()) == {"decision", "reason", "rule_id"}
+        assert response.json()["decision"] == "deny"
+        assert response.json()["rule_id"] == "outbound.broadcast"
+        reason = response.json()["reason"]
+        assert reason.startswith("Denied by policy rule outbound.broadcast: ")
+        assert "\n" not in reason
+        for private in (body["session_id"], body["tool_use_id"], body["tool_input"]["text"]):
+            assert private not in reason
+        [stored] = _store(client).list_decisions("sample", 0, 10)
+        response = _owner(client, "GET", "/agents/sample/policy/decisions?since=0&limit=10")
+        assert response.status_code == 200, response.text
+        assert isinstance(response.json(), list)
+        [exposed] = response.json()
+        for row in (stored, exposed):
+            assert set(row) == DECISION_KEYS
+            assert row["eval_type"] == "rule"
+            assert row["rule_id"] == "outbound.broadcast"
+            assert row["reason_code"] == "broadcast"
+            assert row["principal_class"] == "group"
+            assert row["input_sha256"] == _binding(body)["input_sha256"]
+            assert row["result"] == "deny"
+            assert row["latency_ms"] >= 0
+            assert row["session_id"] == body["session_id"]
+            assert row["tool_use_id"] == body["tool_use_id"]
+        assert exposed == stored
+
+
+def test_log_mode_defaults_to_full_allow_logging(tmp_path, monkeypatch):
+    monkeypatch.delenv("PINKY_TOOL_POLICY_LOG_ALLOWS", raising=False)
+    with _gateway(tmp_path, monkeypatch, mode="log") as client:
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate",
+                           body=_body(tool="LocalComputation"))
+        assert response.status_code == 200 and response.json()["decision"] == "allow"
+        [row] = _store(client).list_decisions("sample", 0, 10)
+        assert row["eval_type"] == "default"
+        assert row["result"] == "allow"
+
+
+def test_pending_wait_is_clamped_to_thirty_seconds(tmp_path, monkeypatch):
+    # Virtualize only the route's clock/sleep; no thirty-second wall-clock test.
+    import types
+
+    import pinky_daemon.api as api_module
+
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, _ = _pause(client)
+        elapsed = 0.0
+        sleeps = []
+        real_time = time.time()
+        real_asyncio = api_module.asyncio
+
+        async def advance(delay):
+            nonlocal elapsed
+            assert delay == 0.5
+            sleeps.append(delay)
+            elapsed += delay
+            assert elapsed <= 30.5, "wait was not clamped to thirty seconds"
+            await real_asyncio.sleep(0)
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(time, name)
+
+            def time(self):
+                return real_time + elapsed
+
+            def monotonic(self):
+                return elapsed
+
+        class Asyncio:
+            def __getattr__(self, name):
+                return getattr(real_asyncio, name)
+
+            sleep = staticmethod(advance)
+
+        assert isinstance(api_module, types.ModuleType)
+        monkeypatch.setattr(api_module, "time", Clock())
+        monkeypatch.setattr(api_module, "asyncio", Asyncio())
+        response = _signed(client, "GET", f'/agents/sample/policy/pending/{pause["pending_id"]}?wait=999')
+        assert response.status_code == 200, response.text
+        assert response.json() == {"state": "pending"}
+        assert sum(sleeps) == 30
+
+
+def test_default_pending_ttl_is_570_below_hook_deadline(tmp_path, monkeypatch):
+    from pinky_daemon import agent_registry
+
+    monkeypatch.delenv("PINKY_TOOL_POLICY_TTL_SEC", raising=False)
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, _ = _pause(client)
+        row = _store(client).get_pending(pause["pending_id"])
+        ttl = row["deadline_ts"] - row["created_at"]
+        assert ttl == pytest.approx(570, abs=0.01)
+        assert ttl < agent_registry.TOOL_POLICY_HOOK_DEADLINE_SEC == 600

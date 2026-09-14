@@ -8,6 +8,7 @@ import sqlite3
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import closing
 
 import pytest
 
@@ -172,6 +173,13 @@ def test_allow_counts_and_full_decisions_remain_separate(tmp_path):
         _record(store, agent_name="other", tool_use_id="tool-2")
         [row] = store.list_decisions("sample", 0, 10)
         assert row["evaluated_permission"] == "deny"
+        assert row["eval_type"] == "rule"
+        assert row["rule_id"] == "shell.destructive"
+        assert row["reason_code"] == "destructive_shell"
+        assert row["principal_class"] == "group"
+        assert row["input_sha256"] == "a" * 64
+        assert row["result"] == "deny"
+        assert row["latency_ms"] >= 0
         assert row["hook_sha256"] == "b" * 64
         assert row["settings_sha256"] == "c" * 64
         assert store.list_decisions("sample", time.time() + 10, 10) == []
@@ -195,7 +203,7 @@ def test_catalog_registration_and_manifest_ownership(tmp_path):
         assert entry.logical_name == "tool_policy"
         assert entry.journal_mode == "wal"
         assert entry.owner == "ToolPolicyStore"
-        catalog.validate()
+        assert catalog.validate() == []
         manifest = derive_fleet_store_manifest(tmp_path / "conversations.db")
         assert manifest["tool_policy"].criticality == "authority"
         assert manifest["tool_policy"].path == str(tmp_path / "tool_policy.db")
@@ -206,7 +214,7 @@ def test_catalog_registration_and_manifest_ownership(tmp_path):
 
 
 def test_hash_columns_migrate_existing_decision_table_without_losing_rows(tmp_path):
-    with sqlite3.connect(tmp_path / "tool_policy.db") as connection:
+    with closing(sqlite3.connect(tmp_path / "tool_policy.db")) as connection:
         connection.execute("""CREATE TABLE tool_policy_decisions (
             id INTEGER PRIMARY KEY, agent_name TEXT, session_id TEXT, tool_use_id TEXT,
             tool_name TEXT, evaluated_permission TEXT, eval_type TEXT, rule_id TEXT,
@@ -214,6 +222,7 @@ def test_hash_columns_migrate_existing_decision_table_without_losing_rows(tmp_pa
             resolved_by TEXT, latency_ms INTEGER, created_at REAL)""")
         connection.execute("""INSERT INTO tool_policy_decisions
             (id,agent_name,evaluated_permission,created_at) VALUES(1,'sample','deny',1)""")
+        connection.commit()
     store = _store(tmp_path)
     try:
         columns = {row[1]: row for row in store._db.execute("PRAGMA table_info(tool_policy_decisions)")}
@@ -254,5 +263,71 @@ def test_thread_local_connections_and_atomic_allow_counter(tmp_path):
         assert len(set(ids)) == 6
         assert store.count_pending() == 60
         assert store._db.execute("SELECT n FROM tool_policy_allow_counts").fetchone()[0] == 60
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("operation", ["resolve", "expire"])
+def test_pending_transition_is_one_conditional_update_without_state_preread(
+    tmp_path, monkeypatch, operation
+):
+    store = _store(tmp_path)
+    try:
+        pending_id = _pending(store, deadline_ts=time.time() + (570 if operation == "resolve" else -1))
+        connection = store._db
+        statements = []
+
+        class ConnectionProbe:
+            def execute(self, sql, parameters=()):
+                statements.append((sql, parameters))
+                return connection.execute(sql, parameters)
+
+            def cursor(self, *args, **kwargs):
+                raise AssertionError("pending CAS must use the observed connection.execute")
+
+            def executemany(self, *args, **kwargs):
+                raise AssertionError("pending CAS must be a single UPDATE")
+
+            def executescript(self, *args, **kwargs):
+                raise AssertionError("pending CAS must be a single UPDATE")
+
+            def __getattr__(self, name):
+                return getattr(connection, name)
+
+            def __enter__(self):
+                connection.__enter__()
+                return self
+
+            def __exit__(self, *args):
+                return connection.__exit__(*args)
+
+        # Probe the public connection seam, independent of its thread-local storage name.
+        with monkeypatch.context() as patch:
+            patch.setattr(type(store), "_db", property(lambda _: ConnectionProbe()))
+            if operation == "resolve":
+                assert _resolve(store, pending_id) == "resolved"
+            else:
+                assert store.expire_due(time.time()) == [pending_id]
+        normalized = [(" ".join(sql.lower().split()), args) for sql, args in statements]
+        updates = [(i, sql, args) for i, (sql, args) in enumerate(normalized)
+                   if sql.startswith("update ")]
+        assert len(updates) == 1, normalized
+        index, sql, args = updates[0]
+        assert "update tool_policy_pending" in sql
+        assert " where " in sql
+        where = sql.split(" where ", 1)[1]
+        # Accept literal or bound values, but pin every predicate to the WHERE clause.
+        assert re.search(r"\bstate\s*=\s*(?:'pending'|[?:])", where), sql
+        if "'pending'" not in where:
+            assert "pending" in (args.values() if isinstance(args, dict) else args)
+        assert re.search(r"\bdeadline_ts\s*" + (r">" if operation == "resolve" else r"<="), where)
+        if operation == "resolve":
+            for column in ("pending_id", "agent_name", "tool_use_id", "input_sha256"):
+                assert re.search(r"\b" + column + r"\s*=", where), sql
+            values = args.values() if isinstance(args, dict) else args
+            for value in (pending_id, "sample", "tool-1", "a" * 64):
+                assert value in values
+        assert not any(sql.startswith("select ") and "tool_policy_pending" in sql
+                       for sql, _ in normalized[:index]), normalized
     finally:
         store.close()

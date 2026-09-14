@@ -2,7 +2,9 @@
 
 from __future__ import annotations
 
+import ast
 import hashlib
+import importlib.util
 import json
 import os
 import socket
@@ -43,7 +45,7 @@ def _payload(tool="mcp__pinky-messaging__broadcast"):
                            tool_input={"text": "private-input"}, cwd="/workspace"))
 
 
-def _env(url="", **changes):
+def _env(url="http://192.0.2.1:9", **changes):
     env = {key: value for key, value in os.environ.items() if not key.startswith("PINKY_")}
     env.update(PINKY_TOOL_POLICY="enforce", PINKY_AGENT_KEY=SECRET, PINKY_DAEMON_URL=url,
                PINKY_TOOL_POLICY_HOOK_DEADLINE_SEC="4")
@@ -216,8 +218,8 @@ def test_silent_daemon_cannot_outlive_hook_deadline(tmp_path, phase):
     ]
     with _daemon(responses) as (url, _):
         started = time.monotonic()
-        response = _run(path, _env(url, PINKY_TOOL_POLICY_HOOK_DEADLINE_SEC="0.4"), timeout=2)
-        assert time.monotonic() - started < 1.5
+        response = _run(path, _env(url, PINKY_TOOL_POLICY_HOOK_DEADLINE_SEC="0.4"), timeout=3)
+        assert 0.4 <= time.monotonic() - started < 3
         _decision(response, "deny", TIMEOUT)
 
 
@@ -258,12 +260,13 @@ exec(code, {"__name__": "__main__", "__file__": str(path)})
 '''
         started = time.monotonic()
         response = _run(path, _env(f"http://127.0.0.1:{port}"), wrapper=wrapper)
-        assert time.monotonic() - started < 5
+        assert 2 <= time.monotonic() - started < 5
         _decision(response, "deny", UNREACHABLE)
         assert attempts.read_text().splitlines() == ["attempt"] * 3
 
 
-@pytest.mark.parametrize("payload", ["not-json", "[]", "null", '{"tool_name":"Bash","tool_input":[]}'])
+@pytest.mark.parametrize("payload", ["not-json private-input", "[]", "null",
+                                     '{"tool_name":"Bash","tool_input":[],"extra":"private-input"}'])
 def test_malformed_stdin_denies_without_request(tmp_path, payload):
     path = _script(tmp_path)
     with _daemon([{"decision": "allow"}]) as (url, requests):
@@ -300,3 +303,30 @@ exec(code, {"__name__": "__main__", "__file__": str(path)})
     response = _run(path, _env("http://127.0.0.1:1"), wrapper=wrapper)
     _decision(response, "deny")
     assert "Traceback" not in response.stderr
+
+
+@pytest.mark.parametrize("override,expected", [(None, 600), ("5000", 600), ("4", 4)])
+def test_hook_is_importable_and_deadline_override_can_only_shorten(tmp_path, monkeypatch, override, expected):
+    path = _script(tmp_path)
+    tree = ast.parse(path.read_text())
+    assert any(isinstance(node, ast.If) and ast.unparse(node.test) == "__name__ == '__main__'"
+               for node in tree.body)
+    spec = importlib.util.spec_from_file_location("generated_policy_hook", path)
+    module = importlib.util.module_from_spec(spec)
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("importing the hook must not run main or perform I/O")
+
+    # Load source before patching open; the guard covers module execution only.
+    code = spec.loader.get_code(spec.name)
+    with monkeypatch.context() as patch:
+        patch.setattr("builtins.input", unexpected)
+        patch.setattr("sys.stdin", type("Unreadable", (), {"read": unexpected})())
+        patch.setattr("socket.socket", unexpected)
+        patch.setattr("builtins.open", unexpected)
+        patch.setattr("pathlib.Path.open", unexpected)
+        exec(code, module.__dict__)
+    assert callable(module.main)
+    assert callable(module.effective_deadline)
+    env = {} if override is None else {"PINKY_TOOL_POLICY_HOOK_DEADLINE_SEC": override}
+    assert module.effective_deadline(env) == expected

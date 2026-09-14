@@ -6,6 +6,7 @@ import ast
 import hashlib
 import importlib
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -43,7 +44,7 @@ def _context(api, tool="Bash", tool_input=None, **changes):
         agent_name="sample", isolated=False, principal_class="owner", transport="tmux",
         tool_name=tool, tool_input=tool_input or {}, agent_dir="/work/sample", home_dir="/home/test",
         tmp_roots=["/private/scratch"], public_remotes=["origin"],
-        known_recipients=frozenset({"telegram:owner-chat", "slack:approved-chat"}),
+        known_recipients=frozenset({"telegram:owner-chat", "approved-chat"}),
         data_roots=["/repo/data"], repo_default_branches={"origin": "main"},
         is_worktree_checkout=True, cwd="/work/sample",
     )
@@ -64,6 +65,8 @@ def test_rule_principal_transport_matrix(
     expected = owner_decision if principal in {"owner", "schedule"} else other_decision
     assert record["evaluated_permission"] == expected
     evaluation = record["evaluation"]
+    assert evaluation["type"] == ("static" if tool == "Read" else "rule" if rule else "default")
+    assert evaluation["reason_code"] in api.REASON_CODES
     assert evaluation.get("rule_id") == rule
     assert evaluation["principal_class"] == ("group" if principal == "unknown" else principal)
     assert evaluation["input_sha256"] == api.canonical_input_sha256(tool_input)
@@ -146,6 +149,7 @@ def test_specific_override_and_rule_scope():
 
 @pytest.mark.parametrize("pattern,tool,inputs,expected", [
     ("Bash", "Bash", {}, True), ("Bash", "BashExtra", {}, False),
+    ("Bash(git log)", "Bash", {"command": "git log --oneline\n"}, True),
     ("mcp__billing__*", "mcp__billing__refund", {}, True),
     ("Bash(git log)", "Bash", {"command": "git log --oneline"}, True),
     ("Bash(git log)", "Bash", {"command": "git status"}, False),
@@ -158,6 +162,7 @@ def test_tool_pattern_grammar(pattern, tool, inputs, expected):
 
 @pytest.mark.parametrize("command,rule,expected", [
     ("rm -rf /work/sample/cache", "shell.destructive", False),
+    ("rm -rf /work/sample/cache\n", "shell.destructive", False),
     ("rm -rf '/work/sample/quoted cache'", "shell.destructive", False),
     ("rm -rf /private/scratch/cache", "shell.destructive", False),
     ("rm -rf /work/sample/scratchpad/cache", "shell.destructive", False),
@@ -214,6 +219,7 @@ def test_self_modification_guards_file_tools(tool, path):
 
 @pytest.mark.parametrize("platform,chat_id,expected", [
     ("telegram", "owner-chat", "allow"), ("slack", "approved-chat", "allow"),
+    ("telegram", "approved-chat", "allow"),
     ("slack", "owner-chat", "pause"), ("ferry", "peer", "pause"),
     ("telegram", "unknown", "pause"),
 ])
@@ -228,7 +234,7 @@ def test_static_names_are_registered_and_not_unbounded_wildcards():
     builtin = {"Read", "Glob", "Grep", "LS", "ToolSearch", "TodoWrite"}
     registered = set()
     for namespace in ("self", "memory"):
-        source = Path(f"src/pinky_{namespace}/server.py").read_text()
+        source = _package_source(f"pinky_{namespace}", "server.py").read_text()
         for node in ast.walk(ast.parse(source)):
             if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
@@ -236,21 +242,7 @@ def test_static_names_are_registered_and_not_unbounded_wildcards():
                    and d.func.attr == "tool" for d in node.decorator_list):
                 registered.add(f"mcp__pinky-{namespace}__{node.name}")
     assert isinstance(api.STATIC_ALLOW_TOOLS, frozenset)
-    memory_names = {
-        "recall", "introspect", "kg_query", "kg_connections", "kg_stats", "kg_timeline",
-        "memory_query", "memory_links",
-    }
-    self_names = {
-        "context_status", "who_am_i", "load_my_context", "agent_status", "check_my_health",
-        "search_history", "list_my_schedules", "get_next_task", "get_presentation_template",
-        "list_presentations", "get_owner_profile", "get_my_research_assignments",
-        "list_research_topics", "get_research_detail", "list_agents", "list_my_skills",
-        "list_available_skills", "list_triggers", "get_attribution", "get_agent_card",
-        "list_voice_calls", "list_call_requests", "get_app_source", "list_apps",
-    }
-    expected = builtin | {f"mcp__pinky-memory__{name}" for name in memory_names} | {
-        f"mcp__pinky-self__{name}" for name in self_names
-    }
+    expected = _expected_static_tools()
     assert api.STATIC_ALLOW_TOOLS == frozenset(expected)
     assert api.STATIC_ALLOW_TOOLS <= builtin | registered
     assert not any("*" in name for name in api.STATIC_ALLOW_TOOLS)
@@ -270,8 +262,8 @@ def test_static_set_excludes_write_and_outbound_families():
     )
     for name in api.STATIC_ALLOW_TOOLS:
         assert not name.startswith(("mcp__pinky-web__", "mcp__pinky-messaging__"))
-        if name.startswith("mcp__pinky-self__"):
-            assert not name.removeprefix("mcp__pinky-self__").startswith(prefixes)
+        if name.startswith("mcp__"):
+            assert not name.split("__", 2)[2].startswith(prefixes)
 
 
 @pytest.mark.parametrize("tool,inputs,rule", [
@@ -326,10 +318,331 @@ def test_engine_evaluation_does_not_read_files_or_external_state(monkeypatch):
     def unexpected(*args, **kwargs):
         raise AssertionError("pure policy evaluation attempted I/O")
 
-    monkeypatch.setattr("builtins.open", unexpected)
-    monkeypatch.setattr("pathlib.Path.open", unexpected)
-    monkeypatch.setattr("pathlib.Path.resolve", unexpected)
-    monkeypatch.setattr("socket.socket", unexpected)
-    monkeypatch.setattr("sqlite3.connect", unexpected)
-    monkeypatch.setattr("os.getenv", unexpected)
-    assert api.evaluate(ctx, now=100).to_record()["evaluated_permission"] == "pause"
+    with monkeypatch.context() as patch:
+        patch.setattr("builtins.open", unexpected)
+        patch.setattr("pathlib.Path.open", unexpected)
+        patch.setattr("pathlib.Path.resolve", unexpected)
+        patch.setattr("socket.socket", unexpected)
+        patch.setattr("sqlite3.connect", unexpected)
+        patch.setattr("os.getenv", unexpected)
+        patch.setattr(os.environ, "get", unexpected)
+        patch.setattr("os.stat", unexpected)
+        result = api.evaluate(ctx, now=100).to_record()
+    assert result["evaluated_permission"] == "pause"
+
+
+def test_reason_code_vocabulary_covers_all_default_rules():
+    api = _policy()
+    assert isinstance(api.REASON_CODES, frozenset)
+    assert api.REASON_CODES
+    for rule in api.DEFAULT_RULES:
+        assert rule["reason_code"] in api.REASON_CODES
+    for kind in ("static", "rule", "override", "default", "tamper", "unavailable"):
+        tool = "Read" if kind == "static" else "Agent" if kind == "rule" else "LocalComputation"
+        options = {kind: True} if kind in {"tamper", "unavailable"} else {}
+        if kind == "override":
+            options["overrides"] = [{"pattern": tool, "decision": "deny"}]
+        record = api.evaluate(_context(api, tool), now=100, **options).to_record()
+        assert record["evaluation"]["type"] == kind
+        assert record["evaluation"]["reason_code"] in api.REASON_CODES
+
+
+def _package_source(package, filename):
+    spec = importlib.util.find_spec(package)
+    assert spec is not None and spec.origin, f"cannot resolve installed package {package}"
+    return Path(spec.origin).parent / filename
+
+
+STATIC_INVARIANT = (
+    "A static tool performs no writes beyond its own bookkeeping and sends no network "
+    "request to a destination chosen at call time."
+)
+STATIC_EXCEPTIONS = {
+    "TodoWrite": "session-local",
+    "mcp__pinky-memory__recall": (
+        "access bookkeeping write (accessed_at/access_count/weight) + query embedding sent "
+        "to the configured embeddings provider (fixed destination)"
+    ),
+}
+_WRITE_PREFIXES = (
+    "write", "update_", "create_", "delete_", "set_", "register_", "deploy_", "install_",
+    "add_", "remove_", "complete_", "claim_", "block_", "spawn_", "propose_", "publish_",
+    "submit_", "kb_save", "kb_ingest", "kb_delete", "save_", "context_restart", "restart_",
+    "discard_", "mesh_", "broadcast", "reflect", "unlink", "mkdir", "rmdir", "rename",
+    "replace_file", "chmod", "chown", "touch", "truncate", "send", "commit", "executescript",
+)
+
+
+def _registered_handlers(package):
+    source = _package_source(package, "server.py")
+    tree = ast.parse(source.read_text())
+    handlers = {}
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and any(
+            isinstance(d, ast.Call) and isinstance(d.func, ast.Attribute) and d.func.attr == "tool"
+            for d in node.decorator_list
+        ):
+            handlers[node.name] = node
+    return tree, handlers
+
+
+def _handler_effects(handler, tree, store_tree=None):
+    """Follow local helpers and store methods; reject write and external-client sinks.
+
+    Literal GETs through the daemon adapter are read operations. _get_store only
+    obtains the agent's store capability; its methods are inspected at their call
+    sites. Decorations and server construction are outside a handler invocation.
+    This bounded source audit is backed by injected direct and transitive sinks.
+    """
+    import re
+
+    functions = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    methods = {} if store_tree is None else {
+        n.name: n for n in ast.walk(store_tree)
+        if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    aliases = {}
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            aliases.update({a.asname or a.name: a.name for a in node.names})
+        elif isinstance(node, ast.ImportFrom):
+            aliases.update({a.asname or a.name: f"{node.module}.{a.name}" for a in node.names})
+    effects, seen = [], set()
+
+    def visit(function, chain):
+        if id(function) in seen:
+            return
+        seen.add(id(function))
+        body = ast.Module(body=function.body, type_ignores=[])
+        bindings = {}
+        for node in ast.walk(body):
+            if isinstance(node, ast.Assign):
+                for target in node.targets:
+                    if isinstance(target, ast.Name):
+                        bindings.setdefault(target.id, []).append(node.value)
+            elif isinstance(node, ast.AnnAssign) and isinstance(node.target, ast.Name):
+                bindings.setdefault(node.target.id, []).append(node.value)
+
+        def strings(node, visiting=frozenset()):
+            if isinstance(node, ast.Constant) and isinstance(node.value, str):
+                return [node.value]
+            if isinstance(node, ast.Name) and node.id not in visiting:
+                return [s for value in bindings.get(node.id, [])
+                        for s in strings(value, visiting | {node.id})]
+            if isinstance(node, ast.JoinedStr):
+                return [s for value in node.values for s in strings(value, visiting)]
+            if isinstance(node, ast.BinOp):
+                return strings(node.left, visiting) + strings(node.right, visiting)
+            return []
+
+        for call in (n for n in ast.walk(body) if isinstance(n, ast.Call)):
+            target = ast.unparse(call.func)
+            name = target.rsplit(".", 1)[-1]
+            root = target.split(".", 1)[0]
+            expanded = aliases.get(root, root) + target[len(root):]
+            location = " -> ".join((*chain, f"{target}:{call.lineno}"))
+            if target in {"_api", "_api_async"}:
+                if not call.args or not isinstance(call.args[0], ast.Constant) or (
+                    call.args[0].value != "GET"
+                ):
+                    effects.append(location + " daemon mutation")
+                def is_path(value, seen_names=frozenset()):
+                    if isinstance(value, ast.Name) and value.id not in seen_names:
+                        sources = bindings.get(value.id, [])
+                        return bool(sources) and all(is_path(v, seen_names | {value.id}) for v in sources)
+                    if isinstance(value, ast.IfExp):
+                        return is_path(value.body, seen_names) and is_path(value.orelse, seen_names)
+                    if isinstance(value, ast.Constant) and isinstance(value.value, str):
+                        return bool(re.fullmatch(r"/[a-z][a-z0-9_/?=&-]*", value.value))
+                    if isinstance(value, ast.JoinedStr) and value.values:
+                        first = value.values[0]
+                        return isinstance(first, ast.Constant) and bool(re.match(
+                            r"\A/[a-z][a-z0-9_-]*(?:/|\?|\Z)", first.value,
+                        ))
+                    return False
+
+                if len(call.args) < 2 or not is_path(call.args[1]):
+                    effects.append(location + " non-path daemon destination")
+                if call.keywords or len(call.args) > 2:
+                    effects.append(location + " unexpected daemon arguments")
+                continue
+            if name.startswith(_WRITE_PREFIXES) or name in {
+                "execute_write", "system", "popen", "Popen", "run", "exec", "eval",
+                "update", "create", "delete", "save", "insert", "log",
+            }:
+                effects.append(location + " write/process verb")
+            if re.search(r"(?:urllib|httpx|requests|openai|socket|http\.client)(?:\.|$)", expanded):
+                # urllib.parse formats query strings locally; it is not a client.
+                if not expanded.startswith("urllib.parse."):
+                    effects.append(location + " network client")
+            if name in {"urlopen", "request", "post", "put", "patch", "delete", "connect"} or (
+                any(part in expanded.lower() for part in ("client.", "embeddings.", "embedder."))
+            ):
+                effects.append(location + " network/client path")
+            if name in {"open", "fdopen"}:
+                mode = next((k.value for k in call.keywords if k.arg == "mode"),
+                            call.args[1] if len(call.args) > 1 else ast.Constant("r"))
+                if not isinstance(mode, ast.Constant) or mode.value not in {"r", "rb", "rt"}:
+                    effects.append(location + " writable file")
+            if name in {"execute", "executemany"}:
+                sql = " ".join(strings(call.args[0])) if call.args else ""
+                if not sql.lstrip().upper().startswith("SELECT") or re.search(
+                    r"\b(?:UPDATE|INSERT|DELETE|REPLACE|CREATE|ALTER|DROP|ATTACH)\b", sql, re.I
+                ):
+                    effects.append(location + " SQL write/unresolved SQL")
+            if isinstance(call.func, ast.Name) and name in functions and name != "_get_store":
+                visit(functions[name], (*chain, name))
+            elif isinstance(call.func, ast.Attribute) and name in methods:
+                receiver = ast.unparse(call.func.value)
+                sources = bindings.get(receiver, [])
+                if receiver in {"self", "s", "store", "_get_store()"} or any(
+                    isinstance(v, ast.Call) and ast.unparse(v.func) == "_get_store" for v in sources
+                ):
+                    visit(methods[name], (*chain, name))
+
+    visit(handler, (handler.name,))
+    return effects
+
+
+def test_every_static_mcp_handler_has_no_unexcepted_effects():
+    """A static tool performs no writes beyond its own bookkeeping and sends no network
+    request to a destination chosen at call time. Recall alone is excepted for access
+    bookkeeping and its fixed-provider embedding client; other write/client paths fail.
+    """
+    api = _policy()
+    assert api.STATIC_ALLOW_EXCEPTIONS == STATIC_EXCEPTIONS
+    engine_tree = ast.parse(Path(api.__file__).read_text())
+    for index, node in enumerate(engine_tree.body):
+        targets = node.targets if isinstance(node, ast.Assign) else (
+            [node.target] if isinstance(node, ast.AnnAssign) else []
+        )
+        if any(isinstance(t, ast.Name) and t.id == "STATIC_ALLOW_TOOLS" for t in targets):
+            doc = engine_tree.body[index + 1]
+            assert isinstance(doc, ast.Expr) and isinstance(doc.value, ast.Constant)
+            assert STATIC_INVARIANT in doc.value.value
+            break
+    else:
+        pytest.fail("STATIC_ALLOW_TOOLS must carry the documented effect invariant")
+    for tool in sorted(api.STATIC_ALLOW_TOOLS):
+        if not tool.startswith("mcp__"):
+            continue
+        _, namespace, name = tool.split("__", 2)
+        package = namespace.replace("-", "_")
+        tree, handlers = _registered_handlers(package)
+        assert name in handlers, f"unregistered static tool: {tool}"
+        store_path = _package_source(package, "store.py")
+        store_tree = ast.parse(store_path.read_text()) if store_path.exists() else None
+        effects = _handler_effects(handlers[name], tree, store_tree)
+        if tool not in api.STATIC_ALLOW_EXCEPTIONS:
+            assert effects == [], f"{tool}: {effects}"
+
+
+@pytest.mark.parametrize("sink", [
+    'Path("file").write_text("payload")',
+    'open("file", "w")',
+    'db.execute("UPDATE rows SET value=1")',
+    '_api("POST", "/tasks", {})',
+    'urllib.request.urlopen("https://example.test")',
+    'httpx.get("https://example.test")',
+    'requests.get("https://example.test")',
+    'client.embeddings.create(input="payload")',
+    'store.reflect("payload")',
+    '_api("GET", url)',
+    '_api("GET", "https://example.test/path")',
+    '_api("GET", "//example.test/path")',
+    '_api(method, "/tasks")',
+])
+@pytest.mark.parametrize("indirect", [False, True])
+def test_static_effect_audit_detects_injected_writes_and_clients(sink, indirect):
+    # No engine import: these controls must pass even on a feature-absent RED head.
+    body = f"def helper():\n    {sink}\n\ndef read_tool():\n    helper()\n" if indirect else (
+        f"def read_tool():\n    {sink}\n"
+    )
+    tree = ast.parse(body)
+    handler = next(n for n in tree.body if n.name == "read_tool")
+    assert _handler_effects(handler, tree), sink
+
+
+def test_static_effect_audit_follows_store_methods_and_import_aliases():
+    tree = ast.parse("def read_tool():\n    s.read_records()\n")
+    store = ast.parse('def read_records(self):\n    self._conn.execute("DELETE FROM rows")\n')
+    assert _handler_effects(tree.body[0], tree, store)
+    tree = ast.parse('from urllib.request import urlopen as fetch\ndef read_tool():\n    fetch(url)\n')
+    assert _handler_effects(tree.body[1], tree)
+
+
+def test_daemon_read_adapter_uses_configured_base_and_accepts_only_path_arguments():
+    tree, handlers = _registered_handlers("pinky_self")
+    assert all("api_url" not in {a.arg for a in n.args.args + n.args.kwonlyargs}
+               for n in handlers.values())
+    functions = {n.name: n for n in ast.walk(tree)
+                 if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))}
+    for name in ("_api", "_api_async"):
+        function = functions[name]
+        assert [a.arg for a in function.args.args] == ["method", "path", "body"]
+        assert function.args.vararg is None and function.args.kwarg is None
+        assert not any(isinstance(n, (ast.Global, ast.Nonlocal)) for n in ast.walk(function))
+    api = functions["_api"]
+    assignments = {t.id: n.value for n in ast.walk(api) if isinstance(n, ast.Assign)
+                   for t in n.targets if isinstance(t, ast.Name)}
+    assert ast.unparse(assignments["url"]) == "f'{api_url}{path}'"
+    requests = [n for n in ast.walk(api) if isinstance(n, ast.Call)
+                and ast.unparse(n.func) == "urllib.request.Request"]
+    assert len(requests) == 1 and ast.unparse(requests[0].args[0]) == "url"
+    opens = [n for n in ast.walk(api) if isinstance(n, ast.Call)
+             and ast.unparse(n.func) == "urllib.request.urlopen"]
+    assert len(opens) == 1 and ast.unparse(opens[0].args[0]) == "req"
+    async_api = functions["_api_async"]
+    calls = [n for n in ast.walk(async_api) if isinstance(n, ast.Call)]
+    assert len(calls) == 1
+    assert ast.unparse(calls[0]) == "asyncio.to_thread(_api, method, path, body)"
+    factory = functions["create_server"]
+    defaults = dict(zip((a.arg for a in factory.args.kwonlyargs), factory.args.kw_defaults))
+    assert isinstance(defaults["api_url"], ast.Constant)
+    assert defaults["api_url"].value == "http://localhost:8888"
+    # The configured closure base cannot be rebound by a handler or helper.
+    assert not any(isinstance(n, (ast.Global, ast.Nonlocal)) and "api_url" in n.names
+                   for n in ast.walk(factory))
+    assert not any(isinstance(n, ast.Name) and isinstance(n.ctx, ast.Store) and n.id == "api_url"
+                   for n in ast.walk(factory))
+
+
+def _expected_static_tools():
+    builtin = {"Read", "Glob", "Grep", "LS", "ToolSearch", "TodoWrite"}
+    memory_names = {
+        "recall", "introspect", "kg_query", "kg_connections", "kg_stats", "kg_timeline",
+        "memory_query", "memory_links",
+    }
+    self_names = {
+        "context_status", "who_am_i", "load_my_context", "agent_status", "check_my_health",
+        "search_history", "list_my_schedules", "get_next_task", "get_presentation_template",
+        "list_presentations", "get_owner_profile", "get_my_research_assignments",
+        "list_research_topics", "get_research_detail", "list_agents", "list_my_skills",
+        "list_available_skills", "list_triggers", "get_attribution", "get_agent_card",
+        "list_voice_calls", "list_call_requests", "get_app_source", "list_apps",
+    }
+    expected = builtin | {f"mcp__pinky-memory__{name}" for name in memory_names} | {
+        f"mcp__pinky-self__{name}" for name in self_names
+    }
+    return frozenset(expected)
+
+
+def test_static_audit_controls_cover_existing_handlers_without_engine():
+    for tool in sorted(_expected_static_tools()):
+        if not tool.startswith("mcp__") or tool in STATIC_EXCEPTIONS:
+            continue
+        _, namespace, name = tool.split("__", 2)
+        package = namespace.replace("-", "_")
+        tree, handlers = _registered_handlers(package)
+        store_path = _package_source(package, "store.py")
+        store_tree = ast.parse(store_path.read_text()) if store_path.exists() else None
+        assert _handler_effects(handlers[name], tree, store_tree) == [], tool
+
+
+def test_static_effect_audit_tracks_assigned_store_and_path_branches():
+    tree = ast.parse("def read_tool():\n    db = _get_store()\n    db.read_records()\n")
+    store = ast.parse('def read_records(self):\n    self._conn.execute("UPDATE rows SET value=1")\n')
+    assert _handler_effects(tree.body[0], tree, store)
+    tree = ast.parse('def read_tool(url):\n    path = "/tasks" if safe else url\n    _api("GET", path)\n')
+    assert _handler_effects(tree.body[0], tree)

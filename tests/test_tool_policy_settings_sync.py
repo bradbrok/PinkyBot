@@ -69,7 +69,9 @@ def test_timeout_is_patched_even_if_command_is_already_current(old_timeout):
 def test_managed_script_rewritten_and_settings_upgrade_is_idempotent(tmp_path):
     directory, entry, settings = _installed(tmp_path)
     script = directory / ".claude/hook_tool_policy.py"
-    assert entry == {"type": "command", "command": _command(script), "timeout": 660}
+    assert entry == {"type": "command", "command": _command(script),
+                     "timeout": agent_registry.TOOL_POLICY_HOOK_TIMEOUT_SEC}
+    assert entry["timeout"] == 660
     source = script.read_text()
     compile(source, str(script), "exec")
     settings["hooks"]["PreToolUse"].append({"matcher": "Read", "hooks": [
@@ -184,3 +186,31 @@ async def test_sdk_exports_effective_opt_in_mode_without_connecting(tmp_path, mo
 
 def test_hook_generator_is_available_for_workspace_sync():
     assert callable(getattr(agent_registry, "_tool_policy_hook_source", None))
+
+
+def test_exported_deadline_and_settings_timeout_constants(tmp_path):
+    deadline = getattr(agent_registry, "TOOL_POLICY_HOOK_DEADLINE_SEC", None)
+    timeout = getattr(agent_registry, "TOOL_POLICY_HOOK_TIMEOUT_SEC", None)
+    assert deadline == 600
+    assert timeout == 660
+    assert 570 < deadline < timeout
+    _, entry, _ = _installed(tmp_path)
+    assert entry["timeout"] == timeout
+
+
+def test_settings_sync_uses_exported_timeout_constant(tmp_path, monkeypatch):
+    assert getattr(agent_registry, "TOOL_POLICY_HOOK_TIMEOUT_SEC", None) == 660
+    monkeypatch.setattr(agent_registry, "TOOL_POLICY_HOOK_TIMEOUT_SEC", 661)
+    directory, entry, settings = _installed(tmp_path)
+    assert entry["timeout"] == 661
+    for bucket in settings["hooks"]["PreToolUse"]:
+        for hook in bucket["hooks"]:
+            if "hook_tool_policy.py" in hook["command"]:
+                hook["timeout"] = 17
+    settings_path = directory / ".claude/settings.json"
+    settings_path.write_text(json.dumps(settings))
+    AgentRegistry._setup_hooks(directory, "sample")
+    entries = [h for b in json.loads(settings_path.read_text())["hooks"]["PreToolUse"]
+               for h in b["hooks"] if "hook_tool_policy.py" in h["command"]]
+    assert len(entries) == 1
+    assert entries[0]["timeout"] == 661
