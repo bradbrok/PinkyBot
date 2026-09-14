@@ -1276,9 +1276,9 @@ class TmuxPaneKeysRequest(BaseModel):
 
 
 class ToolPolicyEvaluateRequest(BaseModel):
-    session_id: str = Field(min_length=1)
-    tool_use_id: str = Field(min_length=1)
-    tool_name: str = Field(min_length=1)
+    session_id: str = Field(min_length=1, max_length=200, pattern=re.compile(r"\A[^\x00-\x1f\x7f]{1,200}\Z"))
+    tool_use_id: str = Field(min_length=1, max_length=200, pattern=re.compile(r"\A[^\x00-\x1f\x7f]{1,200}\Z"))
+    tool_name: str = Field(min_length=1, max_length=200, pattern=re.compile(r"\A[^\x00-\x1f\x7f]{1,200}\Z"))
     tool_input: dict
     transport: Literal["tmux", "sdk"] = "tmux"
     principal_class: str = "unknown"
@@ -1298,5 +1298,5 @@ class ToolPolicyOverrideRequest(BaseModel):
     pattern: str
     decision: Literal["allow", "deny", "pause"]
     rule_id: str | None = None
-    note: str = ""
+    note: str = Field(default="", max_length=500)
     valid_until: float | None = None

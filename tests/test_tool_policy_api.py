@@ -82,6 +82,7 @@ def _store(client):
 def _pause(client):
     response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
         "pattern": "mcp__pinky-messaging__broadcast", "decision": "pause",
+        "rule_id": "outbound.broadcast",
     })
     assert response.status_code == 200, response.text
     body = _body()
@@ -846,6 +847,14 @@ def test_pending_poll_throttles_global_writes_but_expires_due_row(tmp_path, monk
         pause, _ = _pause(client)
         store = _store(client)
         calls = []
+        reads = []
+        get_pending = store.get_pending
+
+        def observed_read(pending_id):
+            reads.append(pending_id)
+            return get_pending(pending_id)
+
+        monkeypatch.setattr(store, "get_pending", observed_read)
         expire = store.expire_due
 
         def observed(now):
@@ -868,3 +877,4 @@ def test_pending_poll_throttles_global_writes_but_expires_due_row(tmp_path, monk
             assert response.json() == {"state": "pending"}
             assert 3 <= elapsed < 5
             assert len(calls) <= 1
+            assert reads.count(pause["pending_id"]) >= 4

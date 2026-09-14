@@ -542,13 +542,15 @@ class StreamingSession(TransportReplacementMixin):
         policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
         try:
             policy_agent = self._registry.get(self.agent_name) if self._registry and self.agent_name else None
+            policy_flag = getattr(policy_agent, "tool_policy_enabled", None)
+            if policy_flag is False:
+                policy_mode = "off"
+            elif policy_flag is not True:
+                raise ValueError("agent policy flag is unknown")
         except Exception as exc:
             # A cache miss must consult server authority instead of disarming.
             _log(f"WARNING tool policy flag lookup failed for {self.agent_name}: {exc}; "
                  f"exporting armed, server-authoritative (configured mode={policy_mode})")
-        else:
-            if not policy_agent or getattr(policy_agent, "tool_policy_enabled", False) is not True:
-                policy_mode = "off"
         provider_env["PINKY_TOOL_POLICY"] = policy_mode
         if effort:
             provider_env["PINKY_EXPECTED_EFFORT"] = effort

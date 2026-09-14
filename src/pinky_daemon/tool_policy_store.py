@@ -36,6 +36,7 @@ class ToolPolicyStore:
                 summary TEXT NOT NULL, created_at REAL NOT NULL, deadline_ts REAL NOT NULL,
                 state TEXT NOT NULL DEFAULT 'pending' CHECK(state IN ('pending','resolved')),
                 result TEXT, resolved_by TEXT, reason TEXT, resolved_at REAL,
+                eval_type TEXT, reason_code TEXT, principal_class TEXT, rule_id TEXT,
                 UNIQUE(agent_name, tool_use_id));
             CREATE INDEX IF NOT EXISTS idx_tool_policy_pending_deadline
                 ON tool_policy_pending(state, deadline_ts);
@@ -48,6 +49,8 @@ class ToolPolicyStore:
                 hook_sha256 TEXT, settings_sha256 TEXT);
             CREATE INDEX IF NOT EXISTS idx_tool_policy_decisions_agent_time
                 ON tool_policy_decisions(agent_name, created_at);
+            CREATE INDEX IF NOT EXISTS idx_tool_policy_decisions_agent_tool_use
+                ON tool_policy_decisions(agent_name, tool_use_id);
             CREATE TABLE IF NOT EXISTS tool_policy_allow_counts (
                 agent_name TEXT NOT NULL, rule_id TEXT NOT NULL, day TEXT NOT NULL,
                 n INTEGER NOT NULL, PRIMARY KEY(agent_name, rule_id, day));
@@ -71,10 +74,14 @@ class ToolPolicyStore:
         return connection
 
     def _ensure_columns(self):
-        existing = {row[1] for row in self._db.execute("PRAGMA table_info(tool_policy_decisions)")}
-        for column in ("hook_sha256", "settings_sha256"):
-            if column not in existing:
-                self._db.execute(f"ALTER TABLE tool_policy_decisions ADD COLUMN {column} TEXT")
+        for table, columns in (
+            ("tool_policy_decisions", ("hook_sha256", "settings_sha256")),
+            ("tool_policy_pending", ("eval_type", "reason_code", "principal_class", "rule_id")),
+        ):
+            existing = {row[1] for row in self._db.execute(f"PRAGMA table_info({table})")}
+            for column in columns:
+                if column not in existing:
+                    self._db.execute(f"ALTER TABLE {table} ADD COLUMN {column} TEXT")
 
     def close(self):
         connection = getattr(self._thread_local, "connection", None)
@@ -105,15 +112,18 @@ class ToolPolicyStore:
         return cursor.rowcount == 1
 
     def create_pending(self, *, agent_name, session_id, tool_use_id, tool_name, input_sha256,
-                       summary, created_at, deadline_ts) -> str:
+                       summary, created_at, deadline_ts, evaluation=None) -> str:
         pending_id = "tp_" + secrets.token_hex(8)
+        detail = (evaluation or {}).get("evaluation", {})
         with self._db:
             self._db.execute(
                 "INSERT INTO tool_policy_pending "
-                "(pending_id,agent_name,session_id,tool_use_id,tool_name,input_sha256,summary,created_at,deadline_ts) "
-                "VALUES(?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name,tool_use_id) DO NOTHING",
+                "(pending_id,agent_name,session_id,tool_use_id,tool_name,input_sha256,summary,created_at,deadline_ts, "
+                "eval_type,reason_code,principal_class,rule_id) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(agent_name,tool_use_id) DO NOTHING",
                 (pending_id, agent_name, session_id, tool_use_id, tool_name, input_sha256,
-                 summary, created_at, deadline_ts),
+                 summary, created_at, deadline_ts, detail.get("type"), detail.get("reason_code"),
+                 detail.get("principal_class"), detail.get("rule_id")),
             )
             row = self._db.execute(
                 "SELECT * FROM tool_policy_pending WHERE agent_name=? AND tool_use_id=?",
@@ -130,10 +140,16 @@ class ToolPolicyStore:
         return dict(row) if row else None
 
     def resolve_pending(self, pending_id, *, agent, tool_use_id, input_sha256, result, resolved_by, reason):
+        """CAS at write-lock acquisition time; a deadline crossed while waiting refuses approval.
+
+        Expired rows remain pending for the route's expiry sweep, which owns the
+        timeout audit and session event. No state is read before the conditional UPDATE.
+        """
         if result not in {"allow", "deny"}:
             raise ValueError("invalid resolution")
-        now = time.time()
         with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            now = time.time()
             cursor = self._db.execute(
                 "UPDATE tool_policy_pending SET state='resolved',result=?,resolved_by=?,reason=?,resolved_at=? "
                 "WHERE pending_id=? AND agent_name=? AND tool_use_id=? AND input_sha256=? "
@@ -148,7 +164,7 @@ class ToolPolicyStore:
         if (row["agent_name"], row["tool_use_id"], row["input_sha256"]) != (agent, tool_use_id, input_sha256):
             return "binding_mismatch"
         if row["state"] == "pending" and row["deadline_ts"] <= now:
-            self.expire_due(now)
+            return "expired"
         return "already_resolved"
 
     def expire_due(self, now: float) -> list[str]:
@@ -181,6 +197,14 @@ class ToolPolicyStore:
                 "INSERT INTO tool_policy_allow_counts VALUES(?,?,?,1) "
                 "ON CONFLICT(agent_name,rule_id,day) DO UPDATE SET n=n+1", (agent, rule_id, day),
             )
+
+    def get_pause_decision(self, agent_name: str, tool_use_id: str) -> dict | None:
+        """Read the original pause provenance through the agent/tool-use index."""
+        row = self._db.execute(
+            "SELECT * FROM tool_policy_decisions WHERE agent_name=? AND tool_use_id=? "
+            "AND evaluated_permission='pause' ORDER BY id LIMIT 1", (agent_name, tool_use_id),
+        ).fetchone()
+        return dict(row) if row else None
 
     def list_decisions(self, agent, since, limit) -> list[dict]:
         return [dict(row) for row in self._db.execute(

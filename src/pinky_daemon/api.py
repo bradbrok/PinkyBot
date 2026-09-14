@@ -230,7 +230,12 @@ from pinky_daemon.store_snapshot import (
 )
 from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
-from pinky_daemon.tool_policy import DEFAULT_RULES, PolicyContext
+from pinky_daemon.tool_policy import (
+    DEFAULT_RULES,
+    STATIC_ALLOW_TOOLS,
+    PolicyContext,
+    primary_input_field,
+)
 from pinky_daemon.tool_policy import (
     UNAVAILABLE_REASON as POLICY_UNAVAILABLE_REASON,
 )
@@ -257,6 +262,11 @@ try:
 except ImportError:
     ReflectionStore = None  # type: ignore[assignment, misc]
     MemoryQueryFilters = None  # type: ignore[assignment, misc]
+
+
+# Shared across long-poll requests: reads stay per tick, global sweeps are throttled.
+_TOOL_POLICY_EXPIRE_LOCK = threading.Lock()
+_TOOL_POLICY_LAST_EXPIRE = float("-inf")
 
 
 def _log(msg: str) -> None:
@@ -1777,6 +1787,9 @@ def create_api(
     policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
     if policy_mode not in {"off", "log", "enforce"}:
         raise ValueError("PINKY_TOOL_POLICY must be off, log, or enforce")
+    policy_trust_principal_body = os.environ.get("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY") == "1"
+    if policy_mode == "enforce" and policy_trust_principal_body:
+        raise ValueError("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY is forbidden in enforce mode")
     try:
         policy_ttl = float(os.environ.get("PINKY_TOOL_POLICY_TTL_SEC", "570"))
     except ValueError:
@@ -1965,10 +1978,12 @@ def create_api(
     tool_policy_store = ToolPolicyStore(store_manifest["tool_policy"].path, catalog=store_catalog)
     app.state.tool_policy_store = tool_policy_store
     armed = sorted(a.name for a in agents.list() if a.tool_policy_enabled)
+    trust_status = (f" trust_principal_body={str(policy_trust_principal_body).lower()}"
+                    if policy_mode == "log" else "")
     if policy_mode != "off" and armed:
-        _log(f"TOOL_POLICY ARMED mode={policy_mode} agents=[{','.join(armed)}]")
+        _log(f"TOOL_POLICY ARMED mode={policy_mode} agents=[{','.join(armed)}]{trust_status}")
     else:
-        _log(f"TOOL_POLICY INERT (PINKY_TOOL_POLICY={os.environ.get('PINKY_TOOL_POLICY', 'unset')})")
+        _log(f"TOOL_POLICY INERT (PINKY_TOOL_POLICY={os.environ.get('PINKY_TOOL_POLICY', 'unset')}){trust_status}")
     hooks = HookManager(audit_store=audit)
 
     # In-memory live status for agents (updated by POST /agents/{name}/status).
@@ -8021,25 +8036,37 @@ npm run build</pre>
         row = tool_policy_store.get_pending(pending_id)
         if row is None or row["state"] != "resolved":
             return
-        previous = next((r for r in tool_policy_store.list_decisions(row["agent_name"], 0, 1000)
-                         if r["tool_use_id"] == row["tool_use_id"] and r["evaluated_permission"] == "pause"), None)
-        detail = {"type": "rule", "reason_code": "owner_only", "principal_class": "group",
-                  "input_sha256": row["input_sha256"]}
-        if previous:
-            detail.update({key: previous[key] for key in ("reason_code", "principal_class", "input_sha256")})
-            detail["type"] = previous["eval_type"]
-            if previous["rule_id"]:
-                detail["rule_id"] = previous["rule_id"]
+        previous = tool_policy_store.get_pause_decision(row["agent_name"], row["tool_use_id"])
+        source = previous or row
+        missing = not all(source.get(key) for key in ("eval_type", "reason_code", "principal_class"))
+        detail = {"type": source["eval_type"], "reason_code": source["reason_code"],
+                  "principal_class": source["principal_class"], "input_sha256": row["input_sha256"]}
+        if source.get("rule_id"):
+            detail["rule_id"] = source["rule_id"]
+        if missing:
+            logging.getLogger(__name__).error(
+                "tool policy provenance missing: agent=%s pending_id=%s", row["agent_name"], pending_id,
+            )
+            detail = {"type": "unavailable", "reason_code": "policy_unavailable",
+                      "principal_class": "unknown", "input_sha256": row["input_sha256"]}
+        elif previous is None:
+            logging.getLogger(__name__).warning(
+                "tool policy audit row missing; using pending provenance: agent=%s pending_id=%s",
+                row["agent_name"], pending_id,
+            )
         record = {"evaluated_permission": "pause", "evaluation": detail}
+        latency_ms = max(0, (row["resolved_at"] - row["created_at"]) * 1000)
         tool_policy_store.record_decision(
             agent_name=row["agent_name"], session_id=row["session_id"], tool_use_id=row["tool_use_id"],
             tool_name=row["tool_name"], evaluation=record, result=row["result"], resolved_by=row["resolved_by"],
-            latency_ms=max(0, (row["resolved_at"] - row["created_at"]) * 1000),
+            latency_ms=latency_ms,
             hook_sha256=previous["hook_sha256"] if previous else None,
             settings_sha256=previous["settings_sha256"] if previous else None,
         )
         session_event_store.log(row["session_id"], row["agent_name"], "tool_policy.decision", metadata={
-            **record, "resolution": {"result": row["result"], "by": row["resolved_by"]},
+            **record, **({"provenance": "missing"} if missing else {}),
+            "resolution": {"result": row["result"], "by": row["resolved_by"],
+                           "reason": row["reason"], "latency_ms": latency_ms},
         })
 
     def _policy_expire(now: float):
@@ -8054,8 +8081,7 @@ npm run build</pre>
         if not agent.tool_policy_enabled:
             return {"decision": "allow", "mode": "disabled", "reason_code": "policy_disabled"}
         started = time.monotonic()
-        principal = (req.principal_class if os.environ.get("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY") == "1"
-                     else "unknown")
+        principal = req.principal_class if policy_trust_principal_body else "unknown"
         known = {f'{d["platform"]}:{d["conversation_id"]}'
                  for d in agents.get_owner_notification_destinations()}
         known.update(user.chat_id for user in agents.list_approved_users(name) if user.status == "approved")
@@ -8082,6 +8108,7 @@ npm run build</pre>
                     agent_name=name, session_id=req.session_id, tool_use_id=req.tool_use_id,
                     tool_name=req.tool_name, input_sha256=evaluated.input_sha256,
                     summary=f"tool={req.tool_name}", created_at=now, deadline_ts=now + policy_ttl,
+                    evaluation=record,
                 )
             except ValueError:
                 raise HTTPException(422, "pending binding mismatch") from None
@@ -8120,14 +8147,24 @@ npm run build</pre>
 
     @app.get("/agents/{name}/policy/pending/{pending_id}")
     async def get_tool_policy_pending(name: str, pending_id: str, request: Request, wait: float = 0):
+        global _TOOL_POLICY_LAST_EXPIRE
         _policy_agent(request, name)
         stop = time.monotonic() + max(0, min(30, wait))
         while True:
             row = tool_policy_store.get_pending(pending_id)
             if row is None or row["agent_name"] != name:
                 raise HTTPException(404, "pending decision not found")
-            _policy_expire(time.time())
-            row = tool_policy_store.get_pending(pending_id)
+            now = time.time()
+            with _TOOL_POLICY_EXPIRE_LOCK:
+                tick = time.monotonic()
+                sweep = (row["state"] == "pending" and row["deadline_ts"] <= now) or (
+                    tick - _TOOL_POLICY_LAST_EXPIRE >= 5
+                )
+                if sweep:
+                    _TOOL_POLICY_LAST_EXPIRE = tick
+            if sweep:
+                _policy_expire(now)
+                row = tool_policy_store.get_pending(pending_id)
             if row["state"] == "resolved":
                 return {key: row[key] for key in ("state", "result", "resolved_by", "reason")}
             remaining = stop - time.monotonic()
@@ -8146,24 +8183,41 @@ npm run build</pre>
             pending_id, agent=name, tool_use_id=req.tool_use_id, input_sha256=req.input_sha256,
             result=req.result, resolved_by=actor, reason=req.reason,
         )
+        if status == "expired":
+            _policy_expire(time.time())
         if status != "resolved":
-            raise HTTPException({"not_found": 404, "already_resolved": 409, "binding_mismatch": 422}[status], status)
+            raise HTTPException({"not_found": 404, "already_resolved": 409, "expired": 409,
+                                 "binding_mismatch": 422}[status], status)
         _policy_resolution_event(pending_id)
         return {"status": "resolved"}
 
+    def _policy_reader(request: Request, name: str):
+        if getattr(request.state, "internal_caller", None) == name:
+            _policy_agent(request, name)
+        else:
+            _policy_owner(request)
+
     @app.get("/agents/{name}/policy/overrides")
-    async def get_tool_policy_overrides(name: str):
+    async def get_tool_policy_overrides(name: str, request: Request):
+        _policy_reader(request, name)
         return tool_policy_store.list_overrides(name, time.time())
 
     @app.put("/agents/{name}/policy/overrides")
     async def put_tool_policy_override(name: str, req: ToolPolicyOverrideRequest, request: Request):
         actor = _policy_owner(request)
+        name = _agent_name_or_400(name)
+        if agents.get(name) is None:
+            raise HTTPException(404, "agent not found")
         if req.rule_id is not None and req.rule_id not in {rule["rule_id"] for rule in DEFAULT_RULES}:
             raise HTTPException(422, "unknown rule_id")
         try:
-            parse_tool_pattern(req.pattern)
+            tool, argument = parse_tool_pattern(req.pattern)
         except ToolPatternValidationError:
             raise HTTPException(422, "invalid tool pattern") from None
+        if tool in STATIC_ALLOW_TOOLS:
+            raise HTTPException(422, "static tool overrides cannot take effect")
+        if argument is not None and primary_input_field(tool) is None:
+            raise HTTPException(422, "tool has no mapped argument field")
         if req.valid_until is not None and not math.isfinite(req.valid_until):
             raise HTTPException(422, "invalid expiration")
         oid = tool_policy_store.put_override(agent=name, created_by=actor, **req.model_dump())
@@ -8177,12 +8231,14 @@ npm run build</pre>
         return {"deleted": True}
 
     @app.get("/agents/{name}/policy/decisions")
-    async def get_tool_policy_decisions(name: str, since: float = 0, limit: int = 100):
+    async def get_tool_policy_decisions(name: str, request: Request, since: float = 0, limit: int = 100):
+        _policy_reader(request, name)
         return tool_policy_store.list_decisions(name, since, limit)
 
     @app.get("/system/tool-policy")
-    async def get_tool_policy_status():
-        return {"mode": policy_mode,
+    async def get_tool_policy_status(request: Request):
+        _policy_owner(request)
+        return {"mode": policy_mode, "trust_principal_body": policy_trust_principal_body,
                 "armed_agents": sorted(a.name for a in agents.list() if a.tool_policy_enabled)
                 if policy_mode != "off" else [],
                 "pending_count": tool_policy_store.count_pending(),

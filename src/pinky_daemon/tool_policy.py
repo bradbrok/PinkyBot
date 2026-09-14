@@ -3,6 +3,9 @@
 The Bash classifier is a bounded pattern table, not a shell parser or a sandbox.
 Lexical path checks do not resolve symlinks. Native tool denials, signed daemon
 boundaries and process isolation remain the hard enforcement boundaries.
+Precedence: tamper/unavailable, static, non-overridable self.modify_guard,
+scoped overrides, remaining rules, default allow. Bash argument overrides admit
+exactly one non-empty segment; trailing separators may leave empty segments.
 """
 
 from __future__ import annotations
@@ -99,6 +102,33 @@ def canonical_input_sha256(tool_input: dict) -> str:
                                      ensure_ascii=False, default=str).encode()).hexdigest()
 
 
+PRIMARY_INPUT_FIELDS = {
+    "Bash": "command", "Read": "file_path", "Write": "file_path", "Edit": "file_path",
+    "NotebookEdit": "notebook_path", "Glob": "pattern", "Grep": "pattern",
+    "mcp__pinky-messaging__send": "chat_id", "mcp__pinky-messaging__thread": "message_id",
+}
+
+
+def primary_input_field(tool_name: str) -> str | None:
+    """Resolve only explicit action fields; send variants share recipient scope."""
+    if tool_name.startswith("mcp__pinky-messaging__send_"):
+        return "chat_id"
+    return PRIMARY_INPUT_FIELDS.get(tool_name)
+
+
+def _bash_segments(command: str) -> list[list[str]]:
+    lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n<>")
+    lexer.whitespace = " \t\r"
+    lexer.whitespace_split = True
+    segments: list[list[str]] = [[]]
+    for token in lexer:
+        if token and all(c in ";&|\n" for c in token):
+            segments.append([])
+        else:
+            segments[-1].append(token)
+    return [args for args in segments if args]
+
+
 def matches_tool_pattern(pattern: str, tool_name: str, tool_input: dict | None = None) -> bool:
     try:
         name, argument = parse_tool_pattern(pattern)
@@ -106,12 +136,24 @@ def matches_tool_pattern(pattern: str, tool_name: str, tool_input: dict | None =
         return False
     if not fnmatch.fnmatchcase(tool_name, name):
         return False
-    return argument is None or (tool_input is not None and any(
-        argument in value for value in tool_input.values() if isinstance(value, str)
-    ))
+    if argument is None:
+        return True
+    field = primary_input_field(tool_name)
+    value = tool_input.get(field) if field and tool_input is not None else None
+    if not isinstance(value, str) or not value.startswith(argument):
+        return False
+    if value != argument and value[len(argument)] not in " \t\n;&|/":
+        return False
+    if tool_name == "Bash":
+        try:
+            return len(_bash_segments(value)) == 1
+        except ValueError:
+            return False
+    return True
 
 
 def _path(path: str, ctx: PolicyContext) -> str:
+    path = re.sub(r"\A(?:\$HOME|\$\{HOME\})(?=/|\Z)", lambda _: ctx.home_dir, path)
     if path == "~":
         path = ctx.home_dir
     if path.startswith("~/"):
@@ -120,14 +162,14 @@ def _path(path: str, ctx: PolicyContext) -> str:
 
 
 def _within(path: str, root: str, ctx: PolicyContext) -> bool:
-    path, root = _path(path, ctx), _path(root, ctx)
+    path, root = _path(path, ctx).casefold(), _path(root, ctx).casefold()
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
 def _protected(path: str, ctx: PolicyContext) -> bool:
-    normalized = _path(path, ctx)
+    normalized = _path(path, ctx).casefold()
     return (_within(path, posixpath.join(ctx.agent_dir, ".claude"), ctx)
-            or normalized == posixpath.join(ctx.agent_dir, ".mcp.json")
+            or normalized == posixpath.join(ctx.agent_dir, ".mcp.json").casefold()
             or (_within(path, posixpath.join(ctx.home_dir, ".claude"), ctx)
                 and fnmatch.fnmatchcase(posixpath.basename(normalized), "settings*.json")))
 
@@ -135,25 +177,20 @@ def _protected(path: str, ctx: PolicyContext) -> bool:
 def classify_bash(command: str, ctx: PolicyContext) -> list[str]:
     found: set[str] = set()
     try:
-        lexer = shlex.shlex(command, posix=True, punctuation_chars=";&|\n<>")
-        lexer.whitespace = " \t\r"
-        lexer.whitespace_split = True
-        tokens = list(lexer)
+        segments = _bash_segments(command)
     except ValueError:
         return ["shell.destructive"]
-    segments: list[list[str]] = [[]]
-    for token in tokens:
-        if token and all(c in ";&|\n" for c in token):
-            segments.append([])
-        else:
-            segments[-1].append(token)
     for args in segments:
         if not args:
             continue
         executable = posixpath.basename(args[0])
         rest = args[1:]
         literal = " ".join(args)
-        if any(_protected(value, ctx) for value in rest if value):
+        if any(_protected(value, ctx) or (
+            ("$" in value or "`" in value) and any(
+                name in value.casefold() for name in (".claude", ".mcp.json", "settings")
+            )
+        ) for value in args if value):
             found.add("self.modify_guard")
         if executable == "sqlite3" and any(
             _within(value, root, ctx) for value in rest if not value.startswith("-")
@@ -282,6 +319,8 @@ def evaluate(ctx: PolicyContext, *, overrides=(), now: float,
     if ctx.tool_name in STATIC_ALLOW_TOOLS:
         return result("allow", "static", "static_readonly")
     matched = next((rule for rule in DEFAULT_RULES if rule["matcher"](ctx)), None)
+    if matched and matched["rule_id"] == "self.modify_guard":
+        return result("deny", "rule", matched["reason_code"], matched["rule_id"])
     candidates = []
     for row in overrides:
         if row.get("valid_until") is not None and row["valid_until"] <= now:
