@@ -790,3 +790,28 @@ def test_dynamic_protected_shell_tokens_fail_closed(command):
     api = _policy()
     result = api.evaluate(_context(api, tool_input={"command": command}), now=100)
     assert result.rule_id == "self.modify_guard" and result.evaluated_permission == "deny"
+
+
+@pytest.mark.parametrize("command,expected", [
+    ("git log # comment\nrm -rf /outside", False),
+    ("git log --grep=a#b\nrm -rf /outside", False),
+    ("git log # note", True),
+    ("git log # ; note", False),
+    ("git log --grep=a#b", True),
+    ("git log \\\nrm -rf /outside", True),
+    ('git log "; rm -rf /outside"', True),
+])
+def test_bash_argument_override_does_not_collapse_comments(command, expected):
+    api = _policy()
+    assert api.matches_tool_pattern("Bash(git log)", "Bash", {"command": command}) is expected
+
+
+@pytest.mark.parametrize("substitution", [
+    "$(rm -rf /outside)", "`rm -rf /outside`", "<(rm -rf /outside)", ">(rm -rf /outside)",
+])
+@pytest.mark.parametrize("quote", ["", "'", '\"'])
+def test_bash_argument_override_rejects_substitution_even_when_quoted(substitution, quote):
+    api = _policy()
+    # Payloads are strings for the pure classifier; no shell is invoked.
+    command = f"git log {quote}{substitution}{quote}"
+    assert not api.matches_tool_pattern("Bash(git log)", "Bash", {"command": command})

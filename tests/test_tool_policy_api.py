@@ -913,3 +913,29 @@ def test_resolve_sweep_advances_the_global_poll_throttle(tmp_path, monkeypatch):
         response = _signed(client, "GET", f'/agents/sample/policy/pending/{second.json()["pending_id"]}?wait=0')
         assert response.status_code == 200 and response.json() == {"state": "pending"}
         assert len(calls) == 1, "undue polling must honor the resolve-triggered sweep timestamp"
+
+
+@pytest.mark.parametrize("command", [
+    "git log # comment\nrm -rf /outside", "git log $(rm -rf /outside)",
+])
+def test_signed_bash_grant_cannot_hide_another_command(tmp_path, monkeypatch, command):
+    with _gateway(tmp_path, monkeypatch) as client:
+        broad = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "Bash", "decision": "deny",
+        })
+        scoped = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "Bash(git log)", "decision": "allow",
+        })
+        assert broad.status_code == scoped.status_code == 200
+        # Signed evaluation only; none of these shell strings are executed.
+        body = _body(tool="Bash", tool_id="safe-control")
+        body["tool_input"] = {"command": "git log --oneline"}
+        control = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert control.status_code == 200 and control.json()["decision"] == "allow"
+        body["tool_use_id"] = "hidden-command"
+        body["tool_input"] = {"command": command}
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert response.status_code == 200, response.text
+        assert response.json()["decision"] == "deny"
+        assert response.json()["override_id"] == broad.json()["id"]
+        assert response.json()["override_id"] != scoped.json()["id"]
