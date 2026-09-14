@@ -539,11 +539,17 @@ class StreamingSession(TransportReplacementMixin):
         # empty (intentionally adaptive).
         if self.agent_name:
             provider_env["PINKY_AGENT_NAME"] = self.agent_name
-        policy_agent = self._registry.get(self.agent_name) if self._registry and self.agent_name else None
-        provider_env["PINKY_TOOL_POLICY"] = (
-            os.environ.get("PINKY_TOOL_POLICY", "off")
-            if policy_agent and getattr(policy_agent, "tool_policy_enabled", False) is True else "off"
-        )
+        policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
+        try:
+            policy_agent = self._registry.get(self.agent_name) if self._registry and self.agent_name else None
+        except Exception as exc:
+            # A cache miss must consult server authority instead of disarming.
+            _log(f"WARNING tool policy flag lookup failed for {self.agent_name}: {exc}; "
+                 f"exporting armed, server-authoritative (configured mode={policy_mode})")
+        else:
+            if not policy_agent or getattr(policy_agent, "tool_policy_enabled", False) is not True:
+                policy_mode = "off"
+        provider_env["PINKY_TOOL_POLICY"] = policy_mode
         if effort:
             provider_env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:

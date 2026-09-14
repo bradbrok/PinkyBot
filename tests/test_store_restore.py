@@ -611,6 +611,10 @@ def test_schema_sentinel_inventory_is_complete_for_every_manifest_logical_store(
     assert "session_events" in sentinels["session_events"]
     assert "messages" in sentinels["conversations"]
     assert "messages_fts" in sentinels["conversations"]
+    assert set(sentinels["tool_policy"]) == {
+        "tool_policy_overrides", "tool_policy_pending",
+        "tool_policy_decisions", "tool_policy_allow_counts",
+    }
 
 
 @pytest.mark.parametrize("selection", ["unregistered", "absent", "nonregular", "symlink"])
@@ -812,3 +816,18 @@ def test_restore_cli_is_local_attended_wrapper_with_explicit_selection() -> None
     assert "restore_store" in source
     assert not any(name and name.startswith("urllib") for name in imported_modules | imported_from)
     assert "/internal/" not in source
+
+
+def test_tool_policy_schema_sentinels_exist_in_fresh_store(tmp_path: Path) -> None:
+    from pinky_daemon.tool_policy_store import ToolPolicyStore
+
+    store = ToolPolicyStore(str(tmp_path / "tool_policy.db"))
+    try:
+        actual = {row[0] for row in store._db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        )}
+        sentinels = _restore_module().STORE_SCHEMA_SENTINELS["tool_policy"]
+        assert sentinels
+        assert set(sentinels) <= actual
+    finally:
+        store.close()

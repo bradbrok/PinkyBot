@@ -232,11 +232,24 @@ class TestHookCommandQuoting:
             for h in bucket["hooks"]
         ]
         assert commands
+        policy_prefix = 'if [ "${PINKY_TOOL_POLICY:-off}" = "off" ]; then exit 0; fi; '
+        policy_commands = 0
         for cmd in commands:
-            tokens = shlex.split(cmd)
-            assert tokens[0] == "python3"
-            script = Path(tokens[1])
+            if cmd.startswith(policy_prefix):
+                policy_commands += 1
+                assert cmd.endswith(" || exit 2")
+                tokens = shlex.split(cmd.removeprefix(policy_prefix).removesuffix(" || exit 2"))
+                assert len(tokens) == 2
+                assert tokens[0] == "python3"
+                script = Path(tokens[1])
+                assert script == work_dir / ".claude" / "hook_tool_policy.py"
+            else:
+                tokens = shlex.split(cmd)
+                assert tokens[0] == "python3"
+                script = Path(tokens[1])
+            assert script.is_relative_to(work_dir)
             assert script.is_file(), f"hook script path mangled in: {cmd}"
+        assert policy_commands == 1
 
 
 class TestApproveUserDisplayName:

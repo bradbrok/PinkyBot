@@ -28,6 +28,10 @@ STORE_SCHEMA_SENTINELS: dict[str, tuple[str, ...]] = {
     "analytics": ("analytics_session_facts",),
     "agents": ("agents",),
     "agent_signing_keys": ("agent_signing_keys",),
+    "tool_policy": (
+        "tool_policy_overrides", "tool_policy_pending",
+        "tool_policy_decisions", "tool_policy_allow_counts",
+    ),
     "audit": ("audit_log",),
     "agent_comms": ("messages", "inbox"),
     "activity": ("activity_log",),

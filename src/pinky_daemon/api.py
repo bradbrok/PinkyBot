@@ -8049,8 +8049,10 @@ npm run build</pre>
     @app.post("/agents/{name}/policy/evaluate")
     async def evaluate_tool_policy(name: str, req: ToolPolicyEvaluateRequest, request: Request):
         agent = _policy_agent(request, name)
-        if policy_mode == "off" or not agent.tool_policy_enabled:
-            return {"decision": "allow", "mode": "off" if policy_mode == "off" else "disabled"}
+        if policy_mode == "off":
+            return {"decision": "allow", "mode": "off"}
+        if not agent.tool_policy_enabled:
+            return {"decision": "allow", "mode": "disabled", "reason_code": "policy_disabled"}
         started = time.monotonic()
         principal = (req.principal_class if os.environ.get("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY") == "1"
                      else "unknown")

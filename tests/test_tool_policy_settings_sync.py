@@ -212,3 +212,41 @@ def test_settings_sync_uses_exported_timeout_constant(tmp_path, monkeypatch):
                for h in b["hooks"] if "hook_tool_policy.py" in h["command"]]
     assert len(entries) == 1
     assert entries[0]["timeout"] == 661
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["off", "log", "enforce"])
+@pytest.mark.parametrize("transport", ["tmux", "sdk"])
+async def test_registry_lookup_failure_defers_policy_to_server(
+    tmp_path, monkeypatch, capsys, mode, transport,
+):
+    monkeypatch.setenv("PINKY_TOOL_POLICY", mode)
+    registry = MagicMock()
+    registry.get.side_effect = RuntimeError("test registry unavailable")
+    registry.get_signing_key.return_value = "sample-agent-key"
+    captured = []
+
+    class StopBeforeConnectError(Exception):
+        pass
+
+    def capture(options):
+        captured.append(options)
+        raise StopBeforeConnectError
+
+    config = StreamingSessionConfig(agent_name="sample", working_dir=str(tmp_path))
+    if transport == "tmux":
+        session = TmuxSession(config, registry=registry, tmux_control=MagicMock())
+        env = session._build_repl_env()
+    else:
+        monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", capture)
+        session = StreamingSession(config, registry=registry)
+        with pytest.raises(StopBeforeConnectError):
+            await session.connect()
+        env = captured[0].env
+    assert env["PINKY_TOOL_POLICY"] == mode
+    assert "PINKY_SESSION_SECRET" not in env
+    warning = capsys.readouterr().err
+    assert "WARNING" in warning
+    assert "tool policy flag lookup failed" in warning
+    assert "sample" in warning and "test registry unavailable" in warning
+    assert "exporting armed, server-authoritative" in warning

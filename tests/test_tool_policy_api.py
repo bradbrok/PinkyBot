@@ -108,7 +108,10 @@ def test_mode_matrix_and_decision_receipts(tmp_path, monkeypatch, mode, enabled,
         store = _store(client)
         rows = store.list_decisions("sample", 0, 10)
         if mode == "off" or not enabled:
-            assert data == {"decision": "allow", "mode": "off" if mode == "off" else "disabled"}
+            expected = {"decision": "allow", "mode": "off" if mode == "off" else "disabled"}
+            if mode != "off":
+                expected["reason_code"] = "policy_disabled"
+            assert data == expected
             assert rows == []
             assert store.count_pending() == 0
             assert store._db.execute("SELECT count(*) FROM tool_policy_allow_counts").fetchone()[0] == 0
