@@ -1795,6 +1795,7 @@ def create_api(
 
     wake_launch_history = _WakeLaunchHistory()
     active_boot_mcp_gate = None
+    boot_mcp_keys: set[tuple[str, str]] = set()
     policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
     if policy_mode not in {"off", "log", "enforce"}:
         raise ValueError("PINKY_TOOL_POLICY must be off, log, or enforce")
@@ -3938,7 +3939,7 @@ def create_api(
         resume_id: str = "",
     ):
         """Create, connect, and register a streaming session for an agent label."""
-        boot_mcp_gate = active_boot_mcp_gate
+        boot_mcp_gate = active_boot_mcp_gate if (agent_name, label) in boot_mcp_keys else None
         from pinky_daemon.codex_session import CodexSession
         from pinky_daemon.codex_tmux_session import CodexTmuxSession
         from pinky_daemon.streaming_session import (
@@ -13109,6 +13110,11 @@ npm run build</pre>
             _log("startup: invalid MCP readiness cap; using 120s")
         boot_mcp_gate = BootMcpReadiness(cap_sec=readiness_cap)
         active_boot_mcp_gate = boot_mcp_gate
+        boot_mcp_keys.update(
+            (agent.name, "main" if agent.name == main_name_for_boot else restart_sessions[agent.name])
+            for agent in all_agents
+            if agent.name == main_name_for_boot or agent.name in restart_sessions
+        )
         if readiness_cap == 0:
             _log("startup: mcp readiness gate disabled")
         boot_launches = []
@@ -13283,6 +13289,7 @@ npm run build</pre>
             await asyncio.gather(*boot_launches, return_exceptions=True)
             await boot_mcp_gate.close()
             active_boot_mcp_gate = None
+            boot_mcp_keys.clear()
             readiness = boot_mcp_gate.report()
             up = sum(r.status == "up" for r in readiness.results.values())
             unreachable = sum(r.status == "unreachable" for r in readiness.results.values())

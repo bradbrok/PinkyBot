@@ -157,6 +157,42 @@ async def test_local_agent_and_poller_start_while_remote_probe_pending(
 
 
 @pytest.mark.asyncio
+async def test_boot_gate_does_not_cancel_unrelated_on_demand_launch(boot_app, tmp_path, monkeypatch):
+    app, trace = boot_app
+    _agent(app, tmp_path)
+    _agent(app, tmp_path, "late")
+    _remote(app, "late")
+    late_started = asyncio.Event()
+    release = asyncio.Event()
+    inbound = []
+
+    async def probe(*args, **kwargs):
+        await release.wait()
+
+    async def connect(session):
+        if session.agent_name == "primary":
+            inbound.append(asyncio.create_task(app.state.broker._ensure_session_callback("late")))
+            await asyncio.wait_for(late_started.wait(), timeout=1)
+        else:
+            late_started.set()
+        trace.append(("launch", session.agent_name))
+        session._state_machine._state = SessionState.CONNECTED
+
+    probe_mock = AsyncMock(side_effect=probe)
+    monkeypatch.setattr(asyncio, "open_connection", probe_mock)
+    monkeypatch.setattr(TmuxSession, "connect", connect)
+    monkeypatch.setenv("PINKY_MCP_READINESS_CAP_SEC", "2")
+    try:
+        async with app.router.lifespan_context(app):
+            await asyncio.wait_for(inbound[0], timeout=3)
+            assert ("launch", "primary") in trace and ("launch", "late") in trace
+            probe_mock.assert_not_awaited()
+    finally:
+        release.set()
+        await asyncio.gather(*inbound, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 @pytest.mark.parametrize("disabled", [False, True])
 async def test_stdio_or_disabled_gate_launches_without_probe(
     boot_app, tmp_path, monkeypatch, capsys, disabled,
