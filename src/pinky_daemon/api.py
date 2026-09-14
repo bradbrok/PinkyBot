@@ -8069,7 +8069,13 @@ npm run build</pre>
                            "reason": row["reason"], "latency_ms": latency_ms},
         })
 
-    def _policy_expire(now: float):
+    def _policy_expire(now: float, *, throttled: bool = False):
+        global _TOOL_POLICY_LAST_EXPIRE
+        with _TOOL_POLICY_EXPIRE_LOCK:
+            tick = time.monotonic()
+            if throttled and tick - _TOOL_POLICY_LAST_EXPIRE < 5:
+                return
+            _TOOL_POLICY_LAST_EXPIRE = tick
         for pending_id in tool_policy_store.expire_due(now):
             _policy_resolution_event(pending_id)
 
@@ -8147,7 +8153,6 @@ npm run build</pre>
 
     @app.get("/agents/{name}/policy/pending/{pending_id}")
     async def get_tool_policy_pending(name: str, pending_id: str, request: Request, wait: float = 0):
-        global _TOOL_POLICY_LAST_EXPIRE
         _policy_agent(request, name)
         stop = time.monotonic() + max(0, min(30, wait))
         while True:
@@ -8155,15 +8160,10 @@ npm run build</pre>
             if row is None or row["agent_name"] != name:
                 raise HTTPException(404, "pending decision not found")
             now = time.time()
-            with _TOOL_POLICY_EXPIRE_LOCK:
-                tick = time.monotonic()
-                sweep = (row["state"] == "pending" and row["deadline_ts"] <= now) or (
-                    tick - _TOOL_POLICY_LAST_EXPIRE >= 5
-                )
-                if sweep:
-                    _TOOL_POLICY_LAST_EXPIRE = tick
-            if sweep:
-                _policy_expire(now)
+            due = row["state"] == "pending" and row["deadline_ts"] <= now
+            if due or time.monotonic() - _TOOL_POLICY_LAST_EXPIRE >= 5:
+                # Recheck under the shared lock to avoid competing poll sweeps.
+                _policy_expire(now, throttled=not due)
                 row = tool_policy_store.get_pending(pending_id)
             if row["state"] == "resolved":
                 return {key: row[key] for key in ("state", "result", "resolved_by", "reason")}

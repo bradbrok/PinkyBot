@@ -89,6 +89,8 @@ def _pause(client):
     response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
     assert response.status_code == 200, response.text
     assert response.json()["decision"] == "pause", response.text
+    assert response.json()["poll_after_s"] == 25
+    assert 560 <= response.json()["deadline_ts"] - time.time() <= 571
     return response.json(), body
 
 
@@ -130,10 +132,6 @@ def test_mode_matrix_and_decision_receipts(tmp_path, monkeypatch, mode, enabled,
             else:
                 events = client.app.state.session_event_store.get_for_agent("sample")
                 assert any(e["event_type"] == "tool_policy.decision" for e in events)
-                if decision == "pause":
-                    assert data["poll_after_s"] == 25
-                    assert 560 <= data["deadline_ts"] - time.time() <= 571
-                    assert store.count_pending() == 1
 
 
 @pytest.mark.parametrize("isolated", [False, True])
@@ -878,3 +876,40 @@ def test_pending_poll_throttles_global_writes_but_expires_due_row(tmp_path, monk
             assert 3 <= elapsed < 5
             assert len(calls) <= 1
             assert reads.count(pause["pending_id"]) >= 4
+
+
+
+def test_resolve_sweep_advances_the_global_poll_throttle(tmp_path, monkeypatch):
+    import pinky_daemon.api as api_module
+
+    with _gateway(tmp_path, monkeypatch) as client:
+        pause, body = _pause(client)
+        second = _signed(client, "POST", "/agents/sample/policy/evaluate", body=_body(tool_id="tool-2"))
+        assert second.status_code == 200 and second.json()["decision"] == "pause"
+        store = _store(client)
+        calls = []
+        expire = store.expire_due
+        real_time = api_module.time
+        # Put any preceding poll sweep beyond the five-second throttle window.
+        now = real_time.monotonic() + 10
+
+        class Clock:
+            def __getattr__(self, name):
+                return getattr(real_time, name)
+
+            def monotonic(self):
+                return now
+
+        def observed(timestamp):
+            calls.append(timestamp)
+            return expire(timestamp)
+
+        monkeypatch.setattr(api_module, "time", Clock())
+        monkeypatch.setattr(store, "expire_due", observed)
+        response = _owner(client, "POST", f'/agents/sample/policy/pending/{pause["pending_id"]}/resolve',
+                          body=_binding(body))
+        assert response.status_code == 200
+        assert len(calls) == 1, "owner resolution performs a global expiry sweep"
+        response = _signed(client, "GET", f'/agents/sample/policy/pending/{second.json()["pending_id"]}?wait=0')
+        assert response.status_code == 200 and response.json() == {"state": "pending"}
+        assert len(calls) == 1, "undue polling must honor the resolve-triggered sweep timestamp"
