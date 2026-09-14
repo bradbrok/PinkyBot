@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 import sys
 import time
 from dataclasses import dataclass, field
@@ -538,6 +539,11 @@ class StreamingSession(TransportReplacementMixin):
         # empty (intentionally adaptive).
         if self.agent_name:
             provider_env["PINKY_AGENT_NAME"] = self.agent_name
+        policy_agent = self._registry.get(self.agent_name) if self._registry and self.agent_name else None
+        provider_env["PINKY_TOOL_POLICY"] = (
+            os.environ.get("PINKY_TOOL_POLICY", "off")
+            if policy_agent and getattr(policy_agent, "tool_policy_enabled", False) is True else "off"
+        )
         if effort:
             provider_env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:

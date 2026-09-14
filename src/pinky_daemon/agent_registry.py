@@ -504,6 +504,26 @@ def validate_restart_tokens_cap(value: object) -> int:
     return value
 
 
+TOOL_POLICY_HOOK_DEADLINE_SEC = 600
+TOOL_POLICY_HOOK_TIMEOUT_SEC = 660
+
+
+def _tool_policy_hook_source(agent_name: str) -> str:
+    from pinky_daemon.tool_policy import STATIC_ALLOW_TOOLS, TIMEOUT_REASON, UNAVAILABLE_REASON
+    from pinky_daemon.tool_policy_hook import HOOK_TEMPLATE
+
+    source = HOOK_TEMPLATE
+    for marker, value in {
+        "__POLICY_AGENT__": _validate_agent_name(agent_name),
+        "__POLICY_STATIC__": sorted(STATIC_ALLOW_TOOLS),
+        "__POLICY_DEADLINE__": TOOL_POLICY_HOOK_DEADLINE_SEC,
+        "__POLICY_UNAVAILABLE__": UNAVAILABLE_REASON,
+        "__POLICY_TIMEOUT__": TIMEOUT_REASON,
+    }.items():
+        source = source.replace(marker, repr(value))
+    return source
+
+
 @dataclass
 class Agent:
     """A named agent with persistent identity."""
@@ -594,6 +614,8 @@ class Agent:
     # Resolves to xhigh for the actual effort knob (the CLI flag rejects the
     # literal "ultracode"); the workflow-by-default behavior is injected via
     # ULTRACODE_DIRECTIVE in build_system_prompt.
+    # Action policy is opt-in and may only be changed through explicit updates.
+    tool_policy_enabled: bool = False
     # When True, the verify_effort CLI hook blocks tool calls if the runtime
     # effort drifts from thinking_effort. Default False (warn-only): drift is
     # surfaced to /agents/{name}/effort-drift + heartbeat but does not block.
@@ -672,6 +694,7 @@ class Agent:
             "provider_ref": self.provider_ref,
             "codex_home": self.codex_home,
             "thinking_effort": self.thinking_effort,
+            "tool_policy_enabled": self.tool_policy_enabled,
             "strict_effort_enforcement": self.strict_effort_enforcement,
             "dedicated_config_dir": self.dedicated_config_dir,
             "watchdog_config": self.watchdog_config,
@@ -1997,6 +2020,7 @@ class AgentRegistry:
             row[1] for row in self._db.execute("PRAGMA table_info(agents)").fetchall()
         }
         migrations = [
+            ("tool_policy_enabled", "INTEGER NOT NULL DEFAULT 0"),
             ("auto_start", "INTEGER NOT NULL DEFAULT 0"),
             # HTTP create-only registration commits its ownership claim before
             # fallible provisioning/MCP publication. Pre-upgrade rows are all
@@ -2723,6 +2747,13 @@ except Exception as exc:
             agent_name=agent_name,
         )
 
+        policy_path = resolve_agent_path(agent_name, work_dir, ".claude", "hook_tool_policy.py")
+        AgentRegistry._write_hook_if_changed(
+            agent_dir=work_dir, hook_path=policy_path,
+            new_source=_tool_policy_hook_source(agent_name),
+            hook_filename="hook_tool_policy.py", agent_name=agent_name,
+        )
+
         AgentRegistry._sync_hooks_settings(
             resolve_agent_path(agent_name, work_dir, ".claude", "settings.json"),
             agent_dir=work_dir,
@@ -2814,6 +2845,10 @@ except Exception as exc:
             f"python3 {shlex.quote(str(tmux_stop_failure_path))} 2>/dev/null || true"
         )
 
+        policy_path = resolve_agent_path(agent_name, agent_dir, ".claude", "hook_tool_policy.py")
+        policy_cmd = ('if [ "${PINKY_TOOL_POLICY:-off}" = "off" ]; then exit 0; fi; '
+                      f'python3 {shlex.quote(str(policy_path))} || exit 2')
+
         if not settings_path.exists():
             settings = {
                 "permissions": {
@@ -2825,6 +2860,8 @@ except Exception as exc:
                         {
                             "matcher": ".*",
                             "hooks": [
+                                {"type": "command", "command": policy_cmd,
+                                 "timeout": TOOL_POLICY_HOOK_TIMEOUT_SEC},
                                 {"type": "command", "command": working_cmd},
                                 {"type": "command", "command": verify_cmd},
                                 # Task #93: tool-use start (no-op for non-tmux).
@@ -2992,6 +3029,11 @@ except Exception as exc:
             command=tmux_stop_failure_cmd,
         )
 
+        changed |= AgentRegistry._merge_hook_into_event(
+            hooks, "PreToolUse", needle=str(policy_path), command=policy_cmd,
+            timeout=TOOL_POLICY_HOOK_TIMEOUT_SEC,
+        )
+
         if changed:
             replace_agent_text(
                 agent_name,
@@ -3006,7 +3048,7 @@ except Exception as exc:
 
     @staticmethod
     def _merge_hook_into_event(
-        hooks: dict, event: str, *, needle: str, command: str,
+        hooks: dict, event: str, *, needle: str, command: str, timeout: int | None = None,
     ) -> bool:
         """Insert ``command`` into ``hooks[event]`` if no entry containing
         ``needle`` exists. Returns True iff the structure was modified.
@@ -3018,7 +3060,8 @@ except Exception as exc:
         for entry in event_list:
             for h in entry.get("hooks", []):
                 if needle in (h.get("command") or ""):
-                    if h.get("type") == "command" and h.get("command") == command:
+                    if (h.get("type") == "command" and h.get("command") == command
+                            and (timeout is None or h.get("timeout") == timeout)):
                         return False
                     # PinkyBot-managed hook paths are the identity.  Upgrade
                     # stale command wrappers in place (for example, remove the
@@ -3026,6 +3069,8 @@ except Exception as exc:
                     # treating any path match as permanently current.
                     h["type"] = "command"
                     h["command"] = command
+                    if timeout is not None:
+                        h["timeout"] = timeout
                     return True
 
         target_bucket = None
@@ -3038,7 +3083,8 @@ except Exception as exc:
             event_list.append(target_bucket)
 
         target_bucket.setdefault("hooks", []).append(
-            {"type": "command", "command": command}
+            {"type": "command", "command": command,
+             **({"timeout": timeout} if timeout is not None else {})}
         )
         return True
 
@@ -3204,7 +3250,7 @@ except Exception as exc:
                         "librarian_enabled", "librarian_schedule",
                         "runtime", "transport", "provider_url", "provider_model", "provider_ref",
                         "codex_home",
-                        "thinking_effort", "strict_effort_enforcement",
+                        "thinking_effort", "strict_effort_enforcement", "tool_policy_enabled",
                         "dedicated_config_dir", "isolated",
                         "isolation_mode", "container_image"):
                 if key in kwargs:
@@ -3224,7 +3270,7 @@ except Exception as exc:
 
             for key in ("auto_restart", "enabled", "auto_start", "clock_aligned",
                         "plain_text_fallback", "dream_enabled", "dream_notify",
-                        "librarian_enabled", "strict_effort_enforcement",
+                        "librarian_enabled", "strict_effort_enforcement", "tool_policy_enabled",
                         "dedicated_config_dir", "isolated"):
                 if key in updates:
                     updates[key] = int(updates[key])
@@ -3418,6 +3464,7 @@ except Exception as exc:
 
     def register(self, name: str, *, create_only: bool = False, **kwargs) -> Agent:
         """Register atomically, including cross-agent workspace ownership."""
+        kwargs.pop("tool_policy_enabled", None)
         name = _validate_agent_name(name)
         if "restart_tokens_cap" in kwargs:
             validate_restart_tokens_cap(kwargs["restart_tokens_cap"])
@@ -3618,7 +3665,8 @@ except Exception as exc:
         "runtime, transport, provider_url, provider_key, provider_model, provider_ref, "
         "disallowed_tools, thinking_effort, watchdog_config, last_seen_at, "
         "strict_effort_enforcement, context_nudge_threshold_pct, isolated, "
-        "isolation_mode, container_image, dedicated_config_dir, codex_home, restart_tokens_cap"
+        "isolation_mode, container_image, dedicated_config_dir, codex_home, restart_tokens_cap, "
+        "tool_policy_enabled"
     )
 
     def get(self, name: str) -> Agent | None:
@@ -8625,6 +8673,7 @@ except Exception as exc:
             dedicated_config_dir=bool(row[54]) if len(row) > 54 else False,
             codex_home=row[55] if len(row) > 55 and row[55] else "",
             restart_tokens_cap=row[56] if len(row) > 56 else 0,
+            tool_policy_enabled=bool(row[57]) if len(row) > 57 else False,
         )
 
     # ── Cost Tracking ──────────────────────────────────────

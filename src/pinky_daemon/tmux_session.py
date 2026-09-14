@@ -4368,6 +4368,11 @@ class TmuxSession(TransportReplacementMixin):
         # the runtime $CLAUDE_EFFORT, which reports xhigh under ultracode — so
         # expect xhigh, not the literal "ultracode", to avoid false drift.
         effort = resolve_cli_effort(self.effective_effort)
+        policy_agent = self._registry.get(self.agent_name) if self._registry and self.agent_name else None
+        env["PINKY_TOOL_POLICY"] = (
+            os.environ.get("PINKY_TOOL_POLICY", "off")
+            if policy_agent and getattr(policy_agent, "tool_policy_enabled", False) is True else "off"
+        )
         if effort:
             env["PINKY_EXPECTED_EFFORT"] = effort
         if self._config.strict_effort_enforcement:

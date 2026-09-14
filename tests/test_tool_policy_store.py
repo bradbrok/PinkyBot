@@ -196,7 +196,7 @@ def test_allow_counts_and_full_decisions_remain_separate(tmp_path):
 
 
 def test_catalog_registration_and_manifest_ownership(tmp_path):
-    catalog = StoreCatalog(expected_root=tmp_path)
+    catalog = StoreCatalog(expected_root=tmp_path, silence_allowlist={})
     store = _store(tmp_path, catalog=catalog)
     try:
         [entry] = catalog.snapshot()

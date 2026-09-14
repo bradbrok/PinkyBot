@@ -125,6 +125,9 @@ from pinky_daemon.api_models import (
     SpawnSessionRequest,
     StoreSnapshotRequest,
     TmuxPaneKeysRequest,
+    ToolPolicyEvaluateRequest,
+    ToolPolicyOverrideRequest,
+    ToolPolicyResolveRequest,
     TransportStopFailureRequest,
     TransportToolResultRequest,
     TransportToolUseRequest,
@@ -205,6 +208,7 @@ from pinky_daemon.shared_mcp import (
 )
 from pinky_daemon.skill_loader import discover_all_skills, register_discovered_skills
 from pinky_daemon.skill_store import SkillStore
+from pinky_daemon.skill_tool_policy import ToolPatternValidationError, parse_tool_pattern
 from pinky_daemon.storage_observability import StorageObservability
 from pinky_daemon.store_catalog import (
     DaemonStoreCatalog,
@@ -226,6 +230,12 @@ from pinky_daemon.store_snapshot import (
 )
 from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
+from pinky_daemon.tool_policy import (
+    UNAVAILABLE_REASON as POLICY_UNAVAILABLE_REASON,
+)
+from pinky_daemon.tool_policy import PolicyContext
+from pinky_daemon.tool_policy import evaluate as evaluate_policy
+from pinky_daemon.tool_policy_store import ToolPolicyStore
 
 # Alias: pinky_daemon.sessions.SessionState (imported above) is the
 # harness/agent-SDK lifecycle enum (running/closed); the import below is the
@@ -1764,6 +1774,17 @@ def create_api(
     db_path: str = "data/conversations.db",
 ) -> FastAPI:
     """Create the FastAPI application."""
+    policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
+    if policy_mode not in {"off", "log", "enforce"}:
+        raise ValueError("PINKY_TOOL_POLICY must be off, log, or enforce")
+    try:
+        policy_ttl = float(os.environ.get("PINKY_TOOL_POLICY_TTL_SEC", "570"))
+    except ValueError:
+        raise ValueError("PINKY_TOOL_POLICY_TTL_SEC must be a number below 600") from None
+    if not math.isfinite(policy_ttl) or not 0 < policy_ttl < 600:
+        raise ValueError("PINKY_TOOL_POLICY_TTL_SEC must be positive and below 600")
+    policy_log_allows = os.environ.get("PINKY_TOOL_POLICY_LOG_ALLOWS", "1" if policy_mode == "log" else "0") == "1"
+
 
     db_path = os.path.realpath(db_path)
     _data_dir = Path(db_path).parent
@@ -1941,6 +1962,13 @@ def create_api(
     _run_grandfather_approved_users_migration(store, agents)
     audit = AuditStore(db_path=store_manifest["audit"].path, catalog=store_catalog)
     app.state.audit = audit
+    tool_policy_store = ToolPolicyStore(store_manifest["tool_policy"].path, catalog=store_catalog)
+    app.state.tool_policy_store = tool_policy_store
+    armed = sorted(a.name for a in agents.list() if a.tool_policy_enabled)
+    if policy_mode != "off" and armed:
+        _log(f"TOOL_POLICY ARMED mode={policy_mode} agents=[{','.join(armed)}]")
+    else:
+        _log(f"TOOL_POLICY INERT (PINKY_TOOL_POLICY={os.environ.get('PINKY_TOOL_POLICY', 'unset')})")
     hooks = HookManager(audit_store=audit)
 
     # In-memory live status for agents (updated by POST /agents/{name}/status).
@@ -7975,8 +8003,177 @@ npm run build</pre>
             "groups": agent.groups,
         }
 
+    # Action policy routes compose with the existing signed caller and owner gates.
+    def _policy_agent(request: Request, name: str):
+        name = _agent_name_or_400(name)
+        if getattr(request.state, "internal_caller", None) != name:
+            raise HTTPException(403, "verified caller must match the target agent")
+        agent = agents.get(name)
+        if agent is None:
+            raise HTTPException(404, "agent not found")
+        return agent
+
+    def _policy_owner(request: Request) -> str:
+        return "owner:" + _owner_control_actor(request).removeprefix("ui:")
+
+    def _policy_resolution_event(pending_id: str):
+        row = tool_policy_store.get_pending(pending_id)
+        if row is None or row["state"] != "resolved":
+            return
+        previous = next((r for r in tool_policy_store.list_decisions(row["agent_name"], 0, 1000)
+                         if r["tool_use_id"] == row["tool_use_id"] and r["evaluated_permission"] == "pause"), None)
+        detail = {"type": "rule", "reason_code": "owner_only", "principal_class": "group",
+                  "input_sha256": row["input_sha256"]}
+        if previous:
+            detail.update({key: previous[key] for key in ("reason_code", "principal_class", "input_sha256")})
+            detail["type"] = previous["eval_type"]
+            if previous["rule_id"]:
+                detail["rule_id"] = previous["rule_id"]
+        record = {"evaluated_permission": "pause", "evaluation": detail}
+        tool_policy_store.record_decision(
+            agent_name=row["agent_name"], session_id=row["session_id"], tool_use_id=row["tool_use_id"],
+            tool_name=row["tool_name"], evaluation=record, result=row["result"], resolved_by=row["resolved_by"],
+            latency_ms=max(0, (row["resolved_at"] - row["created_at"]) * 1000),
+            hook_sha256=previous["hook_sha256"] if previous else None,
+            settings_sha256=previous["settings_sha256"] if previous else None,
+        )
+        session_event_store.log(row["session_id"], row["agent_name"], "tool_policy.decision", metadata={
+            **record, "resolution": {"result": row["result"], "by": row["resolved_by"]},
+        })
+
+    def _policy_expire(now: float):
+        for pending_id in tool_policy_store.expire_due(now):
+            _policy_resolution_event(pending_id)
+
+    @app.post("/agents/{name}/policy/evaluate")
+    async def evaluate_tool_policy(name: str, req: ToolPolicyEvaluateRequest, request: Request):
+        agent = _policy_agent(request, name)
+        if policy_mode == "off" or not agent.tool_policy_enabled:
+            return {"decision": "allow", "mode": "off" if policy_mode == "off" else "disabled"}
+        started = time.monotonic()
+        principal = (req.principal_class if os.environ.get("PINKY_TOOL_POLICY_TRUST_PRINCIPAL_BODY") == "1"
+                     else "unknown")
+        known = {f'{d["platform"]}:{d["conversation_id"]}'
+                 for d in agents.get_owner_notification_destinations()}
+        known.update(user.chat_id for user in agents.list_approved_users(name) if user.status == "approved")
+        ctx = PolicyContext(
+            agent_name=name, isolated=agent.isolated, principal_class=principal,
+            transport=req.transport, tool_name=req.tool_name, tool_input=req.tool_input,
+            agent_dir=agent.working_dir, home_dir=str(Path.home()), tmp_roots=[tempfile.gettempdir()],
+            known_recipients=frozenset(known), data_roots=[str(_data_dir)], public_remotes=[],
+            repo_default_branches={}, is_worktree_checkout=(Path(agent.working_dir) / ".git").is_file(),
+            cwd=agent.working_dir,
+        )
+        now = time.time()
+        try:
+            evaluated = evaluate_policy(ctx, overrides=tool_policy_store.list_overrides(name, now), now=now)
+        except Exception:
+            evaluated = evaluate_policy(ctx, now=now, unavailable=True)
+        record = evaluated.to_record()
+        permission = evaluated.evaluated_permission
+        outcome = (f"would_{permission}" if permission != "allow" else "allow") if policy_mode == "log" else permission
+        pending = None
+        if permission == "pause" and policy_mode == "enforce":
+            try:
+                pending_id = tool_policy_store.create_pending(
+                    agent_name=name, session_id=req.session_id, tool_use_id=req.tool_use_id,
+                    tool_name=req.tool_name, input_sha256=evaluated.input_sha256,
+                    summary=f"tool={req.tool_name}", created_at=now, deadline_ts=now + policy_ttl,
+                )
+            except ValueError:
+                raise HTTPException(422, "pending binding mismatch") from None
+            pending = tool_policy_store.get_pending(pending_id)
+        if permission != "allow" or policy_log_allows:
+            tool_policy_store.record_decision(
+                agent_name=name, session_id=req.session_id, tool_use_id=req.tool_use_id,
+                tool_name=req.tool_name, evaluation=record, result=outcome,
+                latency_ms=(time.monotonic() - started) * 1000,
+                hook_sha256=req.hook_sha256, settings_sha256=req.settings_sha256,
+            )
+        else:
+            tool_policy_store.bump_allow_count(agent=name, rule_id=evaluated.rule_id or evaluated.type,
+                                               day=time.strftime("%Y-%m-%d", time.gmtime(now)))
+        if permission != "allow":
+            session_event_store.log(req.session_id, name, "tool_policy.decision", metadata=record)
+        if policy_mode == "log" or permission == "allow":
+            return {"decision": "allow"}
+        if permission == "deny":
+            reason = (f"Denied by policy rule {evaluated.rule_id}: {evaluated.reason_code}."
+                      if evaluated.rule_id else POLICY_UNAVAILABLE_REASON)
+            return {"decision": "deny", "reason": reason, "rule_id": evaluated.rule_id}
+        return {"decision": "pause", "pending_id": pending["pending_id"],
+                "deadline_ts": pending["deadline_ts"], "poll_after_s": 25}
+
+    @app.get("/agents/{name}/policy/pending/{pending_id}")
+    async def get_tool_policy_pending(name: str, pending_id: str, request: Request, wait: float = 0):
+        _policy_agent(request, name)
+        stop = time.monotonic() + max(0, min(30, wait))
+        while True:
+            row = tool_policy_store.get_pending(pending_id)
+            if row is None or row["agent_name"] != name:
+                raise HTTPException(404, "pending decision not found")
+            _policy_expire(time.time())
+            row = tool_policy_store.get_pending(pending_id)
+            if row["state"] == "resolved":
+                return {key: row[key] for key in ("state", "result", "resolved_by", "reason")}
+            remaining = stop - time.monotonic()
+            if remaining <= 0:
+                return {"state": "pending"}
+            await asyncio.sleep(min(0.5, remaining))
+
+    @app.post("/agents/{name}/policy/pending/{pending_id}/resolve")
+    async def resolve_tool_policy(name: str, pending_id: str, req: ToolPolicyResolveRequest, request: Request):
+        actor = _policy_owner(request)
+        row = tool_policy_store.get_pending(pending_id)
+        if row is None or row["agent_name"] != name:
+            raise HTTPException(404, "pending decision not found")
+        _policy_expire(time.time())
+        status = tool_policy_store.resolve_pending(
+            pending_id, agent=name, tool_use_id=req.tool_use_id, input_sha256=req.input_sha256,
+            result=req.result, resolved_by=actor, reason=req.reason,
+        )
+        if status != "resolved":
+            raise HTTPException({"not_found": 404, "already_resolved": 409, "binding_mismatch": 422}[status], status)
+        _policy_resolution_event(pending_id)
+        return {"status": "resolved"}
+
+    @app.get("/agents/{name}/policy/overrides")
+    async def get_tool_policy_overrides(name: str):
+        return tool_policy_store.list_overrides(name, time.time())
+
+    @app.put("/agents/{name}/policy/overrides")
+    async def put_tool_policy_override(name: str, req: ToolPolicyOverrideRequest, request: Request):
+        actor = _policy_owner(request)
+        try:
+            parse_tool_pattern(req.pattern)
+        except ToolPatternValidationError:
+            raise HTTPException(422, "invalid tool pattern") from None
+        if req.valid_until is not None and not math.isfinite(req.valid_until):
+            raise HTTPException(422, "invalid expiration")
+        oid = tool_policy_store.put_override(agent=name, created_by=actor, **req.model_dump())
+        return {"id": oid, **req.model_dump(), "created_by": actor}
+
+    @app.delete("/agents/{name}/policy/overrides/{override_id}")
+    async def delete_tool_policy_override(name: str, override_id: int, request: Request):
+        _policy_owner(request)
+        if not tool_policy_store.delete_override(agent=name, override_id=override_id):
+            raise HTTPException(404, "override not found")
+        return {"deleted": True}
+
+    @app.get("/agents/{name}/policy/decisions")
+    async def get_tool_policy_decisions(name: str, since: float = 0, limit: int = 100):
+        return tool_policy_store.list_decisions(name, since, limit)
+
+    @app.get("/system/tool-policy")
+    async def get_tool_policy_status():
+        return {"mode": policy_mode,
+                "armed_agents": sorted(a.name for a in agents.list() if a.tool_policy_enabled)
+                if policy_mode != "off" else [],
+                "pending_count": tool_policy_store.count_pending(),
+                "tamper_count_24h": tool_policy_store.tamper_count_since(time.time() - 86400)}
+
     @app.put("/agents/{name}")
-    async def update_agent(name: str, req: UpdateAgentRequest):
+    async def update_agent(name: str, req: UpdateAgentRequest, request: Request):
         """Update an agent's configuration."""
         name = _agent_name_or_400(name)
         existing = agents.get(name)
@@ -7984,6 +8181,10 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        policy_enabled = kwargs.pop("tool_policy_enabled", None)
+        if policy_enabled is not None:
+            _owner_control_actor(request)
+
         force_soul = bool(kwargs.pop("force_soul", False))
         # #638: flipping an agent to a non-local isolation_mode implies
         # isolated=True (same coupling RegisterAgentRequest enforces) — without
@@ -8027,6 +8228,9 @@ npm run build</pre>
             raise HTTPException(409, {"code": "agent_workspace_overlap"}) from exc
         except (AgentPathContainmentError, AgentWorkspacePathError) as exc:
             raise HTTPException(400, {"code": "invalid_agent_workspace"}) from exc
+
+        if policy_enabled is not None:
+            agent = agents.update(name, tool_policy_enabled=policy_enabled)
 
         isolation_touched = "isolation_mode" in kwargs or "container_image" in kwargs
         if isolation_touched:
