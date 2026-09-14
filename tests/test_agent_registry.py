@@ -1308,6 +1308,17 @@ def test_resolve_agent_path_refuses_out_of_tree_alias(tmp_path):
     assert outside.read_text() == "victim-private"
 
 
+@pytest.mark.parametrize("absolute", [False, True])
+def test_resolve_agent_path_refuses_escaping_parts(tmp_path, absolute):
+    owner_root = tmp_path / "alice"
+    owner_root.mkdir()
+    outside = tmp_path / "alice-other" / "CLAUDE.md"
+    parts = (outside,) if absolute else ("..", "alice-other", "CLAUDE.md")
+
+    with pytest.raises(AgentPathContainmentError):
+        resolve_agent_path("alice", owner_root, *parts)
+
+
 @pytest.mark.parametrize("owner_root", ["", "relative/agent-root"])
 def test_resolve_agent_path_requires_persisted_absolute_owner_root(owner_root):
     with pytest.raises(AgentPathContainmentError):

@@ -946,3 +946,23 @@ def test_signed_bash_grant_cannot_hide_another_command(tmp_path, monkeypatch, co
         assert response.json()["decision"] == "deny"
         assert response.json()["override_id"] == broad.json()["id"]
         assert response.json()["override_id"] != scoped.json()["id"]
+
+
+@pytest.mark.parametrize("pending_id", [
+    "tp_invalid", "tp_" + "a" * 15, "tp_" + "a" * 17,
+    "tp_" + "A" * 16, "xp_" + "a" * 16,
+])
+@pytest.mark.parametrize("method", ["GET", "POST"])
+def test_malformed_pending_token_is_404_without_store_query(
+    tmp_path, monkeypatch, pending_id, method
+):
+    with _gateway(tmp_path, monkeypatch) as client:
+        queries = []
+        monkeypatch.setattr(_store(client), "get_pending", lambda token: queries.append(token))
+        path = f"/agents/sample/policy/pending/{pending_id}"
+        if method == "GET":
+            response = _signed(client, method, path)
+        else:
+            response = _owner(client, method, path + "/resolve", body=_binding(_body()))
+        assert response.status_code == 404, response.text
+        assert queries == [], "malformed pending tokens must be rejected before a store query"
