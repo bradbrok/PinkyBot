@@ -136,6 +136,7 @@ def resolve_agent_path(
     absolute children, symlinks, and case-normalized aliases cannot escape
     the workspace.  The agent name is validated here as well so every path
     boundary shares the registry's existing strict allowlist.
+    A lexical containment guard runs before filesystem resolution.
     """
     _validate_agent_name(agent_name)
     if not agent_dir:
@@ -143,9 +144,12 @@ def resolve_agent_path(
     workspace_path = Path(agent_dir)
     if not workspace_path.is_absolute():
         raise AgentPathContainmentError("agent workspace is not an absolute path")
-    workspace = workspace_path.resolve()
-    candidate = workspace.joinpath(*parts) if parts else workspace
-    resolved = candidate.resolve()
+    base = os.path.normpath(str(workspace_path))
+    candidate = os.path.normpath(os.path.join(base, *(str(p) for p in parts))) if parts else base
+    if candidate != base and not candidate.startswith(base + os.sep):
+        raise AgentPathContainmentError("agent path is outside its workspace")
+    workspace = Path(base).resolve()
+    resolved = Path(candidate).resolve()
     if resolved != workspace and not resolved.is_relative_to(workspace):
         raise AgentPathContainmentError("agent path is outside its workspace")
     return resolved

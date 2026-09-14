@@ -8045,14 +8045,15 @@ npm run build</pre>
             detail["rule_id"] = source["rule_id"]
         if missing:
             logging.getLogger(__name__).error(
-                "tool policy provenance missing: agent=%s pending_id=%s", row["agent_name"], pending_id,
+                "tool policy provenance missing: agent=%s pending_id=%s",
+                row["agent_name"], row["pending_id"],
             )
             detail = {"type": "unavailable", "reason_code": "policy_unavailable",
                       "principal_class": "unknown", "input_sha256": row["input_sha256"]}
         elif previous is None:
             logging.getLogger(__name__).warning(
                 "tool policy audit row missing; using pending provenance: agent=%s pending_id=%s",
-                row["agent_name"], pending_id,
+                row["agent_name"], row["pending_id"],
             )
         record = {"evaluated_permission": "pause", "evaluation": detail}
         latency_ms = max(0, (row["resolved_at"] - row["created_at"]) * 1000)
@@ -8154,6 +8155,8 @@ npm run build</pre>
     @app.get("/agents/{name}/policy/pending/{pending_id}")
     async def get_tool_policy_pending(name: str, pending_id: str, request: Request, wait: float = 0):
         _policy_agent(request, name)
+        if not re.fullmatch(r"\Atp_[0-9a-f]{16}\Z", pending_id):
+            raise HTTPException(404, "pending decision not found")
         stop = time.monotonic() + max(0, min(30, wait))
         while True:
             row = tool_policy_store.get_pending(pending_id)
@@ -8175,6 +8178,8 @@ npm run build</pre>
     @app.post("/agents/{name}/policy/pending/{pending_id}/resolve")
     async def resolve_tool_policy(name: str, pending_id: str, req: ToolPolicyResolveRequest, request: Request):
         actor = _policy_owner(request)
+        if not re.fullmatch(r"\Atp_[0-9a-f]{16}\Z", pending_id):
+            raise HTTPException(404, "pending decision not found")
         row = tool_policy_store.get_pending(pending_id)
         if row is None or row["agent_name"] != name:
             raise HTTPException(404, "pending decision not found")
