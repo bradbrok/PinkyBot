@@ -11221,11 +11221,12 @@ class TestWakeSubmissionVerification:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("codex", [False, True])
+    @pytest.mark.parametrize("reason", ["wake_resume", "wake_new_session"])
     async def test_cold_boot_unknown_probe_retries_then_verifies_without_repaste(
-        self, monkeypatch, codex,
+        self, monkeypatch, codex, reason,
     ):
         ss, tmux = self._cold_boot_session(monkeypatch, codex=codex)
-        turn = self._cold_boot_turn()
+        turn = self._cold_boot_turn(reason)
         tmux.capture_pane = AsyncMock(side_effect=[
             asyncio.TimeoutError(), _fail("pane unavailable"),
             TmuxCommandResult(0, f"> {turn.prompt}", ""),
@@ -11250,10 +11251,11 @@ class TestWakeSubmissionVerification:
         assert turn.submission_receipt.result() is True
 
     @pytest.mark.asyncio
-    async def test_cold_boot_unknown_probe_exhausts_bounded_backoff(self, monkeypatch):
+    @pytest.mark.parametrize("reason", ["wake_resume", "wake_new_session"])
+    async def test_cold_boot_unknown_probe_exhausts_bounded_backoff(self, monkeypatch, reason):
         monkeypatch.setenv("PINKY_WAKE_SUBMISSION_ESCALATION", "0")
         ss, tmux = self._cold_boot_session(monkeypatch)
-        turn = self._cold_boot_turn()
+        turn = self._cold_boot_turn(reason)
         tmux.capture_pane = AsyncMock(side_effect=asyncio.TimeoutError())
         waits = []
 
@@ -11345,6 +11347,17 @@ class TestWakeSubmissionVerification:
         ss._wake_launch_history = SimpleNamespace(in_launch_storm=lambda: storm)
         assert ss._wake_receipt_timeout_sec() == expected
 
+    def test_cold_boot_default_history_clock_is_monotonic(self, monkeypatch):
+        monkeypatch.setattr(tmux_session.time, "monotonic", lambda: 200)
+        monkeypatch.setattr(tmux_session.time, "time", lambda: 10**12)
+        history = tmux_session._WakeLaunchHistory(daemon_started_at=0)
+        history.record_spawn()
+        monkeypatch.setattr(tmux_session.time, "monotonic", lambda: 289)
+        history.record_spawn()
+        assert history.in_launch_storm() is True
+        monkeypatch.setattr(tmux_session.time, "monotonic", lambda: 291)
+        assert history.in_launch_storm() is False
+
     def test_cold_boot_receipt_window_hard_cap(self, monkeypatch):
         ss, _ = _make_session(agent_name="primary")
         ss._wake_launch_history = SimpleNamespace(in_launch_storm=lambda: True)
@@ -11367,7 +11380,7 @@ class TestWakeSubmissionVerification:
         injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
         expected = tmux_session._WakeSubmissionFallbackQueued if escalates else RuntimeError
-        with pytest.raises(expected):
+        with pytest.raises(expected, match=None if escalates else "not confirmed"):
             await ss._deliver_turn(turn)
         tmux.paste_text.assert_awaited_once_with(turn.prompt, enter=True)
         assert injector.await_count == int(escalates)

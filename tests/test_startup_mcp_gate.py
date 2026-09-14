@@ -5,7 +5,9 @@ from __future__ import annotations
 import asyncio
 import json
 import re
+import tomllib
 from datetime import datetime, timezone
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, Mock
 
@@ -216,7 +218,7 @@ def test_codex_effective_config_seam_is_read_only_and_overlays_runtime(tmp_path,
 
 
 @pytest.mark.asyncio
-async def test_boot_wires_terminal_wake_alert_to_owner_path(boot_app, tmp_path):
+async def test_boot_wires_terminal_wake_alert_to_owner_path(boot_app, tmp_path, monkeypatch):
     app, _ = boot_app
     _agent(app, tmp_path)
     app.state.agents.set_owner_notification_destinations([{
@@ -229,14 +231,111 @@ async def test_boot_wires_terminal_wake_alert_to_owner_path(boot_app, tmp_path):
         assert callable(callback)
         send = AsyncMock(return_value={"sent": True})
         app.state.broker.send_callback = send
+        monkeypatch.setattr(app.state.agents, "get_raw_token_for_account", lambda *args: "test")
         message = (
             "Wake submission unverified: agent=primary reason=wake_resume "
             "submit_attempts=1 latency_ms=20"
         )
         assert await callback("primary", message) is True
         send.assert_awaited_once()
-        assert send.await_args.kwargs["content"] == message
-        assert send.await_args.kwargs["chat_id"] == "D_TEST"
+        assert send.await_args.args == ("primary", "slack", "D_TEST", message)
+
+
+@pytest.mark.asyncio
+async def test_terminal_wake_session_produces_owner_notification(boot_app, tmp_path, monkeypatch):
+    from pinky_daemon import tmux_session
+    from pinky_daemon.tmux_session import TmuxCommandResult, _QueuedTurn
+
+    app, _ = boot_app
+    _agent(app, tmp_path)
+    app.state.agents.set_owner_notification_destinations([{
+        "platform": "slack", "account_id": "T_TEST", "conversation_id": "D_TEST",
+        "principal_id": "U_TEST",
+    }])
+    monkeypatch.setattr(tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.001)
+    async with app.router.lifespan_context(app):
+        session = app.state.broker._streaming["primary"]["main"]
+        monkeypatch.setattr(session, "_wake_receipt_timeout_sec", lambda: 0.001, raising=False)
+        session._session_ready_event.set()
+        session._tmux.paste_text = AsyncMock(return_value=TmuxCommandResult(0, "", ""))
+        session._tmux.capture_pane = AsyncMock(return_value=TmuxCommandResult(0, "> empty", ""))
+        send = AsyncMock(return_value={"sent": True})
+        app.state.broker.send_callback = send
+        monkeypatch.setattr(app.state.agents, "get_raw_token_for_account", lambda *args: "test")
+        events = []
+
+        async def event(data):
+            events.append(data)
+
+        session._stream_event_callback = event
+        turn = _QueuedTurn(
+            prompt="private wake payload must not enter the owner alert",
+            internal=True, reason="wake_new_session",
+            submission_receipt=asyncio.get_running_loop().create_future(),
+        )
+        with pytest.raises(RuntimeError, match="not confirmed"):
+            await session._deliver_turn(turn)
+        await session._notify_delivery_failure(turn)
+        send.assert_awaited_once()
+        terminal = [e for e in events if e["type"] == "wake_prompt_submission_unverified"]
+        assert len(terminal) == 1 and terminal[0]["terminal"] is True
+        assert terminal[0]["submit_attempts"] == 1
+        expected = (
+            "Wake submission unverified: agent=primary reason=wake_new_session "
+            f"submit_attempts=1 latency_ms={terminal[0]['latency_ms']}"
+        )
+        assert send.await_args.args == ("primary", "slack", "D_TEST", expected)
+        assert "\n" not in expected and turn.prompt not in expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("transport", ["tmux", "sdk"])
+async def test_codex_boot_uses_single_read_only_config_seam(
+    boot_app, tmp_path, monkeypatch, transport,
+):
+    app, trace = boot_app
+    _agent(app, tmp_path, runtime="codex_cli", transport=transport)
+    original = codex_home.effective_codex_mcp_config
+    home = tmp_path / "codex-config"
+    home.mkdir()
+    monkeypatch.setenv("CODEX_HOME", str(home))
+    path = home / "config.toml"
+    path.write_text('[mcp_servers.remote]\nurl = "https://seam.example/mcp"\n')
+    in_seam = False
+    real_open, real_load, real_loads = Path.open, tomllib.load, tomllib.loads
+
+    def guarded_open(self, *args, **kwargs):
+        assert self != path or in_seam, "Codex TOML opened outside extraction seam"
+        return real_open(self, *args, **kwargs)
+
+    def guarded_load(*args, **kwargs):
+        assert in_seam, "ad hoc TOML parse outside extraction seam"
+        return real_load(*args, **kwargs)
+
+    def guarded_loads(*args, **kwargs):
+        assert in_seam, "ad hoc TOML parse outside extraction seam"
+        return real_loads(*args, **kwargs)
+
+    def extract(*args, **kwargs):
+        nonlocal in_seam
+        in_seam = True
+        try:
+            return original(*args, **kwargs)
+        finally:
+            in_seam = False
+
+    spy = Mock(side_effect=extract)
+    monkeypatch.setattr(codex_home, "effective_codex_mcp_config", spy)
+    monkeypatch.setattr(Path, "open", guarded_open)
+    monkeypatch.setattr(tomllib, "load", guarded_load)
+    monkeypatch.setattr(tomllib, "loads", guarded_loads)
+    writer = SimpleNamespace(close=Mock(), wait_closed=AsyncMock())
+    probe = AsyncMock(return_value=(None, writer))
+    monkeypatch.setattr(asyncio, "open_connection", probe)
+    async with app.router.lifespan_context(app):
+        spy.assert_called_once()
+        probe.assert_awaited_once_with("seam.example", 443)
+        assert ("launch", "primary") in trace
 
 
 def test_container_shared_alias_from_real_writer_is_not_remote(boot_app, tmp_path, monkeypatch):
