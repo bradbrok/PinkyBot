@@ -230,7 +230,7 @@ async def test_boot_wires_terminal_wake_alert_to_owner_path(boot_app, tmp_path, 
         callback = session._config.wake_failure_callback
         assert callable(callback)
         send = AsyncMock(return_value={"sent": True})
-        app.state.broker.send_callback = send
+        monkeypatch.setattr(app.state.broker, "_send_callback", send)
         monkeypatch.setattr(app.state.agents, "get_raw_token_for_account", lambda *args: "test")
         message = (
             "Wake submission unverified: agent=primary reason=wake_resume "
@@ -260,7 +260,7 @@ async def test_terminal_wake_session_produces_owner_notification(boot_app, tmp_p
         session._tmux.paste_text = AsyncMock(return_value=TmuxCommandResult(0, "", ""))
         session._tmux.capture_pane = AsyncMock(return_value=TmuxCommandResult(0, "> empty", ""))
         send = AsyncMock(return_value={"sent": True})
-        app.state.broker.send_callback = send
+        monkeypatch.setattr(app.state.broker, "_send_callback", send)
         monkeypatch.setattr(app.state.agents, "get_raw_token_for_account", lambda *args: "test")
         events = []
 

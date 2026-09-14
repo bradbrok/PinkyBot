@@ -11909,7 +11909,8 @@ class TestWakeSubmissionVerification:
         ("reason", "disable_escalation"),
         [
             ("wake_context_restart", True),
-            ("wake_resume", False),
+            ("wake_resume", True),
+            ("wake_new_session", False),
         ],
     )
     async def test_non_escalating_receipt_is_frozen_before_legacy_event(
@@ -11968,7 +11969,9 @@ class TestWakeSubmissionVerification:
             "submit_attempts",
             "latency_ms",
             "prompt_visible",
+            "terminal",
         }
+        assert events[0]["terminal"] is True
 
     @pytest.mark.asyncio
     async def test_external_disconnect_releases_real_restart_owner_and_latch(
@@ -12123,6 +12126,7 @@ class TestWakeSubmissionVerification:
     async def test_unrelated_user_row_is_not_a_submission_receipt(
         self, monkeypatch,
     ) -> None:
+        monkeypatch.setenv("PINKY_WAKE_SUBMISSION_ESCALATION", "0")
         monkeypatch.setattr(
             tmux_session, "_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC", 0.02
         )
