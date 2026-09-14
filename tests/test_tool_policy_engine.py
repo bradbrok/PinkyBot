@@ -798,7 +798,7 @@ def test_dynamic_protected_shell_tokens_fail_closed(command):
     ("git log # note", True),
     ("git log # ; note", False),
     ("git log --grep=a#b", True),
-    ("git log \\\nrm -rf /outside", True),
+    ("git log \\\nrm -rf /outside", False),
     ('git log "; rm -rf /outside"', True),
 ])
 def test_bash_argument_override_does_not_collapse_comments(command, expected):
@@ -814,4 +814,19 @@ def test_bash_argument_override_rejects_substitution_even_when_quoted(substituti
     api = _policy()
     # Payloads are strings for the pure classifier; no shell is invoked.
     command = f"git log {quote}{substitution}{quote}"
+    assert not api.matches_tool_pattern("Bash(git log)", "Bash", {"command": command})
+
+
+@pytest.mark.parametrize("command", [
+    'git log $\\\n(rm -rf /outside)',
+    'git log <\\\n(rm -rf /outside)',
+    'git log >\\\n(rm -rf /outside)',
+    'git log $\\\n\\\n(rm -rf /outside)',
+    'git log "$\\\n(rm -rf /outside)"',
+    'git log $\\\r\n(rm -rf /outside)',
+    'git log \\\\\nrm -rf /outside',
+])
+def test_bash_argument_override_rejects_line_continuations(command):
+    api = _policy()
+    # Classifier inputs only; no shell payload is executed.
     assert not api.matches_tool_pattern("Bash(git log)", "Bash", {"command": command})

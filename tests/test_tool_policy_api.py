@@ -917,6 +917,13 @@ def test_resolve_sweep_advances_the_global_poll_throttle(tmp_path, monkeypatch):
 
 @pytest.mark.parametrize("command", [
     "git log # comment\nrm -rf /outside", "git log $(rm -rf /outside)",
+    'git log $\\\n(rm -rf /outside)',
+    'git log <\\\n(rm -rf /outside)',
+    'git log >\\\n(rm -rf /outside)',
+    'git log $\\\n\\\n(rm -rf /outside)',
+    'git log "$\\\n(rm -rf /outside)"',
+    'git log $\\\r\n(rm -rf /outside)',
+    'git log \\\\\nrm -rf /outside',
 ])
 def test_signed_bash_grant_cannot_hide_another_command(tmp_path, monkeypatch, command):
     with _gateway(tmp_path, monkeypatch) as client:
