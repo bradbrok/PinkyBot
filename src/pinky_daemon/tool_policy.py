@@ -5,8 +5,8 @@ Lexical path checks do not resolve symlinks. Native tool denials, signed daemon
 boundaries and process isolation remain the hard enforcement boundaries.
 Precedence: tamper/unavailable, static, non-overridable self.modify_guard,
 scoped overrides, remaining rules, default allow. Bash argument overrides admit
-exactly one non-empty segment, without comment collapse or command/process
-substitution. Comments are tokens; trailing separators may leave empty segments.
+exactly one non-empty segment, with no line continuations, comment collapse or
+command/process substitution. Comments are tokens; trailing separators may leave empty segments.
 """
 
 from __future__ import annotations
@@ -147,6 +147,8 @@ def matches_tool_pattern(pattern: str, tool_name: str, tool_input: dict | None =
     if value != argument and value[len(argument)] not in " \t\n;&|/":
         return False
     if tool_name == "Bash":
+        if re.search(r"\\\r?\n", value):
+            return False
         if any(marker in value for marker in ("$(", "`", "<(", ">(")):
             return False
         try:
