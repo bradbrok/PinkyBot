@@ -6,6 +6,7 @@ import errno
 import fcntl
 import hashlib
 import json
+import logging
 import math
 import os
 import shutil
@@ -13,6 +14,7 @@ import stat
 import subprocess
 import tempfile
 import time
+import tomllib
 import uuid
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
@@ -91,6 +93,41 @@ def codex_home_for(agent: object | None = None) -> Path:
     if override:
         return Path(override).expanduser().resolve()
     return _agent_working_dir(agent) / ".codex"
+
+
+def effective_codex_mcp_config(agent: object, overrides: dict) -> dict:
+    """Read the launch scope without preparing, migrating or rewriting its home.
+
+    Managed homes regenerate a minimal config without MCP entries at spawn;
+    unmanaged configurations are preserved by that existing preparation path.
+    Runtime URL overrides have the same precedence as the CLI's -c arguments.
+    """
+    servers: dict = {}
+    path = codex_home_for(agent) / "config.toml"
+    try:
+        entry = path.lstat()
+        if not stat.S_ISREG(path.stat().st_mode):
+            raise ValueError("configuration is not a regular file")
+        with path.open("rb") as handle:
+            content = handle.read()
+        regenerated = (
+            per_agent_codex_home_enabled() and stat.S_ISREG(entry.st_mode)
+            and entry.st_nlink == 1 and content.startswith(MANAGED_CONFIG_SENTINEL.encode())
+        )
+        if not regenerated:
+            parsed = tomllib.loads(content.decode("utf-8"))
+            native = parsed.get("mcp_servers", {})
+            if isinstance(native, dict):
+                servers = {name: dict(value) for name, value in native.items()
+                           if isinstance(value, dict)}
+    except FileNotFoundError:
+        pass
+    except (OSError, ValueError, UnicodeError):
+        logging.getLogger(__name__).warning("startup: could not read Codex MCP configuration")
+    for name, override in overrides.items():
+        if isinstance(override, dict) and override.get("url"):
+            servers.setdefault(name, {}).update(override)
+    return {"mcp_servers": servers}
 
 
 def _managed_config(working_dir: Path) -> str:

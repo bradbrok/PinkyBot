@@ -132,11 +132,13 @@ class StreamingSessionConfig:
     # Fires when a completed turn leaves no queued transport work. Scheduler
     # delivery uses this edge to drain durable wakes without timer polling.
     on_turn_idle: object = None  # Callable(agent_name) -> None
-    # Tmux-only #984 recovery seam.  A verified-failed context-restart wake
+    # Tmux-only recovery seam. A verified-failed resume or context-restart wake
     # uses this to route a CONTEXT-RELOAD instruction through the broker's
     # agent-message path.  The callback returns a positive handoff bool; the
     # session escalates to transport recovery when it is absent or false.
     wake_submission_recovery_injector: object = None
+    wake_failure_callback: object = None  # Async Callable(agent_name, message) -> bool
+    wake_launch_history: object = None  # Daemon-scoped monotonic spawn history for tmux receipts
     restart_guard: object = None  # Callable(session) -> dict; blocks restart if persistence is stale
     live_status_fn: object = None  # Callable() -> dict|None; agent's live REPL status {"status","last_updated"} from Claude Code working/idle hooks. Tmux inflight watchdog uses it to avoid force-restarting an idle (not wedged) REPL (#118).
     watchdog_enabled_fn: object = None  # Callable() -> bool; whether this agent's watchdog_config.enabled is set. The tmux inflight watchdog reads it per tick so watchdog_config.enabled=false is an operator kill-switch for BOTH the daemon SessionWatchdog and per-session inflight recovery (#846). None → treated as enabled (default True).

@@ -73,7 +73,8 @@ case "$OS" in
             cat > /tmp/pinkybot.service <<UNITEOF
 [Unit]
 Description=PinkyBot Daemon
-After=network.target
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=simple
@@ -116,6 +117,7 @@ UNITEOF
 
         else
             # User-level service — needs DBUS session (desktop Linux)
+            # User units cannot order after system units; the daemon readiness gate applies here.
             UNIT_DIR="$HOME/.config/systemd/user"
             UNIT_DST="$UNIT_DIR/pinkybot.service"
 

@@ -135,8 +135,10 @@ async def test_local_agent_and_poller_start_while_remote_probe_pending(
     monkeypatch.setenv("PINKY_MCP_READINESS_CAP_SEC", "2")
     lifespan = app.router.lifespan_context(app)
     startup = asyncio.create_task(lifespan.__aenter__())
+    inbound = None
     try:
         await asyncio.wait_for(probe_entered.wait(), timeout=1)
+        inbound = asyncio.create_task(app.state.broker._ensure_session_callback("primary"))
         for _ in range(100):
             if ("launch", "local") in trace and ("poller", "local") in trace:
                 break
@@ -144,10 +146,14 @@ async def test_local_agent_and_poller_start_while_remote_probe_pending(
         assert ("launch", "primary") not in trace
         assert ("launch", "local") in trace
         assert ("poller", "local") in trace
+        assert not inbound.done(), "inbound wake must join the boot launch"
     finally:
         release.set()
         await asyncio.wait_for(startup, timeout=3)
+        if inbound is not None:
+            await asyncio.wait_for(inbound, timeout=3)
         await lifespan.__aexit__(None, None, None)
+    assert trace.count(("launch", "primary")) == 1
 
 
 @pytest.mark.asyncio
@@ -215,6 +221,28 @@ def test_codex_effective_config_seam_is_read_only_and_overlays_runtime(tmp_path,
     assert config_path.read_text() == text
     assert config_path.stat().st_mtime_ns == before.st_mtime_ns
     assert list(home.iterdir()) == [config_path]
+
+
+@pytest.mark.parametrize("linked", [False, True])
+def test_codex_gate_respects_managed_config_preservation(tmp_path, monkeypatch, linked):
+    home = tmp_path / "scope"
+    home.mkdir()
+    monkeypatch.setenv(codex_home.PER_AGENT_CODEX_HOME_ENV, "1")
+    content = (
+        codex_home.MANAGED_CONFIG_SENTINEL
+        + '\n[mcp_servers.remote]\nurl = "https://preserved.example/mcp"\n'
+    )
+    path = home / "config.toml"
+    if linked:
+        target = tmp_path / "preserved.toml"
+        target.write_text(content)
+        path.symlink_to(target)
+    else:
+        path.write_text(content)
+    agent = SimpleNamespace(working_dir=str(tmp_path), codex_home=str(home))
+    config = codex_home.effective_codex_mcp_config(agent, {})
+    assert bool(config["mcp_servers"]) is linked
+    assert path.read_text() == content
 
 
 @pytest.mark.asyncio

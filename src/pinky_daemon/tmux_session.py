@@ -69,6 +69,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from typing import Literal
 
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
@@ -458,6 +459,12 @@ _PASTE_ENTER_MAX_DELAY_MS = 2_000
 # in the composer.  Three total submit attempts match the bounded retry shape
 # used by the dashboard terminal transport.
 _WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC = 5.0
+_WAKE_SUBMISSION_STORM_RECEIPT_TIMEOUT_SEC = 20.0
+_WAKE_SUBMISSION_MAX_RECEIPT_TIMEOUT_SEC = 30.0
+_WAKE_LAUNCH_UPTIME_WINDOW_SEC = 120.0
+_WAKE_LAUNCH_SPAWN_WINDOW_SEC = 90.0
+_WAKE_PROMPT_PROBE_RETRY_DELAYS = (1, 2, 4)
+_WAKE_PROMPT_PROBE_BUDGET_SEC = 30.0
 _WAKE_SUBMISSION_ENTER_RETRY_LIMIT = 2
 # A context-restart wake that exhausts the ordinary verifier gets one final
 # receipt-only grace window.  The mechanical exactly-once contract is narrow:
@@ -478,8 +485,30 @@ _WAKE_CONTEXT_RELOAD_INSTRUCTION = (
 )
 
 
+class _WakeLaunchHistory:
+    """Monotonic launch pressure shared by the daemon's tmux sessions."""
+
+    def __init__(self, daemon_started_at: float | None = None):
+        self.daemon_started_at = time.monotonic() if daemon_started_at is None else daemon_started_at
+        self._spawns: deque[float] = deque()
+
+    def _prune(self, now: float) -> None:
+        while self._spawns and self._spawns[0] < now - _WAKE_LAUNCH_SPAWN_WINDOW_SEC:
+            self._spawns.popleft()
+
+    def record_spawn(self, *, now: float | None = None) -> None:
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        self._spawns.append(now)
+
+    def in_launch_storm(self, *, now: float | None = None) -> bool:
+        now = time.monotonic() if now is None else now
+        self._prune(now)
+        return now - self.daemon_started_at < _WAKE_LAUNCH_UPTIME_WINDOW_SEC or len(self._spawns) >= 2
+
+
 def _wake_submission_escalation_enabled() -> bool:
-    """Whether verified-failed context-restart wakes run the #984 ladder.
+    """Whether verified-failed resume/context-restart wakes run the recovery ladder.
 
     Default ON.  Read at verdict time so an operator can disable the ladder
     without restarting the daemon while retaining the existing loud
@@ -1476,6 +1505,9 @@ class _QueuedTurn:
     # scheduler receipt because wake prompts remain ordinary worker-queued
     # internal turns rather than scheduler-serialized external turns.
     submission_receipt: asyncio.Future[bool] | None = None
+    wake_submit_attempts: int = 0
+    wake_submission_latency_ms: int = 0
+    wake_terminal_reported: bool = False
 
 
 @dataclass(frozen=True)
@@ -1996,6 +2028,8 @@ class TmuxSession(TransportReplacementMixin):
         tmux_control: _TmuxControl | None = None,
     ) -> None:
         self._config = config
+        self._wake_launch_history = config.wake_launch_history
+        self._wake_owner_alerted = False
         self._response_callback = response_callback
         self._cost_callback = cost_callback
         self._conversation_store = conversation_store
@@ -3990,6 +4024,10 @@ class TmuxSession(TransportReplacementMixin):
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
+
+        self._wake_owner_alerted = False
+        if self._wake_launch_history is not None:
+            self._wake_launch_history.record_spawn()
 
         # REPL + tailer are both up as a unit — NOW it's safe to
         # consume the one-shot ``force_fresh_context_once`` flag
@@ -7347,10 +7385,14 @@ class TmuxSession(TransportReplacementMixin):
         paste failure or exhausted timeout retries). The message was
         already popped from ``_message_queue`` and will not be
         redelivered; without this the sender gets no signal at all.
-        Internal turns have no chat target, so they are skipped.
+        Terminal wake turns notify the owner once per actual session spawn.
+        Other internal turns have no chat target, so they are skipped.
         Failure-tolerant: a broken callback must not take the worker
         down with it.
         """
+        if turn.internal and turn.reason.startswith("wake_"):
+            await self._report_terminal_wake_failure(turn)
+            return
         if turn.internal or not self._response_callback:
             return
         notice = TurnResponse(
@@ -7375,6 +7417,33 @@ class TmuxSession(TransportReplacementMixin):
                 f"callback raised: {e}"
             )
 
+    async def _report_terminal_wake_failure(self, turn: _QueuedTurn) -> None:
+        if not turn.internal or not turn.reason.startswith("wake_"):
+            return
+        if not turn.wake_terminal_reported:
+            turn.wake_terminal_reported = True
+            await self._emit_stream_event({
+                "type": "wake_prompt_submission_unverified", "agent_name": self.agent_name,
+                "reason": turn.reason, "submit_attempts": turn.wake_submit_attempts,
+                "latency_ms": turn.wake_submission_latency_ms, "terminal": True,
+            })
+        if self._wake_owner_alerted:
+            return
+        self._wake_owner_alerted = True
+        callback = self._config.wake_failure_callback
+        if callback is not None:
+            try:
+                result = callback(
+                    self.agent_name,
+                    f"Wake submission unverified: agent={self.agent_name} reason={turn.reason} "
+                    f"submit_attempts={turn.wake_submit_attempts} "
+                    f"latency_ms={turn.wake_submission_latency_ms}",
+                )
+                if asyncio.iscoroutine(result):
+                    await result
+            except Exception as exc:
+                _log(f"tmux[{self.agent_name}]: wake failure alert callback failed ({type(exc).__name__})")
+
     async def _timed_out_turn_landed(self, turn: _QueuedTurn) -> bool:
         """Capture-pane check: did a timed-out delivery actually land?
 
@@ -7392,6 +7461,12 @@ class TmuxSession(TransportReplacementMixin):
         of a dropped message. Best-effort by design: a capture-pane
         that itself times out yields False, never an exception.
         """
+        return await self._probe_prompt_landed(turn) == "landed"
+
+    async def _probe_prompt_landed(
+        self, turn: _QueuedTurn,
+    ) -> Literal["landed", "absent", "unknown"]:
+        """Keep failed pane observations distinct from a confirmed missing marker."""
         marker = ""
         for line in turn.prompt.splitlines():
             line = line.strip()
@@ -7399,12 +7474,35 @@ class TmuxSession(TransportReplacementMixin):
                 marker = line[:_PANE_MARKER_CHARS]
                 break
         if len(marker) < _PANE_MARKER_MIN_CHARS:
-            return False
+            return "unknown"
         try:
             result = await self._tmux.capture_pane()
         except Exception:
-            return False
-        return result.ok and marker in (result.stdout or "")
+            return "unknown"
+        if not result.ok:
+            return "unknown"
+        return "landed" if marker in (result.stdout or "") else "absent"
+
+    async def _probe_wake_prompt_landed(self, turn: _QueuedTurn) -> str:
+        try:
+            async with asyncio.timeout(_WAKE_PROMPT_PROBE_BUDGET_SEC):
+                for index in range(len(_WAKE_PROMPT_PROBE_RETRY_DELAYS) + 1):
+                    result = await self._probe_prompt_landed(turn)
+                    if result != "unknown" or self._receipt_accepted(turn.submission_receipt):
+                        return result
+                    if index < len(_WAKE_PROMPT_PROBE_RETRY_DELAYS):
+                        await _async_sleep(_WAKE_PROMPT_PROBE_RETRY_DELAYS[index])
+                        if self._receipt_accepted(turn.submission_receipt):
+                            return "unknown"
+        except TimeoutError:
+            pass
+        return "unknown"
+
+    def _wake_receipt_timeout_sec(self) -> float:
+        timeout = _WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC
+        if self._wake_launch_history is not None and self._wake_launch_history.in_launch_storm():
+            timeout = _WAKE_SUBMISSION_STORM_RECEIPT_TIMEOUT_SEC
+        return min(timeout, _WAKE_SUBMISSION_MAX_RECEIPT_TIMEOUT_SEC)
 
     def _main_transcript_age(self, now: float) -> float | None:
         """Seconds since the main transcript was last written, or None.
@@ -10578,6 +10676,7 @@ class TmuxSession(TransportReplacementMixin):
                 "detail": detail,
             }
         )
+        await self._report_terminal_wake_failure(turn)
 
     async def _wait_for_wake_submission_receipt_quiescence(
         self,
@@ -10749,7 +10848,7 @@ class TmuxSession(TransportReplacementMixin):
                 accepted = bool(
                     await asyncio.wait_for(
                         asyncio.shield(receipt),
-                        timeout=_WAKE_SUBMISSION_RECEIPT_TIMEOUT_SEC,
+                        timeout=self._wake_receipt_timeout_sec(),
                     )
                 )
             except asyncio.TimeoutError:
@@ -10776,7 +10875,8 @@ class TmuxSession(TransportReplacementMixin):
 
             # No exact receipt: retry only when the prompt is still visible.
             # Re-pasting here could duplicate a side-effecting wake turn.
-            prompt_visible = await self._timed_out_turn_landed(turn)
+            probe = await self._probe_wake_prompt_landed(turn)
+            prompt_visible = None if probe == "unknown" else probe == "landed"
             if self._receipt_accepted(receipt):
                 await self._report_verified_wake_submission(
                     turn,
@@ -10809,8 +10909,9 @@ class TmuxSession(TransportReplacementMixin):
                 f"submit_attempt={submit_attempts})"
             )
 
-        if prompt_visible is None:
-            prompt_visible = await self._timed_out_turn_landed(turn)
+        if prompt_visible is None and retry_index >= _WAKE_SUBMISSION_ENTER_RETRY_LIMIT:
+            probe = await self._probe_wake_prompt_landed(turn)
+            prompt_visible = None if probe == "unknown" else probe == "landed"
         # The exact row can land while the final best-effort pane probe yields.
         # Positive transcript evidence wins that timeout boundary.
         if self._receipt_accepted(receipt):
@@ -10820,10 +10921,9 @@ class TmuxSession(TransportReplacementMixin):
                 submit_attempts=submit_attempts,
             )
             return "verified"
-        latency_ms = int((time.monotonic() - started) * 1000)
         escalation_applies = bool(
             allow_escalation
-            and turn.reason == f"wake_{WakeReason.CONTEXT_RESTART.value}"
+            and turn.reason in {f"wake_{WakeReason.CONTEXT_RESTART.value}", f"wake_{WakeReason.RESUME.value}"}
             and _wake_submission_escalation_enabled()
         )
         if (
@@ -10840,6 +10940,7 @@ class TmuxSession(TransportReplacementMixin):
         # can yield.  A late exact row must not turn the terminal verdict True
         # while a distinct broker CONTEXT-RELOAD handoff is already underway.
         self._resolve_submission_receipt(turn, False)
+        latency_ms = int((time.monotonic() - started) * 1000)
         _log(
             f"tmux[{self.agent_name}]: wake prompt submission UNVERIFIED "
             f"after bounded Enter retries (reason={turn.reason}, "
@@ -10855,6 +10956,11 @@ class TmuxSession(TransportReplacementMixin):
             "latency_ms": latency_ms,
             "prompt_visible": prompt_visible,
         }
+        turn.wake_submit_attempts = submit_attempts
+        turn.wake_submission_latency_ms = latency_ms
+        if not escalation_applies:
+            unverified_event["terminal"] = True
+            turn.wake_terminal_reported = True
         if escalation_applies:
             unverified_event["escalating"] = True
             # Arm before the first escalation callback can yield. A late exact
