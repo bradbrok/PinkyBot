@@ -230,10 +230,10 @@ from pinky_daemon.store_snapshot import (
 )
 from pinky_daemon.streaming_session import is_1m_model
 from pinky_daemon.task_store import TaskStore
+from pinky_daemon.tool_policy import DEFAULT_RULES, PolicyContext
 from pinky_daemon.tool_policy import (
     UNAVAILABLE_REASON as POLICY_UNAVAILABLE_REASON,
 )
-from pinky_daemon.tool_policy import PolicyContext
 from pinky_daemon.tool_policy import evaluate as evaluate_policy
 from pinky_daemon.tool_policy_store import ToolPolicyStore
 
@@ -8101,9 +8101,20 @@ npm run build</pre>
         if policy_mode == "log" or permission == "allow":
             return {"decision": "allow"}
         if permission == "deny":
-            reason = (f"Denied by policy rule {evaluated.rule_id}: {evaluated.reason_code}."
-                      if evaluated.rule_id else POLICY_UNAVAILABLE_REASON)
-            return {"decision": "deny", "reason": reason, "rule_id": evaluated.rule_id}
+            extra = {}
+            if evaluated.type == "override":
+                source = f"owner override {evaluated.override_id}"
+                if evaluated.rule_id:
+                    source += f" for policy rule {evaluated.rule_id}"
+                reason = f"Denied by {source}; do not retry automatically, tell the owner what you needed."
+                extra["override_id"] = evaluated.override_id
+            elif evaluated.type == "unavailable":
+                reason = POLICY_UNAVAILABLE_REASON
+            elif evaluated.type == "tamper":
+                reason = "Denied: policy hook integrity check failed; tell the owner what you needed."
+            else:
+                reason = f"Denied by policy rule {evaluated.rule_id}: {evaluated.reason_code}."
+            return {"decision": "deny", "reason": reason, "rule_id": evaluated.rule_id, **extra}
         return {"decision": "pause", "pending_id": pending["pending_id"],
                 "deadline_ts": pending["deadline_ts"], "poll_after_s": 25}
 
@@ -8147,6 +8158,8 @@ npm run build</pre>
     @app.put("/agents/{name}/policy/overrides")
     async def put_tool_policy_override(name: str, req: ToolPolicyOverrideRequest, request: Request):
         actor = _policy_owner(request)
+        if req.rule_id is not None and req.rule_id not in {rule["rule_id"] for rule in DEFAULT_RULES}:
+            raise HTTPException(422, "unknown rule_id")
         try:
             parse_tool_pattern(req.pattern)
         except ToolPatternValidationError:

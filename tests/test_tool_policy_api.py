@@ -520,3 +520,90 @@ def test_default_pending_ttl_is_570_below_hook_deadline(tmp_path, monkeypatch):
         ttl = row["deadline_ts"] - row["created_at"]
         assert ttl == pytest.approx(570, abs=0.01)
         assert ttl < agent_registry.TOOL_POLICY_HOOK_DEADLINE_SEC == 600
+
+
+@pytest.mark.parametrize("rule_id", [None, "outbound.broadcast"])
+def test_owner_deny_override_names_its_source_and_forbids_retry(tmp_path, monkeypatch, rule_id):
+    with _gateway(tmp_path, monkeypatch, trust=None) as client:
+        created = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "mcp__pinky-messaging__broadcast", "decision": "deny", "rule_id": rule_id,
+        })
+        assert created.status_code == 200, created.text
+        override_id = created.json()["id"]
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=_body())
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["decision"] == "deny"
+        assert data["override_id"] == override_id
+        assert f"owner override {override_id}" in data["reason"]
+        assert "do not retry" in data["reason"]
+        assert "retry the same call" not in data["reason"]
+        assert "unavailable" not in data["reason"]
+        assert data["rule_id"] == rule_id
+        if rule_id is not None:
+            assert f"policy rule {rule_id}" in data["reason"]
+
+
+@pytest.mark.parametrize("rule_id,status", [
+    ("outbound.broadcats", 422), ("", 422), ("outbound.broadcast", 200),
+])
+def test_override_rule_binding_must_name_a_default_rule(tmp_path, monkeypatch, rule_id, status):
+    with _gateway(tmp_path, monkeypatch) as client:
+        response = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "mcp__pinky-messaging__broadcast", "decision": "deny", "rule_id": rule_id,
+        })
+        assert response.status_code == status, response.text
+        if status == 422:
+            assert response.json()["detail"] == "unknown rule_id"
+            assert _store(client).list_overrides("sample", time.time()) == []
+        else:
+            assert response.json()["rule_id"] == rule_id
+
+
+@pytest.mark.parametrize("kind", ["tamper", "unavailable"])
+def test_non_rule_denials_keep_distinct_model_reasons(tmp_path, monkeypatch, kind):
+    from pinky_daemon import api as api_module
+    from pinky_daemon.tool_policy import UNAVAILABLE_REASON, evaluate
+
+    def force_evaluation(ctx, *, now, **_kwargs):
+        return evaluate(ctx, now=now, **{kind: True})
+
+    with _gateway(tmp_path, monkeypatch) as client:
+        monkeypatch.setattr(api_module, "evaluate_policy", force_evaluation)
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=_body())
+        assert response.status_code == 200, response.text
+        data = response.json()
+        assert data["decision"] == "deny"
+        assert "override_id" not in data
+        if kind == "unavailable":
+            assert data["reason"] == UNAVAILABLE_REASON
+        else:
+            assert "integrity" in data["reason"]
+            assert "retry the same call" not in data["reason"]
+            assert "unavailable" not in data["reason"]
+
+
+
+def test_operator_pause_override_reaches_approval_without_trusted_principal(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch, trust=None) as client:
+        created = _owner(client, "PUT", "/agents/sample/policy/overrides", body={
+            "pattern": "Bash", "decision": "pause",
+        })
+        assert created.status_code == 200, created.text
+        body = _body(tool="Bash", principal="owner")
+        body["tool_input"] = {"command": "true"}
+        response = _signed(client, "POST", "/agents/sample/policy/evaluate", body=body)
+        assert response.status_code == 200, response.text
+        pause = response.json()
+        assert pause["decision"] == "pause" and pause["pending_id"].startswith("tp_")
+        [record] = _store(client).list_decisions("sample", 0, 10)
+        assert record["principal_class"] == "group"
+        assert record["eval_type"] == "override" and record["result"] == "pause"
+        path = f'/agents/sample/policy/pending/{pause["pending_id"]}'
+        resolved = _owner(client, "POST", path + "/resolve", body=_binding(body))
+        assert resolved.status_code == 200, resolved.text
+        polled = _signed(client, "GET", path)
+        assert polled.status_code == 200
+        assert polled.json()["state"] == "resolved"
+        assert polled.json()["result"] == "allow"
+        assert polled.json()["resolved_by"] == "owner:admin"

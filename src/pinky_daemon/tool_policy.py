@@ -84,6 +84,7 @@ class Evaluation:
     principal_class: str
     input_sha256: str
     rule_id: str | None = None
+    override_id: int | None = None
 
     def to_record(self) -> dict:
         details = {"type": self.type, "reason_code": self.reason_code,
@@ -271,8 +272,8 @@ def evaluate(ctx: PolicyContext, *, overrides=(), now: float,
         principal = "group"
     digest = canonical_input_sha256(ctx.tool_input)
 
-    def result(permission, kind, reason, rule_id=None):
-        return Evaluation(permission, kind, reason, principal, digest, rule_id)
+    def result(permission, kind, reason, rule_id=None, override_id=None):
+        return Evaluation(permission, kind, reason, principal, digest, rule_id, override_id)
 
     if tamper:
         return result("deny", "tamper", "hook_tamper")
@@ -298,7 +299,7 @@ def evaluate(ctx: PolicyContext, *, overrides=(), now: float,
         candidates.append((specificity, row))
     if candidates:
         row = max(candidates, key=lambda item: item[0])[1]
-        return result(row["decision"], "override", "override", row.get("rule_id"))
+        return result(row["decision"], "override", "override", row.get("rule_id"), row.get("id"))
     if matched:
         return result(matched["owner" if principal in {"owner", "schedule"} else "other"],
                       "rule", matched["reason_code"], matched["rule_id"])

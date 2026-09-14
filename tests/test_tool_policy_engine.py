@@ -657,3 +657,19 @@ def test_static_effect_audit_tracks_assigned_store_and_path_branches():
     assert {kind for kind, _ in _handler_effects(tree.body[0], tree, store)} == {"sql_write"}
     tree = ast.parse('def read_tool(url):\n    path = "/tasks" if safe else url\n    _api("GET", path)\n')
     assert {kind for kind, _ in _handler_effects(tree.body[0], tree)} == {"daemon_destination"}
+
+
+
+def test_selected_override_id_is_metadata_outside_the_frozen_audit_shape():
+    api = _policy()
+    ctx = _context(api, "Bash", tool_input={"command": "true"})
+    result = api.evaluate(ctx, now=100, overrides=[
+        {"id": 41, "pattern": "B*", "decision": "allow"},
+        {"id": 42, "pattern": "Bash", "decision": "deny"},
+    ])
+    assert result.override_id == 42
+    record = result.to_record()
+    assert set(record) == {"evaluated_permission", "evaluation"}
+    assert set(record["evaluation"]) == {"type", "reason_code", "principal_class", "input_sha256"}
+    assert record["evaluation"]["type"] == "override"
+    assert record["evaluated_permission"] == "deny"
