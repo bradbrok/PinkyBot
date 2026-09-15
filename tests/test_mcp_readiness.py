@@ -164,6 +164,42 @@ async def test_two_agents_share_one_endpoint_probe_task():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_caller", [False, True])
+async def test_boot_teardown_falls_open_but_caller_cancellation_propagates(
+    monkeypatch, cancel_caller,
+):
+    mod = _readiness()
+    clock = _ProbeClock()
+    monkeypatch.setattr(mod, "time", SimpleNamespace(monotonic=lambda: clock.now))
+    entered = asyncio.Event()
+
+    async def connect(host, port):
+        entered.set()
+        await asyncio.Event().wait()
+
+    gate = mod.BootMcpReadiness(connect=connect)
+    endpoint = ("bridge.example", 443)
+    inbound = asyncio.create_task(gate.wait_for({endpoint}))
+    try:
+        await asyncio.wait_for(entered.wait(), timeout=1)
+        clock.now += 2
+        if cancel_caller:
+            inbound.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await inbound
+        else:
+            await gate.close()
+            report = await asyncio.wait_for(inbound, timeout=1)
+            result = report.results[endpoint]
+            assert (result.status, result.attempts, result.waited_sec) == ("unreachable", 1, 2)
+            assert gate.report().results[endpoint] == result
+            assert (await gate.wait_for({endpoint})).results[endpoint] == result
+    finally:
+        await gate.close()
+        await asyncio.gather(inbound, return_exceptions=True)
+
+
+@pytest.mark.asyncio
 async def test_gate_disabled_does_not_connect_or_sleep():
     connect, wait = AsyncMock(), AsyncMock()
     report = await _readiness().wait_for_endpoints(

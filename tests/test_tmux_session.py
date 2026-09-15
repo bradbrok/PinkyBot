@@ -11424,6 +11424,22 @@ class TestWakeSubmissionVerification:
         assert all(e.get("terminal") is True for e in terminal)
 
     @pytest.mark.asyncio
+    async def test_terminal_wake_alert_is_not_repeated_for_same_turn_after_spawn_reset(
+        self, monkeypatch,
+    ):
+        ss, _ = self._cold_boot_session(monkeypatch)
+        alerts = AsyncMock()
+        ss._config.wake_failure_callback = alerts
+        turn = self._cold_boot_turn()
+        await ss._report_terminal_wake_failure(turn)
+        ss._wake_owner_alerted = False
+        await ss._report_terminal_wake_failure(turn)
+        alerts.assert_awaited_once()
+        # A different failure in the new spawn still has its own alert budget.
+        await ss._report_terminal_wake_failure(self._cold_boot_turn())
+        assert alerts.await_count == 2
+
+    @pytest.mark.asyncio
     async def test_cold_boot_alert_callback_failure_is_tolerated_and_bounded(self, monkeypatch):
         monkeypatch.setenv("PINKY_WAKE_SUBMISSION_ESCALATION", "0")
         ss, _ = self._cold_boot_session(monkeypatch)
