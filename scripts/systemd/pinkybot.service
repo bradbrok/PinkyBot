@@ -1,6 +1,7 @@
 [Unit]
 Description=PinkyBot Daemon
-After=network.target
+After=network-online.target tailscaled.service
+Wants=network-online.target tailscaled.service
 
 [Service]
 Type=simple

@@ -1261,6 +1261,13 @@ def _mcp_connect_host() -> str:
     return SHARED_MCP_HOST
 
 
+def _shared_mcp_endpoints() -> set[tuple[str, int]]:
+    """Listener identities emitted for host and container MCP clients."""
+    return {(host, SHARED_MCP_PORT) for host in (
+        SHARED_MCP_HOST, _mcp_connect_host(), "host.containers.internal",
+    )}
+
+
 def _write_mcp_json(
     work_dir: Path,
     agent_name: str,
@@ -1784,6 +1791,11 @@ def create_api(
     db_path: str = "data/conversations.db",
 ) -> FastAPI:
     """Create the FastAPI application."""
+    from pinky_daemon.tmux_session import _WakeLaunchHistory
+
+    wake_launch_history = _WakeLaunchHistory()
+    active_boot_mcp_gate = None
+    boot_mcp_keys: set[tuple[str, str]] = set()
     policy_mode = os.environ.get("PINKY_TOOL_POLICY", "off")
     if policy_mode not in {"off", "log", "enforce"}:
         raise ValueError("PINKY_TOOL_POLICY must be off, log, or enforce")
@@ -3927,6 +3939,7 @@ def create_api(
         resume_id: str = "",
     ):
         """Create, connect, and register a streaming session for an agent label."""
+        boot_mcp_gate = active_boot_mcp_gate if (agent_name, label) in boot_mcp_keys else None
         from pinky_daemon.codex_session import CodexSession
         from pinky_daemon.codex_tmux_session import CodexTmuxSession
         from pinky_daemon.streaming_session import (
@@ -4121,6 +4134,8 @@ def create_api(
             on_wake_delivered=_log_agent_wake_event,
             on_turn_idle=_notify_scheduler_turn_idle,
             wake_submission_recovery_injector=_inject_wake_context_reload,
+            wake_failure_callback=_notify_owner_alert,
+            wake_launch_history=wake_launch_history,
             restart_guard=lambda session, _agent_name=agent_name: _get_streaming_restart_guard(_agent_name, session),
             # #943: verdict-time fresh read of the persisted field that the
             # working/idle hooks update.  The in-memory map is non-authoritative
@@ -4181,6 +4196,39 @@ def create_api(
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
 
         ss = SessionClass(config, **init_kwargs)
+        if boot_mcp_gate is not None:
+            from pinky_daemon import codex_home
+            from pinky_daemon.mcp_readiness import remote_mcp_endpoints
+
+            # Read from the same resolved config used by this launch, once.
+            # Codex consumes its native TOML plus these runtime overrides;
+            # Claude consumes the .mcp.json already regenerated at boot.
+            if is_codex:
+                effective_mcp = codex_home.effective_codex_mcp_config(config, codex_mcp_servers)
+            else:
+                try:
+                    effective_mcp = json.loads((Path(work_dir) / ".mcp.json").read_text())
+                except (OSError, ValueError):
+                    effective_mcp = {}
+                    _log(f"startup: could not read MCP configuration for {agent_name}")
+            report = await boot_mcp_gate.wait_for(remote_mcp_endpoints(
+                effective_mcp, excluded_endpoints=_shared_mcp_endpoints(),
+            ))
+            for (host, port), result in report.results.items():
+                if result.status == "unreachable":
+                    _log(
+                        f"startup: remote MCP host {host}:{port} unreachable after "
+                        f"{result.waited_sec:g}s ({result.attempts} attempts); "
+                        f"launching {agent_name} without waiting"
+                    )
+                    try:
+                        session_event_store.log(
+                            session_id=ss.id, agent_name=agent_name,
+                            event_type="mcp_host_unreachable",
+                            metadata={"host": host, "port": port, "waited_sec": result.waited_sec},
+                        )
+                    except Exception as exc:
+                        _log(f"startup: remote MCP event could not be recorded ({type(exc).__name__})")
         ss._on_resume_handle = sid_callback
         if hasattr(ss, "_on_resume_handle_sync"):
             ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
@@ -12856,6 +12904,7 @@ npm run build</pre>
     async def on_startup():
         """Start broker pollers, streaming sessions, scheduler, and autonomy."""
         nonlocal shared_mcp_manager
+        nonlocal active_boot_mcp_gate
 
         storage_observability.enable_runtime()
 
@@ -13050,6 +13099,43 @@ npm run build</pre>
         )
         all_agents = agents.list(enabled_only=True)
         streaming_count = 0
+        from pinky_daemon.mcp_readiness import BootMcpReadiness
+
+        try:
+            readiness_cap = float(os.environ.get("PINKY_MCP_READINESS_CAP_SEC", "120"))
+            if not math.isfinite(readiness_cap) or readiness_cap < 0:
+                raise ValueError("invalid readiness cap")
+        except ValueError:
+            readiness_cap = 120.0
+            _log("startup: invalid MCP readiness cap; using 120s")
+        boot_mcp_gate = BootMcpReadiness(cap_sec=readiness_cap)
+        active_boot_mcp_gate = boot_mcp_gate
+        boot_mcp_keys.update(
+            (agent.name, "main" if agent.name == main_name_for_boot else restart_sessions[agent.name])
+            for agent in all_agents
+            if agent.name == main_name_for_boot or agent.name in restart_sessions
+        )
+        if readiness_cap == 0:
+            _log("startup: mcp readiness gate disabled")
+        boot_launches = []
+
+        async def _launch_boot_session(name, label, resume_id):
+            nonlocal streaming_count
+            try:
+                # Use the existing lifecycle/ensure locks so an inbound wake
+                # during the readiness wait cannot start a duplicate session.
+                await _ensure_streaming_session(name, label=label)
+                streaming_count += 1
+                if resume_id:
+                    _log(f"startup: streaming session resumed for {name}/{label} (session {resume_id[:12]})")
+                else:
+                    _log(f"startup: streaming session connected for {name}/{label} (new)")
+            except Exception as e:
+                _log(f"startup: streaming session failed for {name}/{label}: {e}")
+                if resume_id:
+                    _log(f"startup: clearing stale session ID for {name}/{label}")
+                    agents.set_streaming_session_id(name, "", label=label)
+
         for agent in all_agents:
             # Regenerate .mcp.json on every startup so paths match the current machine.
             # Critical for migration scenarios (e.g. Mac Mini → RPi) where old paths linger.
@@ -13191,19 +13277,26 @@ npm run build</pre>
                 continue
 
             resume_id = agents.get_streaming_session_id(agent.name, label=label)
-            try:
-                await _start_streaming_session(agent.name, label=label, resume_id=resume_id)
-                streaming_count += 1
-                if resume_id:
-                    _log(f"startup: streaming session resumed for {agent.name}/{label} (session {resume_id[:12]})")
-                else:
-                    _log(f"startup: streaming session connected for {agent.name}/{label} (new)")
-            except Exception as e:
-                _log(f"startup: streaming session failed for {agent.name}/{label}: {e}")
-                # If resume failed, clear the stale session ID and try fresh on next boot
-                if resume_id:
-                    _log(f"startup: clearing stale session ID for {agent.name}/{label}")
-                    agents.set_streaming_session_id(agent.name, "", label=label)
+            boot_launches.append((agent.name, label, resume_id))
+
+        boot_launches = [asyncio.create_task(_launch_boot_session(*args)) for args in boot_launches]
+        try:
+            await asyncio.gather(*boot_launches)
+        finally:
+            active_boot_mcp_gate = None
+            boot_mcp_keys.clear()
+            for task in boot_launches:
+                if not task.done():
+                    task.cancel()
+            await asyncio.gather(*boot_launches, return_exceptions=True)
+            await boot_mcp_gate.close()
+            readiness = boot_mcp_gate.report()
+            up = sum(r.status == "up" for r in readiness.results.values())
+            unreachable = sum(r.status == "unreachable" for r in readiness.results.values())
+            _log(
+                f"startup: mcp readiness — {up} host(s) up, {unreachable} unreachable, "
+                f"waited {readiness.waited_sec:g}s"
+            )
 
         # Clean up restored legacy SDK sessions: those superseded by a live
         # streaming session, plus unowned ghosts (blank agent_name) that would
