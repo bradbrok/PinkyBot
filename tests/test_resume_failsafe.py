@@ -460,3 +460,96 @@ async def test_sdk_two_attempts_share_outer_startup_timeout(tmp_path, monkeypatc
     assert not attempts[1]
     ss.disconnect.assert_awaited_once()
     assert ss.state == SessionState.DEAD
+
+
+async def test_resume_rejection_after_early_turn_notification_cannot_retry(tmp_path):
+    ss = codex_session(tmp_path)
+    ss.codex_session_id = ss.resume_handle = MISSING_THREAD
+    methods = []
+
+    async def request(method, params):
+        methods.append(method)
+        await ss._on_appserver_notification("turn/started", {"threadId": MISSING_THREAD})
+        raise missing_rollout_error()
+
+    ss._app_client = SimpleNamespace(request=request, close=AsyncMock())
+    ss._ensure_app_server = AsyncMock(return_value=True)
+    result = await ss._exec_codex_app_server("Perform once")
+    assert result.failed
+    assert methods == ["thread/resume"]
+
+
+async def test_missing_target_cleanup_failure_never_spawns_fresh(tmp_path, monkeypatch):
+    from claude_agent_sdk._errors import ProcessError
+
+    error = ProcessError(
+        f"Claude Code returned an error result: No conversation found with session ID: {MISSING_THREAD}",
+        exit_code=1,
+    )
+    client = SimpleNamespace(connect=AsyncMock(side_effect=error),
+                             disconnect=AsyncMock(side_effect=RuntimeError("still live")))
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", factory)
+    ss = StreamingSession(StreamingSessionConfig(
+        agent_name="sample", working_dir=str(tmp_path), resume_handle=MISSING_THREAD,
+    ))
+    with pytest.raises(ProcessError):
+        await ss.connect()
+    assert factory.call_count == 1
+    assert ss._client is client
+    assert ss.resume_handle == MISSING_THREAD
+    assert ss.state == SessionState.DEAD
+
+
+async def test_rejected_thread_notification_cannot_restore_cleared_id(tmp_path):
+    ss = codex_session(tmp_path)
+    ss.codex_session_id = ss.resume_handle = MISSING_THREAD
+    ss._ensure_app_server = AsyncMock(return_value=True)
+
+    async def request(method, params):
+        if method == "thread/resume":
+            raise missing_rollout_error()
+        if method == "thread/start":
+            await ss._on_appserver_notification("thread/started", {"thread": {"id": MISSING_THREAD}})
+            assert ss.codex_session_id == ""
+            assert ss._pending_resume_handle_update == ""
+            return {"thread": {"id": FRESH_THREAD}}
+        await ss._on_appserver_notification("turn/completed", {
+            "threadId": FRESH_THREAD, "turn": {"id": "one", "status": "completed"},
+        })
+        return {"turn": {"id": "one"}}
+
+    ss._app_client = SimpleNamespace(request=request, close=AsyncMock())
+    result = await ss._exec_codex_app_server("Perform once")
+    assert not result.failed
+    assert ss.codex_session_id == FRESH_THREAD
+
+
+async def test_sdk_replacement_cleanup_failure_keeps_child_handle(tmp_path):
+    ss = StreamingSession(StreamingSessionConfig(agent_name="sample", working_dir=str(tmp_path)))
+    ss._state_machine._state = SessionState.CONNECTED
+    client = SimpleNamespace(disconnect=AsyncMock(side_effect=RuntimeError("still live")))
+    ss._client = client
+    spawn = AsyncMock()
+    with pytest.raises(RuntimeError, match="still live"):
+        await ss.restart_transport(target_preflight=lambda: None, bring_up=spawn)
+    spawn.assert_not_awaited()
+    assert ss._client is client
+
+
+@pytest.mark.parametrize("error", [
+    asyncio.CancelledError(), SystemExit(1), KeyboardInterrupt(),
+    BaseExceptionGroup("cancelled", [asyncio.CancelledError(), RuntimeError("error")]),
+])
+async def test_appserver_control_exceptions_cleanup_without_retry(tmp_path, error):
+    ss = codex_session(tmp_path)
+    ss.codex_session_id = ss.resume_handle = MISSING_THREAD
+    client = SimpleNamespace(request=AsyncMock(side_effect=error), close=AsyncMock())
+    ss._app_client = client
+    ss._ensure_app_server = AsyncMock(return_value=True)
+    with pytest.raises(BaseException) as caught:
+        await ss._exec_codex_app_server("Perform once")
+    assert caught.value is error
+    assert [call.args[0] for call in client.request.await_args_list] == ["thread/resume"]
+    client.close.assert_awaited_once()
+    assert ss.state == SessionState.DEAD

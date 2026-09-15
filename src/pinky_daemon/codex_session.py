@@ -25,6 +25,7 @@ import shlex
 import time
 from dataclasses import dataclass, field
 
+from pinky_daemon import resume_recovery
 from pinky_daemon.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -1102,7 +1103,10 @@ class CodexSession(TransportReplacementMixin):
             # once the OS buffer (~64KiB) fills, wedging the turn (same hazard
             # codex_app_server._drain_stderr guards against).
             if proc.stderr:
-                stderr_task = asyncio.create_task(proc.stderr.read())
+                stderr_task = asyncio.create_task(
+                    resume_recovery.drain_diagnostic(proc.stderr)
+                    if resume_recovery.enabled() else proc.stderr.read()
+                )
 
             # Feed prompt via stdin, then close stdin to signal EOF
             proc.stdin.write(prompt.encode())
@@ -1177,9 +1181,12 @@ class CodexSession(TransportReplacementMixin):
             if stderr_task is not None:
                 stderr_data = await stderr_task
                 if stderr_data:
-                    stderr_str = stderr_data.decode().strip()
+                    stderr_str = stderr_data if isinstance(stderr_data, str) else stderr_data.decode().strip()
                     if stderr_str:
                         _log(f"codex[{self.agent_name}]: stderr: {stderr_str[:200]}")
+                        if resume_recovery.enabled() and proc.returncode:
+                            result.errors.append(stderr_str)
+                            result.failed = True
 
             if proc.returncode and proc.returncode != 0:
                 _log(f"codex[{self.agent_name}]: exit code {proc.returncode}")
@@ -1257,6 +1264,17 @@ class CodexSession(TransportReplacementMixin):
 
         started_at = time.monotonic()
 
+        generation = object()
+        self._appserver_generation = generation
+
+        async def notification(method, params):
+            if not resume_recovery.enabled() or self._appserver_generation is generation:
+                await self._on_appserver_notification(method, params)
+
+        def closed(error):
+            if not resume_recovery.enabled() or self._appserver_generation is generation:
+                self._on_appserver_transport_closed(error)
+
         async def _spawn_and_initialize() -> None:
             if self._use_tmux_app_server:
                 # #791 Design A: the supervisor spawns the shim under tmux and
@@ -1264,7 +1282,7 @@ class CodexSession(TransportReplacementMixin):
                 # the single end-to-end gate for that child.
                 assert self._app_supervisor is not None
                 self._app_client, self._app_proc = await self._app_supervisor.start(
-                    notification_handler=self._on_appserver_notification,
+                    notification_handler=notification,
                     server_request_handler=self._on_appserver_request,
                 )
             else:
@@ -1272,7 +1290,7 @@ class CodexSession(TransportReplacementMixin):
                     command=self._app_server_command,
                     cwd=self._working_dir,
                     env=self._build_codex_env(),
-                    notification_handler=self._on_appserver_notification,
+                    notification_handler=notification,
                     server_request_handler=self._on_appserver_request,
                     log=_log,
                 )
@@ -1284,7 +1302,7 @@ class CodexSession(TransportReplacementMixin):
                 self._app_client, "set_transport_closed_handler", None
             )
             if set_closed_handler is not None:
-                set_closed_handler(self._on_appserver_transport_closed)
+                set_closed_handler(closed)
 
             self._appserver_spawn_count += 1
             pid = self._app_proc.pid
@@ -1346,6 +1364,7 @@ class CodexSession(TransportReplacementMixin):
         a failed kill/wait remains observable, cached handles remain available
         for a later cleanup attempt, and no replacement spawn can continue.
         """
+        self._appserver_generation = None
         self._report_appserver_terminal_stream_survivors(phase="teardown")
         client = self._app_client
         proc = self._app_proc
@@ -1464,6 +1483,7 @@ class CodexSession(TransportReplacementMixin):
         self._active_turn_result = result
         self._turn_done = loop.create_future()
         self._appserver_last_usage = {}
+        self._appserver_execution_observed = False
 
         config = self._appserver_config()
         turn_started_at = time.monotonic()
@@ -1471,6 +1491,16 @@ class CodexSession(TransportReplacementMixin):
             f"app_server_turn_start agent={self.agent_name} "
             f"thread={'resume' if self.codex_session_id else 'new'}"
         )
+
+        operation = resume_recovery.RecoveryOperation()
+        recovery_evidence = None
+        recovered = False
+
+        async def request(method, params):
+            if not resume_recovery.enabled():
+                return await client.request(method, params)
+            async with asyncio.timeout_at(operation.deadline):
+                return await client.request(method, params)
 
         try:
             if self.codex_session_id:
@@ -1483,7 +1513,35 @@ class CodexSession(TransportReplacementMixin):
                     params["model"] = self._codex_model
                 if config:
                     params["config"] = config
-                resp = await client.request("thread/resume", params)
+                requested_id = self.codex_session_id
+                try:
+                    resp = await request("thread/resume", params)
+                except CodexAppServerError as exc:
+                    evidence = resume_recovery.appserver_rejection(
+                        exc, requested_id, operation.generation,
+                    )
+                    if (self._appserver_execution_observed or self._turn_done.done()
+                            or result.tool_uses or result.text_parts or not operation.claim(evidence)):
+                        raise
+                    recovery_evidence = evidence
+                    self._resume_rejected_thread_id = requested_id
+                    await self._emit_stream_event(operation.event(
+                        "resume_fallback_attempted", evidence, self.agent_name, self._config.label,
+                    ))
+                    self.codex_session_id = self.resume_handle = self._config.resume_handle = ""
+                    self._pending_resume_handle_update = ""
+                    if self._on_resume_handle:
+                        await self._on_resume_handle(self.agent_name, "")
+                    fresh_params = {k: v for k, v in params.items() if k != "threadId"}
+                    fresh_params["cwd"] = self._working_dir
+                    resp = await request("thread/start", fresh_params)
+                    if not isinstance(resp, dict) or not (resp.get("thread") or {}).get("id"):
+                        raise CodexAppServerError("Fresh thread response omitted its ID")
+                    recovered = True
+                    await self._emit_stream_event(operation.event(
+                        "resume_failed_restarted_fresh", evidence,
+                        self.agent_name, self._config.label,
+                    ))
             else:
                 params = {
                     "cwd": self._working_dir,
@@ -1494,7 +1552,7 @@ class CodexSession(TransportReplacementMixin):
                     params["model"] = self._codex_model
                 if config:
                     params["config"] = config
-                resp = await client.request("thread/start", params)
+                resp = await request("thread/start", params)
 
             # The thread/started notification normally sets codex_session_id via
             # _handle_event; cover the case where only the response carries it.
@@ -1514,7 +1572,7 @@ class CodexSession(TransportReplacementMixin):
             effort = self._appserver_effort()
             if effort:
                 turn_params["effort"] = effort
-            await client.request("turn/start", turn_params)
+            await request("turn/start", turn_params)
             # Successful turn/start response is the app-server's exact prompt
             # acceptance edge. Thread start/resume alone is not sufficient.
             self._accept_scheduler_delivery(
@@ -1523,7 +1581,7 @@ class CodexSession(TransportReplacementMixin):
 
             # turn/start returns immediately; notifications drive the turn.
             # _on_appserver_notification resolves _turn_done on turn/completed.
-            await asyncio.wait_for(self._turn_done, timeout=600)
+            await asyncio.wait_for(self._turn_done, timeout=(max(0, operation.deadline - time.monotonic()) if resume_recovery.enabled() else 600))
 
         except asyncio.TimeoutError:
             result.failed = True
@@ -1561,7 +1619,20 @@ class CodexSession(TransportReplacementMixin):
             })
             await self._teardown_app_server()
             await self._terminalize_dead("app-server turn exception")
+        except BaseException:
+            if resume_recovery.enabled():
+                result.failed = True
+                try:
+                    await self._teardown_app_server()
+                    await self._terminalize_dead("app-server operation interrupted")
+                except BaseException:
+                    pass  # Preserve the original cancellation/process-control exception.
+            raise
         finally:
+            if recovery_evidence is not None and not recovered:
+                await self._emit_stream_event(operation.event(
+                    "resume_fallback_failed", recovery_evidence, self.agent_name, self._config.label,
+                ))
             elapsed_ms = round((time.monotonic() - turn_started_at) * 1000)
             if result.failed:
                 self._appserver_counters["turns_failed"] += 1
@@ -1606,6 +1677,14 @@ class CodexSession(TransportReplacementMixin):
 
     async def _on_appserver_notification(self, method: str, params: dict) -> None:
         """Translate an app-server notification onto the legacy event path."""
+        thread_id = params.get("threadId") or (params.get("thread") or {}).get("id")
+        if resume_recovery.enabled() and thread_id and (
+            thread_id == getattr(self, "_resume_rejected_thread_id", None) or
+            self.codex_session_id and thread_id != self.codex_session_id
+        ):
+            return
+        if method.startswith(("turn/", "item/")):
+            self._appserver_execution_observed = True
         # Incremental streaming text — UI only; full text arrives via the
         # final item/completed agentMessage (matches the legacy non-delta path).
         if method == "item/agentMessage/delta":
@@ -2439,13 +2518,14 @@ class CodexSession(TransportReplacementMixin):
                 self._current_proc.kill()
                 await self._current_proc.wait()
             except Exception:
-                pass
+                if getattr(self, "_replacement_cleanup_strict", False):
+                    raise
             self._current_proc = None
 
         # Unblock an in-flight app-server turn, then tear down the connection.
         if self._turn_done is not None and not self._turn_done.done():
             self._turn_done.set_exception(CodexAppServerError("session disconnected"))
-        await self._teardown_app_server()
+        await self._teardown_app_server(strict=getattr(self, "_replacement_cleanup_strict", False))
 
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()

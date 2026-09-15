@@ -4702,9 +4702,13 @@ class TmuxSession(TransportReplacementMixin):
         # Kill tmux session. ``kill_session`` is idempotent after verifying
         # that a failed kill left no owned session behind.
         try:
-            await self._tmux.kill_session()
+            killed = await self._tmux.kill_session()
+            if getattr(self, "_replacement_cleanup_strict", False) and not killed.ok:
+                raise RuntimeError("Owned tmux session cleanup failed")
         except Exception as e:
             _log(f"tmux[{self.agent_name}]: kill_session raised: {e}")
+            if getattr(self, "_replacement_cleanup_strict", False):
+                raise
 
         # Default disconnect (no prior intent set) → DEAD. The state
         # machine's existing matrix already handles the CONNECTED → DEAD
@@ -10810,6 +10814,15 @@ class TmuxSession(TransportReplacementMixin):
         self, turn: _QueuedTurn
     ) -> bool:
         """Schedule at most one force-restart until a wake verifies."""
+        from pinky_daemon.resume_recovery import enabled
+
+        if enabled():
+            # A receipt timeout or failed context-reload delivery cannot prove
+            # that resuming failed before execution. Pane attribution is pending.
+            await self._report_wake_submission_escalation_terminal(
+                turn, detail="resume_rejection_not_proven",
+            )
+            return False
         task = self._wake_submission_recovery_task
         if task is not None and not task.done():
             await self._report_wake_submission_escalation_terminal(

@@ -107,3 +107,14 @@ async def test_existing_wake_recovery_budget_is_one_shot(make_session, cls):
     scheduled = await ss._schedule_wake_submission_transport_recovery(turn)
     assert scheduled is False
     ss.force_restart.assert_not_awaited()
+
+
+@pytest.mark.parametrize("cls", [TmuxSession, CodexTmuxSession])
+async def test_replacement_nonzero_kill_blocks_target_spawn(make_session, cls):
+    ss, tmux = make_session(cls)
+    ss._state_machine._state = SessionState.CONNECTED
+    tmux.kill_session = AsyncMock(return_value=TmuxCommandResult(1, "", "still live"))
+    spawn = AsyncMock()
+    with pytest.raises(RuntimeError, match="cleanup failed"):
+        await ss.restart_transport(target_preflight=lambda: None, bring_up=spawn)
+    spawn.assert_not_awaited()

@@ -106,6 +106,7 @@ class TransportReplacementMixin:
         self,
         *,
         configure: ReplacementStep | None = None,
+        target_preflight: ReplacementStep | None = None,
         bring_up: ReplacementStep | None = None,
         connect_wrapper: ReplacementConnectWrapper | None = None,
         suppress_teardown_errors: bool = False,
@@ -120,13 +121,19 @@ class TransportReplacementMixin:
         """
         if bring_up is not None and connect_wrapper is not None:
             raise ValueError("connect_wrapper and bring_up are mutually exclusive")
-        self._preflight_transport_replacement()
+        await self._run_replacement_step(
+            target_preflight or self._preflight_transport_replacement
+        )
         await self._run_replacement_step(configure)
+        prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+        self._replacement_cleanup_strict = target_preflight is not None or prior_strict
         try:
             await self.disconnect()  # type: ignore[attr-defined]
         except Exception:
-            if not suppress_teardown_errors:
+            if self._replacement_cleanup_strict or not suppress_teardown_errors:
                 raise
+        finally:
+            self._replacement_cleanup_strict = prior_strict
         if bring_up is None:
             connect = self.connect  # type: ignore[attr-defined]
             if connect_wrapper is None:
@@ -285,6 +292,7 @@ class Transport(Protocol):
         self,
         *,
         configure: ReplacementStep | None = None,
+        target_preflight: ReplacementStep | None = None,
         bring_up: ReplacementStep | None = None,
         connect_wrapper: ReplacementConnectWrapper | None = None,
         suppress_teardown_errors: bool = False,
