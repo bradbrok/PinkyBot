@@ -126,11 +126,11 @@ def sanitized_diagnostic(value: str) -> str:
     value = re.sub(r"(?i)((?:basic|bearer)\s+|(?:api[_-]?key|token|password|secret)\s*[=:]\s*)\S+",
                    r"\1[redacted]", value)
     value = re.sub(r"(?i)\b(https?://)[^\s/?#]*@", r"\1[redacted]@", value)
-    # At EOF/cap an authority may end before its @. Preserve numeric ports,
-    # but withhold an ambiguous user:password fragment.
+    # At EOF/cap an authority may end before its @. Withhold ambiguous
+    # user:password fragments even when the password could look like a port.
     value = re.sub(
         r"(?i)\b(https?://)([^\s/?#:@]+):([^\s/?#@]+)(?=$|\s)",
-        lambda m: m[0] if m[3].isdigit() else m[1] + "[redacted]", value,
+        lambda m: m[1] + "[redacted]", value,
     )
     value = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", value)
     value = re.sub(r"\beyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}", "[redacted]", value)

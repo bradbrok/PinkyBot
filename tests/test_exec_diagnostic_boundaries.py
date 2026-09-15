@@ -28,6 +28,8 @@ DIAGNOSTICS = [
     ("escaped", '{"api_key": "synthetic\\"secret-value"}', "synthetic"),
     ("unterminated-json", '{"token":"' + TOKEN, TOKEN),
     ("unterminated-url", "https://user:" + TOKEN, TOKEN),
+    ("numeric-url-boundary", " " * (4096 - len("https://user:1234567890"))
+     + "https://user:1234567890@proxy.invalid", "1234567890"),
     ("input-boundary", " " * 4078 + '{"token":"' + TOKEN + '"}', "synthe"),
     ("url-boundary", " " * 4060 + "https://user:" + TOKEN + "@proxy.invalid", "synthetic"),
     ("output-cap", '{"token":"' + TOKEN * 100 + '"} SAFE_SUFFIX', TOKEN),
