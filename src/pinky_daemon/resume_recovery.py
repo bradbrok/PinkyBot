@@ -6,6 +6,7 @@ import os
 import re
 import time
 import uuid
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -78,11 +79,61 @@ def appserver_rejection(error: BaseException, requested_id: str,
     return None
 
 
+def sdk_contract() -> tuple[str, bool]:
+    """Characterize metadata and exception rendering without launching a CLI."""
+    from importlib.metadata import PackageNotFoundError, version
+
+    from claude_agent_sdk._errors import ProcessError
+
+    try:
+        installed = version("claude-agent-sdk")
+    except PackageNotFoundError:
+        installed = "unknown"
+    display = installed if re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.+-]{0,20})?", installed) else "unknown"
+    compatible = installed == "0.2.138" and str(ProcessError("canary", exit_code=1)) == "canary (exit code: 1)"
+    return display, compatible
+
+
+_sdk_drift_events: OrderedDict = OrderedDict()
+
+
+def report_sdk_drift(log, version: str, reason: str) -> None:
+    """Bound both event size and repeated emission, including cache retention."""
+    import json
+
+    key = (log, version, reason)
+    now = time.monotonic()
+    if now - _sdk_drift_events.get(key, float("-inf")) < 300:
+        return
+    _sdk_drift_events[key] = now
+    _sdk_drift_events.move_to_end(key)
+    while len(_sdk_drift_events) > 64:
+        _sdk_drift_events.popitem(last=False)
+    log(json.dumps({"type": "resume_signature_contract_drift",
+                    "sdk_version": version, "reason": reason}))
+
+
 def sanitized_diagnostic(value: str) -> str:
-    """Bound diagnostic retention and remove common credential assignments."""
+    """Sanitize a bounded raw prefix, including incomplete credential values."""
     value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value[:4096])
-    value = re.sub(r"(?i)(bearer\s+|(?:api[_-]?key|token|password|secret)\s*[=:]\s*)\S+",
+    # Quoted fields can contain spaces, escaped quotes, or end at the input
+    # cap. Consume an unfinished value too; never retain its raw prefix.
+    value = re.sub(
+        r'''(?i)(["'](?:api[_-]?key|token|password|secret)["']\s*[:=]\s*)'''
+        r'''(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$))''',
+        r'\1"[redacted]"', value,
+    )
+    value = re.sub(r"(?i)((?:basic|bearer)\s+|(?:api[_-]?key|token|password|secret)\s*[=:]\s*)\S+",
                    r"\1[redacted]", value)
+    value = re.sub(r"(?i)\b(https?://)[^\s/?#]*@", r"\1[redacted]@", value)
+    # At EOF/cap an authority may end before its @. Preserve numeric ports,
+    # but withhold an ambiguous user:password fragment.
+    value = re.sub(
+        r"(?i)\b(https?://)([^\s/?#:@]+):([^\s/?#@]+)(?=$|\s)",
+        lambda m: m[0] if m[3].isdigit() else m[1] + "[redacted]", value,
+    )
+    value = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", value)
+    value = re.sub(r"\beyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}", "[redacted]", value)
     return " ".join(value.split())[:1024]
 
 

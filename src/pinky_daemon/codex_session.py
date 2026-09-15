@@ -2426,8 +2426,26 @@ class CodexSession(TransportReplacementMixin):
     # Reconnect backoff schedule (seconds). Kept in step with StreamingSession's
     # watchdog contract so api._heartbeat_resurrect can treat runtimes uniformly.
     _RECONNECT_BACKOFF = (2, 8, 30)
+    _reconnect_task: asyncio.Task | None = None
+    _owned_reconnect_task: asyncio.Task | None = None
 
     async def attempt_reconnect(self, *, trigger: Trigger = Trigger.WATCHDOG) -> None:
+        if not self._recovery_ownership_enabled():
+            await self._reconnect_attempts(trigger=trigger)
+            return
+        self._check_recovery_owner()
+        task = getattr(self, "_reconnect_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self._reconnect_attempts(trigger=trigger))
+            self._reconnect_task = task
+            self._owned_reconnect_task = task
+        try:
+            await task
+        finally:
+            if self._reconnect_task is task and task.done():
+                self._reconnect_task = None
+
+    async def _reconnect_attempts(self, *, trigger: Trigger = Trigger.WATCHDOG) -> None:
         """Reconnect with bounded retries under a SINGLE RECONNECTING transition.
 
         Takes RECONNECTING ownership once and retries the substrate bring-up
@@ -2460,44 +2478,55 @@ class CodexSession(TransportReplacementMixin):
                 )
             return
         token = res.owner_token
-        self._begin_app_server_reconnect_cycle()
+        settled = False
+        try:
+            self._begin_app_server_reconnect_cycle()
 
-        last_error: Exception | None = None
-        for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
-            self._stats["reconnects"] += 1
-            _log(
-                f"codex[{self.agent_name}]: reconnect attempt {attempt_idx}/"
-                f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
-                f"after {delay}s backoff"
-            )
-            try:
-                await self.disconnect()  # state==RECONNECTING → no standalone DEAD
-            except Exception as e:
-                _log(f"codex[{self.agent_name}]: pre-attempt disconnect raised: {e}")
-            await asyncio.sleep(delay)
-            try:
-                await self._bring_up_substrate()
-            except Exception as e:
-                last_error = e
-                _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
-                continue
-            # Success — complete to CONNECTED + bring the worker/wake back up.
+            last_error: Exception | None = None
+            for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
+                self._stats["reconnects"] += 1
+                _log(
+                    f"codex[{self.agent_name}]: reconnect attempt {attempt_idx}/"
+                    f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
+                    f"after {delay}s backoff"
+                )
+                try:
+                    await self.disconnect()  # state==RECONNECTING → no standalone DEAD
+                except Exception as e:
+                    _log(f"codex[{self.agent_name}]: pre-attempt disconnect raised: {e}")
+                await asyncio.sleep(delay)
+                self._check_recovery_owner()
+                try:
+                    await self._bring_up_substrate()
+                except Exception as e:
+                    last_error = e
+                    _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
+                    continue
+                # Success — complete to CONNECTED + bring the worker/wake back up.
+                await self._state_machine.transition_complete(
+                    token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+                )
+                settled = True
+                self._analytics_session_started()
+                self._start_worker()
+                await self._enqueue_wake()
+                _log(f"codex[{self.agent_name}]: reconnected successfully")
+                return
+
             await self._state_machine.transition_complete(
-                token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+                token, SessionState.DEAD, trigger=Trigger.INTERNAL
             )
-            self._analytics_session_started()
-            self._start_worker()
-            await self._enqueue_wake()
-            _log(f"codex[{self.agent_name}]: reconnected successfully")
-            return
-
-        await self._state_machine.transition_complete(
-            token, SessionState.DEAD, trigger=Trigger.INTERNAL
-        )
-        _log(
-            f"codex[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
-            f"attempts failed (last error: {last_error}); session DEAD"
-        )
+            settled = True
+            _log(
+                f"codex[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
+                f"attempts failed (last error: {last_error}); session DEAD"
+            )
+        except BaseException:
+            if self._recovery_ownership_enabled() and not settled:
+                await self._state_machine.transition_complete(
+                    token, SessionState.DEAD, trigger=Trigger.INTERNAL,
+                )
+            raise
 
     async def disconnect(self) -> None:
         """Tear down the worker + any codex subprocess / app-server. Idempotent.

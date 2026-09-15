@@ -14,6 +14,7 @@ from pinky_daemon.transport_state import SessionState
 TOKEN = "synthetic-secret-value"
 JWT = "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJzeW50aGV0aWMifQ.c3ludGhldGlj"
 DIAGNOSTICS = [
+    ("ansi-key", '{"api_\x1b[31mkey\x1b[0m": "' + TOKEN + '"}', TOKEN),
     ("json-key", '{"api_key": "' + TOKEN + '"}', TOKEN),
     ("json-token", '{"token": "' + TOKEN + '"}', TOKEN),
     ("basic", "Authorization: Basic " + TOKEN, TOKEN),
@@ -112,8 +113,11 @@ async def test_exec_drain_result_and_worker_log_redact_credentials(
         assert len(results) == 1 and results[0].failed
         assert all(len(error) <= 1024 for error in results[0].errors)
         assert any("turn failed:" in line for line in logs), "Worker log sink was not reached"
-        assert secret not in " ".join(results[0].errors), "Credential survived result retention"
-        assert secret not in "\n".join(logs), "Credential survived diagnostic/worker log sink"
+        leaked_sinks = [name for name, text in {
+            "result.errors": " ".join(results[0].errors),
+            "worker-log": "\n".join(logs),
+        }.items() if secret in text]
+        assert not leaked_sinks, f"Credential survived in {leaked_sinks}"
         assert "[redacted]" in " ".join(results[0].errors)
         if case == "output-cap":
             assert "SAFE_SUFFIX" in " ".join(results[0].errors), "Cap applied before redaction"

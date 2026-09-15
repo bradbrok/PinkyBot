@@ -71,7 +71,9 @@ Brad's Dymok test agent).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -93,6 +95,39 @@ class TransportReplacementMixin:
 
     def _preflight_transport_replacement(self) -> None:
         """Prove that a replacement may be started without mutating transport."""
+
+    @staticmethod
+    def _recovery_fencing_enabled() -> bool:
+        return os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1"
+
+    def _recovery_ownership_enabled(self) -> bool:
+        return self._recovery_fencing_enabled() or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
+
+    def _check_recovery_owner(self) -> None:
+        if self._recovery_ownership_enabled() and (
+            getattr(self, "_recovery_inhibited", False)
+            or getattr(self, "_recovery_retired", False)
+        ):
+            raise RuntimeError("Transport recovery owner is retired or quiescing")
+
+    async def _quiesce_recovery_owner(self) -> None:
+        task = getattr(self, "_reconnect_task", None)
+        if task is asyncio.current_task():
+            raise RuntimeError("Recovery owner cannot replace itself")
+        if task is not None and not task.done() and task is not getattr(self, "_owned_reconnect_task", None):
+            # Do not cancel an arbitrary caller/ancestor supplied as a handle.
+            # Only the task minted by this transport's recovery entry is ours.
+            raise RuntimeError("Unrecognized recovery owner; replacement refused")
+        # Inhibit synchronously before cancellation yields: a concurrent stale
+        # reference must not acquire a new owner while this one is stopping.
+        self._recovery_inhibited = True
+        if task is not None and not task.done():
+            task.cancel()
+            done, _ = await asyncio.wait({task}, timeout=5)
+            if not done:
+                raise TimeoutError("Transport recovery owner did not stop")
+            if not task.cancelled():
+                task.result()
 
     @staticmethod
     async def _run_replacement_step(step: ReplacementStep | None) -> None:
@@ -124,6 +159,11 @@ class TransportReplacementMixin:
         await self._run_replacement_step(
             target_preflight or self._preflight_transport_replacement
         )
+        fenced = target_preflight is not None and self._recovery_fencing_enabled()
+        if fenced:
+            await self._quiesce_recovery_owner()
+            if bring_up is not None:
+                self._recovery_retired = True
         await self._run_replacement_step(configure)
         prior_strict = getattr(self, "_replacement_cleanup_strict", False)
         self._replacement_cleanup_strict = target_preflight is not None or prior_strict
@@ -142,6 +182,11 @@ class TransportReplacementMixin:
                 await connect_wrapper(connect)
         else:
             await self._run_replacement_step(bring_up)
+        if fenced:
+            self._recovery_inhibited = False
+            if bring_up is None:
+                # Only a successful retained-object restart permits another owner.
+                self._recovery_retired = False
 
 
 @runtime_checkable

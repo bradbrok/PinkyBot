@@ -174,6 +174,21 @@ async def test_replacement_refuses_self_owned_recovery_without_self_cancel(lifec
         old._reconnect_task = None
 
 
+async def test_direct_replacement_refuses_current_recovery_owner(lifecycle_harness):
+    old = lifecycle_harness.seed()
+    task = asyncio.current_task()
+    old._reconnect_task = old._owned_reconnect_task = task
+    outcome = None
+    try:
+        await old.restart_transport(target_preflight=old._preflight_transport_replacement)
+    except BaseException as exc:
+        outcome = exc
+    finally:
+        old._reconnect_task = old._owned_reconnect_task = None
+    assert isinstance(outcome, RuntimeError), "Current owner must be refused before cancellation"
+    assert not task.cancelling()
+
+
 @pytest.mark.parametrize("mode", ["off", "q2"])
 async def test_disabled_rebuild_retains_original_object(lifecycle_harness, monkeypatch, mode):
     h = lifecycle_harness
@@ -275,3 +290,43 @@ async def test_target_preflight_failure_does_not_cancel_old_recovery(
     finally:
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("source", ["claude_sdk", "codex_cli"])
+async def test_replacement_awaits_delayed_owner_cancellation(lifecycle_harness, source):
+    h = lifecycle_harness
+    old = h.seed((source, "sdk"))
+    old._RECONNECT_BACKOFF = (0,)
+    entered, cancelling, release = asyncio.Event(), asyncio.Event(), asyncio.Event()
+
+    async def external_start(ss):
+        if ss is old:
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                cancelling.set()
+                await release.wait()
+                raise
+
+    h.control.start_hook = external_start
+    recovery = asyncio.create_task(old.attempt_reconnect())
+    await asyncio.wait_for(entered.wait(), 1)
+    h.app.state.agents.register(
+        "sample", runtime="codex_cli" if source == "claude_sdk" else "claude_sdk",
+    )
+    replacement = asyncio.create_task(h.client.post("/admin/force-restart-agent/sample"))
+    try:
+        await asyncio.wait_for(cancelling.wait(), 1)
+        await asyncio.sleep(0)
+        assert not any(action == "connect" and ss is not old for action, ss in h.trace), (
+            "Replacement started before old owner acknowledged cancellation"
+        )
+        assert not recovery.done()
+    finally:
+        release.set()
+        await asyncio.gather(recovery, return_exceptions=True)
+    response = await replacement
+    assert response.status_code == 200, response.text
+    assert old.state == SessionState.DEAD
+    assert old._state_machine._in_flight is None

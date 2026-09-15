@@ -574,6 +574,11 @@ class StreamingSession(TransportReplacementMixin):
             deadline=min(time.monotonic() + 600, getattr(self, "_startup_deadline", None) or float("inf")),
         )
         evidence = None
+        sdk_contract = None
+        if resume_recovery.enabled() and options.resume:
+            sdk_contract = resume_recovery.sdk_contract()
+            if not sdk_contract[1]:
+                resume_recovery.report_sdk_drift(_log, sdk_contract[0], "unsupported_sdk_version")
         try:
             if not resume_recovery.enabled():
                 self._client = ClaudeSDKClient(options)
@@ -591,6 +596,14 @@ class StreamingSession(TransportReplacementMixin):
                         candidate = resume_recovery.sdk_rejection(
                             exc, options.resume or "", operation.generation,
                         )
+                        if sdk_contract is not None and not sdk_contract[1]:
+                            candidate = None
+                        elif options.resume and candidate is None and isinstance(exc, Exception):
+                            resume_recovery.report_sdk_drift(
+                                _log, sdk_contract[0],
+                                "stderr_shape_changed" if getattr(exc, "stderr", None)
+                                else "unclassified_initialize",
+                            )
                         claimed = operation.claim(candidate)
                         if claimed:
                             evidence = candidate
@@ -1701,6 +1714,7 @@ class StreamingSession(TransportReplacementMixin):
         it alive when the initiating caller (e.g. the old reader task,
         cancelled by disconnect()) dies mid-reconnect.
         """
+        self._check_recovery_owner()
         task = self._reconnect_task
         if task is not None and not task.done():
             _log(
@@ -1710,6 +1724,8 @@ class StreamingSession(TransportReplacementMixin):
         else:
             task = asyncio.create_task(self._reconnect_with_backoff())
             self._reconnect_task = task
+            if self._recovery_ownership_enabled():
+                self._owned_reconnect_task = task
             task.add_done_callback(self._clear_reconnect_task)
         await asyncio.wait_for(task, timeout=None)
 
@@ -1720,9 +1736,16 @@ class StreamingSession(TransportReplacementMixin):
     async def _reconnect_with_backoff(self) -> None:
         """Keep the operation, deadline and fresh budget across backoff attempts."""
         if not resume_recovery.enabled():
-            await self._reconnect_attempts()
+            try:
+                await self._reconnect_attempts()
+            except BaseException:
+                if self._recovery_fencing_enabled():
+                    self._state_machine._state = SessionState.DEAD
+                raise
             return
         self._recovery_operation = resume_recovery.RecoveryOperation()
+        prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+        self._replacement_cleanup_strict = True
         try:
             async with asyncio.timeout_at(self._recovery_operation.deadline):
                 await self._reconnect_attempts()
@@ -1731,6 +1754,7 @@ class StreamingSession(TransportReplacementMixin):
             raise
         finally:
             self._recovery_operation = None
+            self._replacement_cleanup_strict = prior_strict
 
     async def _reconnect_attempts(self) -> None:
         """Single warm-reconnect cycle: disconnect, then bounded retries."""
@@ -1747,6 +1771,7 @@ class StreamingSession(TransportReplacementMixin):
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
             if resume_recovery.enabled():
+                self._recovery_operation.cleanup_failed = True
                 self._state_machine._state = SessionState.DEAD
                 return
         # disconnect()'s no-prior-intent fallback would normally drive
@@ -1763,6 +1788,7 @@ class StreamingSession(TransportReplacementMixin):
                 f"after {delay}s backoff"
             )
             await asyncio.sleep(delay)
+            self._check_recovery_owner()
             try:
                 await self.connect()
                 _log(f"streaming[{self.agent_name}]: reconnected successfully")
@@ -1781,7 +1807,9 @@ class StreamingSession(TransportReplacementMixin):
                 try:
                     await self.disconnect()
                 except Exception:
-                    pass
+                    if resume_recovery.enabled():
+                        self._recovery_operation.cleanup_failed = True
+                        break
                 # Re-assert RECONNECTING after the inner disconnect. ``connect()``
                 # flips state to CONNECTED before its post-connect setup
                 # (analytics session-started, reader-loop spawn); a raise during

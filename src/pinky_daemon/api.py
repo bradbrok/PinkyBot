@@ -478,6 +478,8 @@ async def _bounded_cold_start_connect(
                 f"streaming-start: cold start timed out for {agent_name}/{label} "
                 f"after {timeout:.0f}s — discarding unregistered session"
             )
+            if getattr(ss, "_startup_cleanup_owned", False):
+                raise
             try:
                 if bounded_recovery:
                     async with asyncio.timeout(5):
@@ -3811,7 +3813,7 @@ def create_api(
         epoch=None,
     ) -> None:
         """Synchronously persist one streaming SDK resume-handle update."""
-        if owner is not None and _rebuild_enabled():
+        if owner is not None and _startup_fencing_enabled():
             current = broker._streaming.get(agent_name, {}).get(label)
             if (_resume_epochs.get((agent_name, label)) is not epoch or
                     _resume_owners.get((agent_name, label)) is not owner) or (
@@ -4250,6 +4252,40 @@ def create_api(
         return ss
 
     async def _connect_prepared_session(ss):
+        if not _startup_fencing_enabled():
+            return await _connect_prepared_session_unchecked(ss)
+        name, label = ss.agent_name, ss._config.label
+        async with _session_scope(name, label):
+            await _settle_startup_debt(name, label)
+            current = broker._streaming.get(name, {}).get(label)
+            if current is not None and current is not ss:
+                raise HTTPException(409, "Startup owner superseded")
+            prior_strict = getattr(ss, "_replacement_cleanup_strict", False)
+            prior_owned = getattr(ss, "_startup_cleanup_owned", False)
+            ss._replacement_cleanup_strict = ss._startup_cleanup_owned = True
+            try:
+                return await _connect_prepared_session_unchecked(ss)
+            except BaseException:
+                # Publish ownership of uncertainty BEFORE cleanup can suspend.
+                key = (name, label)
+                if _resume_owners.get(key) is ss:
+                    _resume_owners.pop(key, None)
+                    _resume_epochs[key] = object()
+                if broker._streaming.get(name, {}).get(label) is ss:
+                    broker.unregister_streaming(name, label=label)
+                _candidate_cleanup_debts[key] = ss
+                try:
+                    await _settle_startup_debt(name, label)
+                except BaseException:
+                    # Preserve the initiating exception/cancellation. The debt
+                    # remains visible to all subsequent startup callers.
+                    pass
+                raise
+            finally:
+                ss._replacement_cleanup_strict = prior_strict
+                ss._startup_cleanup_owned = prior_owned
+
+    async def _connect_prepared_session_unchecked(ss):
         agent_name, label = ss.agent_name, ss._config.label
         config = ss._config
         resume_id = config.resume_handle
@@ -4391,6 +4427,15 @@ def create_api(
         return ss
 
     async def _start_streaming_session(agent_name: str, *, label="main", resume_id=""):
+        if _startup_fencing_enabled():
+            async with _session_scope(agent_name, label):
+                await _settle_startup_debt(agent_name, label)
+                return await _start_streaming_session_unchecked(
+                    agent_name, label=label, resume_id=resume_id,
+                )
+        return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
+
+    async def _start_streaming_session_unchecked(agent_name: str, *, label="main", resume_id=""):
         ss = await _prepare_streaming_session(agent_name, label=label, resume_id=resume_id)
         if ss is None:
             return None
@@ -4416,6 +4461,48 @@ def create_api(
 
     _lifecycle_owners = {}
     _candidate_cleanup_debts = {}
+    _label_owners = {}
+
+    def _startup_fencing_enabled():
+        return _rebuild_enabled() or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
+
+    @contextlib.asynccontextmanager
+    async def _label_scope(name, label):
+        key, task = (name, label), asyncio.current_task()
+        if _label_owners.get(key) is task:
+            yield
+            return
+        async with _streaming_ensure_locks.setdefault(key, asyncio.Lock()):
+            _label_owners[key] = task
+            try:
+                yield
+            finally:
+                _label_owners.pop(key, None)
+
+    @contextlib.asynccontextmanager
+    async def _session_scope(name, label):
+        async with _lifecycle(name), _label_scope(name, label):
+            yield
+
+    async def _settle_startup_debt(name, label):
+        key = (name, label)
+        debt = _candidate_cleanup_debts.get(key)
+        if debt is None:
+            return
+        current = broker._streaming.get(name, {}).get(label)
+        if current is not None and current is not debt:
+            raise HTTPException(409, "Cleanup owner superseded; startup refused")
+        prior_strict = getattr(debt, "_replacement_cleanup_strict", False)
+        debt._replacement_cleanup_strict = True
+        debt._recovery_retired = True
+        try:
+            async with asyncio.timeout(5):
+                await debt._quiesce_recovery_owner()
+                await debt.disconnect()
+        finally:
+            debt._replacement_cleanup_strict = prior_strict
+        if _candidate_cleanup_debts.get(key) is debt:
+            _candidate_cleanup_debts.pop(key)
 
     @contextlib.asynccontextmanager
     async def _lifecycle(name):
@@ -4467,6 +4554,7 @@ def create_api(
                     or (queue is not None and not queue.empty()))
             if busy or not _get_streaming_restart_guard(name, old)["restart_safe"]:
                 raise HTTPException(409, "Session replacement must wait for a safe idle boundary")
+        await _settle_startup_debt(name, label)
         original_fingerprint = copy.deepcopy(_launch_fingerprint(agent))
         candidate = await _prepare_streaming_session(name, label=label, agent_snapshot=launch_agent)
         if candidate is None:
@@ -4487,21 +4575,7 @@ def create_api(
             if broker._streaming.get(name, {}).get(label) is not old:
                 raise HTTPException(409, "Session replacement superseded")
             broker.unregister_streaming(name, label=label)
-            try:
-                await _connect_prepared_session(candidate)
-            except BaseException:
-                if _resume_owners.get((name, label)) is candidate:
-                    _resume_owners.pop((name, label), None)
-                if broker._streaming.get(name, {}).get(label) in (None, candidate):
-                    candidate._replacement_cleanup_strict = True
-                    try:
-                        await candidate.disconnect()
-                    except BaseException:
-                        _candidate_cleanup_debts[(name, label)] = candidate
-                        raise
-                    finally:
-                        candidate._replacement_cleanup_strict = False
-                raise
+            await _connect_prepared_session(candidate)
 
         await old.restart_transport(
             target_preflight=candidate._preflight_transport_replacement,
@@ -4514,7 +4588,7 @@ def create_api(
             await ss.restart_transport(configure=configure, **kwargs)
             return ss
         label = getattr(ss._config, "label", "main") or "main"
-        async with _lifecycle(name), _streaming_ensure_locks.setdefault((name, label), asyncio.Lock()):
+        async with _session_scope(name, label):
             current = broker._streaming.get(name, {}).get(label)
             if current is not ss:
                 if current is not None and current.state == TransportSessionState.CONNECTED:
@@ -4577,17 +4651,8 @@ def create_api(
 
             deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
             while True:
-                async with _lifecycle(agent_name), _streaming_ensure_locks.setdefault(
-                    (agent_name, label), asyncio.Lock(),
-                ):
-                    debt = _candidate_cleanup_debts.get((agent_name, label))
-                    if debt is not None:
-                        debt._replacement_cleanup_strict = True
-                        try:
-                            await debt.disconnect()
-                        finally:
-                            debt._replacement_cleanup_strict = False
-                        _candidate_cleanup_debts.pop((agent_name, label), None)
+                async with _session_scope(agent_name, label):
+                    await _settle_startup_debt(agent_name, label)
                     ss = broker._streaming.get(agent_name, {}).get(label)
                     agent = agents.get(agent_name)
                     if not agent or not agent.enabled:
@@ -4633,7 +4698,7 @@ def create_api(
         # is in flight for this agent, so we never start a session against a
         # half-applied isolation row. The CONNECTED fast path above stays
         # lock-free, so this adds no contention on the hot inbound path.
-        async with _lifecycle(agent_name), lock:
+        async with _lifecycle(agent_name), (_label_scope(agent_name, label) if _startup_fencing_enabled() else lock):
             # Re-check under the lock: a concurrent caller may have started
             # or reconnected the session while we waited.
             sessions = broker._streaming.get(agent_name, {})
@@ -4673,7 +4738,7 @@ def create_api(
     async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
-            async with _lifecycle(name), _streaming_ensure_locks.setdefault((name, label), asyncio.Lock()):
+            async with _session_scope(name, label):
                 if broker._streaming.get(name, {}).get(label) is not ss:
                     continue
                 if _rebuild_enabled() and type(ss) is not _expected_session_class(agents.get(name)):
@@ -8777,7 +8842,7 @@ npm run build</pre>
             disconnect_sessions=_disconnect_streaming_sessions,
             start_session=_container_start_main,
             has_live_session=lambda n: bool(broker._streaming.get(n)),
-            lifecycle_lock=_container_lifecycle_lock,
+            lifecycle_lock=lambda name: (_lifecycle(name) if _startup_fencing_enabled() else _container_lifecycle_lock(name)),
             op_registry=_container_op_registry,
             is_busy=_container_agent_busy,
             log=_log,
@@ -11100,7 +11165,7 @@ npm run build</pre>
         if _rebuild_enabled():
             old = broker._get_streaming_session(name)
             if old is not None and type(old) is not _expected_session_class(candidate):
-                async with _streaming_ensure_locks.setdefault((name, "main"), asyncio.Lock()):
+                async with _label_scope(name, "main"):
                     await _replace_session_locked(
                         name, "main", old, reason="model_change", implicit=True,
                         launch_agent=candidate, updates={"model": req.model},
@@ -12600,7 +12665,7 @@ npm run build</pre>
         _log(f"api: watchdog resurrection — reconnecting {agent_name}")
         if _rebuild_enabled():
             label = getattr(ss._config, "label", "main") or "main"
-            async with _streaming_ensure_locks.setdefault((agent_name, label), asyncio.Lock()):
+            async with _label_scope(agent_name, label):
                 if type(ss) is not _expected_session_class(agents.get(agent_name)):
                     await _replace_session_locked(agent_name, label, ss, reason="heartbeat_resurrect")
                     return

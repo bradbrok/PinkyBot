@@ -103,6 +103,8 @@ async def test_failed_start_cleanup_fences_next_real_create(
     response = await h.client.post("/agents/sample/streaming-sessions")
     assert response.status_code == 200, response.text
     assert len(h.clients) == before + 2
+    current = h.app.state.broker._streaming["sample"]["main"]
+    assert await h.app.state.broker._ensure_session_callback("sample") is current
 
 
 @pytest.mark.parametrize("mode", ["a", "b", "both"])
@@ -136,6 +138,8 @@ async def test_interrupted_cold_start_retains_cleanup_owner(
     before = len(h.clients)
     failed = h.sessions[-1]
     peer = h.clients[-1]
+    if mode == "a":
+        assert peer.disconnect.await_count == 1, "Startup cleanup acquired a second budget"
     h.control.start_hook = h.control.cleanup_error = None
     response = await h.client.post("/agents/sample/streaming-sessions")
     assert response.status_code >= 400, "Interrupted startup lost cleanup ownership"
@@ -227,3 +231,47 @@ async def test_concurrent_create_and_ensure_share_one_startup_owner(lifecycle_ha
     assert response.status_code == 200, response.text
     assert len(h.clients) == before + 1
     assert h.app.state.broker._streaming["sample"]["main"] is current
+
+
+async def test_cleanup_debt_never_tears_down_a_superseded_label_owner(lifecycle_harness):
+    h = lifecycle_harness
+    h.seed()
+    h.app.state.broker.unregister_streaming("sample", label="main")
+    h.control.start_error = RuntimeError("initialize failed")
+    h.control.cleanup_error = RuntimeError("child still alive")
+    with pytest.raises(RuntimeError):
+        await h.app.state.broker._ensure_session_callback("sample")
+    peer = h.clients[-1]
+    before = peer.disconnect.await_count
+    h.control.start_error = h.control.cleanup_error = None
+    replacement = h.seed()
+    try:
+        await invoke(h, "container")
+    except HTTPException as exc:
+        assert exc.status_code == 409
+    else:
+        pytest.fail("Superseded cleanup owner was admitted")
+    assert peer.disconnect.await_count == before, "Cleanup touched a superseded label"
+    assert h.app.state.broker._streaming["sample"]["main"] is replacement
+
+
+async def test_post_connect_refusal_keeps_failed_cleanup_owner(lifecycle_harness, monkeypatch):
+    h = lifecycle_harness
+    set_flags(monkeypatch, "a")
+    h.seed()
+    h.app.state.broker.unregister_streaming("sample", label="main")
+
+    async def change_launch_row(ss):
+        h.app.state.agents.register("sample", model="haiku")
+
+    h.control.start_hook = change_launch_row
+    h.control.cleanup_error = RuntimeError("child still alive")
+    response = await h.client.post("/agents/sample/streaming-sessions")
+    assert response.status_code >= 400
+    failed = h.sessions[-1]
+    assert failed._client is h.clients[-1], "Post-connect refusal discarded an uncleaned client"
+    h.control.start_hook = h.control.cleanup_error = None
+    count = len(h.clients)
+    response = await h.client.post("/agents/sample/streaming-sessions")
+    assert response.status_code >= 400
+    assert len(h.clients) == count
