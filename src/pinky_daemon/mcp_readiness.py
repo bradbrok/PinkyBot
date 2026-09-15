@@ -78,7 +78,9 @@ async def _connect(host: str, port: int):
     return await asyncio.open_connection(host, port)
 
 
-async def _probe_endpoint(endpoint, *, delays, cap_sec, connect, wait) -> EndpointReadiness:
+async def _probe_endpoint(
+    endpoint, *, delays, cap_sec, connect, wait, cancel_falls_open=False,
+) -> EndpointReadiness:
     started = time.monotonic()
     deadline = started + cap_sec
     attempts = 0
@@ -92,9 +94,12 @@ async def _probe_endpoint(endpoint, *, delays, cap_sec, connect, wait) -> Endpoi
                 await writer.wait_closed()
             status = "up"
             break
+        except asyncio.CancelledError:
+            if not cancel_falls_open:
+                raise
+            break
         except Exception:
             # DNS failures, refused sockets and timeout all consume an attempt.
-            # Cancellation is a BaseException and remains a lifecycle signal.
             pass
         remaining = deadline - time.monotonic()
         if remaining <= 0:
@@ -103,6 +108,10 @@ async def _probe_endpoint(endpoint, *, delays, cap_sec, connect, wait) -> Endpoi
         try:
             async with asyncio.timeout(remaining):
                 await wait(delay)
+        except asyncio.CancelledError:
+            if not cancel_falls_open:
+                raise
+            break
         except TimeoutError:
             break
     return EndpointReadiness(status, min(cap_sec, time.monotonic() - started), attempts)
@@ -147,14 +156,25 @@ class BootMcpReadiness:
             if key not in self._tasks:
                 self._tasks[key] = asyncio.create_task(_probe_endpoint(
                     key, delays=DEFAULT_RETRY_DELAYS, cap_sec=self.cap_sec,
-                    connect=self._connect, wait=self._wait,
+                    connect=self._connect, wait=self._wait, cancel_falls_open=True,
                 ))
-        results = await asyncio.gather(*(asyncio.shield(self._tasks[key]) for key in keys))
-        return ReadinessReport(dict(zip(keys, results)))
+        # Teardown of the shared probe falls open; cancellation of this caller
+        # still propagates from gather and cannot cancel the shielded probe.
+        await asyncio.gather(
+            *(asyncio.shield(self._tasks[key]) for key in keys), return_exceptions=True,
+        )
+        return ReadinessReport({key: self._result(self._tasks[key]) for key in keys})
+
+    @staticmethod
+    def _result(task: asyncio.Task) -> EndpointReadiness:
+        # Cancellation before the coroutine starts has no attempts or elapsed wait.
+        if task.cancelled():
+            return EndpointReadiness("unreachable", 0.0, 0)
+        return task.result()
 
     def report(self) -> ReadinessReport:
-        return ReadinessReport({key: task.result() for key, task in self._tasks.items()
-                                if task.done() and not task.cancelled() and not task.exception()})
+        return ReadinessReport({key: self._result(task) for key, task in self._tasks.items()
+                                if task.done() and (task.cancelled() or not task.exception())})
 
     async def close(self) -> None:
         for task in self._tasks.values():

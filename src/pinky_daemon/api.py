@@ -13283,13 +13283,13 @@ npm run build</pre>
         try:
             await asyncio.gather(*boot_launches)
         finally:
+            active_boot_mcp_gate = None
+            boot_mcp_keys.clear()
             for task in boot_launches:
                 if not task.done():
                     task.cancel()
             await asyncio.gather(*boot_launches, return_exceptions=True)
             await boot_mcp_gate.close()
-            active_boot_mcp_gate = None
-            boot_mcp_keys.clear()
             readiness = boot_mcp_gate.report()
             up = sum(r.status == "up" for r in readiness.results.values())
             unreachable = sum(r.status == "unreachable" for r in readiness.results.values())

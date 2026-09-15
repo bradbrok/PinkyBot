@@ -1508,6 +1508,7 @@ class _QueuedTurn:
     wake_submit_attempts: int = 0
     wake_submission_latency_ms: int = 0
     wake_terminal_reported: bool = False
+    wake_owner_alerted: bool = False
 
 
 @dataclass(frozen=True)
@@ -7427,9 +7428,10 @@ class TmuxSession(TransportReplacementMixin):
                 "reason": turn.reason, "submit_attempts": turn.wake_submit_attempts,
                 "latency_ms": turn.wake_submission_latency_ms, "terminal": True,
             })
-        if self._wake_owner_alerted:
+        if self._wake_owner_alerted or turn.wake_owner_alerted:
             return
         self._wake_owner_alerted = True
+        turn.wake_owner_alerted = True
         callback = self._config.wake_failure_callback
         if callback is not None:
             try:
