@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 
 from pinky_daemon.codex_home import (
+    CODEX_AUTO_COMPACT_TOKEN_LIMIT,
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
     per_agent_codex_home_enabled,
@@ -248,6 +249,7 @@ class CodexTmuxSession(TmuxSession):
         # --no-alt-screen keeps codex in an inline REPL (alt-screen TUI is hostile
         # to send-keys + transcript tail).
         parts += ["--dangerously-bypass-approvals-and-sandbox", "--no-alt-screen"]
+        parts += ["-c", f"model_auto_compact_token_limit={CODEX_AUTO_COMPACT_TOKEN_LIMIT}"]
         if self._codex_model:
             parts += ["-m", self._codex_model]
         if not use_resume:
