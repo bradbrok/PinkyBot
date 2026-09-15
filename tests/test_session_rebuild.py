@@ -10,6 +10,7 @@ from unittest.mock import AsyncMock
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from starlette.requests import Request
 
 from pinky_daemon.api import create_api
@@ -272,7 +273,7 @@ async def test_connected_ensure_preserves_runtime_refusal(harness, runtime):
     h = harness
     old = h.seed()
     h.app.state.agents.register("sample", runtime=runtime)
-    with pytest.raises(Exception):
+    with pytest.raises(HTTPException):
         await h.app.state.broker._ensure_session_callback("sample")
     assert h.app.state.broker._streaming["sample"]["main"] is old
     assert not any(action in {"connect", "disconnect"} for action, _ in h.trace)
@@ -519,3 +520,45 @@ async def test_catalog_read_failure_is_not_unknown_model_allow(harness, monkeypa
     else:
         assert response.status_code >= 500, response.text
     assert h.app.state.agents.get("sample").model == before
+
+
+async def test_delivery_rechecks_class_after_attachment_download(harness, monkeypatch):
+    h = harness
+    old = h.seed()
+
+    async def download(*args):
+        h.target(("codex_cli", "tmux"))
+
+    monkeypatch.setattr(h.app.state.broker, "_download_photo_attachments", download)
+    assert await h.app.state.broker._route_streaming("sample", BrokerMessage(
+        platform="web", chat_id="web", sender_name="User", sender_id="user",
+        content="Continue", agent_name="sample",
+    ))
+    current = h.app.state.broker._streaming["sample"]["main"]
+    assert type(current) is CodexTmuxSession
+    assert ("send", current) in h.trace
+    assert ("send", old) not in h.trace
+
+
+async def test_custom_endpoint_keeps_known_foreign_model_id(harness, monkeypatch):
+    h = harness
+    h.seed()
+    monkeypatch.setenv("PINKY_MODEL_RUNTIME_GUARD", "1")
+    response = await h.client.put("/agents/sample", json={
+        "provider_url": "https://proxy.example/v1", "provider_model": "gpt-5.6-sol",
+    })
+    assert response.status_code == 200
+    assert h.app.state.agents.get("sample").provider_model == "gpt-5.6-sol"
+
+
+async def test_model_rebuild_launches_requested_model_before_live_control(harness):
+    h = harness
+    old = h.seed()
+    h.target(("codex_cli", "sdk"))
+    response = await h.client.post("/agents/sample/streaming/model", json={"model": "gpt-5.6-sol"})
+    assert response.status_code == 200, response.text
+    current, config = h.configs[-1]
+    assert type(current) is CodexSession
+    assert config.model == "gpt-5.6-sol"
+    assert h.app.state.agents.get("sample").model == "gpt-5.6-sol"
+    old._client.set_model.assert_not_awaited()
