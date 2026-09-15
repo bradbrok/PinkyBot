@@ -4399,6 +4399,7 @@ def create_api(
         return _container_lifecycle_locks.setdefault(agent_name, asyncio.Lock())
 
     _lifecycle_owners = {}
+    _candidate_cleanup_debts = {}
 
     @contextlib.asynccontextmanager
     async def _lifecycle(name):
@@ -4439,7 +4440,8 @@ def create_api(
         _expected_session_class(agent)
         if implicit:
             queue = getattr(old, "_message_queue", None)
-            busy = (getattr(old, "_processing", False) or getattr(old, "_inflight", None)
+            busy = (old.state in {TransportSessionState.BOOTING, TransportSessionState.RECONNECTING}
+                    or getattr(old, "_processing", False) or getattr(old, "_inflight", None)
                     or getattr(old, "_pending_chats", None)
                     or getattr(old, "_inflight_metas", None)
                     or getattr(old, "_inflight_turn", None)
@@ -4472,7 +4474,14 @@ def create_api(
                 if _resume_owners.get((name, label)) is candidate:
                     _resume_owners.pop((name, label), None)
                 if broker._streaming.get(name, {}).get(label) in (None, candidate):
-                    await candidate.disconnect()
+                    candidate._replacement_cleanup_strict = True
+                    try:
+                        await candidate.disconnect()
+                    except BaseException:
+                        _candidate_cleanup_debts[(name, label)] = candidate
+                        raise
+                    finally:
+                        candidate._replacement_cleanup_strict = False
                 raise
 
         await old.restart_transport(
@@ -4552,6 +4561,14 @@ def create_api(
                 async with _lifecycle(agent_name), _streaming_ensure_locks.setdefault(
                     (agent_name, label), asyncio.Lock(),
                 ):
+                    debt = _candidate_cleanup_debts.get((agent_name, label))
+                    if debt is not None:
+                        debt._replacement_cleanup_strict = True
+                        try:
+                            await debt.disconnect()
+                        finally:
+                            debt._replacement_cleanup_strict = False
+                        _candidate_cleanup_debts.pop((agent_name, label), None)
                     ss = broker._streaming.get(agent_name, {}).get(label)
                     agent = agents.get(agent_name)
                     if not agent or not agent.enabled:
@@ -4570,8 +4587,10 @@ def create_api(
                             )
                         if ss.state != TransportSessionState.CONNECTED:
                             _enforce_isolation_runnable(agent_name)
-                            _refresh_streaming_launch_config(agent_name, ss)
-                            await ss.connect()
+                            await ss.restart_transport(
+                                target_preflight=ss._preflight_transport_replacement,
+                                configure=lambda: _refresh_streaming_launch_config(agent_name, ss),
+                            )
                         return ss
                 if time.monotonic() >= deadline:
                     raise HTTPException(409, "Session transition still in progress")
@@ -4633,7 +4652,7 @@ def create_api(
             )
 
     async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
-        while True:
+        for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
             async with _lifecycle(name), _streaming_ensure_locks.setdefault((name, label), asyncio.Lock()):
                 if broker._streaming.get(name, {}).get(label) is not ss:
@@ -4649,6 +4668,7 @@ def create_api(
                             kwargs["on_accept"] = schedule_receipt.accept
                         return ss, await sender(prompt, **kwargs)
                 return ss, await ss.send(prompt, **kwargs)
+        raise HTTPException(409, "Session changed repeatedly before delivery")
 
     broker._compatible_delivery = _deliver_streaming
 
@@ -10942,8 +10962,6 @@ npm run build</pre>
             except Exception as e:
                 if not _rebuild_enabled():
                     broker.unregister_streaming(name)
-                elif broker._streaming.get(name, {}).get("main") is ss and ss.state == TransportSessionState.DEAD:
-                    broker.unregister_streaming(name, label="main")
                 _log(
                     f"api: post-response context restart failed for {name}: {e}"
                 )
@@ -11030,6 +11048,7 @@ npm run build</pre>
             _validate_model_runtime(candidate, {"model": req.model})
             if os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") == "1":
                 req = req.model_copy(update={"model": _effective_launch_model(candidate)[2]})
+                candidate = _merged_agent(agent, {"model": req.model})
         if _rebuild_enabled():
             old = broker._get_streaming_session(name)
             if old is not None and type(old) is not _expected_session_class(candidate):
@@ -11040,7 +11059,6 @@ npm run build</pre>
                     )
                 return {"updated": True, "agent": name, "model": req.model,
                         "restarted": True, "applied": "restarted"}
-            await _ensure_streaming_session(name)
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
@@ -11130,8 +11148,6 @@ npm run build</pre>
             except Exception as e:
                 if not _rebuild_enabled():
                     broker.unregister_streaming(name)
-                elif broker._streaming.get(name, {}).get("main") is ss and ss.state == TransportSessionState.DEAD:
-                    broker.unregister_streaming(name, label="main")
                 raise HTTPException(500, f"Failed to restart: {e}")
 
             return {
@@ -11228,8 +11244,6 @@ npm run build</pre>
         except Exception as e:
             if not _rebuild_enabled():
                 broker.unregister_streaming(name)
-            elif broker._streaming.get(name, {}).get("main") is ss and ss.state == TransportSessionState.DEAD:
-                broker.unregister_streaming(name, label="main")
             raise HTTPException(500, f"Failed to restart after archive: {e}")
 
         return {
@@ -13172,7 +13186,7 @@ npm run build</pre>
             )
             _log(f"watchdog: MCP-recovered {agent_name}/{label} (force-fresh)")
         except Exception as exc:
-            if broker._streaming.get(agent_name, {}).get(label) is ss:
+            if not _rebuild_enabled() and broker._streaming.get(agent_name, {}).get(label) is ss:
                 broker.unregister_streaming(agent_name, label=label)
             _log(f"watchdog: MCP recovery connect failed for {agent_name}/{label}: {exc}")
             raise
@@ -14461,8 +14475,6 @@ npm run build</pre>
         except Exception as e:
             if not _rebuild_enabled():
                 broker.unregister_streaming(name)
-            elif broker._streaming.get(name, {}).get("main") is ss and ss.state == TransportSessionState.DEAD:
-                broker.unregister_streaming(name, label="main")
             raise HTTPException(500, f"Failed to force-restart: {e}")
 
         return {

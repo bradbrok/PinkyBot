@@ -562,3 +562,50 @@ async def test_model_rebuild_launches_requested_model_before_live_control(harnes
     assert config.model == "gpt-5.6-sol"
     assert h.app.state.agents.get("sample").model == "gpt-5.6-sol"
     old._client.set_model.assert_not_awaited()
+
+
+async def test_model_route_refuses_transition_without_waiting_under_lifecycle_lock(harness):
+    h = harness
+    old = h.seed()
+    old._state_machine._state = SessionState.RECONNECTING
+    response = await asyncio.wait_for(h.client.post(
+        "/agents/sample/streaming/model", json={"model": "sonnet"},
+    ), timeout=1)
+    assert response.status_code == 409
+    assert not any(action in {"connect", "disconnect", "model"} for action, _ in h.trace)
+
+
+async def test_failed_teardown_keeps_old_identity_for_cleanup(harness, monkeypatch):
+    h = harness
+    old = h.seed()
+    h.target(("codex_cli", "tmux"))
+
+    async def disconnect():
+        old._state_machine._state = SessionState.DEAD
+        raise RuntimeError("child cleanup uncertain")
+
+    monkeypatch.setattr(old, "disconnect", disconnect)
+    response = await h.client.post("/admin/force-restart-agent/sample")
+    assert response.status_code >= 400
+    assert h.app.state.broker._streaming["sample"]["main"] is old
+    assert not any(action == "connect" for action, _ in h.trace)
+
+
+async def test_failed_candidate_cleanup_blocks_next_spawn_until_cleanup_succeeds(harness, monkeypatch):
+    h = harness
+    h.seed()
+    h.target(("codex_cli", "tmux"))
+    h.control.connect_failure = True
+    original_disconnect = CodexTmuxSession.disconnect
+    monkeypatch.setattr(CodexTmuxSession, "disconnect", AsyncMock(side_effect=RuntimeError("still live")))
+    response = await h.client.post("/admin/force-restart-agent/sample")
+    assert response.status_code >= 400
+    assert h.app.state.broker._streaming.get("sample", {}).get("main") is None
+    with pytest.raises(RuntimeError, match="still live"):
+        await h.app.state.broker._ensure_session_callback("sample")
+    assert len([event for event in h.trace if event[0] == "connect"]) == 1
+    monkeypatch.setattr(CodexTmuxSession, "disconnect", original_disconnect)
+    h.control.connect_failure = False
+    replacement = await h.app.state.broker._ensure_session_callback("sample")
+    assert replacement.state == SessionState.CONNECTED
+    assert len([event for event in h.trace if event[0] == "connect"]) == 2
