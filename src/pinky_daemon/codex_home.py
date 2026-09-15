@@ -24,6 +24,8 @@ from functools import cache
 from pathlib import Path
 from typing import BinaryIO
 
+# Apply the same compaction threshold through config files and launch overrides.
+CODEX_AUTO_COMPACT_TOKEN_LIMIT = 130_000
 PER_AGENT_CODEX_HOME_ENV = "PINKY_CODEX_PER_AGENT_HOME"
 MANAGED_CONFIG_SENTINEL = "# pinkybot-managed-codex-home-v1"
 ROLLOUT_MIGRATION_MARKER = ".pinkybot-rollout-migration-v1.json"
@@ -135,6 +137,7 @@ def _managed_config(working_dir: Path) -> str:
     return (
         f"{MANAGED_CONFIG_SENTINEL}\n"
         "# Generated for an isolated agent session.\n\n"
+        f"model_auto_compact_token_limit = {CODEX_AUTO_COMPACT_TOKEN_LIMIT}\n\n"
         "[features]\n"
         "apps = false\n"
         "plugins = false\n\n"

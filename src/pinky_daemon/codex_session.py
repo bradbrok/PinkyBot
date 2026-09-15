@@ -32,6 +32,7 @@ from pinky_daemon.codex_app_server import (
 )
 from pinky_daemon.codex_app_server_tmux import CodexAppServerSupervisor
 from pinky_daemon.codex_home import (
+    CODEX_AUTO_COMPACT_TOKEN_LIMIT,
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
     validate_agent_codex_home,
@@ -980,6 +981,7 @@ class CodexSession(TransportReplacementMixin):
         is_resume = bool(self.codex_session_id)
 
         cmd.extend(["--json", "--dangerously-bypass-approvals-and-sandbox"])
+        cmd.extend(["-c", f"model_auto_compact_token_limit={CODEX_AUTO_COMPACT_TOKEN_LIMIT}"])
 
         if self._codex_model:
             cmd.extend(["-m", self._codex_model])
@@ -1392,7 +1394,7 @@ class CodexSession(TransportReplacementMixin):
             self._app_proc = None
 
     def _appserver_config(self) -> dict:
-        """Build the per-thread ``config`` override for MCP servers.
+        """Build per-thread compaction and MCP server config overrides.
 
         Mirrors _build_codex_cmd's ``-c mcp_servers.<name>.url=...`` injection,
         expressed as the nested config object app-server's thread/start accepts.
@@ -1407,7 +1409,10 @@ class CodexSession(TransportReplacementMixin):
             if headers:
                 entry["http_headers"] = dict(headers)
             mcp[name] = entry
-        return {"mcp_servers": mcp} if mcp else {}
+        config: dict = {"model_auto_compact_token_limit": CODEX_AUTO_COMPACT_TOKEN_LIMIT}
+        if mcp:
+            config["mcp_servers"] = mcp
+        return config
 
     def _appserver_effort(self) -> str | None:
         """Map the configured thinking_effort onto a ReasoningEffort value."""
