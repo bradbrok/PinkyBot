@@ -4420,12 +4420,15 @@ def create_api(
                 _lifecycle_owners.pop(name, None)
 
     def _locked_agent(fn):
+        agent_parameter = next(iter(inspect.signature(fn).parameters))
+
         @functools.wraps(fn)
-        async def wrapped(name, *args, **kwargs):
+        async def wrapped(*args, **kwargs):
             if not _rebuild_enabled() and os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") != "1":
-                return await fn(name, *args, **kwargs)
+                return await fn(*args, **kwargs)
+            name = args[0] if args else kwargs[agent_parameter]
             async with _lifecycle(name):
-                return await fn(name, *args, **kwargs)
+                return await fn(*args, **kwargs)
         return wrapped
 
     def _clear_resume(name, label, ss):
