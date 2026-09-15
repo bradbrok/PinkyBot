@@ -571,3 +571,55 @@ async def test_untyped_sdk_error_with_exact_missing_text_does_not_retry(tmp_path
     assert caught.value is error
     assert factory.call_count == 1
     assert ss.resume_handle == MISSING_THREAD
+
+
+async def test_reconnect_cleanup_uncertainty_cannot_spawn_another_child(tmp_path, monkeypatch):
+    ss = StreamingSession(StreamingSessionConfig(
+        agent_name="sample", working_dir=str(tmp_path), resume_handle=MISSING_THREAD,
+    ))
+    ss._state_machine._state = SessionState.RECONNECTING
+    ss._RECONNECT_BACKOFF = (0, 0, 0)
+    ss.disconnect = AsyncMock()
+    client = SimpleNamespace(
+        connect=AsyncMock(side_effect=RuntimeError("startup unavailable")),
+        disconnect=AsyncMock(side_effect=RuntimeError("cleanup unconfirmed")),
+    )
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", factory)
+    await ss._reconnect_with_backoff()
+    assert factory.call_count == 1
+    assert ss._client is client
+    assert ss.state == SessionState.DEAD
+
+
+async def test_sdk_cleanup_uses_operation_deadline_and_claims_budget_first(tmp_path, monkeypatch):
+    import time
+
+    from claude_agent_sdk._errors import ProcessError
+
+    from pinky_daemon.resume_recovery import RecoveryOperation
+
+    ss = StreamingSession(StreamingSessionConfig(
+        agent_name="sample", working_dir=str(tmp_path), resume_handle=MISSING_THREAD,
+    ))
+    operation = RecoveryOperation(deadline=time.monotonic() + 0.03)
+    ss._recovery_operation = operation
+    error = ProcessError(
+        f"Claude Code returned an error result: No conversation found with session ID: {MISSING_THREAD}",
+        exit_code=1,
+    )
+
+    async def disconnect():
+        assert operation.fresh_used
+        await asyncio.Event().wait()
+
+    client = SimpleNamespace(connect=AsyncMock(side_effect=error), disconnect=disconnect)
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", factory)
+    with pytest.raises(ProcessError) as caught:
+        await asyncio.wait_for(ss.connect(), timeout=1)
+    assert caught.value is error
+    assert isinstance(error.__cause__, TimeoutError)
+    assert operation.cleanup_failed
+    assert factory.call_count == 1
+    assert ss._client is client

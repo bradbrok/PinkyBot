@@ -467,6 +467,10 @@ async def _bounded_cold_start_connect(
     is enabled.
     """
     async with _coldstart_gate(agent_name, label):
+        bounded_recovery = os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
+        prior_deadline = getattr(ss, "_startup_deadline", None)
+        if bounded_recovery:
+            ss._startup_deadline = time.monotonic() + timeout
         try:
             await asyncio.wait_for(ss.connect(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -475,13 +479,20 @@ async def _bounded_cold_start_connect(
                 f"after {timeout:.0f}s — discarding unregistered session"
             )
             try:
-                await ss.disconnect()
+                if bounded_recovery:
+                    async with asyncio.timeout(5):
+                        await ss.disconnect()
+                else:
+                    await ss.disconnect()
             except Exception as de:  # best-effort cleanup; never mask the timeout
                 _log(
                     f"streaming-start: post-timeout disconnect failed for "
                     f"{agent_name}/{label}: {de}"
                 )
             raise
+        finally:
+            if bounded_recovery:
+                ss._startup_deadline = prior_deadline
 
 
 # ── Request/Response Models ──────────────────────────────────

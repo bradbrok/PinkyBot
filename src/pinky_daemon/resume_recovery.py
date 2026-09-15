@@ -35,6 +35,7 @@ class RecoveryOperation:
     deadline: float = field(default_factory=lambda: time.monotonic() + 600)
     operation_id: str = field(default_factory=lambda: uuid.uuid4().hex)
     fresh_used: bool = False
+    cleanup_failed: bool = False
     generation: int = 0
 
     def claim(self, evidence: ResumeEvidence | None) -> bool:

@@ -570,7 +570,9 @@ class StreamingSession(TransportReplacementMixin):
             options.resume = self.resume_handle
             _log(f"streaming[{self.agent_name}]: resuming via handle {self.resume_handle[:12]}...")
 
-        operation = getattr(self, "_recovery_operation", None) or resume_recovery.RecoveryOperation()
+        operation = getattr(self, "_recovery_operation", None) or resume_recovery.RecoveryOperation(
+            deadline=min(time.monotonic() + 600, getattr(self, "_startup_deadline", None) or float("inf")),
+        )
         evidence = None
         try:
             if not resume_recovery.enabled():
@@ -586,23 +588,27 @@ class StreamingSession(TransportReplacementMixin):
                             await partial.connect()
                         break
                     except BaseException as exc:
-                        # Close a partially initialized SDK even for cancellation and
-                        # process-control exceptions. Cleanup failure forbids retry.
-                        if partial is not None:
-                            try:
-                                await partial.disconnect()
-                            except BaseException as cleanup_error:
-                                raise exc from cleanup_error
-                            self._client = None
                         candidate = resume_recovery.sdk_rejection(
                             exc, options.resume or "", operation.generation,
                         )
-                        if not operation.claim(candidate):
+                        claimed = operation.claim(candidate)
+                        if claimed:
+                            evidence = candidate
+                            _log(json.dumps(operation.event(
+                                "resume_fallback_attempted", evidence, self.agent_name, self._config.label,
+                            )))
+                        # Retain the client when cleanup cannot be proven, and
+                        # prevent outer backoff from spawning over that child.
+                        if partial is not None:
+                            try:
+                                async with asyncio.timeout_at(operation.deadline):
+                                    await partial.disconnect()
+                            except BaseException as cleanup_error:
+                                operation.cleanup_failed = True
+                                raise exc from cleanup_error
+                            self._client = None
+                        if not claimed:
                             raise
-                        evidence = candidate
-                        _log(json.dumps(operation.event(
-                            "resume_fallback_attempted", evidence, self.agent_name, self._config.label,
-                        )))
                         self.resume_handle = self._config.resume_handle = ""
                         if self._on_resume_handle_sync:
                             self._on_resume_handle_sync(self.agent_name, "")
@@ -1763,7 +1769,9 @@ class StreamingSession(TransportReplacementMixin):
                 return
             except Exception as e:
                 last_error = e
-                if resume_recovery.enabled() and self._recovery_operation.fresh_used:
+                if resume_recovery.enabled() and (
+                    self._recovery_operation.fresh_used or self._recovery_operation.cleanup_failed
+                ):
                     break
                 _log(
                     f"streaming[{self.agent_name}]: reconnect attempt {attempt_idx} "
