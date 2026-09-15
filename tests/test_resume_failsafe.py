@@ -553,3 +553,21 @@ async def test_appserver_control_exceptions_cleanup_without_retry(tmp_path, erro
     assert [call.args[0] for call in client.request.await_args_list] == ["thread/resume"]
     client.close.assert_awaited_once()
     assert ss.state == SessionState.DEAD
+
+
+async def test_untyped_sdk_error_with_exact_missing_text_does_not_retry(tmp_path, monkeypatch):
+    error = RuntimeError(
+        f"Claude Code returned an error result: No conversation found with session ID: {MISSING_THREAD} (exit code: 1)"
+    )
+    error.exit_code = 1
+    client = SimpleNamespace(connect=AsyncMock(side_effect=error), disconnect=AsyncMock())
+    factory = MagicMock(return_value=client)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", factory)
+    ss = StreamingSession(StreamingSessionConfig(
+        agent_name="sample", working_dir=str(tmp_path), resume_handle=MISSING_THREAD,
+    ))
+    with pytest.raises(RuntimeError) as caught:
+        await ss.connect()
+    assert caught.value is error
+    assert factory.call_count == 1
+    assert ss.resume_handle == MISSING_THREAD

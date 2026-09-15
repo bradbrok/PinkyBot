@@ -3175,11 +3175,16 @@ def create_api(
         url, _, _ = _resolve_agent_provider(agent)
         _, _, model = _effective_launch_model(agent)
         # Explicit custom Anthropic-compatible endpoints own their model namespace.
-        endpoint = urllib.parse.urlsplit(url) if url else None
-        direct = not url or url == "codex_cli" or (
-            endpoint.scheme == "https" and endpoint.netloc in
-            {"api.anthropic.com", "api.openai.com"} and endpoint.path.rstrip("/") in {"", "/v1"}
-        )
+        try:
+            endpoint = urllib.parse.urlsplit(url) if url else None
+            direct = not url or url == "codex_cli" or (
+                endpoint.scheme in {"http", "https"}
+                and endpoint.hostname in {"api.anthropic.com", "api.openai.com"}
+                and endpoint.port in {None, 80, 443}
+                and endpoint.path.rstrip("/") in {"", "/v1"}
+            )
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid provider endpoint") from exc
         if not direct:
             return
         try:
@@ -4691,10 +4696,18 @@ def create_api(
         closed = 0
 
         for label, ss in sessions.items():
+            if _rebuild_enabled():
+                ss._replacement_cleanup_strict = True
             try:
                 await ss.disconnect()
             except Exception:
-                pass
+                if _rebuild_enabled():
+                    raise
+            finally:
+                ss._replacement_cleanup_strict = False
+            if _rebuild_enabled():
+                _resume_owners.pop((agent_name, label), None)
+                _resume_epochs[(agent_name, label)] = object()
             closed += 1
             agents.set_streaming_session_id(agent_name, "", label=label)
 
@@ -6993,6 +7006,7 @@ npm run build</pre>
         return {"disabled": True, "agent": name, "skill": skill_name}
 
     @app.post("/agents/{name}/skills/apply")
+    @_locked_agent
     async def apply_agent_skills(name: str):
         """Re-materialize skills and restart the agent's streaming session.
 
@@ -9124,6 +9138,7 @@ npm run build</pre>
         }
 
     @app.delete("/agents/{name}")
+    @_locked_agent
     async def retire_agent(name: str):
         """Retire an agent (soft delete). Preserves all data for restoration."""
         agent = agents.get(name)  # capture before retire so we can deprovision
@@ -10143,6 +10158,7 @@ npm run build</pre>
         }
 
     @app.post("/agents/{name}/streaming-sessions")
+    @_locked_agent
     async def create_streaming_session(name: str, label: str = "main"):
         """Create a new streaming session for an agent."""
         agent = agents.get(name)
@@ -10167,6 +10183,7 @@ npm run build</pre>
             raise HTTPException(500, f"Failed to create streaming session: {e}")
 
     @app.delete("/agents/{name}/streaming-sessions/{label}")
+    @_locked_agent
     async def delete_streaming_session(name: str, label: str):
         """Stop and remove a streaming session."""
         if label == "main":
@@ -10175,15 +10192,24 @@ npm run build</pre>
         ss = sessions.get(label)
         if not ss:
             raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
+        if _rebuild_enabled():
+            ss._replacement_cleanup_strict = True
         try:
             await ss.disconnect()
         except Exception:
-            pass
+            if _rebuild_enabled():
+                raise
+        finally:
+            ss._replacement_cleanup_strict = False
+        if _rebuild_enabled():
+            _resume_owners.pop((name, label), None)
+            _resume_epochs[(name, label)] = object()
         agents.set_streaming_session_id(name, "", label=label)
         broker.unregister_streaming(name, label=label)
         return {"deleted": True, "agent": name, "label": label}
 
     @app.patch("/agents/{name}/streaming-sessions/{label}")
+    @_locked_agent
     async def rename_streaming_session(name: str, label: str, req: dict):
         """Rename a streaming session label."""
         new_label = (req.get("label") or "").strip()
@@ -10203,11 +10229,19 @@ npm run build</pre>
         # resume-handle callback closed over the old label, so without this the
         # session keeps persisting turns and resume handles under the old name.
         ss._config.label = new_label
-        ss._on_resume_handle = await _make_streaming_resume_handle_callback(name, new_label)
+        if _rebuild_enabled():
+            _resume_owners.pop((name, label), None)
+            _resume_epochs[(name, label)] = object()
+            _resume_owners[(name, new_label)] = ss
+            _resume_epochs[(name, new_label)] = object()
+        ss._on_resume_handle = await _make_streaming_resume_handle_callback(
+            name, new_label, owner=ss,
+        )
         if hasattr(ss, "_on_resume_handle_sync"):
             ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
                 name,
                 new_label,
+                owner=ss,
             )
         # Update stored session ID mapping
         old_sid = agents.get_streaming_session_id(name, label=label)
@@ -12288,6 +12322,7 @@ npm run build</pre>
     # platform's inbound message via `_route_streaming`.
 
     @app.post("/agents/{agent_name}/stop")
+    @_locked_agent
     async def stop_agent(agent_name: str):
         """Force-stop an agent — immediately disconnect all sessions.
 

@@ -609,3 +609,35 @@ async def test_failed_candidate_cleanup_blocks_next_spawn_until_cleanup_succeeds
     replacement = await h.app.state.broker._ensure_session_callback("sample")
     assert replacement.state == SessionState.CONNECTED
     assert len([event for event in h.trace if event[0] == "connect"]) == 2
+
+
+async def test_renamed_session_callbacks_keep_generation_fence(harness):
+    h = harness
+    h.seed()
+    secondary = await h.app.state.broker._ensure_session_callback("sample", label="secondary")
+    before_rename = secondary._on_resume_handle
+    response = await h.client.patch(
+        "/agents/sample/streaming-sessions/secondary", json={"label": "renamed"},
+    )
+    assert response.status_code == 200
+    await before_rename("sample", "late-before-rename")
+    assert h.app.state.agents.get_streaming_session_id("sample", label="secondary") == ""
+    after_rename = secondary._on_resume_handle
+    h.seed(("codex_cli", "tmux"), label="renamed")
+    h.app.state.agents.set_streaming_session_id("sample", "current", label="renamed")
+    await after_rename("sample", "late-after-rename")
+    assert h.app.state.agents.get_streaming_session_id("sample", label="renamed") == "current"
+
+
+@pytest.mark.parametrize("endpoint,status", [
+    ("https://API.ANTHROPIC.COM:443/v1/", 422),
+    ("https://api.anthropic.com.proxy.example/v1", 200),
+])
+async def test_model_guard_uses_canonical_endpoint_identity(harness, monkeypatch, endpoint, status):
+    h = harness
+    h.seed()
+    monkeypatch.setenv("PINKY_MODEL_RUNTIME_GUARD", "1")
+    response = await h.client.put("/agents/sample", json={
+        "provider_url": endpoint, "provider_model": "gpt-5.6-sol",
+    })
+    assert response.status_code == status, response.text
