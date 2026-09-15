@@ -260,6 +260,55 @@ async def test_concurrent_reconnect_callers_share_one_owner(lifecycle_harness, m
     assert old._state_machine._in_flight is None
 
 
+@pytest.mark.parametrize("source", ["claude_sdk", "codex_cli"])
+async def test_replacement_stops_owner_with_two_reconnect_callers(lifecycle_harness, monkeypatch, source):
+    h = lifecycle_harness
+    old = h.seed((source, "sdk"))
+    entered, release = asyncio.Event(), asyncio.Event()
+    owners, observations = [], []
+    real_sleep = asyncio.sleep
+    old._RECONNECT_BACKOFF = (137.0,)
+
+    async def pause(delay):
+        if delay == 137.0:
+            owners.append(asyncio.current_task())
+            entered.set()
+            await release.wait()
+        else:
+            await real_sleep(delay)
+
+    register = h.app.state.broker.register_streaming
+
+    def publish(name, ss, **kwargs):
+        if ss is not old:
+            observations.append((owners[0].done(), old.state, old._state_machine._in_flight))
+        return register(name, ss, **kwargs)
+
+    monkeypatch.setattr(asyncio, "sleep", pause)
+    monkeypatch.setattr(h.app.state.broker, "register_streaming", publish)
+    first = asyncio.create_task(old.attempt_reconnect())
+    second = None
+    try:
+        await asyncio.wait_for(entered.wait(), 1)
+        second = asyncio.create_task(old.attempt_reconnect())
+        for _ in range(3):
+            await real_sleep(0)
+        h.app.state.agents.register(
+            "sample", runtime="codex_cli" if source == "claude_sdk" else "claude_sdk",
+        )
+        response = await h.client.post("/admin/force-restart-agent/sample")
+        assert response.status_code == 200, response.text
+        assert observations == [(True, SessionState.DEAD, None)], (
+            "Replacement published while the original coalesced owner was still live"
+        )
+    finally:
+        release.set()
+        first.cancel()
+        if second is not None:
+            second.cancel()
+        await asyncio.gather(first, *([second] if second is not None else []), return_exceptions=True)
+
+
 async def test_target_preflight_failure_does_not_cancel_old_recovery(
     lifecycle_harness, monkeypatch
 ):
