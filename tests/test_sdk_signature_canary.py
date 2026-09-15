@@ -131,3 +131,30 @@ async def test_disabled_canary_keeps_original_failure_and_silence(tmp_path, monk
     peer.disconnect.assert_not_awaited()
     peer.query.assert_not_awaited()
     assert not any("resume_signature_contract_drift" in line for line in logs)
+
+
+@pytest.mark.parametrize("installed", ["1" * 1024 + ".2.3", "0.2.999+/private/synthetic"])
+async def test_malformed_version_metadata_is_bounded_and_excluded(tmp_path, monkeypatch, installed):
+    monkeypatch.setenv("PINKY_RESUME_FAILSAFE", "1")
+    real_version = importlib.metadata.version
+    monkeypatch.setattr(importlib.metadata, "version", lambda name: installed
+                        if name == "claude-agent-sdk" else real_version(name))
+    peer = SDKPeer()
+    error = rejection()
+    peer.connect.side_effect = error
+    factory = MagicMock(return_value=peer)
+    monkeypatch.setattr("claude_agent_sdk.ClaudeSDKClient", factory)
+    logs = []
+    monkeypatch.setattr("pinky_daemon.streaming_session._log", logs.append)
+    ss = StreamingSession(StreamingSessionConfig(
+        agent_name="sample", working_dir=str(tmp_path), resume_handle=REQUESTED,
+    ))
+    with pytest.raises(ProcessError) as caught:
+        await ss.connect()
+    assert caught.value is error
+    factory.assert_called_once()
+    peer.query.assert_not_awaited()
+    events = [json.loads(line) for line in logs if line.startswith("{")]
+    assert events == [{"type": "resume_signature_contract_drift", "sdk_version": "unknown",
+                       "reason": "unsupported_sdk_version"}]
+    assert len(json.dumps(events)) <= 512

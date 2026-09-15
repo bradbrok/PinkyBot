@@ -89,7 +89,7 @@ def sdk_contract() -> tuple[str, bool]:
         installed = version("claude-agent-sdk")
     except PackageNotFoundError:
         installed = "unknown"
-    display = installed if re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.+-]{0,20})?", installed) else "unknown"
+    display = installed if len(installed) <= 64 and re.fullmatch(r"\d+\.\d+\.\d+(?:[a-z0-9.+-]{0,20})?", installed) else "unknown"
     compatible = installed == "0.2.138" and str(ProcessError("canary", exit_code=1)) == "canary (exit code: 1)"
     return display, compatible
 

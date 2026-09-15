@@ -247,8 +247,13 @@ async def test_concurrent_reconnect_callers_share_one_owner(lifecycle_harness, m
     first = asyncio.create_task(old.attempt_reconnect())
     await asyncio.wait_for(entered.wait(), 1)
     second = asyncio.create_task(old.attempt_reconnect())
-    await real_sleep(0)
-    release.set()
+    try:
+        await real_sleep(0)
+        await real_sleep(0)
+        await real_sleep(0)
+        assert not second.done(), "Coalesced caller returned before the recovery owner settled"
+    finally:
+        release.set()
     await asyncio.gather(first, second)
     assert len(owners) == 1
     assert old.state == SessionState.CONNECTED
@@ -325,6 +330,8 @@ async def test_replacement_awaits_delayed_owner_cancellation(lifecycle_harness, 
         assert not recovery.done()
     finally:
         release.set()
+        if not cancelling.is_set():
+            recovery.cancel()
         await asyncio.gather(recovery, return_exceptions=True)
     response = await replacement
     assert response.status_code == 200, response.text
