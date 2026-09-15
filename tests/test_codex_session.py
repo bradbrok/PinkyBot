@@ -1340,14 +1340,14 @@ class TestCodexAppServerEffortAndConfig:
             "empty": {"url": ""},
         }
         cfg = s._appserver_config()
-        assert cfg == {"model_auto_compact_token_limit": 130000, "mcp_servers": {
+        assert cfg == {"mcp_servers": {
             "pinky": {"url": "http://x/mcp", "http_headers": {"X-Agent-Name": "test-agent"}},
         }}
 
-    def test_config_keeps_compaction_when_no_servers(self):
+    def test_config_empty_when_no_servers(self):
         s = _appserver_session()
         s._mcp_servers = {}
-        assert s._appserver_config() == {"model_auto_compact_token_limit": 130000}
+        assert s._appserver_config() == {}
 
 
 class TestCodexAppServerTurn:
@@ -1397,9 +1397,6 @@ class TestCodexAppServerTurn:
         # request sequence: fresh thread/start then turn/start
         methods = [m for m, _ in fake.requests]
         assert methods == ["thread/start", "turn/start"]
-        assert dict(fake.requests)["thread/start"]["config"][
-            "model_auto_compact_token_limit"
-        ] == 130000
 
     @pytest.mark.asyncio
     async def test_thread_id_from_response_when_no_notification(self):
@@ -1431,9 +1428,6 @@ class TestCodexAppServerTurn:
         await s._exec_codex_app_server("again")
         methods = [m for m, _ in fake.requests]
         assert methods == ["thread/resume", "turn/start"]
-        assert dict(fake.requests)["thread/resume"]["config"][
-            "model_auto_compact_token_limit"
-        ] == 130000
         # turn/start targets the existing thread
         turn_params = dict(fake.requests)["turn/start"]
         assert turn_params["threadId"] == "existing-thread"
