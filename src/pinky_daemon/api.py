@@ -10305,6 +10305,9 @@ npm run build</pre>
             raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
         if new_label in sessions:
             raise HTTPException(409, f"Session '{new_label}' already exists for {name}")
+        if _startup_fencing_enabled():
+            async with _label_scope(name, new_label):
+                await _settle_startup_debt(name, new_label)
         # Move in broker registry
         sessions[new_label] = sessions.pop(label)
         # Retarget the live session: its id derives from _config.label and the
