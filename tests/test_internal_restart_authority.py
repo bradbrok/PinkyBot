@@ -125,8 +125,9 @@ async def test_real_sdk_context_restart_is_owned(lifecycle_harness, monkeypatch,
 
 @pytest.mark.parametrize("mode", ["a", "b", "both"])
 @pytest.mark.parametrize("failed", [False, True])
+@pytest.mark.parametrize("entry", ["ensure", "force"])
 async def test_ensure_binds_both_callbacks_before_startup(
-    lifecycle_harness, monkeypatch, mode, failed,
+    lifecycle_harness, monkeypatch, mode, failed, entry,
 ):
     h = lifecycle_harness
     set_flags(monkeypatch, mode)
@@ -157,7 +158,10 @@ async def test_ensure_binds_both_callbacks_before_startup(
         await ss._on_resume_handle("sample", "current")
 
     h.control.start_hook = during_start
-    await h.app.state.broker._ensure_session_callback("sample")
+    if entry == "ensure":
+        await h.app.state.broker._ensure_session_callback("sample")
+    else:
+        assert (await h.client.post("/admin/force-restart-agent/sample")).status_code == 200
     assert seen == ["during-start", "during-start", ""]
     assert h.app.state.agents.get_streaming_session_id("sample") == "current"
     assert ss.state == SessionState.CONNECTED
@@ -175,7 +179,7 @@ async def test_internal_restart_generation_loss_stops_publication(
     ss = h.seed((source, transport))
     entered, release = asyncio.Event(), asyncio.Event()
     publications = []
-    analytics = ss._analytics_session_started
+    analytics = getattr(ss, "_analytics_session_started", lambda: None)
 
     def observe_publication():
         publications.append(ss.state)
@@ -399,3 +403,38 @@ async def test_reconnect_joins_active_internal_restart(lifecycle_harness, source
         if observer:
             observer.cancel()
         await asyncio.gather(*(t for t in (force, reconnect, observer) if t), return_exceptions=True)
+
+
+@pytest.mark.parametrize("source,transport", [
+    ("claude_sdk", "sdk"), ("codex_cli", "sdk"),
+    ("claude_sdk", "tmux"), ("codex_cli", "tmux"),
+])
+async def test_internal_restart_refuses_unconfirmed_cleanup(lifecycle_harness, source, transport):
+    h = lifecycle_harness
+    ss = h.seed((source, transport))
+
+    def refuse():
+        raise RuntimeError("cleanup unconfirmed")
+
+    peer = getattr(ss, "_client", None)
+    proc = None
+    if transport == "tmux":
+        ss._tmux.kill_session.side_effect = refuse
+    elif source == "claude_sdk":
+        peer.disconnect.side_effect = refuse
+    else:
+        proc = SimpleNamespace(returncode=None, kill=refuse, wait=AsyncMock())
+        ss._app_proc = proc
+    before = len(h.clients), sum(event == "substrate" for event, _ in h.trace)
+    try:
+        assert await ss.force_restart() is False
+        assert (len(h.clients), sum(event == "substrate" for event, _ in h.trace)) == before
+        assert ss.state == SessionState.DEAD
+        assert ss._state_machine._in_flight is None
+    finally:
+        if transport == "tmux":
+            ss._tmux.kill_session.side_effect = None
+        elif peer:
+            peer.disconnect.side_effect = peer.close
+        if proc:
+            proc.returncode = 0
