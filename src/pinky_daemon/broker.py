@@ -1610,6 +1610,14 @@ class MessageBroker:
         ``fix/inbound-msg-cold-wake``.
         """
         streaming = self._get_streaming_session(agent_name, message.chat_id)
+        compatible = (getattr(self, "_compatible_delivery", None)
+                      if os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1" else None)
+        if compatible:
+            label = self._registry.get_channel_session(agent_name, message.chat_id) or "main"
+            try:
+                streaming = await self._ensure_session_callback(agent_name, label=label)
+            except Exception:
+                return False
         idle_ensurer_attempted = False
 
         # Auto-wake: deliberate idle-sleep with a retained resume_handle can be
@@ -1704,7 +1712,9 @@ class MessageBroker:
             deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
             while time.monotonic() < deadline:
                 await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
-                if streaming.state == SessionState.CONNECTED:
+                if compatible:
+                    streaming = self._get_streaming_session(agent_name, message.chat_id)
+                if streaming and streaming.state == SessionState.CONNECTED:
                     _log(f"broker: {agent_name} reconnect completed — resuming delivery")
                     break
 
@@ -1780,13 +1790,21 @@ class MessageBroker:
                         f' — or thread(message_id="{message.message_id}", text=...) '
                         f"to quote/thread-reply to this message"
                     )
-        await streaming.send(
-            prompt,
-            platform=message.platform,
-            chat_id=message.chat_id,
-            message_id=message.message_id,
-            agent_hint=hint,
-        )
+        if compatible:
+            try:
+                streaming, accepted = await compatible(
+                    agent_name, prompt, label=label, platform=message.platform,
+                    chat_id=message.chat_id, message_id=message.message_id, agent_hint=hint,
+                )
+            except Exception:
+                return False
+            if accepted is False:
+                return False
+        else:
+            await streaming.send(
+                prompt, platform=message.platform, chat_id=message.chat_id,
+                message_id=message.message_id, agent_hint=hint,
+            )
         # Server-side presence: successful inbound delivery = agent pipe is working
         try:
             self._registry.stamp_last_seen(agent_name)
@@ -1832,7 +1850,15 @@ class MessageBroker:
         from datetime import timezone as tz
         ts = datetime.now(tz.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
         prompt = f"[agent | {from_agent} | internal | {ts}]\n{message}"
-        handoff = await streaming.send(prompt)
+        compatible = (getattr(self, "_compatible_delivery", None)
+                      if os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1" else None)
+        if compatible:
+            try:
+                streaming, handoff = await compatible(to_agent, prompt)
+            except Exception:
+                return InjectResult(delivered=False, confirmed=False)
+        else:
+            handoff = await streaming.send(prompt)
         confirmed = bool(handoff) and bool(
             getattr(streaming, "injection_confirms_consumption", False)
         )
@@ -2316,6 +2342,12 @@ class MessageBroker:
         if agent_name not in self._streaming:
             self._streaming[agent_name] = {}
         displaced = self._streaming[agent_name].get(label)
+        if (displaced is not None and displaced is not session
+                and (os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1"
+                     or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1")):
+            # Registration is synchronous: terminal cleanup must finish at the
+            # lifecycle owner before it unregisters and publishes a successor.
+            raise RuntimeError("Streaming owner must be retired before replacement")
         if (
             displaced is not None
             and displaced is not session

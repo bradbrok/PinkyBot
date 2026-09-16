@@ -71,7 +71,9 @@ Brad's Dymok test agent).
 
 from __future__ import annotations
 
+import asyncio
 import inspect
+import os
 from collections.abc import Awaitable, Callable
 from typing import Any, Protocol, runtime_checkable
 
@@ -95,6 +97,143 @@ class TransportReplacementMixin:
         """Prove that a replacement may be started without mutating transport."""
 
     @staticmethod
+    def _recovery_fencing_enabled() -> bool:
+        return os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1"
+
+    def _recovery_ownership_enabled(self) -> bool:
+        return self._recovery_fencing_enabled() or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
+
+    def _check_recovery_owner(self) -> None:
+        if self._recovery_ownership_enabled() and (
+            getattr(self, "_recovery_inhibited", False)
+            or getattr(self, "_recovery_retired", False)
+        ):
+            raise RuntimeError("Transport recovery owner is retired or quiescing")
+
+    def _check_startup_owner(self) -> None:
+        # A retained restart may connect while recovery is inhibited. A
+        # terminally retired object must never acquire another substrate.
+        if self._recovery_ownership_enabled() and (
+            getattr(self, "_recovery_retired", False)
+            or (getattr(self, "_recovery_inhibited", False)
+                and getattr(self, "_replacement_connect_owner", None) is not asyncio.current_task())
+        ):
+            raise RuntimeError("Transport startup owner is retired or quiescing")
+
+        task = getattr(self, "_force_restart_task", None)
+        if (self._recovery_ownership_enabled() and task is not None and not task.done()
+                and getattr(self, "_force_restart_generation", None)
+                != getattr(self, "_recovery_generation", 0)):
+            raise RuntimeError("Startup belongs to a stale internal restart")
+
+    async def retire_transport(self) -> None:
+        """Quiesce terminal recovery before cleanup; retain uncertainty on failure."""
+        fenced = self._recovery_ownership_enabled()
+        if fenced:
+            await self._quiesce_recovery_owner()
+            self._recovery_retired = True
+        prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+        self._replacement_cleanup_strict = fenced or prior_strict
+        try:
+            await self.disconnect()  # type: ignore[attr-defined]
+        finally:
+            self._replacement_cleanup_strict = prior_strict
+
+    def _check_force_restart_authority(self) -> None:
+        if not self._recovery_ownership_enabled():
+            return
+        self._check_recovery_owner()
+        if (asyncio.current_task() is not getattr(self, "_owned_force_restart_task", None)
+                or getattr(self, "_force_restart_generation", None)
+                != getattr(self, "_recovery_generation", 0)):
+            raise RuntimeError("Internal restart authority is stale")
+
+    def _start_force_restart(
+        self, operation: Callable[[], Awaitable[bool]],
+    ) -> asyncio.Task[bool] | None:
+        """Register ownership synchronously, before a scheduled restart can run."""
+        self._check_recovery_owner()
+        task = getattr(self, "_force_restart_task", None)
+        if task is asyncio.current_task():
+            raise RuntimeError("Internal restart cannot await itself")
+        if task is not None and not task.done():
+            if task is not getattr(self, "_owned_force_restart_task", None):
+                raise RuntimeError("Unrecognized internal restart owner")
+        else:
+            reconnect = getattr(self, "_reconnect_task", None)
+            if reconnect is not None and not reconnect.done():
+                return None
+            self._recovery_generation = getattr(self, "_recovery_generation", 0) + 1
+            self._force_restart_generation = self._recovery_generation
+
+            async def run():
+                self._check_force_restart_authority()
+                prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+                self._replacement_cleanup_strict = True
+                try:
+                    return await operation()
+                finally:
+                    self._replacement_cleanup_strict = prior_strict
+
+            self._force_restart_initiator = asyncio.current_task()
+            task = asyncio.create_task(run())
+            self._force_restart_task = self._owned_force_restart_task = task
+            # A cancelled reader/watchdog may stop observing; still consume the
+            # outcome and retain the handle until settlement is observable.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return task
+
+    async def _run_force_restart(self, operation: Callable[[], Awaitable[bool]]) -> bool:
+        """Callers observe the owned operation without lending it their task."""
+        if not self._recovery_ownership_enabled():
+            return await operation()
+        task = self._start_force_restart(operation)
+        if task is None:
+            return False
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled() and not asyncio.current_task().cancelling():
+                return False
+            raise
+
+    async def _join_internal_restart(self) -> bool:
+        if not self._recovery_ownership_enabled():
+            return False
+        task = getattr(self, "_force_restart_task", None)
+        if task is None or task.done():
+            return False
+        # The public gateway validates identity and shields the existing task.
+        # A backoff entry must not create a competing client on this object.
+        await self.force_restart()  # type: ignore[attr-defined]
+        return True
+
+    async def _quiesce_recovery_owner(self) -> None:
+        tasks = set()
+        for slot, owned in (("_reconnect_task", "_owned_reconnect_task"),
+                            ("_force_restart_task", "_owned_force_restart_task")):
+            task = getattr(self, slot, None)
+            if task is asyncio.current_task():
+                raise RuntimeError("Recovery owner cannot replace itself")
+            if task is not None and not task.done():
+                if task is not getattr(self, owned, None):
+                    raise RuntimeError("Unrecognized recovery owner; replacement refused")
+                tasks.add(task)
+        # Revoke before yielding, including operations already inside cleanup
+        # or spawn. No new owner may enter until retained startup succeeds.
+        self._recovery_inhibited = True
+        self._recovery_generation = getattr(self, "_recovery_generation", 0) + 1
+        for task in tasks:
+            task.cancel()
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=5)
+            if pending:
+                raise TimeoutError("Transport recovery owner did not stop")
+            for task in done:
+                if not task.cancelled():
+                    task.result()
+
+    @staticmethod
     async def _run_replacement_step(step: ReplacementStep | None) -> None:
         if step is None:
             return
@@ -106,6 +245,7 @@ class TransportReplacementMixin:
         self,
         *,
         configure: ReplacementStep | None = None,
+        target_preflight: ReplacementStep | None = None,
         bring_up: ReplacementStep | None = None,
         connect_wrapper: ReplacementConnectWrapper | None = None,
         suppress_teardown_errors: bool = False,
@@ -120,21 +260,41 @@ class TransportReplacementMixin:
         """
         if bring_up is not None and connect_wrapper is not None:
             raise ValueError("connect_wrapper and bring_up are mutually exclusive")
-        self._preflight_transport_replacement()
+        await self._run_replacement_step(
+            target_preflight or self._preflight_transport_replacement
+        )
+        fenced = self._recovery_ownership_enabled()
+        if fenced:
+            await self._quiesce_recovery_owner()
+            if bring_up is not None:
+                self._recovery_retired = True
         await self._run_replacement_step(configure)
+        prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+        self._replacement_cleanup_strict = fenced or target_preflight is not None or prior_strict
         try:
             await self.disconnect()  # type: ignore[attr-defined]
         except Exception:
-            if not suppress_teardown_errors:
+            if self._replacement_cleanup_strict or not suppress_teardown_errors:
                 raise
+        finally:
+            self._replacement_cleanup_strict = prior_strict
         if bring_up is None:
             connect = self.connect  # type: ignore[attr-defined]
-            if connect_wrapper is None:
-                await connect()
-            else:
-                await connect_wrapper(connect)
+            self._replacement_connect_owner = asyncio.current_task()
+            try:
+                if connect_wrapper is None:
+                    await connect()
+                else:
+                    await connect_wrapper(connect)
+            finally:
+                self._replacement_connect_owner = None
         else:
             await self._run_replacement_step(bring_up)
+        if fenced:
+            self._recovery_inhibited = False
+            if bring_up is None:
+                # Only a successful retained-object restart permits another owner.
+                self._recovery_retired = False
 
 
 @runtime_checkable
@@ -285,6 +445,7 @@ class Transport(Protocol):
         self,
         *,
         configure: ReplacementStep | None = None,
+        target_preflight: ReplacementStep | None = None,
         bring_up: ReplacementStep | None = None,
         connect_wrapper: ReplacementConnectWrapper | None = None,
         suppress_teardown_errors: bool = False,

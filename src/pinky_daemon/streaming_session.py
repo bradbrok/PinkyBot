@@ -19,6 +19,7 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from pinky_daemon import resume_recovery
 from pinky_daemon.agent_registry import validate_restart_tokens_cap
 from pinky_daemon.context_window import resolve_context_window
 from pinky_daemon.effort import CLI_EFFORT_LEVELS, resolve_cli_effort
@@ -400,6 +401,8 @@ class StreamingSession(TransportReplacementMixin):
         """
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+        self._check_startup_owner()
+
         # PR6: cold-start wire-up. If we entered connect() in UNINITIALIZED
         # OR a BOOT is already in flight (state == BOOTING with our state
         # machine mid-handshake from a concurrent caller), request BOOT
@@ -569,10 +572,84 @@ class StreamingSession(TransportReplacementMixin):
             options.resume = self.resume_handle
             _log(f"streaming[{self.agent_name}]: resuming via handle {self.resume_handle[:12]}...")
 
+        operation = getattr(self, "_recovery_operation", None) or resume_recovery.RecoveryOperation(
+            deadline=min(time.monotonic() + 600, getattr(self, "_startup_deadline", None) or float("inf")),
+        )
+        evidence = None
+        sdk_contract = None
+        if resume_recovery.enabled() and options.resume:
+            sdk_contract = resume_recovery.sdk_contract()
+            if not sdk_contract[1]:
+                resume_recovery.report_sdk_drift(_log, sdk_contract[0], "unsupported_sdk_version")
         try:
-            self._client = ClaudeSDKClient(options)
-            await self._client.connect()
+            # A previous strict cleanup can outlive its recovery operation.
+            # Every entry to connect must settle that retained child before
+            # assigning a new client, including ordinary ensure/idle wake.
+            if resume_recovery.enabled() and self._client is not None:
+                prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+                self._replacement_cleanup_strict = True
+                try:
+                    async with asyncio.timeout_at(operation.deadline):
+                        await self.disconnect()
+                finally:
+                    self._replacement_cleanup_strict = prior_strict
+            if not resume_recovery.enabled():
+                self._client = ClaudeSDKClient(options)
+                await self._client.connect()
+            else:
+                while True:
+                    partial = None
+                    try:
+                        self._check_startup_owner()
+                        partial = ClaudeSDKClient(options)
+                        self._client = partial
+                        async with asyncio.timeout_at(operation.deadline):
+                            await partial.connect()
+                        break
+                    except BaseException as exc:
+                        candidate = resume_recovery.sdk_rejection(
+                            exc, options.resume or "", operation.generation,
+                        )
+                        if sdk_contract is not None and not sdk_contract[1]:
+                            candidate = None
+                        elif options.resume and candidate is None and isinstance(exc, Exception):
+                            resume_recovery.report_sdk_drift(
+                                _log, sdk_contract[0],
+                                "stderr_shape_changed" if getattr(exc, "stderr", None)
+                                else "unclassified_initialize",
+                            )
+                        claimed = operation.claim(candidate)
+                        if claimed:
+                            evidence = candidate
+                            _log(json.dumps(operation.event(
+                                "resume_fallback_attempted", evidence, self.agent_name, self._config.label,
+                            )))
+                        # Retain the client when cleanup cannot be proven, and
+                        # prevent outer backoff from spawning over that child.
+                        if partial is not None:
+                            try:
+                                async with asyncio.timeout_at(operation.deadline):
+                                    await partial.disconnect()
+                            except BaseException as cleanup_error:
+                                operation.cleanup_failed = True
+                                self._cleanup_uncertain = True
+                                raise exc from cleanup_error
+                            self._client = None
+                            self._cleanup_uncertain = False
+                        if not claimed:
+                            raise
+                        self.resume_handle = self._config.resume_handle = ""
+                        if self._on_resume_handle_sync:
+                            self._on_resume_handle_sync(self.agent_name, "")
+                        elif self._on_resume_handle:
+                            await self._on_resume_handle(self.agent_name, "")
+                        options.resume = None
+            self._check_startup_owner()
         except BaseException:
+            if evidence is not None:
+                _log(json.dumps(operation.event(
+                    "resume_fallback_failed", evidence, self.agent_name, self._config.label,
+                )))
             # On cold-start failure, drive the BOOTING → DEAD transition via
             # BOOT_FAILED so the lifecycle is auditable in logs. Warm-reconnect
             # callers (force_restart etc.) don't enter this branch — their
@@ -588,6 +665,8 @@ class StreamingSession(TransportReplacementMixin):
                         f"streaming[{self.agent_name}]: BOOT_FAILED completion "
                         f"raised after cold-start error: {ce}"
                     )
+            if resume_recovery.enabled() and cold_start_token is None and not getattr(self, "_recovery_operation", None):
+                self._state_machine._state = SessionState.DEAD
             raise
 
         # Land in CONNECTED. Cold-start goes through the matrix
@@ -603,6 +682,11 @@ class StreamingSession(TransportReplacementMixin):
             )
         else:
             self._state_machine._state = SessionState.CONNECTED
+
+        if evidence is not None:
+            _log(json.dumps(operation.event(
+                "resume_failed_restarted_fresh", evidence, self.agent_name, self._config.label,
+            )))
 
         # Capture account info from SDK init result
         try:
@@ -1481,6 +1565,9 @@ class StreamingSession(TransportReplacementMixin):
             pass
 
     async def force_restart(self) -> bool:
+        return await self._run_force_restart(self._force_restart)
+
+    async def _force_restart(self) -> bool:
         """Force a context restart — disconnect, clear session, reconnect fresh."""
         if self._config.restart_guard:
             try:
@@ -1496,6 +1583,33 @@ class StreamingSession(TransportReplacementMixin):
                 await self._notify_restart_blocked(guard)
                 return False
 
+        return await self._force_restart_owned()
+
+    async def _force_restart_owned(self) -> bool:
+        if not self._recovery_ownership_enabled():
+            return await self._force_restart_steps()
+        result = await self._state_machine.request_transition(
+            SessionState.RECONNECTING, Trigger.USER_AGENT, reason="force_restart",
+        )
+        token = result.owner_token
+        if token is None:
+            return False
+        succeeded = False
+        try:
+            self._check_force_restart_authority()
+            result = await self._force_restart_steps()
+            self._check_force_restart_authority()
+            succeeded = result
+            return result
+        except Exception:
+            return False
+        finally:
+            await self._state_machine.transition_complete(
+                token, SessionState.CONNECTED if succeeded else SessionState.DEAD,
+                trigger=Trigger.INTERNAL,
+            )
+
+    async def _force_restart_steps(self) -> bool:
         _log(f"streaming[{self.agent_name}]: force restarting session")
 
         # Settle macro state in RECONNECTING for the full restart window —
@@ -1514,7 +1628,9 @@ class StreamingSession(TransportReplacementMixin):
                 pass
 
         # Disconnect
+        self._check_force_restart_authority()
         await self.disconnect()
+        self._check_force_restart_authority()
         # Re-assert RECONNECTING after the teardown. ``disconnect()``'s
         # fallback only fires from CONNECTED, so it shouldn't trip here —
         # but defensive: if a future change adds another path that flips
@@ -1647,6 +1763,9 @@ class StreamingSession(TransportReplacementMixin):
         it alive when the initiating caller (e.g. the old reader task,
         cancelled by disconnect()) dies mid-reconnect.
         """
+        if await self._join_internal_restart():
+            return
+        self._check_recovery_owner()
         task = self._reconnect_task
         if task is not None and not task.done():
             _log(
@@ -1656,6 +1775,8 @@ class StreamingSession(TransportReplacementMixin):
         else:
             task = asyncio.create_task(self._reconnect_with_backoff())
             self._reconnect_task = task
+            if self._recovery_ownership_enabled():
+                self._owned_reconnect_task = task
             task.add_done_callback(self._clear_reconnect_task)
         await asyncio.wait_for(task, timeout=None)
 
@@ -1664,6 +1785,29 @@ class StreamingSession(TransportReplacementMixin):
             self._reconnect_task = None
 
     async def _reconnect_with_backoff(self) -> None:
+        """Keep the operation, deadline and fresh budget across backoff attempts."""
+        if not resume_recovery.enabled():
+            try:
+                await self._reconnect_attempts()
+            except BaseException:
+                if self._recovery_fencing_enabled():
+                    self._state_machine._state = SessionState.DEAD
+                raise
+            return
+        self._recovery_operation = resume_recovery.RecoveryOperation()
+        prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+        self._replacement_cleanup_strict = True
+        try:
+            async with asyncio.timeout_at(self._recovery_operation.deadline):
+                await self._reconnect_attempts()
+        except BaseException:
+            self._state_machine._state = SessionState.DEAD
+            raise
+        finally:
+            self._recovery_operation = None
+            self._replacement_cleanup_strict = prior_strict
+
+    async def _reconnect_attempts(self) -> None:
         """Single warm-reconnect cycle: disconnect, then bounded retries."""
         # Settle the macro state: RECONNECTING for the duration of all retry
         # attempts (transport_state.py §5 — no flicker DEAD ↔ RECONNECTING
@@ -1677,6 +1821,10 @@ class StreamingSession(TransportReplacementMixin):
             await self.disconnect()
         except Exception as e:
             _log(f"streaming[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+            if resume_recovery.enabled():
+                self._recovery_operation.cleanup_failed = True
+                self._state_machine._state = SessionState.DEAD
+                return
         # disconnect()'s no-prior-intent fallback would normally drive
         # CONNECTED → DEAD; re-assert RECONNECTING after teardown so the
         # state reflects the in-flight retry, not a terminal failure.
@@ -1691,12 +1839,17 @@ class StreamingSession(TransportReplacementMixin):
                 f"after {delay}s backoff"
             )
             await asyncio.sleep(delay)
+            self._check_recovery_owner()
             try:
                 await self.connect()
                 _log(f"streaming[{self.agent_name}]: reconnected successfully")
                 return
             except Exception as e:
                 last_error = e
+                if resume_recovery.enabled() and (
+                    self._recovery_operation.fresh_used or self._recovery_operation.cleanup_failed
+                ):
+                    break
                 _log(
                     f"streaming[{self.agent_name}]: reconnect attempt {attempt_idx} "
                     f"failed: {e}"
@@ -1705,7 +1858,9 @@ class StreamingSession(TransportReplacementMixin):
                 try:
                     await self.disconnect()
                 except Exception:
-                    pass
+                    if resume_recovery.enabled():
+                        self._recovery_operation.cleanup_failed = True
+                        break
                 # Re-assert RECONNECTING after the inner disconnect. ``connect()``
                 # flips state to CONNECTED before its post-connect setup
                 # (analytics session-started, reader-loop spawn); a raise during
@@ -1758,9 +1913,15 @@ class StreamingSession(TransportReplacementMixin):
         if self._client:
             try:
                 await self._client.disconnect()
-            except Exception:
-                pass
+            except BaseException as exc:
+                if (getattr(self, "_replacement_cleanup_strict", False)
+                        or getattr(self, "_cleanup_uncertain", False)):
+                    self._cleanup_uncertain = True
+                    raise
+                if not isinstance(exc, Exception):
+                    raise
             self._client = None
+            self._cleanup_uncertain = False
         # Routing entries for turns that will never complete are stale; a
         # reconnected session must not deliver its first responses (e.g. the
         # wake-prompt turn) to a leftover chat_id from before the teardown.

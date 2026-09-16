@@ -25,6 +25,7 @@ import shlex
 import time
 from dataclasses import dataclass, field
 
+from pinky_daemon import resume_recovery
 from pinky_daemon.codex_app_server import (
     CodexAppServerClient,
     CodexAppServerError,
@@ -314,6 +315,7 @@ class CodexSession(TransportReplacementMixin):
         app-server substrate is up (app-server mode) and the worker drainer is
         about to run. We never hold BOOTING across a model turn (#206; Murzik).
         """
+        self._check_startup_owner()
         cold_start_token: OwnerToken | None = None
         warm_wake_token: OwnerToken | None = None
         st = self.state
@@ -427,8 +429,10 @@ class CodexSession(TransportReplacementMixin):
         mode itself has no persistent substrate. Preflight failures still raise
         because the same unsafe auth/home would affect both transports.
         """
+        self._check_startup_owner()
         if self._use_app_server:
             await self._ensure_app_server()
+        self._check_startup_owner()
 
     def _begin_app_server_reconnect_cycle(self) -> None:
         """Retry a construction-selected app-server after sticky degradation."""
@@ -1102,7 +1106,10 @@ class CodexSession(TransportReplacementMixin):
             # once the OS buffer (~64KiB) fills, wedging the turn (same hazard
             # codex_app_server._drain_stderr guards against).
             if proc.stderr:
-                stderr_task = asyncio.create_task(proc.stderr.read())
+                stderr_task = asyncio.create_task(
+                    resume_recovery.drain_diagnostic(proc.stderr)
+                    if resume_recovery.enabled() else proc.stderr.read()
+                )
 
             # Feed prompt via stdin, then close stdin to signal EOF
             proc.stdin.write(prompt.encode())
@@ -1177,9 +1184,13 @@ class CodexSession(TransportReplacementMixin):
             if stderr_task is not None:
                 stderr_data = await stderr_task
                 if stderr_data:
-                    stderr_str = stderr_data.decode().strip()
+                    stderr_str = stderr_data if isinstance(stderr_data, str) else stderr_data.decode().strip()
                     if stderr_str:
-                        _log(f"codex[{self.agent_name}]: stderr: {stderr_str[:200]}")
+                        diagnostic = resume_recovery.sanitized_diagnostic(stderr_str)
+                        _log(f"codex[{self.agent_name}]: stderr: {diagnostic[:200]}")
+                        if resume_recovery.enabled() and proc.returncode:
+                            result.errors.append(stderr_str)
+                            result.failed = True
 
             if proc.returncode and proc.returncode != 0:
                 _log(f"codex[{self.agent_name}]: exit code {proc.returncode}")
@@ -1255,16 +1266,29 @@ class CodexSession(TransportReplacementMixin):
             # failure must abort before the spawn boundary publishes a soul.
             await self._teardown_app_server(strict=True)
 
+        self._check_startup_owner()
         started_at = time.monotonic()
 
+        generation = object()
+        self._appserver_generation = generation
+
+        async def notification(method, params):
+            if not resume_recovery.enabled() or self._appserver_generation is generation:
+                await self._on_appserver_notification(method, params)
+
+        def closed(error):
+            if not resume_recovery.enabled() or self._appserver_generation is generation:
+                self._on_appserver_transport_closed(error)
+
         async def _spawn_and_initialize() -> None:
+            self._check_startup_owner()
             if self._use_tmux_app_server:
                 # #791 Design A: the supervisor spawns the shim under tmux and
                 # hands back an UN-initialized client. The initialize below is
                 # the single end-to-end gate for that child.
                 assert self._app_supervisor is not None
                 self._app_client, self._app_proc = await self._app_supervisor.start(
-                    notification_handler=self._on_appserver_notification,
+                    notification_handler=notification,
                     server_request_handler=self._on_appserver_request,
                 )
             else:
@@ -1272,7 +1296,7 @@ class CodexSession(TransportReplacementMixin):
                     command=self._app_server_command,
                     cwd=self._working_dir,
                     env=self._build_codex_env(),
-                    notification_handler=self._on_appserver_notification,
+                    notification_handler=notification,
                     server_request_handler=self._on_appserver_request,
                     log=_log,
                 )
@@ -1284,7 +1308,7 @@ class CodexSession(TransportReplacementMixin):
                 self._app_client, "set_transport_closed_handler", None
             )
             if set_closed_handler is not None:
-                set_closed_handler(self._on_appserver_transport_closed)
+                set_closed_handler(closed)
 
             self._appserver_spawn_count += 1
             pid = self._app_proc.pid
@@ -1305,9 +1329,15 @@ class CodexSession(TransportReplacementMixin):
             # One bound covers process/supervisor spawn plus initialize. A child
             # that starts but never answers cannot hold BOOTING for the client's
             # blanket 600-second request timeout.
-            await asyncio.wait_for(
-                _spawn_and_initialize(), timeout=self._app_server_init_timeout
-            )
+            if self._recovery_ownership_enabled():
+                # Keep the retained connect permit and recovery authority on
+                # their owning task throughout the bounded startup operation.
+                async with asyncio.timeout(self._app_server_init_timeout):
+                    await _spawn_and_initialize()
+            else:
+                await asyncio.wait_for(
+                    _spawn_and_initialize(), timeout=self._app_server_init_timeout
+                )
         except asyncio.CancelledError:
             await self._teardown_app_server()
             raise
@@ -1346,6 +1376,7 @@ class CodexSession(TransportReplacementMixin):
         a failed kill/wait remains observable, cached handles remain available
         for a later cleanup attempt, and no replacement spawn can continue.
         """
+        self._appserver_generation = None
         self._report_appserver_terminal_stream_survivors(phase="teardown")
         client = self._app_client
         proc = self._app_proc
@@ -1464,6 +1495,7 @@ class CodexSession(TransportReplacementMixin):
         self._active_turn_result = result
         self._turn_done = loop.create_future()
         self._appserver_last_usage = {}
+        self._appserver_execution_observed = False
 
         config = self._appserver_config()
         turn_started_at = time.monotonic()
@@ -1471,6 +1503,16 @@ class CodexSession(TransportReplacementMixin):
             f"app_server_turn_start agent={self.agent_name} "
             f"thread={'resume' if self.codex_session_id else 'new'}"
         )
+
+        operation = resume_recovery.RecoveryOperation()
+        recovery_evidence = None
+        recovered = False
+
+        async def request(method, params):
+            if not resume_recovery.enabled():
+                return await client.request(method, params)
+            async with asyncio.timeout_at(operation.deadline):
+                return await client.request(method, params)
 
         try:
             if self.codex_session_id:
@@ -1483,7 +1525,35 @@ class CodexSession(TransportReplacementMixin):
                     params["model"] = self._codex_model
                 if config:
                     params["config"] = config
-                resp = await client.request("thread/resume", params)
+                requested_id = self.codex_session_id
+                try:
+                    resp = await request("thread/resume", params)
+                except CodexAppServerError as exc:
+                    evidence = resume_recovery.appserver_rejection(
+                        exc, requested_id, operation.generation,
+                    )
+                    if (self._appserver_execution_observed or self._turn_done.done()
+                            or result.tool_uses or result.text_parts or not operation.claim(evidence)):
+                        raise
+                    recovery_evidence = evidence
+                    self._resume_rejected_thread_id = requested_id
+                    await self._emit_stream_event(operation.event(
+                        "resume_fallback_attempted", evidence, self.agent_name, self._config.label,
+                    ))
+                    self.codex_session_id = self.resume_handle = self._config.resume_handle = ""
+                    self._pending_resume_handle_update = ""
+                    if self._on_resume_handle:
+                        await self._on_resume_handle(self.agent_name, "")
+                    fresh_params = {k: v for k, v in params.items() if k != "threadId"}
+                    fresh_params["cwd"] = self._working_dir
+                    resp = await request("thread/start", fresh_params)
+                    if not isinstance(resp, dict) or not (resp.get("thread") or {}).get("id"):
+                        raise CodexAppServerError("Fresh thread response omitted its ID")
+                    recovered = True
+                    await self._emit_stream_event(operation.event(
+                        "resume_failed_restarted_fresh", evidence,
+                        self.agent_name, self._config.label,
+                    ))
             else:
                 params = {
                     "cwd": self._working_dir,
@@ -1494,7 +1564,7 @@ class CodexSession(TransportReplacementMixin):
                     params["model"] = self._codex_model
                 if config:
                     params["config"] = config
-                resp = await client.request("thread/start", params)
+                resp = await request("thread/start", params)
 
             # The thread/started notification normally sets codex_session_id via
             # _handle_event; cover the case where only the response carries it.
@@ -1514,7 +1584,7 @@ class CodexSession(TransportReplacementMixin):
             effort = self._appserver_effort()
             if effort:
                 turn_params["effort"] = effort
-            await client.request("turn/start", turn_params)
+            await request("turn/start", turn_params)
             # Successful turn/start response is the app-server's exact prompt
             # acceptance edge. Thread start/resume alone is not sufficient.
             self._accept_scheduler_delivery(
@@ -1523,7 +1593,7 @@ class CodexSession(TransportReplacementMixin):
 
             # turn/start returns immediately; notifications drive the turn.
             # _on_appserver_notification resolves _turn_done on turn/completed.
-            await asyncio.wait_for(self._turn_done, timeout=600)
+            await asyncio.wait_for(self._turn_done, timeout=(max(0, operation.deadline - time.monotonic()) if resume_recovery.enabled() else 600))
 
         except asyncio.TimeoutError:
             result.failed = True
@@ -1561,7 +1631,20 @@ class CodexSession(TransportReplacementMixin):
             })
             await self._teardown_app_server()
             await self._terminalize_dead("app-server turn exception")
+        except BaseException:
+            if resume_recovery.enabled():
+                result.failed = True
+                try:
+                    await self._teardown_app_server()
+                    await self._terminalize_dead("app-server operation interrupted")
+                except BaseException:
+                    pass  # Preserve the original cancellation/process-control exception.
+            raise
         finally:
+            if recovery_evidence is not None and not recovered:
+                await self._emit_stream_event(operation.event(
+                    "resume_fallback_failed", recovery_evidence, self.agent_name, self._config.label,
+                ))
             elapsed_ms = round((time.monotonic() - turn_started_at) * 1000)
             if result.failed:
                 self._appserver_counters["turns_failed"] += 1
@@ -1606,6 +1689,14 @@ class CodexSession(TransportReplacementMixin):
 
     async def _on_appserver_notification(self, method: str, params: dict) -> None:
         """Translate an app-server notification onto the legacy event path."""
+        thread_id = params.get("threadId") or (params.get("thread") or {}).get("id")
+        if resume_recovery.enabled() and thread_id and (
+            thread_id == getattr(self, "_resume_rejected_thread_id", None) or
+            self.codex_session_id and thread_id != self.codex_session_id
+        ):
+            return
+        if method.startswith(("turn/", "item/")):
+            self._appserver_execution_observed = True
         # Incremental streaming text — UI only; full text arrives via the
         # final item/completed agentMessage (matches the legacy non-delta path).
         if method == "item/agentMessage/delta":
@@ -2217,6 +2308,9 @@ class CodexSession(TransportReplacementMixin):
             })
 
     async def force_restart(self) -> bool:
+        return await self._run_force_restart(self._force_restart)
+
+    async def _force_restart(self) -> bool:
         """Force a context restart — clear codex session, start fresh."""
         if self._config.restart_guard:
             try:
@@ -2255,6 +2349,8 @@ class CodexSession(TransportReplacementMixin):
         token = res.owner_token
         self._begin_app_server_reconnect_cycle()
 
+        settled = False
+        publication_started = False
         try:
             # Clear the resume handle (fresh start).
             if self._on_resume_handle:
@@ -2263,7 +2359,9 @@ class CodexSession(TransportReplacementMixin):
                 except Exception:
                     pass
 
+            self._check_force_restart_authority()
             await self.disconnect()
+            self._check_force_restart_authority()
 
             # #591 P1#1 (Murzik round-2): connect() is the single source-of-truth
             # for the wake_context body + side-effect consumption; _enqueue_wake
@@ -2272,21 +2370,28 @@ class CodexSession(TransportReplacementMixin):
             self.resume_handle = ""
 
             await self._bring_up_substrate()
-        except BaseException as e:
-            _log(f"codex[{self.agent_name}]: force restart failed: {e}")
+            self._check_force_restart_authority()
+            publication_started = True
             await self._state_machine.transition_complete(
-                token, SessionState.DEAD, trigger=Trigger.INTERNAL
+                token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
             )
+            settled = True
+            self._check_force_restart_authority()
+            self._analytics_session_started()
+            self._start_worker()
+            await self._enqueue_wake()
+            _log(f"codex[{self.agent_name}]: force restart complete")
+            return True
+        except BaseException as e:
+            if publication_started and not self._recovery_ownership_enabled():
+                raise
+            _log(f"codex[{self.agent_name}]: force restart failed: {e}")
             return False
-
-        await self._state_machine.transition_complete(
-            token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
-        )
-        self._analytics_session_started()
-        self._start_worker()
-        await self._enqueue_wake()
-        _log(f"codex[{self.agent_name}]: force restart complete")
-        return True
+        finally:
+            if not settled and (self._recovery_ownership_enabled() or not publication_started):
+                await self._state_machine.transition_complete(
+                    token, SessionState.DEAD, trigger=Trigger.INTERNAL,
+                )
 
     async def idle_sleep(self) -> bool:
         """Put the session to sleep. Codex session ID preserved for resume."""
@@ -2347,8 +2452,28 @@ class CodexSession(TransportReplacementMixin):
     # Reconnect backoff schedule (seconds). Kept in step with StreamingSession's
     # watchdog contract so api._heartbeat_resurrect can treat runtimes uniformly.
     _RECONNECT_BACKOFF = (2, 8, 30)
+    _reconnect_task: asyncio.Task | None = None
+    _owned_reconnect_task: asyncio.Task | None = None
 
     async def attempt_reconnect(self, *, trigger: Trigger = Trigger.WATCHDOG) -> None:
+        if not self._recovery_ownership_enabled():
+            await self._reconnect_attempts(trigger=trigger)
+            return
+        if await self._join_internal_restart():
+            return
+        self._check_recovery_owner()
+        task = getattr(self, "_reconnect_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self._reconnect_attempts(trigger=trigger))
+            self._reconnect_task = task
+            self._owned_reconnect_task = task
+        try:
+            await task
+        finally:
+            if self._reconnect_task is task and task.done():
+                self._reconnect_task = None
+
+    async def _reconnect_attempts(self, *, trigger: Trigger = Trigger.WATCHDOG) -> None:
         """Reconnect with bounded retries under a SINGLE RECONNECTING transition.
 
         Takes RECONNECTING ownership once and retries the substrate bring-up
@@ -2381,44 +2506,55 @@ class CodexSession(TransportReplacementMixin):
                 )
             return
         token = res.owner_token
-        self._begin_app_server_reconnect_cycle()
+        settled = False
+        try:
+            self._begin_app_server_reconnect_cycle()
 
-        last_error: Exception | None = None
-        for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
-            self._stats["reconnects"] += 1
-            _log(
-                f"codex[{self.agent_name}]: reconnect attempt {attempt_idx}/"
-                f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
-                f"after {delay}s backoff"
-            )
-            try:
-                await self.disconnect()  # state==RECONNECTING → no standalone DEAD
-            except Exception as e:
-                _log(f"codex[{self.agent_name}]: pre-attempt disconnect raised: {e}")
-            await asyncio.sleep(delay)
-            try:
-                await self._bring_up_substrate()
-            except Exception as e:
-                last_error = e
-                _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
-                continue
-            # Success — complete to CONNECTED + bring the worker/wake back up.
+            last_error: Exception | None = None
+            for attempt_idx, delay in enumerate(self._RECONNECT_BACKOFF, start=1):
+                self._stats["reconnects"] += 1
+                _log(
+                    f"codex[{self.agent_name}]: reconnect attempt {attempt_idx}/"
+                    f"{len(self._RECONNECT_BACKOFF)} (#{self._stats['reconnects']} total) "
+                    f"after {delay}s backoff"
+                )
+                try:
+                    await self.disconnect()  # state==RECONNECTING → no standalone DEAD
+                except Exception as e:
+                    _log(f"codex[{self.agent_name}]: pre-attempt disconnect raised: {e}")
+                await asyncio.sleep(delay)
+                self._check_recovery_owner()
+                try:
+                    await self._bring_up_substrate()
+                except Exception as e:
+                    last_error = e
+                    _log(f"codex[{self.agent_name}]: reconnect attempt {attempt_idx} failed: {e}")
+                    continue
+                # Success — complete to CONNECTED + bring the worker/wake back up.
+                await self._state_machine.transition_complete(
+                    token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+                )
+                settled = True
+                self._analytics_session_started()
+                self._start_worker()
+                await self._enqueue_wake()
+                _log(f"codex[{self.agent_name}]: reconnected successfully")
+                return
+
             await self._state_machine.transition_complete(
-                token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
+                token, SessionState.DEAD, trigger=Trigger.INTERNAL
             )
-            self._analytics_session_started()
-            self._start_worker()
-            await self._enqueue_wake()
-            _log(f"codex[{self.agent_name}]: reconnected successfully")
-            return
-
-        await self._state_machine.transition_complete(
-            token, SessionState.DEAD, trigger=Trigger.INTERNAL
-        )
-        _log(
-            f"codex[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
-            f"attempts failed (last error: {last_error}); session DEAD"
-        )
+            settled = True
+            _log(
+                f"codex[{self.agent_name}]: all {len(self._RECONNECT_BACKOFF)} reconnect "
+                f"attempts failed (last error: {last_error}); session DEAD"
+            )
+        except BaseException:
+            if self._recovery_ownership_enabled() and not settled:
+                await self._state_machine.transition_complete(
+                    token, SessionState.DEAD, trigger=Trigger.INTERNAL,
+                )
+            raise
 
     async def disconnect(self) -> None:
         """Tear down the worker + any codex subprocess / app-server. Idempotent.
@@ -2439,13 +2575,14 @@ class CodexSession(TransportReplacementMixin):
                 self._current_proc.kill()
                 await self._current_proc.wait()
             except Exception:
-                pass
+                if getattr(self, "_replacement_cleanup_strict", False):
+                    raise
             self._current_proc = None
 
         # Unblock an in-flight app-server turn, then tear down the connection.
         if self._turn_done is not None and not self._turn_done.done():
             self._turn_done.set_exception(CodexAppServerError("session disconnected"))
-        await self._teardown_app_server()
+        await self._teardown_app_server(strict=getattr(self, "_replacement_cleanup_strict", False))
 
         if self._worker_task and not self._worker_task.done():
             self._worker_task.cancel()

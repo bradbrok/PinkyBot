@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import copy
+import functools
 import hashlib
 import hmac
 import inspect
@@ -465,6 +467,10 @@ async def _bounded_cold_start_connect(
     is enabled.
     """
     async with _coldstart_gate(agent_name, label):
+        bounded_recovery = os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
+        prior_deadline = getattr(ss, "_startup_deadline", None)
+        if bounded_recovery:
+            ss._startup_deadline = time.monotonic() + timeout
         try:
             await asyncio.wait_for(ss.connect(), timeout=timeout)
         except asyncio.TimeoutError:
@@ -472,14 +478,23 @@ async def _bounded_cold_start_connect(
                 f"streaming-start: cold start timed out for {agent_name}/{label} "
                 f"after {timeout:.0f}s — discarding unregistered session"
             )
+            if getattr(ss, "_startup_cleanup_owned", False):
+                raise
             try:
-                await ss.disconnect()
+                if bounded_recovery:
+                    async with asyncio.timeout(5):
+                        await ss.disconnect()
+                else:
+                    await ss.disconnect()
             except Exception as de:  # best-effort cleanup; never mask the timeout
                 _log(
                     f"streaming-start: post-timeout disconnect failed for "
                     f"{agent_name}/{label}: {de}"
                 )
             raise
+        finally:
+            if bounded_recovery:
+                ss._startup_deadline = prior_deadline
 
 
 # ── Request/Response Models ──────────────────────────────────
@@ -3120,8 +3135,102 @@ def create_api(
                 db=agents._db,
             )
         except Exception as e:
+            if os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") == "1":
+                raise HTTPException(503, "Provider catalog unavailable") from e
             _log(f"api: could not resolve provider config for {agent.name}: {e}")
             return agent.provider_url or "", agent.provider_key or "", agent.provider_model or ""
+
+    def _rebuild_enabled() -> bool:
+        return os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1"
+
+    def _resolved_runtime(agent):
+        runtime = (getattr(agent, "runtime", "") or "").strip()
+        return runtime or ("codex_cli" if (agent.provider_url or "").strip() == "codex_cli" else "claude_sdk")
+
+    def _runtime_transport(agent):
+        runtime = _resolved_runtime(agent)
+        transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
+        if runtime == "opencode":
+            if os.environ.get("PINKY_ENABLE_OPENCODE", "0") == "1":
+                raise HTTPException(501, "opencode runtime is enabled but OpencodeSession is not implemented yet")
+            raise HTTPException(503, "opencode runtime is disabled; set PINKY_ENABLE_OPENCODE=1 after implementation lands")
+        if runtime not in {"claude_sdk", "codex_cli"}:
+            raise HTTPException(400, f"unknown runtime '{runtime}' for agent '{agent.name}'")
+        if transport not in {"sdk", "tmux"}:
+            raise HTTPException(400, f"unknown transport '{transport}' for agent '{agent.name}'")
+        return runtime, transport
+
+    def _expected_session_class(agent):
+        from pinky_daemon.codex_session import CodexSession
+        from pinky_daemon.codex_tmux_session import CodexTmuxSession
+        from pinky_daemon.streaming_session import StreamingSession
+        from pinky_daemon.tmux_session import TmuxSession
+
+        return {("claude_sdk", "sdk"): StreamingSession,
+                ("claude_sdk", "tmux"): TmuxSession,
+                ("codex_cli", "sdk"): CodexSession,
+                ("codex_cli", "tmux"): CodexTmuxSession}[_runtime_transport(agent)]
+
+    def _effective_launch_model(agent):
+        url, key, provider_model = _resolve_agent_provider(agent)
+        runtime = _resolved_runtime(agent)
+        model = (agent.model or provider_model if runtime == "codex_cli" and
+                 not (agent.provider_ref or "").strip() else provider_model or agent.model)
+        return ("codex_cli" if runtime == "codex_cli" else url), key, model
+
+    def _validate_model_runtime(agent, updates=None):
+        if os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") != "1":
+            return
+        selection = {"runtime", "model", "provider_url", "provider_model", "provider_ref"}
+        if updates is not None and not selection.intersection(updates):
+            return
+        runtime, _ = _runtime_transport(agent)
+        url, _, _ = _resolve_agent_provider(agent)
+        _, _, model = _effective_launch_model(agent)
+        # Explicit custom Anthropic-compatible endpoints own their model namespace.
+        try:
+            endpoint = urllib.parse.urlsplit(url) if url else None
+            direct = not url or url == "codex_cli" or (
+                endpoint.scheme in {"http", "https"}
+                and endpoint.hostname in {"api.anthropic.com", "api.openai.com"}
+                and endpoint.port in {None, 80, 443}
+                and endpoint.path.rstrip("/") in {"", "/v1"}
+            )
+        except ValueError as exc:
+            raise HTTPException(422, "Invalid provider endpoint") from exc
+        if not direct:
+            return
+        try:
+            entry = agents.get_model(model)
+            # A bare ID may exist in multiple provider namespaces. Do not guess.
+            providers = {row[0] for row in agents._db.execute(
+                "SELECT provider FROM models WHERE id=? OR model_id=?", (model, model),
+            ).fetchall()}
+        except Exception as exc:
+            raise HTTPException(503, "Model catalog unavailable") from exc
+        if entry is None or len(providers) > 1:
+            return
+        provider = entry.get("provider", "").lower()
+        if (runtime == "codex_cli" and provider == "anthropic" or
+                runtime == "claude_sdk" and provider == "openai"):
+            raise HTTPException(422, "Model provider is incompatible with the selected runtime")
+
+    def _launch_fingerprint(agent):
+        if agent is None:
+            return None
+        return tuple(getattr(agent, key, None) for key in (
+            "enabled", "runtime", "transport", "model", "provider_url", "provider_key",
+            "provider_model", "provider_ref", "working_dir", "isolation_mode", "container_image",
+            "codex_home", "permission_mode", "max_turns", "thinking_effort", "allowed_tools",
+            "disallowed_tools", "strict_effort_enforcement",
+        ))
+
+    def _merged_agent(agent, updates):
+        candidate = copy.copy(agent)
+        for key, value in updates.items():
+            if hasattr(candidate, key):
+                setattr(candidate, key, value)
+        return candidate
 
     def _refresh_streaming_launch_config(agent_name: str, ss) -> None:
         """Refresh process-launch settings on a retained session object.
@@ -3134,22 +3243,7 @@ def create_api(
         if not agent or not agent.enabled:
             raise RuntimeError(f"Agent '{agent_name}' is missing or disabled")
 
-        provider_url, provider_key, provider_model = _resolve_agent_provider(agent)
-        runtime = (getattr(agent, "runtime", "") or "").strip()
-        if not runtime:
-            runtime = "codex_cli" if (agent.provider_url or "").strip() == "codex_cli" else "claude_sdk"
-        if runtime == "codex_cli":
-            provider_url = "codex_cli"
-
-        # Codex's canonical selection is agents.model (what agent-card and the
-        # live /streaming/model control persist). provider_model may retain an
-        # older provider-era value; letting it win reproduced murzik's
-        # gpt-5.6-sol registry -> gpt-5.5 rebuilt pane mismatch (#856). An
-        # explicit provider_ref remains an intentional provider-model override.
-        if runtime == "codex_cli" and not (agent.provider_ref or "").strip():
-            model = agent.model or provider_model
-        else:
-            model = provider_model or agent.model
+        provider_url, provider_key, model = _effective_launch_model(agent)
         effort = agent.thinking_effort or "medium"
         if ss._config.model != model:
             ss._reported_context_max_tokens = 0
@@ -3706,14 +3800,26 @@ def create_api(
             f"(reason={decision.get('reason')})"
         )
 
+    _resume_owners: dict[tuple[str, str], object] = {}
+    _resume_epochs: dict[tuple[str, str], object] = {}
+
     def _persist_streaming_resume_handle(
         agent_name: str,
         label: str,
         resume_handle: str,
         *,
         log_context_restart: bool,
+        owner=None,
+        epoch=None,
     ) -> None:
         """Synchronously persist one streaming SDK resume-handle update."""
+        if owner is not None and _startup_fencing_enabled():
+            current = broker._streaming.get(agent_name, {}).get(label)
+            if (_resume_epochs.get((agent_name, label)) is not epoch or
+                    _resume_owners.get((agent_name, label)) is not owner) or (
+                current is not None and current is not owner
+            ):
+                return
         agents.set_streaming_session_id(agent_name, resume_handle, label=label)
         short_id = resume_handle[:12] if resume_handle else ""
         _log(f"streaming[{agent_name}/{label}]: persisted resume_handle {short_id}")
@@ -3735,7 +3841,7 @@ def create_api(
             except Exception:
                 pass
 
-    async def _make_streaming_resume_handle_callback(agent_name: str, label: str):
+    async def _make_streaming_resume_handle_callback(agent_name: str, label: str, *, owner=None):
         """Persist a streaming session's SDK resume handle when captured.
 
         Also logs auto context-restart events: an empty handle means
@@ -3746,23 +3852,25 @@ def create_api(
         the in-memory surface. A DB-column / AgentRegistry rename is a
         deliberate follow-up to avoid bundling a migration into this PR.
         """
+        epoch = _resume_epochs.get((agent_name, label))
         async def _on_resume_handle(_agent_name: str, resume_handle: str):
             _persist_streaming_resume_handle(
                 agent_name,
                 label,
                 resume_handle,
-                log_context_restart=True,
+                log_context_restart=True, owner=owner, epoch=epoch,
             )
         return _on_resume_handle
 
-    def _make_streaming_resume_handle_sync_callback(agent_name: str, label: str):
+    def _make_streaming_resume_handle_sync_callback(agent_name: str, label: str, *, owner=None):
         """Build the no-await persistence path used by reset frames."""
+        epoch = _resume_epochs.get((agent_name, label))
         def _on_resume_handle_sync(_agent_name: str, resume_handle: str) -> None:
             _persist_streaming_resume_handle(
                 agent_name,
                 label,
                 resume_handle,
-                log_context_restart=False,
+                log_context_restart=False, owner=owner, epoch=epoch,
             )
 
         return _on_resume_handle_sync
@@ -3932,24 +4040,20 @@ def create_api(
             _log(f"api: refusing to start {agent_name}: {detail}")
             raise HTTPException(status, detail)
 
-    async def _start_streaming_session(
+    async def _prepare_streaming_session(
         agent_name: str,
         *,
         label: str = "main",
         resume_id: str = "",
+        agent_snapshot=None,
     ):
-        """Create, connect, and register a streaming session for an agent label."""
-        boot_mcp_gate = active_boot_mcp_gate if (agent_name, label) in boot_mcp_keys else None
-        from pinky_daemon.codex_session import CodexSession
-        from pinky_daemon.codex_tmux_session import CodexTmuxSession
+        """Freeze launch inputs and construct an unconnected candidate."""
         from pinky_daemon.streaming_session import (
             DEFAULT_STREAMING_ALLOWED_TOOLS,
-            StreamingSession,
             StreamingSessionConfig,
         )
-        from pinky_daemon.tmux_session import TmuxSession
 
-        agent = agents.get(agent_name)
+        agent = agent_snapshot if agent_snapshot is not None else agents.get(agent_name)
         if not agent or not agent.enabled:
             return None
 
@@ -4002,39 +4106,7 @@ def create_api(
             # Deduplicate
             effective_disallowed = sorted(set(effective_disallowed))
 
-        def runtime_from_legacy_provider(agent_config) -> str:
-            """Deprecated temporary shim for the runtime rollout.
-
-            Runtime selection now belongs to agents.runtime. This fallback exists
-            only for legacy rows that have not passed the one-shot codex_cli
-            provider_url backfill yet, and should be removed after rollout.
-            """
-            runtime = (getattr(agent_config, "runtime", "") or "").strip()
-            if runtime:
-                return runtime
-            if (getattr(agent_config, "provider_url", "") or "").strip() == "codex_cli":
-                return "codex_cli"
-            return "claude_sdk"
-
-        runtime = runtime_from_legacy_provider(agent)
-        transport = (getattr(agent, "transport", "") or "sdk").strip() or "sdk"
-        if runtime == "opencode":
-            if os.environ.get("PINKY_ENABLE_OPENCODE", "0") == "1":
-                msg = "opencode runtime is enabled but OpencodeSession is not implemented yet"
-                status = 501
-            else:
-                msg = "opencode runtime is disabled; set PINKY_ENABLE_OPENCODE=1 after implementation lands"
-                status = 503
-            _log(f"api: refusing to start {agent_name}: {msg}")
-            raise HTTPException(status, msg)
-        if runtime not in {"claude_sdk", "codex_cli"}:
-            msg = f"unknown runtime '{runtime}' for agent '{agent_name}'"
-            _log(f"api: {msg}")
-            raise HTTPException(400, msg)
-        if transport not in {"sdk", "tmux"}:
-            msg = f"unknown transport '{transport}' for agent '{agent_name}'"
-            _log(f"api: {msg}")
-            raise HTTPException(400, msg)
+        runtime, transport = _runtime_transport(agent)
         # All four runtime×transport combos are now valid — (claude_sdk, sdk),
         # (claude_sdk, tmux), (codex_cli, sdk), (codex_cli, tmux). The codex tmux
         # transport (#215) is the last to land; runtime/transport were each range-
@@ -4052,20 +4124,7 @@ def create_api(
         # codex transports (it correctly drives MCP injection + the no-auth-
         # callback / stream-event-callback init below); ``is_codex_tmux`` only
         # selects the session class + provider stamp.
-        is_codex_tmux = runtime == "codex_cli" and transport == "tmux"
-        resolved_provider_url, resolved_provider_key, resolved_provider_model = _resolve_agent_provider(agent)
-        if is_codex:
-            resolved_provider_url = "codex_cli"
-        # For Codex, agents.model is the operator-facing canonical model and
-        # must win over a stale provider_model left by older provider config.
-        # An explicit provider_ref (and all non-Codex custom providers) retains
-        # its intentional provider-model override.
-        effective_model = (
-            agent.model or resolved_provider_model
-            if is_codex and not (agent.provider_ref or "").strip()
-            else resolved_provider_model or agent.model
-        )
-
+        resolved_provider_url, resolved_provider_key, effective_model = _effective_launch_model(agent)
         # Build MCP server config for Codex agents (injected via -c flags)
         codex_mcp_servers = {}
         if is_codex and SHARED_MCP_ENABLED:
@@ -4166,17 +4225,7 @@ def create_api(
         )
 
         callback = await _make_streaming_response_callback()
-        sid_callback = await _make_streaming_resume_handle_callback(agent_name, label)
-
-        # Select session class based on persisted runtime + transport.
-        if is_codex_tmux:
-            SessionClass = CodexTmuxSession  # noqa: N806
-        elif is_tmux:
-            SessionClass = TmuxSession  # noqa: N806
-        elif is_codex:
-            SessionClass = CodexSession  # noqa: N806
-        else:
-            SessionClass = StreamingSession  # noqa: N806
+        SessionClass = _expected_session_class(agent)  # noqa: N806
 
         init_kwargs = {
             "response_callback": callback,
@@ -4196,6 +4245,57 @@ def create_api(
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
 
         ss = SessionClass(config, **init_kwargs)
+        ss._launch_runtime = runtime
+        ss._launch_transport = transport
+        ss._launch_snapshot = copy.deepcopy(_launch_fingerprint(agent))
+        ss._launch_provider_snapshot = _effective_launch_model(agent)
+        return ss
+
+    async def _connect_prepared_session(ss):
+        if not _startup_fencing_enabled():
+            return await _connect_prepared_session_unchecked(ss)
+        name, label = ss.agent_name, ss._config.label
+        async with _session_scope(name, label):
+            await _settle_startup_debt(name, label)
+            current = broker._streaming.get(name, {}).get(label)
+            if current is not None and current is not ss:
+                raise HTTPException(409, "Startup owner superseded")
+            prior_strict = getattr(ss, "_replacement_cleanup_strict", False)
+            prior_owned = getattr(ss, "_startup_cleanup_owned", False)
+            ss._replacement_cleanup_strict = ss._startup_cleanup_owned = True
+            try:
+                return await _connect_prepared_session_unchecked(ss)
+            except BaseException:
+                # Publish ownership of uncertainty BEFORE cleanup can suspend.
+                key = (name, label)
+                if _resume_owners.get(key) is ss:
+                    _resume_owners.pop(key, None)
+                    _resume_epochs[key] = object()
+                if broker._streaming.get(name, {}).get(label) is ss:
+                    broker.unregister_streaming(name, label=label)
+                _candidate_cleanup_debts[key] = ss
+                try:
+                    await _settle_startup_debt(name, label)
+                except BaseException:
+                    # Preserve the initiating exception/cancellation. The debt
+                    # remains visible to all subsequent startup callers.
+                    pass
+                raise
+            finally:
+                ss._replacement_cleanup_strict = prior_strict
+                ss._startup_cleanup_owned = prior_owned
+
+    async def _connect_prepared_session_unchecked(ss):
+        agent_name, label = ss.agent_name, ss._config.label
+        config = ss._config
+        resume_id = config.resume_handle
+        work_dir = config.working_dir
+        is_codex = config.provider_url == "codex_cli"
+        codex_mcp_servers = config.mcp_servers
+        boot_mcp_gate = active_boot_mcp_gate if (agent_name, label) in boot_mcp_keys else None
+        _resume_owners[(agent_name, label)] = ss
+        _resume_epochs[(agent_name, label)] = object()
+        sid_callback = await _make_streaming_resume_handle_callback(agent_name, label, owner=ss)
         if boot_mcp_gate is not None:
             from pinky_daemon import codex_home
             from pinky_daemon.mcp_readiness import remote_mcp_endpoints
@@ -4234,6 +4334,7 @@ def create_api(
             ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
                 agent_name,
                 label,
+                owner=ss,
             )
         try:
             await _bounded_cold_start_connect(
@@ -4276,6 +4377,17 @@ def create_api(
                     f"{agent_name}: {ae}"
                 )
             raise
+        if _rebuild_enabled() and ss.state != TransportSessionState.CONNECTED:
+            raise HTTPException(503, "Candidate did not connect")
+        current = broker._streaming.get(agent_name, {}).get(label)
+        if _rebuild_enabled() and current is not None and current is not ss:
+            raise HTTPException(409, "Session generation superseded")
+        if _rebuild_enabled() and (
+            _launch_fingerprint(agents.get(agent_name)) != ss._launch_snapshot or
+            _effective_launch_model(agents.get(agent_name)) != ss._launch_provider_snapshot
+        ):
+            await ss.disconnect()
+            raise HTTPException(409, "Launch configuration changed during preparation")
         broker.register_streaming(agent_name, ss, label=label)
 
         # Log session lifecycle event
@@ -4285,8 +4397,10 @@ def create_api(
                 session_id=ss.id,
                 agent_name=agent_name,
                 session_label=label,
-                provider="codex_tmux" if is_codex_tmux else ("tmux" if is_tmux else (runtime if is_codex else (resolved_provider_url or "default"))),
-                model=effective_model or "",
+                provider=("codex_tmux" if is_codex and ss._launch_transport == "tmux" else
+                          "tmux" if ss._launch_transport == "tmux" else
+                          ss._launch_runtime if is_codex else config.provider_url or "default"),
+                model=config.model or "",
             )
             analytics.log_activity(
                 session_id=ss.id,
@@ -4312,6 +4426,21 @@ def create_api(
 
         return ss
 
+    async def _start_streaming_session(agent_name: str, *, label="main", resume_id=""):
+        if _startup_fencing_enabled():
+            async with _session_scope(agent_name, label):
+                await _settle_startup_debt(agent_name, label)
+                return await _start_streaming_session_unchecked(
+                    agent_name, label=label, resume_id=resume_id,
+                )
+        return await _start_streaming_session_unchecked(agent_name, label=label, resume_id=resume_id)
+
+    async def _start_streaming_session_unchecked(agent_name: str, *, label="main", resume_id=""):
+        ss = await _prepare_streaming_session(agent_name, label=label, resume_id=resume_id)
+        if ss is None:
+            return None
+        return await _connect_prepared_session(ss)
+
     # Per-(agent,label) locks so concurrent triggers (inbound platform
     # message, scheduler wake, HTTP chat/wake endpoints) cannot all observe
     # "no session" and each launch a full cold start. The loser of such a
@@ -4329,6 +4458,190 @@ def create_api(
 
     def _container_lifecycle_lock(agent_name: str) -> asyncio.Lock:
         return _container_lifecycle_locks.setdefault(agent_name, asyncio.Lock())
+
+    _lifecycle_owners = {}
+    _candidate_cleanup_debts = {}
+    _label_owners = {}
+
+    def _startup_fencing_enabled():
+        return _rebuild_enabled() or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1"
+
+    @contextlib.asynccontextmanager
+    async def _label_scope(name, label):
+        key, task = (name, label), asyncio.current_task()
+        if _label_owners.get(key) is task:
+            yield
+            return
+        async with _streaming_ensure_locks.setdefault(key, asyncio.Lock()):
+            _label_owners[key] = task
+            try:
+                yield
+            finally:
+                _label_owners.pop(key, None)
+
+    @contextlib.asynccontextmanager
+    async def _session_scope(name, label):
+        async with _lifecycle(name), _label_scope(name, label):
+            yield
+
+    async def _settle_startup_debt(name, label):
+        key = (name, label)
+        debt = _candidate_cleanup_debts.get(key)
+        if debt is None:
+            return
+        current = broker._streaming.get(name, {}).get(label)
+        if current is not None and current is not debt:
+            raise HTTPException(409, "Cleanup owner superseded; startup refused")
+        prior_strict = getattr(debt, "_replacement_cleanup_strict", False)
+        debt._replacement_cleanup_strict = True
+        debt._recovery_retired = True
+        try:
+            async with asyncio.timeout(5):
+                await debt._quiesce_recovery_owner()
+                await debt.disconnect()
+        finally:
+            debt._replacement_cleanup_strict = prior_strict
+        if _candidate_cleanup_debts.get(key) is debt:
+            _candidate_cleanup_debts.pop(key)
+
+    @contextlib.asynccontextmanager
+    async def _lifecycle(name):
+        task = asyncio.current_task()
+        if _lifecycle_owners.get(name) is task:
+            yield
+            return
+        async with _container_lifecycle_lock(name):
+            _lifecycle_owners[name] = task
+            try:
+                yield
+            finally:
+                _lifecycle_owners.pop(name, None)
+
+    def _locked_agent(fn):
+        agent_parameter = next(iter(inspect.signature(fn).parameters))
+
+        @functools.wraps(fn)
+        async def wrapped(*args, **kwargs):
+            if not _startup_fencing_enabled() and os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") != "1":
+                return await fn(*args, **kwargs)
+            name = args[0] if args else kwargs[agent_parameter]
+            async with _lifecycle(name):
+                return await fn(*args, **kwargs)
+        return wrapped
+
+    def _clear_resume(name, label, ss):
+        _resume_owners.pop((name, label), None)
+        _resume_epochs[(name, label)] = object()
+        agents.set_streaming_session_id(name, "", label=label)
+        ss.resume_handle = ss._config.resume_handle = ""
+        if hasattr(ss, "codex_session_id"):
+            ss.codex_session_id = ""
+        if hasattr(ss, "_pending_resume_handle_update"):
+            ss._pending_resume_handle_update = ""
+
+    async def _replace_session_locked(name, label, old, *, reason, implicit=False, launch_agent=None, updates=None):
+        agent = agents.get(name)
+        if not agent or not agent.enabled:
+            raise HTTPException(409, "Agent missing or disabled")
+        _expected_session_class(agent)
+        if implicit:
+            queue = getattr(old, "_message_queue", None)
+            busy = (old.state in {TransportSessionState.BOOTING, TransportSessionState.RECONNECTING}
+                    or getattr(old, "_processing", False) or getattr(old, "_inflight", None)
+                    or getattr(old, "_pending_chats", None)
+                    or getattr(old, "_inflight_metas", None)
+                    or getattr(old, "_inflight_turn", None)
+                    or (queue is not None and not queue.empty()))
+            if busy or not _get_streaming_restart_guard(name, old)["restart_safe"]:
+                raise HTTPException(409, "Session replacement must wait for a safe idle boundary")
+        await _settle_startup_debt(name, label)
+        original_fingerprint = copy.deepcopy(_launch_fingerprint(agent))
+        candidate = await _prepare_streaming_session(name, label=label, agent_snapshot=launch_agent)
+        if candidate is None:
+            raise HTTPException(503, "Candidate unavailable")
+        candidate._config.force_fresh_context_once = True
+        candidate._config.restart_reason = reason
+        candidate._config.wake_context = _build_streaming_wake_context(name, commit=False)
+
+        def configure():
+            if (_launch_fingerprint(agents.get(name)) != original_fingerprint or
+                    _effective_launch_model(launch_agent or agents.get(name)) != candidate._launch_provider_snapshot):
+                raise HTTPException(409, "Launch configuration changed during preparation")
+            if updates:
+                agents.register(name, **updates)
+            _clear_resume(name, label, old)
+
+        async def bring_up():
+            if broker._streaming.get(name, {}).get(label) is not old:
+                raise HTTPException(409, "Session replacement superseded")
+            broker.unregister_streaming(name, label=label)
+            await _connect_prepared_session(candidate)
+
+        await old.restart_transport(
+            target_preflight=candidate._preflight_transport_replacement,
+            configure=configure, bring_up=bring_up,
+        )
+        return candidate
+
+    async def _bind_retained_resume_owner(name, label, ss):
+        """Publish one epoch and both callbacks before retained startup emits."""
+        if broker._streaming.get(name, {}).get(label) is not ss:
+            raise HTTPException(409, "Session restart superseded")
+        _resume_epochs[(name, label)] = object()
+        _resume_owners[(name, label)] = ss
+        ss._on_resume_handle = await _make_streaming_resume_handle_callback(
+            name, label, owner=ss,
+        )
+        if hasattr(ss, "_on_resume_handle_sync"):
+            ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
+                name, label, owner=ss,
+            )
+
+    async def _connect_retained_session(name, label, ss, connect=None):
+        await _bind_retained_resume_owner(name, label, ss)
+        await (connect or ss.connect)()
+
+    async def _restart_compatible(name, ss, *, configure, reason, **kwargs):
+        if not _startup_fencing_enabled():
+            await ss.restart_transport(configure=configure, **kwargs)
+            return ss
+        label = getattr(ss._config, "label", "main") or "main"
+        async with _session_scope(name, label):
+            current = broker._streaming.get(name, {}).get(label)
+            if current is not ss:
+                if current is not None and current.state == TransportSessionState.CONNECTED:
+                    return current
+                raise HTTPException(409, "Session restart superseded")
+            if _rebuild_enabled():
+                agent = agents.get(name)
+                if not agent or not agent.enabled:
+                    raise HTTPException(409, "Agent missing or disabled")
+                if type(ss) is not _expected_session_class(agent):
+                    return await _replace_session_locked(name, label, ss, reason=reason)
+            if _startup_fencing_enabled():
+                async def configure_retained():
+                    _resume_epochs[(name, label)] = object()
+                    _resume_owners.pop((name, label), None)
+                    await ss._run_replacement_step(configure)
+
+                outer_connect = kwargs.pop("connect_wrapper", None)
+
+                async def connect_retained(connect):
+                    await _bind_retained_resume_owner(name, label, ss)
+                    if outer_connect is not None:
+                        await outer_connect(connect)
+                    else:
+                        await connect()
+
+                await ss.restart_transport(
+                    configure=configure_retained, target_preflight=ss._preflight_transport_replacement,
+                    connect_wrapper=connect_retained, **kwargs,
+                )
+            else:
+                await ss.restart_transport(configure=configure, **kwargs)
+            if ss.state != TransportSessionState.CONNECTED:
+                raise HTTPException(503, "Restart did not connect")
+            return ss
 
     async def _ensure_streaming_session(agent_name: str, *, label: str = "main"):
         """Return a connected streaming session for an agent label.
@@ -4348,6 +4661,43 @@ def create_api(
         Cold starts / reconnects are serialized per (agent, label); the
         connected fast path stays lock-free.
         """
+        if _rebuild_enabled():
+            from pinky_daemon.broker import _INBOUND_RECONNECT_POLL_SEC, _INBOUND_RECONNECT_WAIT_SEC
+
+            deadline = time.monotonic() + _INBOUND_RECONNECT_WAIT_SEC
+            while True:
+                async with _session_scope(agent_name, label):
+                    await _settle_startup_debt(agent_name, label)
+                    ss = broker._streaming.get(agent_name, {}).get(label)
+                    agent = agents.get(agent_name)
+                    if not agent or not agent.enabled:
+                        raise HTTPException(409, "Agent missing or disabled")
+                    target = _expected_session_class(agent)
+                    if ss is None:
+                        return await _start_streaming_session(
+                            agent_name, label=label,
+                            resume_id=agents.get_streaming_session_id(agent_name, label=label),
+                        )
+                    if ss.state not in {TransportSessionState.RECONNECTING,
+                                        TransportSessionState.BOOTING}:
+                        if type(ss) is not target:
+                            return await _replace_session_locked(
+                                agent_name, label, ss, reason="context_restart", implicit=True,
+                            )
+                        if ss.state != TransportSessionState.CONNECTED:
+                            _enforce_isolation_runnable(agent_name)
+                            await ss.restart_transport(
+                                target_preflight=ss._preflight_transport_replacement,
+                                configure=lambda: _refresh_streaming_launch_config(agent_name, ss),
+                                connect_wrapper=lambda connect: _connect_retained_session(
+                                    agent_name, label, ss, connect,
+                                ),
+                            )
+                        return ss
+                if time.monotonic() >= deadline:
+                    raise HTTPException(409, "Session transition still in progress")
+                await asyncio.sleep(_INBOUND_RECONNECT_POLL_SEC)
+
         sessions = broker._streaming.get(agent_name, {})
         ss = sessions.get(label)
         if ss and ss.state == TransportSessionState.CONNECTED:
@@ -4366,7 +4716,7 @@ def create_api(
         # is in flight for this agent, so we never start a session against a
         # half-applied isolation row. The CONNECTED fast path above stays
         # lock-free, so this adds no contention on the hot inbound path.
-        async with _container_lifecycle_lock(agent_name), lock:
+        async with _lifecycle(agent_name), (_label_scope(agent_name, label) if _startup_fencing_enabled() else lock):
             # Re-check under the lock: a concurrent caller may have started
             # or reconnected the session while we waited.
             sessions = broker._streaming.get(agent_name, {})
@@ -4395,13 +4745,44 @@ def create_api(
                 # the old local session under the daemon uid (Murzik #642 review).
                 _enforce_isolation_runnable(agent_name)
                 _refresh_streaming_launch_config(agent_name, ss)
-                await ss.connect()
+                if _startup_fencing_enabled():
+                    if getattr(ss, "_recovery_inhibited", False):
+                        await ss.restart_transport(
+                            connect_wrapper=lambda connect: _connect_retained_session(
+                                agent_name, label, ss, connect,
+                            ),
+                        )
+                    else:
+                        await _connect_retained_session(agent_name, label, ss)
+                else:
+                    await ss.connect()
                 return ss
 
             resume_id = agents.get_streaming_session_id(agent_name, label=label)
             return await _start_streaming_session(
                 agent_name, label=label, resume_id=resume_id
             )
+
+    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
+        for _ in range(3):
+            ss = await _ensure_streaming_session(name, label=label)
+            async with _session_scope(name, label):
+                if broker._streaming.get(name, {}).get(label) is not ss:
+                    continue
+                if _rebuild_enabled() and type(ss) is not _expected_session_class(agents.get(name)):
+                    continue
+                if ss is None or ss.state != TransportSessionState.CONNECTED:
+                    raise HTTPException(409, "Session is not ready for delivery")
+                if scheduler:
+                    sender = getattr(ss, "send_scheduler_prompt", None)
+                    if callable(sender):
+                        if schedule_receipt is not None and "on_accept" in inspect.signature(sender).parameters:
+                            kwargs["on_accept"] = schedule_receipt.accept
+                        return ss, await sender(prompt, **kwargs)
+                return ss, await ss.send(prompt, **kwargs)
+        raise HTTPException(409, "Session changed repeatedly before delivery")
+
+    broker._compatible_delivery = _deliver_streaming
 
     # Wire the broker's cold-wake path so inbound platform messages
     # (Telegram, Discord, etc.) can start a fresh streaming session for a
@@ -4415,17 +4796,36 @@ def create_api(
     # block-reason check; the broker logs+skips rather than raising HTTP.
     broker.set_isolation_guard(_isolation_block_reason)
 
+    async def _retire_streaming_session(name, label, ss):
+        """Terminal cleanup keeps registry and callback ownership until confirmed."""
+        if _startup_fencing_enabled():
+            async with _session_scope(name, label):
+                if broker._streaming.get(name, {}).get(label) is not ss:
+                    raise HTTPException(409, "Terminal cleanup owner superseded")
+                await ss.retire_transport()
+                _resume_owners.pop((name, label), None)
+                _resume_epochs[(name, label)] = object()
+        else:
+            try:
+                await ss.disconnect()
+            except Exception:
+                pass
+
     async def _disconnect_streaming_sessions(agent_name: str) -> int:
+        """Serialize terminal teardown with all startup and rename entries."""
+        if _startup_fencing_enabled():
+            async with _lifecycle(agent_name):
+                return await _disconnect_streaming_sessions_unchecked(agent_name)
+        return await _disconnect_streaming_sessions_unchecked(agent_name)
+
+    async def _disconnect_streaming_sessions_unchecked(agent_name: str) -> int:
         """Disconnect and unregister all streaming sessions for an agent."""
         persisted = agents.list_streaming_session_ids(agent_name)
         sessions = dict(broker._streaming.get(agent_name, {}))
         closed = 0
 
         for label, ss in sessions.items():
-            try:
-                await ss.disconnect()
-            except Exception:
-                pass
+            await _retire_streaming_session(agent_name, label, ss)
             closed += 1
             agents.set_streaming_session_id(agent_name, "", label=label)
 
@@ -6724,6 +7124,7 @@ npm run build</pre>
         return {"disabled": True, "agent": name, "skill": skill_name}
 
     @app.post("/agents/{name}/skills/apply")
+    @_locked_agent
     async def apply_agent_skills(name: str):
         """Re-materialize skills and restart the agent's streaming session.
 
@@ -7206,6 +7607,7 @@ npm run build</pre>
             )
             raise HTTPException(403, "isolated agent may not register or modify agents")
 
+        _validate_model_runtime(req)
         raw_work_dir = req.working_dir or f"data/agents/{name}"
         try:
             registration_work_dir = agents.resolve_registration_workspace(
@@ -8298,6 +8700,7 @@ npm run build</pre>
                 "tamper_count_24h": tool_policy_store.tamper_count_since(time.time() - 86400)}
 
     @app.put("/agents/{name}")
+    @_locked_agent
     async def update_agent(name: str, req: UpdateAgentRequest, request: Request):
         """Update an agent's configuration."""
         name = _agent_name_or_400(name)
@@ -8306,6 +8709,7 @@ npm run build</pre>
             raise HTTPException(404, f"Agent '{name}' not found")
 
         kwargs = {k: v for k, v in req.model_dump().items() if v is not None}
+        _validate_model_runtime(_merged_agent(existing, kwargs), kwargs)
         policy_enabled = kwargs.pop("tool_policy_enabled", None)
         if policy_enabled is not None:
             _owner_control_actor(request)
@@ -8477,7 +8881,7 @@ npm run build</pre>
             disconnect_sessions=_disconnect_streaming_sessions,
             start_session=_container_start_main,
             has_live_session=lambda n: bool(broker._streaming.get(n)),
-            lifecycle_lock=_container_lifecycle_lock,
+            lifecycle_lock=lambda name: (_lifecycle(name) if _startup_fencing_enabled() else _container_lifecycle_lock(name)),
             op_registry=_container_op_registry,
             is_busy=_container_agent_busy,
             log=_log,
@@ -8680,6 +9084,7 @@ npm run build</pre>
         )
 
     @app.put("/agents/{name}/provider")
+    @_locked_agent
     async def set_agent_provider(name: str, req: dict):
         """Set agent model provider (Ollama, custom Anthropic-compatible endpoint, etc.)"""
         agent = agents.get(name)
@@ -8701,6 +9106,7 @@ npm run build</pre>
         if "provider_ref" in req:
             updates["provider_ref"] = (req["provider_ref"] or "").strip()
         if updates:
+            _validate_model_runtime(_merged_agent(agent, updates), updates)
             agents.register(name, **updates)
         return {"saved": True, **updates}
 
@@ -8850,6 +9256,7 @@ npm run build</pre>
         }
 
     @app.delete("/agents/{name}")
+    @_locked_agent
     async def retire_agent(name: str):
         """Retire an agent (soft delete). Preserves all data for restoration."""
         agent = agents.get(name)  # capture before retire so we can deprovision
@@ -9869,6 +10276,7 @@ npm run build</pre>
         }
 
     @app.post("/agents/{name}/streaming-sessions")
+    @_locked_agent
     async def create_streaming_session(name: str, label: str = "main"):
         """Create a new streaming session for an agent."""
         agent = agents.get(name)
@@ -9893,6 +10301,7 @@ npm run build</pre>
             raise HTTPException(500, f"Failed to create streaming session: {e}")
 
     @app.delete("/agents/{name}/streaming-sessions/{label}")
+    @_locked_agent
     async def delete_streaming_session(name: str, label: str):
         """Stop and remove a streaming session."""
         if label == "main":
@@ -9901,15 +10310,13 @@ npm run build</pre>
         ss = sessions.get(label)
         if not ss:
             raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
-        try:
-            await ss.disconnect()
-        except Exception:
-            pass
+        await _retire_streaming_session(name, label, ss)
         agents.set_streaming_session_id(name, "", label=label)
         broker.unregister_streaming(name, label=label)
         return {"deleted": True, "agent": name, "label": label}
 
     @app.patch("/agents/{name}/streaming-sessions/{label}")
+    @_locked_agent
     async def rename_streaming_session(name: str, label: str, req: dict):
         """Rename a streaming session label."""
         new_label = (req.get("label") or "").strip()
@@ -9923,17 +10330,28 @@ npm run build</pre>
             raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
         if new_label in sessions:
             raise HTTPException(409, f"Session '{new_label}' already exists for {name}")
+        if _startup_fencing_enabled():
+            async with _label_scope(name, new_label):
+                await _settle_startup_debt(name, new_label)
         # Move in broker registry
         sessions[new_label] = sessions.pop(label)
         # Retarget the live session: its id derives from _config.label and the
         # resume-handle callback closed over the old label, so without this the
         # session keeps persisting turns and resume handles under the old name.
         ss._config.label = new_label
-        ss._on_resume_handle = await _make_streaming_resume_handle_callback(name, new_label)
+        if _startup_fencing_enabled():
+            _resume_owners.pop((name, label), None)
+            _resume_epochs[(name, label)] = object()
+            _resume_owners[(name, new_label)] = ss
+            _resume_epochs[(name, new_label)] = object()
+        ss._on_resume_handle = await _make_streaming_resume_handle_callback(
+            name, new_label, owner=ss,
+        )
         if hasattr(ss, "_on_resume_handle_sync"):
             ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
                 name,
                 new_label,
+                owner=ss,
             )
         # Update stored session ID mapping
         old_sid = agents.get_streaming_session_id(name, label=label)
@@ -10666,7 +11084,7 @@ npm run build</pre>
                         ss.codex_session_id = ""
                     agents.set_streaming_session_id(name, "", label="main")
 
-                await ss.restart_transport(configure=_configure_context_restart)
+                ss = await _restart_compatible(name, ss, configure=_configure_context_restart, reason="context_restart")
                 _log(f"api: streaming session restarted for {name}")
                 activity.log(
                     name, "context_restart", f"{name} context restarted"
@@ -10686,7 +11104,8 @@ npm run build</pre>
                 _log(f"api: post-response context restart cancelled for {name}")
                 raise
             except Exception as e:
-                broker.unregister_streaming(name)
+                if not _startup_fencing_enabled():
+                    broker.unregister_streaming(name)
                 _log(
                     f"api: post-response context restart failed for {name}: {e}"
                 )
@@ -10754,6 +11173,7 @@ npm run build</pre>
         }
 
     @app.post("/agents/{name}/streaming/model")
+    @_locked_agent
     async def set_streaming_model(name: str, req: SetModelRequest):
         """Change the model on a running streaming session.
 
@@ -10764,6 +11184,25 @@ npm run build</pre>
         CLI renegotiates the window itself, so no restart is forced);
         ``applied`` in the response reports how far the change got.
         """
+        if _rebuild_enabled() or os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") == "1":
+            agent = agents.get(name)
+            if agent is None:
+                raise HTTPException(404, "Agent not found")
+            candidate = _merged_agent(agent, {"model": req.model})
+            _validate_model_runtime(candidate, {"model": req.model})
+            if os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") == "1":
+                req = req.model_copy(update={"model": _effective_launch_model(candidate)[2]})
+                candidate = _merged_agent(agent, {"model": req.model})
+        if _rebuild_enabled():
+            old = broker._get_streaming_session(name)
+            if old is not None and type(old) is not _expected_session_class(candidate):
+                async with _label_scope(name, "main"):
+                    await _replace_session_locked(
+                        name, "main", old, reason="model_change", implicit=True,
+                        launch_agent=candidate, updates={"model": req.model},
+                    )
+                return {"updated": True, "agent": name, "model": req.model,
+                        "restarted": True, "applied": "restarted"}
         ss = broker._get_streaming_session(name)
         if not ss:
             raise HTTPException(404, f"No streaming session for '{name}'")
@@ -10848,10 +11287,11 @@ npm run build</pre>
                 _refresh_streaming_launch_config(name, ss)
 
             try:
-                await ss.restart_transport(configure=_configure_model_restart)
+                ss = await _restart_compatible(name, ss, configure=_configure_model_restart, reason="model_change")
                 _log(f"api: restarted {name} with model {req.model}")
             except Exception as e:
-                broker.unregister_streaming(name)
+                if not _startup_fencing_enabled():
+                    broker.unregister_streaming(name)
                 raise HTTPException(500, f"Failed to restart: {e}")
 
             return {
@@ -10897,6 +11337,7 @@ npm run build</pre>
         return {"compacted": True, "agent": name}
 
     @app.post("/agents/{name}/streaming/archive")
+    @_locked_agent
     async def archive_streaming_session(name: str):
         """Archive session: nudge agent to save memory, then start fresh."""
         ss = broker._get_streaming_session(name)
@@ -10942,10 +11383,11 @@ npm run build</pre>
                 ss.codex_session_id = ""
 
         try:
-            await ss.restart_transport(configure=_configure_archive_restart)
+            ss = await _restart_compatible(name, ss, configure=_configure_archive_restart, reason="archive")
             _log(f"api: archived and restarted session for {name}")
         except Exception as e:
-            broker.unregister_streaming(name)
+            if not _startup_fencing_enabled():
+                broker.unregister_streaming(name)
             raise HTTPException(500, f"Failed to restart after archive: {e}")
 
         return {
@@ -11142,7 +11584,12 @@ npm run build</pre>
             ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
 
         prompt = f"[web | dm | Admin | web | {ts}]\n{content}"
-        await streaming.send(prompt, platform="web", chat_id="web")
+        if _rebuild_enabled():
+            _, accepted = await _deliver_streaming(name, prompt, label=label, platform="web", chat_id="web")
+            if accepted is False:
+                raise HTTPException(409, "Message handoff refused")
+        else:
+            await streaming.send(prompt, platform="web", chat_id="web")
         return {"sent": True, "agent": name}
 
     @app.get("/agents/{agent_name}/streaming/events")
@@ -11985,6 +12432,7 @@ npm run build</pre>
     # platform's inbound message via `_route_streaming`.
 
     @app.post("/agents/{agent_name}/stop")
+    @_locked_agent
     async def stop_agent(agent_name: str):
         """Force-stop an agent — immediately disconnect all sessions.
 
@@ -12046,7 +12494,12 @@ npm run build</pre>
         ss = await _ensure_streaming_session(agent_name, label="main")
         if not ss:
             raise HTTPException(503, f"No streaming session for '{agent_name}'")
-        await ss.send(content)
+        if _rebuild_enabled():
+            ss, accepted = await _deliver_streaming(agent_name, content)
+            if accepted is False:
+                raise HTTPException(409, "Message handoff refused")
+        else:
+            await ss.send(content)
         activity.log(agent_name, "message_forwarded",
                      f"Message forwarded to {agent_name}")
         return {"sent": True, "agent": agent_name}
@@ -12064,7 +12517,12 @@ npm run build</pre>
         ss = await _ensure_streaming_session(agent_name, label="main")
         if not ss:
             raise HTTPException(503, f"Failed to start streaming main session for '{agent_name}'")
-        await ss.send(wake_prompt)
+        if _rebuild_enabled():
+            ss, accepted = await _deliver_streaming(agent_name, wake_prompt)
+            if accepted is False:
+                raise HTTPException(409, "Wake handoff refused")
+        else:
+            await ss.send(wake_prompt)
 
         return {
             "agent": agent_name,
@@ -12086,6 +12544,19 @@ npm run build</pre>
         if not ss:
             _log(f"scheduler: no streaming main session for {agent_name}, skipping wake")
             return False
+
+        if _rebuild_enabled():
+            try:
+                ss, receipt = await _deliver_streaming(
+                    agent_name, prompt, scheduler=True, schedule_receipt=schedule_receipt,
+                )
+            except HTTPException:
+                return False
+            if callable(getattr(ss, "send_scheduler_prompt", None)):
+                return receipt
+            if not receipt or not getattr(ss, "injection_confirms_consumption", False):
+                return False
+            return schedule_receipt.accept() if schedule_receipt is not None else True
 
         scheduler_send = getattr(ss, "send_scheduler_prompt", None)
         if callable(scheduler_send):
@@ -12183,6 +12654,7 @@ npm run build</pre>
         except Exception as e:
             _log(f"scheduler: librarian run failed for '{agent_name}': {e}")
 
+    @_locked_agent
     async def _heartbeat_resurrect(agent_name: str, _session_id: str) -> None:
         """Watchdog resurrection: reconnect a dead streaming session.
 
@@ -12222,6 +12694,12 @@ npm run build</pre>
             )
             return
         _log(f"api: watchdog resurrection — reconnecting {agent_name}")
+        if _rebuild_enabled():
+            label = getattr(ss._config, "label", "main") or "main"
+            async with _label_scope(agent_name, label):
+                if type(ss) is not _expected_session_class(agents.get(agent_name)):
+                    await _replace_session_locked(agent_name, label, ss, reason="heartbeat_resurrect")
+                    return
         try:
             _refresh_streaming_launch_config(agent_name, ss)
             # #202: serialize the fresh boot behind the process-global cold-start
@@ -12508,6 +12986,7 @@ npm run build</pre>
         # fields can't be silently dropped here.
         return WatchdogConfig.from_raw(agent.watchdog_config)
 
+    @_locked_agent
     async def _watchdog_recover(agent_name: str, label: str, reason: str) -> None:
         """Recovery callback: stop + reconnect a single stuck streaming session."""
         _log(f"watchdog: recovering {agent_name}/{label} — {reason}")
@@ -12520,8 +12999,20 @@ npm run build</pre>
             # Disconnect only the stuck session, not siblings
             sessions = broker._streaming.get(agent_name, {})
             ss = sessions.get(label)
-            if ss:
+            if ss and _rebuild_enabled():
+                def configure_watchdog():
+                    _clear_resume(agent_name, label, ss)
+                    _refresh_streaming_launch_config(agent_name, ss)
+                    ss._config.force_fresh_context_once = True
+                    ss._config.restart_reason = "watchdog_recover"
+                ss = await _restart_compatible(
+                    agent_name, ss, configure=configure_watchdog, reason="watchdog_recover",
+                )
+            elif ss:
                 async def _rebuild_watchdog_transport() -> None:
+                    if _startup_fencing_enabled():
+                        _resume_owners.pop((agent_name, label), None)
+                        _resume_epochs[(agent_name, label)] = object()
                     agents.set_streaming_session_id(agent_name, "", label=label)
                     broker.unregister_streaming(agent_name, label=label)
                     await asyncio.sleep(2)
@@ -12774,6 +13265,7 @@ npm run build</pre>
             "probe_request": get_probe_request(agent_name),
         }
 
+    @_locked_agent
     async def _watchdog_mcp_recover(agent_name: str, label: str, reason: str) -> None:
         """Force-fresh recover an MCP-unbound session (#663).
 
@@ -12828,7 +13320,8 @@ npm run build</pre>
                 await connect()
 
         try:
-            await ss.restart_transport(
+            ss = await _restart_compatible(
+                agent_name, ss, reason="mcp_epoch_unbound",
                 configure=_configure_mcp_recovery,
                 connect_wrapper=_connect_mcp_recovery,
                 suppress_teardown_errors=True,
@@ -12841,7 +13334,8 @@ npm run build</pre>
             )
             _log(f"watchdog: MCP-recovered {agent_name}/{label} (force-fresh)")
         except Exception as exc:
-            broker.unregister_streaming(agent_name, label=label)
+            if not _startup_fencing_enabled() and broker._streaming.get(agent_name, {}).get(label) is ss:
+                broker.unregister_streaming(agent_name, label=label)
             _log(f"watchdog: MCP recovery connect failed for {agent_name}/{label}: {exc}")
             raise
 
@@ -13410,11 +13904,21 @@ npm run build</pre>
         for name in list(broker._streaming.keys()):
             sessions = broker._streaming.get(name, {})
             for label, ss in list(sessions.items()):
-                try:
-                    await ss.disconnect()
-                except Exception:
-                    pass
-            broker.unregister_streaming(name)
+                if _startup_fencing_enabled():
+                    async with _session_scope(name, label):
+                        try:
+                            await _retire_streaming_session(name, label, ss)
+                        except Exception as exc:
+                            _log(f"shutdown: transport cleanup unconfirmed ({type(exc).__name__})")
+                            continue
+                        broker.unregister_streaming(name, label=label)
+                else:
+                    try:
+                        await ss.disconnect()
+                    except Exception:
+                        pass
+            if not _startup_fencing_enabled():
+                broker.unregister_streaming(name)
         for poller in _broker_pollers:
             poller.stop()
         _broker_pollers.clear()
@@ -13980,6 +14484,7 @@ npm run build</pre>
         return {"restarting": True, "git_hash": _git_hash}
 
     @app.post("/admin/force-restart-agent/{name}")
+    @_locked_agent
     async def admin_force_restart_agent(
         name: str, req: ForceRestartAgentRequest | None = None
     ):
@@ -14107,7 +14612,7 @@ npm run build</pre>
             "source": "force_restart_endpoint",
         }
         try:
-            await ss.restart_transport(configure=_configure_forced_restart)
+            ss = await _restart_compatible(name, ss, configure=_configure_forced_restart, reason="force_restart")
             _log(
                 f"api: FORCE-restarted streaming session for {name} "
                 f"(heartbeat_age={heartbeat_age_sec}s, "
@@ -14126,7 +14631,8 @@ npm run build</pre>
                 metadata=audit_meta,
             )
         except Exception as e:
-            broker.unregister_streaming(name)
+            if not _startup_fencing_enabled():
+                broker.unregister_streaming(name)
             raise HTTPException(500, f"Failed to force-restart: {e}")
 
         return {

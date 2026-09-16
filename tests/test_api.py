@@ -1059,7 +1059,13 @@ class TestAPI:
                 and isinstance(node.func.value, ast.Name)
                 and node.func.value.id == "ss"
             ]
-            assert "restart_transport" in session_calls, name
+            helper_calls = {
+                node.func.id for node in ast.walk(function)
+                if isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+            }
+            assert ("restart_transport" in session_calls or
+                    "_restart_compatible" in helper_calls or
+                    "_replace_session_locked" in helper_calls), name
             assert "disconnect" not in session_calls, name
             assert "connect" not in session_calls, name
 
