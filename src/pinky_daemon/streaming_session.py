@@ -644,6 +644,7 @@ class StreamingSession(TransportReplacementMixin):
                         elif self._on_resume_handle:
                             await self._on_resume_handle(self.agent_name, "")
                         options.resume = None
+            self._check_startup_owner()
         except BaseException:
             if evidence is not None:
                 _log(json.dumps(operation.event(
@@ -667,8 +668,6 @@ class StreamingSession(TransportReplacementMixin):
             if resume_recovery.enabled() and cold_start_token is None and not getattr(self, "_recovery_operation", None):
                 self._state_machine._state = SessionState.DEAD
             raise
-
-        self._check_startup_owner()
 
         # Land in CONNECTED. Cold-start goes through the matrix
         # (BOOTING → CONNECTED via BOOT_COMPLETE), keeping the cold-start
