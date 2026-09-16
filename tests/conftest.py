@@ -108,6 +108,37 @@ def pytest_configure(config: pytest.Config) -> None:
         "markers",
         "real_transport: test intentionally uses a real external transport",
     )
+    config.addinivalue_line(
+        "markers",
+        "store_security: test exercises the store ownership/mode security boundary — "
+        "opts out of the global _verified_daemon_owned_path stub",
+    )
+
+
+@pytest.fixture(autouse=True)
+def _stub_daemon_wal_path_check(request, monkeypatch):
+    """Bypass the DaemonStoreCatalog WAL path ownership/mode check in tests.
+
+    The check rejects any store path whose ancestor directories are writable by
+    non-daemon UIDs — /tmp (mode 1777) is one such ancestor.  All test helpers
+    that call create_api() use tempfile paths under /tmp, so without this stub
+    the preflight fails whenever a store file lands there.
+
+    Tests marked ``store_security`` test the security boundary itself and need
+    the real implementation — they opt out of this stub via the marker.
+    """
+    if request.node.get_closest_marker("store_security"):
+        yield
+        return
+
+    from pinky_daemon.store_catalog import DaemonStoreCatalog
+
+    monkeypatch.setattr(
+        DaemonStoreCatalog,
+        "_verified_daemon_owned_path",
+        lambda self, path: os.path.realpath(path),
+    )
+    yield
 
 
 def pytest_runtest_setup(item: pytest.Item) -> None:

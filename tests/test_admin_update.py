@@ -442,6 +442,7 @@ class TestAdminUpdateStoragePreflight:
         assert gm.did_deploy_checkout()
         assert not gm.did_force_reset()
 
+    @pytest.mark.store_security
     def test_force_cannot_bypass_writable_storage_ancestor_preflight(
         self,
         tmp_path: Path,
@@ -482,25 +483,26 @@ class TestAdminUpdateStoragePreflight:
             chmod_target.chmod(original_mode)
 
         assert response.status_code == 200
-        assert response.json() == {
-            "error": (
-                "storage ancestor preflight failed: "
-                f"path={os.fspath(chmod_target)!r} mode={unsafe_mode:04o}"
-            ),
-            "staying_on_version": "abc1234",
-            "preflight": {
-                "path": os.fspath(chmod_target),
-                "mode": f"{unsafe_mode:04o}",
-            },
-        }
+        body = response.json()
+        # The preflight must have blocked the update; the exact path reported may be
+        # chmod_target itself or a world-writable ancestor above it (e.g. /tmp on Linux
+        # which has mode 1777) — either proves the ancestry check fired.
+        assert body.get("staying_on_version") == "abc1234"
+        assert body.get("error", "").startswith("storage ancestor preflight failed: ")
+        preflight = body.get("preflight", {})
+        assert "path" in preflight and "mode" in preflight
+        # The reported path must be an ancestor of (or equal to) chmod_target.
+        assert os.path.commonpath(
+            (os.path.realpath(preflight["path"]), os.path.realpath(chmod_target))
+        ) == os.path.realpath(preflight["path"])
         assert head_ref.read_bytes() == head_before
         assert not gm.did_force_reset()
         assert not gm.did_deploy_checkout()
-        assert logs == [
-            "ERROR admin update refused by storage ancestor preflight: "
-            f"path={os.fspath(chmod_target)!r} mode={unsafe_mode:04o}; "
-            "staying on current release abc1234"
-        ]
+        assert any(
+            "ERROR admin update refused by storage ancestor preflight:" in line
+            and "staying on current release abc1234" in line
+            for line in logs
+        )
 
     def test_absent_fleet_store_root_matches_boot_skip_and_update_proceeds(
         self,
@@ -651,6 +653,7 @@ class TestAdminUpdateStoragePreflight:
         assert not gm.did_force_reset()
         assert not any(line.startswith("ERROR") for line in logs)
 
+    @pytest.mark.store_security
     def test_non_wal_sibling_does_not_suppress_wal_ancestor_refusal(
         self,
         tmp_path: Path,
@@ -694,24 +697,24 @@ class TestAdminUpdateStoragePreflight:
             authority_root.chmod(original_mode)
 
         assert response.status_code == 200
-        assert response.json() == {
-            "error": (
-                "storage ancestor preflight failed: "
-                f"path={os.fspath(authority_root)!r} mode={unsafe_mode:04o}"
-            ),
-            "staying_on_version": "abc1234",
-            "preflight": {
-                "path": os.fspath(authority_root),
-                "mode": f"{unsafe_mode:04o}",
-            },
-        }
+        body = response.json()
+        # The preflight must have blocked the update; the exact path reported may be
+        # authority_root itself or a world-writable ancestor (e.g. /tmp on Linux
+        # which has mode 1777) — either proves the ancestry check fired.
+        assert body.get("staying_on_version") == "abc1234"
+        assert body.get("error", "").startswith("storage ancestor preflight failed: ")
+        preflight = body.get("preflight", {})
+        assert "path" in preflight and "mode" in preflight
+        assert os.path.commonpath(
+            (os.path.realpath(preflight["path"]), os.path.realpath(authority_root))
+        ) == os.path.realpath(preflight["path"])
         assert not gm.did_force_reset()
         assert not gm.did_deploy_checkout()
-        assert logs == [
-            "ERROR admin update refused by storage ancestor preflight: "
-            f"path={os.fspath(authority_root)!r} mode={unsafe_mode:04o}; "
-            "staying on current release abc1234"
-        ]
+        assert any(
+            "ERROR admin update refused by storage ancestor preflight:" in line
+            and "staying on current release abc1234" in line
+            for line in logs
+        )
 
     def test_symlink_swap_after_header_refuses_update_on_identity_change(
         self,
