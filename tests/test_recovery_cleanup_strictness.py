@@ -55,6 +55,7 @@ async def test_cleanup_uncertainty_blocks_this_and_later_recovery_cycles(
         first_state = ss.state
         await ss._reconnect_with_backoff()
         expected = 0 if stage == "initial" else 1
+        assert ss._stats["reconnects"] == expected, "Recovery retried after unconfirmed cleanup"
         assert first_count == expected, "Recovery spawned after uncertain cleanup"
         assert factory_spy.call_count == expected, "Outer recovery renewed a failed cleanup cycle"
         assert retained is (existing if stage == "initial" else peers[0])
