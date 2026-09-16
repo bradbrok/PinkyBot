@@ -438,3 +438,25 @@ async def test_internal_restart_refuses_unconfirmed_cleanup(lifecycle_harness, s
             peer.disconnect.side_effect = peer.close
         if proc:
             proc.returncode = 0
+
+
+@pytest.mark.parametrize("source,transport", [
+    ("claude_sdk", "sdk"), ("codex_cli", "sdk"),
+    ("claude_sdk", "tmux"), ("codex_cli", "tmux"),
+])
+async def test_internal_restart_cannot_retire_its_own_task(lifecycle_harness, source, transport):
+    h = lifecycle_harness
+    ss = h.seed((source, transport))
+    refused = []
+
+    async def spawn(owner):
+        if owner is ss:
+            with pytest.raises(RuntimeError, match="cannot replace itself"):
+                await ss.retire_transport()
+            refused.append(True)
+
+    h.control.start_hook = spawn
+    assert await ss.force_restart() is True
+    assert refused == [True]
+    assert ss.state == SessionState.CONNECTED
+    assert ss._state_machine._in_flight is None
