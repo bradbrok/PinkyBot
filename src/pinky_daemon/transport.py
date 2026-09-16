@@ -120,6 +120,12 @@ class TransportReplacementMixin:
         ):
             raise RuntimeError("Transport startup owner is retired or quiescing")
 
+        task = getattr(self, "_force_restart_task", None)
+        if (self._recovery_ownership_enabled() and task is not None and not task.done()
+                and getattr(self, "_force_restart_generation", None)
+                != getattr(self, "_recovery_generation", 0)):
+            raise RuntimeError("Startup belongs to a stale internal restart")
+
     async def retire_transport(self) -> None:
         """Quiesce terminal recovery before cleanup; retain uncertainty on failure."""
         fenced = self._recovery_ownership_enabled()
@@ -133,24 +139,99 @@ class TransportReplacementMixin:
         finally:
             self._replacement_cleanup_strict = prior_strict
 
-    async def _quiesce_recovery_owner(self) -> None:
-        task = getattr(self, "_reconnect_task", None)
+    def _check_force_restart_authority(self) -> None:
+        if not self._recovery_ownership_enabled():
+            return
+        self._check_recovery_owner()
+        if (asyncio.current_task() is not getattr(self, "_owned_force_restart_task", None)
+                or getattr(self, "_force_restart_generation", None)
+                != getattr(self, "_recovery_generation", 0)):
+            raise RuntimeError("Internal restart authority is stale")
+
+    def _start_force_restart(
+        self, operation: Callable[[], Awaitable[bool]],
+    ) -> asyncio.Task[bool] | None:
+        """Register ownership synchronously, before a scheduled restart can run."""
+        self._check_recovery_owner()
+        task = getattr(self, "_force_restart_task", None)
         if task is asyncio.current_task():
-            raise RuntimeError("Recovery owner cannot replace itself")
-        if task is not None and not task.done() and task is not getattr(self, "_owned_reconnect_task", None):
-            # Do not cancel an arbitrary caller/ancestor supplied as a handle.
-            # Only the task minted by this transport's recovery entry is ours.
-            raise RuntimeError("Unrecognized recovery owner; replacement refused")
-        # Inhibit synchronously before cancellation yields: a concurrent stale
-        # reference must not acquire a new owner while this one is stopping.
-        self._recovery_inhibited = True
+            raise RuntimeError("Internal restart cannot await itself")
         if task is not None and not task.done():
+            if task is not getattr(self, "_owned_force_restart_task", None):
+                raise RuntimeError("Unrecognized internal restart owner")
+        else:
+            reconnect = getattr(self, "_reconnect_task", None)
+            if reconnect is not None and not reconnect.done():
+                return None
+            self._recovery_generation = getattr(self, "_recovery_generation", 0) + 1
+            self._force_restart_generation = self._recovery_generation
+
+            async def run():
+                self._check_force_restart_authority()
+                prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+                self._replacement_cleanup_strict = True
+                try:
+                    return await operation()
+                finally:
+                    self._replacement_cleanup_strict = prior_strict
+
+            self._force_restart_initiator = asyncio.current_task()
+            task = asyncio.create_task(run())
+            self._force_restart_task = self._owned_force_restart_task = task
+            # A cancelled reader/watchdog may stop observing; still consume the
+            # outcome and retain the handle until settlement is observable.
+            task.add_done_callback(lambda done: None if done.cancelled() else done.exception())
+        return task
+
+    async def _run_force_restart(self, operation: Callable[[], Awaitable[bool]]) -> bool:
+        """Callers observe the owned operation without lending it their task."""
+        if not self._recovery_ownership_enabled():
+            return await operation()
+        task = self._start_force_restart(operation)
+        if task is None:
+            return False
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            if task.cancelled() and not asyncio.current_task().cancelling():
+                return False
+            raise
+
+    async def _join_internal_restart(self) -> bool:
+        if not self._recovery_ownership_enabled():
+            return False
+        task = getattr(self, "_force_restart_task", None)
+        if task is None or task.done():
+            return False
+        # The public gateway validates identity and shields the existing task.
+        # A backoff entry must not create a competing client on this object.
+        await self.force_restart()  # type: ignore[attr-defined]
+        return True
+
+    async def _quiesce_recovery_owner(self) -> None:
+        tasks = set()
+        for slot, owned in (("_reconnect_task", "_owned_reconnect_task"),
+                            ("_force_restart_task", "_owned_force_restart_task")):
+            task = getattr(self, slot, None)
+            if task is asyncio.current_task():
+                raise RuntimeError("Recovery owner cannot replace itself")
+            if task is not None and not task.done():
+                if task is not getattr(self, owned, None):
+                    raise RuntimeError("Unrecognized recovery owner; replacement refused")
+                tasks.add(task)
+        # Revoke before yielding, including operations already inside cleanup
+        # or spawn. No new owner may enter until retained startup succeeds.
+        self._recovery_inhibited = True
+        self._recovery_generation = getattr(self, "_recovery_generation", 0) + 1
+        for task in tasks:
             task.cancel()
-            done, _ = await asyncio.wait({task}, timeout=5)
-            if not done:
+        if tasks:
+            done, pending = await asyncio.wait(tasks, timeout=5)
+            if pending:
                 raise TimeoutError("Transport recovery owner did not stop")
-            if not task.cancelled():
-                task.result()
+            for task in done:
+                if not task.cancelled():
+                    task.result()
 
     @staticmethod
     async def _run_replacement_step(step: ReplacementStep | None) -> None:

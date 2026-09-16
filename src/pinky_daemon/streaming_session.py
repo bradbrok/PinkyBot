@@ -600,6 +600,7 @@ class StreamingSession(TransportReplacementMixin):
                 while True:
                     partial = None
                     try:
+                        self._check_startup_owner()
                         partial = ClaudeSDKClient(options)
                         self._client = partial
                         async with asyncio.timeout_at(operation.deadline):
@@ -666,6 +667,8 @@ class StreamingSession(TransportReplacementMixin):
             if resume_recovery.enabled() and cold_start_token is None and not getattr(self, "_recovery_operation", None):
                 self._state_machine._state = SessionState.DEAD
             raise
+
+        self._check_startup_owner()
 
         # Land in CONNECTED. Cold-start goes through the matrix
         # (BOOTING → CONNECTED via BOOT_COMPLETE), keeping the cold-start
@@ -1563,6 +1566,9 @@ class StreamingSession(TransportReplacementMixin):
             pass
 
     async def force_restart(self) -> bool:
+        return await self._run_force_restart(self._force_restart)
+
+    async def _force_restart(self) -> bool:
         """Force a context restart — disconnect, clear session, reconnect fresh."""
         if self._config.restart_guard:
             try:
@@ -1578,6 +1584,33 @@ class StreamingSession(TransportReplacementMixin):
                 await self._notify_restart_blocked(guard)
                 return False
 
+        return await self._force_restart_owned()
+
+    async def _force_restart_owned(self) -> bool:
+        if not self._recovery_ownership_enabled():
+            return await self._force_restart_steps()
+        result = await self._state_machine.request_transition(
+            SessionState.RECONNECTING, Trigger.USER_AGENT, reason="force_restart",
+        )
+        token = result.owner_token
+        if token is None:
+            return False
+        succeeded = False
+        try:
+            self._check_force_restart_authority()
+            result = await self._force_restart_steps()
+            self._check_force_restart_authority()
+            succeeded = result
+            return result
+        except Exception:
+            return False
+        finally:
+            await self._state_machine.transition_complete(
+                token, SessionState.CONNECTED if succeeded else SessionState.DEAD,
+                trigger=Trigger.INTERNAL,
+            )
+
+    async def _force_restart_steps(self) -> bool:
         _log(f"streaming[{self.agent_name}]: force restarting session")
 
         # Settle macro state in RECONNECTING for the full restart window —
@@ -1596,7 +1629,9 @@ class StreamingSession(TransportReplacementMixin):
                 pass
 
         # Disconnect
+        self._check_force_restart_authority()
         await self.disconnect()
+        self._check_force_restart_authority()
         # Re-assert RECONNECTING after the teardown. ``disconnect()``'s
         # fallback only fires from CONNECTED, so it shouldn't trip here —
         # but defensive: if a future change adds another path that flips
@@ -1729,6 +1764,8 @@ class StreamingSession(TransportReplacementMixin):
         it alive when the initiating caller (e.g. the old reader task,
         cancelled by disconnect()) dies mid-reconnect.
         """
+        if await self._join_internal_restart():
+            return
         self._check_recovery_owner()
         task = self._reconnect_task
         if task is not None and not task.done():

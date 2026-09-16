@@ -4583,6 +4583,24 @@ def create_api(
         )
         return candidate
 
+    async def _bind_retained_resume_owner(name, label, ss):
+        """Publish one epoch and both callbacks before retained startup emits."""
+        if broker._streaming.get(name, {}).get(label) is not ss:
+            raise HTTPException(409, "Session restart superseded")
+        _resume_epochs[(name, label)] = object()
+        _resume_owners[(name, label)] = ss
+        ss._on_resume_handle = await _make_streaming_resume_handle_callback(
+            name, label, owner=ss,
+        )
+        if hasattr(ss, "_on_resume_handle_sync"):
+            ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(
+                name, label, owner=ss,
+            )
+
+    async def _connect_retained_session(name, label, ss, connect=None):
+        await _bind_retained_resume_owner(name, label, ss)
+        await (connect or ss.connect)()
+
     async def _restart_compatible(name, ss, *, configure, reason, **kwargs):
         if not _startup_fencing_enabled():
             await ss.restart_transport(configure=configure, **kwargs)
@@ -4609,10 +4627,7 @@ def create_api(
                 outer_connect = kwargs.pop("connect_wrapper", None)
 
                 async def connect_retained(connect):
-                    _resume_owners[(name, label)] = ss
-                    ss._on_resume_handle = await _make_streaming_resume_handle_callback(name, label, owner=ss)
-                    if hasattr(ss, "_on_resume_handle_sync"):
-                        ss._on_resume_handle_sync = _make_streaming_resume_handle_sync_callback(name, label, owner=ss)
+                    await _bind_retained_resume_owner(name, label, ss)
                     if outer_connect is not None:
                         await outer_connect(connect)
                     else:
@@ -4674,6 +4689,9 @@ def create_api(
                             await ss.restart_transport(
                                 target_preflight=ss._preflight_transport_replacement,
                                 configure=lambda: _refresh_streaming_launch_config(agent_name, ss),
+                                connect_wrapper=lambda connect: _connect_retained_session(
+                                    agent_name, label, ss, connect,
+                                ),
                             )
                         return ss
                 if time.monotonic() >= deadline:
@@ -4727,8 +4745,15 @@ def create_api(
                 # the old local session under the daemon uid (Murzik #642 review).
                 _enforce_isolation_runnable(agent_name)
                 _refresh_streaming_launch_config(agent_name, ss)
-                if _startup_fencing_enabled() and getattr(ss, "_recovery_inhibited", False):
-                    await ss.restart_transport()
+                if _startup_fencing_enabled():
+                    if getattr(ss, "_recovery_inhibited", False):
+                        await ss.restart_transport(
+                            connect_wrapper=lambda connect: _connect_retained_session(
+                                agent_name, label, ss, connect,
+                            ),
+                        )
+                    else:
+                        await _connect_retained_session(agent_name, label, ss)
                 else:
                     await ss.connect()
                 return ss

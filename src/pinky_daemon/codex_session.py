@@ -429,8 +429,10 @@ class CodexSession(TransportReplacementMixin):
         mode itself has no persistent substrate. Preflight failures still raise
         because the same unsafe auth/home would affect both transports.
         """
+        self._check_startup_owner()
         if self._use_app_server:
             await self._ensure_app_server()
+        self._check_startup_owner()
 
     def _begin_app_server_reconnect_cycle(self) -> None:
         """Retry a construction-selected app-server after sticky degradation."""
@@ -1264,6 +1266,7 @@ class CodexSession(TransportReplacementMixin):
             # failure must abort before the spawn boundary publishes a soul.
             await self._teardown_app_server(strict=True)
 
+        self._check_startup_owner()
         started_at = time.monotonic()
 
         generation = object()
@@ -1278,6 +1281,7 @@ class CodexSession(TransportReplacementMixin):
                 self._on_appserver_transport_closed(error)
 
         async def _spawn_and_initialize() -> None:
+            self._check_startup_owner()
             if self._use_tmux_app_server:
                 # #791 Design A: the supervisor spawns the shim under tmux and
                 # hands back an UN-initialized client. The initialize below is
@@ -1325,9 +1329,15 @@ class CodexSession(TransportReplacementMixin):
             # One bound covers process/supervisor spawn plus initialize. A child
             # that starts but never answers cannot hold BOOTING for the client's
             # blanket 600-second request timeout.
-            await asyncio.wait_for(
-                _spawn_and_initialize(), timeout=self._app_server_init_timeout
-            )
+            if self._recovery_ownership_enabled():
+                # Keep the retained connect permit and recovery authority on
+                # their owning task throughout the bounded startup operation.
+                async with asyncio.timeout(self._app_server_init_timeout):
+                    await _spawn_and_initialize()
+            else:
+                await asyncio.wait_for(
+                    _spawn_and_initialize(), timeout=self._app_server_init_timeout
+                )
         except asyncio.CancelledError:
             await self._teardown_app_server()
             raise
@@ -2298,6 +2308,9 @@ class CodexSession(TransportReplacementMixin):
             })
 
     async def force_restart(self) -> bool:
+        return await self._run_force_restart(self._force_restart)
+
+    async def _force_restart(self) -> bool:
         """Force a context restart — clear codex session, start fresh."""
         if self._config.restart_guard:
             try:
@@ -2336,6 +2349,8 @@ class CodexSession(TransportReplacementMixin):
         token = res.owner_token
         self._begin_app_server_reconnect_cycle()
 
+        settled = False
+        publication_started = False
         try:
             # Clear the resume handle (fresh start).
             if self._on_resume_handle:
@@ -2344,7 +2359,9 @@ class CodexSession(TransportReplacementMixin):
                 except Exception:
                     pass
 
+            self._check_force_restart_authority()
             await self.disconnect()
+            self._check_force_restart_authority()
 
             # #591 P1#1 (Murzik round-2): connect() is the single source-of-truth
             # for the wake_context body + side-effect consumption; _enqueue_wake
@@ -2353,21 +2370,28 @@ class CodexSession(TransportReplacementMixin):
             self.resume_handle = ""
 
             await self._bring_up_substrate()
-        except BaseException as e:
-            _log(f"codex[{self.agent_name}]: force restart failed: {e}")
+            self._check_force_restart_authority()
+            publication_started = True
             await self._state_machine.transition_complete(
-                token, SessionState.DEAD, trigger=Trigger.INTERNAL
+                token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
             )
+            settled = True
+            self._check_force_restart_authority()
+            self._analytics_session_started()
+            self._start_worker()
+            await self._enqueue_wake()
+            _log(f"codex[{self.agent_name}]: force restart complete")
+            return True
+        except BaseException as e:
+            if publication_started and not self._recovery_ownership_enabled():
+                raise
+            _log(f"codex[{self.agent_name}]: force restart failed: {e}")
             return False
-
-        await self._state_machine.transition_complete(
-            token, SessionState.CONNECTED, trigger=Trigger.INTERNAL
-        )
-        self._analytics_session_started()
-        self._start_worker()
-        await self._enqueue_wake()
-        _log(f"codex[{self.agent_name}]: force restart complete")
-        return True
+        finally:
+            if not settled and (self._recovery_ownership_enabled() or not publication_started):
+                await self._state_machine.transition_complete(
+                    token, SessionState.DEAD, trigger=Trigger.INTERNAL,
+                )
 
     async def idle_sleep(self) -> bool:
         """Put the session to sleep. Codex session ID preserved for resume."""
@@ -2434,6 +2458,8 @@ class CodexSession(TransportReplacementMixin):
     async def attempt_reconnect(self, *, trigger: Trigger = Trigger.WATCHDOG) -> None:
         if not self._recovery_ownership_enabled():
             await self._reconnect_attempts(trigger=trigger)
+            return
+        if await self._join_internal_restart():
             return
         self._check_recovery_owner()
         task = getattr(self, "_reconnect_task", None)
