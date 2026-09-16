@@ -115,15 +115,21 @@ def report_sdk_drift(log, version: str, reason: str) -> None:
 
 def sanitized_diagnostic(value: str) -> str:
     """Sanitize a bounded raw prefix, including incomplete credential values."""
-    value = re.sub(r"\x1b\[[0-?]*[ -/]*[@-~]", "", value[:4096])
+    value = re.sub(
+        r"\x1b\][^\x07\x1b]*(?:\x07|\x1b\\|$)"
+        r"|\x1b\[[0-?]*[ -/]*[@-~]|\x1b[()][0-2A-Z]|\x1b[78=>DEHMNc]",
+        "", value[:4096],
+    ).replace("\x1b", "")
     # Quoted fields can contain spaces, escaped quotes, or end at the input
     # cap. Consume an unfinished value too; never retain its raw prefix.
     value = re.sub(
-        r'''(?i)(["'](?:api[_-]?key|token|password|secret)["']\s*[:=]\s*)'''
-        r'''(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$))''',
+        r'''(?i)(["']?(?:api[_-]?key|token|password|secret)["']?\s*[:=]\s*)'''
+        r'''(?:"(?:\\.|[^"\\])*(?:"|\\?$)|'(?:\\.|[^'\\])*(?:'|\\?$)|\S+)''',
         r'\1"[redacted]"', value,
     )
-    value = re.sub(r"(?i)((?:basic|bearer)\s+|(?:api[_-]?key|token|password|secret)\s*[=:]\s*)\S+",
+    # Malformed authorization values may contain spaces. Withhold the rest
+    # of their line rather than guessing where credential bytes end.
+    value = re.sub(r"(?i)((?:basic|bearer)\s+)[^\r\n]+",
                    r"\1[redacted]", value)
     value = re.sub(r"(?i)\b(https?://)[^\s/?#]*@", r"\1[redacted]@", value)
     # At EOF/cap an authority may end before its @. Withhold ambiguous
@@ -132,7 +138,7 @@ def sanitized_diagnostic(value: str) -> str:
         r"(?i)\b(https?://)([^\s/?#:@]+):([^\s/?#@]+)(?=$|\s)",
         lambda m: m[1] + "[redacted]", value,
     )
-    value = re.sub(r"\bsk-[A-Za-z0-9_-]+", "[redacted]", value)
+    value = re.sub(r"\bsk(?:-|_(?:live|test)_)[A-Za-z0-9_-]+", "[redacted]", value)
     value = re.sub(r"\beyJ[A-Za-z0-9_-]*(?:\.[A-Za-z0-9_-]*){0,2}", "[redacted]", value)
     return " ".join(value.split())[:1024]
 

@@ -4522,7 +4522,7 @@ def create_api(
 
         @functools.wraps(fn)
         async def wrapped(*args, **kwargs):
-            if not _rebuild_enabled() and os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") != "1":
+            if not _startup_fencing_enabled() and os.environ.get("PINKY_MODEL_RUNTIME_GUARD", "0") != "1":
                 return await fn(*args, **kwargs)
             name = args[0] if args else kwargs[agent_parameter]
             async with _lifecycle(name):
@@ -4584,7 +4584,7 @@ def create_api(
         return candidate
 
     async def _restart_compatible(name, ss, *, configure, reason, **kwargs):
-        if not _rebuild_enabled():
+        if not _startup_fencing_enabled():
             await ss.restart_transport(configure=configure, **kwargs)
             return ss
         label = getattr(ss._config, "label", "main") or "main"
@@ -4600,7 +4600,7 @@ def create_api(
                     raise HTTPException(409, "Agent missing or disabled")
                 if type(ss) is not _expected_session_class(agent):
                     return await _replace_session_locked(name, label, ss, reason=reason)
-            if _rebuild_enabled():
+            if _startup_fencing_enabled():
                 async def configure_retained():
                     _resume_epochs[(name, label)] = object()
                     _resume_owners.pop((name, label), None)
@@ -4727,7 +4727,10 @@ def create_api(
                 # the old local session under the daemon uid (Murzik #642 review).
                 _enforce_isolation_runnable(agent_name)
                 _refresh_streaming_launch_config(agent_name, ss)
-                await ss.connect()
+                if _startup_fencing_enabled() and getattr(ss, "_recovery_inhibited", False):
+                    await ss.restart_transport()
+                else:
+                    await ss.connect()
                 return ss
 
             resume_id = agents.get_streaming_session_id(agent_name, label=label)
@@ -4768,25 +4771,36 @@ def create_api(
     # block-reason check; the broker logs+skips rather than raising HTTP.
     broker.set_isolation_guard(_isolation_block_reason)
 
+    async def _retire_streaming_session(name, label, ss):
+        """Terminal cleanup keeps registry and callback ownership until confirmed."""
+        if _startup_fencing_enabled():
+            async with _session_scope(name, label):
+                if broker._streaming.get(name, {}).get(label) is not ss:
+                    raise HTTPException(409, "Terminal cleanup owner superseded")
+                await ss.retire_transport()
+                _resume_owners.pop((name, label), None)
+                _resume_epochs[(name, label)] = object()
+        else:
+            try:
+                await ss.disconnect()
+            except Exception:
+                pass
+
     async def _disconnect_streaming_sessions(agent_name: str) -> int:
+        """Serialize terminal teardown with all startup and rename entries."""
+        if _startup_fencing_enabled():
+            async with _lifecycle(agent_name):
+                return await _disconnect_streaming_sessions_unchecked(agent_name)
+        return await _disconnect_streaming_sessions_unchecked(agent_name)
+
+    async def _disconnect_streaming_sessions_unchecked(agent_name: str) -> int:
         """Disconnect and unregister all streaming sessions for an agent."""
         persisted = agents.list_streaming_session_ids(agent_name)
         sessions = dict(broker._streaming.get(agent_name, {}))
         closed = 0
 
         for label, ss in sessions.items():
-            if _rebuild_enabled():
-                ss._replacement_cleanup_strict = True
-            try:
-                await ss.disconnect()
-            except Exception:
-                if _rebuild_enabled():
-                    raise
-            finally:
-                ss._replacement_cleanup_strict = False
-            if _rebuild_enabled():
-                _resume_owners.pop((agent_name, label), None)
-                _resume_epochs[(agent_name, label)] = object()
+            await _retire_streaming_session(agent_name, label, ss)
             closed += 1
             agents.set_streaming_session_id(agent_name, "", label=label)
 
@@ -10271,18 +10285,7 @@ npm run build</pre>
         ss = sessions.get(label)
         if not ss:
             raise HTTPException(404, f"Streaming session '{label}' not found for {name}")
-        if _rebuild_enabled():
-            ss._replacement_cleanup_strict = True
-        try:
-            await ss.disconnect()
-        except Exception:
-            if _rebuild_enabled():
-                raise
-        finally:
-            ss._replacement_cleanup_strict = False
-        if _rebuild_enabled():
-            _resume_owners.pop((name, label), None)
-            _resume_epochs[(name, label)] = object()
+        await _retire_streaming_session(name, label, ss)
         agents.set_streaming_session_id(name, "", label=label)
         broker.unregister_streaming(name, label=label)
         return {"deleted": True, "agent": name, "label": label}
@@ -10308,7 +10311,7 @@ npm run build</pre>
         # resume-handle callback closed over the old label, so without this the
         # session keeps persisting turns and resume handles under the old name.
         ss._config.label = new_label
-        if _rebuild_enabled():
+        if _startup_fencing_enabled():
             _resume_owners.pop((name, label), None)
             _resume_epochs[(name, label)] = object()
             _resume_owners[(name, new_label)] = ss
@@ -11073,7 +11076,7 @@ npm run build</pre>
                 _log(f"api: post-response context restart cancelled for {name}")
                 raise
             except Exception as e:
-                if not _rebuild_enabled():
+                if not _startup_fencing_enabled():
                     broker.unregister_streaming(name)
                 _log(
                     f"api: post-response context restart failed for {name}: {e}"
@@ -11259,7 +11262,7 @@ npm run build</pre>
                 ss = await _restart_compatible(name, ss, configure=_configure_model_restart, reason="model_change")
                 _log(f"api: restarted {name} with model {req.model}")
             except Exception as e:
-                if not _rebuild_enabled():
+                if not _startup_fencing_enabled():
                     broker.unregister_streaming(name)
                 raise HTTPException(500, f"Failed to restart: {e}")
 
@@ -11355,7 +11358,7 @@ npm run build</pre>
             ss = await _restart_compatible(name, ss, configure=_configure_archive_restart, reason="archive")
             _log(f"api: archived and restarted session for {name}")
         except Exception as e:
-            if not _rebuild_enabled():
+            if not _startup_fencing_enabled():
                 broker.unregister_streaming(name)
             raise HTTPException(500, f"Failed to restart after archive: {e}")
 
@@ -12979,6 +12982,9 @@ npm run build</pre>
                 )
             elif ss:
                 async def _rebuild_watchdog_transport() -> None:
+                    if _startup_fencing_enabled():
+                        _resume_owners.pop((agent_name, label), None)
+                        _resume_epochs[(agent_name, label)] = object()
                     agents.set_streaming_session_id(agent_name, "", label=label)
                     broker.unregister_streaming(agent_name, label=label)
                     await asyncio.sleep(2)
@@ -13300,7 +13306,7 @@ npm run build</pre>
             )
             _log(f"watchdog: MCP-recovered {agent_name}/{label} (force-fresh)")
         except Exception as exc:
-            if not _rebuild_enabled() and broker._streaming.get(agent_name, {}).get(label) is ss:
+            if not _startup_fencing_enabled() and broker._streaming.get(agent_name, {}).get(label) is ss:
                 broker.unregister_streaming(agent_name, label=label)
             _log(f"watchdog: MCP recovery connect failed for {agent_name}/{label}: {exc}")
             raise
@@ -13870,11 +13876,21 @@ npm run build</pre>
         for name in list(broker._streaming.keys()):
             sessions = broker._streaming.get(name, {})
             for label, ss in list(sessions.items()):
-                try:
-                    await ss.disconnect()
-                except Exception:
-                    pass
-            broker.unregister_streaming(name)
+                if _startup_fencing_enabled():
+                    async with _session_scope(name, label):
+                        try:
+                            await _retire_streaming_session(name, label, ss)
+                        except Exception as exc:
+                            _log(f"shutdown: transport cleanup unconfirmed ({type(exc).__name__})")
+                            continue
+                        broker.unregister_streaming(name, label=label)
+                else:
+                    try:
+                        await ss.disconnect()
+                    except Exception:
+                        pass
+            if not _startup_fencing_enabled():
+                broker.unregister_streaming(name)
         for poller in _broker_pollers:
             poller.stop()
         _broker_pollers.clear()
@@ -14587,7 +14603,7 @@ npm run build</pre>
                 metadata=audit_meta,
             )
         except Exception as e:
-            if not _rebuild_enabled():
+            if not _startup_fencing_enabled():
                 broker.unregister_streaming(name)
             raise HTTPException(500, f"Failed to force-restart: {e}")
 

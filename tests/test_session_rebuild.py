@@ -364,6 +364,8 @@ async def test_late_old_resume_callback_cannot_overwrite_new_identity(harness):
     old = await h.app.state.broker._ensure_session_callback("sample")
     callback = old._on_resume_handle
     assert callable(callback)
+    # Simulate registry supersession without bypassing registration's owner guard.
+    h.app.state.broker.unregister_streaming("sample", label="main")
     new = h.seed(("codex_cli", "tmux"))
     h.app.state.agents.set_streaming_session_id("sample", "new-thread", label="main")
     await callback("sample", "stale-sdk-handle")
@@ -399,6 +401,7 @@ async def test_broker_waiter_resolves_replaced_object(harness, monkeypatch):
         content="Continue", agent_name="sample",
     )))
     await asyncio.sleep(0)
+    h.app.state.broker.unregister_streaming("sample", label="main")
     new = h.seed()
     assert new is not old
     delivered = await route
@@ -623,6 +626,7 @@ async def test_renamed_session_callbacks_keep_generation_fence(harness):
     await before_rename("sample", "late-before-rename")
     assert h.app.state.agents.get_streaming_session_id("sample", label="secondary") == ""
     after_rename = secondary._on_resume_handle
+    h.app.state.broker.unregister_streaming("sample", label="renamed")
     h.seed(("codex_cli", "tmux"), label="renamed")
     h.app.state.agents.set_streaming_session_id("sample", "current", label="renamed")
     await after_rename("sample", "late-after-rename")

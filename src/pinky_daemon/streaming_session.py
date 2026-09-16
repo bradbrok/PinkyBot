@@ -401,6 +401,8 @@ class StreamingSession(TransportReplacementMixin):
         """
         from claude_agent_sdk import ClaudeAgentOptions, ClaudeSDKClient
 
+        self._check_startup_owner()
+
         # PR6: cold-start wire-up. If we entered connect() in UNINITIALIZED
         # OR a BOOT is already in flight (state == BOOTING with our state
         # machine mid-handshake from a concurrent caller), request BOOT
@@ -580,6 +582,17 @@ class StreamingSession(TransportReplacementMixin):
             if not sdk_contract[1]:
                 resume_recovery.report_sdk_drift(_log, sdk_contract[0], "unsupported_sdk_version")
         try:
+            # A previous strict cleanup can outlive its recovery operation.
+            # Every entry to connect must settle that retained child before
+            # assigning a new client, including ordinary ensure/idle wake.
+            if resume_recovery.enabled() and self._client is not None:
+                prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+                self._replacement_cleanup_strict = True
+                try:
+                    async with asyncio.timeout_at(operation.deadline):
+                        await self.disconnect()
+                finally:
+                    self._replacement_cleanup_strict = prior_strict
             if not resume_recovery.enabled():
                 self._client = ClaudeSDKClient(options)
                 await self._client.connect()
@@ -618,8 +631,10 @@ class StreamingSession(TransportReplacementMixin):
                                     await partial.disconnect()
                             except BaseException as cleanup_error:
                                 operation.cleanup_failed = True
+                                self._cleanup_uncertain = True
                                 raise exc from cleanup_error
                             self._client = None
+                            self._cleanup_uncertain = False
                         if not claimed:
                             raise
                         self.resume_handle = self._config.resume_handle = ""
@@ -1862,10 +1877,15 @@ class StreamingSession(TransportReplacementMixin):
         if self._client:
             try:
                 await self._client.disconnect()
-            except Exception:
-                if getattr(self, "_replacement_cleanup_strict", False):
+            except BaseException as exc:
+                if (getattr(self, "_replacement_cleanup_strict", False)
+                        or getattr(self, "_cleanup_uncertain", False)):
+                    self._cleanup_uncertain = True
+                    raise
+                if not isinstance(exc, Exception):
                     raise
             self._client = None
+            self._cleanup_uncertain = False
         # Routing entries for turns that will never complete are stale; a
         # reconnected session must not deliver its first responses (e.g. the
         # wake-prompt turn) to a leftover chat_id from before the teardown.

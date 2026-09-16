@@ -2342,6 +2342,12 @@ class MessageBroker:
         if agent_name not in self._streaming:
             self._streaming[agent_name] = {}
         displaced = self._streaming[agent_name].get(label)
+        if (displaced is not None and displaced is not session
+                and (os.environ.get("PINKY_SESSION_CLASS_REBUILD", "0") == "1"
+                     or os.environ.get("PINKY_RESUME_FAILSAFE", "0") == "1")):
+            # Registration is synchronous: terminal cleanup must finish at the
+            # lifecycle owner before it unregisters and publishes a successor.
+            raise RuntimeError("Streaming owner must be retired before replacement")
         if (
             displaced is not None
             and displaced is not session

@@ -110,6 +110,29 @@ class TransportReplacementMixin:
         ):
             raise RuntimeError("Transport recovery owner is retired or quiescing")
 
+    def _check_startup_owner(self) -> None:
+        # A retained restart may connect while recovery is inhibited. A
+        # terminally retired object must never acquire another substrate.
+        if self._recovery_ownership_enabled() and (
+            getattr(self, "_recovery_retired", False)
+            or (getattr(self, "_recovery_inhibited", False)
+                and getattr(self, "_replacement_connect_owner", None) is not asyncio.current_task())
+        ):
+            raise RuntimeError("Transport startup owner is retired or quiescing")
+
+    async def retire_transport(self) -> None:
+        """Quiesce terminal recovery before cleanup; retain uncertainty on failure."""
+        fenced = self._recovery_ownership_enabled()
+        if fenced:
+            await self._quiesce_recovery_owner()
+            self._recovery_retired = True
+        prior_strict = getattr(self, "_replacement_cleanup_strict", False)
+        self._replacement_cleanup_strict = fenced or prior_strict
+        try:
+            await self.disconnect()  # type: ignore[attr-defined]
+        finally:
+            self._replacement_cleanup_strict = prior_strict
+
     async def _quiesce_recovery_owner(self) -> None:
         task = getattr(self, "_reconnect_task", None)
         if task is asyncio.current_task():
@@ -159,14 +182,14 @@ class TransportReplacementMixin:
         await self._run_replacement_step(
             target_preflight or self._preflight_transport_replacement
         )
-        fenced = target_preflight is not None and self._recovery_fencing_enabled()
+        fenced = self._recovery_ownership_enabled()
         if fenced:
             await self._quiesce_recovery_owner()
             if bring_up is not None:
                 self._recovery_retired = True
         await self._run_replacement_step(configure)
         prior_strict = getattr(self, "_replacement_cleanup_strict", False)
-        self._replacement_cleanup_strict = target_preflight is not None or prior_strict
+        self._replacement_cleanup_strict = fenced or target_preflight is not None or prior_strict
         try:
             await self.disconnect()  # type: ignore[attr-defined]
         except Exception:
@@ -176,10 +199,14 @@ class TransportReplacementMixin:
             self._replacement_cleanup_strict = prior_strict
         if bring_up is None:
             connect = self.connect  # type: ignore[attr-defined]
-            if connect_wrapper is None:
-                await connect()
-            else:
-                await connect_wrapper(connect)
+            self._replacement_connect_owner = asyncio.current_task()
+            try:
+                if connect_wrapper is None:
+                    await connect()
+                else:
+                    await connect_wrapper(connect)
+            finally:
+                self._replacement_connect_owner = None
         else:
             await self._run_replacement_step(bring_up)
         if fenced:

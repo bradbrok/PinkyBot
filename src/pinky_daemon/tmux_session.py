@@ -3299,6 +3299,7 @@ class TmuxSession(TransportReplacementMixin):
                 only legal trigger). Default ``BROKER`` — the most
                 common caller (auto-wake on inbound message).
         """
+        self._check_startup_owner()
         cold_start_token = None
         warm_wake_token = None
 
@@ -11680,6 +11681,21 @@ class TmuxSession(TransportReplacementMixin):
         return True
 
     async def attempt_reconnect(self, *, trigger: Trigger = Trigger.BROKER) -> None:
+        if not self._recovery_ownership_enabled():
+            await self._reconnect_attempts(trigger=trigger)
+            return
+        self._check_recovery_owner()
+        task = getattr(self, "_reconnect_task", None)
+        if task is None or task.done():
+            task = asyncio.create_task(self._reconnect_attempts(trigger=trigger))
+            self._reconnect_task = self._owned_reconnect_task = task
+        try:
+            await task
+        finally:
+            if self._reconnect_task is task and task.done():
+                self._reconnect_task = None
+
+    async def _reconnect_attempts(self, *, trigger: Trigger = Trigger.BROKER) -> None:
         """Best-effort reconnect after a transient transport failure.
 
         Drives the warm-reconnect loop with bounded backoff. Matches the
@@ -11746,67 +11762,77 @@ class TmuxSession(TransportReplacementMixin):
             return
 
         try:
-            await self.disconnect()
-        except Exception as e:
-            _log(f"tmux[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
-
-        last_error: Exception | None = None
-        for attempt_idx, delay in enumerate(_RECONNECT_BACKOFF, start=1):
-            self._stats["reconnects"] += 1
-            _log(
-                f"tmux[{self.agent_name}]: reconnect attempt {attempt_idx}/"
-                f"{len(_RECONNECT_BACKOFF)} after {delay}s backoff"
-            )
-            await asyncio.sleep(delay)
             try:
-                await self._spawn_tmux_repl()
+                await self.disconnect()
+            except Exception as e:
+                _log(f"tmux[{self.agent_name}]: pre-reconnect disconnect raised: {e}")
+
+            last_error: Exception | None = None
+            for attempt_idx, delay in enumerate(_RECONNECT_BACKOFF, start=1):
+                self._stats["reconnects"] += 1
+                _log(
+                    f"tmux[{self.agent_name}]: reconnect attempt {attempt_idx}/"
+                    f"{len(_RECONNECT_BACKOFF)} after {delay}s backoff"
+                )
+                await asyncio.sleep(delay)
+                self._check_recovery_owner()
+                try:
+                    await self._spawn_tmux_repl()
+                    await self._state_machine.transition_complete(
+                        token,
+                        SessionState.CONNECTED,
+                        trigger=Trigger.INTERNAL,
+                    )
+                    # Re-prime with an orientation wake prompt BEFORE the
+                    # worker starts draining, mirroring force_restart (#589).
+                    # Without this a heartbeat-resurrected agent comes back
+                    # on a session with no saved-state / current-time /
+                    # channel orientation. Reason derivation matches
+                    # force_restart's launch-signal mapping.
+                    if self._last_launch_forced_fresh:
+                        wake_reason = WakeReason.CONTEXT_RESTART
+                    elif self._last_launch_had_prior_transcript:
+                        wake_reason = WakeReason.RESUME
+                    else:
+                        wake_reason = WakeReason.NEW_SESSION
+                    await self._enqueue_wake_prompt(wake_reason, front=True)
+                    # Respawn the worker — disconnect() above cancelled it, so
+                    # the queue would otherwise have no drainer on success.
+                    if not self._worker_task or self._worker_task.done():
+                        self._worker_task = asyncio.create_task(self._message_worker())
+                    # Respawn the watchdog too (#560).
+                    if not self._watchdog_task or self._watchdog_task.done():
+                        self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
+                    _log(
+                        f"tmux[{self.agent_name}]: reconnected successfully "
+                        f"(wake_reason={wake_reason.value})"
+                    )
+                    return
+                except Exception as e:
+                    last_error = e
+                    _log(
+                        f"tmux[{self.agent_name}]: reconnect attempt {attempt_idx} "
+                        f"failed: {e}"
+                    )
+
+            # Exhausted retry budget → DEAD.
+            try:
                 await self._state_machine.transition_complete(
                     token,
-                    SessionState.CONNECTED,
+                    SessionState.DEAD,
                     trigger=Trigger.INTERNAL,
                 )
-                # Re-prime with an orientation wake prompt BEFORE the
-                # worker starts draining, mirroring force_restart (#589).
-                # Without this a heartbeat-resurrected agent comes back
-                # on a session with no saved-state / current-time /
-                # channel orientation. Reason derivation matches
-                # force_restart's launch-signal mapping.
-                if self._last_launch_forced_fresh:
-                    wake_reason = WakeReason.CONTEXT_RESTART
-                elif self._last_launch_had_prior_transcript:
-                    wake_reason = WakeReason.RESUME
-                else:
-                    wake_reason = WakeReason.NEW_SESSION
-                await self._enqueue_wake_prompt(wake_reason, front=True)
-                # Respawn the worker — disconnect() above cancelled it, so
-                # the queue would otherwise have no drainer on success.
-                if not self._worker_task or self._worker_task.done():
-                    self._worker_task = asyncio.create_task(self._message_worker())
-                # Respawn the watchdog too (#560).
-                if not self._watchdog_task or self._watchdog_task.done():
-                    self._watchdog_task = asyncio.create_task(self._inflight_watchdog())
-                _log(
-                    f"tmux[{self.agent_name}]: reconnected successfully "
-                    f"(wake_reason={wake_reason.value})"
-                )
-                return
-            except Exception as e:
-                last_error = e
-                _log(
-                    f"tmux[{self.agent_name}]: reconnect attempt {attempt_idx} "
-                    f"failed: {e}"
-                )
-
-        # Exhausted retry budget → DEAD.
-        try:
-            await self._state_machine.transition_complete(
-                token,
-                SessionState.DEAD,
-                trigger=Trigger.INTERNAL,
+            except Exception:
+                pass
+            _log(
+                f"tmux[{self.agent_name}]: all {len(_RECONNECT_BACKOFF)} reconnect "
+                f"attempts failed (last error: {last_error}); landed DEAD"
             )
-        except Exception:
-            pass
-        _log(
-            f"tmux[{self.agent_name}]: all {len(_RECONNECT_BACKOFF)} reconnect "
-            f"attempts failed (last error: {last_error}); landed DEAD"
-        )
+        except BaseException:
+            if self._recovery_ownership_enabled():
+                pending = self._state_machine._in_flight
+                if pending is not None and pending.owner_token is token:
+                    await self._state_machine.transition_complete(
+                        token, SessionState.DEAD, trigger=Trigger.INTERNAL,
+                    )
+            raise

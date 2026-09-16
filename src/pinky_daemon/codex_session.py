@@ -315,6 +315,7 @@ class CodexSession(TransportReplacementMixin):
         app-server substrate is up (app-server mode) and the worker drainer is
         about to run. We never hold BOOTING across a model turn (#206; Murzik).
         """
+        self._check_startup_owner()
         cold_start_token: OwnerToken | None = None
         warm_wake_token: OwnerToken | None = None
         st = self.state
@@ -1183,7 +1184,8 @@ class CodexSession(TransportReplacementMixin):
                 if stderr_data:
                     stderr_str = stderr_data if isinstance(stderr_data, str) else stderr_data.decode().strip()
                     if stderr_str:
-                        _log(f"codex[{self.agent_name}]: stderr: {stderr_str[:200]}")
+                        diagnostic = resume_recovery.sanitized_diagnostic(stderr_str)
+                        _log(f"codex[{self.agent_name}]: stderr: {diagnostic[:200]}")
                         if resume_recovery.enabled() and proc.returncode:
                             result.errors.append(stderr_str)
                             result.failed = True
