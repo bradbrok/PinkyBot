@@ -65,7 +65,7 @@ async def test_retirement_awaits_suspended_internal_restart(
         assert h.app.state.broker._streaming["sample"]["main"] is ss
         before = len(h.clients), len(h.trace)
         with pytest.raises(RuntimeError):
-            await ss.force_restart()
+            await asyncio.wait_for(ss.force_restart(), 0.1)
         assert (len(h.clients), len(h.trace)) == before
         release.set()
         assert (await stop).status_code == 200
