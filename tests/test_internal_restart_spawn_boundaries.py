@@ -148,3 +148,35 @@ async def test_real_codex_initialize_is_joined_before_retirement(monkeypatch, tm
         task.cancel()
         await asyncio.gather(task, return_exceptions=True)
         await ss.disconnect()
+
+
+@pytest.mark.parametrize("mode", ["a", "b", "both"])
+async def test_startup_refusal_after_initialize_settles_cold_token(lifecycle_harness, monkeypatch, mode):
+    from pinky_daemon.streaming_session import StreamingSession
+
+    h = lifecycle_harness
+    set_flags(monkeypatch, mode)
+    old = h.seed()
+    assert (await h.client.post("/agents/sample/stop")).status_code == 200
+    ss = StreamingSession(old._config)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def spawn(owner):
+        if owner is ss:
+            entered.set()
+            await release.wait()
+
+    h.control.start_hook = spawn
+    connect = asyncio.create_task(ss.connect())
+    try:
+        await asyncio.wait_for(entered.wait(), 2)
+        assert ss.state == SessionState.BOOTING
+        await ss.retire_transport()
+        release.set()
+        with pytest.raises(RuntimeError, match="retired or quiescing"):
+            await connect
+        assert ss.state == SessionState.DEAD
+        assert ss._state_machine._in_flight is None
+    finally:
+        release.set()
+        await asyncio.gather(connect, return_exceptions=True)
