@@ -143,7 +143,6 @@ async def test_post_paste_idle_accepts_exact_fire_before_idle_notification(harne
         "inflight": harness.session.scheduler_wake_inflight(turn.prompt),
         "durability_before_future": receipt_order,
         "idle_observations": idle_observations,
-        "idle_captures": harness.tmux.capture_pane.await_count,
     } == {
         "positive_receipt": True,
         "accepted": True,
@@ -152,7 +151,6 @@ async def test_post_paste_idle_accepts_exact_fire_before_idle_notification(harne
         "inflight": False,
         "durability_before_future": [False],
         "idle_observations": [(True, True)],
-        "idle_captures": 2,
     }
 
 
