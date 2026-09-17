@@ -71,7 +71,6 @@ from pinky_daemon.tmux_session import (
     _SchedulerDeliveryCancelled,
     _TmuxControl,
 )
-from pinky_daemon.transport_state import SessionState
 
 # Codex's inline composer renders slower than claude's REPL; the bracketed-paste
 # needs a longer settle before the submit Enter or the Enter lands before the
