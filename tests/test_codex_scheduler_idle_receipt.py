@@ -263,7 +263,7 @@ async def test_first_idle_read_without_confirmation_does_not_accept(harness, sec
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("blocker", ["in_hand", "queued", "other_meta"])
+@pytest.mark.parametrize("blocker", ["in_hand", "queued", "other_meta", "tool_after_close"])
 async def test_other_work_prevents_idle_fallback_acceptance(harness, blocker):
     turn, receipt = await _paste(harness)
     await _start(harness)
@@ -272,9 +272,17 @@ async def test_other_work_prevents_idle_fallback_acceptance(harness, blocker):
         harness.session._inflight_turn = other
     elif blocker == "queued":
         harness.session._message_queue.put_nowait(other)
-    else:
+    elif blocker == "other_meta":
+        other.pane_delivery_started = True
         harness.session._finish_turn_delivery(other)
+    else:
+        async def newly_active_tool(_response):
+            harness.session._inflight_tool_calls["new-tool"] = {"tool": "test"}
+
+        harness.session._response_callback = newly_active_tool
     await _complete(harness)
+    if blocker == "tool_after_close":
+        assert harness.session._inflight_tool_calls
     assert not receipt.done()
     assert harness.session.scheduler_wake_inflight(turn.prompt)
 
