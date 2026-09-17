@@ -560,17 +560,6 @@ class CodexTmuxSession(TmuxSession):
 
     async def _handle_turn_complete(self, response) -> None:
         """Retire Codex metas coalesced into the just-closed rollout turn."""
-        # Capture the exact FIFO occurrence before the base handler pops it or
-        # awaits user callbacks. Never rematch by prompt text after an await.
-        turn = self._inflight_metas[0].turn if self._inflight_metas else None
-        tailer = self._tailer
-        completion = (
-            tailer.completion
-            if isinstance(tailer, CodexTmuxTranscriptTailer)
-            and tailer.completion_response is response else None
-        )
-        ticket = self._codex_paste_ticket(turn) if turn is not None else None
-        delivery = turn.scheduler_delivery if turn is not None else None
         self._defer_scheduler_idle_notify = True
         try:
             await super()._handle_turn_complete(response)
@@ -588,8 +577,10 @@ class CodexTmuxSession(TmuxSession):
         self._reconcile_codex_phantom_metas(
             coalesced, reason="accepted_before_task_close"
         )
-        if completion is not None and delivery is not None:
-            await self._accept_codex_completed_wake(turn, delivery, ticket, tailer, completion)
+        # A post-paste task close proves task completion, not ownership of
+        # the pasted prompt. An autonomous task can be the first task after
+        # the anchor. Only the matching user_message receipt below can accept
+        # the wake; without it, retain unresolved late-receipt authority.
         self._notify_scheduler_idle_if_ready()
 
     @staticmethod
@@ -602,71 +593,6 @@ class CodexTmuxSession(TmuxSession):
             turn.transcript_anchor_at_paste,
             turn.transcript_ticket_captured_at_ns,
         )
-
-    def _codex_completion_matches_paste(self, turn, ticket, tailer, completion) -> bool:
-        """Fail closed on absent, historical, ambiguous, or replaced evidence."""
-        if (
-            self._tailer is not tailer
-            or tailer.completion is not completion
-            or tailer._swap_generation != completion.generation
-            or tailer.transcript_path != completion.path
-            or self._codex_paste_ticket(turn) != ticket
-        ):
-            return False
-        path, identity, offset, anchor_start, anchor, captured_at = ticket
-        if (
-            path != completion.path
-            or identity != completion.file_identity
-            or offset is None or anchor_start is None or anchor is None
-            or captured_at is None
-            or offset > completion.start_offset
-            or anchor_start < 0 or anchor_start + len(anchor) != offset
-        ):
-            return False
-        try:
-            with path.open("rb") as stream:
-                stat = os.fstat(stream.fileno())
-                # Unread trailing bytes can contain a new active turn. Wait for
-                # real receipt authority instead of assuming the close is last.
-                if (
-                    (stat.st_dev, stat.st_ino) != identity
-                    or stat.st_size != completion.end_offset
-                ):
-                    return False
-                for position, expected in (
-                    (anchor_start, anchor),
-                    (completion.start_offset, completion.start_record),
-                    (completion.end_offset - len(completion.close_record), completion.close_record),
-                ):
-                    stream.seek(position)
-                    if stream.read(len(expected)) != expected:
-                        return False
-        except OSError:
-            return False
-        return True
-
-    async def _accept_codex_completed_wake(self, turn, delivery, ticket, tailer, completion):
-        """Resolve only the same completed scheduler occurrence after two idle reads."""
-        def still_eligible():
-            return (
-                self.state == SessionState.CONNECTED
-                and turn.scheduler_serialized
-                and turn.pane_delivery_started and turn.pane_delivery_recorded
-                and turn.scheduler_delivery is delivery and not delivery.done()
-                and any(candidate is turn for candidate in self._acceptance_candidates())
-                and not any(self._codex_scheduler_evidence())
-                and self._codex_completion_matches_paste(turn, ticket, tailer, completion)
-            )
-
-        if not still_eligible() or not await self._codex_capture_explicit_idle():
-            return
-        if not still_eligible():
-            return
-        await asyncio.sleep(_CODEX_IDLE_CONFIRM_SEC)
-        if not still_eligible() or not await self._codex_capture_explicit_idle():
-            return
-        if still_eligible():
-            self._mark_transport_accepted(turn)
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Map Codex rollout acceptance onto the shared exact-receipt path."""
