@@ -91,6 +91,7 @@ async def test_idle_await_cannot_change_occurrence(harness, capture_number, chan
     await _start(harness)
     original_tailer = harness.session._tailer
     capture_calls = 0
+    applied_changes = []
 
     async def capture(**_kwargs):
         nonlocal capture_calls
@@ -138,7 +139,7 @@ async def test_idle_await_cannot_change_occurrence(harness, capture_number, chan
                 other = _QueuedTurn(prompt="next work", pane_delivery_started=True)
                 harness.session._finish_turn_delivery(other)
             elif change == "disconnected":
-                harness.session._state_machine._state = SessionState.DISCONNECTED
+                harness.session._state_machine._state = SessionState.DEAD
             elif change == "receipt_replaced":
                 turn.scheduler_delivery = asyncio.get_running_loop().create_future()
             elif change == "receipt_cancelled":
@@ -152,10 +153,12 @@ async def test_idle_await_cannot_change_occurrence(harness, capture_number, chan
                 })
             elif change == "candidate_removed":
                 harness.session._scheduler_pending_turns.remove(turn)
+            applied_changes.append(change)
         return _ok(IDLE)
 
     harness.tmux.capture_pane.side_effect = capture
     await _complete(harness)
+    assert applied_changes == [change], "capture must apply the intended change without an exception"
     assert original_tailer.stats["callback_errors"] == 0
     if change == "late_user_message":
         assert receipt.done() and receipt.result() is True
