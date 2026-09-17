@@ -692,20 +692,16 @@ class CodexTmuxTranscriptTailer:
             for record in complete.splitlines(keepends=True):
                 line_offset = self._offset + bytes_read
                 bytes_read += len(record)
+                # Preserve the tolerant semantic stream used for user receipts
+                # and turn retirement. Strict decoding only gates provenance:
+                # a corrupt record cannot certify this occurrence, but must not
+                # prevent an otherwise readable receipt or close being handled.
+                line = record.decode("utf-8", errors="replace")
                 try:
-                    line = record.decode("utf-8")
+                    record.decode("utf-8")
                 except UnicodeDecodeError:
-                    # Replacement decoding can make distinct corrupt task IDs
-                    # equal. Any undecodable record invalidates this occurrence,
-                    # including an intervening record with otherwise valid IDs.
-                    self._stats["lines_read"] += 1
                     self._stats["parse_errors"] += 1
                     self._ambiguous_start = True
-                    _log(
-                        f"codex_tailer[{self._agent_name}]: skipping invalid "
-                        f"UTF-8 record at offset {line_offset}"
-                    )
-                    continue
                 if not line.strip():
                     continue
                 self._stats["lines_read"] += 1

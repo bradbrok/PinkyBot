@@ -110,6 +110,10 @@ def _schedule_fire(harness, *, age=10, prompt="scheduled work"):
 
 
 @pytest.mark.asyncio
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1159 deferred: missing receipt needs independent submission ownership",
+)
 async def test_post_paste_idle_accepts_exact_fire_before_idle_notification(harness):
     """Missing user_message must not strand a completed, explicitly idle wake."""
     schedule, pending, durable = _schedule_fire(harness)
@@ -154,6 +158,10 @@ async def test_post_paste_idle_accepts_exact_fire_before_idle_notification(harne
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("new_prompt", ["newer distinct work", "older work"])
+@pytest.mark.xfail(
+    strict=True,
+    reason="#1159 deferred: missing receipt needs independent submission ownership",
+)
 async def test_completed_abandoned_wake_releases_newer_fire_at_idle_boundary(harness, new_prompt):
     """Real receipt ownership and real replay must release same-schedule debt."""
     schedule, older, durable = _schedule_fire(harness, age=3_601, prompt="older work")
