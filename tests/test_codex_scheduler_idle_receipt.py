@@ -2,7 +2,6 @@
 
 import asyncio
 import json
-import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +18,7 @@ from pinky_daemon.transport_state import SessionState
 
 IDLE = "Ready\nmodel · /tmp/worker\n"
 BUSY = "Working (esc to interrupt)\n" + IDLE
+NOW = 1_800_000_000.0
 
 
 def _ok(text=""):
@@ -40,7 +40,6 @@ async def _drain_delivery(harness):
     tasks = list(harness.session._scheduler_delivery_tasks)
     if tasks:
         await asyncio.wait_for(asyncio.gather(*tasks), timeout=5)
-    await asyncio.sleep(0)
 
 
 async def _paste(harness, *, prompt="scheduled work", on_accept=None):
@@ -63,12 +62,12 @@ async def _complete(harness, turn_id="current-turn"):
         "last_agent_message": "completed", "duration_ms": 10,
     })
     await _read(harness)
-    await asyncio.sleep(0)
 
 
 @pytest.fixture
 async def harness(tmp_path, monkeypatch):
-    monkeypatch.setattr("pinky_daemon.codex_tmux_session._CODEX_IDLE_CONFIRM_SEC", 0.001)
+    monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: NOW)
+    monkeypatch.setattr("pinky_daemon.codex_tmux_session._CODEX_IDLE_CONFIRM_SEC", 0)
     tmux = MagicMock(spec=_TmuxControl)
     tmux.session_name = "test-scheduler-pane"
     tmux.has_session = AsyncMock(return_value=False)
@@ -102,7 +101,7 @@ def _schedule_fire(harness, *, age=10, prompt="scheduled work"):
     schedule = harness.registry.add_schedule(
         "worker", "0 * * * *", name="periodic", prompt=prompt,
     )
-    fired_at = time.time() - age
+    fired_at = NOW - age
     pending, _ = harness.registry.persist_schedule_wake(
         schedule.id, agent_name="worker", schedule_name=schedule.name,
         prompt=prompt, fired_at=fired_at,
@@ -191,18 +190,26 @@ async def test_completed_abandoned_wake_releases_newer_fire_at_idle_boundary(har
 
     newer, _ = harness.registry.persist_schedule_wake(
         schedule.id, agent_name="worker", schedule_name=schedule.name,
-        prompt=new_prompt, fired_at=time.time() - 1,
+        prompt=new_prompt, fired_at=NOW - 1,
     )
     # Preserve the old exact-fire authority while its work really is active.
     await scheduler._replay_pending_locked("worker")
     assert submitted == []
     assert harness.registry.get_schedule_wake_by_fire(schedule.id, newer.fired_at).attempts == 0
 
-    harness.session._config.on_turn_idle = scheduler.notify_agent_idle
+    idle_notifications = []
+
+    def first_idle_boundary(agent_name):
+        idle_notifications.append(agent_name)
+        scheduler.notify_agent_idle(agent_name)
+
+    harness.session._config.on_turn_idle = first_idle_boundary
     await _complete(harness)
+    assert idle_notifications == ["worker"]
     replay_tasks = list(scheduler._pending_replay_tasks.values())
     assert replay_tasks, "the actual completion must notify the scheduler"
     await asyncio.wait_for(asyncio.gather(*replay_tasks), timeout=5)
+    assert idle_notifications == ["worker"], "no second idle boundary or age-out pass"
     row = harness.registry.get_schedule_wake_by_fire(schedule.id, newer.fired_at)
     assert {
         "old_inflight": harness.session.scheduler_wake_inflight(turn.prompt),
@@ -334,7 +341,6 @@ async def test_completion_does_not_reaccept_terminal_receipt(harness, terminal):
         receipt.set_result(False)
     else:
         receipt.cancel()
-    await asyncio.sleep(0)
     before = (turn.transport_accepted, receipt.cancelled(), accept.call_count)
     await _complete(harness)
     assert (turn.transport_accepted, receipt.cancelled(), accept.call_count) == before
