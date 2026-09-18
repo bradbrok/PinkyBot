@@ -1061,9 +1061,14 @@ ISOLATED_STRIPPED_GATES: frozenset[str] = frozenset({"admin", "skill-admin"})
 def _strip_gates_for_isolated(agent_name: str, gates: set[str], registry) -> set[str]:
     """Remove ISOLATED_STRIPPED_GATES when ``agent_name`` is isolated.
 
-    registry=None (legacy callers, unit tests) leaves gates untouched. A registry that
-    is present but fails to resolve the agent FAILS CLOSED: the privileged gates are
-    stripped, matching _is_isolated_agent()'s posture elsewhere in this module."""
+    registry=None (legacy callers, unit tests) leaves gates untouched, i.e. the None
+    default is FAIL-OPEN for the isolation strip. Every production callsite that
+    builds a real session's tool gates MUST pass the registry (today:
+    _get_agent_tool_gates via the internal chain and _get_shared_mode_disallowed_tools);
+    a new callsite that omits it silently re-grants admin/skill-admin to isolated
+    agents. A registry that is present but fails to resolve the agent FAILS CLOSED:
+    the privileged gates are stripped, matching _is_isolated_agent()'s posture
+    elsewhere in this module."""
     if registry is None or not (gates & ISOLATED_STRIPPED_GATES):
         return gates
     try:

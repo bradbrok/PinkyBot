@@ -326,7 +326,7 @@ class TestMessageBrokerRouting:
         tmpdir, registry, broker, _sent, _reactions = self._make_broker()
         try:
             registry.set_default_timezone("UTC")
-            registry.approve_user("barsik", "U7RDGUM3P", "Ryan Martin", approved_by="admin")
+            registry.approve_user("barsik", "U0TEST001", "Test Approver", approved_by="admin")
 
             def hdr(**kw):
                 base = dict(platform="slack", content="x", agent_name="barsik",
@@ -334,22 +334,22 @@ class TestMessageBrokerRouting:
                 base.update(kw)
                 return broker._format_prompt(BrokerMessage(**base)).splitlines()[0]
 
-            approved_dm = hdr(chat_id="D0BG69YQ6NB", sender_name="Ryan Martin",
-                              sender_id="U7RDGUM3P", is_group=False)
-            assert approved_dm.endswith("| sender_id:U7RDGUM3P | sender_trust:approved]")
+            approved_dm = hdr(chat_id="D0BG69YQ6NB", sender_name="Test Approver",
+                              sender_id="U0TEST001", is_group=False)
+            assert approved_dm.endswith("| sender_id:U0TEST001 | sender_trust:approved]")
 
             channel_only = hdr(chat_id="C0C0M2618QP", chat_title="support-internal",
                                sender_name="Some Staffer", sender_id="U0STAFF01", is_group=True)
             assert channel_only.endswith("| sender_id:U0STAFF01 | sender_trust:channel]")
 
             approved_in_channel = hdr(chat_id="C0C0M2618QP", chat_title="support-internal",
-                                      sender_name="Ryan Martin", sender_id="U7RDGUM3P",
+                                      sender_name="Test Approver", sender_id="U0TEST001",
                                       is_group=True)
-            assert approved_in_channel.endswith("| sender_id:U7RDGUM3P | sender_trust:approved]")
+            assert approved_in_channel.endswith("| sender_id:U0TEST001 | sender_trust:approved]")
 
             # A spoofed display name changes nothing: trust follows the signed id.
             spoof = hdr(chat_id="C0C0M2618QP", chat_title="support-internal",
-                        sender_name="Ryan Martin", sender_id="U0STAFF01", is_group=True)
+                        sender_name="Test Approver", sender_id="U0STAFF01", is_group=True)
             assert spoof.endswith("| sender_id:U0STAFF01 | sender_trust:channel]")
         finally:
             tmpdir.cleanup()
