@@ -927,6 +927,61 @@ class TestGateToolNames:
         disallowed = _get_shared_mode_disallowed_tools("agent", skill_store=BrokenSkillStore())
         assert set(disallowed) == ALL_GATED_TOOL_NAMES
 
+    def test_isolated_agent_never_gets_admin_or_skill_admin_gates(self):
+        """#346: a staff-facing (isolated) agent must not be able to restart the daemon or
+        widen its own tool set on request. Gating keys on the PERSISTED agents.isolated
+        flag via the registry, never on anything inferred."""
+        from types import SimpleNamespace
+
+        from pinky_daemon.api import (
+            ISOLATED_STRIPPED_GATES,
+            _get_agent_tool_gates,
+            _get_shared_mode_disallowed_tools,
+        )
+
+        class Store:
+            def get_agent_skills(self, name, enabled_only=True):
+                return [{"name": "pinky-self"}, {"name": "pinky-memory"}]
+
+        class Registry:
+            def __init__(self, isolated):
+                self._iso = isolated
+
+            def get(self, name):
+                return SimpleNamespace(name=name, isolated=self._iso)
+
+        full = set(_get_agent_tool_gates("geordi", Store()))  # legacy: no registry
+        assert ISOLATED_STRIPPED_GATES <= full
+
+        iso = set(_get_agent_tool_gates("geordi", Store(), Registry(True)))
+        assert not (iso & ISOLATED_STRIPPED_GATES)
+        assert iso == full - ISOLATED_STRIPPED_GATES  # nothing else touched
+
+        open_agent = set(_get_agent_tool_gates("picard", Store(), Registry(False)))
+        assert open_agent == full
+
+        # shared-MCP mode: the stripped gates' tools land in the disallowed list
+        disallowed = set(_get_shared_mode_disallowed_tools("geordi", Store(), Registry(True)))
+        assert "mcp__pinky-self__update_and_restart" in disallowed
+        assert "mcp__pinky-self__add_skill" in disallowed
+        assert "mcp__pinky-self__update_and_restart" not in set(
+            _get_shared_mode_disallowed_tools("picard", Store(), Registry(False)))
+
+    def test_isolation_lookup_failure_strips_privileged_gates(self):
+        """Registry error while resolving the isolated flag fails CLOSED."""
+        from pinky_daemon.api import ISOLATED_STRIPPED_GATES, _get_agent_tool_gates
+
+        class Store:
+            def get_agent_skills(self, name, enabled_only=True):
+                return [{"name": "pinky-self"}]
+
+        class BrokenRegistry:
+            def get(self, name):
+                raise RuntimeError("database is locked")
+
+        gates = set(_get_agent_tool_gates("geordi", Store(), BrokenRegistry()))
+        assert gates and not (gates & ISOLATED_STRIPPED_GATES)
+
     def test_with_mock_skill_store_no_skills(self):
         """Agent with skill store but no skills → all gated tools disallowed."""
         from pinky_daemon.api import ALL_GATED_TOOL_NAMES, _get_shared_mode_disallowed_tools
