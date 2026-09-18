@@ -46,6 +46,7 @@ import asyncio
 import json
 import os
 import sys
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -74,6 +75,24 @@ _MAX_READ_CHUNK_BYTES = 10 * 1024 * 1024
 # How many rollout files to scan during cwd-based discovery (mtime desc).
 # Prevents unbounded glob cost on machines with thousands of sessions.
 _DISCOVERY_SCAN_LIMIT = 50
+
+
+@dataclass(frozen=True)
+class CodexTurnCompletion:
+    """Byte provenance available only during one completion callback.
+
+    A polling hint or a close without a matching observed start cannot create
+    this evidence. Consumers must still validate the paste boundary and file.
+    """
+
+    path: Path
+    file_identity: tuple[int, int]
+    generation: int
+    start_offset: int
+    start_record: bytes
+    end_offset: int
+    close_record: bytes
+    turn_id: str
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -366,6 +385,10 @@ class CodexTmuxTranscriptTailer:
         # while it was parked in a turn callback (mirrors #496 gen-check).
         self._swap_generation: int = 0
         self._buffer = _CodexTurnBuffer()
+        self._turn_start: tuple[int, bytes, str, tuple[int, int]] | None = None
+        self._ambiguous_start = False
+        self.completion: CodexTurnCompletion | None = None
+        self.completion_response: TurnResponse | None = None
         # Latest harness-reported cap for the bound rollout. Unlike per-turn
         # usage this remains available after the buffer drains, including when
         # token_count.info is absent and task_started is the only source.
@@ -417,6 +440,7 @@ class CodexTmuxTranscriptTailer:
 
         Safe to call before ``start()``.
         """
+        self.drain_buffer()
         self._offset = max(0, offset)
 
     def set_transcript_path(
@@ -452,7 +476,7 @@ class CodexTmuxTranscriptTailer:
             else:
                 self._offset = bind_size
                 self._historical_high_water = bind_size
-            self._buffer.drain()    # silent drain; we're not at a boundary
+            self.drain_buffer()    # silent drain; we're not at a boundary
             self._stats["rotations"] += 1
             self._wake_event.set()
 
@@ -472,6 +496,11 @@ class CodexTmuxTranscriptTailer:
         (e.g. force_restart). Mirrors ``TmuxTranscriptTailer.drain_buffer``.
         """
         self._buffer.drain()
+        self._turn_start = None
+        self._ambiguous_start = False
+        self.completion = None
+        self.completion_response = None
+        self._swap_generation += 1
 
     def mark_active(self) -> None:
         """Hint that a turn is in flight; switch to the tighter poll cadence.
@@ -630,7 +659,8 @@ class CodexTmuxTranscriptTailer:
             self._offset = 0
             self._historical_high_water = 0
             self.model_context_window = 0
-            self._buffer.drain()
+            self.drain_buffer()
+            generation = self._swap_generation
             self._stats["rotations"] += 1
 
         if size == self._offset:
@@ -638,7 +668,9 @@ class CodexTmuxTranscriptTailer:
 
         bytes_read = 0
 
-        with self._path.open("r", encoding="utf-8", errors="replace") as fh:
+        with self._path.open("rb") as fh:
+            source_stat = os.fstat(fh.fileno())
+            identity = (source_stat.st_dev, source_stat.st_ino)
             fh.seek(self._offset)
             chunk = fh.read(_MAX_READ_CHUNK_BYTES)
             more_pending = (size - self._offset) > _MAX_READ_CHUNK_BYTES
@@ -646,18 +678,30 @@ class CodexTmuxTranscriptTailer:
             if not chunk:
                 return 0
 
-            if chunk.endswith("\n"):
+            if chunk.endswith(b"\n"):
                 complete = chunk
-                partial = ""
+                partial = b""
             else:
-                last_nl = chunk.rfind("\n")
+                last_nl = chunk.rfind(b"\n")
                 if last_nl == -1:
                     # No complete line yet — don't advance offset.
                     return 0
                 complete = chunk[: last_nl + 1]
                 partial = chunk[last_nl + 1:]
 
-            for line in complete.splitlines():
+            for record in complete.splitlines(keepends=True):
+                line_offset = self._offset + bytes_read
+                bytes_read += len(record)
+                # Preserve the tolerant semantic stream used for user receipts
+                # and turn retirement. Strict decoding only gates provenance:
+                # a corrupt record cannot certify this occurrence, but must not
+                # prevent an otherwise readable receipt or close being handled.
+                line = record.decode("utf-8", errors="replace")
+                try:
+                    record.decode("utf-8")
+                except UnicodeDecodeError:
+                    self._stats["parse_errors"] += 1
+                    self._ambiguous_start = True
                 if not line.strip():
                     continue
                 self._stats["lines_read"] += 1
@@ -669,7 +713,7 @@ class CodexTmuxTranscriptTailer:
                         f"codex_tailer[{self._agent_name}]: skipping malformed "
                         f"JSON at offset {self._offset}+{bytes_read}"
                     )
-                    bytes_read += len(line.encode("utf-8")) + 1
+                    self._ambiguous_start = True
                     continue
 
                 # Capture session_meta fields on line 1.
@@ -693,6 +737,12 @@ class CodexTmuxTranscriptTailer:
                 closes_turn = False
                 aborted = False
                 try:
+                    payload = entry.get("payload") or {}
+                    if entry.get("type") == "event_msg" and payload.get("type") == "task_started":
+                        self._active = True
+                        if self._turn_start is not None:
+                            self._ambiguous_start = True
+                        self._turn_start = (line_offset, record, payload.get("turn_id"), identity)
                     closes_turn, aborted = self._buffer.feed(entry)
                     captured_window = self._buffer.model_context_window
                     if captured_window > 0:
@@ -702,16 +752,31 @@ class CodexTmuxTranscriptTailer:
                         # concurrent mark_active doesn't race the flip.
                         self._active = False
                 except Exception as e:
+                    self._ambiguous_start = True
                     self._stats["parse_errors"] += 1
                     _log(
                         f"codex_tailer[{self._agent_name}]: feed raised "
                         f"({type(e).__name__}: {e}); skipping entry"
                     )
 
-                bytes_read += len(line.encode("utf-8")) + 1  # +1 for \n
-
                 if closes_turn:
                     marker_end = self._offset + bytes_read
+                    start = self._turn_start
+                    completion = None
+                    if (
+                        start is not None
+                        and not self._ambiguous_start
+                        and not aborted
+                        and isinstance(start[2], str) and start[2]
+                        and payload.get("turn_id") == start[2]
+                        and identity == start[3]
+                    ):
+                        completion = CodexTurnCompletion(
+                            self._path, identity, generation, start[0], start[1],
+                            marker_end, record, start[2],
+                        )
+                    self._turn_start = None
+                    self._ambiguous_start = False
                     live_textless_close = (
                         marker_end > self._historical_high_water
                         and self._buffer.observed_task_started_since_drain
@@ -727,14 +792,20 @@ class CodexTmuxTranscriptTailer:
                     )
                     if should_fire:
                         self._stats["turns_fired"] += 1
-                        await self._safe_callback(response)
+                        self.completion = completion
+                        self.completion_response = response
+                        try:
+                            await self._safe_callback(response)
+                        finally:
+                            self.completion = None
+                            self.completion_response = None
                         if self._swap_generation != generation:
                             # Path swapped mid-callback. Discard remainder of
                             # old file's chunk (mirrors #496 gen-check).
                             return bytes_read
 
             # Advance past complete lines only. Partial line stays on disk.
-            self._offset += len(complete.encode("utf-8"))
+            self._offset += len(complete)
             _ = partial  # intentionally not consumed
 
         if more_pending:

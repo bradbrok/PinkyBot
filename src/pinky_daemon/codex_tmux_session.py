@@ -576,7 +576,22 @@ class CodexTmuxSession(TmuxSession):
         self._reconcile_codex_phantom_metas(
             coalesced, reason="accepted_before_task_close"
         )
+        # A post-paste task close proves task completion, not ownership of
+        # the pasted prompt. An autonomous task can be the first task after
+        # the anchor. Only the matching user_message receipt below can accept
+        # the wake; without it, retain unresolved late-receipt authority.
         self._notify_scheduler_idle_if_ready()
+
+    @staticmethod
+    def _codex_paste_ticket(turn):
+        return (
+            turn.transcript_path_at_paste,
+            turn.transcript_file_identity_at_paste,
+            turn.transcript_offset_at_paste,
+            turn.transcript_anchor_start_at_paste,
+            turn.transcript_anchor_at_paste,
+            turn.transcript_ticket_captured_at_ns,
+        )
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Map Codex rollout acceptance onto the shared exact-receipt path."""
