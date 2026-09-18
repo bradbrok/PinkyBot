@@ -124,9 +124,11 @@ class TestMessageBrokerRouting:
             header = prompt.splitlines()[0]
             assert "thread_root_ts:" not in header
             assert "is_thread_reply:" not in header
+            # #346: the Slack-signed sender id and its standing follow msg_id.
             assert header == (
                 "[slack | group | C123 | Alex | C123 | "
-                "1970-01-01 00:00:00 UTC | msg_id:1711584000.000100]"
+                "1970-01-01 00:00:00 UTC | msg_id:1711584000.000100"
+                " | sender_id:U123 | sender_trust:channel]"
             )
         finally:
             tmpdir.cleanup()
@@ -302,14 +304,72 @@ class TestMessageBrokerRouting:
                     is_group=False,
                 )
             )
+            # #346: positional fields are byte-identical; the verified sender id and
+            # its standing are appended after msg_id. Alex holds no approved row here,
+            # so the group is "channel" (admitted via the channel) and the DM "unknown".
             assert group == (
                 "[telegram | group | Ops | Alex | -100123 | "
-                "1970-01-01 00:00:00 UTC | msg_id:7]\ngroup body"
+                "1970-01-01 00:00:00 UTC | msg_id:7 | sender_id:42 | sender_trust:channel]\ngroup body"
             )
+            # Telegram 1:1: chat_id already IS the sender id, so no duplicate sender_id field.
             assert dm == (
                 "[telegram | dm | Alex | 42 | "
-                "1970-01-01 00:00:00 UTC | msg_id:8]\ndm body"
+                "1970-01-01 00:00:00 UTC | msg_id:8 | sender_trust:unknown]\ndm body"
             )
+        finally:
+            tmpdir.cleanup()
+
+    def test_header_carries_verified_slack_sender_id_and_trust(self):
+        """#346: agents must never infer a requester's identity from a display name.
+        Slack headers carry the Slack-signed user id and whether that individual is
+        approved, only channel-admitted, or the owner."""
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            registry.approve_user("barsik", "U7RDGUM3P", "Ryan Martin", approved_by="admin")
+
+            def hdr(**kw):
+                base = dict(platform="slack", content="x", agent_name="barsik",
+                            message_id="1", timestamp=0)
+                base.update(kw)
+                return broker._format_prompt(BrokerMessage(**base)).splitlines()[0]
+
+            approved_dm = hdr(chat_id="D0BG69YQ6NB", sender_name="Ryan Martin",
+                              sender_id="U7RDGUM3P", is_group=False)
+            assert approved_dm.endswith("| sender_id:U7RDGUM3P | sender_trust:approved]")
+
+            channel_only = hdr(chat_id="C0C0M2618QP", chat_title="support-internal",
+                               sender_name="Some Staffer", sender_id="U0STAFF01", is_group=True)
+            assert channel_only.endswith("| sender_id:U0STAFF01 | sender_trust:channel]")
+
+            approved_in_channel = hdr(chat_id="C0C0M2618QP", chat_title="support-internal",
+                                      sender_name="Ryan Martin", sender_id="U7RDGUM3P",
+                                      is_group=True)
+            assert approved_in_channel.endswith("| sender_id:U7RDGUM3P | sender_trust:approved]")
+
+            # A spoofed display name changes nothing: trust follows the signed id.
+            spoof = hdr(chat_id="C0C0M2618QP", chat_title="support-internal",
+                        sender_name="Ryan Martin", sender_id="U0STAFF01", is_group=True)
+            assert spoof.endswith("| sender_id:U0STAFF01 | sender_trust:channel]")
+        finally:
+            tmpdir.cleanup()
+
+    def test_header_marks_primary_user_as_owner(self):
+        tmpdir, registry, broker, _sent, _reactions = self._make_broker()
+        try:
+            registry.set_default_timezone("UTC")
+            registry.set_primary_user("6770805286", "Brad")
+            dm = broker._format_prompt(BrokerMessage(
+                platform="telegram", chat_id="6770805286", sender_name="Brad",
+                sender_id="6770805286", content="x", agent_name="barsik",
+                message_id="1", timestamp=0, is_group=False)).splitlines()[0]
+            assert dm.endswith("| sender_trust:owner]")
+            grp = broker._format_prompt(BrokerMessage(
+                platform="telegram", chat_id="-100999", chat_title="Ops", sender_name="Brad",
+                sender_id="6770805286", content="x", agent_name="barsik",
+                message_id="2", timestamp=0, is_group=True)).splitlines()[0]
+            assert grp.endswith("| sender_id:6770805286 | sender_trust:owner]")
+            # buzz keeps its own principal rendering: no #346 fields.
         finally:
             tmpdir.cleanup()
 
