@@ -30,13 +30,62 @@ import tempfile
 from collections import defaultdict
 
 
-def collect(app) -> tuple[list[tuple[str, str]], dict]:
-    """Return ([(kind, path), ...], auth_route_sets) for ``app``."""
+def _kind(route) -> str:
+    """Map a concrete route object to the audit's kind label."""
     from fastapi.routing import APIRoute
     from starlette.routing import Mount, WebSocketRoute
 
+    if isinstance(route, WebSocketRoute):
+        return "WS"
+    if isinstance(route, (APIRoute, Mount)):
+        return "MOUNT" if isinstance(route, Mount) else "HTTP"
+    return "HTTP"
+
+
+def _included_children(router) -> list[tuple[str, str]] | None:
+    """Expand a FastAPI ``_IncludedRouter`` into (kind, effective path) pairs.
+
+    Returns ``None`` when ``router`` is not that kind of wrapper, so the caller
+    can fall through to the other strategies.
+    """
+    candidates = getattr(router, "effective_candidates", None)
+    if not callable(candidates):
+        return None
+
+    collected: list[tuple[str, str]] = []
+    for ctx in candidates():
+        nested = _included_children(ctx)
+        if nested is not None:
+            # A router included inside another router.
+            collected.extend(nested)
+            continue
+        original = getattr(ctx, "original_route", None)
+        path = getattr(ctx, "path", None)
+        if path is None:
+            raise RuntimeError(
+                f"included route {type(ctx).__name__!r} has no effective .path — "
+                "extend collect() rather than letting it go unaudited"
+            )
+        if _is_mount(original):
+            collected.append(("MOUNT", path.rstrip("/") + "/"))
+        else:
+            collected.append((_kind(original), path))
+    return collected
+
+
+def _is_mount(route) -> bool:
+    from starlette.routing import Mount
+
+    return isinstance(route, Mount)
+
+
+def _walk(container) -> list[tuple[str, str]]:
+    """Collect (kind, path) for every route reachable from ``container.routes``."""
+    from fastapi.routing import APIRoute
+    from starlette.routing import Mount, Route, WebSocketRoute
+
     routes: list[tuple[str, str]] = []
-    for r in app.routes:
+    for r in container.routes:
         if isinstance(r, APIRoute):
             routes.append(("HTTP", r.path))
         elif isinstance(r, WebSocketRoute):
@@ -50,7 +99,42 @@ def collect(app) -> tuple[list[tuple[str, str]], dict]:
             # subtree prefix (trailing slash) so it matches the public/protected
             # prefix tuples the middleware uses.
             routes.append(("MOUNT", r.path.rstrip("/") + "/"))
-    return routes, app.state.auth_route_sets
+        elif isinstance(r, Route):
+            # Plain Starlette routes — NOT APIRoutes. FastAPI registers /docs,
+            # /redoc, /openapi.json and /docs/oauth2-redirect this way. Skipping
+            # them made this audit BLIND (#510): they reach the app through the
+            # same gate as everything else, and all four were unclassified while
+            # the audit reported zero gaps. Anything callable must be collected.
+            routes.append(("HTTP", r.path))
+        else:
+            # Never drop a route silently — an unrecognised route type is the
+            # exact failure mode #510 exposed. Surface it instead.
+            path = getattr(r, "path", None)
+            if path is None:
+                # FastAPI >= 0.141 wraps an included router in an _IncludedRouter:
+                # no .path and no .routes of its own, but effective_candidates()
+                # yields the child routes with their prefix already applied. Those
+                # children are real, reachable paths — descend instead of failing,
+                # so the audit stays exhaustive across dependency versions.
+                nested = _included_children(r)
+                if nested is not None:
+                    routes.extend(nested)
+                    continue
+                # Older layouts expose the children directly.
+                if getattr(r, "routes", None) is not None:
+                    routes.extend(_walk(r))
+                    continue
+                raise RuntimeError(
+                    f"uncollectable route {type(r).__name__!r} has no .path — "
+                    "extend collect() rather than letting it go unaudited"
+                )
+            routes.append((type(r).__name__.upper()[:5], path))
+    return routes
+
+
+def collect(app) -> tuple[list[tuple[str, str]], dict]:
+    """Return ([(kind, path), ...], auth_route_sets) for ``app``."""
+    return _walk(app), app.state.auth_route_sets
 
 
 def classifier(sets: dict):

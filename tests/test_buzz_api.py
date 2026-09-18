@@ -122,9 +122,9 @@ def test_arbitrary_or_caller_supplied_authority_cannot_enable(tmp_path):
     app = _app(tmp_path)
     with TestClient(app) as client:
         client.post("/agents", json={"name": "barsik", "model": "sonnet"})
-        schema = client.get("/openapi.json").json()["components"]["schemas"][
-            "BindBuzzIdentityRequest"
-        ]
+        # /openapi.json is no longer served (#510: the docs surfaces were public).
+        # The schema itself is still the thing under test, so read it from the app.
+        schema = app.openapi()["components"]["schemas"]["BindBuzzIdentityRequest"]
         assert set(schema["properties"]) == {
             "private_key",
             "relay_url",
