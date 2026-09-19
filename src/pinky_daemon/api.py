@@ -14678,9 +14678,10 @@ npm run build</pre>
 
     @app.get("/scheduler/fire-trace")
     async def scheduler_fire_trace(
-        since: float | None = None, agent: str | None = None, schedule_id: int | None = None,
+        since: float | None = Query(None, allow_inf_nan=False), agent: str | None = None,
+        schedule_id: int | None = Query(None, ge=-(2**63), le=2**63 - 1),
         outcome: str | None = None, limit: int = Query(200, ge=1, le=1000),
-        offset: int = Query(0, ge=0),
+        offset: int = Query(0, ge=0, le=2**63 - 1),
     ):
         """Read observed fire evidence through the existing admin/signed auth boundary."""
         return await asyncio.to_thread(agents._fire_trace.report,
@@ -14690,14 +14691,22 @@ npm run build</pre>
 
     @app.get("/scheduler/status")
     async def scheduler_status():
-        """Get scheduler status."""
+        """Get scheduler status; trace failure integers are upper bounds.
+
+        Per-edge bounds describe rolling-window uncertainty, with display labels
+        such as '≤2 (approx.)' for a partially covered overflow bucket.
+        """
         all_schedules = agents.get_all_schedules(enabled_only=False)
         auto_start = agents.list_auto_start_agents()
         pending_health = agents.get_pending_schedule_wake_health()
+        failure_bounds = await asyncio.to_thread(
+            agents._fire_trace.failure_bounds, since=time.time() - 86400
+        )
         return {
             "running": scheduler.running,
             "fire_trace_24h": (await asyncio.to_thread(agents._fire_trace.report, since=time.time() - 86400))["counts"],
-            "trace_write_failures_24h": await asyncio.to_thread(agents._fire_trace.failure_counts, since=time.time() - 86400),
+            "trace_write_failures_24h": {edge: value["upper"] for edge, value in failure_bounds.items()},
+            "trace_write_failure_bounds_24h": failure_bounds,
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],

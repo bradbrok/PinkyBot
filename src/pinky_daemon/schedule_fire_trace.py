@@ -66,6 +66,9 @@ _COLUMNS = {
 
 def derive_outcome(row: dict, ledger: dict | None = None) -> str:
     """Re-derive the diagnostic class without granting receipt authority."""
+    if "abandon" in row.get("failed_edges", ()):
+        # A later lifecycle transition cannot reconstruct a missing earlier one.
+        return "trace_incomplete"
     ledger = dict(ledger or {})
     ledger["accepted_at"] = max(ledger.get("accepted_at", 0), row.get("ledger_accepted_at", 0))
     ledger["attempts"] = max(ledger.get("attempts", 0), row.get("ledger_attempts", 0))
@@ -130,7 +133,7 @@ class ScheduleFireTrace:
     all ledger reads finish before a trace write transaction starts. Workers use
     zero busy timeout with bounded backoff, while API readers run off the loop.
     Bounded memory retains failed edges until background persistence succeeds;
-    overflow keeps per-edge daily counts and conservative diagnostic uncertainty.
+    overflow keeps bounded hourly counts and conservative diagnostic uncertainty.
     """
 
     DETAIL_LIMIT = 1024
@@ -251,24 +254,25 @@ class ScheduleFireTrace:
                 if len(self._failures) < self.DETAIL_LIMIT:
                     self._failures[row["event_id"]] = row
                 else:
-                    day = int(row["failed_at"] // 86400)
-                    key = (day, row["edge"])
+                    hour = int(row["failed_at"] // 3600)
+                    key = (hour, row["edge"])
                     if key not in self._overflow:
                         self._overflow[key] = {
                             **row,
                             "schedule_id": 0,
                             "fired_at": 0,
                             "fire_id": None,
-                            "reason": "overflow",
+                            "reason": "overflow_hour",
                             "failures": 0,
                         }
                     self._overflow[key]["failures"] += 1
                     self._overflow[key]["failed_at"] = max(
                         self._overflow[key]["failed_at"], row["failed_at"]
                     )
-                    # At most 32 daily buckets per edge; older buckets are beyond retention.
+                    # Bound in-memory overflow independently of outage duration.
+                    oldest_hour = max(k[0] for k in self._overflow) - 47
                     for old in list(self._overflow):
-                        if old[0] < day - 31:
+                        if old[0] < oldest_hour:
                             evicted = self._overflow.pop(old)
                             self._overflow_persisted.pop(evicted["event_id"], None)
             self._schedule_failure_retry()
@@ -277,10 +281,11 @@ class ScheduleFireTrace:
 
     def _schedule_failure_retry(self):
         with self._worker_lock:
-            if self._closed.is_set() or self._retry_timer is not None or self._retry_attempts >= 10:
+            if self._closed.is_set() or self._retry_timer is not None:
                 return
             delay = min(0.05 * 2**self._retry_attempts, 1.0)
-            self._retry_attempts += 1
+            # Bound the rate, not the lifetime of recovery after storage returns.
+            self._retry_attempts = min(self._retry_attempts + 1, 10)
 
             def ready():
                 with self._worker_lock:
@@ -343,6 +348,8 @@ class ScheduleFireTrace:
                 self._running = False
                 if not self._queue.empty() and not self._closed.is_set():
                     self._kick()
+            with self._queue.all_tasks_done:
+                self._queue.all_tasks_done.notify_all()
 
     def _write_with_retry(self, event):
         deadline = time.monotonic() + 0.5
@@ -407,7 +414,7 @@ class ScheduleFireTrace:
             with self._failure_lock:
                 for row in pending:
                     self._failures.pop(row["event_id"], None)
-                    if row["reason"] == "overflow":
+                    if row["reason"].startswith("overflow"):
                         self._overflow_persisted[row["event_id"]] = max(
                             row["failures"], self._overflow_persisted.get(row["event_id"], 0)
                         )
@@ -458,8 +465,16 @@ class ScheduleFireTrace:
                     with db:
                         failures = db.execute(
                             """DELETE FROM schedule_fire_trace_failures WHERE event_id IN (
-                            SELECT event_id FROM schedule_fire_trace_failures WHERE failed_at < ?
-                            ORDER BY failed_at LIMIT 500)""",
+                            SELECT f.event_id FROM schedule_fire_trace_failures f
+                            WHERE f.failed_at < ? AND NOT EXISTS (
+                                SELECT 1 FROM schedule_fire_trace t WHERE
+                                (t.schedule_id=f.schedule_id AND t.fired_at=f.fired_at)
+                                OR t.fire_id=f.fire_id
+                                OR (f.reason='overflow_hour' AND t.fired_at<
+                                    (CAST(f.failed_at/3600 AS INTEGER)+1)*3600)
+                                OR (f.reason='overflow' AND t.fired_at<
+                                    (CAST(f.failed_at/86400 AS INTEGER)+1)*86400))
+                            ORDER BY f.failed_at LIMIT 500)""",
                             (cutoff,),
                         ).rowcount
                     if max(traces, failures) < 500:
@@ -597,6 +612,8 @@ class ScheduleFireTrace:
             row["matched_at"],
             row["abandoned_at"],
             row["released_at"],
+            row["terminal_abandoned_at"],
+            row["drain_parked_at"],
         )
         # Duplicate accepts retain the exact persisted evidence and retention stamp.
         row["updated_at"] = max(row["updated_at"], row["outcome_at"], at if edge == "replay" else 0)
@@ -615,15 +632,29 @@ class ScheduleFireTrace:
             )
 
     def flush(self, timeout=5):
-        """Explicit maintenance/test barrier; never used by wake callers."""
+        """Wait for queued events and the active worker's final persistence pass.
+
+        Future recovery timers may remain while storage is unavailable. This is
+        worker quiescence, not a durability promise during an outage. Wake callers
+        never use this maintenance/test barrier.
+        """
         deadline = time.monotonic() + timeout
         with self._queue.all_tasks_done:
-            while self._queue.unfinished_tasks:
+            while self._queue.unfinished_tasks or self._running:
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
                 self._queue.all_tasks_done.wait(remaining)
         return True
+
+    @staticmethod
+    def _overflow_window(row):
+        # Old daily aggregates remain conservative after reopening an older store.
+        width = {"overflow": 86400, "overflow_hour": 3600}.get(row["reason"])
+        if width is None:
+            return None
+        start = int(row["failed_at"] // width) * width
+        return start, start + width
 
     def failures(self, since=0):
         # Snapshot memory before SQLite: commit/pop between these reads cannot hide a failure.
@@ -632,13 +663,17 @@ class ScheduleFireTrace:
                 dict(row)
                 for row in (*self._failures.values(), *self._overflow.values())
                 if row["failed_at"] >= since
+                or (self._overflow_window(row) or (0, 0))[1] > since
             ]
         db = self._connect(timeout=1.0)
         try:
             records = {
                 r["event_id"]: dict(r)
                 for r in db.execute(
-                    "SELECT * FROM schedule_fire_trace_failures WHERE failed_at>=?", (since,)
+                    """SELECT * FROM schedule_fire_trace_failures WHERE failed_at>=?
+                    OR (reason='overflow_hour' AND failed_at>=?)
+                    OR (reason='overflow' AND failed_at>=?)""",
+                    (since, int(since // 3600) * 3600, int(since // 86400) * 86400),
                 )
             }
         finally:
@@ -650,10 +685,58 @@ class ScheduleFireTrace:
         return list(records.values())
 
     def failure_counts(self, *, since):
-        counts = dict.fromkeys(EDGES, 0)
+        """Return per-edge upper bounds; failure_bounds describes any approximation."""
+        return {edge: bounds["upper"] for edge, bounds in self.failure_bounds(since=since).items()}
+
+    def failure_bounds(self, *, since):
+        """Bound a rolling window without claiming bucket totals are exact events."""
+        counts = {
+            edge: dict(count=0, exact=True, lower=0, upper=0, bucket_start=None, bucket_end=None)
+            for edge in EDGES
+        }
         for row in self.failures(since):
-            counts[row["edge"]] = counts.get(row["edge"], 0) + row["failures"]
+            bounds = counts[row["edge"]]
+            bounds["upper"] += row["failures"]
+            window = self._overflow_window(row)
+            if window and window[0] < since < window[1]:
+                bounds["exact"] = False
+                bounds["bucket_start"] = min(bounds["bucket_start"] or window[0], window[0])
+                bounds["bucket_end"] = max(bounds["bucket_end"] or window[1], window[1])
+            else:
+                bounds["lower"] += row["failures"]
+        for bounds in counts.values():
+            bounds["count"] = bounds["upper"]
+            bounds["display"] = (
+                str(bounds["count"]) if bounds["exact"] else f"≤{bounds['count']} (approx.)"
+            )
         return counts
+
+    def _snapshot_ledger(self, db, *, since, agent, schedule_id):
+        """Exhaust bounded ledger reads before any classification or trace snapshot.
+
+        Read-only attachments still lock rollback-journal ledgers. No ledger
+        cursor or transaction may survive into slow Python/SQL report work.
+        """
+        keys = db.execute(
+            """SELECT schedule_id,fired_at FROM schedule_fire_trace
+            WHERE fired_at>=? AND (? IS NULL OR agent_name=?)
+            AND (? IS NULL OR schedule_id=?)""",
+            (since, agent, agent, schedule_id, schedule_id),
+        ).fetchall()
+        snapshot = []
+        for offset in range(0, len(keys), 64):
+            batch = keys[offset:offset + 64]
+            snapshot.extend(db.execute(
+                """SELECT schedule_id,fired_at,accepted_at,attempts,released_at,abandoned_at
+                FROM ledger.pending_schedule_wakes WHERE (schedule_id,fired_at) IN (VALUES """
+                + ",".join("(?,?)" for _ in batch) + ")",
+                tuple(value for key in batch for value in key),
+            ).fetchall())
+        db.execute("""CREATE TEMP TABLE report_ledger (
+            schedule_id INTEGER, fired_at REAL, accepted_at REAL, attempts INTEGER,
+            released_at REAL, abandoned_at REAL, PRIMARY KEY(schedule_id,fired_at))""")
+        db.executemany("INSERT INTO report_ledger VALUES (?,?,?,?,?,?)", snapshot)
+        db.commit()
 
     def report(self, *, since=0, agent=None, schedule_id=None, outcome=None, limit=200, offset=0):
         """Return a bounded page, full-window counts, and counts for the page's keys."""
@@ -663,11 +746,10 @@ class ScheduleFireTrace:
             overlay = [
                 dict(row)
                 for row in (*self._failures.values(), *self._overflow.values())
-                if row["failed_at"] >= since
             ]
         by_key, by_id, overflow = {}, {}, []
         for failure in overlay:
-            if failure["reason"] == "overflow":
+            if self._overflow_window(failure):
                 overflow.append(failure)
             else:
                 by_key.setdefault((failure["schedule_id"], failure["fired_at"]), []).append(
@@ -682,7 +764,7 @@ class ScheduleFireTrace:
             row["failed_edges"] += by_key.get((row["schedule_id"], row["fired_at"]), [])
             row["failed_edges"] += by_id.get(row["fire_id"], [])
             row["failed_edges"] += [
-                f["edge"] for f in overflow if f["failed_at"] >= row["fired_at"]
+                f["edge"] for f in overflow if self._overflow_window(f)[1] > row["fired_at"]
             ]
             ledger = {
                 name: row.pop("current_" + name) or 0
@@ -706,9 +788,13 @@ class ScheduleFireTrace:
             + ledger_fields
             + """,
                 'failed_edges_sql',COALESCE((SELECT group_concat(f.edge) FROM schedule_fire_trace_failures f
-                    WHERE f.failed_at>=? AND ((f.schedule_id=t.schedule_id AND f.fired_at=t.fired_at)
-                    OR f.fire_id=t.fire_id OR (f.reason='overflow' AND f.failed_at>=t.fired_at))),'')) AS evidence
-            FROM schedule_fire_trace t LEFT JOIN ledger.pending_schedule_wakes w
+                    WHERE (f.schedule_id=t.schedule_id AND f.fired_at=t.fired_at)
+                    OR f.fire_id=t.fire_id
+                    OR (f.reason='overflow_hour'
+                        AND f.failed_at>=CAST(t.fired_at/3600 AS INTEGER)*3600)
+                    OR (f.reason='overflow'
+                        AND f.failed_at>=CAST(t.fired_at/86400 AS INTEGER)*86400)),'')) AS evidence
+            FROM schedule_fire_trace t LEFT JOIN temp.report_ledger w
                 ON w.schedule_id=t.schedule_id AND w.fired_at=t.fired_at
             WHERE t.fired_at>=? AND (? IS NULL OR t.agent_name=?)
                 AND (? IS NULL OR t.schedule_id=?)
@@ -718,10 +804,13 @@ class ScheduleFireTrace:
             SELECT * FROM classified WHERE (? IS NULL OR derived_outcome=?)
         ) """
         )
-        parameters = (since, since, agent, agent, schedule_id, schedule_id, outcome, outcome)
+        parameters = (since, agent, agent, schedule_id, schedule_id, outcome, outcome)
         db = self._connect(timeout=1.0)
         try:
+            self._snapshot_ledger(db, since=since, agent=agent, schedule_id=schedule_id)
             db.create_function("trace_outcome", 1, classify)
+            # Only the trace file participates in this consistent page/count snapshot.
+            db.execute("BEGIN")
             records = [
                 dict(row)
                 for row in db.execute(
@@ -750,6 +839,7 @@ class ScheduleFireTrace:
                         group.setdefault(str(key), dict.fromkeys(OUTCOMES, 0))[name] = count
                 groups[label] = group
         finally:
+            db.rollback()
             db.close()
         for row in records:
             row.pop("evidence")
