@@ -10638,7 +10638,20 @@ class TmuxSession(TransportReplacementMixin):
                     return
                 turn = self._match_acceptance_content(prompt)
                 if turn is not None:
-                    self._mark_transport_accepted(turn)
+                    # Bare exact rows retain their inherited acceptance path.
+                    # An envelope previously reached the containment fallback:
+                    # normalizing it must retain that same paste-bound guard.
+                    meta = self._inflight_meta_for_turn(turn)
+                    if prompt == turn.prompt or (
+                        meta is not None
+                        and self._transcript_entry_matches_ticket(
+                            entry_offset=entry_offset,
+                            source_identity=source_identity,
+                            ticket_offset=meta.transcript_offset_at_paste,
+                            ticket_identity=meta.transcript_file_identity_at_paste,
+                        )
+                    ):
+                        self._mark_transport_accepted(turn)
                 else:
                     for folded_turn in self._folded_acceptance_turns(prompt):
                         folded_meta = next(
