@@ -329,6 +329,12 @@ def test_failed_last_edge_is_retried_after_lock_release(registry):
     try:
         receipt.trace("observed")
         assert registry._fire_trace.flush(timeout=1)
+        # Release storage only after the event worker has finished, so success
+        # must come from the autonomous retry rather than its final flush.
+        deadline = time.monotonic() + 1
+        while registry._fire_trace._running and time.monotonic() < deadline:
+            threading.Event().wait(0.001)
+        assert not registry._fire_trace._running
     finally:
         lock.rollback()
         lock.close()
