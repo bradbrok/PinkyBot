@@ -1145,27 +1145,6 @@ class TestAgentIsolationScoping:
     def _make_skill_catalog_client(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
 
-        # The static /skills/apply route is currently declared after the
-        # /skills/{skill_name} POST route, so FastAPI otherwise dispatches
-        # "apply" as a skill name and returns a missing-body 422. Route-order
-        # repair is tracked in #1202 and outside this PR; promote the existing
-        # static route in this fixture so signed effect checks exercise its
-        # real handler.
-        routes = client.app.router.routes
-        apply_route = next(
-            route
-            for route in routes
-            if getattr(route, "path", "") == "/agents/{name}/skills/apply"
-        )
-        assignment_index = next(
-            index
-            for index, route in enumerate(routes)
-            if getattr(route, "path", "") == "/agents/{name}/skills/{skill_name}"
-                and "POST" in (getattr(route, "methods", set()) or set())
-        )
-        routes.remove(apply_route)
-        routes.insert(assignment_index, apply_route)
-
         # /skills/from-md and /skills/from-git persist under _pinky_root. Keep
         # every effect test inside pytest's external scratch tree so a RED run
         # on the vulnerable base cannot clobber the live checkout (#1078).
