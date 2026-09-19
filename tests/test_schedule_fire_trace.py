@@ -445,3 +445,117 @@ def test_t6_api_filters_counts_and_auth(tmp_path):
     finally:
         client.close()
         registry.close()
+
+
+async def test_t5_queue_full_preserves_authoritative_acceptance(registry, monkeypatch, caplog):
+    import queue
+
+    pending, durable = fire(registry)
+    writer = registry._fire_trace
+    monkeypatch.setattr(writer, "_queue", queue.Queue(maxsize=1))
+    entered, release = threading.Event(), threading.Event()
+    original = writer._write
+
+    def blocked(event):
+        entered.set()
+        assert release.wait(2)
+        return original(event)
+
+    monkeypatch.setattr(writer, "_write", blocked)
+    durable.trace("replay")
+    assert await asyncio.to_thread(entered.wait, 1)
+    try:
+        durable.trace("replay")
+        started = time.perf_counter()
+        assert durable.accept()
+        assert time.perf_counter() - started < 0.5
+        assert registry.get_schedule_wake_by_fire(
+            pending.schedule_id, pending.fired_at,
+        ).accepted_at > 0
+    finally:
+        release.set()
+        flush(registry)
+    assert writer.failure_counts(since=0)["accept"] == 1
+    errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    assert len(errors) == 1 and "Full" in errors[0].message
+    assert writer.report()["rows"][0]["outcome"] == "trace_incomplete"
+    assert rows(registry)[0]["replay_count"] == 2
+
+
+def test_t3_additive_migration_reopen_and_identity_fallback(tmp_path):
+    from pinky_daemon.schedule_fire_trace import trace_event
+
+    path = str(tmp_path / "migration.db")
+    with sqlite3.connect(path) as db:
+        db.execute("""CREATE TABLE schedule_fire_trace (
+            schedule_id INTEGER NOT NULL, fired_at REAL NOT NULL,
+            PRIMARY KEY(schedule_id,fired_at))""")
+    registry = AgentRegistry(path)
+    try:
+        assert registry._db.execute("PRAGMA journal_mode").fetchone()[0] == "truncate"
+        registry.register("worker", working_dir=str(tmp_path / "worker"))
+        schedule = registry.add_schedule("worker", "*/5 * * * *", name="recurring")
+        fired_at = time.time()
+        trace_event(registry, "enqueue", schedule_id=schedule.id, fired_at=fired_at,
+                    agent_name="worker", schedule_name="recurring", prompt="work")
+        before, = rows(registry)
+        assert before["fire_id"] is None, "an unbound fire must not allocate an unrelated id"
+        pending, _ = registry.persist_schedule_wake(
+            schedule.id, fired_at=fired_at, agent_name="worker", schedule_name="recurring",
+            prompt="work",
+        )
+        after, = rows(registry)
+        assert after["fire_id"] == pending.id
+        assert after["enqueued_at"] == before["enqueued_at"]
+    finally:
+        registry.close()
+    reopened = AgentRegistry(path)
+    try:
+        assert rows(reopened) == [after]
+    finally:
+        reopened.close()
+
+
+def test_t4_read_api_cross_checks_authoritative_ledger(tmp_path):
+    from pinky_daemon.api import create_api
+
+    app = create_api(db_path=str(tmp_path / "cross-check.db"))
+    registry = app.state.agents
+    registry.register("worker", working_dir=str(tmp_path / "worker"))
+    attempted, _ = fire(registry)
+    accepted, _ = fire(registry, name="accepted recurrence")
+    registry.increment_pending_schedule_wake_attempts(attempted.id)
+    # Simulate missing observations while retaining real authoritative evidence.
+    registry._db.execute("UPDATE pending_schedule_wakes SET accepted_at=? WHERE id=?",
+                         (time.time(), accepted.id))
+    registry._db.commit()
+    client = TestClient(app)
+    try:
+        response = client.get("/scheduler/fire-trace", params={"outcome": "trace_incomplete"})
+        assert response.status_code == 200
+        assert {r["fire_id"] for r in response.json()["rows"]} == {attempted.id, accepted.id}
+        counts = client.get("/scheduler/status").json()["fire_trace_24h"]
+        assert counts["trace_incomplete"] == 2
+        assert counts["never_pasted"] == counts["observer_unmatched"] == counts["pending"] == 0
+    finally:
+        client.close()
+        registry.close()
+
+
+def test_t5_non_busy_error_has_no_retry(registry, monkeypatch, caplog):
+    _, durable = fire(registry)
+    writer = registry._fire_trace
+    calls = []
+
+    def invalid_sql(event):
+        calls.append(event)
+        raise sqlite3.OperationalError("no such table: injected_missing_table")
+
+    monkeypatch.setattr(writer, "_write", invalid_sql)
+    started = time.perf_counter()
+    durable.trace("paste", pointer="{}")
+    flush(registry)
+    assert time.perf_counter() - started < 0.5
+    assert len(calls) == 1
+    assert writer.failure_counts(since=0)["paste"] == 1
+    assert len([r for r in caplog.records if "schedule fire trace" in r.message.lower()]) == 1
