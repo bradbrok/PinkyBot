@@ -25,6 +25,8 @@ _EXPECTED_CRITICALITY = {
     "conversations": "memory",
     "analytics": "telemetry",
     "agents": "delivery",
+    "schedule_fire_trace": "telemetry",
+    "schedule_fire_trace_read": "telemetry",
     "agent_signing_keys": "authority",
     "tool_policy": "authority",
     "audit": "memory",
@@ -115,7 +117,9 @@ def test_fleet_manifest_declares_exact_criticality_and_connection_policy(tmp_pat
         name
         for name, target in manifest.items()
         if target.connection_policy.busy_timeout_ms == 5_000
-    } == set(manifest) - _THIRTY_SECOND_BUSY_STORES
+    } == set(manifest) - _THIRTY_SECOND_BUSY_STORES - {"schedule_fire_trace", "schedule_fire_trace_read"}
+    assert manifest["schedule_fire_trace"].connection_policy.busy_timeout_ms == 0
+    assert manifest["schedule_fire_trace_read"].connection_policy.busy_timeout_ms == 1000
     assert {target.connection_policy.rollback_retries for target in manifest.values()} == {6}
     assert {
         target.connection_policy.rollback_retry_delay_seconds for target in manifest.values()

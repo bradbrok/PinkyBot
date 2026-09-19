@@ -2015,6 +2015,7 @@ class TmuxSession(TransportReplacementMixin):
     # CodexTmuxSession. See
     # MessageBroker.injection_confirms_consumption.
     injection_confirms_consumption: bool = False
+    _trace_transport_kind = "tmux_claude"
 
     def __init__(
         self,
@@ -9365,6 +9366,7 @@ class TmuxSession(TransportReplacementMixin):
                         if delivery is not None and not delivery.done():
                             delivery.set_result(False)
                         return False
+                    self._trace_scheduler_turn(t, "replay", reason="watchdog_replay")
                     # Its old FIFO metadata was removed above. Allow the
                     # replacement-pane delivery to record a fresh entry.
                     t.pane_delivery_recorded = False
@@ -10330,6 +10332,40 @@ class TmuxSession(TransportReplacementMixin):
                 )
                 return
 
+    @staticmethod
+    def _trace_scheduler_turn(turn, edge: str, **fields) -> None:
+        owner = getattr(getattr(turn, "scheduler_accept", None), "__self__", None)
+        trace = getattr(owner, "trace", None)
+        if callable(trace):
+            try:
+                if "pointer" in fields:
+                    fields["pointer"] = json.dumps(fields["pointer"], default=str)
+                trace(edge, **fields)
+            except Exception as exc:
+                try:
+                    owner.trace_failure(edge, exc)
+                except Exception:
+                    _log(f"schedule fire trace callback failed ({type(exc).__name__})")
+
+    def _trace_observed_prompt(self, prompt, *, pointer) -> None:
+        # Observe separately from the acceptance matcher: matching failure is
+        # itself a diagnostic class. Do not grant or change receipt authority.
+        occupied: list[tuple[int, int]] = []
+        for turn in self._acceptance_candidates():
+            if not turn.pane_delivery_started:
+                continue
+            if isinstance(pointer, dict) and not self._transcript_entry_matches_ticket(
+                entry_offset=pointer.get("offset"), source_identity=pointer.get("identity"),
+                ticket_offset=turn.transcript_offset_at_paste,
+                ticket_identity=turn.transcript_file_identity_at_paste,
+            ):
+                continue
+            span = self._first_unoccupied_prompt_span(prompt, turn.prompt, occupied)
+            if span is None:
+                continue
+            occupied.append(span)
+            self._trace_scheduler_turn(turn, "observed", pointer=pointer)
+
     def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
         """Resolve exact receipts only on observed pane acceptance."""
         if turn is None:
@@ -10343,6 +10379,7 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_requires_submission_receipt(turn):
             self._finish_turn_delivery(turn, fire_on_delivered=False)
         if turn.scheduler_accept is not None:
+            self._trace_scheduler_turn(turn, "accept_source", matched_by="transcript_receipt")
             try:
                 persisted = turn.scheduler_accept()
             except Exception as exc:
@@ -10514,6 +10551,11 @@ class TmuxSession(TransportReplacementMixin):
         if entry_type == "user":
             prompt = self._transcript_user_text(entry)
             if prompt is not None:
+                self._trace_observed_prompt(prompt, pointer={
+                    "path": getattr(self._tailer, "transcript_path", ""),
+                    "offset": entry_offset,
+                    "identity": source_identity,
+                })
                 guard = self._wake_context_reload_guard
                 if (
                     guard is not None
@@ -11467,6 +11509,13 @@ class TmuxSession(TransportReplacementMixin):
             ),
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
+        self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,
+                                   transport_kind=self._trace_transport_kind,
+                                   pointer={
+                                       "path": turn.transcript_path_at_paste or _tpath or "",
+                                       "offset": turn.transcript_offset_at_paste,
+                                       "identity": turn.transcript_file_identity_at_paste,
+                                   })
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If
         # other entries are ahead, the head's clock was set when IT

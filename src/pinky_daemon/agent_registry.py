@@ -43,6 +43,7 @@ from pinky_daemon.agent_signing_key_store import (
 )
 from pinky_daemon.cron_utils import _field_matches
 from pinky_daemon.effort import is_ultracode
+from pinky_daemon.schedule_fire_trace import ScheduleFireTrace, trace_event
 from pinky_daemon.store_catalog import (
     StoreCatalog,
     StoreConnectionPolicy,
@@ -1539,6 +1540,7 @@ class AgentRegistry:
         # different entries, and one write loses.
         self._rmw_lock = threading.RLock()
         self._init_tables()
+        self._fire_trace = ScheduleFireTrace(self._db_path, self._db, catalog=catalog)
 
     def _init_tables(self) -> None:
         self._db.executescript("""
@@ -5548,6 +5550,9 @@ except Exception as exc:
                 schedule_id, timestamp
             )
             self._db.commit()
+        trace_event(self, "enqueue", fire_id=row[0], schedule_id=schedule_id,
+                    fired_at=timestamp, enqueued_at=created_at, agent_name=agent_name,
+                    schedule_name=schedule_name, prompt=prompt)
         return True, PendingScheduleWake(*row)
 
     def _select_schedule_wake_by_fire(
@@ -5606,6 +5611,10 @@ except Exception as exc:
                 (schedule_id, fired_at),
             ).fetchone()
             self._db.commit()
+        if created:
+            trace_event(self, "enqueue", fire_id=row[0], schedule_id=schedule_id,
+                        fired_at=fired_at, enqueued_at=created_at, agent_name=agent_name,
+                        schedule_name=schedule_name, prompt=prompt)
         return PendingScheduleWake(*row), created
 
     def list_pending_schedule_wakes(
@@ -5877,6 +5886,8 @@ except Exception as exc:
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
+        if cursor.rowcount > 0:
+            trace_event(self, "abandon", fire_id=pending_id, at=timestamp, reason="drain_parked")
         return cursor.rowcount > 0
 
     def release_drain_parked_schedule_wakes(self, agent_name: str) -> int:
@@ -5892,16 +5903,20 @@ except Exception as exc:
         recurrence-supersession floor keys on the column and no park-reason
         text — any case, any content — can dodge it.
         """
+        timestamp = time.time()
         with self._rmw_lock:
             released = self._release_drain_parked_locked(
-                agent_name, time.time()
+                agent_name, timestamp
             )
             self._db.commit()
-        return released
+        for fire_id, schedule_id, fired_at in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=agent_name, reason="released",
+                        fire_id=fire_id, schedule_id=schedule_id, fired_at=fired_at)
+        return len(released)
 
     def _release_drain_parked_locked(
         self, agent_name: str, timestamp: float
-    ) -> int:
+    ) -> list[tuple[int, int, float]]:
         """Release one agent's drain-parked rows; caller holds the rmw lock.
 
         Shared by the public release and both durable confirm transitions:
@@ -5914,10 +5929,11 @@ except Exception as exc:
                SET drain_parked_at=0,
                    released_at=?
                WHERE agent_name=? AND drain_parked_at>0
-                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
+                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0
+               RETURNING id, schedule_id, fired_at""",
             (timestamp, agent_name),
         )
-        return cursor.rowcount
+        return cursor.fetchall()
 
     def has_released_pending_wakes(self, agent_name: str) -> bool:
         """Whether this agent holds active rows released from drain parking.
@@ -5972,6 +5988,8 @@ except Exception as exc:
                 (timestamp, timestamp, reason, pending_id),
             )
             self._db.commit()
+        if cursor.rowcount > 0:
+            trace_event(self, "abandon", fire_id=pending_id, at=timestamp, reason=reason)
         return cursor.rowcount > 0
 
     def collapse_pending_schedule_wake(
@@ -6002,7 +6020,8 @@ except Exception as exc:
         return cursor.rowcount > 0
 
     def confirm_pending_schedule_wake(
-        self, pending_id: int, *, delivered_at: float = 0.0
+        self, pending_id: int, *, delivered_at: float = 0.0,
+        trace_matched_by: str = "turn_complete"
     ) -> bool:
         """Atomically retain a positive receipt and retire it from replay."""
         timestamp = delivered_at or time.time()
@@ -6034,8 +6053,13 @@ except Exception as exc:
             )
             # A durable positive receipt is release evidence for every
             # other drain-parked row this agent holds (#635, #991 seam).
-            self._release_drain_parked_locked(str(row[3]), timestamp)
+            released = self._release_drain_parked_locked(str(row[3]), timestamp)
             self._db.commit()
+        trace_event(self, "accept", fire_id=pending_id, schedule_id=row[0], fired_at=float(row[2]),
+                    at=timestamp, result=True, matched_by=trace_matched_by)
+        for released_id, released_schedule, released_fire in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=str(row[3]), reason="released",
+                        fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         return True
 
     def confirm_pending_schedule_wake_by_fire(
@@ -6044,6 +6068,7 @@ except Exception as exc:
         fired_at: float,
         *,
         delivered_at: float = 0.0,
+        trace_matched_by: str = "on_accept",
     ) -> bool:
         """Atomically persist acceptance for one exact fire before replay."""
         timestamp = delivered_at or time.time()
@@ -6076,8 +6101,13 @@ except Exception as exc:
             )
             # A durable positive receipt is release evidence for every
             # other drain-parked row this agent holds (#635, #991 seam).
-            self._release_drain_parked_locked(str(row[2]), timestamp)
+            released = self._release_drain_parked_locked(str(row[2]), timestamp)
             self._db.commit()
+        trace_event(self, "accept", fire_id=row[0], schedule_id=schedule_id, fired_at=fired_at,
+                    at=timestamp, result=True, matched_by=trace_matched_by)
+        for released_id, released_schedule, released_fire in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=str(row[2]), reason="released",
+                        fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         newly_receipted = float(row[1]) == 0
         if newly_receipted:
             _log(
@@ -6221,6 +6251,10 @@ except Exception as exc:
                     (*params, int(batch_size)),
                 ).fetchall()
                 self._db.commit()
+                if metric_field == "abandoned":
+                    for row in rows:
+                        trace_event(self, "abandon", fire_id=row[1], schedule_id=row[2],
+                                    fired_at=row[3], at=observed_at, reason="reaper")
                 for row in rows:
                     agent_metrics = _agent_metrics(str(row[0]))
                     agent_metrics[metric_field] = (
@@ -6324,7 +6358,7 @@ except Exception as exc:
                              )
                            ORDER BY id ASC LIMIT ?
                        )
-                       RETURNING agent_name""",
+                       RETURNING agent_name, id, schedule_id, fired_at""",
                     (observed_at, abandon_cutoff),
                     "abandoned",
                 )
@@ -8950,5 +8984,9 @@ except Exception as exc:
                 self.set_mesh_outbound_allowlist(agent_name, kept)
             return removed
 
+    def prune_schedule_fire_trace(self, *, now: float, retention_days: int = 30) -> None:
+        trace_event(self, "prune", at=now, retention_days=retention_days)
+
     def close(self) -> None:
+        self._fire_trace.close()
         self._db.close()

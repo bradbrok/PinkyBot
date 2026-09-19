@@ -27,6 +27,8 @@ STORE_SCHEMA_SENTINELS: dict[str, tuple[str, ...]] = {
     "conversations": ("messages", "messages_fts"),
     "analytics": ("analytics_session_facts",),
     "agents": ("agents",),
+    "schedule_fire_trace": ("schedule_fire_trace", "schedule_fire_trace_failures"),
+    "schedule_fire_trace_read": ("schedule_fire_trace", "schedule_fire_trace_failures"),
     "agent_signing_keys": ("agent_signing_keys",),
     "tool_policy": (
         "tool_policy_overrides", "tool_policy_pending",

@@ -53,6 +53,14 @@ def derive_fleet_store_manifest(
         "agents": _store(
             "agents", agents_path, criticality="delivery", journal_mode="truncate"
         ),
+        "schedule_fire_trace": _store(
+            "schedule_fire_trace", agents_path + ".fire-trace.db",
+            criticality="telemetry", journal_mode="truncate",
+        ),
+        "schedule_fire_trace_read": _store(
+            "schedule_fire_trace_read", agents_path + ".fire-trace.db",
+            criticality="telemetry", journal_mode="truncate",
+        ),
         "agent_signing_keys": _store(
             "agent_signing_keys",
             agents_path,

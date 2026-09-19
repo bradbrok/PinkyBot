@@ -4763,6 +4763,25 @@ def create_api(
                 agent_name, label=label, resume_id=resume_id
             )
 
+    def _trace_sdk_submission(session, receipt):
+        if receipt is None:
+            return
+        # send() exposes no backend message id. This session-local sequence
+        # describes observed submissions without inventing backend identity.
+        try:
+            sequence = vars(session).get("_schedule_trace_submit_seq", 0) + 1
+            session._schedule_trace_submit_seq = sequence
+            receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
+                "resume_handle": getattr(session, "resume_handle", ""),
+                "message_id": None,
+                "submit_seq": sequence,
+            }, default=str))
+        except Exception as exc:
+            try:
+                receipt.trace_failure("paste", exc)
+            except Exception:
+                _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
+
     async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
@@ -4777,9 +4796,13 @@ def create_api(
                     sender = getattr(ss, "send_scheduler_prompt", None)
                     if callable(sender):
                         if schedule_receipt is not None and "on_accept" in inspect.signature(sender).parameters:
+                            # Preserve the bound method: trace hooks recover its exact fire owner.
                             kwargs["on_accept"] = schedule_receipt.accept
                         return ss, await sender(prompt, **kwargs)
-                return ss, await ss.send(prompt, **kwargs)
+                result = await ss.send(prompt, **kwargs)
+                if scheduler and result and schedule_receipt is not None:
+                    _trace_sdk_submission(ss, schedule_receipt)
+                return ss, result
         raise HTTPException(409, "Session changed repeatedly before delivery")
 
     broker._compatible_delivery = _deliver_streaming
@@ -12566,6 +12589,7 @@ npm run build</pre>
                 try:
                     signature = inspect.signature(scheduler_send)
                     if "on_accept" in signature.parameters:
+                        # Preserve the bound method: trace hooks recover its exact fire owner.
                         scheduler_kwargs["on_accept"] = (
                             schedule_receipt.accept
                         )
@@ -12579,6 +12603,8 @@ npm run build</pre>
             return receipt
 
         handed_off = await ss.send(prompt)
+        if handed_off and schedule_receipt is not None:
+            _trace_sdk_submission(ss, schedule_receipt)
         confirmed = bool(
             handed_off
             and getattr(ss, "injection_confirms_consumption", False)
@@ -14650,14 +14676,37 @@ npm run build</pre>
 
     # ── Scheduler Control ──────────────────────────────────
 
+    @app.get("/scheduler/fire-trace")
+    async def scheduler_fire_trace(
+        since: float | None = Query(None, allow_inf_nan=False), agent: str | None = None,
+        schedule_id: int | None = Query(None, ge=-(2**63), le=2**63 - 1),
+        outcome: str | None = None, limit: int = Query(200, ge=1, le=1000),
+        offset: int = Query(0, ge=0, le=2**63 - 1),
+    ):
+        """Read observed fire evidence through the existing admin/signed auth boundary."""
+        return await asyncio.to_thread(agents._fire_trace.report,
+                                       since=time.time() - 86400 if since is None else since,
+                                       agent=agent, schedule_id=schedule_id, outcome=outcome,
+                                       limit=limit, offset=offset)
+
     @app.get("/scheduler/status")
     async def scheduler_status():
-        """Get scheduler status."""
+        """Get scheduler status; trace failure integers are upper bounds.
+
+        Per-edge bounds describe rolling-window uncertainty, with display labels
+        such as '≤2 (approx.)' for a partially covered overflow bucket.
+        """
         all_schedules = agents.get_all_schedules(enabled_only=False)
         auto_start = agents.list_auto_start_agents()
         pending_health = agents.get_pending_schedule_wake_health()
+        failure_bounds = await asyncio.to_thread(
+            agents._fire_trace.failure_bounds, since=time.time() - 86400
+        )
         return {
             "running": scheduler.running,
+            "fire_trace_24h": (await asyncio.to_thread(agents._fire_trace.report, since=time.time() - 86400))["counts"],
+            "trace_write_failures_24h": {edge: value["upper"] for edge, value in failure_bounds.items()},
+            "trace_write_failure_bounds_24h": failure_bounds,
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],

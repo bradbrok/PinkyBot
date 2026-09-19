@@ -725,6 +725,10 @@ class CodexTmuxTranscriptTailer:
                         self.session_cwd = payload.get("cwd", "")
 
                 if self._on_entry is not None:
+                    self.entry_pointer = {
+                        "path": str(self._path), "offset": line_offset,
+                        "identity": identity,
+                    }
                     try:
                         self._on_entry(dict(entry))
                     except Exception as e:

@@ -112,6 +112,7 @@ class CodexTmuxSession(TmuxSession):
     # path's default (CodexSession._analytics_log_turn_usage) and
     # analytics_store._provider_alias maps it onto the openai rate rows.
     _ANALYTICS_PROVIDER = "codex_cli"
+    _trace_transport_kind = "tmux_codex"
 
     def _reported_context_window(self) -> int:
         """Return the latest positive window reported by the Codex rollout."""
@@ -600,6 +601,12 @@ class CodexTmuxSession(TmuxSession):
             if payload.get("type") == "user_message":
                 prompt = payload.get("message")
                 if isinstance(prompt, str):
+                    self._trace_observed_prompt(prompt, pointer=(
+                        getattr(self._tailer, "entry_pointer", None) or {
+                            "path": getattr(self._tailer, "transcript_path", ""),
+                            "offset": None,
+                        }
+                    ))
                     turn = self._match_acceptance_turn(prompt)
                     # The rollout tailer can observe user_message and a very
                     # fast task_complete in one read while paste_text's final
