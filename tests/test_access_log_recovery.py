@@ -82,6 +82,7 @@ def test_interrupted_compression_recovers_once_and_prunes(tmp_path, published):
         digest = hashlib.sha256(archive.read_bytes()).hexdigest()
     else:
         partial.write_bytes(b"incomplete compressed bytes")
+        os.utime(partial, (time.time() - 7200,) * 2)
     old = path.with_name(path.name + ".expired.gz")
     old.write_bytes(b"old archive")
     os.utime(old, (time.time() - 91 * 86400,) * 2)
@@ -99,6 +100,27 @@ def test_interrupted_compression_recovers_once_and_prunes(tmp_path, published):
         assert _records(path) == [{"after": 2}, {"after": 3}]
     finally:
         writer.close()
+
+
+def test_prune_removes_only_old_regular_compression_temps(tmp_path):
+    path = tmp_path / "access.log"
+    stamp = "access.log.2026-09-19T120000Z.gz.part-"
+    stale = tmp_path / (stamp + "old")
+    fresh = tmp_path / (stamp + "fresh")
+    linked = tmp_path / (stamp + "link")
+    unrelated = tmp_path / "unrelated.part"
+    for item in (stale, fresh, unrelated):
+        item.write_bytes(b"preserve unless expired and owned")
+    linked.symlink_to(unrelated)
+    old = time.time() - 7200
+    os.utime(stale, (old, old))
+    os.utime(unrelated, (old, old))
+    os.utime(linked, (old, old), follow_symlinks=False)
+    rotator = LogRotator(path, mode="rename", on_rotate=lambda: None)
+    rotator._prune()
+    assert not stale.exists()
+    assert fresh.exists() and unrelated.exists()
+    assert linked.is_symlink() and linked.read_bytes() == unrelated.read_bytes()
 
 
 @pytest.mark.parametrize("fault", ["partial", "write_error", "rollback_error"])
