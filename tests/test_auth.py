@@ -793,6 +793,33 @@ class TestAuthMiddlewareDefaultDeny:
         assert resp.status_code == 401
         os.unlink(path)
 
+    def test_upgrade_header_does_not_bypass_auth_on_get(self, monkeypatch):
+        """A plain HTTP request that merely carries an ``Upgrade: websocket``
+        header is still an HTTP request and must go through auth like any
+        other. Real WebSocket handshakes never reach the HTTP middleware
+        (Starlette routes the ``websocket`` scope around it), so there is
+        nothing for the middleware to carve out.
+        """
+        client, path = self._make_client(monkeypatch)
+        resp = client.get("/scheduler/status", headers={"Upgrade": "websocket"})
+        assert resp.status_code == 401, (
+            f"Upgrade header bypassed auth on GET ({resp.status_code})"
+        )
+        os.unlink(path)
+
+    def test_upgrade_header_does_not_bypass_auth_on_post(self, monkeypatch):
+        """Same as the GET case for a mutating verb on a protected prefix."""
+        client, path = self._make_client(monkeypatch)
+        resp = client.post(
+            "/tasks",
+            json={"title": "x"},
+            headers={"Upgrade": "websocket", "Connection": "Upgrade"},
+        )
+        assert resp.status_code == 401, (
+            f"Upgrade header bypassed auth on POST ({resp.status_code})"
+        )
+        os.unlink(path)
+
     def test_html_redirects_still_307(self, monkeypatch):
         """Protected HTML pages still 307-redirect to /setup or /login —
         the redirect is special-cased BEFORE default-deny because the
