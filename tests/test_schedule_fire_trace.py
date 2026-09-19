@@ -30,8 +30,9 @@ def flush(registry):
 
 def rows(registry):
     flush(registry)
-    cursor = registry._db.execute("SELECT * FROM schedule_fire_trace ORDER BY fired_at")
-    return [dict(zip([c[0] for c in cursor.description], row)) for row in cursor.fetchall()]
+    with sqlite3.connect(registry._fire_trace.path) as db:
+        db.row_factory = sqlite3.Row
+        return [dict(row) for row in db.execute("SELECT * FROM schedule_fire_trace ORDER BY fired_at")]
 
 
 @pytest.fixture
@@ -237,7 +238,11 @@ def test_t1_ledger_and_idle_edges(registry, monkeypatch, edge):
         reap(registry, time.time(), abandon_after=50)
     else:
         scheduler = AgentScheduler(registry)
-        monkeypatch.setattr(scheduler, "replay_pending_for_agent", lambda name: None)
+        monkeypatch.setattr(scheduler, "replay_pending_for_agent",
+                            lambda name: asyncio.run(scheduler._replay_pending_for_agent(name)))
+        monkeypatch.setattr(scheduler, "_wait_for_wake_confirmation", AsyncMock(return_value=False))
+        # Isolate the replay edge from the delivery-attempt ledger mutation.
+        monkeypatch.setattr(registry, "increment_pending_schedule_wake_attempts", lambda _id: 1)
         scheduler.notify_agent_idle("worker")
     record, = rows(registry)
     if edge == "idle_replay":
@@ -369,7 +374,7 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
     assert await asyncio.to_thread(entered.wait, 1)
     timer = None
     if fault in {"busy", "busy_transient"}:
-        lock = sqlite3.connect(pane.registry._db_path, timeout=0, check_same_thread=False)
+        lock = sqlite3.connect(writer.path, timeout=0, check_same_thread=False)
         lock.execute("BEGIN IMMEDIATE")
         if fault == "busy_transient":
             timer = threading.Timer(0.1, lock.rollback)
@@ -483,10 +488,10 @@ async def test_t5_queue_full_preserves_authoritative_acceptance(registry, monkey
 
 
 def test_t3_additive_migration_reopen_and_identity_fallback(tmp_path):
-    from pinky_daemon.schedule_fire_trace import trace_event
+    from pinky_daemon.schedule_fire_trace import ScheduleFireTrace, trace_event
 
     path = str(tmp_path / "migration.db")
-    with sqlite3.connect(path) as db:
+    with sqlite3.connect(ScheduleFireTrace.path_for(path)) as db:
         db.execute("""CREATE TABLE schedule_fire_trace (
             schedule_id INTEGER NOT NULL, fired_at REAL NOT NULL,
             PRIMARY KEY(schedule_id,fired_at))""")
