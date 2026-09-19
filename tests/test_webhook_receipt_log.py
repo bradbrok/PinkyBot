@@ -221,7 +221,7 @@ class TestAccessLogTokenRedaction:
         )
         assert len(access_capture) == 1
         assert TOKEN not in access_capture[0]
-        assert f"/hooks/{TOKEN[:8]}*" in access_capture[0]
+        assert "/hooks/<redacted>" in access_capture[0]
 
     def test_non_hook_paths_pass_through_unchanged(self, access_capture):
         logging.getLogger("uvicorn.access").info(
@@ -253,7 +253,7 @@ class TestAccessLogTokenRedaction:
         self, monkeypatch, capfd
     ):
         """End-to-end with the production log config: the emitted access
-        record must carry the token prefix, never the full credential."""
+        record must redact the entire credential segment."""
         import threading
         import urllib.request
 
@@ -295,7 +295,7 @@ class TestAccessLogTokenRedaction:
             thread.join(timeout=15)
         assert "/hooks/" in emitted, "no access-log line observed"
         assert TOKEN not in emitted
-        assert f"/hooks/{TOKEN[:8]}*" in emitted
+        assert "/hooks/<redacted>" in emitted
 
 
 def _balanced_call(text: str, open_paren_index: int) -> str:
