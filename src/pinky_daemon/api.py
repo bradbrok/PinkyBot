@@ -4793,6 +4793,7 @@ def create_api(
                     sender = getattr(ss, "send_scheduler_prompt", None)
                     if callable(sender):
                         if schedule_receipt is not None and "on_accept" in inspect.signature(sender).parameters:
+                            # Preserve the bound method: trace hooks recover its exact fire owner.
                             kwargs["on_accept"] = schedule_receipt.accept
                         return ss, await sender(prompt, **kwargs)
                 result = await ss.send(prompt, **kwargs)
@@ -12585,6 +12586,7 @@ npm run build</pre>
                 try:
                     signature = inspect.signature(scheduler_send)
                     if "on_accept" in signature.parameters:
+                        # Preserve the bound method: trace hooks recover its exact fire owner.
                         scheduler_kwargs["on_accept"] = (
                             schedule_receipt.accept
                         )

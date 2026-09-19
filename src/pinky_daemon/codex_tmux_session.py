@@ -113,6 +113,7 @@ class CodexTmuxSession(TmuxSession):
     # path's default (CodexSession._analytics_log_turn_usage) and
     # analytics_store._provider_alias maps it onto the openai rate rows.
     _ANALYTICS_PROVIDER = "codex_cli"
+    _trace_transport_kind = "tmux_codex"
 
     def _reported_context_window(self) -> int:
         """Return the latest positive window reported by the Codex rollout."""

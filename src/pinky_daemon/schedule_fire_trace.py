@@ -167,8 +167,8 @@ class ScheduleFireTrace:
         logger.warning("schedule fire trace failed: schedule=%s fire=%s edge=%s (%s)",
                        row["schedule_id"], row["fired_at"], row["edge"], row["reason"])
 
-    def _connect(self):
-        db = sqlite3.connect(self.path, timeout=0)
+    def _connect(self, *, timeout=0):
+        db = sqlite3.connect(self.path, timeout=timeout)
         db.row_factory = sqlite3.Row
         db.execute("PRAGMA mmap_size=0")
         return db
@@ -363,7 +363,7 @@ class ScheduleFireTrace:
         return True
 
     def failures(self, since=0):
-        db = self._connect()
+        db = self._connect(timeout=1.0)
         try:
             records = {r["event_id"]: dict(r)
                        for r in db.execute("SELECT * FROM schedule_fire_trace_failures WHERE failed_at>=?", (since,)) }
@@ -381,7 +381,7 @@ class ScheduleFireTrace:
         return counts
 
     def report(self, *, since=0, agent=None, schedule_id=None, outcome=None):
-        db = self._connect()
+        db = self._connect(timeout=1.0)
         try:
             records = [dict(r) for r in db.execute("""SELECT t.*, w.accepted_at AS current_accepted_at,
                 w.attempts AS current_attempts FROM schedule_fire_trace t

@@ -2015,6 +2015,7 @@ class TmuxSession(TransportReplacementMixin):
     # CodexTmuxSession. See
     # MessageBroker.injection_confirms_consumption.
     injection_confirms_consumption: bool = False
+    _trace_transport_kind = "tmux_claude"
 
     def __init__(
         self,
@@ -10344,10 +10345,15 @@ class TmuxSession(TransportReplacementMixin):
     def _trace_observed_prompt(self, prompt, *, pointer) -> None:
         # Observe separately from the acceptance matcher: matching failure is
         # itself a diagnostic class. Do not grant or change receipt authority.
+        occupied: list[tuple[int, int]] = []
         for turn in self._acceptance_candidates():
-            if turn.pane_delivery_started and turn.prompt == prompt:
-                self._trace_scheduler_turn(turn, "observed", pointer=pointer)
-                break
+            if not turn.pane_delivery_started:
+                continue
+            span = self._first_unoccupied_prompt_span(prompt, turn.prompt, occupied)
+            if span is None:
+                continue
+            occupied.append(span)
+            self._trace_scheduler_turn(turn, "observed", pointer=pointer)
 
     def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
         """Resolve exact receipts only on observed pane acceptance."""
@@ -11493,7 +11499,7 @@ class TmuxSession(TransportReplacementMixin):
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
         self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,
-                                   transport_kind=("tmux_codex" if self.__class__.__name__ == "CodexTmuxSession" else "tmux_claude"),
+                                   transport_kind=self._trace_transport_kind,
                                    pointer=json.dumps({
                                        "path": str(turn.transcript_path_at_paste or _tpath or ""),
                                        "offset": turn.transcript_offset_at_paste,
