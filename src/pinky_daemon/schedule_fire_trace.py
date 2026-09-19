@@ -455,6 +455,7 @@ class ScheduleFireTrace:
                             ORDER BY updated_at LIMIT 500)""",
                             (cutoff,),
                         ).rowcount
+                    with db:
                         failures = db.execute(
                             """DELETE FROM schedule_fire_trace_failures WHERE event_id IN (
                             SELECT event_id FROM schedule_fire_trace_failures WHERE failed_at < ?
