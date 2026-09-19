@@ -283,7 +283,6 @@ def test_t6_exception_logged_and_reraised(factory):
 @pytest.mark.parametrize("fault", ["directory", "closed_fd"])
 def test_t7_write_failure_is_counted_and_throttled(factory, monkeypatch, tmp_path, fault):
     import pinky_daemon.access_log as access_log
-
     import pinky_daemon.api as api
 
     clock = [100.0]
@@ -387,7 +386,6 @@ def test_denial_responses_have_security_headers(factory, target, status):
 
 def test_t8_concurrent_rotation_never_loses_lines(tmp_path):
     from pinky_daemon.access_log import AccessLogWriter
-
     from pinky_daemon.log_rotation import LogRotator
 
     path = tmp_path / "access.log"
@@ -458,3 +456,40 @@ def test_t1_writer_uses_one_append_write_per_line(tmp_path, monkeypatch):
         assert json.loads(calls[0]) == {"sample": "value"}
     finally:
         writer.close()
+
+
+@pytest.mark.parametrize("segment,decoded", [
+    ("prefix%20planted-secret", "prefix planted-secret"),
+    ("prefix%09planted-secret", "prefix\tplanted-secret"),
+    ("prefix%3Fplanted-secret", "prefix?planted-secret"),
+    ("", ""),
+    ("planted-secret" * 100, "planted-secret" * 100),
+])
+def test_t3_credential_position_redacts_any_segment_bytes(factory, segment, decoded):
+    from pinky_daemon.access_log import redact_path
+
+    client, path = factory()
+    client.get("/hooks/" + segment)
+    [row] = rows(path)
+    assert row["path"] == "/hooks/<redacted>"
+    assert redact_path("/hooks/" + decoded) == "/hooks/<redacted>"
+    assert "planted-secret" not in path.read_text()
+
+
+def test_t3_question_mark_in_asgi_path_is_a_credential_byte(factory):
+    client, path = factory()
+    app = client.app
+
+    async def raw_path_app(scope, receive, send):
+        scope = dict(scope, path="/p/prefix?planted-secret",
+                     raw_path=b"/p/prefix%3Fplanted-secret", query_string=b"")
+        await app(scope, receive, send)
+
+    raw_client = TestClient(raw_path_app)
+    try:
+        raw_client.get("/probe")
+    finally:
+        raw_client.close()
+    [row] = rows(path)
+    assert row["path"] == "/p/<redacted>" and row["qk"] == []
+    assert "planted-secret" not in path.read_text()
