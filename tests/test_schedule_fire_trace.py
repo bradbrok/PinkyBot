@@ -585,3 +585,83 @@ async def test_t1_sdk_pointer_uses_session_submission_sequence(tmp_path):
         assert 0 < pointers[0]["submit_seq"] < pointers[1]["submit_seq"]
     finally:
         registry.close()
+
+
+async def test_t1_folded_user_row_is_observed_without_matchers(registry, tmp_path, monkeypatch):
+    from pinky_daemon.tmux_session import _QueuedTurn
+
+    registry.update("worker", transport="tmux")
+    tmux = MagicMock(spec=_TmuxControl)
+    tmux.session_name = "test-fold-trace"
+    ok = TmuxCommandResult(returncode=0, stdout="", stderr="")
+    tmux.paste_text = AsyncMock(return_value=ok)
+    tmux.has_session = AsyncMock(return_value=False)
+    tmux.kill_session = AsyncMock(return_value=ok)
+    session = TmuxSession(StreamingSessionConfig(agent_name="worker", working_dir=str(tmp_path)),
+                          tmux_control=tmux)
+    session._state_machine._state = SessionState.CONNECTED
+    monkeypatch.setattr(session, "_context_lock_path", lambda: tmp_path / "absent.lock")
+    monkeypatch.setattr(session, "_wait_for_scheduler_delivery_slot", AsyncMock())
+    monkeypatch.setattr(session, "_scheduler_pane_busy", lambda *a: False)
+    path = tmp_path / "folded.jsonl"
+    path.touch()
+    session._tailer = TmuxTranscriptTailer(path, session._handle_turn_complete,
+                                          on_entry=session._on_transcript_entry)
+    receipts = []
+    try:
+        for prompt in ("first scheduled prompt", "second scheduled prompt"):
+            _, durable = fire(registry, prompt=prompt, name=prompt)
+            receipt = asyncio.get_running_loop().create_future()
+            receipts.append(receipt)
+            await session._deliver_turn(_QueuedTurn(
+                prompt, scheduler_accept=durable.accept, scheduler_delivery=receipt,
+                scheduler_serialized=True,
+            ))
+        monkeypatch.setattr(session, "_match_acceptance_content", lambda *a, **k: None)
+        monkeypatch.setattr(session, "_folded_acceptance_turns", lambda *a, **k: [])
+        with path.open("a") as stream:
+            stream.write(json.dumps({"type": "user", "message": {
+                "role": "user", "content": "first scheduled prompt\nsecond scheduled prompt",
+            }}) + "\n")
+        await session._tailer.read_once()
+        records = rows(registry)
+        assert len(records) == 2
+        assert all(row["user_message_observed_at"] > 0 for row in records)
+        assert [row["outcome"] for row in records] == ["observer_unmatched"] * 2
+        assert all(not receipt.done() for receipt in receipts)
+    finally:
+        await session.disconnect()
+
+
+def test_t6_readers_tolerate_transient_exclusive_commit(tmp_path):
+    from pinky_daemon.api import create_api
+
+    app = create_api(db_path=str(tmp_path / "read-contention.db"))
+    registry = app.state.agents
+    registry.register("worker", working_dir=str(tmp_path / "worker"))
+    fire(registry)
+    worker_connection = registry._fire_trace._connect()
+    assert worker_connection.execute("PRAGMA busy_timeout").fetchone()[0] == 0
+    worker_connection.close()
+    client = TestClient(app)
+    try:
+        for endpoint in ("/scheduler/status", "/scheduler/fire-trace"):
+            lock = sqlite3.connect(registry._db_path, timeout=0, check_same_thread=False)
+            lock.execute("BEGIN EXCLUSIVE")
+            timer = threading.Timer(0.1, lock.rollback)
+            timer.start()
+            try:
+                response = client.get(endpoint)
+                assert response.status_code == 200
+                if endpoint.endswith("status"):
+                    assert "fire_trace_24h" in response.json()
+                    assert "trace_write_failures_24h" in response.json()
+                else:
+                    assert len(response.json()["rows"]) == 1
+            finally:
+                timer.join()
+                lock.rollback()
+                lock.close()
+    finally:
+        client.close()
+        registry.close()
