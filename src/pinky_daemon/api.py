@@ -1804,6 +1804,7 @@ def create_api(
     max_sessions: int = 50,
     default_working_dir: str = ".",
     db_path: str = "data/conversations.db",
+    access_log_path: str | Path | None = None,
 ) -> FastAPI:
     """Create the FastAPI application."""
     from pinky_daemon.tmux_session import _WakeLaunchHistory
@@ -1922,23 +1923,6 @@ def create_api(
                            "X-Internal-Timestamp", "X-Internal-Signature"],
             max_age=3600,
         )
-
-    # ── Security Headers ──────────────────────────────────
-    @app.middleware("http")
-    async def security_headers_middleware(request: Request, call_next):
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
-        response = await call_next(request)
-        response.headers["X-Content-Type-Options"] = "nosniff"
-        response.headers["X-Frame-Options"] = "DENY"
-        response.headers["X-XSS-Protection"] = "1; mode=block"
-        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
-        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
-        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
-        proto = request.headers.get("x-forwarded-proto", "")
-        if proto == "https" or request.url.scheme == "https":
-            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
-        return response
 
     session_store = SessionStore(db_path=store_manifest["sessions"].path, catalog=store_catalog)
     session_event_store = SessionEventStore(
@@ -5305,8 +5289,6 @@ def create_api(
         "/a/",
         # Twilio voice callbacks — authenticated via X-Twilio-Signature, not session
         "/api/voice/twiml/", "/api/voice/status/", "/api/voice/amd/",
-        # ConversationRelay WebSocket — auth via session-ID-in-path (opaque UUID)
-        "/ws/voice/",
         # Google OAuth callback — Google's redirect arrives cross-site WITHOUT our
         # SameSite=strict cookie; the route self-authenticates via a one-time state
         # nonce. Must stay public even though the rest of /calendar is now protected.
@@ -5762,9 +5744,10 @@ def create_api(
         path = request.url.path
 
         # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
-        #    callbacks, ConversationRelay WS — these are authenticated by
+        #    callbacks — these are authenticated by
         #    other means or are intentionally open).
         if _is_public_path(path):
+            request.state.auth_gate = "public"
             return await call_next(request)
 
         # 2. HMAC-signed internal request (agent-to-daemon, hook scripts).
@@ -5774,6 +5757,7 @@ def create_api(
             caller = request.headers.get(INTERNAL_AGENT_HEADER, "")
             request.state.internal_caller = caller
             if _internal_isolation_denied(request, caller):
+                request.state.auth_gate = "deny_isolation"
                 error = "isolated agent may only access its own resources"
                 if _isolation_fleet_write(request.method, request.url.path):
                     error = (
@@ -5787,18 +5771,27 @@ def create_api(
                     status_code=403,
                     content=content,
                 )
+            request.state.auth_gate = "internal_hmac"
             return await call_next(request)
 
         # 3. Valid session cookie → through. Pulled up from the per-path
         #    branches below so a logged-in browser session passes the same
         #    way regardless of which protected surface is being hit.
-        if _has_valid_session(request):
+        session_secret = _session_secret()
+        session = (
+            verify_session_cookie(session_secret, request.cookies.get(SESSION_COOKIE_NAME, ""))
+            if session_secret else None
+        )
+        if session:
+            request.state.auth_gate = "session"
+            request.state.auth_user = session.get("user") or "-"
             return await call_next(request)
 
         # 4. Protected HTML pages: unauth → 307 redirect to /login (or
         #    /setup before first password is set). Different shape from
         #    the JSON 401 because this is hit by the browser navigating.
         if path in _protected_html_paths:
+            request.state.auth_gate = "redirect_login"
             next_target = _sanitize_next(str(request.url.path) + (f"?{request.url.query}" if request.url.query else ""))
             destination = "/setup" if _setup_required() else "/login"
             return RedirectResponse(url=f"{destination}?next={urllib.parse.quote(next_target, safe='/%#?=&')}", status_code=307)
@@ -5808,6 +5801,7 @@ def create_api(
         #    auth-status info for frontend UX. This is what the SPA reads
         #    to decide whether to show /login vs /setup.
         if _needs_browser_api_auth(request):
+            request.state.auth_gate = "deny_browser_api"
             return JSONResponse(
                 status_code=401,
                 content={
@@ -5844,6 +5838,7 @@ def create_api(
         #    leak, and 401-ing every unmapped path was a UX regression
         #    in v2 of this PR.
         if path.startswith(_protected_api_prefixes):
+            request.state.auth_gate = "deny_protected_prefix"
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
 
         # 7. Deny-by-default (#506). Anything still here is unauthenticated, not
@@ -5853,7 +5848,9 @@ def create_api(
         #    without auth. Genuinely-public routes are added to _public_* (e.g.
         #    the /a/ app viewer) so they pass at step 1 and never reach here.
         if _auth_deny_mode == "enforce":
+            request.state.auth_gate = "deny_default"
             return JSONResponse(status_code=401, content={"detail": "Unauthorized"})
+        request.state.auth_gate = "shadow_passthrough"
         if _auth_deny_mode == "shadow":
             _log(f"auth: would-deny (shadow) {request.method} {path}")
         return await call_next(request)
@@ -6035,10 +6032,23 @@ def create_api(
 
     _SLOW_REQUEST_MS = 500  # noqa: N806 — log requests slower than this
 
+    # ── Security Headers ──────────────────────────────────
+    @app.middleware("http")
+    async def security_headers_middleware(request: Request, call_next):
+        response = await call_next(request)
+        response.headers["X-Content-Type-Options"] = "nosniff"
+        response.headers["X-Frame-Options"] = "DENY"
+        response.headers["X-XSS-Protection"] = "1; mode=block"
+        response.headers["Referrer-Policy"] = "strict-origin-when-cross-origin"
+        response.headers["Permissions-Policy"] = "camera=(), microphone=(), geolocation=()"
+        # HSTS only when behind TLS (reverse proxy sets X-Forwarded-Proto)
+        proto = request.headers.get("x-forwarded-proto", "")
+        if proto == "https" or request.url.scheme == "https":
+            response.headers["Strict-Transport-Security"] = "max-age=31536000; includeSubDomains"
+        return response
+
     @app.middleware("http")
     async def timing_middleware(request: Request, call_next):
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
         start = time.time()
         response = await call_next(request)
         elapsed_ms = (time.time() - start) * 1000
@@ -7206,6 +7216,11 @@ npm run build</pre>
         return {"disabled": True, "agent": name, "skill": skill_name}
 
     # ── System Settings ────────────────────────────────────
+
+    @app.get("/system/health")
+    async def system_health():
+        """Authenticated access-log availability and counted receipt gaps."""
+        return {"access_log": app.state.access_log.status()}
 
     @app.get("/system/timezone")
     async def get_default_timezone():
@@ -13491,6 +13506,16 @@ npm run build</pre>
                     app.state.log_rotation_task = asyncio.create_task(
                         run_rotation_loop(_api_log)
                     )
+                if app.state.access_log.enabled:
+                    app.state.access_log_rotation_task = asyncio.create_task(
+                        run_rotation_loop(
+                            app.state.access_log.path,
+                            backup_days=access_log_retention_days,
+                            max_bytes=200 * 1024 * 1024,
+                            mode="rename",
+                            on_rotate=app.state.access_log.reopen,
+                        )
+                    )
             except Exception as exc:  # never let log rotation abort startup
                 _log(f"startup: log rotation not started ({exc})")
 
@@ -13872,6 +13897,11 @@ npm run build</pre>
         import json as _json
         from datetime import datetime, timezone
 
+        rotation_task = getattr(app.state, "access_log_rotation_task", None)
+        if rotation_task is not None:
+            rotation_task.cancel()
+            await asyncio.gather(rotation_task, return_exceptions=True)
+        app.state.access_log.close()
         await broker.stop_approval_notification_retries()
 
         # Write restart manifest before disconnecting — captures each agent's in-progress state
@@ -15318,6 +15348,27 @@ npm run build</pre>
     except ImportError:
         pass
 
+    from pinky_daemon.access_log import AccessLogWriter, request_record
+
+    @app.middleware("http")
+    async def access_log_middleware(request: Request, call_next):
+        rid = uuid.uuid4().hex
+        request.state.request_id = rid
+        started = time.monotonic()
+        try:
+            response = await call_next(request)
+        except Exception as exc:
+            app.state.access_log.write(request_record(
+                request, rid=rid, status=500, duration=time.monotonic() - started,
+                error=type(exc).__name__,
+            ))
+            raise
+        response.headers["X-Request-ID"] = rid
+        app.state.access_log.write(request_record(
+            request, rid=rid, status=response.status_code, duration=time.monotonic() - started,
+        ))
+        return response
+
     # Installed last so this pure-ASGI layer wraps every BaseHTTPMiddleware
     # registered above.  Its final-body ``send`` return is the deterministic
     # response-delivery barrier used by context_restart.
@@ -15335,4 +15386,15 @@ npm run build</pre>
     storage_observability.record_boot_success(store_catalog.snapshot(), warnings)
     storage_observability.arm_runtime()
 
+    try:
+        access_log_retention_days = int(os.environ.get("PINKY_ACCESS_LOG_RETENTION_DAYS", "90"))
+        if access_log_retention_days < 1:
+            raise ValueError
+    except ValueError:
+        _log("ACCESS LOG: invalid retention days; using 90")
+        access_log_retention_days = 90
+    app.state.access_log = AccessLogWriter(
+        access_log_path if access_log_path is not None else os.environ.get("PINKY_ACCESS_LOG", "logs/access.log"),
+        log=_log,
+    )
     return app

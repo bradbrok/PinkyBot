@@ -2,7 +2,7 @@
 
 Walks ``app.routes`` from a real ``create_api`` instance (post-prefix-resolution)
 and classifies each route as PROTECTED-API / PROTECTED-HTML / PUBLIC-exact /
-PUBLIC-prefix / UNCLASSIFIED.
+PUBLIC-prefix / WS-handler-auth / UNCLASSIFIED.
 
 UNCLASSIFIED is the deny-by-default gap (#506): a path that is neither public
 nor under a protected prefix falls through the auth middleware to the route.
@@ -12,6 +12,9 @@ must be classified. This script is the basis for the regression test
 
 The classification sets are read from ``app.state.auth_route_sets`` — the EXACT
 tuples the auth middleware uses — so this audit never drifts from the gate.
+WebSockets bypass that middleware. The voice handler authenticates its opaque
+session identifier itself; its exact route is classified separately. Unknown
+WebSocket routes remain unclassified until their handler policy is audited.
 
 Usage:
     python3 scripts/audit_route_auth_coverage.py
@@ -54,13 +57,22 @@ def collect(app) -> tuple[list[tuple[str, str]], dict]:
 
 
 def classifier(sets: dict):
-    """Build a classify(path)->label fn from app.state.auth_route_sets."""
+    """Classify HTTP policy or an explicitly audited WebSocket handler."""
     public_exact = sets["public_exact"]
     public_prefixes = tuple(sets["public_prefixes"])
     protected_html = sets["protected_html"]
     protected_api = tuple(sets["protected_api_prefixes"])
 
-    def classify(path: str) -> str:
+    def classify(path: str, *, kind: str = "HTTP") -> str:
+        if kind == "WS":
+            if path == "/ws/voice/{call_session_id}":
+                # The opaque session UUID is the path credential. The handler
+                # voice_routes.conversationrelay_ws rejects unknown, inactive,
+                # or duplicate sessions with 400x close codes. Dispatch and the
+                # separate HTTP denial are pinned by tests/test_access_log.py::
+                # test_voice_websocket_dispatch_is_unchanged.
+                return "WS-handler-auth"
+            return "UNCLASSIFIED"
         if path in public_exact:
             return "PUBLIC-exact"
         if path.startswith(public_prefixes):
@@ -94,7 +106,7 @@ def audit() -> list[tuple[str, str]]:
     app = build_app()
     routes, sets = collect(app)
     classify = classifier(sets)
-    unclass = [(k, p) for (k, p) in routes if classify(p) == "UNCLASSIFIED"]
+    unclass = [(k, p) for (k, p) in routes if classify(p, kind=k) == "UNCLASSIFIED"]
     return sorted(set(unclass), key=lambda x: x[1])
 
 
@@ -105,7 +117,7 @@ def main() -> int:
 
     by_class: dict[str, list[tuple[str, str]]] = defaultdict(list)
     for kind, path in routes:
-        by_class[classify(path)].append((kind, path))
+        by_class[classify(path, kind=kind)].append((kind, path))
 
     print(f"Total callable routes: {len(routes)}")
     print(f"Classes: {dict((k, len(v)) for k, v in by_class.items())}")
