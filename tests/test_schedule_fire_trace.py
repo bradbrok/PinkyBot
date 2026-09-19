@@ -42,8 +42,8 @@ def registry(tmp_path):
     registry.close()
 
 
-def fire(registry, *, age=10, prompt="scheduled work", claim=False):
-    schedule = registry.add_schedule("worker", "*/5 * * * *", name="recurring", prompt=prompt)
+def fire(registry, *, age=10, prompt="scheduled work", claim=False, name="recurring"):
+    schedule = registry.add_schedule("worker", "*/5 * * * *", name=name, prompt=prompt)
     fired_at = time.time() - age
     if claim:
         claimed, pending = registry.claim_schedule_fire(
@@ -56,6 +56,7 @@ def fire(registry, *, age=10, prompt="scheduled work", claim=False):
             schedule.id, agent_name="worker", schedule_name=schedule.name,
             prompt=prompt, fired_at=fired_at,
         )
+    flush(registry)
     return pending, ScheduleWakeReceipt(registry, schedule.id, fired_at)
 
 
@@ -143,6 +144,7 @@ async def test_t1_observer_is_independent_of_matcher(pane, monkeypatch):
     _, durable = fire(pane.registry)
     _, receipt = await paste(pane, durable)
     monkeypatch.setattr(pane.session, "_match_acceptance_content", lambda *a, **k: None)
+    monkeypatch.setattr(pane.session, "_folded_acceptance_turns", lambda *a, **k: [])
     await observe(pane)
     record, = rows(pane.registry)
     assert record["user_message_observed_at"] > 0
@@ -229,6 +231,7 @@ def test_t1_ledger_and_idle_edges(registry, monkeypatch, edge):
     elif edge in {"drain_park", "release"}:
         registry.drain_park_pending_schedule_wake(pending.id)
         if edge == "release":
+            flush(registry)
             assert registry.release_drain_parked_schedule_wakes("worker") == 1
     elif edge == "reaper":
         reap(registry, time.time(), abandon_after=50)
@@ -268,7 +271,9 @@ def test_t2_late_accept_keeps_abandonment(registry):
     pending, durable = fire(registry, age=1800)
     abandoned_at = time.time() - 1
     registry.abandon_pending_schedule_wake(pending.id, abandoned_at=abandoned_at)
+    flush(registry)
     assert durable.accept()
+    flush(registry)
     assert durable.accept()
     record, = rows(registry)
     assert record["abandoned_at"] == abandoned_at
@@ -415,7 +420,13 @@ def test_t6_api_filters_counts_and_auth(tmp_path):
         for params in [{"agent": "missing"}, {"schedule_id": -1},
                        {"outcome": "never_pasted"}, {"since": time.time() + 1}]:
             assert client.get("/scheduler/fire-trace", params=params).json()["rows"] == []
+        waiting, _ = fire(registry, name="waiting recurrence")
         status = client.get("/scheduler/status").json()
+        assert status["fire_trace_24h"]["pending"] == 1
+        assert status["fire_trace_24h"]["never_pasted"] == 0
+        pending_rows = client.get("/scheduler/fire-trace", params={"outcome": "pending"}).json()
+        assert [r["fire_id"] for r in pending_rows["rows"]] == [waiting.id]
+        assert client.get("/scheduler/fire-trace", params={"outcome": "never_pasted"}).json()["rows"] == []
         assert status["fire_trace_24h"]["delivered"] == 1
         assert status["fire_trace_24h"]["trace_incomplete"] == 0
         assert sum(status["trace_write_failures_24h"].values()) == 0
