@@ -74,7 +74,7 @@ class HookTokenRedactionFilter(logging.Filter):
                 _redact_hook_path(arg) if isinstance(arg, str) else arg
                 for arg in record.args
             )
-        if isinstance(record.msg, str) and "/hooks/" in record.msg:
+        if isinstance(record.msg, str):
             record.msg = _redact_hook_path(record.msg)
         return True
 

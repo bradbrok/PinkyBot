@@ -4,6 +4,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import stat
 import threading
 from datetime import datetime, timezone
 from pathlib import Path
@@ -36,7 +37,7 @@ def safe_identity(value: str | None) -> str | None:
 
 
 class AccessLogWriter:
-    """One append syscall per receipt, serialized with descriptor replacement.
+    """Append receipts, serialized with partial-write recovery and fd replacement.
 
     Rename rotation hands off the descriptor before compressing the old inode.
     The lock drains any in-progress append before closing that inode; subsequent
@@ -52,6 +53,7 @@ class AccessLogWriter:
         self._last_error = float("-inf")
         self._off = self.path.strip().lower() == "off"
         self._closed = False
+        self._damaged = False
         if self._off:
             self._console("ACCESS LOG OFF: HTTP receipts are disabled")
         else:
@@ -82,10 +84,18 @@ class AccessLogWriter:
         with self._lock:
             if self._off or self._closed:
                 return
+            if self._damaged:
+                raise OSError("access log disabled after failed append rollback")
             path = Path(self.path)
             path.parent.mkdir(parents=True, exist_ok=True)
-            fd = os.open(path, os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+            fd = os.open(
+                path,
+                os.O_WRONLY | os.O_APPEND | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK,
+                0o600,
+            )
             try:
+                if not stat.S_ISREG(os.fstat(fd).st_mode):
+                    raise OSError("access log must be a regular file")
                 os.fchmod(fd, 0o600)
             except BaseException:
                 os.close(fd)
@@ -98,13 +108,29 @@ class AccessLogWriter:
         with self._lock:
             if self._off or self._closed:
                 return
+            offset = None
             try:
                 if self.fd is None:
                     raise OSError("access log unavailable")
                 data = (json.dumps(record, ensure_ascii=True, separators=(",", ":")) + "\n").encode("utf-8")
-                if os.write(self.fd, data) != len(data):
-                    raise OSError("short access log write")
+                offset = os.fstat(self.fd).st_size
+                remaining = data
+                while remaining:
+                    written = os.write(self.fd, remaining)
+                    if written <= 0:
+                        raise OSError("access log write made no progress")
+                    remaining = remaining[written:]
             except Exception as exc:
+                if offset is not None:
+                    try:
+                        os.ftruncate(self.fd, offset)
+                    except OSError:
+                        self._damaged = True
+                        fd, self.fd = self.fd, None
+                        try:
+                            os.close(fd)
+                        except OSError:
+                            pass
                 self.write_failures += 1
                 self._report_error(exc)
 

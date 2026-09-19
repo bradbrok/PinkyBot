@@ -144,6 +144,25 @@ class LogRotator:
         Returns the archive path if a rotation happened, else ``None``.
         Best-effort: any failure is logged and swallowed (returns ``None``).
         """
+        if self.mode == "rename":
+            # A process can stop after renaming but before descriptor handoff or
+            # compression. Drain any old descriptor before recovering that data.
+            try:
+                raw_pattern = re.compile(
+                    re.escape(self.log_path.name) + r"\.\d{4}-\d{2}-\d{2}(?:T\d{6}Z)?(?:\.\d+)?$"
+                )
+                for raw in sorted(self.log_path.parent.glob(f"{self.log_path.name}.*")):
+                    if raw_pattern.fullmatch(raw.name) and raw.is_file() and not raw.is_symlink():
+                        assert self.on_rotate is not None
+                        self.on_rotate()
+                        stamp = raw.name[len(self.log_path.name) + 1:]
+                        archive = _archive_path(self.log_path, stamp)
+                        self._compress_raw(raw, archive)
+                        self._prune()
+                        return archive
+            except Exception:
+                logger.exception("log_rotation: pending rotation recovery failed")
+                return None
         try:
             size = self.log_path.stat().st_size
         except FileNotFoundError:
@@ -189,7 +208,17 @@ class LogRotator:
             raise FileExistsError(raw)
         os.rename(self.log_path, raw)
         assert self.on_rotate is not None
-        self.on_rotate()
+        try:
+            self.on_rotate()
+        except Exception:
+            # The writer still owns the original descriptor. Restore its live
+            # pathname so subsequent appends and the next rotation can proceed.
+            os.rename(raw, self.log_path)
+            raise
+        self._compress_raw(raw, archive)
+
+    @staticmethod
+    def _compress_raw(raw: Path, archive: Path) -> None:
         tmp = archive.with_name(archive.name + ".part")
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
         try:
