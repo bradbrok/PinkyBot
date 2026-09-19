@@ -1,10 +1,12 @@
 """Access receipt recovery must preserve valid records and unrelated files."""
 
 import gzip
+import hashlib
 import json
 import logging
 import os
 import stat
+import time
 
 import pytest
 
@@ -62,6 +64,39 @@ def test_rotation_recovers_crash_between_rename_and_handoff(tmp_path):
         assert json.loads(gzip.decompress(archive.read_bytes())) == {"before": 1}
         assert _records(path) == [{"after": 2}]
         assert stat.S_IMODE(archive.stat().st_mode) == 0o600
+    finally:
+        writer.close()
+
+
+@pytest.mark.parametrize("published", [False, True])
+def test_interrupted_compression_recovers_once_and_prunes(tmp_path, published):
+    path = tmp_path / "access.log"
+    raw = tmp_path / "access.log.2026-09-19T120000Z"
+    raw.write_bytes(b'{"before":1}\n')
+    raw.chmod(0o600)
+    archive = raw.with_name(raw.name + ".gz")
+    partial = archive.with_name(archive.name + ".part")
+    if published:
+        archive.write_bytes(gzip.compress(raw.read_bytes()))
+        archive.chmod(0o600)
+        digest = hashlib.sha256(archive.read_bytes()).hexdigest()
+    else:
+        partial.write_bytes(b"incomplete compressed bytes")
+    old = path.with_name(path.name + ".expired.gz")
+    old.write_bytes(b"old archive")
+    os.utime(old, (time.time() - 91 * 86400,) * 2)
+    writer = AccessLogWriter(path, log=lambda _: None)
+    try:
+        writer.write({"after": 2})
+        rotator = LogRotator(path, mode="rename", on_rotate=writer.reopen, backup_days=90)
+        assert rotator.check_and_rotate() == archive
+        assert not raw.exists() and not partial.exists() and not old.exists()
+        assert list(tmp_path.glob("access.log.*.gz")) == [archive]
+        assert json.loads(gzip.decompress(archive.read_bytes())) == {"before": 1}
+        if published:
+            assert hashlib.sha256(archive.read_bytes()).hexdigest() == digest
+        writer.write({"after": 3})
+        assert _records(path) == [{"after": 2}, {"after": 3}]
     finally:
         writer.close()
 
