@@ -3,6 +3,7 @@
 import asyncio
 import hashlib
 import json
+import os
 import sqlite3
 import threading
 import time
@@ -117,7 +118,7 @@ def test_t1_enqueue_identity_and_hash(registry, claim):
     assert record["enqueued_at"] == pending.created_at
     assert record["prompt_hash"] == hashlib.sha256(pending.prompt.encode()).hexdigest()[:12]
     assert record["transport_kind"] == "sdk"
-    assert record["outcome"] == "never_pasted"
+    assert record["outcome"] == "pending"
     registry.persist_schedule_wake(pending.schedule_id, agent_name="worker",
                                    schedule_name="recurring", prompt=pending.prompt,
                                    fired_at=pending.fired_at)
@@ -238,7 +239,7 @@ def test_t1_ledger_and_idle_edges(registry, monkeypatch, edge):
     record, = rows(registry)
     if edge == "idle_replay":
         assert record["replay_count"] == 1
-        assert record["outcome"] == "never_pasted"
+        assert record["outcome"] == "pending"
     else:
         assert record["abandoned_at"] > 0
         assert record["abandon_reason"] == {
@@ -298,7 +299,8 @@ def test_t3_independent_retention_and_restart(registry):
 
 
 @pytest.mark.parametrize("evidence,ledger,expected", [
-    ({}, {}, "never_pasted"),
+    ({}, {}, "pending"),
+    ({"abandoned_at": 105}, {}, "never_pasted"),
     ({"drain_parked_at": 105}, {}, "drain_parked"),
     ({"drain_parked_at": 105, "released_at": 110}, {}, "never_pasted"),
     ({"paste_at": 105}, {}, "producer_no_user_turn"),
@@ -325,6 +327,11 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
     pending, durable = fire(pane.registry)
     flush(pane.registry)
     writer = pane.registry._fire_trace
+    connection = writer._connect()
+    try:
+        assert connection.execute("PRAGMA busy_timeout").fetchone()[0] == 0
+    finally:
+        connection.close()
     original = writer._write
     entered = threading.Event()
     release = threading.Event()
@@ -360,7 +367,12 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
         lock.execute("BEGIN IMMEDIATE")
         release.set()
     try:
-        flush(pane.registry)
+        busy_start = time.perf_counter()
+        if fault == "busy":
+            assert writer.flush(timeout=0.8), "trace writer waited for the registry lock"
+            assert time.perf_counter() - busy_start < 1
+        else:
+            flush(pane.registry)
     finally:
         if lock:
             lock.rollback()
@@ -384,7 +396,12 @@ def test_t6_api_filters_counts_and_auth(tmp_path):
     pending, durable = fire(registry)
     durable.accept()
     flush(registry)
+    from pinky_daemon.auth import SESSION_COOKIE_NAME, create_session_cookie
+
     client = TestClient(app)
+    cookie = create_session_cookie(os.environ["PINKY_SESSION_SECRET"], user="admin")
+    client.cookies.set(SESSION_COOKIE_NAME, cookie)
+    assert client.cookies.get(SESSION_COOKIE_NAME) == cookie
     try:
         response = client.get("/scheduler/fire-trace", params={
             "since": time.time() - 86400, "agent": "worker", "schedule_id": pending.schedule_id,
@@ -403,6 +420,7 @@ def test_t6_api_filters_counts_and_auth(tmp_path):
         assert status["fire_trace_24h"]["trace_incomplete"] == 0
         assert sum(status["trace_write_failures_24h"].values()) == 0
         client.cookies.clear()
+        assert SESSION_COOKIE_NAME not in client.cookies
         assert client.get("/scheduler/fire-trace").status_code == 401
     finally:
         client.close()
