@@ -326,7 +326,7 @@ def test_t4_outcome_truth_table(evidence, ledger, expected, replay_count):
     assert derive_outcome({"fired_at": 100, "replay_count": replay_count, **evidence}, ledger) == expected
 
 
-@pytest.mark.parametrize("fault", ["raise", "slow", "busy"])
+@pytest.mark.parametrize("fault", ["raise", "slow", "busy", "busy_transient"])
 @pytest.mark.parametrize("edge", ["paste", "accept"])
 async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, fault, edge):
     pending, durable = fire(pane.registry)
@@ -349,7 +349,7 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
                 raise RuntimeError("injected trace error")
             if fault == "slow":
                 time.sleep(2)
-            if fault == "busy":
+            if fault in {"busy", "busy_transient"}:
                 assert release.wait(3)
         return original(event)
 
@@ -367,25 +367,34 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
         assert receipt.result() is True
     assert elapsed < 0.5, "trace IO added wake-path latency"
     assert await asyncio.to_thread(entered.wait, 1)
-    if fault == "busy":
-        lock = sqlite3.connect(pane.registry._db_path, timeout=0)
+    timer = None
+    if fault in {"busy", "busy_transient"}:
+        lock = sqlite3.connect(pane.registry._db_path, timeout=0, check_same_thread=False)
         lock.execute("BEGIN IMMEDIATE")
+        if fault == "busy_transient":
+            timer = threading.Timer(0.1, lock.rollback)
+            timer.start()
         release.set()
     try:
         busy_start = time.perf_counter()
-        if fault == "busy":
+        if fault in {"busy", "busy_transient"}:
             assert writer.flush(timeout=0.8), "trace writer waited for the registry lock"
             assert time.perf_counter() - busy_start < 1
         else:
             flush(pane.registry)
     finally:
+        if timer:
+            timer.join()
         if lock:
             lock.rollback()
             lock.close()
     failures = writer.failure_counts(since=time.time() - 86400)
-    assert failures[edge] == 1
+    assert failures[edge] == (0 if fault == "busy_transient" else 1)
     errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
-    assert len(errors) == 1
+    assert len(errors) == (0 if fault == "busy_transient" else 1)
+    if fault == "busy_transient":
+        record, = rows(pane.registry)
+        assert record["paste_at" if edge == "paste" else "matched_at"] > 0
     if edge == "accept":
         assert pane.registry.get_schedule_wake_by_fire(
             pending.schedule_id, pending.fired_at,
