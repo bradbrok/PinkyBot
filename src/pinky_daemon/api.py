@@ -7049,6 +7049,64 @@ npm run build</pre>
         )
         return {"agent": name, "skills": [s.to_dict() for s in result], "count": len(result)}
 
+    @app.post("/agents/{name}/skills/apply")
+    @_locked_agent
+    async def apply_agent_skills(name: str):
+        """Re-materialize skills and restart the agent's streaming session.
+
+        This writes the updated .mcp.json, then restarts the current
+        streaming session only if the agent has a recent explicit
+        save_my_context() checkpoint from this session.
+        """
+        agent = agents.get(name)
+        if not agent:
+            raise HTTPException(404, f"Agent '{name}' not found")
+
+        work_dir = Path(agent.working_dir or default_working_dir).resolve()
+
+        # 1. Materialize skills
+        materialized = skills.materialize_for_agent(name)
+
+        # 2. Write file templates (don't overwrite existing files)
+        for rel_path, content in materialized.get("file_templates", {}).items():
+            file_path = (work_dir / rel_path).resolve()
+            # Security: prevent path traversal — file must stay within work_dir
+            if not file_path.is_relative_to(work_dir.resolve()):
+                _log(f"api: BLOCKED path traversal in skill template: {rel_path}")
+                continue
+            if not file_path.exists():
+                file_path.parent.mkdir(parents=True, exist_ok=True)
+                file_path.write_text(content)
+                _log(f"api: wrote skill template {rel_path} to {work_dir}")
+
+        # 3. Rewrite .mcp.json with skill servers
+        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
+
+        # 4. CLAUDE.md is agent-owned — don't overwrite on skill changes
+        # Dynamic parts (directives, skills, users) are injected at session start via system_prompt
+
+        # 5. Restart streaming session if one exists
+        restarted = False
+        streaming = broker._get_streaming_session(name)
+        if streaming:
+            guard = _get_streaming_restart_guard(name, streaming)
+            if not guard["restart_safe"]:
+                raise HTTPException(409, _guard_message("restart", guard))
+
+            # Close and restart
+            await _disconnect_streaming_sessions(name)
+            await _start_streaming_session(name)
+            restarted = True
+
+        return {
+            "applied": True,
+            "agent": name,
+            "mcp_servers": list(materialized.get("mcp_servers", {}).keys()),
+            "tool_patterns": materialized.get("tool_patterns", []),
+            "directives_count": len(materialized.get("directives", [])),
+            "session_restarted": restarted,
+        }
+
     @app.post("/agents/{name}/skills/{skill_name}")
     async def assign_agent_skill(
         name: str, skill_name: str, req: AssignSkillRequest, request: Request
@@ -7146,64 +7204,6 @@ npm run build</pre>
                 return {"disabled": True, "agent": name, "skill": skill_name, "opted_out": True}
             raise HTTPException(404, f"Skill '{skill_name}' not assigned to '{name}'")
         return {"disabled": True, "agent": name, "skill": skill_name}
-
-    @app.post("/agents/{name}/skills/apply")
-    @_locked_agent
-    async def apply_agent_skills(name: str):
-        """Re-materialize skills and restart the agent's streaming session.
-
-        This writes the updated .mcp.json, then restarts the current
-        streaming session only if the agent has a recent explicit
-        save_my_context() checkpoint from this session.
-        """
-        agent = agents.get(name)
-        if not agent:
-            raise HTTPException(404, f"Agent '{name}' not found")
-
-        work_dir = Path(agent.working_dir or default_working_dir).resolve()
-
-        # 1. Materialize skills
-        materialized = skills.materialize_for_agent(name)
-
-        # 2. Write file templates (don't overwrite existing files)
-        for rel_path, content in materialized.get("file_templates", {}).items():
-            file_path = (work_dir / rel_path).resolve()
-            # Security: prevent path traversal — file must stay within work_dir
-            if not file_path.is_relative_to(work_dir.resolve()):
-                _log(f"api: BLOCKED path traversal in skill template: {rel_path}")
-                continue
-            if not file_path.exists():
-                file_path.parent.mkdir(parents=True, exist_ok=True)
-                file_path.write_text(content)
-                _log(f"api: wrote skill template {rel_path} to {work_dir}")
-
-        # 3. Rewrite .mcp.json with skill servers
-        _write_mcp_json(work_dir, name, agent_registry=agents, skill_store=skills)
-
-        # 4. CLAUDE.md is agent-owned — don't overwrite on skill changes
-        # Dynamic parts (directives, skills, users) are injected at session start via system_prompt
-
-        # 5. Restart streaming session if one exists
-        restarted = False
-        streaming = broker._get_streaming_session(name)
-        if streaming:
-            guard = _get_streaming_restart_guard(name, streaming)
-            if not guard["restart_safe"]:
-                raise HTTPException(409, _guard_message("restart", guard))
-
-            # Close and restart
-            await _disconnect_streaming_sessions(name)
-            await _start_streaming_session(name)
-            restarted = True
-
-        return {
-            "applied": True,
-            "agent": name,
-            "mcp_servers": list(materialized.get("mcp_servers", {}).keys()),
-            "tool_patterns": materialized.get("tool_patterns", []),
-            "directives_count": len(materialized.get("directives", [])),
-            "session_restarted": restarted,
-        }
 
     # ── System Settings ────────────────────────────────────
 

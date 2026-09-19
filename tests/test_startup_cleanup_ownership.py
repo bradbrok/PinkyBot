@@ -18,15 +18,6 @@ async def invoke(h, entry):
     if entry == "container":
         lifecycle = closure_value(h.app, "_container_lifecycle")
         return await lifecycle.deps.start_session("sample")
-    if entry == "skills":
-        # Invoke the registered real handler: the earlier /skills/{skill_name}
-        # route otherwise captures the literal "apply" as a skill name.
-        endpoint = next(
-            r.endpoint
-            for r in h.app.routes
-            if getattr(r, "path", "") == "/agents/{name}/skills/apply"
-        )
-        return await endpoint(name="sample")
     route = {
         "post": "/agents/sample/streaming-sessions",
         "skills": "/agents/sample/skills/apply",

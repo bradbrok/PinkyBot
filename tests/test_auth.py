@@ -1145,27 +1145,6 @@ class TestAgentIsolationScoping:
     def _make_skill_catalog_client(self, monkeypatch, tmp_path):
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
 
-        # The static /skills/apply route is currently declared after the
-        # /skills/{skill_name} POST route, so FastAPI otherwise dispatches
-        # "apply" as a skill name and returns a missing-body 422. Route-order
-        # repair is tracked in #1202 and outside this PR; promote the existing
-        # static route in this fixture so signed effect checks exercise its
-        # real handler.
-        routes = client.app.router.routes
-        apply_route = next(
-            route
-            for route in routes
-            if getattr(route, "path", "") == "/agents/{name}/skills/apply"
-        )
-        assignment_index = next(
-            index
-            for index, route in enumerate(routes)
-            if getattr(route, "path", "") == "/agents/{name}/skills/{skill_name}"
-                and "POST" in (getattr(route, "methods", set()) or set())
-        )
-        routes.remove(apply_route)
-        routes.insert(assignment_index, apply_route)
-
         # /skills/from-md and /skills/from-git persist under _pinky_root. Keep
         # every effect test inside pytest's external scratch tree so a RED run
         # on the vulnerable base cannot clobber the live checkout (#1078).
@@ -1355,8 +1334,12 @@ class TestAgentIsolationScoping:
         assert resp.status_code != 403
         os.unlink(path)
 
-    def test_skill_apply_route_shadowing_documents_1202(self, monkeypatch, tmp_path):
-        """DOCUMENTS #1202: the earlier assignment route shadows static /apply."""
+    def test_isolated_agent_can_apply_own_skills(self, monkeypatch, tmp_path):
+        """Pin FIXED behavior: 200/applied=true from the real apply handler.
+
+        The old missing-body 422 was the bug: the earlier parameterized
+        assignment route captured the literal ``apply`` before this handler.
+        """
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
         try:
             response = self._signed_request(
@@ -1366,11 +1349,11 @@ class TestAgentIsolationScoping:
                 "/agents/tenant/skills/apply",
             )
 
-            assert response.status_code == 422, response.text
-            assert any(
-                error["type"] == "missing" and error["loc"] == ["body"]
-                for error in response.json()["detail"]
-            )
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert result["applied"] is True
+            assert result["agent"] == "tenant"
+            assert result["session_restarted"] is False
         finally:
             client.close()
             os.unlink(path)
