@@ -1335,7 +1335,11 @@ class TestAgentIsolationScoping:
         os.unlink(path)
 
     def test_isolated_agent_can_apply_own_skills(self, monkeypatch, tmp_path):
-        """Signed self-apply reaches the real handler through the registered router."""
+        """Pin FIXED behavior: 200/applied=true from the real apply handler.
+
+        The old missing-body 422 was the bug: the earlier parameterized
+        assignment route captured the literal ``apply`` before this handler.
+        """
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
         try:
             response = self._signed_request(
