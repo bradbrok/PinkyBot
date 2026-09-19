@@ -7612,7 +7612,7 @@ class TmuxSession(TransportReplacementMixin):
     def _phantom_consumption_verdicts(
         self, candidates: list[_InflightMeta]
     ) -> list[bool | None]:
-        """Allocate complete post-paste user rows to candidates one-to-one.
+        """Certify paste-bound user rows, folded spans, and exact fold chains.
 
         ``True`` proves this exact occurrence was accepted, ``False`` means
         no paste-bound occurrence was proved (including allocation-only rows
@@ -7771,7 +7771,11 @@ class TmuxSession(TransportReplacementMixin):
                         if (
                             row_offset >= allocation_start
                             and row_offset not in reserved
-                            and prompt == entry.turn.prompt
+                            and (
+                                prompt == entry.turn.prompt
+                                or self._transcript_prompt_identity(prompt)
+                                == entry.turn.prompt
+                            )
                         ):
                             reserved.add(row_offset)
                             break
@@ -7829,8 +7833,8 @@ class TmuxSession(TransportReplacementMixin):
                     incomplete.add(key)
                 rows[key] = found
 
-            # Phase 1 is the pre-#1163 exact allocator byte-for-byte: each
-            # candidate claims its oldest distinct exact row, including an
+            # Phase 1 allocates exact prompt identities (bare or one strict
+            # TUI envelope): each candidate claims its oldest row, including an
             # already accepted candidate whose row must not be donated to a
             # later duplicate. Exact-reserved rows are wholly unavailable to
             # containment, even for a different nested prompt.
@@ -7847,7 +7851,11 @@ class TmuxSession(TransportReplacementMixin):
                     if (
                         row_offset >= allocation_start
                         and occurrence not in exact_rows
-                        and prompt == entry.turn.prompt
+                        and (
+                            prompt == entry.turn.prompt
+                            or self._transcript_prompt_identity(prompt)
+                            == entry.turn.prompt
+                        )
                     ):
                         exact_rows.add(occurrence)
                         claims[index] = _TranscriptProbeRow(
@@ -8111,7 +8119,11 @@ class TmuxSession(TransportReplacementMixin):
                     occurrence = (key, chain_index)
                     if (
                         occurrence in reserved_chains
-                        or chain.prompt != candidate_prompt
+                        or (
+                            chain.prompt != candidate_prompt
+                            and self._transcript_prompt_identity(chain.prompt)
+                            != candidate_prompt
+                        )
                     ):
                         continue
                     reserved_chains.add(occurrence)
@@ -8843,8 +8855,8 @@ class TmuxSession(TransportReplacementMixin):
                 if verdict == "idle":
                     # #1127/#1128: an idle REPL proves there is no work running,
                     # but not that every mechanically successful paste was ever
-                    # submitted. Allocate complete ``type=user`` rows from each
-                    # turn's post-paste transcript boundary, FIFO and one-to-one.
+                    # submitted. Probe complete user rows, folded spans, and
+                    # exact fold chains against each turn's paste boundary.
                     # Existing exact acceptance remains authoritative, while an
                     # older/equal prompt occurrence cannot certify a new paste.
                     candidates = list(self._inflight_metas)
@@ -9619,6 +9631,30 @@ class TmuxSession(TransportReplacementMixin):
         return self._scheduler_pane_busy()
 
     @staticmethod
+    def _transcript_prompt_identity(content: str | None) -> str | None:
+        """Unwrap exactly one Claude Code 2.1.278 pasted-content envelope.
+
+        The closing tag carries the same four-hex id as the opening tag.
+        Only the two framing newlines are removed; raw prompt whitespace is
+        significant. Malformed, nested, or multiple envelopes stay unchanged.
+        Callers compare the original bytes first to preserve literal markup.
+        """
+        if content is None:
+            return None
+        match = re.fullmatch(
+            r'<pasted_content id="([0-9a-fA-F]{4})">\n(.*)\n'
+            r'</pasted_content id="\1">',
+            content.strip(),
+            flags=re.DOTALL,
+        )
+        if match is None:
+            return content
+        inner = match.group(2)
+        if "<pasted_content" in inner or "</pasted_content" in inner:
+            return content
+        return inner
+
+    @staticmethod
     def _transcript_user_text(entry: dict) -> str | None:
         """Extract a plain user prompt from either known transcript shape."""
         message = entry.get("message") or {}
@@ -9713,7 +9749,10 @@ class TmuxSession(TransportReplacementMixin):
             if (
                 not turn.pane_delivery_started
                 or turn.transport_accepted
-                or turn.prompt != content
+                or (
+                    turn.prompt != content
+                    and turn.prompt != self._transcript_prompt_identity(content)
+                )
                 or (
                     turn.submission_receipt is not None
                     and turn.submission_receipt.done()
@@ -10311,7 +10350,11 @@ class TmuxSession(TransportReplacementMixin):
             if (
                 not evidence.retired
                 and evidence.turn is None
-                and evidence.content == turn.prompt
+                and (
+                    evidence.content == turn.prompt
+                    or self._transcript_prompt_identity(evidence.content)
+                    == turn.prompt
+                )
             ):
                 self._pane_queue_operations[index] = replace(
                     evidence,
@@ -10322,7 +10365,11 @@ class TmuxSession(TransportReplacementMixin):
             if (
                 not evidence.retired
                 and evidence.turn is None
-                and evidence.content == turn.prompt
+                and (
+                    evidence.content == turn.prompt
+                    or self._transcript_prompt_identity(evidence.content)
+                    == turn.prompt
+                )
             ):
                 self._pane_dequeued_turns[index] = _DequeuedPromptEvidence(
                     evidence.content,
@@ -10559,7 +10606,11 @@ class TmuxSession(TransportReplacementMixin):
                 guard = self._wake_context_reload_guard
                 if (
                     guard is not None
-                    and prompt == guard.original_turn.prompt
+                    and (
+                        prompt == guard.original_turn.prompt
+                        or self._transcript_prompt_identity(prompt)
+                        == guard.original_turn.prompt
+                    )
                     and not guard.original_seen
                 ):
                     guard.original_seen = True
