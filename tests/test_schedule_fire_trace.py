@@ -346,6 +346,9 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
     original = writer._write
     entered = threading.Event()
     release = threading.Event()
+    busy_seen = threading.Event()
+    lock_released = threading.Event()
+    busy_attempts = []
     lock = None
 
     def faulty(event):
@@ -357,7 +360,15 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
                 time.sleep(2)
             if fault in {"busy", "busy_transient"}:
                 assert release.wait(3)
-        return original(event)
+        try:
+            return original(event)
+        except sqlite3.OperationalError as exc:
+            if (event["edge"] == edge and fault == "busy_transient"
+                    and getattr(exc, "sqlite_errorcode", None) == sqlite3.SQLITE_BUSY):
+                busy_attempts.append(exc.sqlite_errorcode)
+                busy_seen.set()
+                assert lock_released.wait(3)
+            raise
 
     monkeypatch.setattr(writer, "_write", faulty)
     if edge == "paste":
@@ -373,15 +384,16 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
         assert receipt.result() is True
     assert elapsed < 0.5, "trace IO added wake-path latency"
     assert await asyncio.to_thread(entered.wait, 1)
-    timer = None
     if fault in {"busy", "busy_transient"}:
         lock = sqlite3.connect(writer.path, timeout=0, check_same_thread=False)
         lock.execute("BEGIN IMMEDIATE")
-        if fault == "busy_transient":
-            timer = threading.Timer(0.1, lock.rollback)
-            timer.start()
         release.set()
     try:
+        if fault == "busy_transient":
+            # Release only after a real BUSY; acknowledge before the retry can run.
+            assert await asyncio.to_thread(busy_seen.wait, 3)
+            lock.rollback()
+            lock_released.set()
         busy_start = time.perf_counter()
         if fault in {"busy", "busy_transient"}:
             assert writer.flush(timeout=0.8), "trace writer waited for the registry lock"
@@ -389,8 +401,7 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
         else:
             flush(pane.registry)
     finally:
-        if timer:
-            timer.join()
+        lock_released.set()
         if lock:
             lock.rollback()
             lock.close()
@@ -399,6 +410,7 @@ async def test_t5_trace_writer_cannot_block_receipt(pane, monkeypatch, caplog, f
     errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
     assert len(errors) == (0 if fault == "busy_transient" else 1)
     if fault == "busy_transient":
+        assert busy_attempts == [sqlite3.SQLITE_BUSY]
         record, = rows(pane.registry)
         assert record["paste_at" if edge == "paste" else "matched_at"] > 0
     if edge == "accept":
