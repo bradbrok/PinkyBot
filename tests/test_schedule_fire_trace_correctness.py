@@ -142,9 +142,21 @@ def test_release_retains_exact_identity_when_ledger_changes_before_worker(regist
         release_at = registry.get_schedule_wake_by_fire(p.schedule_id, p.fired_at).released_at
         # Normal re-park resets released_at, before the asynchronous release query.
         assert registry.drain_park_pending_schedule_wake(p.id)
+        later_schedule = registry.add_schedule("worker", "*/5 * * * *", name="later recurrence")
+        later, _ = registry.persist_schedule_wake(
+            later_schedule.id,
+            agent_name="worker",
+            schedule_name=later_schedule.name,
+            prompt="later work",
+            fired_at=time.time(),
+        )
+        assert registry.drain_park_pending_schedule_wake(later.id)
     finally:
         proceed.set()
-    result = record(registry)
+    assert writer.flush()
+    records = {row["fire_id"]: row for row in writer.report()["rows"]}
+    result = records[p.id]
+    assert records[later.id]["released_at"] == 0
     print("DELAYED_RELEASE", release_at, result["released_at"], result["drain_parked_at"])
     assert result["released_at"] == release_at
 

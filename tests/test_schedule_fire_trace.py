@@ -226,7 +226,8 @@ async def test_t1_sdk_api_delivery(tmp_path):
 
 @pytest.mark.parametrize("edge", ["abandon", "drain_park", "release", "reaper", "idle_replay"])
 def test_t1_ledger_and_idle_edges(registry, monkeypatch, edge):
-    pending, _ = fire(registry, age=100)
+    # Idle replay must stay below the 60s floor in _pending_wake_replay_max_age.
+    pending, _ = fire(registry, age=10 if edge == "idle_replay" else 100)
     if edge == "abandon":
         registry.abandon_pending_schedule_wake(pending.id, reason="RECEIPT_ABANDONED: wall-clock")
     elif edge in {"drain_park", "release"}:

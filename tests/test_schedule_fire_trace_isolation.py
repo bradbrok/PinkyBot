@@ -66,6 +66,24 @@ def slow_trace_accept(registry, monkeypatch, hold):
     entered, release = threading.Event(), threading.Event()
     once = [False]
 
+    class Cursor:
+        def __init__(self, cursor, owner):
+            self.cursor = cursor
+            self.owner = owner
+
+        def __getattr__(self, name):
+            return getattr(self.cursor, name)
+
+        def execute(self, sql, *args):
+            self.cursor.execute(sql, *args)
+            self.owner.pause(sql)
+            return self
+
+        def executemany(self, sql, *args):
+            self.cursor.executemany(sql, *args)
+            self.owner.pause(sql)
+            return self
+
     class Connection:
         def __init__(self, db):
             self.db = db
@@ -80,10 +98,9 @@ def slow_trace_accept(registry, monkeypatch, hold):
         def __getattr__(self, name):
             return getattr(self.db, name)
 
-        def execute(self, sql, *args):
-            result = self.db.execute(sql, *args)
+        def pause(self, sql):
             if (
-                sql.lstrip().startswith(("INSERT", "UPDATE"))
+                sql.lstrip().startswith(("INSERT", "UPDATE", "DELETE"))
                 and "schedule_fire_trace" in sql
                 and not once[0]
             ):
@@ -91,7 +108,19 @@ def slow_trace_accept(registry, monkeypatch, hold):
                 assert self.db.in_transaction
                 entered.set()
                 assert release.wait(hold + 2)
+
+        def execute(self, sql, *args):
+            result = self.db.execute(sql, *args)
+            self.pause(sql)
             return result
+
+        def executemany(self, sql, *args):
+            result = self.db.executemany(sql, *args)
+            self.pause(sql)
+            return result
+
+        def cursor(self, *args, **kwargs):
+            return Cursor(self.db.cursor(*args, **kwargs), self)
 
     monkeypatch.setattr(writer, "_connect", lambda **kw: Connection(original(**kw)))
     receipt.trace("replay")
@@ -108,6 +137,7 @@ def slow_trace_accept(registry, monkeypatch, hold):
         release.set()
         timer.join()
         assert writer.flush()
+    assert once[0], "the DML pause must fire after transaction lock acquisition"
 
 
 def test_trace_write_lock_must_not_delay_authoritative_accept(registry, monkeypatch):
@@ -171,6 +201,7 @@ def test_failure_handoff_must_not_temporarily_hide_failure(registry, monkeypatch
     w.failed(event, RuntimeError("synthetic"))
     original = w._connect
     once = [False]
+    reader_thread = threading.get_ident()
 
     class Proxy:
         def __init__(self, db):
@@ -189,7 +220,7 @@ def test_failure_handoff_must_not_temporarily_hide_failure(registry, monkeypatch
 
     def connect(**kw):
         db = original(**kw)
-        if kw.get("timeout") == 1.0 and not once[0]:
+        if threading.get_ident() == reader_thread and not once[0]:
             once[0] = True
             return Proxy(db)
         return db
@@ -203,6 +234,7 @@ def test_failure_handoff_must_not_temporarily_hide_failure(registry, monkeypatch
         "FAILURE_HANDOFF",
         {"returned": counts["observed"], "durable": durable, "overlay": len(w._failures)},
     )
+    assert once[0], "the persistence handoff must run during the reader snapshot"
     assert durable == 1
     assert counts["observed"] == 1, "commit/pop between snapshots made a known failure disappear"
 
@@ -300,8 +332,17 @@ def test_failed_last_edge_is_retried_after_lock_release(registry):
     finally:
         lock.rollback()
         lock.close()
-    time.sleep(0.65)
     w = registry._fire_trace
+    deadline = time.monotonic() + 5
+    while True:
+        with sqlite3.connect(w.path, timeout=0.1) as db:
+            persisted = db.execute("SELECT COUNT(*) FROM schedule_fire_trace_failures").fetchone()[
+                0
+            ]
+        if persisted:
+            break
+        assert time.monotonic() < deadline, "failure was not persisted after lock release"
+        threading.Event().wait(0.01)
     before = w.report()["rows"][0]["outcome"]
     # New reader models restart memory loss; do not gracefully close original first.
     reopened = ft.ScheduleFireTrace(registry._db_path, registry._db)
@@ -363,8 +404,7 @@ def test_positive_single_executor_other_registry_waits_without_deadlock(tmp_path
         a.prune_schedule_fire_trace(now=time.time())
         assert entered.wait(1)
         b.prune_schedule_fire_trace(now=time.time())
-        assert not b._fire_trace.flush(timeout=0.05)
-        print("SHARED_EXECUTOR", {"b_waited_for_a": True})
+        # The bounded-slice control below tests fairness; this control pins recovery.
     finally:
         release.set()
         assert a._fire_trace.flush()
@@ -507,3 +547,116 @@ def test_trace_event_contains_failure_reporter_fault(registry, monkeypatch):
     monkeypatch.setattr(writer, "failed", raising)
     assert receipt.accept()
     assert registry.get_schedule_wake_by_fire(receipt.schedule_id, receipt.fired_at).accepted_at > 0
+
+
+def test_idle_notification_without_replay_work_emits_no_edge(registry, monkeypatch):
+    from pinky_daemon.scheduler import AgentScheduler
+
+    fire(registry)
+    scheduler = AgentScheduler(registry)
+    monkeypatch.setattr(scheduler, "replay_pending_for_agent", lambda name: None)
+    scheduler.notify_agent_idle("review-worker")
+    assert registry._fire_trace.flush()
+    assert registry._fire_trace.report()["rows"][0]["replay_count"] == 0
+
+
+def test_writer_and_reader_open_through_catalog_authority(tmp_path, monkeypatch):
+    from pinky_daemon.store_catalog import StoreCatalog
+
+    catalog = StoreCatalog(expected_root=tmp_path)
+    calls = []
+    original = ft.open_store_connection
+
+    def opened(owner_catalog, name, database, **kwargs):
+        calls.append((owner_catalog, name, str(database), kwargs["owner"]))
+        return original(owner_catalog, name, database, **kwargs)
+
+    monkeypatch.setattr(ft, "open_store_connection", opened)
+    registry = ar.AgentRegistry(str(tmp_path / "catalog.db"), catalog=catalog)
+    try:
+        writer = registry._fire_trace
+        connection = writer._connect()
+        connection.close()
+        assert writer.report()["rows"] == []
+        assert {name for _, name, _, _ in calls} == {
+            "schedule_fire_trace",
+            "schedule_fire_trace_read",
+        }
+        assert all(
+            c is catalog and path == writer.path and owner == "schedule_fire_trace"
+            for c, _, path, owner in calls
+        )
+        assert catalog.connection_policy("schedule_fire_trace").busy_timeout_ms == 0
+        assert catalog.connection_policy("schedule_fire_trace_read").busy_timeout_ms == 1000
+    finally:
+        registry.close()
+        assert catalog.shutdown(deadline_seconds=1).ok
+
+
+def test_prune_transactions_delete_at_most_500_rows(registry, monkeypatch):
+    writer = registry._fire_trace
+    old = time.time() - 31 * 86400
+    with sqlite3.connect(writer.path) as db:
+        db.executemany(
+            "INSERT INTO schedule_fire_trace(schedule_id,fired_at,updated_at) VALUES(?,?,?)",
+            [(999, old + i, old) for i in range(1501)],
+        )
+        db.executemany(
+            """INSERT INTO schedule_fire_trace_failures
+            (event_id,schedule_id,fired_at,fire_id,edge,failed_at,failures,reason)
+            VALUES(?,?,?,?,?,?,?,?)""",
+            [
+                (f"bounded-{i}", 999, old + i, None, "observed", old, 1, "synthetic")
+                for i in range(1501)
+            ],
+        )
+    commits = []
+    original = writer._connect
+
+    def connect(**kwargs):
+        db = original(**kwargs)
+        previous = [db.total_changes]
+
+        def trace(sql):
+            if sql.strip().upper() == "COMMIT":
+                commits.append(db.total_changes - previous[0])
+                previous[0] = db.total_changes
+
+        db.set_trace_callback(trace)
+        return db
+
+    monkeypatch.setattr(writer, "_connect", connect)
+    registry.prune_schedule_fire_trace(now=time.time())
+    assert writer.flush()
+    assert commits and sum(commits) == 3002
+    assert max(commits) <= 500, commits
+
+
+def test_worker_reporter_failure_cannot_strand_bookkeeping(registry, monkeypatch):
+    _, receipt = fire(registry)
+    writer = registry._fire_trace
+    original_write = writer._write
+    original_failed = writer.failed
+    raised = threading.Event()
+
+    def broken_write(event):
+        raise RuntimeError("injected worker write failure")
+
+    def broken_reporter(event, error):
+        raised.set()
+        raise RuntimeError("injected diagnostic reporter failure")
+
+    monkeypatch.setattr(writer, "_write", broken_write)
+    monkeypatch.setattr(writer, "failed", broken_reporter)
+    receipt.trace("replay")
+    assert raised.wait(1)
+    assert writer.flush(timeout=1), "failed diagnostics stranded queue accounting"
+    monkeypatch.setattr(writer, "_write", original_write)
+    monkeypatch.setattr(writer, "failed", original_failed)
+    receipt.trace("replay")
+    assert writer.flush(timeout=1)
+    assert writer.report()["rows"][0]["replay_count"] == 1
+    deadline = time.monotonic() + 1
+    while writer._running and time.monotonic() < deadline:
+        threading.Event().wait(0.001)
+    assert not writer._running
