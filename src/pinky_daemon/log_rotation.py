@@ -42,6 +42,8 @@ import gzip
 import logging
 import os
 import re
+import stat
+import tempfile
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -155,9 +157,12 @@ class LogRotator:
                     if raw_pattern.fullmatch(raw.name) and raw.is_file() and not raw.is_symlink():
                         assert self.on_rotate is not None
                         self.on_rotate()
-                        stamp = raw.name[len(self.log_path.name) + 1:]
-                        archive = _archive_path(self.log_path, stamp)
-                        self._compress_raw(raw, archive)
+                        archive = raw.with_name(raw.name + ".gz")
+                        if archive.exists():
+                            # Publication is atomic; only raw cleanup was missed.
+                            raw.unlink()
+                        else:
+                            self._compress_raw(raw, archive)
                         self._prune()
                         return archive
             except Exception:
@@ -219,8 +224,8 @@ class LogRotator:
 
     @staticmethod
     def _compress_raw(raw: Path, archive: Path) -> None:
-        tmp = archive.with_name(archive.name + ".part")
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        fd, temp_name = tempfile.mkstemp(prefix=archive.name + ".part-", dir=archive.parent)
+        tmp = Path(temp_name)
         try:
             with os.fdopen(fd, "wb") as output, raw.open("rb") as source:
                 with gzip.GzipFile(fileobj=output, mode="wb") as compressed:
@@ -234,6 +239,20 @@ class LogRotator:
 
     def _prune(self) -> None:
         """Delete archives older than the retention window. Best-effort."""
+        temp_pattern = re.compile(
+            re.escape(self.log_path.name)
+            + r"\.\d{4}-\d{2}-\d{2}(?:T\d{6}Z)?(?:\.\d+)?\.gz\.part(?:-[A-Za-z0-9_-]+)?$"
+        )
+        temp_cutoff = time.time() - 3600
+        for temp in self.log_path.parent.glob(f"{self.log_path.name}.*"):
+            if not temp_pattern.fullmatch(temp.name):
+                continue
+            try:
+                info = temp.lstat()
+                if stat.S_ISREG(info.st_mode) and info.st_mtime < temp_cutoff:
+                    temp.unlink()
+            except OSError:
+                logger.debug("log_rotation: could not prune expired compression temp", exc_info=True)
         cutoff = time.time() - self.backup_days * 86400
         for p in self.log_path.parent.glob(f"{self.log_path.name}.*.gz"):
             try:

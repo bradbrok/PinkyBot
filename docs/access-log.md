@@ -61,6 +61,8 @@ Redaction runs before path truncation. The console webhook access filter uses th
 
 The existing log rotation loop checks every five minutes, rotating daily or at 200 MiB. Access log rotation is lossless across concurrent appends: rename the live file, switch the writer to a new private file, then gzip the closed old inode. The console `api.log` still uses copytruncate and retains its documented copy/truncate loss window. Neither mode promises durability against a power failure. A failed handoff restores the live pathname so the next rotation can retry. A raw archive left by an interrupted rotation is recovered on the next check, after reopening the live file; failed compression preserves the raw data.
 
+Each compression attempt uses a fresh private temporary file. Recovery keeps an already-published archive unchanged and removes its leftover raw file, preventing duplicate receipts. Pruning removes matching regular compression temps older than one hour; fresh files and symbolic links are left untouched.
+
 | Environment variable | Default | Effect |
 |---|---|---|
 | `PINKY_ACCESS_LOG` | `logs/access.log` | Path, or `off` to disable |
