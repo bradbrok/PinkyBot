@@ -872,6 +872,8 @@ def test_each_trace_alias_restores_the_shared_cohort_once(monkeypatch, tmp_path,
     base, target, snapshot = _trace_restore_fixture(tmp_path)
     _write_corrupt_target(target)
     _configure_lsof(monkeypatch)
+    sidecars = [suffix for suffix in ("-journal", "-wal", "-shm")
+                if Path(os.fspath(target) + suffix).exists()]
     replacements = []
     original = restore.os.replace
 
@@ -884,7 +886,9 @@ def test_each_trace_alias_restores_the_shared_cohort_once(monkeypatch, tmp_path,
     assert result.logical_names == ("schedule_fire_trace", "schedule_fire_trace_read")
     assert sum(destination == target for _, destination in replacements) == 1
     assert sum(source == target for source, _ in replacements) == 1
-    assert len(_corrupt_artifacts(target)) == 1
+    assert set(_corrupt_artifacts(target)) == {
+        Path(result.corrupt_path + suffix) for suffix in ["", *sidecars]
+    }
     assert _quick_check(target) == [("ok",)]
     with sqlite3.connect(target) as connection:
         tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
