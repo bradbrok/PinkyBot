@@ -30,6 +30,7 @@ from pinky_daemon.agent_registry import (
     RecurringScheduleStaleDrop,
 )
 from pinky_daemon.cron_utils import _field_matches
+from pinky_daemon.schedule_fire_trace import trace_event
 from pinky_daemon.transport_state import SessionState
 from pinky_daemon.watchdog_log import log_watchdog_decision
 
@@ -328,6 +329,14 @@ class ScheduleWakeReceipt:
         self.schedule_id = schedule_id
         self.fired_at = fired_at
         self._registry = registry
+        self._trace_matched_by = "on_accept"
+
+    def trace(self, edge: str, **fields) -> None:
+        if edge == "accept_source":
+            self._trace_matched_by = fields.get("matched_by", "transcript_receipt")
+            return
+        trace_event(self._registry, edge, schedule_id=self.schedule_id,
+                    fired_at=self.fired_at, **fields)
 
     def accept(self) -> bool:
         """Commit the positive receipt synchronously and idempotently."""
@@ -335,6 +344,7 @@ class ScheduleWakeReceipt:
             self.schedule_id,
             self.fired_at,
             delivered_at=time.time(),
+            trace_matched_by=self._trace_matched_by,
         )
 
 class AgentScheduler:
@@ -746,6 +756,10 @@ class AgentScheduler:
                     self._outbox_reaper_payload_trim_after_sec
                 ),
             )
+            try:
+                self._registry.prune_schedule_fire_trace(now=now)
+            except Exception:
+                pass
             # #667: bound the durable inbound-idempotency table on the same
             # daily pass. Guarded independently so retention housekeeping can
             # never fail the wake-reaper maintenance it rides along with.
@@ -993,6 +1007,13 @@ class AgentScheduler:
         _log(
             f"scheduler: turn-idle delivery trigger for agent '{agent_name}'"
         )
+        try:
+            for pending in self._registry.list_pending_schedule_wakes(agent_name):
+                trace_event(self._registry, "replay", fire_id=pending.id,
+                            schedule_id=pending.schedule_id, fired_at=pending.fired_at,
+                            reason="idle_replay")
+        except Exception:
+            pass
         self.replay_pending_for_agent(agent_name)
 
     def _alert_stale_one_shot_drop(

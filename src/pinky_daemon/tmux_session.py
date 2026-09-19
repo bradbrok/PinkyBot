@@ -9365,6 +9365,7 @@ class TmuxSession(TransportReplacementMixin):
                         if delivery is not None and not delivery.done():
                             delivery.set_result(False)
                         return False
+                    self._trace_scheduler_turn(t, "replay", reason="watchdog_replay")
                     # Its old FIFO metadata was removed above. Allow the
                     # replacement-pane delivery to record a fresh entry.
                     t.pane_delivery_recorded = False
@@ -10330,6 +10331,24 @@ class TmuxSession(TransportReplacementMixin):
                 )
                 return
 
+    @staticmethod
+    def _trace_scheduler_turn(turn, edge: str, **fields) -> None:
+        owner = getattr(getattr(turn, "scheduler_accept", None), "__self__", None)
+        trace = getattr(owner, "trace", None)
+        if callable(trace):
+            try:
+                trace(edge, **fields)
+            except Exception as exc:
+                _log(f"schedule fire trace callback failed ({type(exc).__name__})")
+
+    def _trace_observed_prompt(self, prompt, *, pointer) -> None:
+        # Observe separately from the acceptance matcher: matching failure is
+        # itself a diagnostic class. Do not grant or change receipt authority.
+        for turn in self._acceptance_candidates():
+            if turn.pane_delivery_started and turn.prompt == prompt:
+                self._trace_scheduler_turn(turn, "observed", pointer=pointer)
+                break
+
     def _mark_transport_accepted(self, turn: _QueuedTurn | None) -> bool:
         """Resolve exact receipts only on observed pane acceptance."""
         if turn is None:
@@ -10343,6 +10362,7 @@ class TmuxSession(TransportReplacementMixin):
         if self._wake_requires_submission_receipt(turn):
             self._finish_turn_delivery(turn, fire_on_delivered=False)
         if turn.scheduler_accept is not None:
+            self._trace_scheduler_turn(turn, "accept_source", matched_by="transcript_receipt")
             try:
                 persisted = turn.scheduler_accept()
             except Exception as exc:
@@ -10514,6 +10534,11 @@ class TmuxSession(TransportReplacementMixin):
         if entry_type == "user":
             prompt = self._transcript_user_text(entry)
             if prompt is not None:
+                self._trace_observed_prompt(prompt, pointer=json.dumps({
+                    "path": str(getattr(self._tailer, "transcript_path", "")),
+                    "offset": entry_offset,
+                    "identity": source_identity,
+                }))
                 guard = self._wake_context_reload_guard
                 if (
                     guard is not None
@@ -11467,6 +11492,13 @@ class TmuxSession(TransportReplacementMixin):
             ),
             fresh_context_epoch=self._fresh_context_respawn_epoch,
         ))
+        self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,
+                                   transport_kind=("tmux_codex" if self.__class__.__name__ == "CodexTmuxSession" else "tmux_claude"),
+                                   pointer=json.dumps({
+                                       "path": str(turn.transcript_path_at_paste or _tpath or ""),
+                                       "offset": turn.transcript_offset_at_paste,
+                                       "identity": turn.transcript_file_identity_at_paste,
+                                   }))
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If
         # other entries are ahead, the head's clock was set when IT

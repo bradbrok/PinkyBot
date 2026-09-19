@@ -4779,7 +4779,13 @@ def create_api(
                         if schedule_receipt is not None and "on_accept" in inspect.signature(sender).parameters:
                             kwargs["on_accept"] = schedule_receipt.accept
                         return ss, await sender(prompt, **kwargs)
-                return ss, await ss.send(prompt, **kwargs)
+                result = await ss.send(prompt, **kwargs)
+                if scheduler and result and schedule_receipt is not None:
+                    schedule_receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
+                        "session_id": getattr(ss, "resume_handle", ""),
+                        "message_id": getattr(ss, "last_message_id", None),
+                    }))
+                return ss, result
         raise HTTPException(409, "Session changed repeatedly before delivery")
 
     broker._compatible_delivery = _deliver_streaming
@@ -12579,6 +12585,11 @@ npm run build</pre>
             return receipt
 
         handed_off = await ss.send(prompt)
+        if handed_off and schedule_receipt is not None:
+            schedule_receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
+                "session_id": getattr(ss, "resume_handle", ""),
+                "message_id": getattr(ss, "last_message_id", None),
+            }))
         confirmed = bool(
             handed_off
             and getattr(ss, "injection_confirms_consumption", False)
@@ -14650,6 +14661,15 @@ npm run build</pre>
 
     # ── Scheduler Control ──────────────────────────────────
 
+    @app.get("/scheduler/fire-trace")
+    async def scheduler_fire_trace(
+        since: float = 0, agent: str | None = None, schedule_id: int | None = None,
+        outcome: str | None = None,
+    ):
+        """Read observed fire evidence through the existing admin/signed auth boundary."""
+        return agents._fire_trace.report(since=since, agent=agent,
+                                         schedule_id=schedule_id, outcome=outcome)
+
     @app.get("/scheduler/status")
     async def scheduler_status():
         """Get scheduler status."""
@@ -14658,6 +14678,8 @@ npm run build</pre>
         pending_health = agents.get_pending_schedule_wake_health()
         return {
             "running": scheduler.running,
+            "fire_trace_24h": agents._fire_trace.report(since=time.time() - 86400)["counts"],
+            "trace_write_failures_24h": agents._fire_trace.failure_counts(since=time.time() - 86400),
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],
