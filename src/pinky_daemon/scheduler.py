@@ -1013,13 +1013,6 @@ class AgentScheduler:
         _log(
             f"scheduler: turn-idle delivery trigger for agent '{agent_name}'"
         )
-        try:
-            for pending in self._registry.list_pending_schedule_wakes(agent_name):
-                trace_event(self._registry, "replay", fire_id=pending.id,
-                            schedule_id=pending.schedule_id, fired_at=pending.fired_at,
-                            reason="idle_replay")
-        except Exception:
-            pass
         self.replay_pending_for_agent(agent_name)
 
     def _alert_stale_one_shot_drop(
@@ -2771,6 +2764,9 @@ class AgentScheduler:
             )
             if attempts is None:
                 continue
+            trace_event(self._registry, "replay", fire_id=pending.id,
+                        schedule_id=pending.schedule_id, fired_at=pending.fired_at,
+                        reason="idle_replay")
             try:
                 confirmed = await self._wait_for_wake_confirmation(
                     pending,

@@ -1540,7 +1540,7 @@ class AgentRegistry:
         # different entries, and one write loses.
         self._rmw_lock = threading.RLock()
         self._init_tables()
-        self._fire_trace = ScheduleFireTrace(self._db_path, self._db)
+        self._fire_trace = ScheduleFireTrace(self._db_path, self._db, catalog=catalog)
 
     def _init_tables(self) -> None:
         self._db.executescript("""
@@ -5909,13 +5909,14 @@ except Exception as exc:
                 agent_name, timestamp
             )
             self._db.commit()
-        if released:
-            trace_event(self, "abandon", at=timestamp, release_agent=agent_name, reason="released")
-        return released
+        for fire_id, schedule_id, fired_at in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=agent_name, reason="released",
+                        fire_id=fire_id, schedule_id=schedule_id, fired_at=fired_at)
+        return len(released)
 
     def _release_drain_parked_locked(
         self, agent_name: str, timestamp: float
-    ) -> int:
+    ) -> list[tuple[int, int, float]]:
         """Release one agent's drain-parked rows; caller holds the rmw lock.
 
         Shared by the public release and both durable confirm transitions:
@@ -5928,10 +5929,11 @@ except Exception as exc:
                SET drain_parked_at=0,
                    released_at=?
                WHERE agent_name=? AND drain_parked_at>0
-                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0""",
+                 AND accepted_at=0 AND parked_at=0 AND abandoned_at=0
+               RETURNING id, schedule_id, fired_at""",
             (timestamp, agent_name),
         )
-        return cursor.rowcount
+        return cursor.fetchall()
 
     def has_released_pending_wakes(self, agent_name: str) -> bool:
         """Whether this agent holds active rows released from drain parking.
@@ -6055,8 +6057,9 @@ except Exception as exc:
             self._db.commit()
         trace_event(self, "accept", fire_id=pending_id, schedule_id=row[0], fired_at=float(row[2]),
                     at=timestamp, result=True, matched_by=trace_matched_by)
-        if released:
-            trace_event(self, "abandon", at=timestamp, release_agent=str(row[3]), reason="released")
+        for released_id, released_schedule, released_fire in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=str(row[3]), reason="released",
+                        fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         return True
 
     def confirm_pending_schedule_wake_by_fire(
@@ -6102,8 +6105,9 @@ except Exception as exc:
             self._db.commit()
         trace_event(self, "accept", fire_id=row[0], schedule_id=schedule_id, fired_at=fired_at,
                     at=timestamp, result=True, matched_by=trace_matched_by)
-        if released:
-            trace_event(self, "abandon", at=timestamp, release_agent=str(row[2]), reason="released")
+        for released_id, released_schedule, released_fire in released:
+            trace_event(self, "abandon", at=timestamp, release_agent=str(row[2]), reason="released",
+                        fire_id=released_id, schedule_id=released_schedule, fired_at=released_fire)
         newly_receipted = float(row[1]) == 0
         if newly_receipted:
             _log(

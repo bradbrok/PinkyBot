@@ -301,6 +301,8 @@ class StoreConnectionPolicy:
 
 def default_store_connection_policy(logical_name: str) -> StoreConnectionPolicy:
     """Return the behavior-preserving policy for a logical daemon store."""
+    if logical_name in {"schedule_fire_trace", "schedule_fire_trace_read"}:
+        return StoreConnectionPolicy(busy_timeout_ms=0 if logical_name == "schedule_fire_trace" else 1000)
     busy_timeout_ms = 30_000 if logical_name in _THIRTY_SECOND_BUSY_STORES else 5_000
     return StoreConnectionPolicy(busy_timeout_ms=busy_timeout_ms)
 

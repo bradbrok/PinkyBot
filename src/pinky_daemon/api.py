@@ -14678,12 +14678,15 @@ npm run build</pre>
 
     @app.get("/scheduler/fire-trace")
     async def scheduler_fire_trace(
-        since: float = 0, agent: str | None = None, schedule_id: int | None = None,
-        outcome: str | None = None,
+        since: float | None = None, agent: str | None = None, schedule_id: int | None = None,
+        outcome: str | None = None, limit: int = Query(200, ge=1, le=1000),
+        offset: int = Query(0, ge=0),
     ):
         """Read observed fire evidence through the existing admin/signed auth boundary."""
-        return agents._fire_trace.report(since=since, agent=agent,
-                                         schedule_id=schedule_id, outcome=outcome)
+        return await asyncio.to_thread(agents._fire_trace.report,
+                                       since=time.time() - 86400 if since is None else since,
+                                       agent=agent, schedule_id=schedule_id, outcome=outcome,
+                                       limit=limit, offset=offset)
 
     @app.get("/scheduler/status")
     async def scheduler_status():
@@ -14693,8 +14696,8 @@ npm run build</pre>
         pending_health = agents.get_pending_schedule_wake_health()
         return {
             "running": scheduler.running,
-            "fire_trace_24h": agents._fire_trace.report(since=time.time() - 86400)["counts"],
-            "trace_write_failures_24h": agents._fire_trace.failure_counts(since=time.time() - 86400),
+            "fire_trace_24h": (await asyncio.to_thread(agents._fire_trace.report, since=time.time() - 86400))["counts"],
+            "trace_write_failures_24h": await asyncio.to_thread(agents._fire_trace.failure_counts, since=time.time() - 86400),
             "total_schedules": len(all_schedules),
             "enabled_schedules": sum(1 for s in all_schedules if s.enabled),
             "auto_start_agents": [a.name for a in auto_start],

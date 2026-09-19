@@ -10354,6 +10354,12 @@ class TmuxSession(TransportReplacementMixin):
         for turn in self._acceptance_candidates():
             if not turn.pane_delivery_started:
                 continue
+            if isinstance(pointer, dict) and not self._transcript_entry_matches_ticket(
+                entry_offset=pointer.get("offset"), source_identity=pointer.get("identity"),
+                ticket_offset=turn.transcript_offset_at_paste,
+                ticket_identity=turn.transcript_file_identity_at_paste,
+            ):
+                continue
             span = self._first_unoccupied_prompt_span(prompt, turn.prompt, occupied)
             if span is None:
                 continue
