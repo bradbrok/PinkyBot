@@ -4775,9 +4775,12 @@ def create_api(
                 "resume_handle": getattr(session, "resume_handle", ""),
                 "message_id": None,
                 "submit_seq": sequence,
-            }))
+            }, default=str))
         except Exception as exc:
-            _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
+            try:
+                receipt.trace_failure("paste", exc)
+            except Exception:
+                _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
 
     async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
         for _ in range(3):

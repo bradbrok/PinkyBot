@@ -338,6 +338,12 @@ class ScheduleWakeReceipt:
         trace_event(self._registry, edge, schedule_id=self.schedule_id,
                     fired_at=self.fired_at, **fields)
 
+    def trace_failure(self, edge: str, error: Exception) -> None:
+        writer = getattr(self._registry, "_fire_trace", None)
+        if writer is not None:
+            writer.failed({"edge": edge, "at": time.time(),
+                           "schedule_id": self.schedule_id, "fired_at": self.fired_at}, error)
+
     def accept(self) -> bool:
         """Commit the positive receipt synchronously and idempotently."""
         return self._registry.confirm_pending_schedule_wake_by_fire(

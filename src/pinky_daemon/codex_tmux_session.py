@@ -45,7 +45,6 @@ resume-UUID-capture diagnostics.
 from __future__ import annotations
 
 import asyncio
-import json
 import os
 import re
 import shlex
@@ -602,9 +601,9 @@ class CodexTmuxSession(TmuxSession):
             if payload.get("type") == "user_message":
                 prompt = payload.get("message")
                 if isinstance(prompt, str):
-                    self._trace_observed_prompt(prompt, pointer=json.dumps(
+                    self._trace_observed_prompt(prompt, pointer=(
                         getattr(self._tailer, "entry_pointer", None) or {
-                            "path": str(getattr(self._tailer, "transcript_path", "")),
+                            "path": getattr(self._tailer, "transcript_path", ""),
                             "offset": None,
                         }
                     ))

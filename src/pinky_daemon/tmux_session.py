@@ -10338,9 +10338,14 @@ class TmuxSession(TransportReplacementMixin):
         trace = getattr(owner, "trace", None)
         if callable(trace):
             try:
+                if "pointer" in fields:
+                    fields["pointer"] = json.dumps(fields["pointer"], default=str)
                 trace(edge, **fields)
             except Exception as exc:
-                _log(f"schedule fire trace callback failed ({type(exc).__name__})")
+                try:
+                    owner.trace_failure(edge, exc)
+                except Exception:
+                    _log(f"schedule fire trace callback failed ({type(exc).__name__})")
 
     def _trace_observed_prompt(self, prompt, *, pointer) -> None:
         # Observe separately from the acceptance matcher: matching failure is
@@ -10540,11 +10545,11 @@ class TmuxSession(TransportReplacementMixin):
         if entry_type == "user":
             prompt = self._transcript_user_text(entry)
             if prompt is not None:
-                self._trace_observed_prompt(prompt, pointer=json.dumps({
-                    "path": str(getattr(self._tailer, "transcript_path", "")),
+                self._trace_observed_prompt(prompt, pointer={
+                    "path": getattr(self._tailer, "transcript_path", ""),
                     "offset": entry_offset,
                     "identity": source_identity,
-                }))
+                })
                 guard = self._wake_context_reload_guard
                 if (
                     guard is not None
@@ -11500,11 +11505,11 @@ class TmuxSession(TransportReplacementMixin):
         ))
         self._trace_scheduler_turn(turn, "paste", at=_paste_succeeded_at,
                                    transport_kind=self._trace_transport_kind,
-                                   pointer=json.dumps({
-                                       "path": str(turn.transcript_path_at_paste or _tpath or ""),
+                                   pointer={
+                                       "path": turn.transcript_path_at_paste or _tpath or "",
                                        "offset": turn.transcript_offset_at_paste,
                                        "identity": turn.transcript_file_identity_at_paste,
-                                   }))
+                                   })
         # Watchdog head-clock. If this entry just became the head (deque
         # was empty before append), start its timeout window NOW. If
         # other entries are ahead, the head's clock was set when IT
