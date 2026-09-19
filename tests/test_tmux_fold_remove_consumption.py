@@ -1285,3 +1285,243 @@ def test_p12_turn_opener_and_dequeue_acceptance_are_preserved(
 
     assert opener.turn.transport_accepted is True
     assert dequeued.turn.transport_accepted is True
+
+
+# #1281 fixture provenance: Claude Code 2.1.278, structure-only production
+# witness, 2026-09-19. The 4-hex id is stable across the session, not a message
+# identity. A mid-tool-call paste has NO user text row: all three queue-chain
+# legs contain the same envelope, including the id on the closing tag.
+def _cc_21278_envelope(raw: str) -> str:
+    return f'<pasted_content id="077e">\n{raw}\n</pasted_content id="077e">'
+
+
+def _cc_21278_chain(content: str, attachment_first: bool) -> list[dict]:
+    enqueue = _queue_entry("enqueue", content)
+    remove = {**_queue_entry("remove", content), "reason": "absorbed_mid_turn"}
+    attachment = _attachment_entry(content)
+    attachment["attachment"]["origin"] = {"kind": "human"}
+    return [enqueue, attachment, remove] if attachment_first else [enqueue, remove, attachment]
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["legacy", "cc-2.1.278"])
+@pytest.mark.parametrize("attachment_first", [False, True])
+@pytest.mark.asyncio
+async def test_1281_idle_chain_drains_without_replay(
+    wrapped: bool, attachment_first: bool, tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "idle-envelope.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    # Preserve raw boundary whitespace; only the two framing newlines go away.
+    raw = " \n[ferry | dm | sender | msg_id:1281-a]\nSynthetic prompt.\n\n "
+    completion = asyncio.Event()
+    receipt = asyncio.get_running_loop().create_future()
+    entry = _seed_inflight(session, prompt=raw, completion_event=completion,
+                           submission_receipt=receipt)
+    _bind_ticket(entry, transcript)
+    content = _cc_21278_envelope(raw) if wrapped else raw
+    for row in _cc_21278_chain(content, attachment_first):
+        _append_entry(transcript, row)
+    assert session._phantom_consumption_verdicts([entry]) == [True]
+    _enable_fast_idle_reconcile(monkeypatch, session)
+    await _run_until_reconciled(session)
+    assert session._message_queue.empty()
+    assert entry.turn.replay_count == 0
+    assert entry.turn.transport_accepted is True
+    assert completion.is_set()
+    assert receipt.result() is True
+    assert "verdict=verified_consumed" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("wrapped", [False, True], ids=["legacy", "cc-2.1.278"])
+@pytest.mark.parametrize("attachment_first", [False, True])
+@pytest.mark.asyncio
+async def test_1281_live_envelope_chain_certifies_receipts(
+    wrapped: bool, attachment_first: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "live-envelope.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    raw = "[ferry | dm | sender | msg_id:1281-live]\nSynthetic live prompt."
+    delivery = asyncio.get_running_loop().create_future()
+    receipt = asyncio.get_running_loop().create_future()
+    entry = _seed_inflight(session, prompt=raw, scheduler_delivery=delivery,
+                           submission_receipt=receipt)
+    _bind_ticket(entry, transcript)
+    content = _cc_21278_envelope(raw) if wrapped else raw
+    rows = _cc_21278_chain(content, attachment_first)
+    for row in rows[:2]:
+        _emit_live(session, transcript, row)
+        assert entry.turn.transport_accepted is False
+    _emit_live(session, transcript, rows[2])
+    assert entry.turn.transport_accepted is True
+    assert delivery.result() is True
+    assert receipt.result() is True
+    session._registry.mark_turn_delivered.assert_called_once()
+    assert not session._pane_queue_operations
+    _assert_fold_pair_byte_counters(session)
+
+
+@pytest.mark.asyncio
+async def test_1281_standalone_envelope_user_row_control(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "standalone-envelope.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt="Standalone synthetic control")
+    _bind_ticket(entry, transcript)
+    _append_entry(transcript, {"type": "user", "message": {
+        "role": "user", "content": "\n\n" + _cc_21278_envelope(entry.turn.prompt) + "\n",
+    }})
+    assert session._phantom_consumption_verdicts([entry]) == [True]
+    _enable_fast_idle_reconcile(monkeypatch, session)
+    await _run_until_reconciled(session)
+    assert session._message_queue.empty()
+    assert entry.turn.replay_count == 0
+    assert entry.turn.transport_accepted is True
+
+
+@pytest.mark.parametrize("unconsumed", [False, True])
+@pytest.mark.asyncio
+async def test_1281_production_mix_two_rows_three_chains(
+    unconsumed: bool, tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "production-mix.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entries = []
+    for index in range(5):
+        entry = _seed_inflight(session, prompt=f"Synthetic prompt {index}",
+                               message_id=f"1281-{index}", completion_event=asyncio.Event())
+        _bind_ticket(entry, transcript)
+        entries.append(entry)
+        content = _cc_21278_envelope(entry.turn.prompt)
+        if index in (1, 4):
+            _append_entry(transcript, {"type": "user", "message": {
+                "role": "user", "content": "\n\n" + content + "\n",
+            }})
+        else:
+            for row in _cc_21278_chain(content, attachment_first=index == 0):
+                _append_entry(transcript, row)
+    absent = None
+    if unconsumed:
+        absent = _seed_inflight(session, prompt="Genuinely absent prompt",
+                                 message_id="1281-absent", completion_event=asyncio.Event())
+        _bind_ticket(absent, transcript)
+    _enable_fast_idle_reconcile(monkeypatch, session)
+    await _run_until_reconciled(session)
+    assert all(entry.turn.transport_accepted for entry in entries)
+    assert all(entry.turn.replay_count == 0 for entry in entries)
+    assert all(entry.completion_event.is_set() for entry in entries)
+    if absent is not None:
+        assert session._message_queue.get_nowait() is absent.turn
+        assert absent.turn.replay_count == 1
+        assert absent.turn.transport_accepted is False
+        assert not absent.completion_event.is_set()
+    assert session._message_queue.empty()
+    output = capsys.readouterr().out
+    assert output.count("verdict=verified_consumed") == 5
+
+
+@pytest.mark.parametrize("variant", [
+    "mismatched-id", "nested", "idless-close", "wrong-close", "nonhex-id",
+    "long-id", "missing-open-newline", "missing-close-newline", "inner-byte",
+    "two-envelopes", "prefix", "suffix",
+])
+def test_1281_malformed_or_unequal_chain_is_not_consumption(
+    variant: str, tmp_path: Path,
+) -> None:
+    raw = "Synthetic exact prompt"
+    content = _cc_21278_envelope(raw)
+    if variant == "mismatched-id":
+        content = content.replace('</pasted_content id="077e">', '</pasted_content id="077f">')
+    elif variant == "nested":
+        content = _cc_21278_envelope(content)
+    elif variant == "idless-close":
+        content = content.replace('</pasted_content id="077e">', '</pasted_content>')
+    elif variant == "wrong-close":
+        content = content.replace("</pasted_content", "</other_content")
+    elif variant == "nonhex-id":
+        content = content.replace("077e", "zzzz")
+    elif variant == "long-id":
+        content = content.replace("077e", "0077e")
+    elif variant == "missing-open-newline":
+        content = content.replace('>\n', '>', 1)
+    elif variant == "missing-close-newline":
+        content = content.replace('\n</', '</', 1)
+    elif variant == "inner-byte":
+        content = _cc_21278_envelope(raw + ".")
+    elif variant == "two-envelopes":
+        content += "\n" + content
+    elif variant == "prefix":
+        content = "prefix " + content
+    elif variant == "suffix":
+        content += " suffix"
+    session = _make_session()
+    transcript = tmp_path / "invalid-envelope.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt=raw)
+    _bind_ticket(entry, transcript)
+    for row in _cc_21278_chain(content, attachment_first=True):
+        _emit_live(session, transcript, row)
+    assert entry.turn.transport_accepted is False
+    assert session._phantom_consumption_verdicts([entry]) == [False]
+    session._registry.mark_turn_delivered.assert_not_called()
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_1281_one_envelope_chain_cannot_certify_equal_prompt_twin(
+    live: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "twins.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    first = _seed_inflight(session, prompt="Equal prompt")
+    second = _seed_inflight(session, prompt="Equal prompt")
+    for entry in (first, second):
+        _bind_ticket(entry, transcript)
+    for row in _cc_21278_chain(_cc_21278_envelope(first.turn.prompt), True):
+        if live:
+            _emit_live(session, transcript, row)
+        else:
+            _append_entry(transcript, row)
+    if live:
+        assert first.turn.transport_accepted is True
+        assert second.turn.transport_accepted is False
+    assert session._phantom_consumption_verdicts([first, second]) == [True, False]
+
+
+@pytest.mark.parametrize("live", [False, True])
+def test_1281_literal_envelope_prompt_keeps_legacy_equality(
+    live: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "literal-envelope.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    # These are the actual queued bytes, not a wrapper around the queued bytes.
+    raw = _cc_21278_envelope("Literal markup supplied by caller")
+    entry = _seed_inflight(session, prompt=raw)
+    _bind_ticket(entry, transcript)
+    for row in _cc_21278_chain(raw, False):
+        if live:
+            _emit_live(session, transcript, row)
+        else:
+            _append_entry(transcript, row)
+    if live:
+        assert entry.turn.transport_accepted is True
+    assert session._phantom_consumption_verdicts([entry]) == [True]
+
+
+def test_1281_pre_ticket_envelope_chain_cannot_certify_later_paste(tmp_path: Path) -> None:
+    session = _make_session()
+    transcript = tmp_path / "old-envelope.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    raw = "Same text, later paste"
+    for row in _cc_21278_chain(_cc_21278_envelope(raw), True):
+        _append_entry(transcript, row)
+    entry = _seed_inflight(session, prompt=raw)
+    _bind_ticket(entry, transcript)
+    assert session._phantom_consumption_verdicts([entry]) == [False]
