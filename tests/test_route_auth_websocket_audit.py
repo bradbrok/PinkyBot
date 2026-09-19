@@ -9,7 +9,6 @@ from fastapi import FastAPI
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 import audit_route_auth_coverage as audit_mod  # noqa: E402
 
-
 VOICE = "/ws/voice/{call_session_id}"
 SETS = {
     "public_exact": set(),
