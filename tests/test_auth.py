@@ -1334,8 +1334,8 @@ class TestAgentIsolationScoping:
         assert resp.status_code != 403
         os.unlink(path)
 
-    def test_skill_apply_route_shadowing_documents_1202(self, monkeypatch, tmp_path):
-        """DOCUMENTS #1202: the earlier assignment route shadows static /apply."""
+    def test_isolated_agent_can_apply_own_skills(self, monkeypatch, tmp_path):
+        """Signed self-apply reaches the real handler through the registered router."""
         client, path = self._make_client_with_agents(monkeypatch, tmp_path)
         try:
             response = self._signed_request(
@@ -1345,11 +1345,11 @@ class TestAgentIsolationScoping:
                 "/agents/tenant/skills/apply",
             )
 
-            assert response.status_code == 422, response.text
-            assert any(
-                error["type"] == "missing" and error["loc"] == ["body"]
-                for error in response.json()["detail"]
-            )
+            assert response.status_code == 200, response.text
+            result = response.json()
+            assert result["applied"] is True
+            assert result["agent"] == "tenant"
+            assert result["session_restarted"] is False
         finally:
             client.close()
             os.unlink(path)
