@@ -4763,6 +4763,22 @@ def create_api(
                 agent_name, label=label, resume_id=resume_id
             )
 
+    def _trace_sdk_submission(session, receipt):
+        if receipt is None:
+            return
+        # send() exposes no backend message id. This session-local sequence
+        # describes observed submissions without inventing backend identity.
+        try:
+            sequence = vars(session).get("_schedule_trace_submit_seq", 0) + 1
+            session._schedule_trace_submit_seq = sequence
+            receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
+                "resume_handle": getattr(session, "resume_handle", ""),
+                "message_id": None,
+                "submit_seq": sequence,
+            }))
+        except Exception as exc:
+            _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
+
     async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
@@ -4781,10 +4797,7 @@ def create_api(
                         return ss, await sender(prompt, **kwargs)
                 result = await ss.send(prompt, **kwargs)
                 if scheduler and result and schedule_receipt is not None:
-                    schedule_receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
-                        "session_id": getattr(ss, "resume_handle", ""),
-                        "message_id": getattr(ss, "last_message_id", None),
-                    }))
+                    _trace_sdk_submission(ss, schedule_receipt)
                 return ss, result
         raise HTTPException(409, "Session changed repeatedly before delivery")
 
@@ -12586,10 +12599,7 @@ npm run build</pre>
 
         handed_off = await ss.send(prompt)
         if handed_off and schedule_receipt is not None:
-            schedule_receipt.trace("paste", transport_kind="sdk", pointer=json.dumps({
-                "session_id": getattr(ss, "resume_handle", ""),
-                "message_id": getattr(ss, "last_message_id", None),
-            }))
+            _trace_sdk_submission(ss, schedule_receipt)
         confirmed = bool(
             handed_off
             and getattr(ss, "injection_confirms_consumption", False)
