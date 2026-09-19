@@ -5714,9 +5714,10 @@ def create_api(
 
     @app.middleware("http")
     async def auth_middleware(request: Request, call_next):
-        # Skip auth for WebSocket upgrades — WS handlers do their own auth
-        if request.headers.get("upgrade", "").lower() == "websocket":
-            return await call_next(request)
+        # No carve-out for an ``Upgrade`` header: real WebSocket handshakes
+        # never enter HTTP middleware (Starlette dispatches the ``websocket``
+        # scope around it), so an HTTP request carrying that header is just
+        # an HTTP request and is authenticated like any other.
 
         # NOTE on the unconfigured-secret case (PINKY_SESSION_SECRET unset):
         # we do NOT short-circuit to call_next here. Doing so would make
