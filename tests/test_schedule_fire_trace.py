@@ -559,3 +559,29 @@ def test_t5_non_busy_error_has_no_retry(registry, monkeypatch, caplog):
     assert len(calls) == 1
     assert writer.failure_counts(since=0)["paste"] == 1
     assert len([r for r in caplog.records if "schedule fire trace" in r.message.lower()]) == 1
+
+
+async def test_t1_sdk_pointer_uses_session_submission_sequence(tmp_path):
+    from pinky_daemon.api import create_api
+
+    app = create_api(db_path=str(tmp_path / "sdk-pointers.db"))
+    registry = app.state.agents
+    registry.register("worker", working_dir=str(tmp_path / "worker"))
+    session = SimpleNamespace(state=SessionState.CONNECTED, send=AsyncMock(return_value=True),
+                              injection_confirms_consumption=True, resume_handle="sdk-session")
+    app.state.broker._streaming["worker"] = {"main": session}
+    pointers = []
+    try:
+        for name in ("first recurrence", "second recurrence"):
+            pending, durable = fire(registry, name=name)
+            assert await app.state.scheduler._wake_callback(
+                "worker", "worker-main", pending.prompt, schedule_receipt=durable,
+            )
+            records = rows(registry)
+            record = next(r for r in records if r["fire_id"] == pending.id)
+            pointers.append(json.loads(record["paste_pointer"]))
+        assert [p["resume_handle"] for p in pointers] == ["sdk-session", "sdk-session"]
+        assert all(p["message_id"] is None for p in pointers)
+        assert 0 < pointers[0]["submit_seq"] < pointers[1]["submit_seq"]
+    finally:
+        registry.close()
