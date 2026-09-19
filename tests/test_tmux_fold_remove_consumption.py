@@ -1525,3 +1525,105 @@ def test_1281_pre_ticket_envelope_chain_cannot_certify_later_paste(tmp_path: Pat
     entry = _seed_inflight(session, prompt=raw)
     _bind_ticket(entry, transcript)
     assert session._phantom_consumption_verdicts([entry]) == [False]
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_1281_only_valid_envelope_gets_exact_user_row_priority(
+    valid: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "exact-priority.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    short = _seed_inflight(session, prompt="alpha")
+    long = _seed_inflight(session, prompt="alpha beta")
+    for entry in (short, long):
+        _bind_ticket(entry, transcript)
+    content = "\n\n" + _cc_21278_envelope(long.turn.prompt) + "\n"
+    if not valid:
+        content = content.replace('</pasted_content id="077e">', '</pasted_content>')
+    _append_entry(transcript, {"type": "user", "message": {"content": content}})
+    # Valid envelope is exact evidence for long before short can take its span.
+    # Malformed envelope remains ordinary containment: oldest span wins as before.
+    assert session._phantom_consumption_verdicts([short, long]) == (
+        [False, True] if valid else [True, False]
+    )
+
+
+@pytest.mark.parametrize("valid", [False, True])
+@pytest.mark.parametrize("dequeued", [False, True])
+def test_1281_retirement_matches_only_valid_envelope_identity(
+    valid: bool, dequeued: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "retirement.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    raw = "Retired original occurrence"
+    content = _cc_21278_envelope(raw)
+    if not valid:
+        content = content.replace('</pasted_content id="077e">', '</pasted_content id="abcd">')
+    # Transcript arrives before there is an owner: test the fallback tombstone.
+    _emit_live(session, transcript, _queue_entry("enqueue", content))
+    if dequeued:
+        _emit_live(session, transcript, _queue_entry("dequeue"))
+    entry = _seed_inflight(session, prompt=raw)
+    _bind_ticket(entry, transcript)
+    session._retire_acceptance_evidence(entry.turn)
+    evidence = (session._pane_dequeued_turns if dequeued else session._pane_queue_operations)[0]
+    assert evidence.retired is valid
+    assert evidence.content == content
+    assert entry.turn.transport_accepted is False
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_1281_late_wake_guard_requires_valid_envelope_identity(
+    valid: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "late-wake.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt="Original orientation wake")
+    _bind_ticket(entry, transcript)
+    guard = tmux_session._WakeContextReloadGuard(entry.turn, "Recovery instruction")
+    session._wake_context_reload_guard = guard
+    content = _cc_21278_envelope(entry.turn.prompt)
+    if not valid:
+        content = _cc_21278_envelope(content)
+    _emit_live(session, transcript, {"type": "user", "message": {"content": content}})
+    assert guard.original_seen is valid
+
+
+@pytest.mark.parametrize("valid", [False, True])
+def test_1281_enqueue_ownership_requires_valid_envelope_identity(
+    valid: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "enqueue-owner.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt="Owned enqueue")
+    _bind_ticket(entry, transcript)
+    content = _cc_21278_envelope(entry.turn.prompt)
+    if not valid:
+        content = content.replace('</pasted_content id="077e">', '</pasted_content>')
+    _emit_live(session, transcript, _queue_entry("enqueue", content))
+    evidence = session._pane_queue_operations[0]
+    assert evidence.turn is (entry.turn if valid else None)
+    assert entry.turn.pane_queue_enqueued is valid
+    assert entry.turn.transport_accepted is False  # Enqueue alone is not consumption.
+    assert evidence.content == content  # Raw leg identity never gets normalized.
+
+
+def test_1281_different_envelope_legs_cannot_form_a_chain(tmp_path: Path) -> None:
+    session = _make_session()
+    transcript = tmp_path / "unequal-legs.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt="Equal inner text is not equal leg identity")
+    _bind_ticket(entry, transcript)
+    envelope = _cc_21278_envelope(entry.turn.prompt)
+    for row in (
+        _queue_entry("enqueue", envelope),
+        _attachment_entry(envelope.replace("077e", "abcd")),
+        _queue_entry("remove", envelope),
+    ):
+        _emit_live(session, transcript, row)
+    assert entry.turn.transport_accepted is False
+    assert session._phantom_consumption_verdicts([entry]) == [False]
