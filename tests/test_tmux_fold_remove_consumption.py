@@ -1331,7 +1331,7 @@ async def test_1281_idle_chain_drains_without_replay(
     assert entry.turn.transport_accepted is True
     assert completion.is_set()
     assert receipt.result() is True
-    assert "verdict=verified_consumed" in capsys.readouterr().out
+    assert "verdict=verified_consumed" in capsys.readouterr().err
 
 
 @pytest.mark.parametrize("wrapped", [False, True], ids=["legacy", "cc-2.1.278"])
@@ -1422,7 +1422,7 @@ async def test_1281_production_mix_two_rows_three_chains(
         assert absent.turn.transport_accepted is False
         assert not absent.completion_event.is_set()
     assert session._message_queue.empty()
-    output = capsys.readouterr().out
+    output = capsys.readouterr().err
     assert output.count("verdict=verified_consumed") == 5
 
 
