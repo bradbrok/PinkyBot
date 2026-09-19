@@ -20,6 +20,7 @@ from typing import Any, Awaitable, Callable
 
 from fastapi import APIRouter, HTTPException, Request
 
+from pinky_daemon.access_log import _redact_hook_path as _redact_hook_path
 from pinky_daemon.api_models import CreateTriggerRequest, UpdateTriggerRequest
 
 router = APIRouter(tags=["triggers"])
@@ -57,14 +58,6 @@ _hook_ip_buckets: dict[str, list[float]] = {}
 
 _HOOK_IP_RATE_LIMIT = 20
 _HOOK_IP_RATE_WINDOW = 60.0
-
-
-_HOOKS_PATH_RE = _re2.compile(r"(/hooks/)([^/\s\"?]+)")
-
-
-def _redact_hook_path(value: str) -> str:
-    """Replace the token segment of a /hooks/<token> path with its 8-char prefix."""
-    return _HOOKS_PATH_RE.sub(lambda m: f"{m.group(1)}{m.group(2)[:8]}*", value)
 
 
 class HookTokenRedactionFilter(logging.Filter):
@@ -335,6 +328,7 @@ async def receive_webhook(token: str, request: Request):
     # rate-limit 429, oversized 413). The token is a credential: prefix only.
     _log(
         f"hooks: receipt token={token[:8]}* ip={_client_ip(request)}"
+        f" rid={getattr(request.state, 'request_id', '-')}"
         f" len={request.headers.get('content-length', '?')}"
         f" type={request.headers.get('content-type', '-')}"
     )

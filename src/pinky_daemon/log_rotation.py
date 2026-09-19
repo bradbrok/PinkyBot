@@ -1,4 +1,7 @@
-"""Daily, size-bounded rotation for the daemon's console log.
+"""Daily, size-bounded rotation for console and writer-owned access logs.
+
+Writer-owned access logs use rename plus a descriptor handoff before gzip,
+which preserves concurrent writes. The console mode below remains copytruncate.
 
 The daemon's console output (every ``_log()`` helper is a plain ``print()``)
 is captured by launchd's ``StandardOutPath`` / ``StandardErrorPath`` into a
@@ -42,6 +45,7 @@ import re
 import time
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 logger = logging.getLogger("pinky.log_rotation")
 
@@ -116,7 +120,15 @@ class LogRotator:
         *,
         max_bytes: int = _DEFAULT_MAX_BYTES,
         backup_days: int = _DEFAULT_BACKUP_DAYS,
+        mode: str = "copytruncate",
+        on_rotate: Callable[[], None] | None = None,
     ) -> None:
+        if mode not in {"copytruncate", "rename"}:
+            raise ValueError("unknown log rotation mode")
+        if mode == "rename" and on_rotate is None:
+            raise ValueError("rename rotation requires a writer handoff")
+        self.mode = mode
+        self.on_rotate = on_rotate
         self.log_path = Path(log_path)
         self.max_bytes = max_bytes
         self.backup_days = backup_days
@@ -151,9 +163,12 @@ class LogRotator:
         archive = _archive_path(self.log_path, stamp)
 
         try:
-            _copytruncate(self.log_path, archive)
+            if self.mode == "rename":
+                self._rename_rotate(archive)
+            else:
+                _copytruncate(self.log_path, archive)
         except Exception:
-            logger.exception("log_rotation: copytruncate failed")
+            logger.exception("log_rotation: rotation failed")
             return None
 
         if day_roll:
@@ -161,6 +176,32 @@ class LogRotator:
         self._prune()
         logger.info("log_rotation: rotated console log and pruned old archives")
         return archive
+
+    def _rename_rotate(self, archive: Path) -> None:
+        """Drain the old writer descriptor before compressing its stable inode.
+
+        Uncompressed data is retained if handoff or compression fails. This mode
+        is for a writer we own; externally owned console descriptors keep using
+        copytruncate.
+        """
+        raw = archive.with_suffix("")
+        if raw.exists():
+            raise FileExistsError(raw)
+        os.rename(self.log_path, raw)
+        assert self.on_rotate is not None
+        self.on_rotate()
+        tmp = archive.with_name(archive.name + ".part")
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        try:
+            with os.fdopen(fd, "wb") as output, raw.open("rb") as source:
+                with gzip.GzipFile(fileobj=output, mode="wb") as compressed:
+                    for line in source:
+                        compressed.write(line)
+            os.replace(tmp, archive)
+            raw.unlink()
+        except BaseException:
+            tmp.unlink(missing_ok=True)
+            raise
 
     def _prune(self) -> None:
         """Delete archives older than the retention window. Best-effort."""
@@ -179,20 +220,28 @@ async def run_rotation_loop(
     max_bytes: int = _DEFAULT_MAX_BYTES,
     backup_days: int = _DEFAULT_BACKUP_DAYS,
     interval_s: int = _CHECK_INTERVAL_S,
+    mode: str = "copytruncate",
+    on_rotate: Callable[[], None] | None = None,
 ) -> None:
     """Background task: rotate ``log_path`` on day-roll or size cap, forever.
 
     An oversized pre-existing file (e.g. the legacy 1.5 GB ``api.log``) is
     rolled promptly on the first check. Blocking copy/gzip runs in a thread.
     """
-    rotator = LogRotator(log_path, max_bytes=max_bytes, backup_days=backup_days)
+    rotator = LogRotator(log_path, max_bytes=max_bytes, backup_days=backup_days,
+                         mode=mode, on_rotate=on_rotate)
     first = True
     while True:
         if not first:
             await asyncio.sleep(interval_s)
         first = False
         try:
-            await asyncio.to_thread(rotator.check_and_rotate)
+            work = asyncio.create_task(asyncio.to_thread(rotator.check_and_rotate))
+            try:
+                await asyncio.shield(work)
+            except asyncio.CancelledError:
+                await work
+                raise
         except asyncio.CancelledError:
             raise
         except Exception:
