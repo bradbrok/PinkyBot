@@ -1627,3 +1627,28 @@ def test_1281_different_envelope_legs_cannot_form_a_chain(tmp_path: Path) -> Non
         _emit_live(session, transcript, row)
     assert entry.turn.transport_accepted is False
     assert session._phantom_consumption_verdicts([entry]) == [False]
+
+
+@pytest.mark.parametrize("boundary", ["post-ticket", "pre-ticket", "missing-ticket", "wrong-source"])
+def test_1281_live_envelope_user_row_preserves_paste_boundary(
+    boundary: str, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "live-row-boundary.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    raw = "Same prompt in an old or new user row"
+    row = {"type": "user", "message": {
+        "content": "\n\n" + _cc_21278_envelope(raw) + "\n",
+    }}
+    if boundary == "pre-ticket":
+        row_offset = _append_entry(transcript, row)
+    entry = _seed_inflight(session, prompt=raw)
+    if boundary != "missing-ticket":
+        _bind_ticket(entry, transcript)
+    if boundary != "pre-ticket":
+        row_offset = _append_entry(transcript, row)
+    stat = transcript.stat()
+    identity = (stat.st_dev, stat.st_ino + (boundary == "wrong-source"))
+    session._on_transcript_entry(row, entry_offset=row_offset, source_identity=identity)
+    assert entry.turn.transport_accepted is (boundary == "post-ticket")
+    assert session._registry.mark_turn_delivered.call_count == (boundary == "post-ticket")
