@@ -665,3 +665,27 @@ def test_t6_readers_tolerate_transient_exclusive_commit(tmp_path):
     finally:
         client.close()
         registry.close()
+
+
+@pytest.mark.parametrize("pane", ["tmux_codex"], indirect=True)
+async def test_t5_unserializable_observer_pointer_cannot_block_acceptance(pane, caplog):
+    class InvalidPointer:
+        def __str__(self):
+            raise RuntimeError("injected invalid pointer")
+
+    _, durable = fire(pane.registry)
+    _, receipt = await paste(pane, durable)
+    pane.session._tailer.entry_pointer = InvalidPointer()
+    pane.session._on_transcript_entry({
+        "type": "event_msg", "payload": {
+            "type": "user_message", "message": "scheduled work",
+        },
+    })
+    assert receipt.result() is True
+    record, = rows(pane.registry)
+    assert record["paste_at"] > 0 and record["paste_attempts"] == 1
+    assert record["matched_at"] > 0 and record["receipt_accept_result"] == 1
+    assert record["user_message_observed_at"] == 0
+    assert pane.registry._fire_trace.failure_counts(since=0)["observed"] == 1
+    errors = [r for r in caplog.records if "schedule fire trace" in r.message.lower()]
+    assert len(errors) == 1 and "observed" in errors[0].message
