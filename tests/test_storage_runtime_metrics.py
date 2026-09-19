@@ -406,7 +406,7 @@ def test_serving_endpoint_adds_exact_runtime_and_corruption_keys_but_starts_idle
         "busy_streak": 3,
         "lock_wait_upper_bound_ms": 250,
     }
-    assert len(runtime["stores"]) == 25
+    assert len(runtime["stores"]) == 27
     assert set(runtime["stores"]) == set(api_module._derive_api_store_manifest(base))
 
     cohort_ids = set()
@@ -433,7 +433,7 @@ def test_serving_endpoint_adds_exact_runtime_and_corruption_keys_but_starts_idle
         assert isinstance(depth["cohort_id"], str) and depth["cohort_id"]
         cohort_ids.add(depth["cohort_id"])
 
-    assert len(cohort_ids) == 23
+    assert len(cohort_ids) == 24
     assert (
         runtime["stores"]["sessions"]["writer_queue_depth"]
         == runtime["stores"]["session_events"]["writer_queue_depth"]
@@ -832,17 +832,21 @@ def test_manifest_cardinality_alias_origin_and_connection_policy_are_unchanged(
     tenant = derive_standalone_tenant_store_manifest(tmp_path / "tenant-keys.db")
 
     assert fleet["tool_policy"].criticality == "authority"
-    assert len(fleet) == 25
+    assert len(fleet) == 27
     assert set(fleet).intersection(tenant) == {"agent_signing_keys"}
     assert fleet["agents"].path == fleet["agent_signing_keys"].path
     assert fleet["sessions"].path == fleet["session_events"].path
+    assert fleet["schedule_fire_trace"].path == fleet["schedule_fire_trace_read"].path
+    for alias, timeout in (("schedule_fire_trace", 0), ("schedule_fire_trace_read", 1_000)):
+        assert fleet[alias].connection_policy.busy_timeout_ms == timeout
+        assert fleet[alias].connection_policy.rollback_retries == 6
     timeout_counts = {
         timeout_ms: sum(
             target.connection_policy.busy_timeout_ms == timeout_ms for target in fleet.values()
         )
-        for timeout_ms in (5_000, 30_000)
+        for timeout_ms in (0, 1_000, 5_000, 30_000)
     }
-    assert timeout_counts == {5_000: 10, 30_000: 15}
+    assert timeout_counts == {0: 1, 1_000: 1, 5_000: 10, 30_000: 15}
     assert {target.connection_policy.rollback_retries for target in fleet.values()} == {6}
     assert {target.connection_policy.rollback_retry_delay_seconds for target in fleet.values()} == {
         0.2

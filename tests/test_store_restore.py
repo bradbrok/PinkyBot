@@ -831,3 +831,61 @@ def test_tool_policy_schema_sentinels_exist_in_fresh_store(tmp_path: Path) -> No
         assert set(sentinels) <= actual
     finally:
         store.close()
+
+
+
+def _trace_restore_fixture(tmp_path: Path) -> tuple[Path, Path, Path]:
+    from pinky_daemon.schedule_fire_trace import ScheduleFireTrace
+
+    base = tmp_path / "target" / "conversations.db"
+    manifest = api_module._derive_api_store_manifest(base)
+    registry_path = Path(manifest["agents"].path)
+    registry_path.parent.mkdir(parents=True)
+    sqlite3.connect(registry_path).close()
+    trace = ScheduleFireTrace(os.fspath(registry_path))
+    trace.close()
+    target = Path(trace.path)
+    snapshot = tmp_path / "trace-snapshot.db"
+    snapshot.write_bytes(target.read_bytes())
+    assert manifest["schedule_fire_trace"].path == manifest["schedule_fire_trace_read"].path
+    assert _quick_check(snapshot) == [("ok",)]
+    return base, target, snapshot
+
+
+def test_trace_restore_rejects_snapshot_missing_failure_evidence(monkeypatch, tmp_path):
+    restore = _restore_module()
+    base, target, snapshot = _trace_restore_fixture(tmp_path)
+    with sqlite3.connect(snapshot) as connection:
+        connection.execute("DROP TABLE schedule_fire_trace_failures")
+    assert _quick_check(snapshot) == [("ok",)]
+    before = _write_corrupt_target(target)
+    _configure_lsof(monkeypatch)
+    with pytest.raises(restore.StoreRestoreVerificationError, match="schema|table"):
+        _restore(base, "schedule_fire_trace", snapshot)
+    assert target.read_bytes() == before
+    assert not _corrupt_artifacts(target)
+
+
+@pytest.mark.parametrize("alias", ["schedule_fire_trace", "schedule_fire_trace_read"])
+def test_each_trace_alias_restores_the_shared_cohort_once(monkeypatch, tmp_path, alias):
+    restore = _restore_module()
+    base, target, snapshot = _trace_restore_fixture(tmp_path)
+    _write_corrupt_target(target)
+    _configure_lsof(monkeypatch)
+    replacements = []
+    original = restore.os.replace
+
+    def replace(source, destination):
+        replacements.append((Path(source), Path(destination)))
+        return original(source, destination)
+
+    monkeypatch.setattr(restore.os, "replace", replace)
+    result = _restore(base, alias, snapshot)
+    assert result.logical_names == ("schedule_fire_trace", "schedule_fire_trace_read")
+    assert sum(destination == target for _, destination in replacements) == 1
+    assert sum(source == target for source, _ in replacements) == 1
+    assert len(_corrupt_artifacts(target)) == 1
+    assert _quick_check(target) == [("ok",)]
+    with sqlite3.connect(target) as connection:
+        tables = {row[0] for row in connection.execute("SELECT name FROM sqlite_master WHERE type='table'")}
+    assert {"schedule_fire_trace", "schedule_fire_trace_failures"} <= tables
