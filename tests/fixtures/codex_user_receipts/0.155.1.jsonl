@@ -1,0 +1,5 @@
+{"payload": {"cli_version": "0.155.1", "originator": "codex-tui"}, "type": "session_meta"}
+{"payload": {"turn_id": "fixture-turn", "type": "task_started"}, "type": "event_msg"}
+{"payload": {"content": [{"text": "scheduled work", "type": "input_text"}], "id": "fixture-user", "internal_chat_message_metadata_passthrough": null, "role": "user", "type": "message"}, "type": "response_item"}
+{"payload": {"item": {"client_id": "fixture-client", "content": [], "id": "fixture-user", "type": "UserMessage"}, "thread_id": "fixture-thread", "turn_id": "fixture-turn", "type": "item_completed"}, "type": "event_msg"}
+{"payload": {"turn_id": "fixture-turn", "type": "task_complete"}, "type": "event_msg"}
