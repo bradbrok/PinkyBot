@@ -245,6 +245,15 @@ def _make_session(
     return ss, tmux
 
 
+def _bind_placeholder_tailer(ss: TmuxSession) -> None:
+    """Give directly connected receipt fixtures the post-spawn tailer state."""
+    assert ss._tailer is None
+    ss._tailer = TmuxTranscriptTailer(
+        transcript_path=tmux_session._PLACEHOLDER_TRANSCRIPT_PATH,
+        on_turn_complete=ss._handle_turn_complete,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────────
 # Construction + identity
 # ──────────────────────────────────────────────────────────────────────────
@@ -4549,6 +4558,7 @@ async def test_scheduler_prompt_receipt_waits_for_live_working_status() -> None:
     """#931: pane status must gate prompts without local inflight metadata."""
     live = {"status": "working", "last_updated": _time.time()}
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _bind_placeholder_tailer(ss)
     ss._config.live_status_fn = lambda: live
 
     receipt = await ss.send_scheduler_prompt("scheduled")
@@ -4672,6 +4682,7 @@ async def test_scheduler_wake_queued_tracks_943_requeued_head() -> None:
 async def test_scheduler_cancel_paste_race_reports_pasted() -> None:
     """The REPL lock adjudicates a paste that starts during queued recall."""
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _bind_placeholder_tailer(ss)
     ss._config.live_status_fn = lambda: {
         "status": "idle",
         "last_updated": _time.time(),
@@ -4830,6 +4841,7 @@ async def test_second_scheduler_prompt_delivers_after_first_receipt_and_stop(
     """Midturn native-queue steering must not starve the next scheduler turn."""
     live = {"status": "idle", "last_updated": _time.time()}
     ss, tmux = _make_session(state=SessionState.CONNECTED)
+    _bind_placeholder_tailer(ss)
     ss._config.live_status_fn = lambda: live
     ss._worker_task = asyncio.create_task(ss._message_worker())
     second_receipt: asyncio.Future[bool] | None = None
@@ -11608,6 +11620,7 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
         ss.force_restart = AsyncMock(return_value=True)
@@ -11666,6 +11679,7 @@ class TestWakeSubmissionVerification:
 
         tmux.capture_pane = AsyncMock(side_effect=final_probe)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         injector = AsyncMock(return_value=True)
         ss._config.wake_submission_recovery_injector = injector
         ss.force_restart = AsyncMock(return_value=True)
@@ -12153,6 +12167,7 @@ class TestWakeSubmissionVerification:
             )
         )
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12237,6 +12252,7 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12333,6 +12349,7 @@ class TestWakeSubmissionVerification:
         )
         tmux = _make_mock_tmux()
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12390,6 +12407,7 @@ class TestWakeSubmissionVerification:
             )
         )
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12454,6 +12472,7 @@ class TestWakeSubmissionVerification:
 
         tmux.paste_text = AsyncMock(side_effect=timeout_after_receipt)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []
@@ -12539,6 +12558,7 @@ class TestWakeSubmissionVerification:
 
         tmux._run = AsyncMock(side_effect=run_command)
         ss, _ = _make_session(state=SessionState.CONNECTED, tmux=tmux)
+        _bind_placeholder_tailer(ss)
         ss._session_ready_event.set()
         receipt = asyncio.get_running_loop().create_future()
         fires: list[str] = []

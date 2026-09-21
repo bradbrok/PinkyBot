@@ -1499,6 +1499,8 @@ class _QueuedTurn:
     transcript_anchor_start_at_paste: int | None = None
     transcript_anchor_at_paste: bytes | None = None
     transcript_ticket_captured_at_ns: int | None = None
+    # Bound warning deduplication to the turn's lifetime, including redelivery.
+    transcript_ticket_warned_shapes: set[str] = field(default_factory=set)
     # Wake-only exact submission receipt (#953). True requires a matching
     # transcript user row or queue enqueue→dequeue; successful tmux paste/Enter
     # commands alone are deliberately insufficient. Kept separate from the
@@ -7583,6 +7585,13 @@ class TmuxSession(TransportReplacementMixin):
             path = Path(raw_path)
         except (TypeError, ValueError):
             return _TranscriptOccurrenceTicket(None, None, None)
+        if path == _PLACEHOLDER_TRANSCRIPT_PATH:
+            # Before first bind, a fresh launch materializes its file after
+            # paste. On --continue, first bind does not seek_to_start, so old
+            # identical rows are not emitted as new acceptance evidence.
+            return _TranscriptOccurrenceTicket(
+                path, None, 0, anchor_start=0, anchor=b"", captured_at_ns=time.time_ns(),
+            )
         try:
             # Preserve the fail-safe distinction between a missing path and an
             # inaccessible bound path. Identity never comes from this lookup;
@@ -9787,6 +9796,50 @@ class TmuxSession(TransportReplacementMixin):
             and entry_offset >= ticket_offset
         )
 
+    def _live_user_row_matches_turn_ticket(
+        self,
+        turn: _QueuedTurn,
+        *,
+        entry_offset: int | None,
+        source_identity: tuple[int, int] | None,
+    ) -> bool:
+        """Check the pre-paste ticket even before routing metadata exists."""
+        identity = turn.transcript_file_identity_at_paste
+        offset = turn.transcript_offset_at_paste
+        if identity is not None and offset is not None:
+            return self._transcript_entry_matches_ticket(
+                entry_offset=entry_offset,
+                source_identity=source_identity,
+                ticket_offset=offset,
+                ticket_identity=identity,
+            )
+        cold_start = (
+            turn.transcript_path_at_paste is not None
+            and identity is None
+            and offset == 0
+        )
+        detail = ""
+        if cold_start:
+            # Preserve first-turn acceptance when the file did not exist at
+            # paste. Anchor/first-materialization certification is a follow-up.
+            shape = "cold-start"
+            reason = "cold_start_ticket_unverified"
+            cold_reason = (
+                "placeholder" if turn.transcript_path_at_paste == _PLACEHOLDER_TRANSCRIPT_PATH
+                else "file_missing"
+            )
+            detail = f" cold_start_reason={cold_reason!r}"
+        else:
+            shape = "unbound" if turn.transcript_path_at_paste is None else "inaccessible"
+            reason = "no paste ticket"
+        if shape not in turn.transcript_ticket_warned_shapes:
+            turn.transcript_ticket_warned_shapes.add(shape)
+            _log(
+                f"WARNING live user-row ticket turn_id={id(turn)} "
+                f"entry_offset={entry_offset} shape={shape} reason={reason!r}{detail}"
+            )
+        return cold_start
+
     @staticmethod
     def _fold_pair_rows_share_occurrence(
         *,
@@ -10642,18 +10695,10 @@ class TmuxSession(TransportReplacementMixin):
                     return
                 turn = self._match_acceptance_content(prompt)
                 if turn is not None:
-                    # Bare exact rows retain their inherited acceptance path.
-                    # An envelope previously reached the containment fallback:
-                    # normalizing it must retain that same paste-bound guard.
-                    meta = self._inflight_meta_for_turn(turn)
-                    if prompt == turn.prompt or (
-                        meta is not None
-                        and self._transcript_entry_matches_ticket(
-                            entry_offset=entry_offset,
-                            source_identity=source_identity,
-                            ticket_offset=meta.transcript_offset_at_paste,
-                            ticket_identity=meta.transcript_file_identity_at_paste,
-                        )
+                    if self._live_user_row_matches_turn_ticket(
+                        turn,
+                        entry_offset=entry_offset,
+                        source_identity=source_identity,
                     ):
                         self._mark_transport_accepted(turn)
                 else:

@@ -134,6 +134,7 @@ def _ticket_parts(transcript: Path) -> tuple[tuple[int, int], int, int, bytes]:
 
 
 def _bind_ticket(entry: _InflightMeta, transcript: Path) -> None:
+    _bind_turn_ticket(entry.turn, transcript)
     identity, offset, anchor_start, anchor = _ticket_parts(transcript)
     entry.transcript_path_at_paste = transcript
     entry.transcript_file_identity_at_paste = identity
@@ -1652,3 +1653,189 @@ def test_1281_live_envelope_user_row_preserves_paste_boundary(
     session._on_transcript_entry(row, entry_offset=row_offset, source_identity=identity)
     assert entry.turn.transport_accepted is (boundary == "post-ticket")
     assert session._registry.mark_turn_delivered.call_count == (boundary == "post-ticket")
+
+
+@pytest.mark.parametrize("before_meta", [False, True], ids=["recorded", "pasting"])
+@pytest.mark.parametrize("boundary", ["pre-ticket", "wrong-source", "post-ticket"])
+def test_1290_bare_user_row_requires_turn_ticket(
+    boundary: str, before_meta: bool, tmp_path: Path,
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "bare-boundary.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt="Repeated bare prompt")
+    row = {"type": "user", "message": {"content": entry.turn.prompt}}
+    if boundary == "pre-ticket":
+        row_offset = _append_entry(transcript, row)
+    _bind_ticket(entry, transcript)
+    if boundary != "pre-ticket":
+        row_offset = _append_entry(transcript, row)
+    if before_meta:
+        session._inflight_metas.clear()
+        session._inflight_turn = entry.turn
+        assert session._inflight_meta_for_turn(entry.turn) is None
+    stat = transcript.stat()
+    identity = (stat.st_dev, stat.st_ino + (boundary == "wrong-source"))
+    session._on_transcript_entry(row, entry_offset=row_offset, source_identity=identity)
+    assert entry.turn.transport_accepted is (boundary == "post-ticket")
+    assert session._registry.mark_turn_delivered.call_count == (boundary == "post-ticket")
+
+
+@pytest.mark.parametrize("shape", ["unbound", "inaccessible"])
+def test_1290_bare_user_row_without_ticket_rejects_and_warns_once(
+    shape: str, tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "missing-ticket.jsonl"
+    entry = _seed_inflight(session, prompt="Prompt without provenance")
+    if shape == "inaccessible":
+        entry.turn.transcript_path_at_paste = transcript
+    row = {"type": "user", "message": {"content": entry.turn.prompt}}
+    row_offset = _emit_live(session, transcript, row)
+    _emit_live(session, transcript, row)
+    assert entry.turn.transport_accepted is False
+    session._registry.mark_turn_delivered.assert_not_called()
+    assert list(session._inflight_metas) == [entry]
+    warnings = [line for line in capsys.readouterr().err.splitlines()
+                if "reason='no paste ticket'" in line]
+    assert len(warnings) == 1
+    assert "WARNING" in warnings[0]
+    assert f"turn_id={id(entry.turn)}" in warnings[0]
+    assert f"entry_offset={row_offset}" in warnings[0]
+    assert f"shape={shape}" in warnings[0]
+
+
+@pytest.mark.asyncio
+async def test_1290_equal_prompt_twins_consume_only_ticketed_occurrence(tmp_path: Path) -> None:
+    session = _make_session()
+    transcript = tmp_path / "bare-twins.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    first_receipt = asyncio.get_running_loop().create_future()
+    second_receipt = asyncio.get_running_loop().create_future()
+    first = _seed_inflight(session, prompt="Equal queued prompt", message_id="first",
+                           scheduler_delivery=first_receipt, completion_event=asyncio.Event())
+    _bind_ticket(first, transcript)
+    row = {"type": "user", "message": {"content": first.turn.prompt}}
+    row_offset = _append_entry(transcript, row)
+    second = _seed_inflight(session, prompt=first.turn.prompt, message_id="second",
+                            scheduler_delivery=second_receipt, completion_event=asyncio.Event())
+    _bind_ticket(second, transcript)
+    identity = first.turn.transcript_file_identity_at_paste
+    for _ in range(2):
+        session._on_transcript_entry(row, entry_offset=row_offset, source_identity=identity)
+    assert first.turn.transport_accepted is True
+    assert second.turn.transport_accepted is False
+    assert first_receipt.result() is True
+    assert not second_receipt.done()
+    assert not second.completion_event.is_set()
+    assert any(meta.turn is second.turn for meta in session._inflight_metas)
+    session._registry.mark_turn_delivered.assert_called_once_with(
+        session.agent_name, "telegram", "chat", "first", source="telegram",
+    )
+
+
+def test_1290_cold_start_bare_user_row_accepts_with_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "cold-start.jsonl"
+    entry = _seed_inflight(session, prompt="First prompt after spawn")
+    session._tailer = MagicMock(transcript_path=transcript)
+    ticket = session._capture_transcript_occurrence_ticket()
+    (entry.turn.transcript_path_at_paste,
+     entry.turn.transcript_file_identity_at_paste,
+     entry.turn.transcript_offset_at_paste) = ticket
+    assert tuple(ticket) == (transcript, None, 0)
+    row = {"type": "user", "message": {"content": entry.turn.prompt}}
+    row_offset = _emit_live(session, transcript, row)
+    _emit_live(session, transcript, row)
+    assert entry.turn.transport_accepted is True
+    session._registry.mark_turn_delivered.assert_called_once()
+    warnings = [line for line in capsys.readouterr().err.splitlines()
+                if "reason='cold_start_ticket_unverified'" in line]
+    assert len(warnings) == 1
+    assert "WARNING" in warnings[0]
+    assert f"turn_id={id(entry.turn)}" in warnings[0]
+    assert f"entry_offset={row_offset}" in warnings[0]
+    assert "shape=cold-start" in warnings[0]
+    assert "cold_start_reason='file_missing'" in warnings[0]
+
+
+@pytest.mark.parametrize("before_meta", [False, True], ids=["recorded", "pasting"])
+@pytest.mark.parametrize("boundary", [
+    "pre-ticket", "wrong-source", "post-ticket", "unbound", "inaccessible", "cold-start",
+])
+def test_1290_enveloped_user_row_uses_same_turn_ticket(
+    boundary: str, before_meta: bool, tmp_path: Path,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = _make_session()
+    transcript = tmp_path / "envelope-ticket.jsonl"
+    transcript.write_text('{"type":"system"}\n', encoding="utf-8")
+    entry = _seed_inflight(session, prompt="Enveloped prompt during paste")
+    row = {"type": "user", "message": {
+        "content": _cc_21278_envelope(entry.turn.prompt),
+    }}
+    if boundary == "pre-ticket":
+        row_offset = _append_entry(transcript, row)
+    if boundary in {"pre-ticket", "wrong-source", "post-ticket"}:
+        _bind_ticket(entry, transcript)
+    elif boundary != "unbound":
+        entry.turn.transcript_path_at_paste = transcript
+        if boundary == "cold-start":
+            entry.turn.transcript_offset_at_paste = 0
+    if boundary != "pre-ticket":
+        row_offset = _append_entry(transcript, row)
+    if before_meta:
+        session._inflight_metas.clear()
+        session._inflight_turn = entry.turn
+    stat = transcript.stat()
+    identity = (stat.st_dev, stat.st_ino + (boundary == "wrong-source"))
+    for _ in range(2):
+        session._on_transcript_entry(row, entry_offset=row_offset, source_identity=identity)
+    accepted = boundary in {"post-ticket", "cold-start"}
+    assert entry.turn.transport_accepted is accepted
+    assert session._registry.mark_turn_delivered.call_count == accepted
+    warnings = [line for line in capsys.readouterr().err.splitlines() if "WARNING" in line]
+    if boundary in {"unbound", "inaccessible", "cold-start"}:
+        assert len(warnings) == 1
+        assert f"shape={boundary}" in warnings[0]
+        reason = "cold_start_ticket_unverified" if boundary == "cold-start" else "no paste ticket"
+        assert f"reason={reason!r}" in warnings[0]
+    else:
+        assert warnings == []
+
+
+def test_1290_placeholder_capture_is_a_cold_start_ticket() -> None:
+    session = _make_session()
+    session._tailer = MagicMock(transcript_path=tmux_session._PLACEHOLDER_TRANSCRIPT_PATH)
+    ticket = session._capture_transcript_occurrence_ticket()
+    assert tuple(ticket) == (tmux_session._PLACEHOLDER_TRANSCRIPT_PATH, None, 0)
+    assert ticket.anchor_start == 0
+    assert ticket.anchor == b""
+    assert ticket.captured_at_ns is not None
+
+
+@pytest.mark.asyncio
+async def test_1290_placeholder_early_paste_accepts_with_warning(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = _make_session()
+    session._tailer = MagicMock(transcript_path=tmux_session._PLACEHOLDER_TRANSCRIPT_PATH)
+    turn = _QueuedTurn(prompt="Ordinary prompt before first bind", message_id="early")
+    session._inflight_turn = turn
+    await session._deliver_turn(turn)
+    assert not session._session_ready_event.is_set()
+    transcript = tmp_path / "first-materialized.jsonl"
+    row_offset = _emit_live(session, transcript, {
+        "type": "user", "message": {"content": turn.prompt},
+    })
+    assert turn.transport_accepted is True
+    session._registry.mark_turn_delivered.assert_called_once()
+    warnings = [line for line in capsys.readouterr().err.splitlines()
+                if "reason='cold_start_ticket_unverified'" in line]
+    assert len(warnings) == 1
+    assert "WARNING" in warnings[0]
+    assert f"turn_id={id(turn)}" in warnings[0]
+    assert f"entry_offset={row_offset}" in warnings[0]
+    assert "cold_start_reason='placeholder'" in warnings[0]
