@@ -596,33 +596,64 @@ class CodexTmuxSession(TmuxSession):
 
     def _on_transcript_entry(self, entry: dict) -> None:
         """Map Codex rollout acceptance onto the shared exact-receipt path."""
-        if entry.get("type") == "event_msg":
-            payload = entry.get("payload") or {}
-            if payload.get("type") == "user_message":
-                prompt = payload.get("message")
-                if isinstance(prompt, str):
-                    self._trace_observed_prompt(prompt, pointer=(
-                        getattr(self._tailer, "entry_pointer", None) or {
-                            "path": getattr(self._tailer, "transcript_path", ""),
-                            "offset": None,
-                        }
-                    ))
-                    turn = self._match_acceptance_turn(prompt)
-                    # The rollout tailer can observe user_message and a very
-                    # fast task_complete in one read while paste_text's final
-                    # tmux subprocess is still returning.  Reserve FIFO
-                    # metadata before resolving the exact scheduler receipt so
-                    # that same-read completion has a head to retire.  The
-                    # normal post-paste path is idempotent on this flag.
-                    if (
-                        turn is not None
-                        and turn.scheduler_delivery is not None
-                        and not turn.pane_delivery_recorded
-                    ):
-                        self._finish_turn_delivery(turn)
-                    self._mark_transport_accepted(turn)
+        payload = entry.get("payload")
+        payload = payload if isinstance(payload, dict) else {}
+        current_user_row = (
+            entry.get("type") == "response_item"
+            and payload.get("type") == "message"
+            and payload.get("role") == "user"
+        )
+        legacy_user_row = (
+            entry.get("type") == "event_msg" and payload.get("type") == "user_message"
+        )
+        if current_user_row:
+            content = payload.get("content")
+            if not isinstance(content, list) or any(
+                not isinstance(item, dict)
+                or (item.get("type") == "input_text" and not isinstance(item.get("text"), str))
+                for item in content
+            ):
+                if not getattr(self, "_codex_user_content_warned", False):
+                    self._codex_user_content_warned = True
+                    _log("WARNING malformed Codex user-row content; receipt ignored")
                 return
-        super()._on_transcript_entry(entry)
+            prompt = "".join(
+                item["text"] for item in content if item.get("type") == "input_text"
+            )
+            if not prompt:
+                return
+        elif legacy_user_row:
+            prompt = payload.get("message")
+        else:
+            super()._on_transcript_entry(entry)
+            return
+        if not isinstance(prompt, str):
+            return
+        pointer = getattr(self._tailer, "entry_pointer", None) or {
+            "path": getattr(self._tailer, "transcript_path", ""), "offset": None,
+        }
+        self._trace_observed_prompt(prompt, pointer=pointer)
+        turn = self._match_acceptance_turn(prompt)
+        if current_user_row and (
+            turn is None
+            or not self._transcript_entry_matches_ticket(
+                entry_offset=pointer.get("offset"),
+                source_identity=pointer.get("identity"),
+                ticket_offset=turn.transcript_offset_at_paste,
+                ticket_identity=turn.transcript_file_identity_at_paste,
+            )
+        ):
+            return
+        # A user row and task_complete can arrive in one read before paste_text
+        # returns. Reserve routing metadata before resolving the receipt so that
+        # completion has a head to retire; normal post-paste recording is idempotent.
+        if (
+            turn is not None
+            and turn.scheduler_delivery is not None
+            and not turn.pane_delivery_recorded
+        ):
+            self._finish_turn_delivery(turn)
+        self._mark_transport_accepted(turn)
 
     # ── seam: cold-start (codex trust pre-seed + NUX dismissal + readiness) ──
     def _preflight_transport_replacement(self) -> None:
