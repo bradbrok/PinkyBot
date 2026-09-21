@@ -213,6 +213,7 @@ class CodexTmuxSession(TmuxSession):
         self._reasoning_effort = config.thinking_effort or "medium"
         self._codex_mcp_servers = config.mcp_servers or {}
         self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
+        self._codex_user_content_warned = False
 
     # ── seam: session name ──────────────────────────────────────────────────
     def _build_session_name(self) -> str:
@@ -613,7 +614,7 @@ class CodexTmuxSession(TmuxSession):
                 or (item.get("type") == "input_text" and not isinstance(item.get("text"), str))
                 for item in content
             ):
-                if not getattr(self, "_codex_user_content_warned", False):
+                if not self._codex_user_content_warned:
                     self._codex_user_content_warned = True
                     _log("WARNING malformed Codex user-row content; receipt ignored")
                 return
@@ -643,6 +644,27 @@ class CodexTmuxSession(TmuxSession):
                 ticket_identity=turn.transcript_file_identity_at_paste,
             )
         ):
+            if turn is not None:
+                identity = turn.transcript_file_identity_at_paste
+                offset = turn.transcript_offset_at_paste
+                path = turn.transcript_path_at_paste
+                if path is not None and identity is None and offset == 0:
+                    shape = "cold-start"
+                elif path is None:
+                    shape = "unbound"
+                elif identity is None or offset is None:
+                    shape = "inaccessible"
+                else:
+                    shape = "mismatch"
+                if shape not in turn.transcript_ticket_warned_shapes:
+                    turn.transcript_ticket_warned_shapes.add(shape)
+                    _log(
+                        f"WARNING codex user-row ticket turn_id={id(turn)} "
+                        f"entry_offset={pointer.get('offset')} "
+                        f"source_identity={pointer.get('identity')} "
+                        f"ticket_offset={offset} ticket_identity={identity} "
+                        f"shape={shape} reason='paste ticket mismatch'"
+                    )
             return
         # A user row and task_complete can arrive in one read before paste_text
         # returns. Reserve routing metadata before resolving the receipt so that

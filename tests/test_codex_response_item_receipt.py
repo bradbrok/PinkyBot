@@ -105,28 +105,47 @@ async def test_current_user_row_releases_first_boundary_replay(harness):
     assert notifications == ["worker"]
 
 
-@pytest.mark.parametrize("shape", ["pre_ticket", "other_source", "missing", "cold_start"])
-async def test_current_user_row_requires_paste_provenance(harness, shape):
+@pytest.mark.parametrize("shape", [
+    "pre_ticket", "other_source", "missing", "cold_start", "unbound", "no_pointer",
+])
+async def test_current_user_row_requires_paste_provenance(harness, shape, capsys):
     if shape == "pre_ticket":
-        append(harness, user_row())
+        append(harness, user_row(), user_row())
     turn, receipt = await _paste(harness)
     if shape == "other_source":
         replacement = harness.rollout.with_suffix(".new")
         replacement.write_text("")
         replacement.replace(harness.rollout)
-    elif shape in {"missing", "cold_start"}:
+    elif shape in {"missing", "cold_start", "unbound"}:
         turn.transcript_file_identity_at_paste = None
         turn.transcript_offset_at_paste = 0 if shape == "cold_start" else None
-    if shape != "pre_ticket":
-        append(harness, user_row())
-    await _read(harness)
+    if shape == "unbound":
+        turn.transcript_path_at_paste = None
+    if shape == "no_pointer":
+        harness.session._tailer.entry_pointer = None
+        harness.session._on_transcript_entry(user_row())
+        harness.session._on_transcript_entry(user_row())
+    else:
+        if shape != "pre_ticket":
+            append(harness, user_row(), user_row())
+        await _read(harness)
     assert not receipt.done(), "a user row without matching paste provenance must be rejected"
     assert not turn.transport_accepted
     assert harness.session.scheduler_wake_inflight(turn.prompt)
+    warnings = [line for line in capsys.readouterr().err.splitlines()
+                if "WARNING codex user-row ticket" in line]
+    assert len(warnings) == 1, "repeated rejected rows must warn once per turn and shape"
+    expected = {"missing": "inaccessible", "cold_start": "cold-start",
+                "unbound": "unbound"}.get(shape, "mismatch")
+    assert f"turn_id={id(turn)}" in warnings[0]
+    assert f"shape={expected}" in warnings[0]
+    assert "reason='paste ticket mismatch'" in warnings[0]
+    for field in ("entry_offset=", "source_identity=", "ticket_offset=", "ticket_identity="):
+        assert field in warnings[0]
 
 
 @pytest.mark.parametrize("change", ["prompt", "assistant", "developer", "no_user_row"])
-async def test_nonmatching_current_rows_cannot_accept(harness, change):
+async def test_nonmatching_current_rows_cannot_accept(harness, change, capsys):
     turn, receipt = await _paste(harness)
     entries = fixture()
     entry = next(row for row in entries if row["type"] == "response_item")
@@ -140,6 +159,7 @@ async def test_nonmatching_current_rows_cannot_accept(harness, change):
     await _read(harness)
     assert not receipt.done()
     assert not turn.transport_accepted
+    assert "WARNING codex user-row ticket" not in capsys.readouterr().err
 
 
 async def test_multiple_input_text_items_preserve_order(harness):
