@@ -384,53 +384,75 @@ def test_denial_responses_have_security_headers(factory, target, status):
     assert response.headers.get("referrer-policy") == "strict-origin-when-cross-origin"
 
 
+# Bound event waits and descriptor handoff if either thread stalls.
+@pytest.mark.timeout(5)
 def test_t8_concurrent_rotation_never_loses_lines(tmp_path):
     from pinky_daemon.access_log import AccessLogWriter
     from pinky_daemon.log_rotation import LogRotator
 
     path = tmp_path / "access.log"
     writer = AccessLogWriter(path, log=lambda message: None)
-    rotator = LogRotator(path, mode="rename", on_rotate=writer.reopen, max_bytes=1, backup_days=90)
-    stopped, ready = threading.Event(), threading.Event()
-    written = []
+    rotations, batch_size = 6, 32
+    stopped, go, ready = threading.Event(), threading.Event(), threading.Event()
     errors = []
 
     def produce():
         try:
-            while not stopped.is_set():
-                number = len(written)
-                writer.write({"sequence": number})
-                written.append(number)
+            for batch in range(rotations):
+                go.wait()
+                go.clear()
+                if stopped.is_set():
+                    return
+                for number in range(batch * batch_size, (batch + 1) * batch_size):
+                    writer.write({"sequence": number})
                 ready.set()
         except BaseException as exc:
             errors.append(exc)
+            ready.set()
+
+    def handoff():
+        # Write to the renamed inode before reopening it, then let the
+        # producer wait so it cannot starve the descriptor handoff.
+        ready.clear()
+        go.set()
+        ready.wait()
+        assert not errors
+        writer.reopen()
+
+    rotator = LogRotator(path, mode="rename", on_rotate=handoff, max_bytes=1, backup_days=90)
 
     producer = threading.Thread(target=produce)
     producer.start()
     archives = []
     try:
-        assert ready.wait(3)
-        for _ in range(6):
-            # The initial line makes each rotation eligible without timing sleeps.
+        for _ in range(rotations):
             writer.write({"rotation_marker": len(archives)})
             archive = rotator.check_and_rotate()
             assert archive is not None
             archives.append(archive)
+        writer.write({"sequence": rotations * batch_size})
     finally:
         stopped.set()
-        producer.join(5)
+        go.set()
+        producer.join()
         writer.close()
     assert not producer.is_alive() and not errors and writer.write_failures == 0
-    documents = [json.loads(line) for line in path.read_bytes().splitlines()]
+    documents = []
     for archive in archives:
         assert stat.S_IMODE(archive.stat().st_mode) == 0o600
         documents.extend(
             json.loads(line) for line in gzip.decompress(archive.read_bytes()).splitlines()
         )
-    assert sorted(row["sequence"] for row in documents if "sequence" in row) == written
-    assert sorted(row["rotation_marker"] for row in documents if "rotation_marker" in row) == list(
-        range(6)
-    )
+    documents.extend(json.loads(line) for line in path.read_bytes().splitlines())
+    expected = []
+    for batch in range(rotations):
+        expected.append({"rotation_marker": batch})
+        expected.extend(
+            {"sequence": number}
+            for number in range(batch * batch_size, (batch + 1) * batch_size)
+        )
+    expected.append({"sequence": rotations * batch_size})
+    assert documents == expected
 
 
 def test_t1_writer_uses_one_append_write_per_line(tmp_path, monkeypatch):
