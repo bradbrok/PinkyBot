@@ -20,6 +20,8 @@ import json as _json
 import os
 import re
 import shlex
+import subprocess
+import sys
 import threading
 import time as _time
 from collections.abc import Iterator
@@ -32,7 +34,7 @@ import pytest
 
 from pinky_daemon import tmux_session
 from pinky_daemon.agent_registry import AgentRegistry
-from pinky_daemon.command_runner import LocalCommandRunner
+from pinky_daemon.command_runner import CommandResult, ContainerCommandRunner, LocalCommandRunner
 from pinky_daemon.scheduler import AgentScheduler, ScheduleWakeReceipt
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import (
@@ -304,6 +306,50 @@ async def test_cold_start_caps_concurrent_subagents_in_spawn_env() -> None:
 
     env = tmux.new_session.await_args.kwargs["env"]
     assert env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] == "6"
+
+
+@pytest.mark.asyncio
+async def test_cold_start_disables_prompt_suggestions_in_spawn_env(monkeypatch) -> None:
+    monkeypatch.setenv("CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION", "true")
+    ss, tmux = _make_session(agent_name="test")
+
+    await ss.connect()
+
+    env = tmux.new_session.await_args.kwargs["env"]
+    assert env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] == "false"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("existing", [None, True], ids=["missing_file", "explicit_true"])
+async def test_container_settings_merge_prompt_suggestions(tmp_path, monkeypatch, existing) -> None:
+    ss, _ = _make_session(agent_name="test")
+    runner = MagicMock(spec=ContainerCommandRunner)
+    runner.run = AsyncMock(return_value=CommandResult(returncode=0, stdout=b"", stderr=b""))
+    monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
+    await ss._seed_container_trust(str(tmp_path / "project"))
+    runner.run.assert_awaited_once()
+    argv = runner.run.await_args.args[0]
+
+    config_dir = tmp_path / "config"
+    settings_path = config_dir / "settings.json"
+    if existing is not None:
+        config_dir.mkdir()
+        settings_path.write_text(_json.dumps({"promptSuggestionEnabled": existing, "theme": "dark"}))
+    else:
+        assert not settings_path.exists()
+
+    completed = subprocess.run(
+        [sys.executable, *argv[1:]],
+        env={"CLAUDE_CONFIG_DIR": str(config_dir), "HOME": str(tmp_path)},
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    assert completed.returncode == 0, completed.stderr
+    settings = _json.loads(settings_path.read_text())
+    assert settings["promptSuggestionEnabled"] is (False if existing is None else existing)
+    if existing is not None:
+        assert settings["theme"] == "dark"
 
 
 @pytest.mark.asyncio

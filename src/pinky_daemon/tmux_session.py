@@ -2694,6 +2694,9 @@ class TmuxSession(TransportReplacementMixin):
             "if not s.get('skipDangerousModePermissionPrompt'):\n"
             "    s['skipDangerousModePermissionPrompt']=True\n"
             "    changed=True\n"
+            "if 'promptSuggestionEnabled' not in s:\n"
+            "    s['promptSuggestionEnabled']=False\n"
+            "    changed=True\n"
             "permissions=s.get('permissions')\n"
             "if not isinstance(permissions,dict):\n"
             "    permissions={}\n"
@@ -4417,6 +4420,7 @@ class TmuxSession(TransportReplacementMixin):
         env["CLAUDE_CODE_MAX_CONCURRENT_SUBAGENTS"] = str(
             DEFAULT_MAX_CONCURRENT_SUBAGENTS
         )
+        env["CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION"] = "false"
         # Surface the RESOLVED effort (#151): the drift hook compares this to
         # the runtime $CLAUDE_EFFORT, which reports xhigh under ultracode — so
         # expect xhigh, not the literal "ultracode", to avoid false drift.
