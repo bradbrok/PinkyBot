@@ -214,6 +214,7 @@ class CodexTmuxSession(TmuxSession):
         self._codex_mcp_servers = config.mcp_servers or {}
         self._codex_last_scheduler_gate_signature: tuple[bool, ...] | None = None
         self._codex_user_content_warned = False
+        self._codex_user_no_text_warned = False
 
     # ── seam: session name ──────────────────────────────────────────────────
     def _build_session_name(self) -> str:
@@ -622,6 +623,13 @@ class CodexTmuxSession(TmuxSession):
                 item["text"] for item in content if item.get("type") == "input_text"
             )
             if not prompt:
+                if content and not self._codex_user_no_text_warned:
+                    self._codex_user_no_text_warned = True
+                    item_types = sorted({str(item.get("type")) for item in content})
+                    _log(
+                        "WARNING Codex user-row content yielded no text; "
+                        f"item types={item_types}"
+                    )
                 return
         elif legacy_user_row:
             prompt = payload.get("message")
@@ -648,12 +656,23 @@ class CodexTmuxSession(TmuxSession):
                 identity = turn.transcript_file_identity_at_paste
                 offset = turn.transcript_offset_at_paste
                 path = turn.transcript_path_at_paste
-                if path is not None and identity is None and offset == 0:
+                detail = ""
+                reason = "paste ticket mismatch"
+                if pointer.get("identity") is None or pointer.get("offset") is None:
+                    shape = "no_pointer"
+                elif path is not None and identity is None and offset == 0:
                     shape = "cold-start"
+                    reason = "cold_start_ticket_unverified"
+                    cold_reason = (
+                        "placeholder" if path == _PLACEHOLDER_TRANSCRIPT_PATH else "file_missing"
+                    )
+                    detail = f" cold_start_reason={cold_reason!r}"
                 elif path is None:
                     shape = "unbound"
+                    reason = "no paste ticket"
                 elif identity is None or offset is None:
                     shape = "inaccessible"
+                    reason = "ticket identity/offset missing"
                 else:
                     shape = "mismatch"
                 if shape not in turn.transcript_ticket_warned_shapes:
@@ -663,7 +682,7 @@ class CodexTmuxSession(TmuxSession):
                         f"entry_offset={pointer.get('offset')} "
                         f"source_identity={pointer.get('identity')} "
                         f"ticket_offset={offset} ticket_identity={identity} "
-                        f"shape={shape} reason='paste ticket mismatch'"
+                        f"shape={shape} reason={reason!r}{detail}"
                     )
             return
         # A user row and task_complete can arrive in one read before paste_text

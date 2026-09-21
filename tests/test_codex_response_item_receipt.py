@@ -8,6 +8,7 @@ from pathlib import Path
 import pytest
 
 from pinky_daemon.scheduler import AgentScheduler
+from pinky_daemon.tmux_session import _PLACEHOLDER_TRANSCRIPT_PATH
 from tests.test_codex_scheduler_idle_receipt import (
     NOW,
     _drain_delivery,
@@ -106,7 +107,7 @@ async def test_current_user_row_releases_first_boundary_replay(harness):
 
 
 @pytest.mark.parametrize("shape", [
-    "pre_ticket", "other_source", "missing", "cold_start", "unbound", "no_pointer",
+    "pre_ticket", "other_source", "missing", "cold_start", "placeholder", "unbound", "no_pointer",
 ])
 async def test_current_user_row_requires_paste_provenance(harness, shape, capsys):
     if shape == "pre_ticket":
@@ -116,9 +117,11 @@ async def test_current_user_row_requires_paste_provenance(harness, shape, capsys
         replacement = harness.rollout.with_suffix(".new")
         replacement.write_text("")
         replacement.replace(harness.rollout)
-    elif shape in {"missing", "cold_start", "unbound"}:
+    elif shape in {"missing", "cold_start", "placeholder", "unbound"}:
         turn.transcript_file_identity_at_paste = None
-        turn.transcript_offset_at_paste = 0 if shape == "cold_start" else None
+        turn.transcript_offset_at_paste = 0 if shape in {"cold_start", "placeholder"} else None
+    if shape == "placeholder":
+        turn.transcript_path_at_paste = _PLACEHOLDER_TRANSCRIPT_PATH
     if shape == "unbound":
         turn.transcript_path_at_paste = None
     if shape == "no_pointer":
@@ -136,10 +139,16 @@ async def test_current_user_row_requires_paste_provenance(harness, shape, capsys
                 if "WARNING codex user-row ticket" in line]
     assert len(warnings) == 1, "repeated rejected rows must warn once per turn and shape"
     expected = {"missing": "inaccessible", "cold_start": "cold-start",
-                "unbound": "unbound"}.get(shape, "mismatch")
+                "placeholder": "cold-start", "unbound": "unbound",
+                "no_pointer": "no_pointer"}.get(shape, "mismatch")
     assert f"turn_id={id(turn)}" in warnings[0]
     assert f"shape={expected}" in warnings[0]
-    assert "reason='paste ticket mismatch'" in warnings[0]
+    reason = {"cold-start": "cold_start_ticket_unverified", "unbound": "no paste ticket",
+              "inaccessible": "ticket identity/offset missing"}.get(expected, "paste ticket mismatch")
+    assert f"reason={reason!r}" in warnings[0]
+    if expected == "cold-start":
+        detail = "placeholder" if shape == "placeholder" else "file_missing"
+        assert f"cold_start_reason={detail!r}" in warnings[0]
     for field in ("entry_offset=", "source_identity=", "ticket_offset=", "ticket_identity="):
         assert field in warnings[0]
 
@@ -227,3 +236,36 @@ async def test_user_row_and_close_during_paste_reserve_metadata_once(harness):
     assert receipts == [True]
     assert receipt.done() and receipt.result() is True
     assert not harness.session._inflight_metas
+
+
+async def test_unknown_text_item_warns_once_without_accepting(harness, capsys):
+    _, receipt = await _paste(harness)
+    entry = user_row()
+    entry["payload"]["content"] = [{"type": "text", "text": "scheduled work"}]
+    append(harness, entry, copy.deepcopy(entry))
+    await _read(harness)
+    assert not receipt.done()
+    warning = "WARNING Codex user-row content yielded no text; item types=['text']"
+    assert capsys.readouterr().err.count(warning) == 1
+
+
+@pytest.mark.parametrize("ticket", ["missing", "pre_ticket"])
+async def test_legacy_receipt_remains_ticket_free(harness, ticket):
+    entry = fixture("0.144.0")[-1]
+    if ticket == "pre_ticket":
+        append(harness, entry)
+    turn, receipt = await _paste(harness)
+    if ticket == "missing":
+        turn.transcript_file_identity_at_paste = None
+        turn.transcript_offset_at_paste = None
+        append(harness, entry)
+    await _read(harness)
+    assert receipt.done() and receipt.result() is True
+    assert turn.transport_accepted
+
+
+@pytest.mark.parametrize("payload", [None, "str"])
+async def test_non_dict_response_payload_is_ignored(harness, payload):
+    _, receipt = await _paste(harness)
+    harness.session._on_transcript_entry({"type": "response_item", "payload": payload})
+    assert not receipt.done()
