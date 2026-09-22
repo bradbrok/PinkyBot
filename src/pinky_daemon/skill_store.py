@@ -350,6 +350,7 @@ class SkillStore:
         default_config: dict | None = None,
         origin_agent: str = "",
         agent_originated: bool = False,
+        audit: dict | None = None,
     ) -> Skill:
         """Register a new skill or update an existing one."""
         now = time.time()
@@ -414,6 +415,13 @@ class SkillStore:
                         json.dumps(file_templates), json.dumps(default_config), now, name,
                     ),
                 )
+                if audit is not None:
+                    self._insert_refresh_audit(name, **audit)
+                    if audit["approval_ref"]:
+                        self._db.execute(
+                            "UPDATE skills SET last_approval_ref=? WHERE name=?",
+                            (audit["approval_ref"], name),
+                        )
             else:
                 self._db.execute(
                     f"""INSERT INTO skills ({_SKILL_COLS})

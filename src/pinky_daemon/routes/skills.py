@@ -305,16 +305,25 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         if req.self_assignable is None
         else req.self_assignable and not bool(internal_caller)
     )
+    description = req.description if req.description is not None else existing.description
+    directive = req.directive if req.directive is not None else existing.directive
+    audit = {
+        "actor": internal_caller or "user", "path": "put",
+        "approval_ref": req.approval_ref or "",
+        "before_hash": skill_text_hash(existing.description, existing.directive),
+        "after_hash": skill_text_hash(description, directive),
+        "fields": sorted(changed_fields),
+    } if text_changed else None
     skill = _skills.register(
         name,
-        description=req.description if req.description is not None else existing.description,
+        description=description,
         skill_type=skill_type,
         version=req.version if req.version is not None else existing.version,
         enabled=req.enabled if req.enabled is not None else existing.enabled,
         config=req.config if req.config is not None else existing.config,
         mcp_server_config=mcp_server_config,
         tool_patterns=tool_patterns,
-        directive=req.directive if req.directive is not None else existing.directive,
+        directive=directive,
         requires=req.requires if req.requires is not None else existing.requires,
         self_assignable=req.self_assignable if req.self_assignable is not None else existing.self_assignable,
         privileged_tool_opt_in=privileged_tool_opt_in,
@@ -323,15 +332,8 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         file_templates=req.file_templates if req.file_templates is not None else existing.file_templates,
         default_config=req.default_config if req.default_config is not None else existing.default_config,
         agent_originated=bool(internal_caller),
+        audit=audit,
     )
-    if text_changed:
-        _skills.record_refresh_audit(
-            name, actor=internal_caller or "user", path="put", approval_ref=req.approval_ref or "",
-            before_hash=skill_text_hash(existing.description, existing.directive),
-            after_hash=skill_text_hash(skill.description, skill.directive),
-            fields=sorted(changed_fields),
-        )
-        skill = _skills.get(name)
     return skill.to_dict()
 
 
