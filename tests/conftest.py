@@ -25,12 +25,15 @@ opt out via the ``real_auth`` pytest marker (set as a module-level
 from __future__ import annotations
 
 import atexit
+import logging
 import os
 import shutil
 import tempfile
 
 import pytest
 from fastapi.testclient import TestClient
+
+from tests._tmp_hygiene import restore_tree_readability
 
 # Test session secret. Long-enough random-looking value; never used in
 # production. Tests that need to override (e.g. test_auth.py) do so via
@@ -122,6 +125,19 @@ def pytest_runtest_setup(item: pytest.Item) -> None:
             f"real transport disabled; set {_REAL_TRANSPORT_OPT_IN_ENV}=1 "
             "for this explicitly marked test"
         )
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _restore_tmp_path_readability(tmp_path_factory):
+    """Leave inspectable artifacts even when a mode-freezing test fails."""
+    try:
+        yield
+    finally:
+        changed = restore_tree_readability(tmp_path_factory.getbasetemp())
+        if changed:
+            logging.getLogger(__name__).info(
+                "Restored owner readability on %d temporary test entries", changed
+            )
 
 
 @pytest.fixture(autouse=True, scope="session")
