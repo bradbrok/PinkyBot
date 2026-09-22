@@ -443,3 +443,19 @@ def test_origin_put_without_delegate_audits_every_text_change(catalog):
         assert audit[0]["before_hash"] == _hash(before.description, before.directive)
         assert audit[0]["after_hash"] == _hash(after.description, after.directive)
     assert after.last_approval_ref == REF
+
+
+def test_mixed_put_rolls_back_text_version_and_approval_when_audit_fails(catalog, monkeypatch):
+    before = catalog.store.get(NAME).to_dict()
+
+    def fail_audit(*args, **kwargs):
+        raise sqlite3.OperationalError("audit unavailable")
+
+    monkeypatch.setattr(catalog.store, "_insert_refresh_audit", fail_audit)
+    with pytest.raises(sqlite3.OperationalError, match="audit unavailable"):
+        catalog.client.put(
+            f"/skills/{NAME}",
+            json={"directive": "Mixed edit.", "version": "2.0.0", "approval_ref": REF},
+        )
+    assert catalog.store.get(NAME).to_dict() == before
+    assert catalog.store.list_refresh_audit(NAME) == []
