@@ -459,3 +459,23 @@ def test_mixed_put_rolls_back_text_version_and_approval_when_audit_fails(catalog
         )
     assert catalog.store.get(NAME).to_dict() == before
     assert catalog.store.list_refresh_audit(NAME) == []
+
+
+def test_converged_origin_clamps_still_disable_existing_self_grants(catalog):
+    store = catalog.store
+    before = store.get(NAME).to_dict()
+    assert before["tool_patterns"]
+    assert not before["shared"] and not before["privileged_tool_opt_in"]
+    assert not before["self_assignable"]
+    with store._db:
+        store._db.execute(
+            "UPDATE agent_skills SET assigned_by='self', enabled=1 WHERE skill_name=?",
+            (NAME,),
+        )
+    store.converge_agent_clamps(NAME)
+    assert store._db.execute(
+        "SELECT enabled FROM agent_skills WHERE skill_name=?", (NAME,)
+    ).fetchone()[0] == 0
+    assert store.get(NAME).to_dict() == before
+    store.converge_agent_clamps(NAME)
+    assert store.get(NAME).to_dict() == before
