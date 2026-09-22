@@ -527,16 +527,21 @@ class SkillStore:
             return existing
         capabilities = bool(existing.tool_patterns or existing.mcp_server_config or existing.file_templates)
         self_assignable = existing.self_assignable and not capabilities
-        if (existing.shared, existing.privileged_tool_opt_in, existing.self_assignable) == (False, False, self_assignable):
+        flags_converged = (
+            existing.shared, existing.privileged_tool_opt_in, existing.self_assignable
+        ) == (False, False, self_assignable)
+        if flags_converged and not capabilities:
             return existing
         with self._db:
-            self._db.execute(
-                """UPDATE skills SET shared=0, privileged_tool_opt_in=0, self_assignable=?, updated_at=?
-                   WHERE name=?""", (int(self_assignable), time.time(), name),
-            )
+            if not flags_converged:
+                self._db.execute(
+                    """UPDATE skills SET shared=0, privileged_tool_opt_in=0, self_assignable=?, updated_at=?
+                       WHERE name=?""", (int(self_assignable), time.time(), name),
+                )
             if capabilities:
                 self._db.execute(
-                    "UPDATE agent_skills SET enabled=0 WHERE skill_name=? AND assigned_by='self'",
+                    """UPDATE agent_skills SET enabled=0
+                       WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
                     (name,),
                 )
         return self.get(name)
