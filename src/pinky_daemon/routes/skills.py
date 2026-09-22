@@ -324,9 +324,9 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         default_config=req.default_config if req.default_config is not None else existing.default_config,
         agent_originated=bool(internal_caller),
     )
-    if not internal_caller and text_changed:
+    if text_changed:
         _skills.record_refresh_audit(
-            name, actor="user", path="put", approval_ref=req.approval_ref or "",
+            name, actor=internal_caller or "user", path="put", approval_ref=req.approval_ref or "",
             before_hash=skill_text_hash(existing.description, existing.directive),
             after_hash=skill_text_hash(skill.description, skill.directive),
             fields=sorted(changed_fields),
