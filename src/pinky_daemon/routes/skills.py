@@ -19,7 +19,9 @@ from fastapi import APIRouter, HTTPException, Request
 
 from pinky_daemon.api_models import (
     CreateSkillFromMdRequest,
+    DiscoverSkillsRequest,
     InstallSkillFromGitRequest,
+    RefreshDelegateRequest,
     RegisterSkillRequest,
     SessionSkillRequest,
     UpdateSkillRequest,
@@ -29,8 +31,10 @@ from pinky_daemon.skill_loader import (
     _CONSECUTIVE_HYPHENS,
     _NAME_RE,
     discover_all_skills,
+    parse_skill_md,
     register_discovered_skills,
 )
+from pinky_daemon.skill_store import skill_text_hash
 from pinky_daemon.skill_tool_policy import ToolPatternValidationError, validate_tool_patterns
 
 router = APIRouter(tags=["skills"])
@@ -110,6 +114,37 @@ def _reject_agent_catalog_overwrite(name: str, internal_caller: str) -> None:
         raise HTTPException(403, "operator-owned skill")
     if any(agent_name != internal_caller for agent_name in _skills.assigned_agents(name)):
         raise HTTPException(403, "skill assigned to another agent")
+
+
+def _delegated_text_refresh(existing, internal_caller, changed_fields, approval_ref) -> None:
+    """Authorize only the operator-designated origin agent's approved text edits."""
+    if not (
+        internal_caller
+        and existing.refresh_delegate == internal_caller
+        and existing.origin_agent == internal_caller
+        and existing.skill_type == "skill"
+    ):
+        _reject_agent_catalog_overwrite(existing.name, internal_caller)
+        raise HTTPException(403, "skill refresh is not delegated")
+    if not set(changed_fields) <= {"description", "directive"}:
+        raise HTTPException(403, "delegated refresh is text-only")
+    if not approval_ref:
+        raise HTTPException(403, "approval_ref required for delegated refresh")
+
+
+def _disk_drift(skill) -> bool:
+    if skill.skill_type != "skill":
+        return False
+    try:
+        location = skill.config.get("location")
+        parsed = parse_skill_md(location) if location else None
+        return bool(parsed and (
+            parsed.description != skill.description
+            or parsed.body != skill.directive
+            or parsed.allowed_tools != skill.tool_patterns
+        ))
+    except Exception:
+        return False
 
 
 def _assignment_refusal(skill_name: str, agent_name: str) -> dict[str, str]:
@@ -218,7 +253,7 @@ async def get_skill(name: str):
     skill = _skills.get(name)
     if not skill:
         raise HTTPException(404, f"Skill '{name}' not found")
-    return skill.to_dict()
+    return {**skill.to_dict(), "disk_drift": _disk_drift(skill)}
 
 
 @router.put("/skills/{name}")
@@ -229,6 +264,28 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         raise HTTPException(404, f"Skill '{name}' not found")
 
     internal_caller = getattr(request.state, "internal_caller", "")
+    changed_fields = {
+        key for key, value in req.model_dump(exclude_none=True).items()
+        if key != "approval_ref" and getattr(existing, key) != value
+    }
+    text_changed = changed_fields & {"description", "directive"}
+    if internal_caller and existing.refresh_delegate == internal_caller:
+        _delegated_text_refresh(existing, internal_caller, changed_fields, req.approval_ref)
+        skill = _skills.refresh_text(
+            name,
+            description=req.description if req.description is not None else existing.description,
+            directive=req.directive if req.directive is not None else existing.directive,
+            actor=internal_caller, path="put", approval_ref=req.approval_ref,
+        )
+        return skill.to_dict()
+    if not internal_caller and text_changed and changed_fields <= {"description", "directive"}:
+        skill = _skills.refresh_text(
+            name,
+            description=req.description if req.description is not None else existing.description,
+            directive=req.directive if req.directive is not None else existing.directive,
+            actor="user", path="put", approval_ref=req.approval_ref or "",
+        )
+        return skill.to_dict()
     _reject_agent_catalog_overwrite(name, internal_caller)
     skill_type = req.skill_type if req.skill_type is not None else existing.skill_type
     mcp_server_config = (
@@ -267,7 +324,40 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         default_config=req.default_config if req.default_config is not None else existing.default_config,
         agent_originated=bool(internal_caller),
     )
+    if not internal_caller and text_changed:
+        _skills.record_refresh_audit(
+            name, actor="user", path="put", approval_ref=req.approval_ref or "",
+            before_hash=skill_text_hash(existing.description, existing.directive),
+            after_hash=skill_text_hash(skill.description, skill.directive),
+            fields=sorted(changed_fields),
+        )
+        skill = _skills.get(name)
     return skill.to_dict()
+
+
+@router.put("/skills/{name}/refresh-delegate")
+async def set_refresh_delegate(name: str, req: RefreshDelegateRequest, request: Request):
+    if getattr(request.state, "internal_caller", ""):
+        raise HTTPException(403, "refresh delegation requires an operator session")
+    existing = _skills.get(name)
+    if existing is None:
+        raise HTTPException(404, f"Skill '{name}' not found")
+    if existing.skill_type != "skill":
+        raise HTTPException(400, "refresh delegation requires a markdown skill")
+    if req.agent and (req.agent != existing.origin_agent or _agents.get(req.agent) is None):
+        raise HTTPException(400, "refresh delegate must be the registered origin agent")
+    return _skills.set_refresh_delegate(name, req.agent).to_dict()
+
+
+@router.get("/skills/{name}/refresh-audit")
+async def get_refresh_audit(name: str, request: Request):
+    existing = _skills.get(name)
+    if existing is None:
+        raise HTTPException(404, f"Skill '{name}' not found")
+    caller = getattr(request.state, "internal_caller", "")
+    if caller and caller != existing.refresh_delegate and caller not in _skills.assigned_agents(name):
+        raise HTTPException(403, "refresh audit requires delegation or assignment")
+    return {"skill": name, "audit": _skills.list_refresh_audit(name)}
 
 
 @router.delete("/skills/{name}")
@@ -622,42 +712,61 @@ async def install_skill_from_git(req: InstallSkillFromGitRequest, request: Reque
 
 
 @router.post("/skills/discover")
-async def discover_skills_endpoint(request: Request):
-    """Re-scan filesystem for SKILL.md files and register new skills."""
+async def discover_skills_endpoint(request: Request, req: DiscoverSkillsRequest | None = None):
+    """Register new files, optionally applying authorized, audited text refreshes."""
+    req = req or DiscoverSkillsRequest()
     internal_caller = getattr(request.state, "internal_caller", "")
     found = discover_all_skills(project_root=str(_pinky_root))
+    refreshes = []
+    refused = []
+    unchanged = []
+    excluded = set()
+    # Authorize the entire scan before applying any refresh or registration.
     for parsed in found:
         existing = _skills.get(parsed.name)
         if existing is None:
             continue
-        content_changed = (
-            existing.skill_type == "skill"
-            and (
-                existing.directive != parsed.body
-                or existing.description != parsed.description
-                or existing.tool_patterns != parsed.allowed_tools
-            )
+        fields = {
+            key for key, value in (
+                ("description", parsed.description), ("directive", parsed.body),
+                ("tool_patterns", parsed.allowed_tools),
+            ) if getattr(existing, key) != value
+        } if existing.skill_type == "skill" else set()
+        clamp_needed = existing.skill_type == "skill" and bool(existing.origin_agent) and (
+            existing.shared or existing.privileged_tool_opt_in
+            or (bool(existing.tool_patterns) and existing.self_assignable)
         )
-        clamp_needed = existing.skill_type == "skill" and bool(
-            existing.origin_agent
-        ) and (
-            existing.shared
-            or existing.privileged_tool_opt_in
-            or (bool(parsed.allowed_tools) and existing.self_assignable)
-        )
-        if content_changed or clamp_needed:
-            _reject_agent_catalog_overwrite(parsed.name, internal_caller)
+        if req.refresh and fields:
+            excluded.add(parsed.name)
+            if "tool_patterns" in fields:
+                refused.append({"name": parsed.name, "reason": "tool_patterns differ", "fields": ["tool_patterns"]})
+                continue
+            if internal_caller:
+                _delegated_text_refresh(existing, internal_caller, fields, req.approval_ref)
+            refreshes.append((existing, parsed))
+        else:
+            if fields or clamp_needed:
+                _reject_agent_catalog_overwrite(parsed.name, internal_caller)
+            if not fields:
+                unchanged.append(parsed.name)
     result = register_discovered_skills(
-        _skills,
-        found,
-        overwrite=False,
-        agent_originated=bool(internal_caller),
-        origin_agent=internal_caller,
+        _skills, [parsed for parsed in found if parsed.name not in excluded],
+        overwrite=False, agent_originated=bool(internal_caller), origin_agent=internal_caller,
     )
-    return {
-        "discovered": len(found),
-        **result,
-    }
+    updated = []
+    for existing, parsed in refreshes:
+        refreshed = _skills.refresh_text(
+            existing.name, description=parsed.description, directive=parsed.body,
+            actor=internal_caller or "user", path="discover", approval_ref=req.approval_ref,
+        )
+        updated.append({
+            "name": existing.name,
+            "before_hash": skill_text_hash(existing.description, existing.directive),
+            "after_hash": skill_text_hash(refreshed.description, refreshed.directive),
+        })
+    if req.refresh:
+        result.update(updated=updated, refused=refused, unchanged=unchanged)
+    return {"discovered": len(found), **result}
 
 
 @router.get("/plugins")

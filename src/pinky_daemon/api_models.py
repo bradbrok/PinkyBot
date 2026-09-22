@@ -221,6 +221,14 @@ class RegisterSkillRequest(BaseModel):
 class UpdateSkillRequest(BaseModel):
     """Update an existing skill."""
 
+    approval_ref: str | None = Field(default=None, max_length=200)
+    privileged_tool_opt_in: bool | None = None
+
+    @field_validator("approval_ref", mode="before")
+    @classmethod
+    def strip_approval_ref(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
     description: str | None = None
     skill_type: str | None = None
     version: str | None = None
@@ -235,6 +243,20 @@ class UpdateSkillRequest(BaseModel):
     shared: bool | None = None
     file_templates: dict | None = None
     default_config: dict | None = None
+
+
+class DiscoverSkillsRequest(BaseModel):
+    refresh: bool = False
+    approval_ref: str = Field(default="", max_length=200)
+
+    @field_validator("approval_ref", mode="before")
+    @classmethod
+    def strip_approval_ref(cls, value):
+        return value.strip() if isinstance(value, str) else value
+
+
+class RefreshDelegateRequest(BaseModel):
+    agent: str = ""
 
 
 class SessionSkillRequest(BaseModel):

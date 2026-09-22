@@ -319,3 +319,93 @@ def test_startup_clamp_convergence_preserves_text_patterns_and_config(catalog):
     assert after == before
     skill = store.get(NAME)
     assert not skill.shared and not skill.privileged_tool_opt_in and not skill.self_assignable
+
+
+def test_refresh_text_and_audit_rollback_together(catalog, monkeypatch):
+    before = catalog.store.get(NAME).to_dict()
+
+    def fail_audit(*args, **kwargs):
+        raise sqlite3.OperationalError("audit unavailable")
+
+    monkeypatch.setattr(catalog.store, "_insert_refresh_audit", fail_audit)
+    with pytest.raises(sqlite3.OperationalError, match="audit unavailable"):
+        catalog.store.refresh_text(
+            NAME,
+            description="Changed.",
+            directive="Changed.",
+            actor="user",
+            path="put",
+            approval_ref=REF,
+        )
+    assert catalog.store.get(NAME).to_dict() == before
+    assert catalog.store.list_refresh_audit(NAME) == []
+
+
+def test_operator_put_audits_without_approval_and_strips_provided_ref(catalog):
+    response = catalog.client.put(f"/skills/{NAME}", json={"directive": "Operator edit."})
+    assert response.status_code == 200
+    first = _audit(catalog)[0]
+    assert first["actor"] == "user" and first["approval_ref"] == ""
+    response = catalog.client.put(
+        f"/skills/{NAME}",
+        json={"description": "Approved description.", "approval_ref": f"  {REF}  "},
+    )
+    assert response.status_code == 200
+    assert response.json()["last_approval_ref"] == REF
+    assert _audit(catalog)[0]["approval_ref"] == REF
+    for route in (f"/skills/{NAME}", "/skills/discover"):
+        method = "PUT" if route != "/skills/discover" else "POST"
+        assert (
+            catalog.client.request(method, route, json={"approval_ref": "x" * 201}).status_code
+            == 422
+        )
+
+
+def test_delegation_compares_values_and_never_bypasses_origin(catalog):
+    _delegate(catalog)
+    before = catalog.store.get(NAME)
+    response = _signed(
+        catalog.client,
+        "PUT",
+        f"/skills/{NAME}",
+        {
+            "directive": "Approved text.",
+            "category": before.category,
+            "tool_patterns": before.tool_patterns,
+            "approval_ref": REF,
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert _audit(catalog)[0]["fields"] == ["directive"]
+    catalog.store.set_refresh_delegate(NAME, ASSIGNED)
+    response = _signed(
+        catalog.client,
+        "PUT",
+        f"/skills/{NAME}",
+        {
+            "directive": "Wrong origin.",
+            "approval_ref": REF,
+        },
+        agent=ASSIGNED,
+    )
+    assert response.status_code == 403
+    assert catalog.store.get(NAME).directive == "Approved text."
+
+
+def test_discovery_without_refresh_reports_drift_without_writing(catalog):
+    _write(catalog.path, body="Unapproved file edit.")
+    before = catalog.store.get(NAME).to_dict()
+    response = catalog.client.post("/skills/discover")
+    assert response.status_code == 200
+    assert response.json()["drifted"] == [{"name": NAME, "fields": ["directive"]}]
+    assert catalog.store.get(NAME).to_dict() == before
+    assert _audit(catalog) == []
+
+
+def test_tool_only_drift_is_visible_and_refused(catalog):
+    _write(catalog.path, tools="Write")
+    assert catalog.client.get(f"/skills/{NAME}").json()["disk_drift"] is True
+    before = catalog.store.get(NAME).to_dict()
+    response = catalog.client.post("/skills/discover", json={"refresh": True})
+    assert response.json()["refused"][0]["fields"] == ["tool_patterns"]
+    assert catalog.store.get(NAME).to_dict() == before

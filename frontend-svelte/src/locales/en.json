@@ -933,7 +933,18 @@
     "toast_skill_registered": "Skill registered",
     "confirm_apply_update": "Apply update and restart the daemon?",
     "default_provider": "Default provider for agents",
-    "default_provider_none": "None (Anthropic default)"
+    "default_provider_none": "None (Anthropic default)",
+    "skill_approval_ref": "External approval id (optional for operators)",
+    "skill_rescan": "Rescan from disk",
+    "skill_rescan_results": "Rescan results",
+    "skill_updated": "updated",
+    "skill_refused": "refused",
+    "skill_unchanged": "unchanged",
+    "skill_delegate": "Refresh delegate",
+    "skill_drift": "drift",
+    "skill_origin_agent": "Origin agent",
+    "skill_delegate_set": "Set",
+    "skill_delegate_clear": "Clear"
   },
   "agents_extra": {
     "file_edit_save": "Save",
