@@ -12,14 +12,16 @@ Skills can be:
 - Agent-specific: manually assigned to individual agents
 - Self-assignable: agents can add them to themselves via pinky-self tools
 
-Storage: SQLite with three tables:
+Storage: SQLite with four tables:
   - skills: global skill catalog
+  - skill_refresh_audit: approved text refresh history
   - agent_skills: per-agent skill assignments
   - session_skills: (deprecated) per-session overrides
 """
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 import sys
@@ -36,6 +38,10 @@ from pinky_daemon.store_catalog import (
     open_store_connection,
     store_connection_policy,
 )
+
+
+def skill_text_hash(description: str, directive: str) -> str:
+    return hashlib.sha256((description + "\n" + directive).encode("utf-8")).hexdigest()
 
 
 def _log(msg: str) -> None:
@@ -69,6 +75,8 @@ class Skill:
     file_templates: dict = field(default_factory=dict)
     default_config: dict = field(default_factory=dict)
     origin_agent: str = ""
+    refresh_delegate: str = ""
+    last_approval_ref: str = ""
     created_at: float = 0.0
     updated_at: float = 0.0
 
@@ -91,6 +99,8 @@ class Skill:
             "file_templates": self.file_templates,
             "default_config": self.default_config,
             "origin_agent": self.origin_agent,
+            "refresh_delegate": self.refresh_delegate,
+            "last_approval_ref": self.last_approval_ref,
             "created_at": self.created_at,
             "updated_at": self.updated_at,
         }
@@ -123,7 +133,7 @@ _SKILL_COLS = (
     "name, description, skill_type, version, enabled, config, "
     "mcp_server_config, tool_patterns, directive, requires, "
     "self_assignable, privileged_tool_opt_in, category, shared, file_templates, default_config, "
-    "origin_agent, created_at, updated_at"
+    "origin_agent, created_at, updated_at, refresh_delegate, last_approval_ref"
 )
 
 
@@ -149,6 +159,8 @@ def _row_to_skill(row: tuple) -> Skill:
         origin_agent=row[16],
         created_at=row[17],
         updated_at=row[18],
+        refresh_delegate=row[19],
+        last_approval_ref=row[20],
     )
 
 
@@ -209,6 +221,20 @@ class SkillStore:
                 updated_at REAL NOT NULL
             );
 
+            CREATE TABLE IF NOT EXISTS skill_refresh_audit (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts REAL NOT NULL,
+                skill TEXT NOT NULL,
+                actor TEXT NOT NULL,
+                path TEXT NOT NULL,
+                approval_ref TEXT NOT NULL DEFAULT '',
+                before_hash TEXT NOT NULL,
+                after_hash TEXT NOT NULL,
+                fields TEXT NOT NULL DEFAULT '[]'
+            );
+            CREATE INDEX IF NOT EXISTS skill_refresh_audit_skill_id
+                ON skill_refresh_audit(skill, id);
+
             CREATE TABLE IF NOT EXISTS session_skills (
                 session_id TEXT NOT NULL,
                 skill_name TEXT NOT NULL,
@@ -249,6 +275,8 @@ class SkillStore:
             ("file_templates", "TEXT NOT NULL DEFAULT '{}'"),
             ("default_config", "TEXT NOT NULL DEFAULT '{}'"),
             ("origin_agent", "TEXT NOT NULL DEFAULT ''"),
+            ("refresh_delegate", "TEXT NOT NULL DEFAULT ''"),
+            ("last_approval_ref", "TEXT NOT NULL DEFAULT ''"),
         ]
         added_privileged_opt_in = "privileged_tool_opt_in" not in existing
         for col, typedef in migrations:
@@ -322,6 +350,7 @@ class SkillStore:
         default_config: dict | None = None,
         origin_agent: str = "",
         agent_originated: bool = False,
+        audit: dict | None = None,
     ) -> Skill:
         """Register a new skill or update an existing one."""
         now = time.time()
@@ -386,21 +415,136 @@ class SkillStore:
                         json.dumps(file_templates), json.dumps(default_config), now, name,
                     ),
                 )
+                if audit is not None:
+                    self._insert_refresh_audit(name, **audit)
+                    if audit["approval_ref"]:
+                        self._db.execute(
+                            "UPDATE skills SET last_approval_ref=? WHERE name=?",
+                            (audit["approval_ref"], name),
+                        )
             else:
                 self._db.execute(
                     f"""INSERT INTO skills ({_SKILL_COLS})
-                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                     (
                         name, description, skill_type, version, int(enabled), json.dumps(config),
                         json.dumps(mcp_server_config), json.dumps(tool_patterns), directive,
                         json.dumps(requires), int(self_assignable), int(privileged_tool_opt_in),
                         category, int(shared),
-                        json.dumps(file_templates), json.dumps(default_config), origin_agent, now, now,
+                        json.dumps(file_templates), json.dumps(default_config), origin_agent, now, now, "", "",
                     ),
                 )
 
         _log(f"skill_store: {'updated' if existing else 'registered'} {name}")
         return self.get(name)  # type: ignore
+
+    def set_refresh_delegate(self, name: str, agent: str) -> Skill:
+        """Persist an operator-authorized refresh delegate without changing the skill."""
+        with self._db:
+            cursor = self._db.execute(
+                "UPDATE skills SET refresh_delegate=?, updated_at=? WHERE name=?",
+                (agent, time.time(), name),
+            )
+            if not cursor.rowcount:
+                raise KeyError(name)
+        return self.get(name)
+
+    def _insert_refresh_audit(
+        self, name: str, *, actor: str, path: str, approval_ref: str,
+        before_hash: str, after_hash: str, fields: list[str],
+    ) -> None:
+        if path not in {"put", "discover"}:
+            raise ValueError("invalid refresh audit path")
+        self._db.execute(
+            """INSERT INTO skill_refresh_audit
+               (ts, skill, actor, path, approval_ref, before_hash, after_hash, fields)
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?)""",
+            (time.time(), name, actor, path, approval_ref, before_hash, after_hash,
+             json.dumps(sorted(fields))),
+        )
+
+    def record_refresh_audit(
+        self, name: str, *, actor: str, path: str, approval_ref: str,
+        before_hash: str, after_hash: str, fields: list[str],
+    ) -> None:
+        """Record an operator update made through the general catalog editor."""
+        with self._db:
+            self._insert_refresh_audit(
+                name, actor=actor, path=path, approval_ref=approval_ref,
+                before_hash=before_hash, after_hash=after_hash, fields=fields,
+            )
+            if approval_ref:
+                self._db.execute(
+                    "UPDATE skills SET last_approval_ref=? WHERE name=?", (approval_ref, name)
+                )
+
+    def list_refresh_audit(self, name: str, limit: int = 50) -> list[dict]:
+        rows = self._db.execute(
+            """SELECT id, ts, skill, actor, path, approval_ref, before_hash, after_hash, fields
+               FROM skill_refresh_audit WHERE skill=? ORDER BY id DESC LIMIT ?""",
+            (name, max(0, min(limit, 1000))),
+        ).fetchall()
+        keys = ("id", "ts", "skill", "actor", "path", "approval_ref", "before_hash", "after_hash", "fields")
+        result = []
+        for row in rows:
+            entry = dict(zip(keys, row))
+            entry["fields"] = json.loads(entry["fields"])
+            result.append(entry)
+        return result
+
+    def refresh_text(
+        self, name: str, *, description: str, directive: str, actor: str,
+        path: str, approval_ref: str,
+    ) -> Skill:
+        """Atomically update only text and approval metadata with its audit evidence."""
+        with self._db:
+            # Reserve the writer before reading the before-image for the audit.
+            self._db.execute("BEGIN IMMEDIATE")
+            existing = self.get(name)
+            if existing is None:
+                raise KeyError(name)
+            fields = [key for key, value in (("description", description), ("directive", directive))
+                      if getattr(existing, key) != value]
+            if not fields:
+                return existing
+            self._db.execute(
+                """UPDATE skills SET description=?, directive=?, updated_at=?, last_approval_ref=?
+                   WHERE name=?""", (description, directive, time.time(), approval_ref, name),
+            )
+            self._insert_refresh_audit(
+                name, actor=actor, path=path, approval_ref=approval_ref,
+                before_hash=skill_text_hash(existing.description, existing.directive),
+                after_hash=skill_text_hash(description, directive), fields=fields,
+            )
+        return self.get(name)
+
+    def converge_agent_clamps(self, name: str) -> Skill:
+        """Revoke automatic grants while preserving stored content and configuration."""
+        existing = self.get(name)
+        if existing is None:
+            raise KeyError(name)
+        if not existing.origin_agent:
+            return existing
+        capabilities = bool(existing.tool_patterns or existing.mcp_server_config or existing.file_templates)
+        self_assignable = existing.self_assignable and not capabilities
+        flags_converged = (
+            existing.shared, existing.privileged_tool_opt_in, existing.self_assignable
+        ) == (False, False, self_assignable)
+        if flags_converged and not capabilities:
+            return existing
+        with self._db:
+            if not flags_converged:
+                self._db.execute(
+                    """UPDATE skills SET shared=0, privileged_tool_opt_in=0, self_assignable=?, updated_at=?
+                       WHERE name=?""", (int(self_assignable), time.time(), name),
+                )
+            if capabilities:
+                self._db.execute(
+                    """UPDATE agent_skills SET enabled=0
+                       WHERE skill_name=? AND assigned_by='self' AND enabled=1""",
+                    (name,),
+                )
+        return self.get(name)
 
     def set_tool_patterns(self, name: str, tool_patterns: list[str]) -> Skill | None:
         """Converge one stored pattern set without replacing unrelated skill fields."""

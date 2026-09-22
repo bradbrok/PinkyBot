@@ -43,6 +43,11 @@
 
     // Skills
     let skills = [];
+    let refreshApprovalRef = '';
+    let rescanBusy = false;
+    let rescanResults = null;
+    let refreshDelegates = {};
+    let delegateBusy = '';
     let skillName = '';
     let skillDesc = '';
     let skillType = 'custom';
@@ -142,7 +147,42 @@
     // Skills
     async function refreshSkills() {
         const data = await api('GET', '/skills');
-        skills = data.skills || [];
+        skills = await Promise.all((data.skills || []).map(async (skill) => {
+            if (skill.skill_type !== 'skill') return skill;
+            return api('GET', `/skills/${encodeURIComponent(skill.name)}`);
+        }));
+        refreshDelegates = Object.fromEntries(skills.map(skill => [skill.name, skill.refresh_delegate || '']));
+    }
+
+    async function rescanSkills() {
+        if (rescanBusy) return;
+        rescanBusy = true;
+        rescanResults = null;
+        try {
+            rescanResults = await api('POST', '/skills/discover', {
+                refresh: true, approval_ref: refreshApprovalRef.trim(),
+            });
+            await refreshSkills();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            rescanBusy = false;
+        }
+    }
+
+    async function setRefreshDelegate(name, clear = false) {
+        if (delegateBusy) return;
+        delegateBusy = name;
+        try {
+            await api('PUT', `/skills/${encodeURIComponent(name)}/refresh-delegate`, {
+                agent: clear ? '' : (refreshDelegates[name] || '').trim(),
+            });
+            await refreshSkills();
+        } catch (e) {
+            toast(e.message, 'error');
+        } finally {
+            delegateBusy = '';
+        }
     }
 
     async function registerSkill() {
@@ -911,6 +951,35 @@
     <!-- Skill Catalog -->
     <div class="section">
         <SectionHeader i18nKey="settings.skill_catalog" onRefresh={refreshSkills} />
+        <div style="padding:1rem 1.5rem;font-family:monospace;border-bottom:1px solid var(--border-color)">
+            <div style="display:flex;gap:0.6rem;align-items:center;flex-wrap:wrap">
+                <input class="form-input" bind:value={refreshApprovalRef} maxlength="200"
+                    aria-label={$_('settings.skill_approval_ref')} placeholder={$_('settings.skill_approval_ref')}
+                    style="max-width:330px;font-family:monospace">
+                <button class="btn btn-primary" disabled={rescanBusy} on:click={rescanSkills}>
+                    {rescanBusy ? '…' : $_('settings.skill_rescan')}
+                </button>
+            </div>
+            {#if rescanResults}
+                <div role="status" aria-live="polite" style="margin-top:0.8rem;font-size:0.85rem">
+                    <strong>{$_('settings.skill_rescan_results')}</strong>
+                    <ul style="padding-left:1.2rem;margin:0.4rem 0 0">
+                        {#each rescanResults.updated || [] as row}
+                            <li>{row.name}: {$_('settings.skill_updated')}</li>
+                        {/each}
+                        {#each rescanResults.refused || [] as row}
+                            <li style="color:var(--tone-warning-text)">{row.name}: {$_('settings.skill_refused')} — {row.reason}</li>
+                        {/each}
+                        {#each rescanResults.unchanged || [] as name}
+                            <li>{name}: {$_('settings.skill_unchanged')}</li>
+                        {/each}
+                        {#each rescanResults.registered || [] as name}
+                            <li>{name}: {$_('settings.toast_skill_registered')}</li>
+                        {/each}
+                    </ul>
+                </div>
+            {/if}
+        </div>
         <div style="padding:1.5rem;background:var(--surface-2);border-radius:var(--radius-lg) var(--radius-lg) 0 0">
             <div class="form-inline" style="margin-bottom:0.8rem">
                 <input type="text" class="form-input" bind:value={skillName} placeholder={$_('settings.skill_name_placeholder')} style="max-width:200px">
@@ -975,17 +1044,33 @@
                 <div class="empty">{$_('settings.skill_no_skills')}</div>
             {:else}
                 <table class="data-table">
-                    <thead><tr><th>{$_('settings.skill_name_col')}</th><th>{$_('settings.skill_type_col')}</th><th>{$_('settings.skill_category_col')}</th><th>{$_('settings.skill_shared_col')}</th><th>{$_('settings.skill_self_assign_col')}</th><th>{$_('settings.skill_tools_col')}</th><th>{$_('settings.skill_status_col')}</th><th>{$_('settings.skill_actions_col')}</th></tr></thead>
+                    <thead><tr><th>{$_('settings.skill_name_col')}</th><th>{$_('settings.skill_type_col')}</th><th>{$_('settings.skill_category_col')}</th><th>{$_('settings.skill_shared_col')}</th><th>{$_('settings.skill_self_assign_col')}</th><th>{$_('settings.skill_tools_col')}</th><th>{$_('settings.skill_status_col')}</th><th>{$_('settings.skill_delegate')}</th><th>{$_('settings.skill_actions_col')}</th></tr></thead>
                     <tbody>
                         {#each skills as s}
                             <tr style={!s.enabled ? 'opacity:0.5' : ''}>
-                                <td class="mono" style="font-weight:600">{s.name}</td>
+                                <td class="mono" style="font-weight:600">{s.name}
+                                    {#if s.disk_drift}<span class="badge" style="margin-left:0.4rem;background:var(--tone-warning-bg);color:var(--tone-warning-text);font-family:monospace">{$_('settings.skill_drift')}</span>{/if}
+                                </td>
                                 <td><StatusBadge variant="model" label={s.skill_type} /></td>
                                 <td><span class="badge" style="background:var(--gray-mid);color:#fff">{s.category}</span></td>
                                 <td><StatusBadge status={s.shared ? 'on' : 'off'} label={s.shared ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
                                 <td><StatusBadge status={s.self_assignable ? 'on' : 'off'} label={s.self_assignable ? $_('settings.skill_yes') : $_('settings.skill_no')} /></td>
                                 <td style="font-size:0.75rem;font-family:var(--font-grotesk);max-width:200px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">{(s.tool_patterns || []).join(', ') || '--'}</td>
                                 <td><StatusBadge status={s.enabled ? 'on' : 'off'} label={s.enabled ? $_('settings.skill_enabled') : $_('settings.skill_off')} /></td>
+                                <td style="font-family:monospace">
+                                    {#if s.skill_type === 'skill'}
+                                        <input class="form-input" bind:value={refreshDelegates[s.name]}
+                                            aria-label={`${$_('settings.skill_delegate')}: ${s.name}`}
+                                            placeholder={s.origin_agent || $_('settings.skill_origin_agent')}
+                                            style="width:150px;font-family:monospace;font-size:0.75rem">
+                                        <div style="display:flex;gap:0.3rem;margin-top:0.3rem">
+                                            <button class="btn btn-sm" disabled={!!delegateBusy || !s.origin_agent || !(refreshDelegates[s.name] || '').trim()}
+                                                on:click={() => setRefreshDelegate(s.name)}>{$_('settings.skill_delegate_set')}</button>
+                                            <button class="btn btn-sm" disabled={!!delegateBusy || !s.refresh_delegate}
+                                                on:click={() => setRefreshDelegate(s.name, true)}>{$_('settings.skill_delegate_clear')}</button>
+                                        </div>
+                                    {:else}--{/if}
+                                </td>
                                 <td>
                                     <div style="display:flex;gap:0.3rem;align-items:center">
                                         {#if s.category !== 'core'}
