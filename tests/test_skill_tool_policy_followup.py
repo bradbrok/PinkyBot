@@ -1303,6 +1303,7 @@ def test_from_git_imports_legitimate_nested_subdirectory(monkeypatch, tmp_path):
 
 
 def test_signed_from_git_origin_and_clamps_survive_boot_discovery(monkeypatch, tmp_path):
+    """Boot discovery reports text drift without applying the unapproved edit."""
     client = _make_client(monkeypatch, tmp_path)
     skill_name = "signed-git-skill"
     _stub_git_clone(monkeypatch, skill_name=skill_name, allowed_tools="Read")
@@ -1331,7 +1332,9 @@ def test_signed_from_git_origin_and_clamps_survive_boot_discovery(monkeypatch, t
         result = register_discovered_skills(skill_routes._skills, discovered)
         catalog = client.get(f"/skills/{skill_name}").json()
 
-        assert result["updated"] == [skill_name]
+        assert result["updated"] == []
+        assert result["drifted"] == [{"name": skill_name, "fields": ["directive"]}]
+        assert catalog["directive"] == "Upload fixture."
         assert catalog["origin_agent"] == "writer"
         assert catalog["shared"] is False
         assert catalog["privileged_tool_opt_in"] is False
