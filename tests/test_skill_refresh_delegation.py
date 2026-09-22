@@ -422,3 +422,24 @@ def test_invalid_disk_patterns_report_drift_and_cannot_skip_clamps(catalog):
     assert skill.tool_patterns == ["Read"]
     assert skill.directive == "Original directive."
     assert not skill.shared and not skill.self_assignable
+
+
+def test_origin_put_without_delegate_audits_every_text_change(catalog):
+    with catalog.store._db:
+        catalog.store._db.execute("DELETE FROM agent_skills WHERE skill_name=?", (NAME,))
+    for index, body in enumerate((
+        {"directive": "Origin text edit."},
+        {"directive": "Origin mixed edit.", "version": "2.0.0", "approval_ref": REF},
+    ), start=1):
+        before = catalog.store.get(NAME)
+        response = _signed(catalog.client, "PUT", f"/skills/{NAME}", body)
+        assert response.status_code == 200, response.text
+        after = catalog.store.get(NAME)
+        audit = catalog.store.list_refresh_audit(NAME)
+        assert len(audit) == index
+        assert audit[0]["actor"] == ORIGIN
+        assert audit[0]["path"] == "put"
+        assert audit[0]["approval_ref"] == body.get("approval_ref", "")
+        assert audit[0]["before_hash"] == _hash(before.description, before.directive)
+        assert audit[0]["after_hash"] == _hash(after.description, after.directive)
+    assert after.last_approval_ref == REF
