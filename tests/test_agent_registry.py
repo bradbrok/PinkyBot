@@ -1838,6 +1838,62 @@ class TestModelSeeds:
         # The 1M-tier suffix strips to the same rate row.
         assert lookup_rate("claude-fable-5-1[1m]") is _FABLE_51
 
+    def test_opus_5_5_seeded_at_current_opus_tier(self, registry):
+        """Claude Opus 5.5 (2026-09-22) is the current Opus at $4/$20 per MTok
+        with a 5% cache read ($0.20) — cheaper than Opus 5 on every field.
+        Pin the catalog + RATE_TABLE + 1M-set so a half-updated table fails
+        loud (four registration sites must agree)."""
+        models = {
+            m["model_id"]: m
+            for m in registry.list_models(provider="anthropic", active_only=False)
+        }
+        assert "claude-opus-5-5" in models
+        o55 = models["claude-opus-5-5"]
+        o5 = models["claude-opus-5"]
+        assert o55["input_price"] == 4.0
+        assert o55["output_price"] == 20.0
+        assert o55["cached_input_price"] == 0.2
+        # Deliberately cheaper than Opus 5's standard tier, not a copy of it.
+        assert o55["input_price"] < o5["input_price"]
+        assert o55["output_price"] < o5["output_price"]
+        assert o55["cached_input_price"] < o5["cached_input_price"]
+        assert o55["context_window"] == 1_000_000
+        assert o55["is_1m"] == 1
+        assert o55["supports_thinking"] == 1
+        assert o55["tier"] == "opus"
+        # 1M-context set (SDK 200k-report correction path).
+        assert "claude-opus-5-5" in registry.get_1m_models()
+        # The live cost path reads pricing.RATE_TABLE; the parity guards skip a
+        # catalog row absent from RATE_TABLE, so require the entry here at the
+        # right rates — that forces the analytics seed via
+        # test_seed_pricing_matches_rate_table, closing the three-table chain.
+        from pinky_daemon.pricing import _OPUS_55, _OPUS_STD, RATE_TABLE
+        assert RATE_TABLE.get("claude-opus-5-5") is _OPUS_55
+        assert _OPUS_55 is not _OPUS_STD
+        assert _OPUS_55["input"] == 4.0
+        assert _OPUS_55["output"] == 20.0
+        assert _OPUS_55["cache_read"] == 0.20
+        assert _OPUS_55["cache_write_5m"] == 5.00
+        assert _OPUS_55["cache_write_1h"] == 8.00
+
+    def test_opus_5_5_cost_path_prices_all_five_fields(self):
+        """A hand-computed mixed-token turn through the live cost engine —
+        every field contributes a distinct dollar amount, so a mutated
+        cache-write tariff cannot ride through on display-price asserts."""
+        from pinky_daemon.pricing import _OPUS_55, compute_turn_cost_usd, lookup_rate
+
+        cost = compute_turn_cost_usd(
+            "claude-opus-5-5",
+            input_tokens=1_000_000,  # 1.00M x $4.00 = $4.00
+            output_tokens=100_000,  # 0.10M x $20.00 = $2.00
+            cache_read_tokens=2_000_000,  # 2.00M x $0.20 = $0.40
+            cache_creation_5m_tokens=40_000,  # 0.04M x $5.00 = $0.20
+            cache_creation_1h_tokens=10_000,  # 0.01M x $8.00 = $0.08
+        )
+        assert cost == pytest.approx(6.68)
+        # The 1M-tier suffix strips to the same rate row.
+        assert lookup_rate("claude-opus-5-5[1m]") is _OPUS_55
+
     def test_openai_seed_prices_match_pricing_rate_table(self, registry):
         """#860 extends the #741 invariant to the OpenAI family: catalog
         display prices must agree with pricing.py (the actual cost engine)
