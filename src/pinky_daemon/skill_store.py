@@ -12,8 +12,9 @@ Skills can be:
 - Agent-specific: manually assigned to individual agents
 - Self-assignable: agents can add them to themselves via pinky-self tools
 
-Storage: SQLite with three tables:
+Storage: SQLite with four tables:
   - skills: global skill catalog
+  - skill_refresh_audit: approved text refresh history
   - agent_skills: per-agent skill assignments
   - session_skills: (deprecated) per-session overrides
 """

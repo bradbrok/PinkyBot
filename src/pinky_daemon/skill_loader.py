@@ -320,10 +320,10 @@ def register_discovered_skills(
     Args:
         skill_store: SkillStore instance
         skills: List of parsed skills to register
-        overwrite: If True, update existing skills. If False, skip existing.
+        overwrite: If True, update existing skills. If False, report existing drift.
 
     Returns:
-        {"registered": [...], "skipped": [...], "updated": [...]}
+        {"registered": [...], "skipped": [...], "updated": [...], "drifted": [...]}
     """
     registered = []
     skipped = []
@@ -338,18 +338,6 @@ def register_discovered_skills(
             if existing
             else agent_originated or bool(persisted_origin)
         )
-
-        try:
-            validate_tool_patterns(
-                skill.allowed_tools,
-                skill_name=skill.name,
-                mcp_server_config={},
-                skill_type="skill",
-            )
-        except ToolPatternValidationError as exc:
-            _log(f"skill_loader: skipping '{skill.name}' — {exc}")
-            skipped.append(skill.name)
-            continue
 
         if existing and not overwrite:
             # Don't overwrite skills registered via API/UI
@@ -368,6 +356,18 @@ def register_discovered_skills(
                 skipped.append(skill.name)
             if enforce_agent_clamps:
                 skill_store.converge_agent_clamps(skill.name)
+            continue
+
+        try:
+            validate_tool_patterns(
+                skill.allowed_tools,
+                skill_name=skill.name,
+                mcp_server_config={},
+                skill_type="skill",
+            )
+        except ToolPatternValidationError as exc:
+            _log(f"skill_loader: skipping '{skill.name}' — {exc}")
+            skipped.append(skill.name)
             continue
 
         # Build tool_patterns from allowed-tools frontmatter

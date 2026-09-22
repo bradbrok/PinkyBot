@@ -409,3 +409,16 @@ def test_tool_only_drift_is_visible_and_refused(catalog):
     response = catalog.client.post("/skills/discover", json={"refresh": True})
     assert response.json()["refused"][0]["fields"] == ["tool_patterns"]
     assert catalog.store.get(NAME).to_dict() == before
+
+
+def test_invalid_disk_patterns_report_drift_and_cannot_skip_clamps(catalog):
+    store = catalog.store
+    with store._db:
+        store._db.execute("UPDATE skills SET shared=1, self_assignable=1 WHERE name=?", (NAME,))
+    _write(catalog.path, tools='["Read,Grep"]')
+    result = register_discovered_skills(store, [parse_skill_md(catalog.path)], overwrite=False)
+    assert result["drifted"] == [{"name": NAME, "fields": ["tool_patterns"]}]
+    skill = store.get(NAME)
+    assert skill.tool_patterns == ["Read"]
+    assert skill.directive == "Original directive."
+    assert not skill.shared and not skill.self_assignable
