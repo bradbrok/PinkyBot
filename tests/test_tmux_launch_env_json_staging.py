@@ -283,7 +283,9 @@ original=fcntl.flock
 parked=False
 wall=time.time()
 deadline=wall+60
-lease_end=time.monotonic()+60
+mono=time.monotonic()
+lease_end=mono+60
+time.monotonic=lambda: mono
 time.time=lambda: wall
 lock_path=Path.home()/".local/state/pinkybot/tmux-launch-env"/("c3"*32)/("env-"+"a1"*16+".lock")
 def parked_flock(fd,op):
@@ -348,6 +350,7 @@ from pinky_daemon import tmux_launch_env as m
 original=os.open
 now=time.time()
 mono=time.monotonic()
+time.monotonic=lambda: mono
 time.time=lambda: now
 def delayed_open(name,flags,*args,**kwargs):
     if str(name).endswith("env-"+"a1"*16+".json") and flags & os.O_CREAT:
