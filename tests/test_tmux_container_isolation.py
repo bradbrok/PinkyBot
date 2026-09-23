@@ -914,12 +914,17 @@ class TestDedicatedConfigDir:
             ),
             working_dir=wd,
         )
-        inner = _RecordingInner()
-        control = _TmuxControl("pinky-dymok-main", command_runner=inner)
+        from tests.tmux_env_support import LaunchRecorder
+
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        monkeypatch.setenv("HOME", str(home))
+        inner = LaunchRecorder(home)
+        control = _TmuxControl("test-session", command_runner=inner)
         await control.new_session(
             cwd=wd, command="claude", env=ss._build_repl_env()
         )
-        argv = inner.calls[-1]
+        argv = inner.tmux_calls[-1]
         # The pair must appear consecutively; the value is the empty string.
         assert "-e" in argv
         pairs = [
@@ -929,32 +934,45 @@ class TestDedicatedConfigDir:
         # And never the shared token itself.
         assert "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-shared" not in pairs
 
-    async def test_default_agent_emits_populated_oauth_e_flag_in_argv(
+    async def test_default_agent_stages_populated_oauth_off_argv(
         self, monkeypatch, tmp_path
     ):
-        # Backward-compat guard: a NON-dedicated agent still forwards the real
-        # shared token as `-e CLAUDE_CODE_OAUTH_TOKEN=<tok>` (never empty).
+        # The populated token is delivered to the pane without entering process argv.
+        from tests.tmux_env_support import (
+            LaunchRecorder,
+            child_payload,
+            env_pairs,
+            probe_command,
+            run_pane,
+            secret_files,
+        )
+
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
-        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-shared")
-        wd = str(tmp_path / "proj")
+        monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "synthetic-forwarded-token")
+        home = tmp_path / "home"
+        home.mkdir(mode=0o700)
+        monkeypatch.setenv("HOME", str(home))
         ss = _session(
+            agent_name="test-agent",
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=False)
+                _FakeAgent("test-agent", "local", working_dir=str(home), dedicated_config_dir=False)
             ),
-            working_dir=wd,
+            working_dir=str(home),
         )
-        inner = _RecordingInner()
-        control = _TmuxControl("pinky-dymok-main", command_runner=inner)
+        inner = LaunchRecorder(home)
+        control = _TmuxControl("test-session", command_runner=inner)
         await control.new_session(
-            cwd=wd, command="claude", env=ss._build_repl_env()
+            cwd=str(home), command=probe_command(home), env=ss._build_repl_env()
         )
-        argv = inner.calls[-1]
-        pairs = [
-            argv[i + 1] for i, tok in enumerate(argv[:-1]) if tok == "-e"
-        ]
-        assert "CLAUDE_CODE_OAUTH_TOKEN=sk-ant-oat01-shared" in pairs
-        assert "CLAUDE_CODE_OAUTH_TOKEN=" not in pairs
+        for argv, _ in inner.calls:
+            assert "synthetic-forwarded-token" not in "\n".join(argv)
+        assert "CLAUDE_CODE_OAUTH_TOKEN" not in env_pairs(inner.tmux_calls[-1])
+        paths = secret_files(home, "synthetic-forwarded-token")
+        assert len(paths) == 1
+        result = child_payload(run_pane(inner.tmux_calls[-1], home))
+        assert result["env"]["CLAUDE_CODE_OAUTH_TOKEN"] == "synthetic-forwarded-token"
+        assert not paths[0].exists()
 
     def test_container_agent_flag_is_noop(self, monkeypatch, tmp_path):
         # dedicated_config_dir is a LOCAL concept — a container agent already
