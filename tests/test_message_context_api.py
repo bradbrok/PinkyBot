@@ -137,3 +137,32 @@ def test_unsigned_and_owner_session_callers_are_refused(tmp_path, monkeypatch):
         response = client.get(PATH)
         assert response.status_code == 403
         assert response.json()["detail"] == "verified caller must match the target agent"
+
+
+def test_cache_only_rows_are_not_served_when_the_store_has_dropped_them(tmp_path, monkeypatch):
+    """The persisted store's bounds decide; a stale cache entry can never widen them."""
+    with _gateway(tmp_path, monkeypatch) as client:
+        broker = client.app.state.broker
+        store = client.app.state.message_context_store
+        _inbound(client)
+        assert _signed(client, PATH).status_code == 200  # cached at the head of the order
+        base = {"agent_name": "sample", "platform": "slack", "chat_id": "D1", "timestamp": 1.0}
+        now = time.time()
+        for index in range(store.max_per_agent):
+            store.put({**base, "message_id": f"fill{index}"}, stored_at=now + index)
+        assert store.get("sample", "m1", platform="slack", chat_id="D1") is None
+        assert ("sample", "slack", "D1", "m1") in broker._message_contexts
+        assert _signed(client, PATH).status_code == 404
+        assert ("sample", "slack", "D1", "m1") not in broker._message_contexts
+
+
+def test_a_row_that_never_persisted_is_not_served(tmp_path, monkeypatch):
+    with _gateway(tmp_path, monkeypatch) as client:
+        broker = client.app.state.broker
+        from pinky_daemon.broker import MessageContext
+
+        with broker._message_context_lock:
+            broker._cache_message_context(MessageContext(
+                agent_name="sample", message_id="m1", platform="slack", chat_id="D1", timestamp=5.0,
+            ))
+        assert _signed(client, PATH).status_code == 404

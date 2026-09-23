@@ -716,9 +716,11 @@ class MessageBroker:
 
         Unlike ``get_message_context`` the caller names the platform and chat,
         so the lookup never has to disambiguate a message ID reused across
-        chats. Returns ``None`` when nothing unexpired matches; the persisted
-        store applies the retention window and the per-agent cap, and the
-        in-memory cache only ever holds rows that were also handed to it.
+        chats. When a persisted store is configured it is authoritative: its
+        retention window and per-agent cap decide existence, and a row that
+        only the in-memory cache holds (persistence failed, or the store has
+        since pruned it while the cache order kept it) is never served. The
+        cache alone answers only when no store is configured.
         """
         if not (agent_name and platform and chat_id and message_id):
             return None
@@ -740,15 +742,14 @@ class MessageBroker:
             except Exception as exc:  # noqa: BLE001 — a store fault reads as "not found"
                 _log(f"message-context load failed: {type(exc).__name__}")
                 return None
-            if stored is not None:
-                stored_at = float(stored.pop("_stored_at"))
-                context = MessageContext(**stored)
-                if cached is None or cached_at is None or stored_at >= cached_at:
-                    self._cache_message_context(context, stored_at=stored_at)
-                    return context, stored_at
-            if cached is not None and cached_at is not None:
-                return cached, cached_at
-            return None
+            if stored is None:
+                if cached is not None:
+                    self._evict_message_context(key)
+                return None
+            stored_at = float(stored.pop("_stored_at"))
+            context = MessageContext(**stored)
+            self._cache_message_context(context, stored_at=stored_at)
+            return context, stored_at
 
     async def _handle_stop_command(self, message: BrokerMessage) -> bool:
         """Intercept /stop commands from the owner. Returns True if handled."""
