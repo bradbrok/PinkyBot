@@ -6,6 +6,7 @@ import time
 from contextlib import contextmanager
 
 import pytest
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 from pinky_daemon.api import create_api
@@ -210,14 +211,14 @@ def test_without_a_store_nothing_is_served(tmp_path, monkeypatch):
 def test_identity_segments_with_reserved_characters_are_refused_before_lookup(
     tmp_path, monkeypatch, encoded, decoded
 ):
-    """Two different encoded identities sharing one signed request never reach the store."""
+    """Reserved identity characters are rejected before a store lookup."""
     with _gateway(tmp_path, monkeypatch) as client:
         store = client.app.state.message_context_store
         base = {"agent_name": "sample", "platform": "slack", "timestamp": 1.0,
                 "metadata": {"direction": "inbound"}}
         store.put({**base, "chat_id": f"D{decoded}one", "message_id": "original"})
         store.put({**base, "chat_id": f"D{decoded}two", "message_id": "different"})
-        # One signature that the shared verifier accepts for both encoded identities.
+        # The signature covers a plain path; both requests require a full routed path.
         signed_for = "/agents/sample/message-context/slack/D"
         headers = build_internal_auth_headers(
             client.app.state.agents.get_signing_key("sample"),
@@ -233,8 +234,36 @@ def test_identity_segments_with_reserved_characters_are_refused_before_lookup(
         monkeypatch.setattr(store, "get", spy)
         first = client.get(f"/agents/sample/message-context/slack/D{encoded}one/original", headers=headers)
         second = client.get(f"/agents/sample/message-context/slack/D{encoded}two/different", headers=headers)
-        assert first.status_code == 404
-        assert second.status_code == 404
-        assert first.json()["detail"]["code"] == "message_context_not_found"
+        assert first.status_code == 401
+        assert second.status_code == 401
+        assert first.json() == {"detail": "Unauthorized"}
         assert second.json() == first.json()
         assert queried == []
+
+
+@pytest.mark.parametrize("segment", ["platform", "chat_id", "message_id"])
+@pytest.mark.parametrize("delimiter", ["?", "#"])
+async def test_message_context_handler_checks_identity_before_lookup(
+    tmp_path, monkeypatch, segment, delimiter
+):
+    """The handler retains its own identity validation after authentication."""
+    with _gateway(tmp_path, monkeypatch) as client:
+        endpoint = next(
+            route.endpoint for route in client.app.routes
+            if getattr(route, "path", None)
+            == "/agents/{name}/message-context/{platform}/{chat_id}/{message_id}"
+        )
+
+        def unexpected_lookup(*args, **kwargs):
+            pytest.fail("identity validation must precede the context lookup")
+
+        monkeypatch.setattr(
+            client.app.state.broker, "get_message_context_by_identity", unexpected_lookup,
+        )
+        identity = {"name": "sample", "platform": "slack", "chat_id": "D1", "message_id": "m1"}
+        identity[segment] += delimiter + "part"
+        request = Request({"type": "http", "state": {"internal_caller": "sample"}})
+        with pytest.raises(HTTPException) as denied:
+            await endpoint(**identity, request=request)
+        assert denied.value.status_code == 404
+        assert denied.value.detail["code"] == "message_context_not_found"
