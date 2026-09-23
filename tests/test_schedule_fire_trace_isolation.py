@@ -44,6 +44,8 @@ def test_positive_uncontended_accept_and_sqlite_policy(registry):
     assert receipt.accept()
     assert time.monotonic() - started < 5, "authoritative accept stalled"
     assert registry.get_schedule_wake_by_fire(p.schedule_id, p.fired_at).accepted_at > 0
+    # The zero-timeout policy probe must not race the accept trace just queued.
+    assert registry._fire_trace.flush()
     assert registry._db.execute("PRAGMA journal_mode").fetchone()[0] == "truncate"
     db = registry._fire_trace._connect()
     try:
