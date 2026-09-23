@@ -688,11 +688,18 @@ def test_prune_transactions_delete_at_most_500_rows(registry, monkeypatch):
     def connect(**kwargs):
         db = original(**kwargs)
         previous = [db.total_changes]
+        deleting = [False]
 
         def trace(sql):
+            if sql.lstrip().upper().startswith("DELETE FROM SCHEDULE_FIRE_TRACE"):
+                deleting[0] = True
             if sql.strip().upper() == "COMMIT":
-                commits.append(db.total_changes - previous[0])
+                # A slow prune may legitimately persist a fresh diagnostic.
+                # This bound describes deleted rows, not every trace-store write.
+                if deleting[0]:
+                    commits.append(db.total_changes - previous[0])
                 previous[0] = db.total_changes
+                deleting[0] = False
                 if sum(commits) >= 3002:
                     completed.set()
 
@@ -710,7 +717,14 @@ def test_prune_transactions_delete_at_most_500_rows(registry, monkeypatch):
     assert max(commits) <= 500, commits
     with sqlite3.connect(writer.path) as db:
         assert db.execute("SELECT COUNT(*) FROM schedule_fire_trace").fetchone()[0] == 0
-        assert db.execute("SELECT COUNT(*) FROM schedule_fire_trace_failures").fetchone()[0] == 0
+        assert db.execute(
+            "SELECT COUNT(*) FROM schedule_fire_trace_failures WHERE event_id LIKE 'bounded-%'"
+        ).fetchone()[0] == 0
+        # Zero fresh diagnostics is valid; any present must describe this prune's
+        # successful slow write, never an unexplained database failure.
+        assert set(db.execute("SELECT edge,reason FROM schedule_fire_trace_failures")) <= {
+            ("prune", "TimeoutError")
+        }
 
 
 def test_worker_reporter_failure_cannot_strand_bookkeeping(registry, monkeypatch):

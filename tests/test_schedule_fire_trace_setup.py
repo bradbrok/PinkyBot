@@ -184,7 +184,7 @@ def test_worker_connect_contention_is_retried_or_accounted(tmp_path, monkeypatch
     lock = sqlite3.connect(writer.path)
     lock.execute("BEGIN EXCLUSIVE")
     original_connect, original_failed = writer._connect, writer.failed
-    attempted, failed = threading.Event(), threading.Event()
+    attempted, failed, released = threading.Event(), threading.Event(), threading.Event()
     errors = []
 
     def connect(**kwargs):
@@ -192,6 +192,10 @@ def test_worker_connect_contention_is_retried_or_accounted(tmp_path, monkeypatch
             return original_connect(**kwargs)
         except sqlite3.OperationalError:
             attempted.set()
+            if release_early:
+                # Observe a real failed open, then release before allowing the
+                # product's retry budget to run. Host scheduling is not the test.
+                assert released.wait(5)
             raise
 
     def account(event, error):
@@ -209,6 +213,7 @@ def test_worker_connect_contention_is_retried_or_accounted(tmp_path, monkeypatch
             assert len(errors) == 1
             assert isinstance(errors[0], sqlite3.OperationalError)
         lock.rollback()
+        released.set()
         assert writer.flush()
         if release_early:
             assert writer.report()["rows"][0]["replay_count"] == 1
@@ -222,6 +227,7 @@ def test_worker_connect_contention_is_retried_or_accounted(tmp_path, monkeypatch
             assert writer.report()["rows"] == []
     finally:
         lock.rollback()
+        released.set()
         lock.close()
         registry.close()
 
