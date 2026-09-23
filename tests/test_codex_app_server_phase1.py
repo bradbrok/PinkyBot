@@ -85,7 +85,8 @@ async def test_init_failure_degrades_to_exec_without_terminalizing(
         monkeypatch, tmp_path, mode=mode, startup_delay=startup_delay, init_timeout=init_timeout
     )
 
-    await asyncio.wait_for(session.connect(), timeout=init_timeout + 5)
+    outer_timeout = 1 if mode == "hang-init" else init_timeout + 5
+    await asyncio.wait_for(session.connect(), timeout=outer_timeout)
 
     assert session.state == SessionState.CONNECTED
     assert session._use_app_server is False
