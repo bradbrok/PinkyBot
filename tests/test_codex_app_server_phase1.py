@@ -29,15 +29,24 @@ def _session(
     mode: str,
     agent_name: str = "phase1-agent",
     init_timeout: float = 0.2,
+    startup_delay: float = 0,
 ) -> CodexSession:
     working_dir = tmp_path / agent_name
     working_dir.mkdir()
     monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
     monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", agent_name)
     monkeypatch.setenv("PINKY_CODEX_APP_SERVER_INIT_TIMEOUT", str(init_timeout))
+    command = [sys.executable, str(_FAKE), "--mode", mode]
+    if startup_delay:
+        command = [
+            sys.executable, "-c",
+            "import runpy,sys,time; time.sleep(float(sys.argv.pop(1))); "
+            "sys.argv.pop(0); runpy.run_path(sys.argv[0],run_name='__main__')",
+            str(startup_delay), str(_FAKE), "--mode", mode,
+        ]
     monkeypatch.setenv(
         "PINKY_CODEX_APP_SERVER_CMD",
-        shlex.join([sys.executable, str(_FAKE), "--mode", mode]),
+        shlex.join(command),
     )
     session = CodexSession(
         StreamingSessionConfig(
@@ -56,6 +65,7 @@ def _session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_delay", [0, 0.35], ids=["natural", "delayed-start"])
 @pytest.mark.parametrize(
     ("mode", "reason"),
     [
@@ -65,11 +75,11 @@ def _session(
     ],
 )
 async def test_init_failure_degrades_to_exec_without_terminalizing(
-    monkeypatch, tmp_path, mode, reason
+    monkeypatch, tmp_path, mode, reason, startup_delay
 ):
     logs: list[str] = []
     monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
-    session = _session(monkeypatch, tmp_path, mode=mode)
+    session = _session(monkeypatch, tmp_path, mode=mode, startup_delay=startup_delay)
 
     await asyncio.wait_for(session.connect(), timeout=1)
 
