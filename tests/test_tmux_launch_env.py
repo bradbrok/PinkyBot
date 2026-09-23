@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-import re
+import shlex
 import stat
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -52,7 +52,7 @@ async def stage(home, env=None, name="test-session", runner=None):
 
 def only_file(home):
     paths = secret_files(home, SENTINEL)
-    assert len(paths) == 1, "the non-empty value must be staged in one protected source file"
+    assert len(paths) == 1, "the non-empty value must be staged in one protected payload file"
     return paths[0]
 
 
@@ -237,7 +237,7 @@ async def test_write_failure_raises_without_falling_back_to_argv(private_home, m
     assert_clean_argv(recorder)
 
 
-async def test_sequential_relaunch_prunes_only_its_session_and_never_reuses_path(private_home):
+async def test_sequential_relaunch_preserves_young_files_and_never_reuses_path(private_home):
     tmux, recorder = await stage(private_home, name="session-one")
     old = only_file(private_home)
     other, other_recorder = await stage(
@@ -246,12 +246,13 @@ async def test_sequential_relaunch_prunes_only_its_session_and_never_reuses_path
         name="session-two",
     )
     other_file = secret_files(private_home, "different-session-value")[0]
-    # Simulate the callers' already-completed stale-session teardown; neither pane sourced.
+    # A replacement may overlap the previous launch's cleanup; young files stay
+    # valid until their exact-nonce cleanup, loader consumption, or orphan TTL.
     await tmux.new_session(
         cwd=str(private_home), command=probe_command(private_home), env={"SECRET": SENTINEL}
     )
-    fresh = only_file(private_home)
-    assert fresh != old and not old.exists()
+    fresh = next(path for path in secret_files(private_home, SENTINEL) if path != old)
+    assert fresh != old and old.exists()
     assert other_file.exists()
     assert (
         child_payload(run_pane(recorder.tmux_calls[-1], private_home))["env"]["SECRET"] == SENTINEL
@@ -399,12 +400,21 @@ async def test_codex_full_env_parity_and_unknown_secret_off_argv(
     assert not path.exists()
 
 
-async def test_source_success_but_delete_failure_must_not_exec(private_home):
+async def test_valid_payload_but_delete_failure_must_not_exec(private_home):
     _, recorder = await stage(private_home)
     path = only_file(private_home)
     argv = list(recorder.tmux_calls[-1])
-    argv[-1], substitutions = re.subn(r"/(?:usr/)?bin/rm\b", "/bin/false", argv[-1])
-    assert substitutions, "cleanup utility must be absolute"
+    loader = shlex.split(argv[-1])
+    source_index = loader.index("-c") + 1
+    source = loader[source_index]
+    loader[source_index] = (
+        "import os\n"
+        "def deny_unlink(*args, **kwargs):\n"
+        "    raise PermissionError('synthetic unlink refusal')\n"
+        "os.unlink = deny_unlink\n"
+        f"exec({source!r})\n"
+    )
+    argv[-1] = shlex.join(loader)
     result = run_pane(argv, private_home)
     assert result.returncode != 0
     assert not result.stdout, "delete failure must not launch the target with a file left behind"
@@ -417,16 +427,32 @@ async def test_partial_local_write_failure_cleans_file_and_never_launches(
 ):
     tmux, recorder = control(private_home)
     recorder.fail_staging = True
+    real_fdopen = os.fdopen
 
     def fail_fdopen(fd, *args, **kwargs):
-        os.close(fd)
-        raise OSError("synthetic-write-failure")
+        stream = real_fdopen(fd, *args, **kwargs)
+
+        class PartialWrite:
+            def __enter__(self):
+                return self
+
+            def write(self, value):
+                stream.write(SENTINEL)
+                stream.flush()
+                raise OSError("synthetic-write-failure")
+
+            def __exit__(self, *args):
+                stream.close()
+
+        return PartialWrite()
 
     monkeypatch.setattr(os, "fdopen", fail_fdopen)
     with pytest.raises((OSError, RuntimeError)):
         await tmux.new_session(cwd=str(private_home), command="true", env={"SECRET": SENTINEL})
     assert not recorder.tmux_calls
-    assert not [p for p in private_home.rglob("*") if p.is_file()]
+    assert not secret_files(private_home, SENTINEL)
+    assert not list(private_home.rglob("env-*.json"))
+    assert all(p.suffix == ".lock" for p in private_home.rglob("*") if p.is_file())
     assert_clean_argv(recorder)
 
 
@@ -445,13 +471,18 @@ async def test_app_server_start_routes_actual_launch_through_file_boundary(
     class LaunchObservedError(Exception):
         pass
 
-    supervisor._await_accept = AsyncMock(side_effect=LaunchObservedError)
+    async def observed_launch():
+        assert SENTINEL in only_file(private_home).read_text()
+        raise LaunchObservedError
+
+    supervisor._await_accept = AsyncMock(side_effect=observed_launch)
     with pytest.raises(LaunchObservedError):
         await supervisor.start()
     assert_clean_argv(recorder)
     assert len(recorder.tmux_calls) == 1
     assert "pinky_daemon.codex_app_server_shim" in recorder.tmux_calls[0][-1]
-    assert SENTINEL in only_file(private_home).read_text()
+    assert not secret_files(private_home, SENTINEL)
+    assert not list(private_home.rglob("env-*.json"))
     supervisor._kill_tmux_session.assert_awaited_once_with(strict=True)
 
 

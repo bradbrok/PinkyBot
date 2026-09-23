@@ -56,10 +56,14 @@ async def test_invalid_ambient_name_is_warned_and_valid_launch_proceeds(
     recorder = LaunchRecorder(home)
     control = _TmuxControl("ambient-name-test", command_runner=recorder)
     await control.new_session(cwd=str(home), command=probe_command(home), env=env)
+    staged_path = secret_files(home, "synthetic-valid-name-value")[0]
     child = child_payload(run_pane(recorder.tmux_calls[-1], home))
     assert child["env"]["UNKNOWN_CREDENTIAL"] == "synthetic-valid-name-value"
     assert name not in child["env"]
-    assert not child["files_at_exec"]
+    assert str(staged_path) not in child["files_at_exec"]
+    assert not staged_path.exists()
+    assert not secret_files(home, "synthetic-valid-name-value")
+    assert all(path.endswith(".lock") for path in child["files_at_exec"])
 
 
 @pytest.mark.parametrize("namespace", ["container", "runuser"])
