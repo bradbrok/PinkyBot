@@ -97,7 +97,7 @@ def test_gc_removes_old_metadata_but_expired_launch_cannot_recreate(home):
     stage(home, nonce=OTHER_NONCE)
     assert all(not path.exists() for path in old_metadata), "expired metadata must be collected"
     with pytest.raises((RuntimeError, ValueError)):
-        stage(home, deadline=time.time() - 1)
+        stage(home, deadline=time.time() - 301)
     assert not (directory / f"env-{NONCE}.json").exists()
     assert not any(NONCE in p.name for p in directory.iterdir()), "expired stager recreated metadata"
 
@@ -281,7 +281,10 @@ from pinky_daemon import tmux_launch_env as m
 ready,release=map(Path,sys.argv[1:3])
 original=fcntl.flock
 parked=False
-deadline=time.time()+30
+wall=time.time()
+deadline=wall+60
+lease_end=time.monotonic()+60
+time.time=lambda: wall
 lock_path=Path.home()/".local/state/pinkybot/tmux-launch-env"/("c3"*32)/("env-"+"a1"*16+".lock")
 def parked_flock(fd,op):
     global parked
@@ -294,7 +297,7 @@ def parked_flock(fd,op):
         while not release.exists(): time.sleep(.01)
         still_open=os.fstat(fd)
         ready.with_suffix(".resumed").write_text(json.dumps({"dev":still_open.st_dev,"ino":still_open.st_ino}))
-        time.time=lambda: deadline+1
+        time.monotonic=lambda: lease_end+1
     return original(fd,op)
 fcntl.flock=parked_flock
 try:
@@ -344,9 +347,11 @@ import os,time
 from pinky_daemon import tmux_launch_env as m
 original=os.open
 now=time.time()
+mono=time.monotonic()
+time.time=lambda: now
 def delayed_open(name,flags,*args,**kwargs):
     if str(name).endswith("env-"+"a1"*16+".json") and flags & os.O_CREAT:
-        time.time=lambda: now+120
+        time.monotonic=lambda: mono+120
     return original(name,flags,*args,**kwargs)
 os.open=delayed_open
 try:
