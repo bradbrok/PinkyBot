@@ -175,6 +175,7 @@ class ScheduleFireTrace:
         self._setup_retry_attempts = 0
         self._setup_state = "starting"
         self._dropped_events = 0
+        self._logging_failures = 0
         self._setup_error = None
         if not self._setup():
             self._schedule_failure_retry()
@@ -187,7 +188,15 @@ class ScheduleFireTrace:
                 "dropped_events": self._dropped_events,
                 "setup_attempts": self._setup_attempts,
                 "error": self._setup_error,
+                "logging_failures": self._logging_failures,
             }
+
+    def _log_transition(self, level, message, *args):
+        try:
+            logger.log(level, message, *args)
+        except Exception:
+            with self._worker_lock:
+                self._logging_failures += 1
 
     def _setup(self):
         # One setup budget covers connection pragmas and taking the schema lock.
@@ -197,7 +206,13 @@ class ScheduleFireTrace:
         deadline = time.monotonic() + SETUP_TIMEOUT_SECONDS
         db = None
         try:
-            db = self._connect(timeout=SETUP_TIMEOUT_SECONDS, setup=True)
+            if self._catalog is not None:
+                remaining = max(0.0, deadline - time.monotonic())
+                self._catalog.verify_deferred_preflight(
+                    "schedule_fire_trace", timeout=remaining
+                )
+            remaining = max(0, deadline - time.monotonic())
+            db = self._connect(timeout=remaining, setup=True)
             remaining = max(0, deadline - time.monotonic())
             db.execute(f"PRAGMA busy_timeout={int(remaining * 1000)}")
             db.execute("BEGIN IMMEDIATE")
@@ -212,7 +227,11 @@ class ScheduleFireTrace:
                 self._setup_state = "degraded"
                 self._setup_error = type(exc).__name__
             if entering:
-                logger.error("schedule fire trace degraded: setup failed (%s)", type(exc).__name__)
+                self._log_transition(
+                    logging.ERROR,
+                    "schedule fire trace degraded: setup failed (%s)",
+                    type(exc).__name__,
+                )
             return False
         finally:
             if db is not None:
@@ -224,7 +243,9 @@ class ScheduleFireTrace:
             dropped = self._dropped_events
             self._setup_retry_attempts = 0
         if recovering:
-            logger.info("schedule fire trace recovered; dropped_events=%s", dropped)
+            self._log_transition(
+                logging.INFO, "schedule fire trace recovered; dropped_events=%s", dropped
+            )
         return True
 
     @staticmethod
@@ -421,8 +442,14 @@ class ScheduleFireTrace:
         finally:
             with self._worker_lock:
                 self._running = False
-                if not self._queue.empty() and not self._closed.is_set():
+                if not self._closed.is_set() and not self._queue.empty():
                     self._kick()
+                elif (
+                    not self._closed.is_set()
+                    and self._setup_state == "degraded"
+                    and self._retry_timer is None
+                ):
+                    self._schedule_failure_retry()
             with self._queue.all_tasks_done:
                 self._queue.all_tasks_done.notify_all()
 
@@ -944,15 +971,18 @@ class ScheduleFireTrace:
         }
 
     def close(self):
-        """Cancel queued observations; an already executing bounded slice may finish.
+        """Stop retries and wait at most one bounded setup attempt for the worker.
 
         Failure records have a documented crash window until their asynchronous
-        persistence succeeds. Closing never waits for a diagnostic database lock.
+        persistence succeeds. Shutdown waits only for the configured setup budget
+        plus a small grace period, never for an unbounded diagnostic lock.
         """
         self._closed.set()
+        timer = None
         with self._worker_lock:
             if self._retry_timer is not None:
-                self._retry_timer.cancel()
+                timer = self._retry_timer
+                timer.cancel()
                 self._retry_timer = None
         while True:
             try:
@@ -961,4 +991,7 @@ class ScheduleFireTrace:
                 break
             else:
                 self._queue.task_done()
-        self.flush(timeout=0.5)
+        join = getattr(timer, "join", None)
+        if join is not None and timer.ident != threading.current_thread().ident:
+            join(timeout=0.1)
+        self.flush(timeout=SETUP_TIMEOUT_SECONDS + 0.5)

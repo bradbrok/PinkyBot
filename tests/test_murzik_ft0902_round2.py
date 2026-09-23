@@ -283,7 +283,7 @@ def test_authoritative_lock_and_corrupt_telemetry_still_fail_closed(tmp_path):
     path = str(tmp_path / 'same.db')
     with sqlite3.connect(path) as db:
         db.execute('CREATE TABLE state(value)')
-    telemetry = StoreIntegrityTarget('trace', path, criticality='telemetry')
+    telemetry = StoreIntegrityTarget('schedule_fire_trace', path, criticality='telemetry')
     authority = StoreIntegrityTarget('authority', path, criticality='authoritative')
     catalog = DaemonStoreCatalog(expected_root=tmp_path, manifest={'trace': telemetry,
                                                                     'authority': authority})
