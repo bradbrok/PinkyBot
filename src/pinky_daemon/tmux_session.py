@@ -73,7 +73,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from pinky_daemon import tmux_launch_env, tmux_launch_env_loader
+from pinky_daemon import isolated_launch_env, tmux_launch_env, tmux_launch_env_loader
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
@@ -4593,6 +4593,9 @@ class TmuxSession(TransportReplacementMixin):
         # FastAPI middleware read it from the same env var. Empty/missing is
         # tolerated: hooks already handle that gracefully (silent no-op).
         #
+        # This gate only omits explicit payload entries; it does not remove
+        # inherited tmux-server secrets. Shadow reporting below observes that
+        # gap without changing the launch environment.
         # #149 phase-3 security gate (fail CLOSED — Murzik #639 review): the
         # global secret is the fleet-wide signing key; the daemon dual-accepts
         # it for EVERY agent name, so any child that holds it can sign internal
@@ -4614,23 +4617,28 @@ class TmuxSession(TransportReplacementMixin):
         if status == "isolated":
             if agent_key:
                 _log(
-                    f"tmux[{self.agent_name}]: isolated — per-agent key only, "
-                    f"global secret withheld"
+                    f"tmux[{self.agent_name}]: isolated — explicit payload omits global "
+                    f"secret; inherited environment unchanged"
                 )
             else:
                 _log(
                     f"tmux[{self.agent_name}]: ERROR isolated agent has no per-agent "
-                    f"signing key — withholding global secret too (hooks/MCP will "
-                    f"no-op); provision a key to restore signing"
+                    f"signing key — explicit payload omits global secret; inherited "
+                    f"environment unchanged; provision a key for scoped signing"
                 )
         elif status == "unknown" and agent_key and secret:
             _log(
                 f"tmux[{self.agent_name}]: isolation status unknown but per-agent "
-                f"key present — withholding global secret (fail closed)"
+                f"key present — explicit payload omits global secret; inherited "
+                f"environment unchanged"
             )
         elif secret:
             env["PINKY_SESSION_SECRET"] = secret
 
+        isolated_launch_env.report_shadow(
+            agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
+            explicit_names=env, log=_log,
+        )
         return env
 
     async def disconnect(self) -> None:
@@ -5819,35 +5827,13 @@ class TmuxSession(TransportReplacementMixin):
         return max(1, raw - self._AUTOCOMPACT_BUFFER_TOKENS)
 
     def _isolation_status(self) -> str:
-        """Tri-state isolation lookup for the env secret gate (#149 phase-3).
+        """Shared tri-state lookup for explicit payload omission and shadowing.
 
-        Returns ``"isolated"``, ``"not_isolated"``, or ``"unknown"`` (registry
-        unwired, agent not found, or lookup raised). A bare bool would conflate
-        "proven non-isolated" (safe to inject the global secret) with "can't
-        tell" — and Murzik's #639 review caught that conflation as a fail-OPEN:
-        if ``get_signing_key`` returns a key but ``registry.get`` raises, a bool
-        helper falls to False and the env builder would inject BOTH the per-agent
-        key AND the forgeable global secret (the same fail-open class fixed in
-        #635). The caller withholds the global secret whenever isolation can't
-        be *proven* false and a per-agent key already provides a working
-        identity, so registry uncertainty never causes global-secret exposure.
+        Unknown isolation plus a signing key uses the isolated policy; a
+        non-local mode also implies isolation regardless of the isolated flag.
+        Omitting a payload entry alone does not remove inherited server state.
         """
-        if not self._registry or not self.agent_name:
-            return "unknown"
-        try:
-            agent = self._registry.get(self.agent_name)
-        except Exception:
-            return "unknown"
-        if agent is None:
-            return "unknown"
-        # A non-local isolation_mode IS isolation, regardless of the `isolated`
-        # bool: a container/unix_user tenant holding the fleet-wide forgeable
-        # PINKY_SESSION_SECRET would defeat the entire OS boundary (#638 gap —
-        # the register/update models coerce isolated=True for non-local modes,
-        # but legacy rows / direct DB writes must not bypass the secret gate).
-        if getattr(agent, "isolation_mode", "local") not in ("", "local"):
-            return "isolated"
-        return "isolated" if getattr(agent, "isolated", False) else "not_isolated"
+        return isolated_launch_env.isolation_status(self._registry, self.agent_name)
 
     def _restart_threshold_pct(self) -> float:
         """Pull the agent's restart threshold from the registry.

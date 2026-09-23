@@ -51,7 +51,7 @@ import shlex
 import time
 from pathlib import Path
 
-from pinky_daemon import tmux_launch_env
+from pinky_daemon import isolated_launch_env, tmux_launch_env
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
@@ -336,6 +336,10 @@ class CodexTmuxSession(TmuxSession):
             env["PINKY_AGENT_NAME"] = self.agent_name
         if per_agent_codex_home_enabled():
             env["CODEX_HOME"] = str(codex_home_for(self._config))
+        isolated_launch_env.report_codex_shadow(
+            agent_name=self.agent_name, registry=self._registry,
+            status_lookup=self._isolation_status, env=env, log=_log,
+        )
         return env
 
     # ── seam: transcript discovery (codex rollout store) ────────────────────

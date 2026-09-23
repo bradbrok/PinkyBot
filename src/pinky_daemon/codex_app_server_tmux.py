@@ -40,7 +40,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 
-from pinky_daemon import tmux_launch_env
+from pinky_daemon import isolated_launch_env, tmux_launch_env
 from pinky_daemon.codex_app_server import (
     _STREAM_LIMIT,
     CodexAppServerClient,
@@ -117,6 +117,7 @@ class CodexAppServerSupervisor:
         openai_api_key: str = "",
         agent_config: object | None = None,
         soul_version_store: object | None = None,
+        registry: object | None = None,
         log: Callable[[str], None] = _log,
     ) -> None:
         self.agent_name = agent_name
@@ -124,6 +125,7 @@ class CodexAppServerSupervisor:
         self._openai_api_key = openai_api_key
         self._agent_config = agent_config
         self._soul_version_store = soul_version_store
+        self._registry = registry
         self._sock_dir, self._sock_dir_is_tmp = self._resolve_sock_dir(agent_name, working_dir)
         self.sock_path = os.path.join(self._sock_dir, "app.sock")
         self._tmux = _TmuxControl(self.session_name, command_runner=LocalCommandRunner())
@@ -250,7 +252,14 @@ class CodexAppServerSupervisor:
                     soul_version_store=self._soul_version_store,
                 )
             )
+        isolated_launch_env.report_codex_shadow(
+            agent_name=self.agent_name, registry=self._registry,
+            status_lookup=self._isolation_status, env=env, log=self._log,
+        )
         return env
+
+    def _isolation_status(self) -> str:
+        return isolated_launch_env.isolation_status(self._registry, self.agent_name)
 
     async def _await_accept(self) -> tuple[asyncio.StreamReader, asyncio.StreamWriter]:
         """Readiness probe: poll until the shim's socket ACCEPTS our connection.
