@@ -153,7 +153,8 @@ def test_cache_only_rows_are_not_served_when_the_store_has_dropped_them(tmp_path
         assert store.get("sample", "m1", platform="slack", chat_id="D1") is None
         assert ("sample", "slack", "D1", "m1") in broker._message_contexts
         assert _signed(client, PATH).status_code == 404
-        assert ("sample", "slack", "D1", "m1") not in broker._message_contexts
+        # The read is side-effect free: reply routing still owns the cache entry.
+        assert ("sample", "slack", "D1", "m1") in broker._message_contexts
 
 
 def test_a_row_that_never_persisted_is_not_served(tmp_path, monkeypatch):
@@ -165,4 +166,15 @@ def test_a_row_that_never_persisted_is_not_served(tmp_path, monkeypatch):
             broker._cache_message_context(MessageContext(
                 agent_name="sample", message_id="m1", platform="slack", chat_id="D1", timestamp=5.0,
             ))
+        assert _signed(client, PATH).status_code == 404
+
+
+def test_without_a_store_nothing_is_served(tmp_path, monkeypatch):
+    """The bounds live in the store; a cache-only broker cannot enforce them."""
+    with _gateway(tmp_path, monkeypatch) as client:
+        broker = client.app.state.broker
+        _inbound(client)
+        assert _signed(client, PATH).status_code == 200
+        broker._message_context_store = None
+        assert broker.get_message_context_by_identity("sample", "slack", "D1", "m1") is None
         assert _signed(client, PATH).status_code == 404
