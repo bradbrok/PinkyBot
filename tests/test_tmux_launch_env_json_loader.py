@@ -11,7 +11,7 @@ from types import SimpleNamespace
 
 import pytest
 
-from pinky_daemon import tmux_launch_env
+from pinky_daemon import tmux_launch_env, tmux_launch_env_loader
 from pinky_daemon.tmux_session import _TmuxControl
 from tests.tmux_env_r3_support import (
     NONCE,
@@ -158,7 +158,7 @@ def test_loader_fifo_without_writer_refuses_promptly(home):
     path = payload(home)
     path.unlink()
     os.mkfifo(path, mode=0o600)
-    source = Path(tmux_launch_env.__file__).read_text()
+    source = Path(tmux_launch_env_loader.__file__).read_text()
     result = subprocess.run(
         [sys.executable, "-I", "-c", source, str(path), NONCE, probe_command()],
         input=b"", capture_output=True, timeout=2,

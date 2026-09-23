@@ -8,7 +8,7 @@ import sys
 import time
 from pathlib import Path
 
-from pinky_daemon import tmux_launch_env
+from pinky_daemon import tmux_launch_env, tmux_launch_env_loader
 
 NONCE = "a1" * 16
 OTHER_NONCE = "b2" * 16
@@ -46,7 +46,7 @@ def probe_command():
 
 
 def run_loader(path, *, nonce=NONCE, command=None):
-    source = Path(tmux_launch_env.__file__).read_text()
+    source = Path(tmux_launch_env_loader.__file__).read_text()
     return subprocess.run(
         [sys.executable, "-I", "-c", source, str(path), nonce, command or probe_command()],
         input=b"", capture_output=True, timeout=10,
