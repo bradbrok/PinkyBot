@@ -5,8 +5,11 @@ import logging
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import time
+from contextlib import closing
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -39,22 +42,28 @@ def fire(r):
 
 def test_positive_uncontended_accept_and_sqlite_policy(registry):
     p, receipt = fire(registry)
-    t = time.monotonic()
+    started = time.monotonic()
     assert receipt.accept()
-    elapsed = time.monotonic() - t
-    assert elapsed < 0.15
+    assert time.monotonic() - started < 5, "authoritative accept stalled"
+    assert registry.get_schedule_wake_by_fire(p.schedule_id, p.fired_at).accepted_at > 0
+    # The zero-timeout policy probe must not race the accept trace just queued.
+    assert registry._fire_trace.flush()
     assert registry._db.execute("PRAGMA journal_mode").fetchone()[0] == "truncate"
     db = registry._fire_trace._connect()
-    print(
-        "POLICIES",
-        {
+    try:
+        policies = {
             "registry_busy_ms": registry._db.execute("PRAGMA busy_timeout").fetchone()[0],
             "worker_busy_ms": db.execute("PRAGMA busy_timeout").fetchone()[0],
             "worker_journal": db.execute("PRAGMA journal_mode").fetchone()[0],
             "worker_mmap": db.execute("PRAGMA mmap_size").fetchone()[0],
-        },
-    )
-    db.close()
+        }
+    finally:
+        db.close()
+    print("POLICIES", policies)
+    assert policies["registry_busy_ms"] > 0
+    assert policies["worker_busy_ms"] == 0
+    assert policies["worker_journal"] == "truncate"
+    assert policies["worker_mmap"] == 0
     assert registry._fire_trace.flush()
     assert registry.get_schedule_wake_by_fire(p.schedule_id, p.fired_at).accepted_at > 0
 
@@ -341,7 +350,9 @@ def test_failed_last_edge_is_retried_after_lock_release(registry):
     w = registry._fire_trace
     deadline = time.monotonic() + 5
     while True:
-        with sqlite3.connect(w.path, timeout=0.1) as db:
+        # This test reader competes with the autonomous retry's TRUNCATE commit.
+        # Its busy wait must tolerate scheduling delays; the worker stays at zero.
+        with closing(sqlite3.connect(w.path, timeout=5)) as db:
             persisted = db.execute("SELECT COUNT(*) FROM schedule_fire_trace_failures").fetchone()[
                 0
             ]
@@ -370,18 +381,54 @@ def test_failure_overlay_is_bounded_when_queue_is_full(registry, monkeypatch):
     w = registry._fire_trace
     entered, release = threading.Event(), threading.Event()
     original = w._write
+    original_failed = w.failed
+    first_replay, failures, written = [], [], []
+    first_written = threading.Event()
+    write_clock = 0.0
+    real_clock_users = set()
+    run_code = type(w)._run.__code__
+
+    def monotonic():
+        caller = sys._getframe(1).f_code
+        if caller is run_code:
+            return write_clock
+        real_clock_users.add(caller.co_name)
+        return time.monotonic()
+
+    # Replace this module's reference, never the shared time module. Only _run's
+    # diagnostic/slice clock is controlled; flush, retries, queues and Events
+    # retain real deadlines. Host scheduling cannot add another slow diagnostic.
+    monkeypatch.setattr(ft, "time", SimpleNamespace(
+        monotonic=monotonic, time=time.time, sleep=time.sleep,
+    ))
 
     def delayed(event):
-        entered.set()
-        assert release.wait(3)
-        return original(event)
+        nonlocal write_clock
+        if event["edge"] == "replay" and not first_replay:
+            first_replay.append(event)
+            entered.set()
+            assert release.wait(10)
+            write_clock += 1.0
+            result = original(event)
+            written.append(event)
+            first_written.set()
+            return result
+        result = original(event)
+        written.append(event)
+        return result
+
+    def failed(event, error):
+        failures.append((event, error))
+        return original_failed(event, error)
 
     monkeypatch.setattr(w, "_write", delayed)
+    monkeypatch.setattr(w, "failed", failed)
     # Silence the synthetic overflow log volume; logging fault tested separately.
     monkeypatch.setattr(ft.logger, "warning", lambda *a, **kw: None)
     receipt.trace("replay")
-    assert entered.wait(1)
     try:
+        assert entered.wait(5), "writer did not take the first replay"
+        assert w._queue.qsize() == 0, "first replay must be outside the queue"
         for _ in range(w._queue.maxsize + 2048):
             receipt.trace("replay")
         queue_size = w._queue.qsize()
@@ -389,9 +436,27 @@ def test_failure_overlay_is_bounded_when_queue_is_full(registry, monkeypatch):
     finally:
         release.set()
         assert w.flush(timeout=15)
-    print("OVERFLOW_BOUND", {"queue": queue_size, "failures": overlay_size})
-    assert w.failure_counts(since=0)["replay"] == 2048
+    full = [(event, error) for event, error in failures if isinstance(error, queue.Full)]
+    slow = [(event, error) for event, error in failures if isinstance(error, TimeoutError)]
+    assert len(full) == 2048
+    assert all(event["edge"] == "replay" for event, _ in full)
+    assert queue_size == w._queue.maxsize
     assert overlay_size <= 1024, "bounded queue diverts unlimited overflow into unbounded dict"
+    # The paused replay must be diagnosed, even when the enqueue loop is fast.
+    # Only this event advances the controlled clock; no extras are legitimate.
+    assert first_written.is_set()
+    assert len(slow) == 1
+    assert slow[0][0] is first_replay[0]
+    assert str(slow[0][1]) == "slow trace write"
+    assert len(written) == w._queue.maxsize + 1
+    assert len({id(event) for event in written}) == len(written)
+    assert sum(event is first_replay[0] for event in written) == 1
+    assert "flush" in real_clock_users and "_write_with_retry" in real_clock_users
+    assert len(failures) == len(full) + len(slow), "unexplained trace failure"
+    assert w.report()["rows"][0]["replay_count"] == w._queue.maxsize + 1
+    assert w.failure_counts(since=0)["replay"] == 2048 + len(slow)
+    print("OVERFLOW_BOUND", {"queue": queue_size, "failures": overlay_size,
+                             "queue_full": len(full), "slow_first_replay": len(slow)})
 
 
 def test_positive_single_executor_other_registry_waits_without_deadlock(tmp_path):

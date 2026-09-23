@@ -2392,7 +2392,7 @@ class TestScheduler:
 
     @pytest.mark.asyncio
     async def test_kill_after_durable_accept_before_future_resolve_never_replays(
-        self, capsys
+        self, capsys, monkeypatch
     ):
         """Exercise the exact #991 crash seam, not a nearby timeout.
 
@@ -2401,6 +2401,10 @@ class TestScheduler:
         before AgentScheduler can observe/confirm that Future. A reopened
         scheduler must read the retained receipt and perform zero replay.
         """
+        # Keep restart in the accepted fire's minute: a later cron occurrence
+        # would be a legitimate new delivery, outside this crash-replay seam.
+        fired_at = 1_790_133_530.0
+        monkeypatch.setattr("pinky_daemon.scheduler.time.time", lambda: fired_at)
         fd, path = tempfile.mkstemp(suffix=".db")
         os.close(fd)
         first = AgentRegistry(db_path=path)
@@ -2408,7 +2412,6 @@ class TestScheduler:
         schedule = first.add_schedule(
             "oleg", "* * * * *", name="crash-seam", prompt="run once"
         )
-        fired_at = time.time()
         claimed, row = first.claim_schedule_fire(
             schedule.id,
             timestamp=fired_at,
