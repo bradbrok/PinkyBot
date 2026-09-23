@@ -439,6 +439,7 @@ def test_cancel_retries_missing_lock_after_partial_gc(home, monkeypatch):
     real_flock, real_unlink = fcntl.flock, os.unlink
     collected = False
     acquired = []
+    held = None
 
     class InterruptedSweepError(Exception):
         pass
@@ -449,10 +450,13 @@ def test_cancel_retries_missing_lock_after_partial_gc(home, monkeypatch):
             raise InterruptedSweepError
 
     def collect_before_cancel_locks(fd, flags):
-        nonlocal collected
+        nonlocal collected, held
         if flags == fcntl.LOCK_EX and not collected:
             collected = True
             acquired.append(os.fstat(fd).st_ino)
+            # Keep A allocated after the retry closes its fd: Linux may reuse
+            # an unlinked inode number. This separate witness does not flock A.
+            held = os.open(lock_path, os.O_RDONLY)
             directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
             try:
                 with monkeypatch.context() as during_gc:
@@ -467,8 +471,13 @@ def test_cancel_retries_missing_lock_after_partial_gc(home, monkeypatch):
         real_flock(fd, flags)
 
     monkeypatch.setattr(fcntl, "flock", collect_before_cancel_locks)
-    cancel()
-    assert collected
-    assert not path.exists()
-    assert lock_path.stat().st_ino != acquired[0]
-    assert lock_path.read_bytes() == b"cancelled\n"
+    try:
+        cancel()
+        assert collected and held is not None
+        assert not path.exists()
+        assert os.pread(held, 64, 0) == b"", "cancel wrote its marker into orphaned A"
+        assert os.fstat(held).st_ino != lock_path.stat().st_ino
+        assert lock_path.read_bytes() == b"cancelled\n"
+    finally:
+        if held is not None:
+            os.close(held)
