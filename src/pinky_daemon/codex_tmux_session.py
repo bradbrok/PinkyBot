@@ -309,8 +309,8 @@ class CodexTmuxSession(TmuxSession):
     def _build_repl_env(self) -> dict[str, str]:
         """Full daemon-env parity for the codex tmux pane — NOT a small allowlist.
 
-        tmux ``new-session`` drops the parent process env entirely; only the
-        ``-e KEY=VAL`` pairs we pass survive into the pane (and its codex child).
+        tmux uses its server environment rather than the caller's environment.
+        The launch boundary explicitly delivers this mapping to the pane child.
         Both other codex transports launch codex with the daemon's FULL env:
         ``CodexSession._exec_codex`` uses ``env={**os.environ}`` (+ the configured
         key), and #792's tmux app-server (``CodexAppServerSupervisor._build_env``)
@@ -325,8 +325,7 @@ class CodexTmuxSession(TmuxSession):
         So we propagate the entire daemon env — including ``CODEX_HOME`` (item G:
         the child writes, and discovery scans, the SAME rollout store) and
         ``PATH`` (so the ``codex`` / ``node`` binaries resolve) — minus
-        tmux-internal vars and any value tmux ``-e`` can't carry (newlines, which
-        are pathological for env anyway), then overlay the configured
+        tmux-internal vars and multiline values, then overlay the configured
         ``OPENAI_API_KEY`` (item H) and this agent's ``PINKY_AGENT_NAME``. No
         ANTHROPIC_* special-casing is needed: codex ignores them, exactly as the
         subprocess transport already inherits them harmlessly.
@@ -338,7 +337,7 @@ class CodexTmuxSession(TmuxSession):
             if "\n" in value or "\r" in value:
                 _log(
                     f"tmux[{self.agent_name}]: dropping multiline env {key!r} "
-                    f"(cannot pass via tmux -e)"
+                    f"(excluded from launch environment)"
                 )
                 continue
             env[key] = value

@@ -71,6 +71,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
+from pinky_daemon import tmux_launch_env
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
@@ -796,12 +797,61 @@ class _TmuxControl:
         ``cwd`` becomes the session's working directory — critical for
         ``claude --continue`` to find the right transcript.
 
-        ``env`` is added as ``-e KEY=VAL`` flags (tmux 3.2+).
+        Only empty values use ``-e KEY=``. Non-empty values are sourced from
+        a private file and deleted before exec. Callers must finish owned
+        predecessor teardown before entering this launch boundary.
         """
+        env = env or {}
+        tmux_launch_env.validate_env(env)
+        scope = hashlib.sha256(json.dumps(
+            [self._base_cmd(), self.session_name], separators=(",", ":"),
+        ).encode()).hexdigest()
+        if isinstance(self._runner, LocalCommandRunner):
+            staged = tmux_launch_env.stage_env(env, scope)
+        else:
+            result = await self._runner.run(
+                ["python3", "-c", Path(tmux_launch_env.__file__).read_text()],
+                stdin_data=json.dumps({"env": env, "scope": scope}).encode(),
+                timeout=5.0,
+            )
+            if not result.ok:
+                raise RuntimeError("launch environment staging failed")
+            try:
+                staged = json.loads(result.stdout)
+            except (ValueError, UnicodeError):
+                raise RuntimeError("invalid launch environment staging response") from None
+        has_values = any(value != "" for value in env.values())
+        if (staged is None) != (not has_values):
+            raise RuntimeError("incomplete launch environment staging response")
+        if staged is not None:
+            if (
+                not isinstance(staged, dict)
+                or set(staged) != {"path", "guard"}
+                or not isinstance(staged["path"], str)
+                or not Path(staged["path"]).is_absolute()
+                or "\x00" in staged["path"]
+                or not isinstance(staged["guard"], str)
+                or re.fullmatch(r"__PINKY_LAUNCH_COMPLETE_[0-9a-f]{32}", staged["guard"]) is None
+            ):
+                raise RuntimeError("invalid launch environment staging response")
+            path = shlex.quote(staged["path"])
+            guard = staged["guard"]
+            cleanup = f"/bin/rm -f -- {path}"
+            failure = "printf '%s\\n' 'launch environment source failed' >&2; exit 1"
+            wrapper = (
+                f"trap {shlex.quote(cleanup)} 0; "
+                f"set +a; unset {guard}; set -a; "
+                f". {path} || {{ {failure}; }}; "
+                f"set +a; [ \"${{{guard}-}}\" = 1 ] || {{ {failure}; }}; "
+                f"unset {guard}; "
+                f"{cleanup} || {{ printf '%s\\n' 'launch environment delete failed' >&2; exit 1; }}; "
+                f"trap - 0; exec {command}"
+            )
+            command = "exec /bin/sh -c " + shlex.quote(wrapper)
         args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
-        if env:
-            for key, value in env.items():
-                args.extend(["-e", f"{key}={value}"])
+        for key, value in env.items():
+            if value == "":
+                args.extend(["-e", f"{key}="])
         # The command is passed as a single string arg; tmux invokes
         # it via the user's shell, so we shell-escape for safety.
         args.append(command)
@@ -4360,9 +4410,9 @@ class TmuxSession(TransportReplacementMixin):
         (e.g. ``hook_verify_effort.py``) see the same signals on both
         backends.
 
-        **#515 follow-up: PINKY_SESSION_SECRET propagation.** Tmux
-        ``new-session`` only propagates env vars listed via ``-e
-        KEY=VAL``; parent-process env is dropped except for the small
+        **#515 follow-up: PINKY_SESSION_SECRET propagation.**
+        The launch boundary explicitly delivers these env vars; the tmux
+        server drops the caller environment except for the small
         ``update-environment`` allowlist (DISPLAY, SSH_*, etc.). Without
         explicit propagation, every PinkyBot-managed hook
         (``hook_idle.py``, ``hook_working.py``, ``hook_verify_effort.py``,
@@ -4395,7 +4445,7 @@ class TmuxSession(TransportReplacementMixin):
         # instead of the single-use refresh token in .credentials.json (no
         # refresh ⇒ no shared-creds de-auth race). ESSENTIAL for container
         # agents — their isolated env does NOT inherit the daemon env, so
-        # without this -e the token never reaches them; local tmux agents get
+        # without explicit delivery the token never reaches them; local tmux agents get
         # it via tmux-server inheritance, but forwarding makes it explicit and
         # uniform. Flag-gated + provider-guarded inside _static_oauth_token.
         #

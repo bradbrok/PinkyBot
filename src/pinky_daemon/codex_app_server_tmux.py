@@ -219,8 +219,8 @@ class CodexAppServerSupervisor:
     def _build_env(self) -> dict[str, str]:
         """Full daemon-env parity for the tmux session — NOT just PATH.
 
-        tmux ``new-session`` drops the parent process env (only ``-e KEY=VAL``
-        survive), and the tmux *server's* env is not the daemon's. The
+        tmux's server environment differs from the caller's environment.
+        The launch boundary explicitly delivers the mapping built here. The
         direct-subprocess app-server path passes ``env={**os.environ}``, so the
         codex child sees the daemon's full config; we must reproduce that here or
         the child silently runs under different CODEX_HOME / HOME / XDG_* / proxy
@@ -229,8 +229,7 @@ class CodexAppServerSupervisor:
         it points at the SAME Codex home/session store (Murzik, #792 P1).
 
         We propagate the entire daemon env (overlaying the configured key for
-        item H), minus tmux-internal vars and any value tmux ``-e`` can't carry
-        (newlines), which are pathological for env anyway.
+        item H), minus tmux-internal vars and multiline values.
         """
         env: dict[str, str] = {}
         for key, value in os.environ.items():
@@ -239,7 +238,7 @@ class CodexAppServerSupervisor:
             if "\n" in value or "\r" in value:
                 self._log(
                     f"codex[{self.agent_name}]: dropping multiline env {key!r} "
-                    f"(cannot pass via tmux -e)"
+                    f"(excluded from launch environment)"
                 )
                 continue
             env[key] = value
