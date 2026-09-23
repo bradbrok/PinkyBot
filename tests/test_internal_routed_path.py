@@ -1,6 +1,10 @@
 """Verify internal request signatures over the routed path."""
 
+import base64
+import hashlib
+import hmac
 import json
+import time
 from urllib.parse import unquote
 
 import pytest
@@ -146,4 +150,19 @@ def test_internal_routed_path_verifier_rejects_delimiters(delimiter):
         _SECRET, agent_name="sample", method="GET", path=path,
         timestamp=headers[INTERNAL_TIMESTAMP_HEADER],
         signature=headers[INTERNAL_SIGNATURE_HEADER],
+    )
+
+
+@pytest.mark.parametrize("delimiter", ["?", "#"])
+def test_internal_routed_path_verifier_rejects_valid_full_path_mac(delimiter):
+    path = f"{_PREFIX}/D{delimiter}one/a"
+    timestamp = str(int(time.time()))
+    payload = f"sample\nGET\n{path}\n{timestamp}".encode("utf-8")
+    signature = base64.urlsafe_b64encode(
+        hmac.new(_SECRET.encode("utf-8"), payload, hashlib.sha256).digest()
+    ).decode("ascii").rstrip("=")
+
+    assert not verify_internal_request(
+        _SECRET, agent_name="sample", method="GET", path=path,
+        timestamp=timestamp, signature=signature,
     )
