@@ -730,11 +730,16 @@ def test_preflight_corruption_counts_physical_once_and_shared_aliases_once(
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(
-        BoundSQLiteFile,
-        "connect_read_only",
-        lambda _bound_file: FakeQuickCheckConnection(),
-    )
+    def connect_read_only(
+        _bound_file: BoundSQLiteFile,
+        *,
+        timeout: float = 5.0,
+    ) -> FakeQuickCheckConnection:
+        # These memory-cohort targets keep the regular read-only timeout.
+        assert timeout == 5.0
+        return FakeQuickCheckConnection()
+
+    monkeypatch.setattr(BoundSQLiteFile, "connect_read_only", connect_read_only)
     caplog.set_level(logging.INFO, logger="pinky.storage")
 
     with pytest.raises(StoreCatalogError):

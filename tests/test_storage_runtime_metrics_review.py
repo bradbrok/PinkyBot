@@ -190,11 +190,15 @@ def test_review_quick_check_error_survives_reconciliation_error(
         def close(self) -> None:
             return None
 
-    monkeypatch.setattr(
-        BoundSQLiteFile,
-        "connect_read_only",
-        lambda _bound_file: FailingQuickCheck(),
-    )
+    def connect_read_only(
+        _bound_file: BoundSQLiteFile,
+        *,
+        timeout: float = 5.0,
+    ) -> FailingQuickCheck:
+        assert timeout == 5.0
+        return FailingQuickCheck()
+
+    monkeypatch.setattr(BoundSQLiteFile, "connect_read_only", connect_read_only)
 
     def fail_reconciliation(_bound_file: BoundSQLiteFile) -> str:
         raise OSError("review reconciliation failure")
