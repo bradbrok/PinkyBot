@@ -8508,6 +8508,49 @@ npm run build</pre>
             "groups": agent.groups,
         }
 
+    @app.get("/agents/{name}/message-context/{platform}/{chat_id}/{message_id}")
+    async def get_agent_message_context(
+        name: str, platform: str, chat_id: str, message_id: str, request: Request
+    ):
+        """Confirm one inbound message the daemon routed to this agent.
+
+        Signed, self-scoped read: only the agent named in the path, proving its
+        own identity through the internal signature, can look up its contexts.
+        Answers with the message timestamp, when the context was stored and
+        whether the chat is a group, or 404 for anything else: an unknown
+        identity, a record not stamped ``direction == "inbound"`` by the
+        broker's routing path (outbound, legacy or unstamped rows alike), a
+        row past the retention window or beyond the per-agent cap. The body
+        never says which of those applied.
+        """
+        name = _agent_name_or_400(name)
+        if getattr(request.state, "internal_caller", None) != name:
+            raise HTTPException(403, "verified caller must match the target agent")
+        not_found = {
+            "code": "message_context_not_found",
+            "detail": (
+                "no inbound message context for that identity within the "
+                f"retention window ({message_context_store.retention_days} days, "
+                f"{message_context_store.max_per_agent} most recent per agent)"
+            ),
+        }
+        # Identity segments are plain platform ids; a decoded '?' or '#' in one
+        # is never legitimate and is refused before any lookup, with the same
+        # body as a miss so the caller sees one shape.
+        if any(ch in segment for segment in (platform, chat_id, message_id) for ch in "?#"):
+            raise HTTPException(404, not_found)
+        found = broker.get_message_context_by_identity(name, platform, chat_id, message_id)
+        if found is None:
+            raise HTTPException(404, not_found)
+        context, stored_at = found
+        if (context.metadata or {}).get("direction") != "inbound":
+            raise HTTPException(404, not_found)
+        return {
+            "message_ts": float(context.timestamp),
+            "stored_at": float(stored_at),
+            "is_group": bool(context.is_group),
+        }
+
     # Action policy routes compose with the existing signed caller and owner gates.
     def _policy_agent(request: Request, name: str):
         name = _agent_name_or_400(name)
