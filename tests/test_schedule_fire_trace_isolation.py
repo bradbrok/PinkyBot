@@ -5,9 +5,11 @@ import logging
 import os
 import queue
 import sqlite3
+import sys
 import threading
 import time
 from contextlib import closing
+from types import SimpleNamespace
 
 import httpx
 import pytest
@@ -380,18 +382,40 @@ def test_failure_overlay_is_bounded_when_queue_is_full(registry, monkeypatch):
     entered, release = threading.Event(), threading.Event()
     original = w._write
     original_failed = w.failed
-    first_replay, failures = [], []
+    first_replay, failures, written = [], [], []
     first_written = threading.Event()
+    write_clock = 0.0
+    real_clock_users = set()
+    run_code = type(w)._run.__code__
+
+    def monotonic():
+        caller = sys._getframe(1).f_code
+        if caller is run_code:
+            return write_clock
+        real_clock_users.add(caller.co_name)
+        return time.monotonic()
+
+    # Replace this module's reference, never the shared time module. Only _run's
+    # diagnostic/slice clock is controlled; flush, retries, queues and Events
+    # retain real deadlines. Host scheduling cannot add another slow diagnostic.
+    monkeypatch.setattr(ft, "time", SimpleNamespace(
+        monotonic=monotonic, time=time.time, sleep=time.sleep,
+    ))
 
     def delayed(event):
+        nonlocal write_clock
         if event["edge"] == "replay" and not first_replay:
             first_replay.append(event)
             entered.set()
             assert release.wait(10)
+            write_clock += 1.0
             result = original(event)
+            written.append(event)
             first_written.set()
             return result
-        return original(event)
+        result = original(event)
+        written.append(event)
+        return result
 
     def failed(event, error):
         failures.append((event, error))
@@ -418,12 +442,16 @@ def test_failure_overlay_is_bounded_when_queue_is_full(registry, monkeypatch):
     assert all(event["edge"] == "replay" for event, _ in full)
     assert queue_size == w._queue.maxsize
     assert overlay_size <= 1024, "bounded queue diverts unlimited overflow into unbounded dict"
-    # A successfully written, deliberately paused replay may also be slow.
-    # Account for that diagnostic explicitly rather than calling it queue overflow.
+    # The paused replay must be diagnosed, even when the enqueue loop is fast.
+    # Only this event advances the controlled clock; no extras are legitimate.
     assert first_written.is_set()
-    assert len(slow) in (0, 1)
-    assert all(event is first_replay[0] and str(error) == "slow trace write"
-               for event, error in slow)
+    assert len(slow) == 1
+    assert slow[0][0] is first_replay[0]
+    assert str(slow[0][1]) == "slow trace write"
+    assert len(written) == w._queue.maxsize + 1
+    assert len({id(event) for event in written}) == len(written)
+    assert sum(event is first_replay[0] for event in written) == 1
+    assert "flush" in real_clock_users and "_write_with_retry" in real_clock_users
     assert len(failures) == len(full) + len(slow), "unexplained trace failure"
     assert w.report()["rows"][0]["replay_count"] == w._queue.maxsize + 1
     assert w.failure_counts(since=0)["replay"] == 2048 + len(slow)
