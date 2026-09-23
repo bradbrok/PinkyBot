@@ -5494,7 +5494,7 @@ def create_api(
             secret,
             agent_name=agent_name,
             method=request.method,
-            path=request.scope.get("root_path", "") + request.scope["path"],
+            path=request.scope["path"],
             timestamp=timestamp,
             signature=signature,
             agent_key=agent_key,
