@@ -10,7 +10,13 @@ from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.command_runner import ContainerCommandRunner, RunuserCommandRunner
 from pinky_daemon.streaming_session import StreamingSessionConfig
 from pinky_daemon.tmux_session import _TmuxControl
-from tests.tmux_env_support import LaunchRecorder, child_payload, probe_command, run_pane
+from tests.tmux_env_support import (
+    LaunchRecorder,
+    child_payload,
+    probe_command,
+    run_pane,
+    secret_files,
+)
 
 
 @pytest.fixture
@@ -78,6 +84,11 @@ async def test_namespace_staging_uses_seed_startup_budget(home, namespace):
         cwd=str(home), command=probe_command(home), env={"SECRET": "synthetic-budget-value"},
     )
     assert recorder.staging_timeout == 15
+    paths = secret_files(home, "synthetic-budget-value")
+    assert len(paths) == 1
+    staged_path = paths[0]
     child = child_payload(run_pane(recorder.tmux_calls[-1], home))
     assert child["env"]["SECRET"] == "synthetic-budget-value"
-    assert not child["files_at_exec"]
+    assert str(staged_path) not in child["files_at_exec"]
+    assert not staged_path.exists()
+    assert not secret_files(home, "synthetic-budget-value")
