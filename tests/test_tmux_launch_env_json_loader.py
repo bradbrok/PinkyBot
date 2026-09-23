@@ -231,20 +231,21 @@ def test_loader_unlinks_before_environment_update_and_exec(home, monkeypatch, ca
         assert name == "/bin/sh" and argv == ["/bin/sh", "-c", "true"]
         raise SystemExit(0)
 
-    monkeypatch.delenv("SECRET", raising=False)
-    monkeypatch.setattr(os, "environ", ObservedEnvironment(os.environ))
-    monkeypatch.setattr(os, "open", open_file)
-    monkeypatch.setattr(os, "unlink", unlink)
-    monkeypatch.setattr(os, "execv", execv)
-    with pytest.raises(SystemExit) as error:
-        fn(str(path), NONCE, "true")
-    if unlink_error is PermissionError:
-        assert error.value.code == 1 and "exec" not in calls
-        assert "SECRET" not in os.environ
-        assert capsys.readouterr().err.strip() == "launch environment load failed"
-    else:
-        assert error.value.code == 0
-        assert calls == ["unlink", "environment", "exec"]
+    with monkeypatch.context() as observed:
+        observed.delenv("SECRET", raising=False)
+        observed.setattr(os, "environ", ObservedEnvironment(os.environ))
+        observed.setattr(os, "open", open_file)
+        observed.setattr(os, "unlink", unlink)
+        observed.setattr(os, "execv", execv)
+        with pytest.raises(SystemExit) as error:
+            fn(str(path), NONCE, "true")
+        if unlink_error is PermissionError:
+            assert error.value.code == 1 and "exec" not in calls
+            assert "SECRET" not in os.environ
+            assert capsys.readouterr().err.strip() == "launch environment load failed"
+        else:
+            assert error.value.code == 0
+            assert calls == ["unlink", "environment", "exec"]
 
 
 def test_cleanup_before_loader_open_exits_without_partial_environment(home):
