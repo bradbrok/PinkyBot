@@ -364,3 +364,59 @@ else:
         assert not (directory / f"env-{NONCE}.json").exists()
     finally:
         finish(stager)
+
+
+@pytest.mark.parametrize("operation", ["stage", "cancel"])
+def test_nonce_lock_retries_replaced_inode(home, monkeypatch, operation):
+    path = Path(stage(home)["path"])
+    path.unlink()
+    lock_path = path.with_suffix(".lock")
+    real_flock = fcntl.flock
+    acquired = []
+
+    def replace_first_lock(fd, flags):
+        real_flock(fd, flags)
+        if flags == fcntl.LOCK_EX:
+            info = os.fstat(fd)
+            acquired.append((info.st_dev, info.st_ino))
+            if len(acquired) == 1:
+                lock_path.unlink()
+                lock_path.touch(mode=0o600)
+                assert lock_path.stat().st_ino != info.st_ino
+
+    monkeypatch.setattr(fcntl, "flock", replace_first_lock)
+    if operation == "stage":
+        assert Path(stage(home)["path"]).exists()
+    else:
+        cancel()
+        assert lock_path.read_bytes() == b"cancelled\n"
+    assert len(acquired) == 2
+    assert acquired[0] != acquired[1]
+
+
+def test_sweep_never_uses_replaced_lock_inode(home, monkeypatch):
+    path = Path(stage(home)["path"])
+    old = time.time() - 15 * 60
+    os.utime(path, (old, old))
+    lock_path = path.with_suffix(".lock")
+    real_flock = fcntl.flock
+    replacement_fd = None
+
+    def replace_gc_lock(fd, flags):
+        nonlocal replacement_fd
+        if replacement_fd is None and flags == fcntl.LOCK_EX | fcntl.LOCK_NB:
+            original = os.fstat(fd)
+            lock_path.unlink()
+            replacement_fd = os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_RDWR, 0o600)
+            assert os.fstat(replacement_fd).st_ino != original.st_ino
+            real_flock(replacement_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        real_flock(fd, flags)
+
+    monkeypatch.setattr(fcntl, "flock", replace_gc_lock)
+    try:
+        stage(home, nonce=OTHER_NONCE)
+        assert replacement_fd is not None, "the old candidate must reach the GC lock"
+        assert path.exists(), "GC used an unlinked lock instead of the active replacement"
+    finally:
+        if replacement_fd is not None:
+            os.close(replacement_fd)
