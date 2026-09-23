@@ -1,10 +1,13 @@
 """Verify internal request signatures over the routed path."""
 
+import json
 from urllib.parse import unquote
 
 import pytest
 from fastapi import Request
 from fastapi.testclient import TestClient
+from starlette.applications import Starlette
+from starlette.routing import Mount
 
 import pinky_daemon.api as api_module
 from pinky_daemon.auth import (
@@ -29,6 +32,7 @@ def _headers(path):
 @pytest.fixture
 def routed_app(monkeypatch, tmp_path):
     monkeypatch.setenv("PINKY_SESSION_SECRET", _SECRET)
+    monkeypatch.setenv("PINKY_AUTH_DENY_DEFAULT", "enforce")
     monkeypatch.delenv("PINKY_UI_PASSWORD", raising=False)
     app = api_module.create_api(
         max_sessions=1, default_working_dir=str(tmp_path),
@@ -97,17 +101,41 @@ def test_internal_routed_path_encoded_slash_keeps_route_shape(routed_app):
     assert seen == [unquote(path)]
 
 
-@pytest.mark.parametrize("include_prefix", [True, False])
-def test_internal_routed_path_root_path(routed_app, include_prefix):
+@pytest.mark.parametrize("mode", ["mount", "root_path"])
+@pytest.mark.parametrize("prefix_count", [1, 0, 2], ids=["full", "unprefixed", "doubled"])
+def test_internal_routed_path_root_path(routed_app, record_property, mode, prefix_count):
     app, seen = routed_app
     path = f"{_PREFIX}/plain/a"
     root_path = "/mounted"
-    signed_path = root_path + path if include_prefix else path
-    response = TestClient(app, root_path=root_path).get(path, headers=_headers(signed_path))
-    assert response.status_code == (200 if include_prefix else 401)
-    assert seen == [root_path + path]
-    if include_prefix:
-        assert response.json()["gate"] == "internal_hmac"
+    external_path = root_path + path
+    scopes = []
+
+    async def capture_scope(scope, receive, send):
+        scopes.append({
+            "root_path": scope["root_path"], "path": scope["path"],
+            "raw_path": scope["raw_path"].decode(),
+            "query_string": scope["query_string"].decode(),
+        })
+        await app(scope, receive, send)
+
+    if mode == "mount":
+        client = TestClient(Starlette(routes=[Mount(root_path, app=capture_scope)]))
+    else:
+        client = TestClient(capture_scope, root_path=root_path)
+    response = client.get(
+        external_path + "?limit=2", headers=_headers(root_path * prefix_count + path),
+    )
+    record_property("asgi_scope", json.dumps(scopes))
+    assert scopes == [{
+        "root_path": root_path, "path": external_path,
+        "raw_path": external_path, "query_string": "limit=2",
+    }]
+    assert seen == [external_path]
+    assert response.status_code == (200 if prefix_count == 1 else 401)
+    if prefix_count == 1:
+        assert response.json() == {"segment": "plain", "item": "a", "gate": "internal_hmac"}
+    else:
+        assert response.json() == {"detail": "Unauthorized"}
 
 
 @pytest.mark.parametrize("delimiter", ["?", "#"])
