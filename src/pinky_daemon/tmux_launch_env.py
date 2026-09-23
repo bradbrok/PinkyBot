@@ -116,7 +116,7 @@ def _directory(parent_fd: int, name: str, *, private: bool, create: bool) -> int
 
 
 @contextmanager
-def _scope_directory(scope: str):
+def _scope_directory(scope: str, *, create: bool = True):
     home = Path.home()
     parts = [".local", "state", "pinkybot", "tmux-launch-env", scope]
     fds = []
@@ -127,7 +127,7 @@ def _scope_directory(scope: str):
         if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
             raise PermissionError("unsafe launch environment home")
         for index, part in enumerate(parts):
-            fd = _directory(fd, part, private=index >= 3, create=True)
+            fd = _directory(fd, part, private=index >= 3, create=create)
             fds.append(fd)
         yield home.joinpath(*parts), fd
     finally:
@@ -225,6 +225,11 @@ def stage_env(env: dict[str, str], scope: str, nonce: str, *, deadline: float) -
     _deadline(deadline, initial=True)
     populated = {key: value for key, value in env.items() if value != ""}
     if not populated:
+        try:
+            with _scope_directory(scope, create=False) as (_, directory):
+                _sweep(directory)
+        except FileNotFoundError:
+            pass
         return None
     with _scope_directory(scope) as (path, directory):
         _sweep(directory)
