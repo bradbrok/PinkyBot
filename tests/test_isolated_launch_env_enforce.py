@@ -6,10 +6,11 @@ import shlex
 import subprocess
 import sys
 from pathlib import Path
+from unittest.mock import Mock
 
 import pytest
 
-from pinky_daemon import tmux_launch_env_loader, tmux_session
+from pinky_daemon import isolated_launch_env, tmux_launch_env_loader, tmux_session
 from pinky_daemon.command_runner import RunuserCommandRunner
 from pinky_daemon.tmux_session import _TmuxControl
 from tests.test_isolated_launch_env_shadow import builder
@@ -49,9 +50,38 @@ async def test_granted_name_present_and_ungranted_name_removed(tmp_path, monkeyp
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
+async def test_grants_reload_at_next_real_spawn(tmp_path, monkeypatch, kind):
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        path = Path(os.environ["PINKY_ISOLATED_ENV_GRANTS_FILE"])
+        assert "HRPOS_PASSWORD" not in await probe.launch(kind)
+        path.write_text('{"test-tenant":["HRPOS_PASSWORD"]}')
+        assert "HRPOS_PASSWORD" in await probe.launch(kind)
+        path.write_text("{}")
+        assert "HRPOS_PASSWORD" not in await probe.launch(kind)
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
+async def test_one_policy_snapshot_per_real_spawn(tmp_path, monkeypatch, kind):
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        capture = Mock(wraps=isolated_launch_env.capture_policy)
+        monkeypatch.setattr(isolated_launch_env, "capture_policy", capture)
+        real_spawn = probe.control.new_session
+
+        async def change_mode_after_policy(**kwargs):
+            monkeypatch.setenv("PINKY_ISOLATED_ENV", "off")
+            Path(os.environ["PINKY_ISOLATED_ENV_GRANTS_FILE"]).write_text("{")
+            return await real_spawn(**kwargs)
+
+        monkeypatch.setattr(probe.control, "new_session", change_mode_after_policy)
+        assert not DAEMON_NAMES & await probe.launch(kind)
+        assert capture.call_count == 1
+
+
+@pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
 @pytest.mark.parametrize("bad", [
     "missing", "malformed", "wildcard", "daemon_only", "not_mapping", "not_list",
     "duplicate_agent", "shell_name", "reserved_name", "symlink", "public", "fifo",
+    "wildcard_agent", "duplicate_name", "ferry_key", "deep", "oversized", "unset",
 ])
 def test_bad_grants_refuse_isolated_payload_loudly(grants, tmp_path, monkeypatch, kind, bad):
     data = {
@@ -61,11 +91,18 @@ def test_bad_grants_refuse_isolated_payload_loudly(grants, tmp_path, monkeypatch
         "duplicate_agent": '{"test-tenant":[],"test-tenant":[]}',
         "shell_name": '{"test-tenant":["BASH_ENV"]}',
         "reserved_name": '{"test-tenant":["__PINKY_LAUNCH_X"]}',
+        "wildcard_agent": '{"*":["HRPOS_PASSWORD"]}',
+        "duplicate_name": '{"test-tenant":["HRPOS_PASSWORD","HRPOS_PASSWORD"]}',
+        "ferry_key": '{"test-tenant":["PINKYBOT_FERRY_SHARED_SECRET"]}',
+        "deep": "[" * 2000 + "0" + "]" * 2000,
+        "oversized": " " * 65537,
     }
     if bad in data:
         grants.write_text(data[bad])
     elif bad == "missing":
         grants.unlink()
+    elif bad == "unset":
+        monkeypatch.delenv("PINKY_ISOLATED_ENV_GRANTS_FILE")
     elif bad == "public":
         grants.chmod(0o644)
     elif bad == "symlink":
@@ -213,6 +250,10 @@ def loader_probe(tmp_path, data):
     path.write_text(json.dumps({"nonce": NONCE, **data}))
     path.chmod(0o600)
     source = Path(tmux_launch_env_loader.__file__).read_text()
+    source = (
+        "import os,json,sys;print('inherited-names='+json.dumps(sorted(os.environ)),file=sys.stderr)\n"
+        + source
+    )
     command = shlex.join([sys.executable, "-I", "-c", "import os,json;print(json.dumps(sorted(os.environ)))"])
     result = subprocess.run(
         [sys.executable, "-I", "-c", source, str(path), NONCE, command],
@@ -233,7 +274,10 @@ def test_loader_clean_exec_and_actual_names_only_log(tmp_path):
     assert not DAEMON_NAMES & names
     assert {"HOME", "PATH", "LC_ALL", "XDG_CONFIG_HOME", "HTTPS_PROXY", "SSL_CERT_FILE", "GRANTED_NAME"} <= names
     assert b"inherited environment scrubbed" in result.stderr
-    assert b"2 names dropped" in result.stderr and b"GRANTED_NAME" in result.stderr
+    before = json.loads(result.stderr.splitlines()[0].removeprefix(b"inherited-names="))
+    expected_base = {"HOME", "PATH", "LC_ALL", "XDG_CONFIG_HOME", "HTTPS_PROXY", "SSL_CERT_FILE"}
+    count = len(set(before) - expected_base)
+    assert f"{count} names dropped".encode() in result.stderr and b"GRANTED_NAME" in result.stderr
 
 
 @pytest.mark.parametrize("policy", [None, True, "all", "other", {}, []])

@@ -23,6 +23,7 @@ from pinky_daemon.tmux_launch_env_loader import (
     _private_regular,
     key_policy,
     validate_env,
+    validate_inherit,
 )
 from pinky_daemon.tmux_launch_env_loader import (
     is_valid_key_name as is_valid_key_name,
@@ -249,29 +250,44 @@ def _sweep_scopes(directory: int, *, deadline: float) -> None:
             os.close(fd)
 
 
-def stage_env(env: dict[str, str], scope: str, nonce: str, *, deadline: float) -> dict | None:
+def stage_env(
+    env: dict[str, str], scope: str, nonce: str, *, deadline: float,
+    inherit: str = "all", granted: tuple[str, ...] = (),
+) -> dict | None:
     lease = time.monotonic() + PUBLICATION_TIMEOUT
     _request_deadline(deadline)
     validate_env(env)
+    validate_inherit(env, inherit)
+    if (
+        not isinstance(granted, (list, tuple))
+        or any(not isinstance(k, str) or k not in env for k in granted)
+        or (inherit != "none" and granted)
+    ):
+        raise ValueError("invalid launch grant names")
     _identity(scope, nonce)
-    populated = {key: value for key, value in env.items() if value != ""}
+    populated = dict(env) if inherit == "none" else {k: v for k, v in env.items() if v != ""}
+    needs_payload = bool(populated) or inherit == "none"
     try:
-        with _state_directory(create=bool(populated), deadline=lease) as (root, parent):
+        with _state_directory(create=needs_payload, deadline=lease) as (root, parent):
             _sweep_scopes(parent, deadline=lease)
-            if not populated:
+            if not needs_payload:
                 return None
             directory = _directory(parent, scope, private=True, create=True, deadline=lease)
             try:
-                return _publish(populated, root / scope, directory, nonce, lease)
+                policy = {"inherit": "none", "granted": list(granted)} if inherit == "none" else {}
+                return _publish(populated, root / scope, directory, nonce, lease, policy=policy)
             finally:
                 os.close(directory)
     except FileNotFoundError:
-        if not populated:
+        if not needs_payload:
             return None
         raise
 
 
-def _publish(populated: dict[str, str], path: Path, directory: int, nonce: str, lease: float):
+def _publish(
+    populated: dict[str, str], path: Path, directory: int, nonce: str, lease: float,
+    *, policy: dict | None = None,
+):
     with _nonce_lock(directory, nonce, deadline=lease) as lock_fd:
         if os.read(lock_fd, 1):
             raise RuntimeError("launch environment publication cancelled")
@@ -290,7 +306,7 @@ def _publish(populated: dict[str, str], path: Path, directory: int, nonce: str, 
                 os.close(output_fd)
                 raise
             with output:
-                json.dump({"nonce": nonce, "env": populated}, output)
+                json.dump({"nonce": nonce, "env": populated, **(policy or {})}, output)
             # A descheduled publisher can cross its lease during the write.
             # Keep the lock until completion or removal of its secret data.
             _deadline(lease)
@@ -317,7 +333,8 @@ def main() -> None:
         action = request.get("action", "stage")
         if action == "stage":
             result = stage_env(request["env"], request["scope"], request["nonce"],
-                               deadline=request["deadline"])
+                               deadline=request["deadline"], inherit=request.get("inherit", "all"),
+                               granted=tuple(request.get("granted", ())))
         elif action == "cancel":
             cancel_env(request["scope"], request["nonce"])
             result = None

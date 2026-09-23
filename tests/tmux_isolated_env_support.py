@@ -97,6 +97,14 @@ class LaunchProbe:
         provider_key="synthetic-provider-key", provider_url="", empty_token=True,
     ):
         m = self.monkeypatch
+        if self.client is not None:
+            await self.client.close()
+            self.client = None
+        if self.supervisor is not None:
+            await self.supervisor.teardown()
+            self.supervisor = None
+        self.names_path.unlink(missing_ok=True)
+        self.empty_names_path.unlink(missing_ok=True)
         registry = registry if registry is not None else Registry()
         config = StreamingSessionConfig(
             agent_name="test-tenant", working_dir=str(self.root),

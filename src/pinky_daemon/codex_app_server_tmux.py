@@ -48,6 +48,7 @@ from pinky_daemon.codex_app_server import (
     ServerRequestHandler,
 )
 from pinky_daemon.codex_home import (
+    codex_home_for,
     per_agent_codex_home_enabled,
     prepare_agent_codex_home,
     validate_agent_codex_home,
@@ -168,6 +169,7 @@ class CodexAppServerSupervisor:
         client plus its process adapter. Raises on tmux failure or readiness
         timeout. The caller (CodexSession) performs the single ``initialize``."""
         self._kill_requested = False
+        launch_policy = self._launch_env_policy()
         if per_agent_codex_home_enabled():
             if self._agent_config is None:
                 raise RuntimeError(
@@ -184,14 +186,15 @@ class CodexAppServerSupervisor:
         self._unlink_sock()
 
         self._ensure_sock_dir_secure()
-        env = self._build_env()
+        policy_args = {"launch_policy": launch_policy} if launch_policy.mode == "enforce" else {}
+        env = self._build_env(**policy_args)
 
         command = " ".join(
             shlex.quote(p)
             for p in [sys.executable, "-m", "pinky_daemon.codex_app_server_shim", self.sock_path]
         )
         result = await self._tmux.new_session(
-            cwd=self._sock_dir, command=command, env=env
+            cwd=self._sock_dir, command=command, env=env, **launch_policy.spawn_options(env),
         )
         if not result.ok:
             raise RuntimeError(
@@ -220,24 +223,27 @@ class CodexAppServerSupervisor:
         )
         return client, _TmuxAppServerProc(self, pid=0)
 
-    def _build_env(self) -> dict[str, str]:
-        """Full daemon-env parity for the tmux session — NOT just PATH.
-
-        tmux's server environment differs from the caller's environment.
-        The launch boundary explicitly delivers the mapping built here. The
-        direct-subprocess app-server path passes ``env={**os.environ}``, so the
-        codex child sees the daemon's full config; we must reproduce that here or
-        the child silently runs under different CODEX_HOME / HOME / XDG_* / proxy
-        / cert / OPENAI_*/CODEX_* settings. That breaks auth and — critically —
-        item G: a fresh child's ``thread/resume`` only finds the prior thread if
-        it points at the SAME Codex home/session store (#792 P1).
-
-        We propagate the daemon env (overlaying the configured key for item H),
-        excluding shell internals, invalid names, undecodable and multiline values.
-        """
-        env = tmux_launch_env.ambient_env(
-            os.environ.items(), lambda message: self._log(f"codex[{self.agent_name}]: {message}"),
+    def _launch_env_policy(self) -> isolated_launch_env.LaunchPolicy:
+        return isolated_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry,
+            status_lookup=self._isolation_status, log=self._log,
         )
+
+    def _build_env(
+        self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+    ) -> dict[str, str]:
+        """Build scoped app-server inputs or the unchanged ambient payload."""
+        launch_policy = launch_policy or self._launch_env_policy()
+        if launch_policy.clean:
+            env = isolated_launch_env.scoped_codex_env(launch_policy, self.agent_name)
+            env["CODEX_HOME"] = str(codex_home_for(self._agent_config))
+            provider_url = getattr(self._agent_config, "provider_url", "")
+            if provider_url:
+                env["OPENAI_BASE_URL"] = provider_url
+        else:
+            env = tmux_launch_env.ambient_env(
+                os.environ.items(), lambda message: self._log(f"codex[{self.agent_name}]: {message}"),
+            )
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
         if per_agent_codex_home_enabled():
@@ -256,7 +262,7 @@ class CodexAppServerSupervisor:
             agent_name=self.agent_name, registry=self._registry,
             status_lookup=self._isolation_status, env=env, log=self._log,
         )
-        return env
+        return isolated_launch_env.with_grants(launch_policy, env)
 
     def _isolation_status(self) -> str:
         return isolated_launch_env.isolation_status(self._registry, self.agent_name)
