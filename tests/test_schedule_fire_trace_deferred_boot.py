@@ -1,4 +1,4 @@
-"""Independent FT2-1216 review witnesses (synthetic stores only)."""
+"""Regression tests for fire-trace recovery under SQLite contention."""
 import asyncio
 import logging
 import os
