@@ -202,3 +202,25 @@ async def test_cancellation_during_nonok_cleanup_does_not_clean_twice(home):
         if not task.done():
             task.cancel()
         await asyncio.gather(task, return_exceptions=True)
+
+
+@pytest.mark.parametrize("kind", ["symlink", "writable", "invalid_name"])
+def test_sibling_sweep_preserves_untrusted_directories(home, kind):
+    own = Path(stage(home)["path"])
+    root = own.parent.parent
+    sibling = root / ("f6" * 32)
+    if kind == "symlink":
+        directory = home / "foreign"
+        directory.mkdir(mode=0o700)
+        sibling.symlink_to(directory, target_is_directory=True)
+    else:
+        directory = sibling if kind == "writable" else root / "unrelated"
+        directory.mkdir(mode=0o700)
+        if kind == "writable":
+            directory.chmod(0o777)
+    foreign = directory / f"env-{NONCE}.json"
+    foreign.write_text(SECRET)
+    foreign.chmod(0o600)
+    os.utime(foreign, (time.time() - 900,) * 2)
+    stage(home, scope="e5" * 32)
+    assert foreign.read_text() == SECRET
