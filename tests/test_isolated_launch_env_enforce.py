@@ -274,6 +274,7 @@ def test_loader_clean_exec_and_actual_names_only_log(tmp_path):
     assert not DAEMON_NAMES & names
     assert {"HOME", "PATH", "LC_ALL", "XDG_CONFIG_HOME", "HTTPS_PROXY", "SSL_CERT_FILE", "GRANTED_NAME"} <= names
     assert b"inherited environment scrubbed" in result.stderr
+    assert b"synthetic" not in result.stderr, "loader diagnostics must contain names only"
     before = json.loads(result.stderr.splitlines()[0].removeprefix(b"inherited-names="))
     expected_base = {"HOME", "PATH", "LC_ALL", "XDG_CONFIG_HOME", "HTTPS_PROXY", "SSL_CERT_FILE"}
     count = len(set(before) - expected_base - {"GRANTED_NAME"})
