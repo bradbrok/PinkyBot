@@ -637,6 +637,11 @@ class MessageBroker:
         """Store inbound routing context for later reply()/react() resolution."""
         if not message.message_id:
             return
+        # Stamp the direction LAST so nothing carried in the platform metadata
+        # can pose as the daemon's own verdict: an identity lookup treats only
+        # an explicit "inbound" as a message the daemon routed to the agent.
+        metadata = dict(message.metadata or {})
+        metadata["direction"] = "inbound"
         self._remember_context(MessageContext(
             agent_name=message.agent_name,
             message_id=message.message_id,
@@ -647,7 +652,7 @@ class MessageBroker:
             is_group=message.is_group,
             source_was_voice=source_was_voice,
             attachments=list(message.attachments or []),
-            metadata=dict(message.metadata or {}),
+            metadata=metadata,
         ))
 
     def remember_outbound_message_context(

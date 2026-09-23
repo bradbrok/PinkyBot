@@ -8518,8 +8518,10 @@ npm run build</pre>
         own identity through the internal signature, can look up its contexts.
         Answers with the message timestamp, when the context was stored and
         whether the chat is a group, or 404 for anything else: an unknown
-        identity, an outbound record, a row past the retention window or
-        beyond the per-agent cap. The body never says which of those applied.
+        identity, a record not stamped ``direction == "inbound"`` by the
+        broker's routing path (outbound, legacy or unstamped rows alike), a
+        row past the retention window or beyond the per-agent cap. The body
+        never says which of those applied.
         """
         name = _agent_name_or_400(name)
         if getattr(request.state, "internal_caller", None) != name:
@@ -8532,11 +8534,16 @@ npm run build</pre>
                 f"{message_context_store.max_per_agent} most recent per agent)"
             ),
         }
+        # Identity segments are plain platform ids; a decoded '?' or '#' in one
+        # is never legitimate and is refused before any lookup, with the same
+        # body as a miss so the caller sees one shape.
+        if any(ch in segment for segment in (platform, chat_id, message_id) for ch in "?#"):
+            raise HTTPException(404, not_found)
         found = broker.get_message_context_by_identity(name, platform, chat_id, message_id)
         if found is None:
             raise HTTPException(404, not_found)
         context, stored_at = found
-        if (context.metadata or {}).get("direction") == "outbound":
+        if (context.metadata or {}).get("direction") != "inbound":
             raise HTTPException(404, not_found)
         return {
             "message_ts": float(context.timestamp),

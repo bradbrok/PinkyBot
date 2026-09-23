@@ -94,18 +94,44 @@ def test_unknown_identity_is_404_with_retention_text(tmp_path, monkeypatch, path
         assert "30 days" in detail["detail"] and "1000" in detail["detail"]
 
 
-def test_outbound_records_are_not_served(tmp_path, monkeypatch):
+def test_only_records_stamped_inbound_by_routing_are_served(tmp_path, monkeypatch):
+    """The routing path stamps direction=inbound last; nothing else counts as proof."""
     with _gateway(tmp_path, monkeypatch) as client:
-        client.app.state.broker.remember_outbound_message_context(
-            "sample", "m1", platform="slack", chat_id="D1",
-        )
-        assert _signed(client, PATH).status_code == 404
+        broker = client.app.state.broker
+        store = client.app.state.message_context_store
+        # Platform metadata claiming "outbound" is overridden at routing.
+        broker.remember_message_context(BrokerMessage(
+            platform="slack", chat_id="D1", sender_name="s", sender_id="U1", content="hi",
+            agent_name="sample", timestamp=1.0, message_id="m1",
+            metadata={"direction": "outbound", "team": "T1"},
+        ))
+        row = store.get("sample", "m1", platform="slack", chat_id="D1")
+        assert row["metadata"]["team"] == "T1"
+        assert row["metadata"]["direction"] == "inbound"
+        assert _signed(client, PATH).status_code == 200
+
+        # An outbound record the agent produced itself.
+        broker.remember_outbound_message_context("sample", "o1", platform="slack", chat_id="D1")
+        assert _signed(client, "/agents/sample/message-context/slack/D1/o1").status_code == 404
+
+        # Legacy rows carry no stamp and are refused the same way.
+        base = {"agent_name": "sample", "platform": "slack", "chat_id": "D1", "timestamp": 1.0}
+        store.put({**base, "message_id": "legacy"})
+        store.put({**base, "message_id": "blank", "metadata": {"direction": ""}})
+        store.put({**base, "message_id": "odd", "metadata": {"direction": "Inbound"}})
+        for message_id in ("legacy", "blank", "odd"):
+            response = _signed(client, f"/agents/sample/message-context/slack/D1/{message_id}")
+            assert response.status_code == 404
+            assert response.json()["detail"]["code"] == "message_context_not_found"
 
 
 def test_rows_past_retention_or_cap_are_404(tmp_path, monkeypatch):
     with _gateway(tmp_path, monkeypatch) as client:
         store = client.app.state.message_context_store
-        base = {"agent_name": "sample", "platform": "slack", "chat_id": "D1", "timestamp": 1.0}
+        base = {
+            "agent_name": "sample", "platform": "slack", "chat_id": "D1", "timestamp": 1.0,
+            "metadata": {"direction": "inbound"},
+        }
         store.put({**base, "message_id": "m1"}, stored_at=time.time() - 31 * 86400)
         assert _signed(client, PATH).status_code == 404
 
@@ -178,3 +204,37 @@ def test_without_a_store_nothing_is_served(tmp_path, monkeypatch):
         broker._message_context_store = None
         assert broker.get_message_context_by_identity("sample", "slack", "D1", "m1") is None
         assert _signed(client, PATH).status_code == 404
+
+
+@pytest.mark.parametrize("encoded, decoded", [("%3F", "?"), ("%23", "#")])
+def test_identity_segments_with_reserved_characters_are_refused_before_lookup(
+    tmp_path, monkeypatch, encoded, decoded
+):
+    """Two different encoded identities sharing one signed request never reach the store."""
+    with _gateway(tmp_path, monkeypatch) as client:
+        store = client.app.state.message_context_store
+        base = {"agent_name": "sample", "platform": "slack", "timestamp": 1.0,
+                "metadata": {"direction": "inbound"}}
+        store.put({**base, "chat_id": f"D{decoded}one", "message_id": "original"})
+        store.put({**base, "chat_id": f"D{decoded}two", "message_id": "different"})
+        # One signature that the shared verifier accepts for both encoded identities.
+        signed_for = "/agents/sample/message-context/slack/D"
+        headers = build_internal_auth_headers(
+            client.app.state.agents.get_signing_key("sample"),
+            agent_name="sample", method="GET", path=signed_for,
+        )
+        queried = []
+        real_get = store.get
+
+        def spy(*args, **kwargs):
+            queried.append((args, kwargs))
+            return real_get(*args, **kwargs)
+
+        monkeypatch.setattr(store, "get", spy)
+        first = client.get(f"/agents/sample/message-context/slack/D{encoded}one/original", headers=headers)
+        second = client.get(f"/agents/sample/message-context/slack/D{encoded}two/different", headers=headers)
+        assert first.status_code == 404
+        assert second.status_code == 404
+        assert first.json()["detail"]["code"] == "message_context_not_found"
+        assert second.json() == first.json()
+        assert queried == []
