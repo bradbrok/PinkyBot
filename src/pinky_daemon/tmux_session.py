@@ -73,7 +73,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from pinky_daemon import tmux_launch_env, tmux_launch_env_loader
+from pinky_daemon import isolated_launch_env, tmux_launch_env, tmux_launch_env_loader
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
@@ -846,29 +846,39 @@ class _TmuxControl:
         cwd: str,
         command: str,
         env: dict[str, str] | None = None,
+        inherit: str = "all",
+        granted: tuple[str, ...] = (),
     ) -> TmuxCommandResult:
         """Spawn using isolated Python to consume private JSON before shell exec."""
         env = env or {}
         tmux_launch_env.validate_env(env)
+        try:
+            tmux_launch_env.validate_inherit(env, inherit)
+        except PermissionError:
+            names = sorted(isolated_launch_env.DAEMON_ONLY.intersection(env))
+            _log("ERROR isolated launch daemon-only payload refused: " + json.dumps(names))
+            raise isolated_launch_env.LaunchEnvError("daemon-only payload refused") from None
+        policy_options = {"inherit": inherit, "granted": granted} if inherit == "none" else {}
         scope = hashlib.sha256(json.dumps(
             [self._base_cmd(), self.session_name], separators=(",", ":"),
         ).encode()).hexdigest()
         nonce = secrets.token_hex(16)
         runner = self._runner
-        has_values = any(value != "" for value in env.values())
+        has_values = inherit == "none" or any(value != "" for value in env.values())
         receipt = (runner, scope, nonce) if has_values else None
         deadline = time.time() + tmux_launch_env.PUBLICATION_TIMEOUT
         try:
             if isinstance(runner, LocalCommandRunner):
                 staged = await asyncio.to_thread(
                     tmux_launch_env.stage_env, env, scope, nonce, deadline=deadline,
+                    **policy_options,
                 )
             else:
                 result = await runner.run(
                     ["python3", "-I", "-c", _LAUNCH_ENV_SOURCE],
                     stdin_data=json.dumps({
                         "action": "stage", "env": env, "scope": scope,
-                        "nonce": nonce, "deadline": deadline,
+                        "nonce": nonce, "deadline": deadline, **policy_options,
                     }).encode(),
                     timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
                 )
@@ -3922,6 +3932,8 @@ class TmuxSession(TransportReplacementMixin):
         than docstring-only.
         """
         self._check_startup_owner()
+        launch_policy = self._launch_env_policy()
+        policy_args = {"launch_policy": launch_policy} if launch_policy.mode == "enforce" else {}
         cwd = self._config.working_dir or "."
         # Ensure cwd exists — claude --continue needs it.
         Path(cwd).mkdir(parents=True, exist_ok=True)
@@ -3990,7 +4002,13 @@ class TmuxSession(TransportReplacementMixin):
         # ``_spawn()`` below (the container is running by now).
         if container_agent is None:
             try:
-                effective_env = {**os.environ, **self._build_repl_env()}
+                effective_env = dict(os.environ)
+                if launch_policy.clean:
+                    effective_env = {
+                        k: v for k, v in effective_env.items()
+                        if k in isolated_launch_env.BASE_ALLOWLIST or k.startswith(("LC_", "XDG_"))
+                    }
+                effective_env.update(self._build_repl_env(**policy_args))
                 cfg_path = _resolve_claude_config_path(effective_env)
                 if _seed_claude_trust_file(cfg_path, cwd):
                     _log(
@@ -4031,7 +4049,7 @@ class TmuxSession(TransportReplacementMixin):
         # most-recent transcript for ``cwd``; falls back to fresh session
         # if none exists.
         claude_cmd = self._build_claude_cmd()
-        env = self._build_repl_env()
+        env = self._build_repl_env(**policy_args)
 
         launch_env = None
 
@@ -4052,6 +4070,7 @@ class TmuxSession(TransportReplacementMixin):
                 cwd=cwd,
                 command=claude_cmd,
                 env=env,
+                **launch_policy.spawn_options(env),
             )
             launch_env = result.launch_env
             if not result.ok:
@@ -4472,7 +4491,15 @@ class TmuxSession(TransportReplacementMixin):
 
         return local_config_dir(wd)
 
-    def _build_repl_env(self) -> dict[str, str]:
+    def _launch_env_policy(self) -> isolated_launch_env.LaunchPolicy:
+        return isolated_launch_env.capture_policy(
+            agent_name=self.agent_name, registry=self._registry,
+            status_lookup=self._isolation_status, log=_log,
+        )
+
+    def _build_repl_env(
+        self, *, launch_policy: isolated_launch_env.LaunchPolicy | None = None,
+    ) -> dict[str, str]:
         """Env vars injected into the tmux session.
 
         Mirrors StreamingSession's ``provider_env`` shape so hook scripts
@@ -4495,6 +4522,7 @@ class TmuxSession(TransportReplacementMixin):
         Propagating the secret here re-enables the entire hook fleet
         for tmux agents without touching any individual hook script.
         """
+        launch_policy = launch_policy or self._launch_env_policy()
         env: dict[str, str] = {}
         if self._config.provider_url:
             env["ANTHROPIC_BASE_URL"] = self._config.provider_url
@@ -4535,6 +4563,12 @@ class TmuxSession(TransportReplacementMixin):
             env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
         elif oauth_token:
             env["CLAUDE_CODE_OAUTH_TOKEN"] = oauth_token
+        if launch_policy.clean and not (self._config.provider_url or self._config.provider_key):
+            for key in ("ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "ANTHROPIC_BASE_URL"):
+                if key in os.environ:
+                    env.setdefault(key, os.environ[key])
+            if not dedicated_config_dir and "CLAUDE_CODE_OAUTH_TOKEN" in os.environ:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = os.environ["CLAUDE_CODE_OAUTH_TOKEN"]
         if self.agent_name:
             env["PINKY_AGENT_NAME"] = self.agent_name
         env[_TMUX_TRANSCRIPT_BIND_MARKER_ENV] = _TMUX_TRANSCRIPT_BIND_MARKER_VALUE
@@ -4568,7 +4602,9 @@ class TmuxSession(TransportReplacementMixin):
         # internal requests with a non-forgeable identity. Lookup guarded like
         # _restart_threshold_pct — a registry hiccup must not break session env.
         agent_key = ""
-        if self._registry and self.agent_name:
+        if launch_policy.mode == "enforce":
+            agent_key = launch_policy.agent_key
+        elif self._registry and self.agent_name:
             try:
                 agent_key = (self._registry.get_signing_key(self.agent_name) or "").strip()
             except Exception:
@@ -4593,6 +4629,7 @@ class TmuxSession(TransportReplacementMixin):
         # FastAPI middleware read it from the same env var. Empty/missing is
         # tolerated: hooks already handle that gracefully (silent no-op).
         #
+        # Resolve the explicit identity independently of the inheritance mode.
         # #149 phase-3 security gate (fail CLOSED — Murzik #639 review): the
         # global secret is the fleet-wide signing key; the daemon dual-accepts
         # it for EVERY agent name, so any child that holds it can sign internal
@@ -4610,27 +4647,33 @@ class TmuxSession(TransportReplacementMixin):
         # non-isolated agents and the legacy/dev "unknown + no key" case (an
         # agent with no key genuinely needs the shared secret to sign at all).
         secret = os.environ.get("PINKY_SESSION_SECRET", "").strip()
-        status = self._isolation_status()
+        status = launch_policy.status if launch_policy.mode == "enforce" else self._isolation_status()
         if status == "isolated":
             if agent_key:
                 _log(
-                    f"tmux[{self.agent_name}]: isolated — per-agent key only, "
-                    f"global secret withheld"
+                    f"tmux[{self.agent_name}]: isolated launch identity configured"
                 )
             else:
                 _log(
                     f"tmux[{self.agent_name}]: ERROR isolated agent has no per-agent "
-                    f"signing key — withholding global secret too (hooks/MCP will "
-                    f"no-op); provision a key to restore signing"
+                    f"signing key; provision a key for scoped signing"
                 )
         elif status == "unknown" and agent_key and secret:
             _log(
                 f"tmux[{self.agent_name}]: isolation status unknown but per-agent "
-                f"key present — withholding global secret (fail closed)"
+                f"key present — scoped identity configured"
             )
         elif secret:
             env["PINKY_SESSION_SECRET"] = secret
 
+        isolated_launch_env.report_shadow(
+            agent_name=self.agent_name, status=status, has_agent_key=bool(agent_key),
+            explicit_names=env, log=_log,
+        )
+        env = isolated_launch_env.with_grants(launch_policy, env)
+        if launch_policy.clean and (self._config.provider_url or self._config.provider_key):
+            if not dedicated_config_dir:
+                env.pop("CLAUDE_CODE_OAUTH_TOKEN", None)
         return env
 
     async def disconnect(self) -> None:
@@ -5819,35 +5862,12 @@ class TmuxSession(TransportReplacementMixin):
         return max(1, raw - self._AUTOCOMPACT_BUFFER_TOKENS)
 
     def _isolation_status(self) -> str:
-        """Tri-state isolation lookup for the env secret gate (#149 phase-3).
+        """Shared tri-state lookup for explicit payload omission and shadowing.
 
-        Returns ``"isolated"``, ``"not_isolated"``, or ``"unknown"`` (registry
-        unwired, agent not found, or lookup raised). A bare bool would conflate
-        "proven non-isolated" (safe to inject the global secret) with "can't
-        tell" — and Murzik's #639 review caught that conflation as a fail-OPEN:
-        if ``get_signing_key`` returns a key but ``registry.get`` raises, a bool
-        helper falls to False and the env builder would inject BOTH the per-agent
-        key AND the forgeable global secret (the same fail-open class fixed in
-        #635). The caller withholds the global secret whenever isolation can't
-        be *proven* false and a per-agent key already provides a working
-        identity, so registry uncertainty never causes global-secret exposure.
+        Unknown isolation plus a signing key uses the isolated policy; a
+        non-local mode also implies isolation regardless of the isolated flag.
         """
-        if not self._registry or not self.agent_name:
-            return "unknown"
-        try:
-            agent = self._registry.get(self.agent_name)
-        except Exception:
-            return "unknown"
-        if agent is None:
-            return "unknown"
-        # A non-local isolation_mode IS isolation, regardless of the `isolated`
-        # bool: a container/unix_user tenant holding the fleet-wide forgeable
-        # PINKY_SESSION_SECRET would defeat the entire OS boundary (#638 gap —
-        # the register/update models coerce isolated=True for non-local modes,
-        # but legacy rows / direct DB writes must not bypass the secret gate).
-        if getattr(agent, "isolation_mode", "local") not in ("", "local"):
-            return "isolated"
-        return "isolated" if getattr(agent, "isolated", False) else "not_isolated"
+        return isolated_launch_env.isolation_status(self._registry, self.agent_name)
 
     def _restart_threshold_pct(self) -> float:
         """Pull the agent's restart threshold from the registry.

@@ -271,6 +271,7 @@ class CodexSession(TransportReplacementMixin):
                 openai_api_key=self._openai_api_key,
                 agent_config=config,
                 soul_version_store=registry,
+                registry=registry,
                 log=_log,
             )
         self._app_client: CodexAppServerClient | None = None
