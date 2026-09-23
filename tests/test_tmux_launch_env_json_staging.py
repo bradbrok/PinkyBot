@@ -111,6 +111,17 @@ def test_orphan_sweep_removes_old_secret_but_preserves_young_launch(home):
     assert young_path.exists()
 
 
+def test_secret_orphan_ttl_is_ten_minutes_not_metadata_ttl(home):
+    old_path = Path(stage(home)["path"])
+    young_path = Path(stage(home, nonce=OTHER_NONCE)["path"])
+    now = time.time()
+    os.utime(old_path, (now - 601, now - 601))
+    os.utime(young_path, (now - 30, now - 30))
+    stage(home, nonce="d4" * 16)
+    assert not old_path.exists(), "secret orphans must not wait for metadata retention"
+    assert young_path.exists(), "a live launch still needs its secret file"
+
+
 def test_gc_never_follows_foreign_symlink(home):
     path = Path(stage(home)["path"])
     foreign = home / "foreign"
