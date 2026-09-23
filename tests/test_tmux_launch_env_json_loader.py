@@ -178,16 +178,25 @@ def test_loader_wrong_owner_refuses_without_unlink(home, monkeypatch):
     path = payload(home)
     fn = loader()
     real_fstat = os.fstat
+    executed = []
 
     def wrong_owner(fd):
         info = real_fstat(fd)
         return SimpleNamespace(st_mode=info.st_mode, st_uid=os.geteuid() + 1)
 
-    monkeypatch.setattr(os, "fstat", wrong_owner)
-    with pytest.raises(SystemExit) as error:
-        fn(str(path), NONCE, "true")
-    assert error.value.code == 1
-    assert path.exists()
+    def forbidden_exec(*args):
+        executed.append(args)
+        raise RuntimeError("synthetic execution refused")
+
+    with monkeypatch.context() as observed:
+        observed.setattr(os, "fstat", wrong_owner)
+        observed.setattr(os, "execv", forbidden_exec)
+        observed.setattr(os, "environ", dict(os.environ))
+        with pytest.raises(SystemExit) as error:
+            fn(str(path), NONCE, "true")
+        assert error.value.code == 1
+        assert not executed
+        assert path.exists()
 
 
 @pytest.mark.parametrize("unlink_error", [None, FileNotFoundError, PermissionError])
