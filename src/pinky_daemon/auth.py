@@ -9,6 +9,7 @@ import json
 import os
 import time
 from typing import Any
+from urllib.parse import unquote
 
 from pinky_daemon.agent_signing_key_store import AgentSigningKeyStore
 
@@ -207,11 +208,18 @@ def make_db_signing_key_resolver(db_path: str):
 
 
 def build_internal_auth_headers(secret: str, *, agent_name: str, method: str, path: str, timestamp: int | None = None) -> dict[str, str]:
-    """Build signed headers for local MCP-to-daemon requests."""
+    """Build signed headers for local MCP-to-daemon requests.
+
+    ``path`` must be the exact on-the-wire request path the client puts in the
+    URL (including any percent escapes, and optionally a query string). The
+    server exposes that URL path percent-decoded in ASGI ``scope["path"]``;
+    unquoting this wire form once produces the path the verifier signs.
+    Callers must encode user-provided path components before building the URL.
+    """
     if not secret or not agent_name:
         return {}
     ts = int(timestamp or time.time())
-    normalized_path = path.split("?", 1)[0]
+    normalized_path = unquote(path.split("?", 1)[0])
     payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
     return {
         INTERNAL_AGENT_HEADER: agent_name,

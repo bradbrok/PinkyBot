@@ -5,7 +5,7 @@ import hashlib
 import hmac
 import json
 import time
-from urllib.parse import unquote
+from urllib.parse import quote, unquote
 
 import pytest
 from fastapi import Request
@@ -63,17 +63,16 @@ def routed_app(monkeypatch, tmp_path):
 def test_internal_routed_path_question_mark_rejected(routed_app, suffix):
     app, seen = routed_app
     path = f"{_PREFIX}/{suffix}"
-    headers = _headers(f"{_PREFIX}/D?one/a")
+    headers = _headers(path)
     response = TestClient(app).get(path, headers=headers)
     assert response.status_code == 401
     assert seen == [unquote(path)]
 
 
-@pytest.mark.parametrize("signed_suffix", ["D", "D#one/a"])
-def test_internal_routed_path_hash_rejected(routed_app, signed_suffix):
+def test_internal_routed_path_hash_rejected(routed_app):
     app, seen = routed_app
     path = f"{_PREFIX}/D%23one/a"
-    response = TestClient(app).get(path, headers=_headers(f"{_PREFIX}/{signed_suffix}"))
+    response = TestClient(app).get(path, headers=_headers(path))
     assert response.status_code == 401
     assert seen == [unquote(path)]
 
@@ -91,7 +90,7 @@ def test_internal_routed_path_hash_rejected(routed_app, signed_suffix):
 def test_internal_routed_path_normal_request(routed_app, suffix, segment):
     app, seen = routed_app
     path = f"{_PREFIX}/{suffix}"
-    response = TestClient(app).get(path, headers=_headers(unquote(path)))
+    response = TestClient(app).get(path, headers=_headers(path))
     assert response.status_code == 200
     assert response.json() == {"segment": segment, "item": "a", "gate": "internal_hmac"}
     assert seen == [unquote(path.split("?", 1)[0])]
@@ -100,7 +99,7 @@ def test_internal_routed_path_normal_request(routed_app, suffix, segment):
 def test_internal_routed_path_encoded_slash_keeps_route_shape(routed_app):
     app, seen = routed_app
     path = f"{_PREFIX}/one%2Ftwo/a"
-    response = TestClient(app).get(path, headers=_headers(unquote(path)))
+    response = TestClient(app).get(path, headers=_headers(path))
     assert response.status_code == 404
     assert seen == [unquote(path)]
 
@@ -145,7 +144,7 @@ def test_internal_routed_path_root_path(routed_app, record_property, mode, prefi
 @pytest.mark.parametrize("delimiter", ["?", "#"])
 def test_internal_routed_path_verifier_rejects_delimiters(delimiter):
     path = f"{_PREFIX}/D{delimiter}one/a"
-    headers = _headers(path)
+    headers = _headers(quote(path, safe="/"))
     assert not verify_internal_request(
         _SECRET, agent_name="sample", method="GET", path=path,
         timestamp=headers[INTERNAL_TIMESTAMP_HEADER],
@@ -166,3 +165,17 @@ def test_internal_routed_path_verifier_rejects_valid_full_path_mac(delimiter):
         _SECRET, agent_name="sample", method="GET", path=path,
         timestamp=timestamp, signature=signature,
     )
+
+
+@pytest.mark.parametrize(
+    ("path", "expected_signature"),
+    [
+        ("/agents/sample/signed-path/plain/a", "l1Gz4yDdA7yOAZxIHD7Iw6Ol7D-KAONqcPkORUYrMU0"),
+        ("/research/42/export?format=pdf", "Pl4-F7aFVrpvs_QO0nujM6AThO4FYUYZciNG9jf6j2I"),
+    ],
+)
+def test_plain_internal_path_signature_is_byte_identical_to_legacy(path, expected_signature):
+    headers = build_internal_auth_headers(
+        _SECRET, agent_name="sample", method="GET", path=path, timestamp=123,
+    )
+    assert headers[INTERNAL_SIGNATURE_HEADER] == expected_signature
