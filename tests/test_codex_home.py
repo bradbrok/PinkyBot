@@ -2735,6 +2735,11 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
     monkeypatch,
 ):
     """R8: tmux's exact no-server result permits boot despite a stale socket."""
+    from tests.tmux_env_support import child_payload, probe_command, run_pane, secret_files
+
+    home = tmp_path / "home"
+    home.mkdir(mode=0o700)
+    monkeypatch.setenv("HOME", str(home))
     config = StreamingSessionConfig(
         agent_name="test-agent",
         working_dir=str(tmp_path / "agent"),
@@ -2759,7 +2764,12 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
                 )
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         if args[0] == "new-session":
-            assert "PINKY_SESSION_SECRET=daemon-env-marker" in args
+            assert "daemon-env-marker" not in "\n".join(args)
+            paths = secret_files(home, "daemon-env-marker")
+            assert len(paths) == 1
+            child = child_payload(run_pane(args, home))
+            assert child["env"]["PINKY_SESSION_SECRET"] == "daemon-env-marker"
+            assert not paths[0].exists()
             return TmuxCommandResult(returncode=0, stdout="", stderr="")
         raise AssertionError(f"unexpected tmux call: {args}")
 
@@ -2781,7 +2791,7 @@ async def test_tmux_repl_absent_server_cold_start_proceeds(
     monkeypatch.setattr(session, "_seed_container_trust", _noop)
     monkeypatch.setattr(session, "_seed_container_home_creds", _noop)
     monkeypatch.setattr(session, "_start_tailer", _noop)
-    monkeypatch.setattr(session, "_build_claude_cmd", lambda: "claude")
+    monkeypatch.setattr(session, "_build_claude_cmd", lambda: probe_command(home))
     monkeypatch.setattr(
         "pinky_daemon.tmux_session._seed_claude_trust_file",
         lambda _path, _cwd: False,
