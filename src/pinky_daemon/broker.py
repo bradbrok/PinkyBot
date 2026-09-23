@@ -705,6 +705,51 @@ class MessageBroker:
             self._cache_message_context(context, stored_at=stored_at)
             return context
 
+    def get_message_context_by_identity(
+        self,
+        agent_name: str,
+        platform: str,
+        chat_id: str,
+        message_id: str,
+    ) -> tuple[MessageContext, float] | None:
+        """Resolve one fully identified context and when it was stored.
+
+        Unlike ``get_message_context`` the caller names the platform and chat,
+        so the lookup never has to disambiguate a message ID reused across
+        chats. Returns ``None`` when nothing unexpired matches; the persisted
+        store applies the retention window and the per-agent cap, and the
+        in-memory cache only ever holds rows that were also handed to it.
+        """
+        if not (agent_name and platform and chat_id and message_id):
+            return None
+        key = (agent_name, platform, chat_id, message_id)
+        with self._message_context_lock:
+            self._prune_expired_message_contexts(time.time())
+            cached = self._message_contexts.get(key)
+            cached_at = self._message_context_stored_at.get(key)
+            if self._message_context_store is None:
+                return (cached, cached_at) if cached is not None and cached_at is not None else None
+            try:
+                stored = self._message_context_store.get(
+                    agent_name,
+                    message_id,
+                    platform=platform,
+                    chat_id=chat_id,
+                    include_stored_at=True,
+                )
+            except Exception as exc:  # noqa: BLE001 — a store fault reads as "not found"
+                _log(f"message-context load failed: {type(exc).__name__}")
+                return None
+            if stored is not None:
+                stored_at = float(stored.pop("_stored_at"))
+                context = MessageContext(**stored)
+                if cached is None or cached_at is None or stored_at >= cached_at:
+                    self._cache_message_context(context, stored_at=stored_at)
+                    return context, stored_at
+            if cached is not None and cached_at is not None:
+                return cached, cached_at
+            return None
+
     async def _handle_stop_command(self, message: BrokerMessage) -> bool:
         """Intercept /stop commands from the owner. Returns True if handled."""
         # Only the primary user can issue stop commands
