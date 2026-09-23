@@ -2,6 +2,8 @@
 
 This module is stdlib-only so the same source runs in the target namespace.
 Secret values enter on stdin or through a private file, never process argv.
+The private state directory must be on a local filesystem: same-process
+threads require flock exclusion, which NFS lock emulation may not provide.
 """
 from __future__ import annotations
 
@@ -33,6 +35,7 @@ _SCOPE = re.compile(r"[0-9a-f]{64}", re.ASCII)
 PUBLICATION_TIMEOUT = 60.0
 _METADATA_TTL = 24 * 60 * 60
 _SECRET_TTL = 10 * 60
+_CLOCK_SKEW = 300.0
 
 
 def ambient_env(items, warn) -> dict[str, str]:
@@ -65,22 +68,31 @@ def _identity(scope: str, nonce: str) -> None:
         raise ValueError("invalid launch environment nonce")
 
 
-def _deadline(deadline: float, *, initial: bool = False) -> None:
+def _request_deadline(deadline: float) -> None:
     now = time.time()
     if (
         not isinstance(deadline, (int, float)) or isinstance(deadline, bool)
-        or not math.isfinite(deadline) or deadline <= now
-        or (initial and deadline > now + PUBLICATION_TIMEOUT)
+        or not math.isfinite(deadline) or deadline <= now - _CLOCK_SKEW
+        or deadline > now + PUBLICATION_TIMEOUT + _CLOCK_SKEW
     ):
-        raise ValueError("invalid or expired launch publication deadline")
+        raise ValueError("invalid or stale launch request deadline")
 
 
-def _directory(parent_fd: int, name: str, *, private: bool, create: bool) -> int:
+def _deadline(deadline: float | None) -> None:
+    if deadline is not None and time.monotonic() >= deadline:
+        raise ValueError("expired launch publication lease")
+
+
+def _directory(
+    parent_fd: int, name: str, *, private: bool, create: bool, deadline: float | None = None,
+) -> int:
+    _deadline(deadline)
     if create:
         try:
             os.mkdir(name, mode=0o700, dir_fd=parent_fd)
         except FileExistsError:
             pass
+    _deadline(deadline)
     fd = os.open(name, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW, dir_fd=parent_fd)
     try:
         info = os.fstat(fd)
@@ -94,23 +106,34 @@ def _directory(parent_fd: int, name: str, *, private: bool, create: bool) -> int
 
 
 @contextmanager
-def _scope_directory(scope: str, *, create: bool = True):
+def _state_directory(*, create: bool, deadline: float | None = None):
     home = Path.home()
-    parts = [".local", "state", "pinkybot", "tmux-launch-env", scope]
+    parts = [".local", "state", "pinkybot", "tmux-launch-env"]
     fds = []
     try:
+        _deadline(deadline)
         fd = os.open(home, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
         fds.append(fd)
         info = os.fstat(fd)
         if info.st_uid != os.geteuid() or stat.S_IMODE(info.st_mode) & 0o022:
             raise PermissionError("unsafe launch environment home")
         for index, part in enumerate(parts):
-            fd = _directory(fd, part, private=index >= 3, create=create)
+            fd = _directory(fd, part, private=index >= 3, create=create, deadline=deadline)
             fds.append(fd)
         yield home.joinpath(*parts), fd
     finally:
         for opened in reversed(fds):
             os.close(opened)
+
+
+@contextmanager
+def _scope_directory(scope: str, *, create: bool = True):
+    with _state_directory(create=create) as (root, parent):
+        fd = _directory(parent, scope, private=True, create=create)
+        try:
+            yield root / scope, fd
+        finally:
+            os.close(fd)
 
 
 @contextmanager
@@ -162,10 +185,11 @@ def _unlink_own(directory: int, name: str) -> None:
         pass
 
 
-def _sweep(directory: int) -> None:
+def _sweep(directory: int, *, deadline: float | None = None) -> None:
     """Bound crash leftovers without removing active publication locks."""
     now = time.time()
     for name in os.listdir(directory):
+        _deadline(deadline)
         match = re.fullmatch(r"env-([0-9a-f]{32})\.(json|lock)", name)
         if match is None:
             continue
@@ -176,6 +200,7 @@ def _sweep(directory: int) -> None:
                 continue
             lock_name = f"env-{match[1]}.lock"
             while True:
+                _deadline(deadline)
                 try:
                     lock_fd = os.open(
                         lock_name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
@@ -192,6 +217,7 @@ def _sweep(directory: int) -> None:
                         fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
                     except BlockingIOError:
                         break
+                    _deadline(deadline)
                     if not _lock_is_current(directory, lock_name, lock_fd):
                         continue
                     current = os.stat(name, dir_fd=directory, follow_symlinks=False)
@@ -206,47 +232,73 @@ def _sweep(directory: int) -> None:
             continue
 
 
+def _sweep_scopes(directory: int, *, deadline: float) -> None:
+    """Collect abandoned launches even when their original scope never returns."""
+    for scope in os.listdir(directory):
+        _deadline(deadline)
+        if _SCOPE.fullmatch(scope) is None:
+            continue
+        try:
+            fd = _directory(directory, scope, private=True, create=False, deadline=deadline)
+        except OSError:
+            # Foreign, permissive, missing or symlinked siblings grant no access.
+            continue
+        try:
+            _sweep(fd, deadline=deadline)
+        finally:
+            os.close(fd)
+
+
 def stage_env(env: dict[str, str], scope: str, nonce: str, *, deadline: float) -> dict | None:
+    lease = time.monotonic() + PUBLICATION_TIMEOUT
+    _request_deadline(deadline)
     validate_env(env)
     _identity(scope, nonce)
-    _deadline(deadline, initial=True)
     populated = {key: value for key, value in env.items() if value != ""}
-    if not populated:
-        try:
-            with _scope_directory(scope, create=False) as (_, directory):
-                _sweep(directory)
-        except FileNotFoundError:
-            pass
-        return None
-    with _scope_directory(scope) as (path, directory):
-        _sweep(directory)
-        with _nonce_lock(directory, nonce, deadline=deadline) as lock_fd:
-            if os.read(lock_fd, 1):
-                raise RuntimeError("launch environment publication cancelled")
-            _deadline(deadline)
-            name = f"env-{nonce}.json"
-            created = False
+    try:
+        with _state_directory(create=bool(populated), deadline=lease) as (root, parent):
+            _sweep_scopes(parent, deadline=lease)
+            if not populated:
+                return None
+            directory = _directory(parent, scope, private=True, create=True, deadline=lease)
             try:
-                output_fd = os.open(
-                    name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-                    0o600, dir_fd=directory,
-                )
-                created = True
-                try:
-                    output = os.fdopen(output_fd, "w", encoding="utf-8", newline="\n")
-                except BaseException:
-                    os.close(output_fd)
-                    raise
-                with output:
-                    json.dump({"nonce": nonce, "env": populated}, output)
-                # A descheduled publisher can cross its lease during the write.
-                # Keep the lock until completion or removal of its secret data.
-                _deadline(deadline)
-                return {"path": str(path / name)}
+                return _publish(populated, root / scope, directory, nonce, lease)
+            finally:
+                os.close(directory)
+    except FileNotFoundError:
+        if not populated:
+            return None
+        raise
+
+
+def _publish(populated: dict[str, str], path: Path, directory: int, nonce: str, lease: float):
+    with _nonce_lock(directory, nonce, deadline=lease) as lock_fd:
+        if os.read(lock_fd, 1):
+            raise RuntimeError("launch environment publication cancelled")
+        _deadline(lease)
+        name = f"env-{nonce}.json"
+        created = False
+        try:
+            output_fd = os.open(
+                name, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                0o600, dir_fd=directory,
+            )
+            created = True
+            try:
+                output = os.fdopen(output_fd, "w", encoding="utf-8", newline="\n")
             except BaseException:
-                if created:
-                    _unlink_own(directory, name)
+                os.close(output_fd)
                 raise
+            with output:
+                json.dump({"nonce": nonce, "env": populated}, output)
+            # A descheduled publisher can cross its lease during the write.
+            # Keep the lock until completion or removal of its secret data.
+            _deadline(lease)
+            return {"path": str(path / name)}
+        except BaseException:
+            if created:
+                _unlink_own(directory, name)
+            raise
 
 
 def cancel_env(scope: str, nonce: str) -> None:

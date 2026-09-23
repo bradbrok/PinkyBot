@@ -906,7 +906,8 @@ class _TmuxControl:
             if result.ok:
                 result.launch_env = receipt
             else:
-                await _cleanup_launch_env(receipt)
+                cleanup_receipt, receipt = receipt, None
+                await _cleanup_launch_env(cleanup_receipt)
             return result
         except BaseException:
             await _cleanup_launch_env(receipt)
@@ -3802,7 +3803,9 @@ class TmuxSession(TransportReplacementMixin):
             raise RuntimeError(f"{failure}; cleanup debt retained at {path}")
         _clear_tmux_spawn_cleanup_debt(path)
 
-    async def _rollback_spawned_session(self, *, site: str) -> str | None:
+    async def _rollback_spawned_session(
+        self, *, site: str, launch_env: tuple[CommandRunner, str, str] | None = None,
+    ) -> str | None:
         """Strictly and boundedly roll back a possibly-created tmux session.
 
         A returned non-ok kill enters the same verification path as a raise:
@@ -3833,11 +3836,16 @@ class TmuxSession(TransportReplacementMixin):
             )
 
         async def _cleanup() -> str | None:
-            failure = await _strict_owned_tmux_cleanup(
-                self._tmux,
-                agent_name=self.agent_name,
-                action=f"spawn rollback at {site}",
-            )
+            try:
+                failure = await _strict_owned_tmux_cleanup(
+                    self._tmux,
+                    agent_name=self.agent_name,
+                    action=f"spawn rollback at {site}",
+                )
+            finally:
+                # The pane may have died before its interpreter consumed JSON.
+                # Complete nonce cleanup after the kill attempt, even on failure.
+                await _cleanup_launch_env(launch_env)
             if failure is None:
                 if debt_path is not None:
                     try:
@@ -4025,7 +4033,10 @@ class TmuxSession(TransportReplacementMixin):
         claude_cmd = self._build_claude_cmd()
         env = self._build_repl_env()
 
+        launch_env = None
+
         async def _spawn():
+            nonlocal launch_env
             # Container is up (started above, outside this umbrella): seed its
             # trust file and home-volume credentials (via `podman exec`)
             # before the REPL launches. No-ops for local agents.
@@ -4042,6 +4053,7 @@ class TmuxSession(TransportReplacementMixin):
                 command=claude_cmd,
                 env=env,
             )
+            launch_env = result.launch_env
             if not result.ok:
                 raise RuntimeError(
                     f"tmux new-session failed: rc={result.returncode} "
@@ -4077,7 +4089,7 @@ class TmuxSession(TransportReplacementMixin):
                 raise asyncio.CancelledError
         except asyncio.TimeoutError as exc:
             rollback_failure = await self._rollback_spawned_session(
-                site="cold-start timeout"
+                site="cold-start timeout", launch_env=launch_env,
             )
             message = (
                 f"tmux[{self.agent_name}]: cold-start timed out after "
@@ -4088,7 +4100,7 @@ class TmuxSession(TransportReplacementMixin):
             raise RuntimeError(message) from exc
         except asyncio.CancelledError as exc:
             rollback_failure = await self._rollback_spawned_session(
-                site="cold-start cancellation"
+                site="cold-start cancellation", launch_env=launch_env,
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
@@ -4113,7 +4125,7 @@ class TmuxSession(TransportReplacementMixin):
             # the Python state machine to DEAD. Strict rollback stays bounded
             # and preserves the original failure (including CancelledError).
             rollback_failure = await self._rollback_spawned_session(
-                site="post-spawn liveness"
+                site="post-spawn liveness", launch_env=launch_env,
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
@@ -4147,7 +4159,7 @@ class TmuxSession(TransportReplacementMixin):
                 pass
             self._tailer = None
             rollback_failure = await self._rollback_spawned_session(
-                site="tailer-start failure"
+                site="tailer-start failure", launch_env=launch_env,
             )
             self._annotate_spawn_rollback_failure(exc, rollback_failure)
             raise
