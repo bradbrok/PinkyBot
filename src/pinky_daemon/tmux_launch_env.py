@@ -118,24 +118,35 @@ def _nonce_lock(directory: int, nonce: str, *, deadline: float | None = None):
     if deadline is not None:
         _deadline(deadline)
     name = f"env-{nonce}.lock"
-    fd = os.open(
-        name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600, dir_fd=directory,
-    )
-    try:
-        if not _private_regular(os.fstat(fd)):
-            raise PermissionError("unsafe launch environment lock")
-        fcntl.flock(fd, fcntl.LOCK_EX)
-        # GC may have removed the inode while a waiter retained an open fd.
-        # Neither an expired lease nor an unlinked inode authorizes publication.
+    while True:
         if deadline is not None:
             _deadline(deadline)
+        fd = os.open(
+            name, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW | os.O_NONBLOCK, 0o600,
+            dir_fd=directory,
+        )
+        try:
+            if not _private_regular(os.fstat(fd)):
+                raise PermissionError("unsafe launch environment lock")
+            fcntl.flock(fd, fcntl.LOCK_EX)
+            # GC can remove an inode while a waiter retains its descriptor.
+            if deadline is not None:
+                _deadline(deadline)
+            if not _lock_is_current(directory, name, fd):
+                continue
+            yield fd
+            return
+        finally:
+            os.close(fd)
+
+
+def _lock_is_current(directory: int, name: str, fd: int) -> bool:
+    try:
         current = os.stat(name, dir_fd=directory, follow_symlinks=False)
-        opened = os.fstat(fd)
-        if (current.st_dev, current.st_ino) != (opened.st_dev, opened.st_ino):
-            raise RuntimeError("launch environment lock was replaced")
-        yield fd
-    finally:
-        os.close(fd)
+    except FileNotFoundError:
+        return False
+    opened = os.fstat(fd)
+    return (current.st_dev, current.st_ino) == (opened.st_dev, opened.st_ino)
 
 
 def _unlink_own(directory: int, name: str) -> None:
@@ -164,28 +175,33 @@ def _sweep(directory: int) -> None:
             if not _private_regular(info) or now - info.st_mtime <= ttl:
                 continue
             lock_name = f"env-{match[1]}.lock"
-            try:
-                lock_fd = os.open(
-                    lock_name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK, dir_fd=directory,
-                )
-            except FileNotFoundError:
-                if match[2] == "json":
-                    _unlink_own(directory, name)
-                continue
-            try:
-                if not _private_regular(os.fstat(lock_fd)):
-                    continue
+            while True:
                 try:
-                    fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-                except BlockingIOError:
-                    continue
-                current = os.stat(name, dir_fd=directory, follow_symlinks=False)
-                if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
-                    continue
-                if now - current.st_mtime > ttl:
-                    _unlink_own(directory, name)
-            finally:
-                os.close(lock_fd)
+                    lock_fd = os.open(
+                        lock_name, os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=directory,
+                    )
+                except FileNotFoundError:
+                    if match[2] == "json":
+                        _unlink_own(directory, name)
+                    break
+                try:
+                    if not _private_regular(os.fstat(lock_fd)):
+                        break
+                    try:
+                        fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                    except BlockingIOError:
+                        break
+                    if not _lock_is_current(directory, lock_name, lock_fd):
+                        continue
+                    current = os.stat(name, dir_fd=directory, follow_symlinks=False)
+                    if (current.st_dev, current.st_ino) != (info.st_dev, info.st_ino):
+                        break
+                    if now - current.st_mtime > ttl:
+                        _unlink_own(directory, name)
+                    break
+                finally:
+                    os.close(lock_fd)
         except FileNotFoundError:
             continue
 
