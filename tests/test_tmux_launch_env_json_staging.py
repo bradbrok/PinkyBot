@@ -126,6 +126,18 @@ def test_secret_orphan_ttl_is_ten_minutes_not_metadata_ttl(home):
     assert metadata.exists(), "cancellation metadata needs a longer retention period"
 
 
+def test_empty_only_launch_sweeps_existing_orphans_without_creating_state(home):
+    assert stage(home, env={"SECRET": ""}) is None
+    assert not list(home.iterdir())
+    old_path = Path(stage(home)["path"])
+    young_path = Path(stage(home, nonce=OTHER_NONCE)["path"])
+    old = time.time() - 900
+    os.utime(old_path, (old, old))
+    assert stage(home, env={"SECRET": ""}) is None
+    assert not old_path.exists()
+    assert young_path.exists()
+
+
 def test_gc_never_follows_foreign_symlink(home):
     path = Path(stage(home)["path"])
     foreign = home / "foreign"
