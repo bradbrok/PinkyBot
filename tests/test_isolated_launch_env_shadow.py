@@ -41,12 +41,12 @@ def builder(kind, registry, tmp_path, monkeypatch):
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
-@pytest.mark.parametrize("flag", [None, "", "0", "true", "yes"])
+@pytest.mark.parametrize("flag", [None, "off"])
 def test_shadow_is_explicitly_opt_in(tmp_path, monkeypatch, kind, flag):
     if flag is None:
-        monkeypatch.delenv(isolated_launch_env.SHADOW_ENV, raising=False)
+        monkeypatch.delenv("PINKY_ISOLATED_ENV", raising=False)
     else:
-        monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, flag)
+        monkeypatch.setenv("PINKY_ISOLATED_ENV", flag)
     build, logs = builder(kind, Registry(), tmp_path, monkeypatch)
     build()
     assert not reports(logs)
@@ -71,7 +71,7 @@ def test_flag_off_adds_no_registry_lookups(tmp_path, monkeypatch, kind):
 def test_tri_state_predicate_and_name_only_reports(
     tmp_path, monkeypatch, kind, status, key, expected,
 ):
-    monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, "1")
+    monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     for name, value in SYNTHETIC_VALUES.items():
         monkeypatch.setenv(name, value)
     monkeypatch.setenv("ZOHO_API_SECRET", "synthetic-future-grant")
@@ -100,7 +100,7 @@ def test_tri_state_predicate_and_name_only_reports(
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
 @pytest.mark.parametrize("mode", ["container", "unix_user"])
 def test_nonlocal_mode_reports_despite_false_flag(tmp_path, monkeypatch, kind, mode):
-    monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, "1")
+    monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     build, logs = builder(kind, Registry("not_isolated", mode=mode), tmp_path, monkeypatch)
     build()
     assert reports(logs)[0]["isolation"] == "isolated"
@@ -108,18 +108,18 @@ def test_nonlocal_mode_reports_despite_false_flag(tmp_path, monkeypatch, kind, m
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
 def test_shadow_preserves_payload_bytes(tmp_path, monkeypatch, kind):
-    monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, "0")
+    monkeypatch.setenv("PINKY_ISOLATED_ENV", "off")
     for name, value in SYNTHETIC_VALUES.items():
         monkeypatch.setenv(name, value)
     build, logs = builder(kind, Registry(), tmp_path, monkeypatch)
     off = build()
-    monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, "1")
+    monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     on = build()
     # Codex forwards the operator's flag as part of existing full-env parity.
     # That input difference is the only allowed difference in output bytes.
     if kind != "claude":
-        assert off.pop(isolated_launch_env.SHADOW_ENV) == "0"
-        assert on.pop(isolated_launch_env.SHADOW_ENV) == "1"
+        assert off.pop("PINKY_ISOLATED_ENV") == "off"
+        assert on.pop("PINKY_ISOLATED_ENV") == "shadow"
     assert json.dumps(off, sort_keys=True).encode() == json.dumps(on, sort_keys=True).encode()
     assert len(reports(logs)) == 1
 
@@ -127,16 +127,16 @@ def test_shadow_preserves_payload_bytes(tmp_path, monkeypatch, kind):
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
 async def test_real_tmux_shadow_preserves_child_names(tmp_path, monkeypatch, kind):
     observed = []
-    for flag in ("0", "1"):
+    for flag in ("off", "shadow"):
         root = tmp_path / flag
         root.mkdir()
         with monkeypatch.context() as launch_patch:
             async with launch_probe(root, launch_patch) as probe:
-                launch_patch.setenv(isolated_launch_env.SHADOW_ENV, flag)
+                launch_patch.setenv("PINKY_ISOLATED_ENV", flag)
                 names = await probe.launch(kind)
                 assert DAEMON_NAMES <= names, "shadow must leave the existing inheritance intact"
                 assert "CLAUDE_CODE_OAUTH_TOKEN" in json.loads(probe.empty_names_path.read_text())
-                assert bool(reports(probe.logs)) is (flag == "1")
+                assert bool(reports(probe.logs)) is (flag == "shadow")
                 if kind == "claude":
                     assert "PINKY_AGENT_KEY" in names
                 observed.append(names)
@@ -157,8 +157,8 @@ def test_base_allowlist_and_explicit_names_do_not_hide_daemon_only(monkeypatch):
             raise AssertionError("shadow read an environment value")
 
         def get(self, name, default=None):
-            assert name == isolated_launch_env.SHADOW_ENV
-            return "1"
+            assert name == "PINKY_ISOLATED_ENV"
+            return "shadow"
 
         def items(self):
             raise AssertionError("shadow iterated environment values")
@@ -178,7 +178,7 @@ def test_base_allowlist_and_explicit_names_do_not_hide_daemon_only(monkeypatch):
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
 def test_status_is_rechecked_for_each_build(tmp_path, monkeypatch, kind):
-    monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, "1")
+    monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     registry = Registry("not_isolated")
     build, logs = builder(kind, registry, tmp_path, monkeypatch)
     build()
@@ -197,7 +197,7 @@ def test_missing_registry_and_lookup_failure_are_unknown():
 
 @pytest.mark.parametrize("kind", ["codex", "app_server"])
 def test_key_lookup_failure_still_reports_proven_isolated(tmp_path, monkeypatch, kind):
-    monkeypatch.setenv(isolated_launch_env.SHADOW_ENV, "1")
+    monkeypatch.setenv("PINKY_ISOLATED_ENV", "shadow")
     registry = Registry()
     monkeypatch.setattr(registry, "get_signing_key", Mock(side_effect=RuntimeError("synthetic")))
     build, logs = builder(kind, registry, tmp_path, monkeypatch)

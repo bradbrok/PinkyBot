@@ -92,12 +92,15 @@ class LaunchProbe:
         self.supervisor = None
         self.client = None
 
-    async def launch(self, kind="claude", *, registry=None, session=None, forbidden=None):
+    async def launch(
+        self, kind="claude", *, registry=None, session=None, forbidden=None,
+        provider_key="synthetic-provider-key", provider_url="", empty_token=True,
+    ):
         m = self.monkeypatch
         registry = registry if registry is not None else Registry()
         config = StreamingSessionConfig(
             agent_name="test-tenant", working_dir=str(self.root),
-            provider_key="synthetic-provider-key",
+            provider_key=provider_key, provider_url=provider_url,
         )
         if kind == "app_server":
             m.setenv("PINKY_CODEX_APP_SERVER", "1")
@@ -128,12 +131,13 @@ class LaunchProbe:
             target, builder = session, "_build_repl_env"
         real_builder = getattr(target, builder)
 
-        def explicit_payload():
-            env = real_builder()
+        def explicit_payload(**kwargs):
+            env = real_builder(**kwargs)
             # Exercise explicit payload delivery without implementing registry
             # grants here. PYTHONPATH binds the real shim to this test checkout.
             env["EXPLICIT_ALLOWED_NAME"] = "synthetic-allowed"
-            env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
+            if empty_token:
+                env["CLAUDE_CODE_OAUTH_TOKEN"] = ""
             env["PYTHONPATH"] = self.seed["PYTHONPATH"]
             if forbidden:
                 env[forbidden] = SYNTHETIC_VALUES[forbidden]
@@ -163,9 +167,16 @@ class LaunchProbe:
 
 
 @asynccontextmanager
-async def launch_probe(root, monkeypatch):
+async def launch_probe(root, monkeypatch, *, mode=None):
     probe = LaunchProbe(root, monkeypatch)
     try:
+        if mode is not None:
+            monkeypatch.setenv("PINKY_ISOLATED_ENV", mode)
+        if mode == "enforce":
+            grants = root / "grants.json"
+            grants.write_text("{}")
+            grants.chmod(0o600)
+            monkeypatch.setenv("PINKY_ISOLATED_ENV_GRANTS_FILE", str(grants))
         yield probe
     finally:
         await probe.close()

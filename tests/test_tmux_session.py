@@ -1634,50 +1634,36 @@ def test_build_repl_env_provisions_per_agent_key(monkeypatch) -> None:
     ss._registry.get_signing_key.assert_called_once_with("dymok")
 
 
-def test_build_repl_env_isolated_withholds_global_secret(monkeypatch) -> None:
-    """#149 phase-3 gate: an isolated agent that carries its own per-agent key
-    must NOT receive the global PINKY_SESSION_SECRET (which the daemon accepts
-    for any name → a forgery vector). It gets PINKY_AGENT_KEY only."""
-    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
-    ss, _ = _make_session(agent_name="dymok")
-    ss._registry = MagicMock()
-    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
-    ss._registry.get.return_value.isolated = True
-    env = ss._build_repl_env()
-    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
-    assert "PINKY_SESSION_SECRET" not in env
+async def test_build_repl_env_isolated_withholds_global_secret(tmp_path, monkeypatch) -> None:
+    """The child, including inherited state, must only carry its scoped identity."""
+    from tests.tmux_isolated_env_support import Registry, launch_probe
+
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        names = await probe.launch(registry=Registry())
+        assert "PINKY_AGENT_KEY" in names
+        assert "PINKY_SESSION_SECRET" not in names
 
 
-def test_build_repl_env_isolated_without_key_withholds_secret(monkeypatch) -> None:
-    """Fail CLOSED (Murzik #639 review): an isolated agent with NO per-agent
-    key is a provisioning failure, not an availability case — withhold the
-    global secret too (hooks/MCP no-op) rather than hand a sandbox the
-    forgeable fleet-wide signing secret for the very window this gate closes."""
-    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
-    ss, _ = _make_session(agent_name="dymok")
-    ss._registry = MagicMock()
-    ss._registry.get_signing_key.return_value = None
-    ss._registry.get.return_value.isolated = True
-    env = ss._build_repl_env()
-    assert "PINKY_AGENT_KEY" not in env
-    assert "PINKY_SESSION_SECRET" not in env
+async def test_build_repl_env_isolated_without_key_withholds_secret(tmp_path, monkeypatch) -> None:
+    """Missing scoped identity must not fall back to an inherited global key."""
+    from tests.tmux_isolated_env_support import Registry, launch_probe
+
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        names = await probe.launch(registry=Registry(key=""))
+        assert "PINKY_AGENT_KEY" not in names
+        assert "PINKY_SESSION_SECRET" not in names
 
 
-def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
-    monkeypatch,
+async def test_build_repl_env_withholds_secret_when_isolation_unknown_but_key_present(
+    tmp_path, monkeypatch,
 ) -> None:
-    """Fail-open guard (Murzik #639 review): if a per-agent key resolves but the
-    isolation lookup RAISES (status unknown), the global secret must still be
-    withheld — registry uncertainty must not expose the forgeable fleet secret
-    (same fail-open class as #635). The key already gives a working identity."""
-    monkeypatch.setenv("PINKY_SESSION_SECRET", "global-secret-xyz")
-    ss, _ = _make_session(agent_name="dymok")
-    ss._registry = MagicMock()
-    ss._registry.get_signing_key.return_value = "dymok-per-agent-key"
-    ss._registry.get.side_effect = RuntimeError("db locked")
-    env = ss._build_repl_env()
-    assert env.get("PINKY_AGENT_KEY") == "dymok-per-agent-key"
-    assert "PINKY_SESSION_SECRET" not in env
+    """Unknown isolation plus a key protects the actual child environment."""
+    from tests.tmux_isolated_env_support import Registry, launch_probe
+
+    async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
+        names = await probe.launch(registry=Registry("unknown"))
+        assert "PINKY_AGENT_KEY" in names
+        assert "PINKY_SESSION_SECRET" not in names
 
 
 def test_build_repl_env_omits_agent_key_when_registry_absent() -> None:
