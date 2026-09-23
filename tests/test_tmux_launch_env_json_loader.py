@@ -154,6 +154,20 @@ def test_loader_rejects_symlink_without_following_or_removing_target(home):
     assert target.read_bytes() == before
 
 
+def test_loader_fifo_without_writer_refuses_promptly(home):
+    path = payload(home)
+    path.unlink()
+    os.mkfifo(path, mode=0o600)
+    source = Path(tmux_launch_env.__file__).read_text()
+    result = subprocess.run(
+        [sys.executable, "-I", "-c", source, str(path), NONCE, probe_command()],
+        input=b"", capture_output=True, timeout=2,
+        env={"HOME": str(home), "PATH": os.defpath},
+    )
+    assert result.returncode == 1 and not result.stdout
+    assert result.stderr.strip() == b"launch environment load failed"
+
+
 def loader():
     fn = getattr(tmux_launch_env, "load_env", None)
     assert callable(fn), "the isolated helper must expose its loader for syscall-order probes"

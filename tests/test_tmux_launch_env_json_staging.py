@@ -1,5 +1,6 @@
 """Nonce cancellation and publication remain atomic across process boundaries."""
 
+import fcntl
 import json
 import os
 import subprocess
@@ -115,11 +116,14 @@ def test_secret_orphan_ttl_is_ten_minutes_not_metadata_ttl(home):
     old_path = Path(stage(home)["path"])
     young_path = Path(stage(home, nonce=OTHER_NONCE)["path"])
     now = time.time()
-    os.utime(old_path, (now - 601, now - 601))
+    metadata = old_path.with_suffix(".lock")
+    os.utime(old_path, (now - 900, now - 900))
+    os.utime(metadata, (now - 900, now - 900))
     os.utime(young_path, (now - 30, now - 30))
     stage(home, nonce="d4" * 16)
     assert not old_path.exists(), "secret orphans must not wait for metadata retention"
     assert young_path.exists(), "a live launch still needs its secret file"
+    assert metadata.exists(), "cancellation metadata needs a longer retention period"
 
 
 def test_gc_never_follows_foreign_symlink(home):
@@ -215,14 +219,33 @@ m.stage_env({"SECRET":"synthetic-json-launch-value-82e6"},"c3"*32,"a1"*16,deadli
     cleaner = None
     try:
         await_file(ready, stager)
+        lock_path = probe.with_name(f"env-{NONCE}.lock")
+        lock_fd = os.open(lock_path, os.O_RDWR | os.O_NOFOLLOW)
+        try:
+            with pytest.raises(BlockingIOError):
+                fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        finally:
+            os.close(lock_fd)
         cleaner = worker(home, '''
+import fcntl,os
 from pathlib import Path
 from pinky_daemon import tmux_launch_env as m
-Path(sys.argv[1]).touch()
+original=fcntl.flock
+expected=os.stat(sys.argv[2])
+def witnessed_flock(fd,op):
+    info=os.fstat(fd)
+    assert (info.st_dev,info.st_ino)==(expected.st_dev,expected.st_ino)
+    try:
+        original(fd,fcntl.LOCK_EX|fcntl.LOCK_NB)
+    except BlockingIOError:
+        Path(sys.argv[1]).touch()
+    else:
+        raise AssertionError("cleanup did not contend with the publisher")
+    return original(fd,op)
+fcntl.flock=witnessed_flock
 m.cancel_env("c3"*32,"a1"*16)
-''', home / "cleanup-entered")
+''', home / "cleanup-entered", lock_path)
         await_file(home / "cleanup-entered", cleaner)
-        time.sleep(0.15)
         assert cleaner.poll() is None, "cleanup crossed the locked check/publication boundary"
         release.touch()
         assert stager.wait(timeout=5) == 0
@@ -240,19 +263,26 @@ def test_stale_lock_fd_after_gc_cannot_publish_after_deadline(home):
     directory = home / ".local/state/pinkybot/tmux-launch-env" / SCOPE
     ready, release = home / "opened-lock", home / "resume-lock"
     code = '''
-import fcntl,time
+import fcntl,json,os,time
 from pathlib import Path
 from pinky_daemon import tmux_launch_env as m
 ready,release=map(Path,sys.argv[1:3])
 original=fcntl.flock
 parked=False
-deadline=time.time()+1
+deadline=time.time()+30
+lock_path=Path.home()/".local/state/pinkybot/tmux-launch-env"/("c3"*32)/("env-"+"a1"*16+".lock")
 def parked_flock(fd,op):
     global parked
     if op & fcntl.LOCK_EX and not parked:
         parked=True
-        ready.touch()
+        info=os.fstat(fd)
+        expected=lock_path.stat()
+        assert (info.st_dev,info.st_ino)==(expected.st_dev,expected.st_ino)
+        ready.write_text(json.dumps({"dev":info.st_dev,"ino":info.st_ino,"deadline":deadline}))
         while not release.exists(): time.sleep(.01)
+        still_open=os.fstat(fd)
+        ready.with_suffix(".resumed").write_text(json.dumps({"dev":still_open.st_dev,"ino":still_open.st_ino}))
+        time.time=lambda: deadline+1
     return original(fd,op)
 fcntl.flock=parked_flock
 try:
@@ -265,21 +295,27 @@ else:
     stager = worker(home, code, ready, release)
     try:
         await_file(ready, stager)
+        inode_a = json.loads(ready.read_text())
+        lock_a = directory / f"env-{NONCE}.lock"
+        assert (inode_a["dev"], inode_a["ino"]) == (lock_a.stat().st_dev, lock_a.stat().st_ino)
         old = time.time() - 7 * 24 * 3600
         old_files = list(directory.iterdir())
         for path in old_files:
             os.utime(path, (old, old))
         stage(home, nonce=OTHER_NONCE)
         assert all(not p.exists() for p in old_files), "GC did not remove the old lock inode"
-        time.sleep(1.1)
         # Recreate only the lock pathname, without a cancellation marker. The
         # child's already-open inode must not bypass its publication deadline.
         locks = [p for p in old_files if p.suffix == ".lock"]
         assert len(locks) == 1
         locks[0].touch(mode=0o600)
+        inode_b = locks[0].stat()
+        assert (inode_b.st_dev, inode_b.st_ino) != (inode_a["dev"], inode_a["ino"])
         release.touch()
         out, err = stager.communicate(timeout=5)
         assert stager.returncode == 0, (out, err)
+        resumed = json.loads(ready.with_suffix(".resumed").read_text())
+        assert resumed == {"dev": inode_a["dev"], "ino": inode_a["ino"]}
         assert not (directory / f"env-{NONCE}.json").exists()
         assert [p for p in directory.iterdir() if NONCE in p.name] == locks
     finally:
