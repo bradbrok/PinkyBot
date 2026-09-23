@@ -61,15 +61,27 @@ async def test_grants_reload_at_next_real_spawn(tmp_path, monkeypatch, kind):
 
 
 @pytest.mark.parametrize("kind", ["claude", "codex", "app_server"])
-async def test_one_policy_snapshot_per_real_spawn(tmp_path, monkeypatch, kind):
+@pytest.mark.parametrize("flip_after_capture", [False, True])
+async def test_one_policy_snapshot_per_real_spawn(tmp_path, monkeypatch, kind, flip_after_capture):
     async with launch_probe(tmp_path, monkeypatch, mode="enforce") as probe:
-        capture = Mock(wraps=isolated_launch_env.capture_policy)
+        real_capture = isolated_launch_env.capture_policy
+
+        def change_policy_inputs():
+            monkeypatch.setenv("PINKY_ISOLATED_ENV", "off")
+            Path(os.environ["PINKY_ISOLATED_ENV_GRANTS_FILE"]).write_text("{")
+
+        def capture_and_flip(**kwargs):
+            policy = real_capture(**kwargs)
+            if flip_after_capture:
+                change_policy_inputs()
+            return policy
+
+        capture = Mock(wraps=capture_and_flip)
         monkeypatch.setattr(isolated_launch_env, "capture_policy", capture)
         real_spawn = probe.control.new_session
 
         async def change_mode_after_policy(**kwargs):
-            monkeypatch.setenv("PINKY_ISOLATED_ENV", "off")
-            Path(os.environ["PINKY_ISOLATED_ENV_GRANTS_FILE"]).write_text("{")
+            change_policy_inputs()
             return await real_spawn(**kwargs)
 
         monkeypatch.setattr(probe.control, "new_session", change_mode_after_policy)
