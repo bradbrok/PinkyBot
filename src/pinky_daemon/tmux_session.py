@@ -73,7 +73,7 @@ from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import Literal
 
-from pinky_daemon import tmux_launch_env
+from pinky_daemon import tmux_launch_env, tmux_launch_env_loader
 from pinky_daemon.agent_registry import (
     CLAUDE_NATIVE_CROSS_SESSION_DENIED_TOOLS,
     validate_restart_tokens_cap,
@@ -139,7 +139,19 @@ FRESH_CONTEXT_RESPAWN_GRACE_SEC = 180.0
 
 # Allow namespace entry and interpreter startup the same budget as credential seeding.
 _NAMESPACE_SEED_TIMEOUT_SEC = 15.0
-_LAUNCH_ENV_SOURCE = Path(tmux_launch_env.__file__).read_text()
+# Cache both target programs once. Only the small loader crosses tmux's
+# command-size boundary; staging uses the runner directly.
+_LAUNCH_ENV_LOADER_SOURCE = Path(tmux_launch_env_loader.__file__).read_text()
+_LAUNCH_ENV_SOURCE = (
+    "import sys, types\n"
+    "_package = types.ModuleType('pinky_daemon')\n"
+    "_package.__path__ = []\n"
+    "sys.modules['pinky_daemon'] = _package\n"
+    "_loader = types.ModuleType('pinky_daemon.tmux_launch_env_loader')\n"
+    f"exec({_LAUNCH_ENV_LOADER_SOURCE!r}, _loader.__dict__)\n"
+    "sys.modules[_loader.__name__] = _loader\n"
+    f"exec({Path(tmux_launch_env.__file__).read_text()!r})\n"
+)
 
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
@@ -881,7 +893,7 @@ class _TmuxControl:
                     raise RuntimeError("invalid launch environment staging response")
                 python = sys.executable if isinstance(runner, LocalCommandRunner) else "python3"
                 command = "exec " + shlex.join([
-                    python, "-I", "-c", _LAUNCH_ENV_SOURCE, path, nonce, command,
+                    python, "-I", "-c", _LAUNCH_ENV_LOADER_SOURCE, path, nonce, command,
                 ])
             args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
             for key, value in env.items():
