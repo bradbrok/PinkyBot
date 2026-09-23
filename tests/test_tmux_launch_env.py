@@ -164,19 +164,9 @@ async def test_real_shell_quoting_round_trip_without_evaluation(private_home, va
     payload = child_payload(run_pane(recorder.tmux_calls[-1], private_home))
     assert payload["env"]["QUOTED"] == value
     assert not path.exists()
-    expected_keys = {
-        "HOME",
-        "PATH",
-        "PWD",
-        "SHLVL",
-        "_",
-        "UNKNOWN_CREDENTIAL",
-        "QUOTED",
-        "LC_CTYPE",
-    }
-    assert not set(payload["env"]) - expected_keys, (
-        "integrity bookkeeping must not leak to child env"
-    )
+    control_env = child_payload(run_pane([probe_command(private_home)], private_home))["env"]
+    assert set(payload["env"]) - set(control_env) == {"UNKNOWN_CREDENTIAL", "QUOTED"}
+    assert not any(key.startswith("__PINKY_LAUNCH_") for key in payload["env"])
 
 
 @pytest.mark.parametrize(
