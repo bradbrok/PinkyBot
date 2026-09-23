@@ -11,7 +11,7 @@ from the daemon process.
 What this supervisor owns:
 
   * spawn the shim in a detached tmux session ``pinky-codex-as-<agent>``,
-    passing the full daemon env via tmux ``-e`` (tmux drops parent env, so it
+    passing the daemon env through the private launch boundary (tmux drops parent env, so it
     must be injected explicitly — parity with the subprocess path's
     ``{**os.environ}`` so CODEX_HOME/HOME/XDG/proxy/cert all reach the
     grandchild ``codex`` the shim spawns, not just the shim; see _build_env)
@@ -40,6 +40,7 @@ import sys
 import tempfile
 from collections.abc import Callable
 
+from pinky_daemon import tmux_launch_env
 from pinky_daemon.codex_app_server import (
     _STREAM_LIMIT,
     CodexAppServerClient,
@@ -229,11 +230,16 @@ class CodexAppServerSupervisor:
         it points at the SAME Codex home/session store (Murzik, #792 P1).
 
         We propagate the entire daemon env (overlaying the configured key for
-        item H), minus tmux-internal vars and multiline values.
+        item H), minus tmux-internal vars, invalid shell names and multiline values.
         """
         env: dict[str, str] = {}
         for key, value in os.environ.items():
             if key in self._ENV_DROP:
+                continue
+            if not tmux_launch_env.is_valid_key_name(key):
+                self._log(
+                    f"WARNING codex[{self.agent_name}]: dropping invalid env name {repr(key)[:64]}"
+                )
                 continue
             if "\n" in value or "\r" in value:
                 self._log(

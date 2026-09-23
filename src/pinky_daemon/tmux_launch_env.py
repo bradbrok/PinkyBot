@@ -19,10 +19,15 @@ from pathlib import Path
 _KEY = re.compile(r"[A-Za-z_][A-Za-z0-9_]*", re.ASCII)
 
 
+def is_valid_key_name(key: str) -> bool:
+    """Return whether a name can be assigned by the launch shell."""
+    return isinstance(key, str) and _KEY.fullmatch(key) is not None
+
+
 def validate_env(env: dict[str, str]) -> None:
     """Reject unsourceable input before creating or pruning any file."""
     for key, value in env.items():
-        if not isinstance(key, str) or _KEY.fullmatch(key) is None or key.startswith("__PINKY_LAUNCH_"):
+        if not is_valid_key_name(key) or key.startswith("__PINKY_LAUNCH_"):
             raise ValueError("invalid launch environment key")
         if not isinstance(value, str) or "\x00" in value:
             raise ValueError("invalid launch environment value")

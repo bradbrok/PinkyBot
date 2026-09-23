@@ -135,6 +135,9 @@ DEFAULT_MAX_CONCURRENT_SUBAGENTS = 6
 # crash returns to normal ``--continue`` behavior.
 FRESH_CONTEXT_RESPAWN_GRACE_SEC = 180.0
 
+# Allow namespace entry and interpreter startup the same budget as credential seeding.
+_NAMESPACE_SEED_TIMEOUT_SEC = 15.0
+
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
 # ──────────────────────────────────────────────────────────────────────────
@@ -812,7 +815,7 @@ class _TmuxControl:
             result = await self._runner.run(
                 ["python3", "-c", Path(tmux_launch_env.__file__).read_text()],
                 stdin_data=json.dumps({"env": env, "scope": scope}).encode(),
-                timeout=5.0,
+                timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
             )
             if not result.ok:
                 raise RuntimeError("launch environment staging failed")
@@ -2633,7 +2636,7 @@ class TmuxSession(TransportReplacementMixin):
         if mode == _CLAUDE_AUTH_MODE_PER_AGENT_OAUTH:
             try:
                 res = await runner.run(
-                    ["python3", "-c", _CONTAINER_CREDS_STATE_PY], timeout=15
+                    ["python3", "-c", _CONTAINER_CREDS_STATE_PY], timeout=_NAMESPACE_SEED_TIMEOUT_SEC
                 )
                 if res.ok:
                     state = res.stdout.decode("utf-8", "replace").strip()
@@ -2665,7 +2668,9 @@ class TmuxSession(TransportReplacementMixin):
             'chmod 600 "$HOME/.claude/.credentials.json"; }'
         )
         try:
-            res = await runner.run(["sh", "-c", seed_sh], timeout=15)
+            res = await runner.run(
+                ["sh", "-c", seed_sh], timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
+            )
             if res.ok:
                 _log(
                     f"tmux[{self.agent_name}]: ensured claude credentials in "

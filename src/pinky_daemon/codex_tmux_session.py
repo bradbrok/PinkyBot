@@ -51,6 +51,7 @@ import shlex
 import time
 from pathlib import Path
 
+from pinky_daemon import tmux_launch_env
 from pinky_daemon.codex_home import (
     MANAGED_CONFIG_SENTINEL,
     codex_home_for,
@@ -325,7 +326,7 @@ class CodexTmuxSession(TmuxSession):
         So we propagate the entire daemon env — including ``CODEX_HOME`` (item G:
         the child writes, and discovery scans, the SAME rollout store) and
         ``PATH`` (so the ``codex`` / ``node`` binaries resolve) — minus
-        tmux-internal vars and multiline values, then overlay the configured
+        tmux-internal vars, invalid shell names and multiline values, then overlay the configured
         ``OPENAI_API_KEY`` (item H) and this agent's ``PINKY_AGENT_NAME``. No
         ANTHROPIC_* special-casing is needed: codex ignores them, exactly as the
         subprocess transport already inherits them harmlessly.
@@ -333,6 +334,11 @@ class CodexTmuxSession(TmuxSession):
         env: dict[str, str] = {}
         for key, value in os.environ.items():
             if key in self._ENV_DROP:
+                continue
+            if not tmux_launch_env.is_valid_key_name(key):
+                _log(
+                    f"WARNING tmux[{self.agent_name}]: dropping invalid env name {repr(key)[:64]}"
+                )
                 continue
             if "\n" in value or "\r" in value:
                 _log(
