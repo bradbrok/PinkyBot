@@ -57,7 +57,11 @@ def shadow_enabled() -> bool:
 
 
 def isolation_status(registry, agent_name: str) -> str:
-    """Use the existing tri-state lookup and non-local mode coupling."""
+    """Preserve tri-state lookup and non-local mode coupling.
+
+    Unknown is not not_isolated: registry uncertainty plus a scoped key must
+    never inject the global secret. A boolean lookup would fail open.
+    """
     if not registry or not agent_name:
         return "unknown"
     try:

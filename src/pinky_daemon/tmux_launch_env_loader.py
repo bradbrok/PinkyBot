@@ -1,4 +1,4 @@
-"""Private launch loader."""
+# Terse: 4 KiB tmux launch budget.
 
 import json
 import os
