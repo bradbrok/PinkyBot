@@ -276,7 +276,7 @@ def test_loader_clean_exec_and_actual_names_only_log(tmp_path):
     assert b"inherited environment scrubbed" in result.stderr
     before = json.loads(result.stderr.splitlines()[0].removeprefix(b"inherited-names="))
     expected_base = {"HOME", "PATH", "LC_ALL", "XDG_CONFIG_HOME", "HTTPS_PROXY", "SSL_CERT_FILE"}
-    count = len(set(before) - expected_base)
+    count = len(set(before) - expected_base - {"GRANTED_NAME"})
     assert f"{count} names dropped".encode() in result.stderr and b"GRANTED_NAME" in result.stderr
 
 
