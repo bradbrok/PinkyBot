@@ -420,3 +420,47 @@ def test_sweep_never_uses_replaced_lock_inode(home, monkeypatch):
     finally:
         if replacement_fd is not None:
             os.close(replacement_fd)
+
+
+def test_cancel_retries_missing_lock_after_partial_gc(home, monkeypatch):
+    path = Path(stage(home)["path"])
+    lock_path = path.with_suffix(".lock")
+    old = time.time() - 2 * 24 * 60 * 60
+    os.utime(lock_path, (old, old))
+    os.utime(path, (old, old))
+    real_flock, real_unlink = fcntl.flock, os.unlink
+    collected = False
+    acquired = []
+
+    class InterruptedSweepError(Exception):
+        pass
+
+    def stop_after_lock_removal(name, *args, **kwargs):
+        real_unlink(name, *args, **kwargs)
+        if name == lock_path.name:
+            raise InterruptedSweepError
+
+    def collect_before_cancel_locks(fd, flags):
+        nonlocal collected
+        if flags == fcntl.LOCK_EX and not collected:
+            collected = True
+            acquired.append(os.fstat(fd).st_ino)
+            directory = os.open(path.parent, os.O_RDONLY | os.O_DIRECTORY)
+            try:
+                with monkeypatch.context() as during_gc:
+                    during_gc.setattr(os, "listdir", lambda _: [lock_path.name, path.name])
+                    during_gc.setattr(os, "unlink", stop_after_lock_removal)
+                    with pytest.raises(InterruptedSweepError):
+                        tmux_launch_env._sweep(directory)
+                assert not lock_path.exists() and path.exists()
+                assert os.fstat(fd).st_ino == acquired[0], "the canceller still holds A"
+            finally:
+                os.close(directory)
+        real_flock(fd, flags)
+
+    monkeypatch.setattr(fcntl, "flock", collect_before_cancel_locks)
+    cancel()
+    assert collected
+    assert not path.exists()
+    assert lock_path.stat().st_ino != acquired[0]
+    assert lock_path.read_bytes() == b"cancelled\n"
