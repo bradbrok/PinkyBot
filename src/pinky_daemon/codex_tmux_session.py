@@ -302,10 +302,6 @@ class CodexTmuxSession(TmuxSession):
         self._codex_model = model
         return "pending_restart"
 
-    # tmux-internal vars that must not leak into the nested REPL's children
-    # (mirrors ``CodexAppServerSupervisor._ENV_DROP``).
-    _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})
-
     # ── seam: env ───────────────────────────────────────────────────────────
     def _build_repl_env(self) -> dict[str, str]:
         """Full daemon-env parity for the codex tmux pane — NOT a small allowlist.
@@ -320,33 +316,20 @@ class CodexTmuxSession(TmuxSession):
         / network / session config: it drops ``HOME`` / ``XDG_*``, the proxy +
         TLS bundle (``HTTPS_PROXY`` / ``SSL_CERT_FILE`` / ``NODE_EXTRA_CA_CERTS``),
         ``OPENAI_BASE_URL`` / ``OPENAI_ORG`` / other ``OPENAI_*`` + ``CODEX_*``
-        knobs, and any future auth/config env (Murzik #795 P1; same class as the
+        knobs, and any future auth/config env (#795 P1; same class as the
         #792 app-server env-parity fix).
 
         So we propagate the entire daemon env — including ``CODEX_HOME`` (item G:
         the child writes, and discovery scans, the SAME rollout store) and
         ``PATH`` (so the ``codex`` / ``node`` binaries resolve) — minus
-        tmux-internal vars, invalid shell names and multiline values, then overlay the configured
+        shell internals, invalid names, undecodable and multiline values, then overlay the configured
         ``OPENAI_API_KEY`` (item H) and this agent's ``PINKY_AGENT_NAME``. No
         ANTHROPIC_* special-casing is needed: codex ignores them, exactly as the
         subprocess transport already inherits them harmlessly.
         """
-        env: dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key in self._ENV_DROP:
-                continue
-            if not tmux_launch_env.is_valid_key_name(key):
-                _log(
-                    f"WARNING tmux[{self.agent_name}]: dropping invalid env name {repr(key)[:64]}"
-                )
-                continue
-            if "\n" in value or "\r" in value:
-                _log(
-                    f"tmux[{self.agent_name}]: dropping multiline env {key!r} "
-                    f"(excluded from launch environment)"
-                )
-                continue
-            env[key] = value
+        env = tmux_launch_env.ambient_env(
+            os.environ.items(), lambda message: _log(f"tmux[{self.agent_name}]: {message}"),
+        )
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
         if self.agent_name:

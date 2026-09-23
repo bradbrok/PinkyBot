@@ -54,7 +54,7 @@ from pinky_daemon.codex_home import (
 )
 from pinky_daemon.command_runner import LocalCommandRunner
 from pinky_daemon.streaming_session import _log
-from pinky_daemon.tmux_session import _TmuxControl
+from pinky_daemon.tmux_session import _cleanup_launch_env, _TmuxControl
 
 # Generous: covers tmux new-session + python import + shim bind. The shim binds
 # its socket before any slow work, so accept usually lands in well under a
@@ -197,7 +197,11 @@ class CodexAppServerSupervisor:
                 f"{result.stderr.strip()}"
             )
 
-        reader, writer = await self._await_accept()
+        try:
+            reader, writer = await self._await_accept()
+        except BaseException:
+            await _cleanup_launch_env(getattr(result, "launch_env", None))
+            raise
 
         client = CodexAppServerClient(
             reader,
@@ -214,9 +218,6 @@ class CodexAppServerSupervisor:
         )
         return client, _TmuxAppServerProc(self, pid=0)
 
-    # tmux-internal vars that must not leak into a nested session's children.
-    _ENV_DROP = frozenset({"TMUX", "TMUX_PANE"})
-
     def _build_env(self) -> dict[str, str]:
         """Full daemon-env parity for the tmux session — NOT just PATH.
 
@@ -227,27 +228,14 @@ class CodexAppServerSupervisor:
         the child silently runs under different CODEX_HOME / HOME / XDG_* / proxy
         / cert / OPENAI_*/CODEX_* settings. That breaks auth and — critically —
         item G: a fresh child's ``thread/resume`` only finds the prior thread if
-        it points at the SAME Codex home/session store (Murzik, #792 P1).
+        it points at the SAME Codex home/session store (#792 P1).
 
-        We propagate the entire daemon env (overlaying the configured key for
-        item H), minus tmux-internal vars, invalid shell names and multiline values.
+        We propagate the daemon env (overlaying the configured key for item H),
+        excluding shell internals, invalid names, undecodable and multiline values.
         """
-        env: dict[str, str] = {}
-        for key, value in os.environ.items():
-            if key in self._ENV_DROP:
-                continue
-            if not tmux_launch_env.is_valid_key_name(key):
-                self._log(
-                    f"WARNING codex[{self.agent_name}]: dropping invalid env name {repr(key)[:64]}"
-                )
-                continue
-            if "\n" in value or "\r" in value:
-                self._log(
-                    f"codex[{self.agent_name}]: dropping multiline env {key!r} "
-                    f"(excluded from launch environment)"
-                )
-                continue
-            env[key] = value
+        env = tmux_launch_env.ambient_env(
+            os.environ.items(), lambda message: self._log(f"codex[{self.agent_name}]: {message}"),
+        )
         if self._openai_api_key:
             env["OPENAI_API_KEY"] = self._openai_api_key
         if per_agent_codex_home_enabled():

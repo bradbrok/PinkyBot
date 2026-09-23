@@ -61,7 +61,9 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import shlex
+import sys
 import threading
 import time
 from collections import OrderedDict, deque
@@ -137,6 +139,7 @@ FRESH_CONTEXT_RESPAWN_GRACE_SEC = 180.0
 
 # Allow namespace entry and interpreter startup the same budget as credential seeding.
 _NAMESPACE_SEED_TIMEOUT_SEC = 15.0
+_LAUNCH_ENV_SOURCE = Path(tmux_launch_env.__file__).read_text()
 
 # ──────────────────────────────────────────────────────────────────────────
 # Tmux subprocess control
@@ -598,10 +601,47 @@ class TmuxCommandResult:
     returncode: int
     stdout: str
     stderr: str
+    launch_env: tuple[CommandRunner, str, str] | None = field(default=None, repr=False, compare=False)
 
     @property
     def ok(self) -> bool:
         return self.returncode == 0
+
+
+async def _cleanup_launch_env(receipt: tuple[CommandRunner, str, str] | None) -> None:
+    """Finish exact-nonce cleanup before allowing cancellation to unwind."""
+    if receipt is None:
+        return
+    runner, scope, nonce = receipt
+
+    async def cleanup() -> None:
+        if isinstance(runner, LocalCommandRunner):
+            await asyncio.to_thread(tmux_launch_env.cancel_env, scope, nonce)
+        else:
+            result = await runner.run(
+                ["python3", "-I", "-c", _LAUNCH_ENV_SOURCE],
+                stdin_data=json.dumps({"action": "cancel", "scope": scope, "nonce": nonce}).encode(),
+                timeout=tmux_launch_env.PUBLICATION_TIMEOUT + _NAMESPACE_SEED_TIMEOUT_SEC,
+            )
+            if not result.ok:
+                raise RuntimeError("launch environment cleanup failed")
+
+    task = asyncio.create_task(cleanup())
+    cancelled = False
+    while not task.done():
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            cancelled = True
+        except Exception:
+            break
+    try:
+        task.result()
+    except (Exception, asyncio.CancelledError):
+        # Runner exceptions can contain command input; never interpolate them.
+        _log("WARNING launch environment cleanup failed")
+    if cancelled:
+        raise asyncio.CancelledError
 
 
 class _TmuxControl:
@@ -795,70 +835,70 @@ class _TmuxControl:
         command: str,
         env: dict[str, str] | None = None,
     ) -> TmuxCommandResult:
-        """Spawn a fresh detached tmux session running ``command``.
-
-        ``cwd`` becomes the session's working directory — critical for
-        ``claude --continue`` to find the right transcript.
-
-        Only empty values use ``-e KEY=``. Non-empty values are sourced from
-        a private file and deleted before exec. Callers must finish owned
-        predecessor teardown before entering this launch boundary.
-        """
+        """Spawn using isolated Python to consume private JSON before shell exec."""
         env = env or {}
         tmux_launch_env.validate_env(env)
         scope = hashlib.sha256(json.dumps(
             [self._base_cmd(), self.session_name], separators=(",", ":"),
         ).encode()).hexdigest()
-        if isinstance(self._runner, LocalCommandRunner):
-            staged = tmux_launch_env.stage_env(env, scope)
-        else:
-            result = await self._runner.run(
-                ["python3", "-c", Path(tmux_launch_env.__file__).read_text()],
-                stdin_data=json.dumps({"env": env, "scope": scope}).encode(),
-                timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
-            )
-            if not result.ok:
-                raise RuntimeError("launch environment staging failed")
-            try:
-                staged = json.loads(result.stdout)
-            except (ValueError, UnicodeError):
-                raise RuntimeError("invalid launch environment staging response") from None
+        nonce = secrets.token_hex(16)
+        runner = self._runner
         has_values = any(value != "" for value in env.values())
-        if (staged is None) != (not has_values):
-            raise RuntimeError("incomplete launch environment staging response")
-        if staged is not None:
-            if (
-                not isinstance(staged, dict)
-                or set(staged) != {"path", "guard"}
-                or not isinstance(staged["path"], str)
-                or not Path(staged["path"]).is_absolute()
-                or "\x00" in staged["path"]
-                or not isinstance(staged["guard"], str)
-                or re.fullmatch(r"__PINKY_LAUNCH_COMPLETE_[0-9a-f]{32}", staged["guard"]) is None
-            ):
-                raise RuntimeError("invalid launch environment staging response")
-            path = shlex.quote(staged["path"])
-            guard = staged["guard"]
-            cleanup = f"/bin/rm -f -- {path}"
-            failure = "printf '%s\\n' 'launch environment source failed' >&2; exit 1"
-            wrapper = (
-                f"trap {shlex.quote(cleanup)} 0; "
-                f"set +a; unset {guard}; set -a; "
-                f". {path} || {{ {failure}; }}; "
-                f"set +a; [ \"${{{guard}-}}\" = 1 ] || {{ {failure}; }}; "
-                f"unset {guard}; "
-                f"{cleanup} || {{ printf '%s\\n' 'launch environment delete failed' >&2; exit 1; }}; "
-                f"trap - 0; exec {command}"
-            )
-            command = "exec /bin/sh -c " + shlex.quote(wrapper)
-        args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
-        for key, value in env.items():
-            if value == "":
-                args.extend(["-e", f"{key}="])
-        # The command is passed as a single string arg; tmux invokes
-        # it via the user's shell, so we shell-escape for safety.
-        args.append(command)
-        return await self._run(*args)
+        receipt = (runner, scope, nonce) if has_values else None
+        deadline = time.time() + tmux_launch_env.PUBLICATION_TIMEOUT
+        try:
+            if isinstance(runner, LocalCommandRunner):
+                staged = await asyncio.to_thread(
+                    tmux_launch_env.stage_env, env, scope, nonce, deadline=deadline,
+                )
+            else:
+                result = await runner.run(
+                    ["python3", "-I", "-c", _LAUNCH_ENV_SOURCE],
+                    stdin_data=json.dumps({
+                        "action": "stage", "env": env, "scope": scope,
+                        "nonce": nonce, "deadline": deadline,
+                    }).encode(),
+                    timeout=_NAMESPACE_SEED_TIMEOUT_SEC,
+                )
+                if not result.ok:
+                    raise RuntimeError("launch environment staging failed")
+                try:
+                    staged = json.loads(result.stdout)
+                except (ValueError, UnicodeError):
+                    raise RuntimeError("invalid launch environment staging response") from None
+            if (staged is None) != (not has_values):
+                raise RuntimeError("incomplete launch environment staging response")
+            if staged is not None:
+                if not isinstance(staged, dict) or set(staged) != {"path"}:
+                    raise RuntimeError("invalid launch environment staging response")
+                path = staged["path"]
+                suffix = (".local", "state", "pinkybot", "tmux-launch-env", scope, f"env-{nonce}.json")
+                if (
+                    not isinstance(path, str) or "\x00" in path or "\n" in path or "\r" in path
+                    or not Path(path).is_absolute() or ".." in Path(path).parts
+                    or Path(path).parts[-len(suffix):] != suffix
+                ):
+                    raise RuntimeError("invalid launch environment staging response")
+                python = sys.executable if isinstance(runner, LocalCommandRunner) else "python3"
+                command = "exec " + shlex.join([
+                    python, "-I", "-c", _LAUNCH_ENV_SOURCE, path, nonce, command,
+                ])
+            args = ["new-session", "-d", "-s", self.session_name, "-c", cwd]
+            for key, value in env.items():
+                if value == "":
+                    args.extend(["-e", f"{key}="])
+            args.append(command)
+            if self._runner is not runner:
+                raise RuntimeError("launch execution namespace changed")
+            result = await self._run(*args)
+            if result.ok:
+                result.launch_env = receipt
+            else:
+                await _cleanup_launch_env(receipt)
+            return result
+        except BaseException:
+            await _cleanup_launch_env(receipt)
+            raise
 
     async def kill_session(self) -> TmuxCommandResult:
         """Kill the tmux session. Idempotent — succeeds whether or not the
