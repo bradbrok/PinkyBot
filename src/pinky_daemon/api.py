@@ -14078,6 +14078,7 @@ npm run build</pre>
                 transport_status[et] = {"status": "unknown", "error": str(e)}
         out["transport_alert_status"] = transport_status
         out["storage"] = storage_observability.snapshot()
+        out["fire_trace"] = agents._fire_trace.status()
         return out
 
     # ── Admin: Shared MCP Status ─────────────────────────
@@ -14777,6 +14778,7 @@ npm run build</pre>
         )
         return {
             "running": scheduler.running,
+            "fire_trace_status": agents._fire_trace.status(),
             "fire_trace_24h": (await asyncio.to_thread(agents._fire_trace.report, since=time.time() - 86400))["counts"],
             "trace_write_failures_24h": {edge: value["upper"] for edge, value in failure_bounds.items()},
             "trace_write_failure_bounds_24h": failure_bounds,

@@ -682,6 +682,7 @@ def test_prune_transactions_delete_at_most_500_rows(registry, monkeypatch):
             ],
         )
     commits = []
+    completed = threading.Event()
     original = writer._connect
 
     def connect(**kwargs):
@@ -692,15 +693,24 @@ def test_prune_transactions_delete_at_most_500_rows(registry, monkeypatch):
             if sql.strip().upper() == "COMMIT":
                 commits.append(db.total_changes - previous[0])
                 previous[0] = db.total_changes
+                if sum(commits) >= 3002:
+                    completed.set()
 
         db.set_trace_callback(trace)
         return db
 
     monkeypatch.setattr(writer, "_connect", connect)
     registry.prune_schedule_fire_trace(now=time.time())
+    assert completed.wait(15), (
+        f"prune stalled: unfinished={writer._queue.unfinished_tasks} "
+        f"running={writer._running} deleted-so-far={sum(commits)}"
+    )
     assert writer.flush()
     assert commits and sum(commits) == 3002
     assert max(commits) <= 500, commits
+    with sqlite3.connect(writer.path) as db:
+        assert db.execute("SELECT COUNT(*) FROM schedule_fire_trace").fetchone()[0] == 0
+        assert db.execute("SELECT COUNT(*) FROM schedule_fire_trace_failures").fetchone()[0] == 0
 
 
 def test_worker_reporter_failure_cannot_strand_bookkeeping(registry, monkeypatch):

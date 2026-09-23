@@ -19,6 +19,9 @@ from pinky_daemon.store_catalog import open_store_connection
 
 logger = logging.getLogger(__name__)
 _WORKERS = ThreadPoolExecutor(max_workers=1, thread_name_prefix="schedule-fire-trace")
+SETUP_TIMEOUT_SECONDS = 2.0
+SETUP_RETRY_SECONDS = 5.0
+SETUP_RETRY_MAX_SECONDS = 300.0
 OUTCOMES = (
     "delivered",
     "late_delivered",
@@ -148,11 +151,6 @@ class ScheduleFireTrace:
         self.registry_path = str(Path(db_path).resolve())
         self.path = self.path_for(db_path)
         self._catalog = catalog
-        db = self._connect()
-        try:
-            self._ensure_columns(db)
-        finally:
-            db.close()
         if catalog is not None:
             for name in ("schedule_fire_trace", "schedule_fire_trace_read"):
                 catalog.register(
@@ -173,6 +171,61 @@ class ScheduleFireTrace:
         self._running = False
         self._retry_timer = None
         self._retry_attempts = 0
+        self._setup_attempts = 0
+        self._setup_retry_attempts = 0
+        self._setup_state = "starting"
+        self._dropped_events = 0
+        self._setup_error = None
+        if not self._setup():
+            self._schedule_failure_retry()
+
+    def status(self):
+        """Expose unavailable telemetry independently of authoritative scheduling."""
+        with self._worker_lock:
+            return {
+                "state": self._setup_state,
+                "dropped_events": self._dropped_events,
+                "setup_attempts": self._setup_attempts,
+                "error": self._setup_error,
+            }
+
+    def _setup(self):
+        # One setup budget covers connection pragmas and taking the schema lock.
+        # Once BEGIN IMMEDIATE succeeds, schema writes cannot contend with writers.
+        with self._worker_lock:
+            self._setup_attempts += 1
+        deadline = time.monotonic() + SETUP_TIMEOUT_SECONDS
+        db = None
+        try:
+            db = self._connect(timeout=SETUP_TIMEOUT_SECONDS, setup=True)
+            remaining = max(0, deadline - time.monotonic())
+            db.execute(f"PRAGMA busy_timeout={int(remaining * 1000)}")
+            db.execute("BEGIN IMMEDIATE")
+            self._ensure_columns(db)
+            # Readers can delay COMMIT even after the writer lock was obtained.
+            remaining = max(0, deadline - time.monotonic())
+            db.execute(f"PRAGMA busy_timeout={int(remaining * 1000)}")
+            db.commit()
+        except Exception as exc:
+            with self._worker_lock:
+                entering = self._setup_state != "degraded"
+                self._setup_state = "degraded"
+                self._setup_error = type(exc).__name__
+            if entering:
+                logger.error("schedule fire trace degraded: setup failed (%s)", type(exc).__name__)
+            return False
+        finally:
+            if db is not None:
+                db.close()
+        with self._worker_lock:
+            recovering = self._setup_state == "degraded"
+            self._setup_state = "recovered" if recovering else "healthy"
+            self._setup_error = None
+            dropped = self._dropped_events
+            self._setup_retry_attempts = 0
+        if recovering:
+            logger.info("schedule fire trace recovered; dropped_events=%s", dropped)
+        return True
 
     @staticmethod
     def _ensure_columns(db):
@@ -211,11 +264,15 @@ class ScheduleFireTrace:
         db.execute(
             "CREATE INDEX IF NOT EXISTS idx_fire_failure_overflow ON schedule_fire_trace_failures(reason,failed_at)"
         )
-        db.commit()
 
     def submit(self, event):
         if self._closed.is_set():
             raise RuntimeError("trace writer closed")
+        with self._worker_lock:
+            if self._setup_state == "degraded":
+                # No IO, retry, or logging runs on authoritative wake callers.
+                self._dropped_events += 1
+                return
         event = dict(event)
         if event.get("fire_id"):
             if "schedule_id" in event:
@@ -283,9 +340,16 @@ class ScheduleFireTrace:
         with self._worker_lock:
             if self._closed.is_set() or self._retry_timer is not None:
                 return
-            delay = min(0.05 * 2**self._retry_attempts, 1.0)
-            # Bound the rate, not the lifetime of recovery after storage returns.
-            self._retry_attempts = min(self._retry_attempts + 1, 10)
+            if self._setup_state == "degraded":
+                delay = min(
+                    SETUP_RETRY_SECONDS * 2**self._setup_retry_attempts,
+                    SETUP_RETRY_MAX_SECONDS,
+                )
+                self._setup_retry_attempts = min(self._setup_retry_attempts + 1, 16)
+            else:
+                delay = min(0.05 * 2**self._retry_attempts, 1.0)
+                # Bound the rate, not the lifetime of recovery after storage returns.
+                self._retry_attempts = min(self._retry_attempts + 1, 10)
 
             def ready():
                 with self._worker_lock:
@@ -299,18 +363,24 @@ class ScheduleFireTrace:
             self._retry_timer.daemon = True
             self._retry_timer.start()
 
-    def _connect(self, *, timeout=0):
-        name = "schedule_fire_trace_read" if timeout else "schedule_fire_trace"
+    def _connect(self, *, timeout=0, setup=False):
+        name = "schedule_fire_trace_read" if timeout and not setup else "schedule_fire_trace"
         db = open_store_connection(
-            self._catalog, name, self.path, owner="schedule_fire_trace", timeout=timeout, uri=True
+            self._catalog, name, self.path, owner="schedule_fire_trace",
+            timeout=0 if setup else timeout, uri=True,
         )
         try:
             db.row_factory = sqlite3.Row
+            if setup:
+                # This short-lived setup connection alone may wait. The catalog's
+                # worker connection policy remains zero-timeout on every write.
+                db.execute(f"PRAGMA busy_timeout={int(timeout * 1000)}")
             db.execute("PRAGMA mmap_size=0")
             db.execute("PRAGMA journal_mode=TRUNCATE")
-            db.execute(
-                "ATTACH DATABASE ? AS ledger", (Path(self.registry_path).as_uri() + "?mode=ro",)
-            )
+            if not setup:
+                db.execute(
+                    "ATTACH DATABASE ? AS ledger", (Path(self.registry_path).as_uri() + "?mode=ro",)
+                )
             return db
         except BaseException:
             db.close()
@@ -319,6 +389,11 @@ class ScheduleFireTrace:
     def _run(self):
         slice_started = time.monotonic()
         try:
+            if self._closed.is_set():
+                return
+            if self.status()["state"] == "degraded" and not self._setup():
+                self._schedule_failure_retry()
+                return
             for _ in range(self.DRAIN_QUANTUM):
                 if time.monotonic() - slice_started >= 0.1:
                     break
@@ -665,6 +740,8 @@ class ScheduleFireTrace:
                 if row["failed_at"] >= since
                 or (self._overflow_window(row) or (0, 0))[1] > since
             ]
+        if self.status()["state"] == "degraded":
+            return overlay
         db = self._connect(timeout=1.0)
         try:
             records = {
@@ -742,6 +819,14 @@ class ScheduleFireTrace:
         """Return a bounded page, full-window counts, and counts for the page's keys."""
         limit = max(1, min(1000, int(limit)))
         offset = max(0, int(offset))
+        status = self.status()
+        if status["state"] == "degraded":
+            return {
+                "status": status, "rows": [], "counts": dict.fromkeys(OUTCOMES, 0),
+                "per_agent": {}, "per_schedule": {}, "limit": limit, "offset": offset,
+                "total": 0, "next_offset": None, "counts_scope": "unavailable",
+                "group_counts_scope": "unavailable",
+            }
         with self._failure_lock:
             overlay = [
                 dict(row)
@@ -846,6 +931,7 @@ class ScheduleFireTrace:
             row["outcome"] = row.pop("derived_outcome")
         total = sum(counts.values())
         return {
+            "status": status,
             "rows": records,
             "counts": counts,
             **groups,

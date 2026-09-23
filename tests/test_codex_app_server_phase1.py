@@ -67,21 +67,25 @@ def _session(
 @pytest.mark.asyncio
 @pytest.mark.parametrize("startup_delay", [0, 0.35], ids=["natural", "delayed-start"])
 @pytest.mark.parametrize(
-    ("mode", "reason"),
+    ("mode", "reason", "init_timeout"),
     [
-        ("hang-init", "timeout"),
-        ("error-init", "error"),
-        ("die-pre-init", "error"),
+        ("hang-init", "timeout", 0.2),
+        ("error-init", "error", 5),
+        ("die-pre-init", "error", 5),
     ],
 )
 async def test_init_failure_degrades_to_exec_without_terminalizing(
-    monkeypatch, tmp_path, mode, reason, startup_delay
+    monkeypatch, tmp_path, mode, reason, init_timeout, startup_delay
 ):
     logs: list[str] = []
     monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
-    session = _session(monkeypatch, tmp_path, mode=mode, startup_delay=startup_delay)
+    # Error cases must reach the fake server despite interpreter startup latency.
+    # The hang case deliberately retains its short timeout contract.
+    session = _session(
+        monkeypatch, tmp_path, mode=mode, startup_delay=startup_delay, init_timeout=init_timeout
+    )
 
-    await asyncio.wait_for(session.connect(), timeout=1)
+    await asyncio.wait_for(session.connect(), timeout=init_timeout + 5)
 
     assert session.state == SessionState.CONNECTED
     assert session._use_app_server is False

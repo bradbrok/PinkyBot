@@ -6877,6 +6877,8 @@ class TestDrainParkedWakeRegistry:
         assert registry.get_schedule(
             schedule.id
         ).last_accepted_fired_at == pytest.approx(pending.fired_at)
+        assert registry._fire_trace.flush()
+        registry._fire_trace.close()
 
         # Simulate a pre-upgrade database: drop the column, discarding the
         # authority, while the accepted wake row remains retained. Reopening
@@ -6893,6 +6895,7 @@ class TestDrainParkedWakeRegistry:
             assert migrated.last_accepted_fired_at == pytest.approx(
                 pending.fired_at
             )
+            assert reopened._fire_trace.status()["state"] == "healthy"
         finally:
             reopened.close()
 
@@ -6901,6 +6904,8 @@ class TestDrainParkedWakeRegistry:
         has not added yet — released upgrade sources have the wake table
         without accepted_at, and a boot abort there bricks the daemon."""
         schedule, pending = self._persist(registry)
+        assert registry._fire_trace.flush()
+        registry._fire_trace.close()
         registry._db.executescript(
             """
             DROP INDEX IF EXISTS idx_schedule_wake_ledger_state;
@@ -6918,6 +6923,7 @@ class TestDrainParkedWakeRegistry:
             # No accepted stamps existed pre-upgrade, so zero is correct —
             # the requirement is that the reopen does not abort.
             assert migrated.last_accepted_fired_at == 0.0
+            assert reopened._fire_trace.status()["state"] == "healthy"
         finally:
             reopened.close()
 
