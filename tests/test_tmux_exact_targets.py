@@ -86,7 +86,7 @@ class PrivateTmux:
         return result.stdout.strip()
 
     def type_literal(self, name: str, text: str) -> None:
-        result = self.run("send-keys", "-t", self.pane_id(name), "-l", text)
+        result = self.run("send-keys", "-t", self.pane_id(name), "-l", "--", text)
         assert result.returncode == 0, result.stderr
 
     def wait_for_text(self, name: str, text: str, timeout: float = 10.0) -> str:
@@ -255,6 +255,104 @@ async def test_capture_pane_named_target_session_is_exact(private_tmux):
     result = await control.capture_pane(lines=50, join=True, target_session="login-hold-x")
     assert result.ok, result.stderr
     assert "EXACT-TEXT" in result.stdout
+
+
+# -- text arguments are typed, never parsed as tmux flags ------------------------
+
+
+async def _type(control: _TmuxControl, method: str, text: str):
+    if method == "send_literal":
+        return await control.send_literal(text)
+    assert method == "send_keys"
+    return await control.send_keys(text, enter=False)
+
+
+@pytest.mark.parametrize("text", ["-Rt=pinky-y:", "-hello", "-l", "--"])
+@pytest.mark.parametrize("method", ["send_literal", "send_keys"])
+async def test_text_starting_with_dash_is_typed_into_the_exact_pane(private_tmux, method, text):
+    """Text that looks like tmux flags is typed as-is. Parsed as flags,
+    ``-R`` would reset a terminal and a later ``-t`` would re-target the
+    command at another session, overriding the exact target."""
+    private_tmux.new("pinky-x", "exec cat")
+    private_tmux.new("pinky-y", "exec cat")
+    private_tmux.type_literal("pinky-y", "NEIGHBOUR")
+    private_tmux.wait_for_text("pinky-y", "NEIGHBOUR")
+    cursor = "#{cursor_x},#{cursor_y}"
+    neighbour_cursor = private_tmux.pane_format("pinky-y", cursor)
+
+    result = await _type(private_tmux.control("pinky-x"), method, text)
+
+    assert result.ok, result.stderr
+    pane = private_tmux.wait_for_text("pinky-x", text, timeout=3.0)
+    assert pane.strip() == text
+    await asyncio.sleep(0.2)
+    assert private_tmux.pane_format("pinky-y", cursor) == neighbour_cursor
+    assert private_tmux.capture("pinky-y").strip() == "NEIGHBOUR"
+
+
+@pytest.mark.parametrize("text", [";", "semi;", "bs\\;", "a;b;"])
+@pytest.mark.parametrize("method", ["send_literal", "send_keys"])
+async def test_text_ending_in_separator_is_typed_exactly(private_tmux, method, text):
+    """tmux splits an argument ending in ``;`` off as a command separator and
+    turns a trailing ``\\;`` into ``;``; the text must still arrive as sent."""
+    private_tmux.new("pinky-x", "exec cat")
+
+    result = await _type(private_tmux.control("pinky-x"), method, text)
+
+    assert result.ok, result.stderr
+    pane = private_tmux.wait_for_text("pinky-x", text, timeout=3.0)
+    assert pane.strip() == text
+
+
+async def test_keys_ending_in_separator_are_still_submitted(private_tmux):
+    private_tmux.new("pinky-x", "exec cat")
+
+    result = await private_tmux.control("pinky-x").send_keys("line;", enter=True)
+
+    assert result.ok, result.stderr
+    private_tmux.wait_for_text("pinky-x", "line;\nline;", timeout=3.0)
+
+
+async def test_new_name_starting_with_dash_is_taken_as_the_name(private_tmux):
+    private_tmux.new("pinky-x")
+    control = private_tmux.control("pinky-x")
+
+    result = await control.rename_session("-renamed")
+
+    assert result.ok, result.stderr
+    assert private_tmux.sessions() == ["-renamed"]
+
+
+@pytest.mark.parametrize(
+    "new_name", ["renamed;", "Renamed", "re.named", "re:named", "re named", ""]
+)
+async def test_new_name_the_targets_cannot_address_is_refused_before_tmux_runs(
+    private_tmux, new_name
+):
+    """The renamed session is addressed later by exact name, so a new name
+    outside the target allowlist is refused: tmux would split ``renamed;``
+    off as a command separator and store ``renamed``."""
+    private_tmux.new("pinky-x")
+    control = private_tmux.control("pinky-x")
+
+    with pytest.raises(ValueError):
+        await control.rename_session(new_name)
+
+    assert private_tmux.sessions() == ["pinky-x"]
+
+
+async def test_name_ending_in_separator_is_refused_before_tmux_runs(private_tmux):
+    """tmux reads an argument ending in ``;`` as a command separator: the
+    target ``=pinky-x;`` would address ``pinky-x``."""
+    private_tmux.new("pinky-x")
+    control = private_tmux.control("pinky-x;")
+
+    with pytest.raises(ValueError):
+        await control.kill_session()
+    with pytest.raises(ValueError):
+        await control.send_literal("MARK")
+
+    assert private_tmux.sessions() == ["pinky-x"]
 
 
 # -- dream runner ---------------------------------------------------------------

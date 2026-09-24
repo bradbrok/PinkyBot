@@ -36,7 +36,7 @@ from pinky_daemon.tmux_session import (
     _resolve_claude_config_path,
     _seed_claude_trust_file,
 )
-from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
+from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 
 _DEFAULT_CLAUDE_BIN = "/opt/homebrew/bin/claude"  # cc_autoupdate.sh manages this path
 
@@ -244,7 +244,12 @@ class TmuxDreamRunner:
                 f"you are done — it is the completion signal."
             )
             rc, out = await self._tmux(
-                "send-keys", "-t", exact_pane_target(self.session_name), "-l", instruction
+                "send-keys",
+                "-t",
+                exact_pane_target(self.session_name),
+                "-l",
+                "--",
+                text_argument(instruction),
             )
             if rc != 0:
                 return RunResult(

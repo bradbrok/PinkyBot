@@ -13284,7 +13284,9 @@ npm run build</pre>
             raise RuntimeError(
                 f"active tmux transport {agent_name}/{label} lacks freeze plumbing"
             )
-        safe_agent = re.sub(r"[^A-Za-z0-9_.-]", "-", agent_name)
+        # Keep only characters the exact tmux targets accept; a valid agent
+        # name passes unchanged.
+        safe_agent = re.sub(r"[^a-z0-9_-]", "-", agent_name)
         hold_session_name = f"login-hold-{safe_agent}"
         rename_result = await rename_session(hold_session_name)
         if not rename_result.ok:

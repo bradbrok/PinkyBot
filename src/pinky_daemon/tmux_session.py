@@ -96,7 +96,12 @@ from pinky_daemon.streaming_session import (
     _log,
     _notify_turn_idle,
 )
-from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
+from pinky_daemon.tmux_targets import (
+    _addressable,
+    exact_pane_target,
+    exact_session_target,
+    text_argument,
+)
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
@@ -948,9 +953,17 @@ class _TmuxControl:
         look for ``pinky-<agent>`` while the preserved OAuth pane lives under
         ``login-hold-<agent>``. Keeping ``self.session_name`` unchanged is
         therefore intentional.
+
+        The renamed session is later addressed by exact name, so ``new_name``
+        must pass the same allowlist as targets; anything else raises
+        ``ValueError`` before tmux runs.
         """
         return await self._run(
-            "rename-session", "-t", exact_session_target(self.session_name), new_name
+            "rename-session",
+            "-t",
+            exact_session_target(self.session_name),
+            "--",
+            _addressable(new_name),
         )
 
     async def resize_window(
@@ -987,15 +1000,17 @@ class _TmuxControl:
         receives the keystrokes and (for claude) processes them as a
         prompt.
 
-        ``text`` is passed as a single tmux argument; tmux interprets
-        no further shell metacharacters.
+        ``text`` is passed as a single tmux argument after ``--``, so text
+        starting with ``-`` is never parsed as tmux flags, and a trailing
+        ``;`` is escaped so tmux does not split it off as a command
+        separator; tmux interprets no further shell metacharacters.
 
         Use ``paste_text`` instead for prompts that need to survive the
         claude cold-start splash UI (issue #514) — bracketed-paste plus
         a short delay is more reliable than raw keystrokes during the
         splash-to-chat transition.
         """
-        args = ["send-keys", "-t", exact_pane_target(self.session_name), text]
+        args = ["send-keys", "-t", exact_pane_target(self.session_name), "--", text_argument(text)]
         if enter:
             args.append("Enter")
         return await self._run(*args)
@@ -1006,9 +1021,20 @@ class _TmuxControl:
         Unlike ``send_keys``, tmux performs no keyname interpretation —
         "Enter" types the five letters, "C-c" types three characters.
         Used by the typeable pane view, where the operator's typed text
-        must never be accidentally promoted to a control key.
+        must never be accidentally promoted to a control key. ``--`` ends
+        tmux's flag parsing, so text starting with ``-`` is typed too rather
+        than read as flags (a later ``-t`` there would re-target the command),
+        and ``text_argument`` keeps a trailing ``;`` from being split off as a
+        command separator.
         """
-        return await self._run("send-keys", "-t", exact_pane_target(self.session_name), "-l", text)
+        return await self._run(
+            "send-keys",
+            "-t",
+            exact_pane_target(self.session_name),
+            "-l",
+            "--",
+            text_argument(text),
+        )
 
     async def paste_text(
         self,

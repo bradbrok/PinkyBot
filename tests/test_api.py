@@ -643,6 +643,33 @@ class TestAPI:
         assert "tmux session 'pinky-murzik'" not in attempts[1][4]
 
     @pytest.mark.asyncio
+    async def test_login_hold_session_name_is_an_exact_tmux_target(self, tmp_path):
+        """The frozen pane is renamed to, then captured by, its exact name: the
+        agent part keeps only characters the exact targets accept, and a
+        valid agent name is kept byte for byte."""
+        from pinky_daemon.tmux_session import TmuxCommandResult
+        from pinky_daemon.tmux_targets import exact_session_target
+
+        app = self._make_app(str(tmp_path / "test.db"))
+        freeze = app.state.watchdog._login_wall_freeze_fn
+        ok = TmuxCommandResult(0, "", "")
+
+        async def hold_session_name(agent_name: str) -> str:
+            tmux = SimpleNamespace(
+                rename_session=AsyncMock(return_value=ok),
+                capture_pane=AsyncMock(return_value=ok),
+            )
+            frozen = await freeze(agent_name, "main", SimpleNamespace(_tmux=tmux))
+            tmux.rename_session.assert_awaited_once_with(frozen.hold_session_name)
+            return frozen.hold_session_name
+
+        for agent_name in ("alpha", "a_b-9", "0" * 63):
+            assert await hold_session_name(agent_name) == f"login-hold-{agent_name}"
+        for code in range(0x80):
+            name = await hold_session_name("a" + chr(code))
+            assert exact_session_target(name) == "=" + name
+
+    @pytest.mark.asyncio
     async def test_login_wall_uses_deployment_owner_destination(self, tmp_path):
         """#916 routes the held login link to this deployment's main user."""
         from pinky_daemon.session_watchdog import (

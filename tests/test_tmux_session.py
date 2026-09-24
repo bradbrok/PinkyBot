@@ -1086,7 +1086,7 @@ async def test_rename_session_freezes_without_retargeting_control() -> None:
     await tmux.rename_session("login-hold-test")
 
     assert calls == [
-        ("rename-session", "-t", "=pinky-test", "login-hold-test")
+        ("rename-session", "-t", "=pinky-test", "--", "login-hold-test")
     ]
     assert tmux.session_name == "pinky-test"
 
