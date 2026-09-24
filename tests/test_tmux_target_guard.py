@@ -1,29 +1,39 @@
 """Static guard: every tmux target in src/ is built by the exact helpers.
 
 A bare session name after ``-t`` lets tmux fall back to prefix and pattern
-matching (see ``pinky_daemon.tmux_targets``). This guard parses every module
-under ``src/`` and classifies every ``-t``/``-s`` flag literal in it.
+matching (see ``pinky_daemon.tmux_targets``), and a command with no ``-t``
+acts on the most recently used session. This guard parses every module under
+``src/`` and classifies every ``-t``/``-s`` flag literal (str or bytes) in it.
 
 A *tmux argv* is a list, tuple or call-argument sequence holding a tmux
 command: a full command name anywhere in it, or, at the command position
 (first element, after the tmux binary and its own options such as ``-L`` or
 ``-S``, or after a ``;`` separator), an alias or unique prefix that tmux
-itself resolves. An element ending in ``;`` ends one tmux command and starts
-the next. ``args = [...]`` grown by ``args.extend(...)``, ``args.append(...)``
-or ``args += [...]`` in the same function, and ``[...] + [...]``, are read as
-one argv.
+itself resolves. An argv holding the tmux binary after a wrapper program
+(``env tmux ...``) is read from the binary on. An element ending in ``;``
+ends one tmux command and starts the next. ``args = [...]`` grown by
+``args.extend(...)``, ``args.append(...)`` or ``args += [...]`` in the same
+function, and ``[...] + [...]``, are read as one argv.
 
 In a tmux argv:
 
+* a command carries ``-t`` before its first argument (tmux reads no flags
+  after it); only the commands in ``UNTARGETED`` go without.
 * the argument after a target flag (``-t``, and ``-s`` where the command takes
   a source target) is an inline ``exact_session_target(...)`` for a session
-  target or ``exact_pane_target(...)`` for a window or pane target. Client
-  targets are not sessions and are left alone.
+  target or ``exact_pane_target(...)`` for a window or pane target. A helper
+  is known by what it was imported as from ``tmux_targets``, not by its local
+  name. Client targets are not sessions and are left alone.
 * a target fused into its flag (``"-tNAME"``, ``"-t" + name``,
   ``f"-t{name}"``, ``"-t%s" % name``, ``"-t{}".format(name)``) or clustered
   with other flags (``"-pt"``) is refused.
 * text arguments of ``send-keys`` and ``rename-*`` follow ``--``, so text
-  starting with ``-`` is never parsed as flags.
+  starting with ``-`` is never parsed as flags, and ``send-keys`` text that
+  is not a literal is an inline ``text_argument(...)``, so a trailing ``;`` is
+  not split off as a command separator.
+* any other non-literal argument may end in ``;`` and so end the command: the
+  element after it may not be a literal tmux command word, and a target flag
+  after an argument is refused.
 
 Elsewhere:
 
@@ -32,7 +42,12 @@ Elsewhere:
 * a ``-t``/``-s`` in another program's argv (``logger -t``,
   ``podman exec -t``, ``add_argument("-t")``) is left alone, unless an exact
   helper follows it: then it is meant for tmux, but its command is not
-  visible, so the helper kind cannot be checked.
+  visible, so the helper kind cannot be checked. In a module that issues tmux
+  commands, an argv with no visible tmux command counts as another program's
+  only when it is led by that program's literal name (``["ssh", "-t", host]``)
+  or only declares options (``add_argument("-t", "--tag")``); any other flag
+  in it is refused, as its command word may sit in a variable or the flag may
+  be spliced into a tmux argv.
 
 Every flag literal lands in exactly one bucket. The src test also checks that
 an independent enumeration of flag literals is fully classified, so a call
@@ -158,8 +173,32 @@ COMMANDS: dict[str, tuple[str | None, str | None, str | None]] = {
 }
 ALIASES = {alias: name for name, (alias, _t, _s) in COMMANDS.items() if alias}
 
-# Commands with free-text arguments, and which of their flags take a value.
-TEXT_COMMANDS = {"send-keys": "cNt", "rename-session": "t", "rename-window": "t"}
+# The only commands src/ issues without a -t. Without one, tmux acts on the
+# most recently used session, so every other command carries an exact -t.
+UNTARGETED = frozenset({"list-sessions", "load-buffer", "new-session"})
+
+# Commands with free-text arguments.
+TEXT_COMMANDS = frozenset({"send-keys", "rename-session", "rename-window"})
+
+# Flags other than -t and a source -s that take a value (tmux 3.4 to 3.6). A
+# command without an entry is read as taking none: a flag value then reads as
+# the first argument, which only makes the guard stricter.
+VALUE_FLAGS = {
+    "capture-pane": "bES",
+    "display-message": "cd",
+    "join-pane": "l",
+    "list-sessions": "Ff",
+    "load-buffer": "b",
+    "new-session": "cefFnsxy",
+    "paste-buffer": "bs",
+    "resize-window": "xy",
+    "send-keys": "cN",
+}
+
+# Where the helpers live, and the calls whose result never ends in ``;``.
+TARGETS_MODULE = "tmux_targets"
+TEXT = "text_argument"
+SAFE_CALLS = (SESSION, PANE, TEXT)
 
 # tmux's own options (before the command) that take a value.
 GLOBAL_VALUE_OPTIONS = "cfLST"
@@ -181,8 +220,11 @@ class Violation:
 @dataclass
 class Report:
     filename: str
+    tmux_module: bool = False
+    bindings: dict[str, str | None] = field(default_factory=dict)
     violations: list[Violation] = field(default_factory=list)
     sites: list[str] = field(default_factory=list)
+    untargeted: list[str] = field(default_factory=list)
     buckets: dict[int, str] = field(default_factory=dict)
     unclassified: list[str] = field(default_factory=list)
 
@@ -209,8 +251,12 @@ def resolve_command(word: str) -> str | None:
 
 
 def _str_const(node: ast.AST) -> str | None:
-    if isinstance(node, ast.Constant) and isinstance(node.value, str):
-        return node.value
+    """A str or bytes literal as text: an argv takes either."""
+    if isinstance(node, ast.Constant):
+        if isinstance(node.value, str):
+            return node.value
+        if isinstance(node.value, bytes):
+            return node.value.decode("utf-8", "surrogateescape")
     return None
 
 
@@ -276,15 +322,77 @@ def _is_sequence_element(node: ast.AST, parent: dict[ast.AST, ast.AST]) -> bool:
     return False
 
 
-def _helper_name(node: ast.AST) -> str | None:
+def _bindings(tree: ast.AST) -> dict[str, str | None]:
+    """What the local names a module imports or rebinds refer to.
+
+    A name imported from ``tmux_targets`` maps to the function it was imported
+    as, a name bound to that module maps to ``TARGETS_MODULE``, and any other
+    binding of an imported name or of a helper or module name maps to None.
+    """
+    bound: dict[str, str | None] = {}
+    rebound: set[str] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ImportFrom):
+            from_targets = (node.module or "").split(".")[-1] == TARGETS_MODULE
+            for alias in node.names:
+                if from_targets:
+                    bound[alias.asname or alias.name] = alias.name
+                elif alias.name == TARGETS_MODULE:
+                    bound[alias.asname or alias.name] = TARGETS_MODULE
+                else:
+                    bound[alias.asname or alias.name] = None
+        elif isinstance(node, ast.Import):
+            for alias in node.names:
+                module = alias.name if alias.asname else alias.name.split(".")[0]
+                is_targets = module.split(".")[-1] == TARGETS_MODULE
+                bound[alias.asname or module] = TARGETS_MODULE if is_targets else None
+        elif isinstance(node, ast.FunctionDef | ast.AsyncFunctionDef | ast.ClassDef):
+            rebound.add(node.name)
+        elif isinstance(node, ast.arg):
+            rebound.add(node.arg)
+        elif isinstance(node, ast.Name) and not isinstance(node.ctx, ast.Load):
+            rebound.add(node.id)
+    for name in rebound:
+        if name in bound or name in (*SAFE_CALLS, TARGETS_MODULE):
+            bound[name] = None
+    return bound
+
+
+def _call_name(node: ast.AST | None, bindings: dict[str, str | None]) -> str | None:
+    """The ``tmux_targets`` function ``node`` calls, resolved through imports."""
     if not isinstance(node, ast.Call):
         return None
     func = node.func
     if isinstance(func, ast.Name):
-        return func.id
-    if isinstance(func, ast.Attribute):
-        return func.attr
+        return bindings.get(func.id, func.id)
+    if isinstance(func, ast.Attribute) and isinstance(func.value, ast.Name):
+        if bindings.get(func.value.id, func.value.id) == TARGETS_MODULE:
+            return func.attr
     return None
+
+
+def _may_end_command(element: ast.AST, bindings: dict[str, str | None]) -> bool:
+    """Whether ``element`` may end in a ``;`` the guard cannot see."""
+    if isinstance(element, ast.Constant):
+        return False  # a visible ``;`` already split the argv
+    if isinstance(element, ast.JoinedStr) and element.values:
+        if _str_const(element.values[-1]) is not None:
+            return False
+    return _call_name(element, bindings) not in SAFE_CALLS
+
+
+def _is_other_program_argv(elements: list[ast.AST]) -> bool:
+    """Led by another program's literal name, or only declaring options
+    (``add_argument("-t", "--tag")``), where no target value can come from a
+    variable."""
+    texts = [_str_const(element) for element in elements]
+    if texts and texts[0] and not texts[0].startswith("-"):
+        return True
+    return (
+        len(texts) > 1
+        and all(text is not None and text.startswith("-") for text in texts)
+        and not _is_flag_literal(elements[-1])
+    )
 
 
 def _is_tmux_binary(node: ast.AST) -> bool:
@@ -356,7 +464,12 @@ def _check_argv(elements: list[ast.AST], report: Report) -> None:
         found.append((index, command))
         tmux_context = tmux_context or command is not None
     if not tmux_context:
-        _check_other_program(elements, report)
+        binary = next((i for i, e in enumerate(elements) if i and _is_tmux_binary(e)), None)
+        if binary is None:
+            _check_other_program(elements, report)
+        else:  # a wrapper program running tmux: ``env tmux ...``
+            _check_other_program(elements[:binary], report)
+            _check_argv(elements[binary:], report)
         return
     for segment, (index, command) in zip(segments, found, strict=True):
         if command is None:
@@ -368,34 +481,62 @@ def _check_argv(elements: list[ast.AST], report: Report) -> None:
             continue
         for element in segment[:index]:
             report.classify(_leading(element)[0], "before the tmux command")
-        _check_command(command, segment[index + 1 :], report)
+        if _hides_command_word(segment, index):
+            report.violation(
+                segment[index], f"a non-literal before {command!r} may be the tmux command word"
+            )
+        _check_command(command, segment[index], segment[index + 1 :], report)
+
+
+def _hides_command_word(segment: list[ast.AST], index: int) -> bool:
+    """Whether the element before the command word may be the real command
+    word, making the visible one its argument. A literal or the tmux binary
+    cannot, and neither can an option's value (``-S path``)."""
+    if index == 0:
+        return False
+    before = segment[index - 1]
+    if isinstance(before, ast.Constant) or _is_tmux_binary(before):
+        return False
+    option = _str_const(segment[index - 2]) if index > 1 else None
+    return not (option is not None and option.startswith("-"))
 
 
 def _check_other_program(elements: list[ast.AST], report: Report) -> None:
+    hidden = report.tmux_module and not _is_other_program_argv(elements)
     for index, element in enumerate(elements):
         head = _leading(element)[0]
         follows = elements[index + 1] if index + 1 < len(elements) else None
-        if (
-            _str_const(element) in ("-t", "-s")
-            and follows is not None
-            and _helper_name(follows) in HELPERS
+        if hidden and head is not None and _is_flag_literal(head):
+            # In a tmux module the command word may sit in a variable, or the
+            # flag may be spliced into a tmux argv later.
+            report.violation(head, "target flag in an argv with no visible tmux command")
+        elif (
+            _str_const(element) in ("-t", "-s") and _call_name(follows, report.bindings) in HELPERS
         ):
             report.violation(element, "cannot tell which tmux command this flag belongs to")
-            continue
-        report.classify(head, "another program's argv")
+        else:
+            report.classify(head, "another program's argv")
 
 
-def _check_command(command: str, body: list[ast.AST], report: Report) -> None:
+def _check_command(command: str, word: ast.AST, body: list[ast.AST], report: Report) -> None:
     _alias, t_kind, s_kind = COMMANDS[command]
     targets = {"t": t_kind}
     if s_kind is not None:
         targets["s"] = s_kind
-    value_flags = TEXT_COMMANDS.get(command)
+    text_command = command in TEXT_COMMANDS
+    value_flags = VALUE_FLAGS.get(command, "")
     pending: tuple[str, ast.AST, str] | str | None = None
-    text_only = False
+    arguments = False  # tmux reads no flags after the first argument or --
+    targeted = False
+    open_end = False  # the element before may end the command with an unseen ;
     for element in body:
         head, dynamic = _leading(element)
-        text = head.value if head is not None else None
+        text = _str_const(head) if head is not None else None
+        if open_end and text is not None and not dynamic and resolve_command(text):
+            report.violation(
+                head, f"a non-literal argument before {text!r} may be a hidden ; separator"
+            )
+        open_end = _may_end_command(element, report.bindings)
         if pending == "value":
             report.classify(head, "flag value")
             pending = None
@@ -405,20 +546,18 @@ def _check_command(command: str, body: list[ast.AST], report: Report) -> None:
             report.classify(head, "target value")
             pending = None
             continue
-        if text_only:
-            report.classify(head, "text after --")
+        if arguments:
+            _check_argument(command, element, report)
             continue
         if text == "--" and not dynamic:
-            text_only = True
+            arguments = True
             continue
         option = OPTION.match(text) if text is not None else None
         if option is None:
-            # A positional argument, or an expression the guard cannot read.
-            if value_flags is not None:
-                if head is None or dynamic:
-                    report.violation(element, f"{command} text argument must follow --")
-                else:
-                    text_only = True  # a literal positional ends tmux's flag parsing
+            # The first argument, or an expression the guard cannot read.
+            if text_command and (head is None or dynamic):
+                report.violation(element, f"{command} text argument must follow --")
+            arguments = True
             report.classify(head, "positional")
             continue
         letters = option.group(1)
@@ -426,14 +565,14 @@ def _check_command(command: str, body: list[ast.AST], report: Report) -> None:
         target = next((i for i, letter in enumerate(letters) if letter in targets), None)
         if target is None:
             report.classify(head, "not a target flag")
-            if value_flags is not None:
-                if dynamic:
-                    report.violation(element, f"{command} text argument must follow --")
-                elif letters[-1] in value_flags and not glued:
-                    pending = "value"
+            if dynamic and text_command:
+                report.violation(element, f"{command} text argument must follow --")
+            elif letters[-1] in value_flags and not glued:
+                pending = "value"
             continue
         flag = f"-{letters[target]}"
         kind = targets[letters[target]]
+        targeted = targeted or (flag == "-t" and kind is not None)
         if kind is None:
             report.violation(head, f"{command} takes no {flag} target")
         elif target > 0:
@@ -444,6 +583,26 @@ def _check_command(command: str, body: list[ast.AST], report: Report) -> None:
             pending = (kind, head, flag)
     if isinstance(pending, tuple):
         report.violation(pending[1], f"{pending[2]} without an inline target")
+    if targeted:
+        return
+    if command in UNTARGETED:
+        report.untargeted.append(command)
+    else:
+        report.violation(word, f"{command} has no exact -t target before its first argument")
+
+
+def _check_argument(command: str, element: ast.AST, report: Report) -> None:
+    """An element after tmux stopped reading flags."""
+    head, dynamic = _leading(element)
+    text = _str_const(head) if head is not None else None
+    if command == "send-keys":
+        if (head is None or dynamic) and _call_name(element, report.bindings) != TEXT:
+            report.violation(element, "send-keys text must go through text_argument(...)")
+        report.classify(head, "text")
+    elif text is not None and not dynamic and TARGET_FLAG.match(text):
+        report.violation(head, f"{command} {text} after an argument is not read as a flag")
+    else:
+        report.classify(head, "argument")
 
 
 def _check_target_value(
@@ -453,7 +612,7 @@ def _check_target_value(
     if kind == CLIENT:
         report.classify(flag_node, "client target")
         return
-    helper = _helper_name(value)
+    helper = _call_name(value, report.bindings)
     if helper not in HELPERS:
         report.violation(flag_node, f"{command} {flag} target is not built by an exact helper")
     elif helper != kind:
@@ -568,7 +727,7 @@ def check_source(source: str, filename: str = "<src>") -> Report:
     """Classify every flag literal in ``source``; collect violations and exact sites."""
     tree = ast.parse(source, filename=filename)
     parent = {child: node for node in ast.walk(tree) for child in ast.iter_child_nodes(node)}
-    report = Report(filename)
+    report = Report(filename, _issues_tmux_commands(tree), _bindings(tree))
 
     grown, grown_parts = _grown_argvs(tree)
     joined, joined_parts = _concatenated_argvs(tree, parent)
@@ -584,7 +743,6 @@ def check_source(source: str, filename: str = "<src>") -> Report:
     for elements in argvs:
         _check_argv(list(elements), report)
 
-    tmux_module = _issues_tmux_commands(tree)
     literals = [node for node in ast.walk(tree) if _is_flag_literal(node)]
     for literal in literals:
         if id(literal) in report.buckets:
@@ -594,9 +752,9 @@ def check_source(source: str, filename: str = "<src>") -> Report:
             report.classify(literal, "inside a longer string")
         elif _is_sequence_element(root, parent):
             continue  # the argv pass above must have classified it
-        elif not tmux_module:
+        elif not report.tmux_module:
             report.classify(literal, "module issues no tmux commands")
-        elif TARGET_FLAG.match(literal.value):
+        elif TARGET_FLAG.match(_str_const(literal)):
             report.violation(literal, "target flag outside an argv the guard can check")
         else:
             report.classify(literal, "not a flag")
@@ -638,8 +796,20 @@ def test_src_scan_sees_the_known_tmux_call_sites(src_reports):
     assert any(" kill-session -t exact_session_target" in site for site in sites)
 
 
+def test_untargeted_commands_are_exactly_those_src_issues(src_reports):
+    """A command without -t acts on tmux's most recent session, so only the
+    untargeted commands src/ issues on purpose are allowed, and no unused
+    entry lingers in the allowlist."""
+    used = {command for report in src_reports.values() for command in report.untargeted}
+    assert used == UNTARGETED
+
+
 # -- guard behaviour ---------------------------------------------------------------
 
+
+# Makes a snippet a module that issues tmux commands, where the module-level
+# rules apply.
+TMUX_MODULE = 'run("has-session", "-t", exact_session_target(n))\n'
 
 BYPASS_SHAPES = [
     ('run("has-session", "-t", self.session_name)', "not built by an exact helper"),
@@ -691,6 +861,69 @@ BYPASS_SHAPES = [
     ('run("send-keys", "-t", exact_pane_target(n), text, "Enter")', "must follow --"),
     ('run("send-keys", "-t", exact_pane_target(n), *keys)', "must follow --"),
     ('run("rename-session", "-t", exact_session_target(n), new_name)', "must follow --"),
+    # The tmux command word is not visible in the argv that carries the flag.
+    ('KILL = "kill-session"\nrun(KILL, "-t", self.session_name)', "no visible tmux command"),
+    ('for cmd in ("has-session", "kill-session"):\n    run(cmd, "-t", name)', "no visible tmux"),
+    (TMUX_MODULE + 'run([binary, "-L", sock, "send", "-t", name])', "no visible tmux command"),
+    ('run("kill-session", *("-t", name))', "no visible tmux command"),
+    ('args = ["kill-session"]\nargs.insert(1, "-t")\nargs.insert(2, name)', "no visible tmux"),
+    ('args = ["kill-session"]\nargs = args + ["-t", name]', "no visible tmux command"),
+    (TMUX_MODULE + 'run(CAPTURE, *("-p", "-t"), name)', "no visible tmux command"),
+    ('run(["env", "tmux", "send", "-t", name])', "not built by an exact helper"),
+    ('run(CMD, "kill-session", "-t", exact_session_target(n))', "may be the tmux command word"),
+    ('run(["tmux", *opts, "kill-session"])', "may be the tmux command word"),
+    ('run("kill-session", b"-t", name)', "not built by an exact helper"),
+    # A command that takes a target has an exact -t before its first argument.
+    ('run("send-keys", "Enter")', "has no exact -t target"),
+    ('run("send-keys", "Enter", "-t", name)', "has no exact -t target"),
+    ('run("send-keys", "-X", "cancel", "-t", name)', "has no exact -t target"),
+    ('run("send-keys", "Enter", "-t", exact_pane_target(n))', "has no exact -t target"),
+    ('run("capture-pane", "-p", lines, "-t", exact_pane_target(n))', "has no exact -t target"),
+    ('run("kill-server")', "has no exact -t target"),
+    (
+        'run("kill-session", "-t", exact_session_target(a), cmd, "-t", exact_pane_target(b))',
+        "-t after an argument",
+    ),
+    (
+        'run("kill-session", "-t", exact_session_target(a), sep,'
+        ' "resize-window", "-t", exact_session_target(b))',
+        "hidden ; separator",
+    ),
+    # send-keys text that is not a literal goes through text_argument.
+    ('run("send-keys", "-t", exact_pane_target(n), "-l", "--", text)', "text_argument"),
+    ('run("send-keys", "-t", exact_pane_target(n), "Enter", key)', "text_argument"),
+    ('run("send-keys", "-t", exact_pane_target(n), "--", f"{text}")', "text_argument"),
+    # A helper is known by what it was imported as, not by its local name.
+    (
+        "from pinky_daemon.tmux_targets import exact_session_target as exact_pane_target\n"
+        'run("send-keys", "-t", exact_pane_target(n), "--", x)',
+        "needs exact_pane_target, not exact_session_target",
+    ),
+    (
+        "from pinky_daemon import tmux_targets as targets\n"
+        'run("send-keys", "-t", targets.exact_session_target(n), "Enter")',
+        "needs exact_pane_target, not exact_session_target",
+    ),
+    (
+        "from elsewhere import exact_pane_target\n"
+        'run("send-keys", "-t", exact_pane_target(n), "Enter")',
+        "not built by an exact helper",
+    ),
+    (
+        "exact_pane_target = exact_session_target\n"
+        'run("send-keys", "-t", exact_pane_target(n), "Enter")',
+        "not built by an exact helper",
+    ),
+    (
+        "from elsewhere import text_argument\n"
+        'run("send-keys", "-t", exact_pane_target(n), "--", text_argument(text))',
+        "text_argument",
+    ),
+    ('run("send-keys", "-t", self.exact_pane_target(n), "Enter")', "not built by an exact"),
+    # Rejected by design: a helper result held in a variable, and a flag
+    # chosen at run time.
+    ('target = exact_pane_target(n)\nrun("capture-pane", "-p", "-t", target)', "not built by"),
+    (TMUX_MODULE + 'cmd = ["ps", "-o", "pid="]\ncmd.append("-t" if tty else "-p")', "outside"),
 ]
 
 CORRECT_SHAPES = [
@@ -704,8 +937,9 @@ CORRECT_SHAPES = [
     'run(["-S", path, "kill-session", "-t", exact_session_target(n)])',
     'run(["tmux", "-S", path, "has-session", "-t", exact_session_target(n)])',
     'args = ["capture-pane", "-p"]\nargs.extend(["-t", exact_pane_target(n)])',
-    'args = ["send-keys", "-t", exact_pane_target(n), "--", text]\nargs.append("Enter")',
-    'run("send-keys", "-t", exact_pane_target(n), "-l", "--", text)',
+    'args = ["send-keys", "-t", exact_pane_target(n), "--", text_argument(text)]\n'
+    'args.append("Enter")',
+    'run("send-keys", "-t", exact_pane_target(n), "-l", "--", text_argument(text))',
     'run("send-keys", "-t", exact_pane_target(n), "--", "-t")',
     'run("send-keys", "-N", count, "-t", exact_pane_target(n), "Enter")',
     'run("rename-session", "-t", exact_session_target(n), "--", new_name)',
@@ -720,6 +954,18 @@ CORRECT_SHAPES = [
     'run("has-session", "-t", exact_session_target(n))\nrun(["podman", "exec", "-t", box, "sh"])',
     'run("has-session", "-t", exact_session_target(n))\nparser.add_argument("-t", "--tag")',
     'run("has-session", "-t", exact_session_target(n))\nlabel = f"{name}-tmux"',
+    'cmd = [self.tmux_binary, "-L", sock]\ncmd += ["kill-session", "-t", exact_session_target(n)]',
+    'run("send-keys", "-t", exact_pane_target(n), "-N", "2", "--", "Down")',
+    'run("capture-pane", "-p", "-J", "-t", exact_pane_target(n), "-S", f"-{lines}")',
+    'run("paste-buffer", "-b", buffer, "-d", "-t", exact_pane_target(n), "-p")',
+    TMUX_MODULE + 'subprocess.run(["ssh", "-t", host, "uptime"])',
+    'args = ["send-keys"]\nargs.extend(("-t", exact_pane_target(n), "--", text_argument(t)))',
+    "from pinky_daemon.tmux_targets import exact_pane_target as pane\n"
+    'run("send-keys", "-t", pane(n), "--", text_argument(t))',
+    "from pinky_daemon import tmux_targets\n"
+    'run("send-keys", "-t", tmux_targets.exact_pane_target(n), "Enter")',
+    'run(["env", "tmux", "-L", sock, "send", "-t", exact_pane_target(n), "Enter"])',
+    'run([binary, "-L", sock, "kill-session", "-t", exact_session_target(n)])',
 ]
 
 
