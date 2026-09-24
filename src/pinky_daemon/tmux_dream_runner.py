@@ -244,7 +244,7 @@ class TmuxDreamRunner:
                 f"you are done — it is the completion signal."
             )
             rc, out = await self._tmux(
-                "send-keys", "-t", exact_pane_target(self.session_name), "-l", instruction
+                "send-keys", "-t", exact_pane_target(self.session_name), "-l", "--", instruction
             )
             if rc != 0:
                 return RunResult(

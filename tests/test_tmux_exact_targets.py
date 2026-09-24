@@ -86,7 +86,7 @@ class PrivateTmux:
         return result.stdout.strip()
 
     def type_literal(self, name: str, text: str) -> None:
-        result = self.run("send-keys", "-t", self.pane_id(name), "-l", text)
+        result = self.run("send-keys", "-t", self.pane_id(name), "-l", "--", text)
         assert result.returncode == 0, result.stderr
 
     def wait_for_text(self, name: str, text: str, timeout: float = 10.0) -> str:
@@ -255,6 +255,49 @@ async def test_capture_pane_named_target_session_is_exact(private_tmux):
     result = await control.capture_pane(lines=50, join=True, target_session="login-hold-x")
     assert result.ok, result.stderr
     assert "EXACT-TEXT" in result.stdout
+
+
+# -- text arguments are typed, never parsed as tmux flags ------------------------
+
+
+async def _type(control: _TmuxControl, method: str, text: str):
+    if method == "send_literal":
+        return await control.send_literal(text)
+    assert method == "send_keys"
+    return await control.send_keys(text, enter=False)
+
+
+@pytest.mark.parametrize("text", ["-Rt=pinky-y:", "-hello", "-l", "--"])
+@pytest.mark.parametrize("method", ["send_literal", "send_keys"])
+async def test_text_starting_with_dash_is_typed_into_the_exact_pane(private_tmux, method, text):
+    """Text that looks like tmux flags is typed as-is. Parsed as flags,
+    ``-R`` would reset a terminal and a later ``-t`` would re-target the
+    command at another session, overriding the exact target."""
+    private_tmux.new("pinky-x", "exec cat")
+    private_tmux.new("pinky-y", "exec cat")
+    private_tmux.type_literal("pinky-y", "NEIGHBOUR")
+    private_tmux.wait_for_text("pinky-y", "NEIGHBOUR")
+    cursor = "#{cursor_x},#{cursor_y}"
+    neighbour_cursor = private_tmux.pane_format("pinky-y", cursor)
+
+    result = await _type(private_tmux.control("pinky-x"), method, text)
+
+    assert result.ok, result.stderr
+    pane = private_tmux.wait_for_text("pinky-x", text, timeout=3.0)
+    assert pane.strip() == text
+    await asyncio.sleep(0.2)
+    assert private_tmux.pane_format("pinky-y", cursor) == neighbour_cursor
+    assert private_tmux.capture("pinky-y").strip() == "NEIGHBOUR"
+
+
+async def test_new_name_starting_with_dash_is_taken_as_the_name(private_tmux):
+    private_tmux.new("pinky-x")
+    control = private_tmux.control("pinky-x")
+
+    result = await control.rename_session("-renamed")
+
+    assert result.ok, result.stderr
+    assert private_tmux.sessions() == ["-renamed"]
 
 
 # -- dream runner ---------------------------------------------------------------

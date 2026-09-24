@@ -950,7 +950,7 @@ class _TmuxControl:
         therefore intentional.
         """
         return await self._run(
-            "rename-session", "-t", exact_session_target(self.session_name), new_name
+            "rename-session", "-t", exact_session_target(self.session_name), "--", new_name
         )
 
     async def resize_window(
@@ -987,15 +987,16 @@ class _TmuxControl:
         receives the keystrokes and (for claude) processes them as a
         prompt.
 
-        ``text`` is passed as a single tmux argument; tmux interprets
-        no further shell metacharacters.
+        ``text`` is passed as a single tmux argument after ``--``, so text
+        starting with ``-`` is never parsed as tmux flags; tmux interprets no
+        further shell metacharacters.
 
         Use ``paste_text`` instead for prompts that need to survive the
         claude cold-start splash UI (issue #514) — bracketed-paste plus
         a short delay is more reliable than raw keystrokes during the
         splash-to-chat transition.
         """
-        args = ["send-keys", "-t", exact_pane_target(self.session_name), text]
+        args = ["send-keys", "-t", exact_pane_target(self.session_name), "--", text]
         if enter:
             args.append("Enter")
         return await self._run(*args)
@@ -1006,9 +1007,13 @@ class _TmuxControl:
         Unlike ``send_keys``, tmux performs no keyname interpretation —
         "Enter" types the five letters, "C-c" types three characters.
         Used by the typeable pane view, where the operator's typed text
-        must never be accidentally promoted to a control key.
+        must never be accidentally promoted to a control key. ``--`` ends
+        tmux's flag parsing, so text starting with ``-`` is typed too rather
+        than read as flags (a later ``-t`` there would re-target the command).
         """
-        return await self._run("send-keys", "-t", exact_pane_target(self.session_name), "-l", text)
+        return await self._run(
+            "send-keys", "-t", exact_pane_target(self.session_name), "-l", "--", text
+        )
 
     async def paste_text(
         self,
