@@ -290,6 +290,29 @@ async def test_text_starting_with_dash_is_typed_into_the_exact_pane(private_tmux
     assert private_tmux.capture("pinky-y").strip() == "NEIGHBOUR"
 
 
+@pytest.mark.parametrize("text", [";", "semi;", "bs\\;", "a;b;"])
+@pytest.mark.parametrize("method", ["send_literal", "send_keys"])
+async def test_text_ending_in_separator_is_typed_exactly(private_tmux, method, text):
+    """tmux splits an argument ending in ``;`` off as a command separator and
+    turns a trailing ``\\;`` into ``;``; the text must still arrive as sent."""
+    private_tmux.new("pinky-x", "exec cat")
+
+    result = await _type(private_tmux.control("pinky-x"), method, text)
+
+    assert result.ok, result.stderr
+    pane = private_tmux.wait_for_text("pinky-x", text, timeout=3.0)
+    assert pane.strip() == text
+
+
+async def test_keys_ending_in_separator_are_still_submitted(private_tmux):
+    private_tmux.new("pinky-x", "exec cat")
+
+    result = await private_tmux.control("pinky-x").send_keys("line;", enter=True)
+
+    assert result.ok, result.stderr
+    private_tmux.wait_for_text("pinky-x", "line;\nline;", timeout=3.0)
+
+
 async def test_new_name_starting_with_dash_is_taken_as_the_name(private_tmux):
     private_tmux.new("pinky-x")
     control = private_tmux.control("pinky-x")

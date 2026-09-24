@@ -49,7 +49,7 @@ from pathlib import Path
 import pytest
 
 from pinky_daemon.agent_registry import _AGENT_NAME_RE
-from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
+from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 
@@ -808,3 +808,18 @@ def test_allowlist_is_the_agent_name_alphabet(helper):
 def test_every_daemon_session_name_is_accepted(helper, prefix, agent):
     assert _AGENT_NAME_RE.fullmatch(agent)
     assert helper(prefix + agent).startswith("=" + prefix + agent)
+
+
+@pytest.mark.parametrize(
+    ("text", "argument"),
+    [
+        ("plain", "plain"),
+        ("-flag-like", "-flag-like"),
+        ("a;b", "a;b"),
+        (";", "\\;"),
+        ("semi;", "semi\\;"),
+        ("bs\\;", "bs\\\\;"),
+    ],
+)
+def test_text_argument_escapes_only_a_trailing_separator(text, argument):
+    assert text_argument(text) == argument

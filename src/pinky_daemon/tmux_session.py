@@ -96,7 +96,7 @@ from pinky_daemon.streaming_session import (
     _log,
     _notify_turn_idle,
 )
-from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
+from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
@@ -988,15 +988,16 @@ class _TmuxControl:
         prompt.
 
         ``text`` is passed as a single tmux argument after ``--``, so text
-        starting with ``-`` is never parsed as tmux flags; tmux interprets no
-        further shell metacharacters.
+        starting with ``-`` is never parsed as tmux flags, and a trailing
+        ``;`` is escaped so tmux does not split it off as a command
+        separator; tmux interprets no further shell metacharacters.
 
         Use ``paste_text`` instead for prompts that need to survive the
         claude cold-start splash UI (issue #514) — bracketed-paste plus
         a short delay is more reliable than raw keystrokes during the
         splash-to-chat transition.
         """
-        args = ["send-keys", "-t", exact_pane_target(self.session_name), "--", text]
+        args = ["send-keys", "-t", exact_pane_target(self.session_name), "--", text_argument(text)]
         if enter:
             args.append("Enter")
         return await self._run(*args)
@@ -1009,10 +1010,17 @@ class _TmuxControl:
         Used by the typeable pane view, where the operator's typed text
         must never be accidentally promoted to a control key. ``--`` ends
         tmux's flag parsing, so text starting with ``-`` is typed too rather
-        than read as flags (a later ``-t`` there would re-target the command).
+        than read as flags (a later ``-t`` there would re-target the command),
+        and ``text_argument`` keeps a trailing ``;`` from being split off as a
+        command separator.
         """
         return await self._run(
-            "send-keys", "-t", exact_pane_target(self.session_name), "-l", "--", text
+            "send-keys",
+            "-t",
+            exact_pane_target(self.session_name),
+            "-l",
+            "--",
+            text_argument(text),
         )
 
     async def paste_text(

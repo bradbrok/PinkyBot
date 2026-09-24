@@ -58,3 +58,16 @@ def exact_pane_target(session_name: str) -> str:
     Addresses the current window and active pane of exactly ``session_name``.
     """
     return "=" + _addressable(session_name) + ":"
+
+
+def text_argument(text: str) -> str:
+    r"""``text`` as a tmux argument that tmux passes on unchanged.
+
+    tmux splits an argument ending in ``;`` off as a command separator (the
+    ``;`` is dropped) and turns a trailing ``\;`` into ``;``. Escaping the
+    final ``;`` as ``\;`` makes tmux restore exactly ``text``. Pair it with
+    ``--`` so text starting with ``-`` is not read as flags either.
+    """
+    if text.endswith(";"):
+        return text[:-1] + "\\;"
+    return text
