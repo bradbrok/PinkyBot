@@ -25,18 +25,24 @@ them or uses the wrong kind for its command.
 
 from __future__ import annotations
 
+import re
+
+# Session names are a fixed prefix plus an agent name, and agent names are
+# validated to lowercase ASCII letters, digits, ``_`` and ``-``. tmux matches a
+# name made only of these characters exactly.
+_ADDRESSABLE_NAME = re.compile(r"[a-z0-9_-]+")
+
 
 def _addressable(session_name: str) -> str:
     """Return ``session_name`` if tmux can address it exactly, else raise.
 
-    tmux stores ``.`` and ``:`` in a session name as ``_``, so a name holding
-    either can never match exactly; a leading ``$`` is parsed as a session id.
-    Refusing such names keeps a malformed name from silently addressing a
-    different session.
+    Only names built from the characters above are accepted. Anything else
+    can address a different session or none: tmux stores ``.`` and ``:`` as
+    ``_`` and control characters in escaped form, a leading ``$`` names a
+    session id, and an argument ending in ``;`` is split off as a command
+    separator (``=NAME;`` addresses ``NAME``).
     """
-    if not isinstance(session_name, str) or not session_name:
-        raise ValueError("tmux session name must be a non-empty string")
-    if "." in session_name or ":" in session_name or session_name.startswith("$"):
+    if not isinstance(session_name, str) or not _ADDRESSABLE_NAME.fullmatch(session_name):
         raise ValueError(f"tmux cannot address session name exactly: {session_name!r}")
     return session_name
 

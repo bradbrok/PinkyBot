@@ -20,6 +20,7 @@ from pathlib import Path
 
 import pytest
 
+from pinky_daemon.agent_registry import _AGENT_NAME_RE
 from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
 
 SRC = Path(__file__).resolve().parents[1] / "src"
@@ -246,8 +247,57 @@ def test_exact_pane_target_form():
     assert exact_pane_target("login-hold-x") == "=login-hold-x:"
 
 
+REFUSED_NAMES = [
+    "",
+    None,
+    "pinky-x.0",
+    "pinky-x:1",
+    "$1",
+    "pinky-x;",
+    "pinky-a;b",
+    "pinky-x\n",
+    "pinky-a\tb",
+    "pinky-\x1bx",
+    "pinky-x\x00",
+    "pinky x",
+    "Pinky-x",
+    "pinky-é",
+    "pinky-x*",
+    "pinky-'x'",
+    "pinky-#x",
+    "pinky-%1",
+    "pinky-{x}",
+    "pinky-x,y",
+    "pinky/x",
+    "=pinky-x",
+]
+
+
 @pytest.mark.parametrize("helper", [exact_session_target, exact_pane_target])
-@pytest.mark.parametrize("name", ["", "pinky-x.0", "pinky-x:1", "$1", None])
-def test_names_tmux_cannot_address_exactly_are_refused(helper, name):
+@pytest.mark.parametrize("name", REFUSED_NAMES)
+def test_names_outside_the_allowlist_are_refused(helper, name):
     with pytest.raises(ValueError):
         helper(name)
+
+
+@pytest.mark.parametrize("helper", [exact_session_target, exact_pane_target])
+def test_allowlist_is_the_agent_name_alphabet(helper):
+    """Session names are a prefix plus an agent name: every character an agent
+    name may hold is accepted, and every other ASCII character is refused."""
+    for code in range(0x80):
+        char = chr(code)
+        if _AGENT_NAME_RE.fullmatch("a" + char):
+            assert helper("pinky-a" + char).startswith("=pinky-a" + char)
+        else:
+            with pytest.raises(ValueError):
+                helper("pinky-a" + char)
+
+
+@pytest.mark.parametrize("helper", [exact_session_target, exact_pane_target])
+@pytest.mark.parametrize(
+    "prefix", ["pinky-", "pinky-codex-", "pinky-codex-as-", "pinky-dream-", "login-hold-"]
+)
+@pytest.mark.parametrize("agent", ["a", "0", "a_b-9", "a" * 63])
+def test_every_daemon_session_name_is_accepted(helper, prefix, agent):
+    assert _AGENT_NAME_RE.fullmatch(agent)
+    assert helper(prefix + agent).startswith("=" + prefix + agent)
