@@ -4,10 +4,14 @@ import base64
 import hashlib
 import hmac
 import json
+import socket
+import threading
 import time
 from urllib.parse import quote, unquote
 
+import httpx
 import pytest
+import uvicorn
 from fastapi import Request
 from fastapi.testclient import TestClient
 from starlette.applications import Starlette
@@ -31,6 +35,35 @@ def _headers(path):
     return build_internal_auth_headers(
         _SECRET, agent_name="sample", method="GET", path=path,
     )
+
+
+def _direct_signature(path, timestamp):
+    payload = f"sample\nGET\n{path}\n{timestamp}".encode("utf-8")
+    return base64.urlsafe_b64encode(
+        hmac.new(_SECRET.encode("utf-8"), payload, hashlib.sha256).digest()
+    ).decode("ascii").rstrip("=")
+
+
+def _serve_real_http(app):
+    listener = socket.socket()
+    listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen()
+    port = listener.getsockname()[1]
+    server = uvicorn.Server(uvicorn.Config(app, log_level="critical", lifespan="off"))
+    thread = threading.Thread(
+        target=server.run, kwargs={"sockets": [listener]}, daemon=True,
+    )
+    thread.start()
+    deadline = time.monotonic() + 5
+    while not server.started and thread.is_alive() and time.monotonic() < deadline:
+        time.sleep(0.01)
+    if not server.started:
+        server.should_exit = True
+        thread.join(timeout=5)
+        listener.close()
+        raise RuntimeError("Uvicorn did not start the real-path test server")
+    return server, thread, listener, f"http://127.0.0.1:{port}"
 
 
 @pytest.fixture
@@ -156,15 +189,53 @@ def test_internal_routed_path_verifier_rejects_delimiters(delimiter):
 def test_internal_routed_path_verifier_rejects_valid_full_path_mac(delimiter):
     path = f"{_PREFIX}/D{delimiter}one/a"
     timestamp = str(int(time.time()))
-    payload = f"sample\nGET\n{path}\n{timestamp}".encode("utf-8")
-    signature = base64.urlsafe_b64encode(
-        hmac.new(_SECRET.encode("utf-8"), payload, hashlib.sha256).digest()
-    ).decode("ascii").rstrip("=")
+    signature = _direct_signature(path, timestamp)
 
     assert not verify_internal_request(
         _SECRET, agent_name="sample", method="GET", path=path,
         timestamp=timestamp, signature=signature,
     )
+
+
+def test_internal_signer_unquotes_after_removing_query():
+    wire_target = f"{_PREFIX}/D%3Fone/a?limit=2"
+    headers = build_internal_auth_headers(
+        _SECRET, agent_name="sample", method="GET", path=wire_target, timestamp=123,
+    )
+    expected = _direct_signature(f"{_PREFIX}/D?one/a", 123)
+    assert headers[INTERNAL_SIGNATURE_HEADER] == expected
+
+
+@pytest.mark.parametrize(
+    ("suffix", "segment"),
+    [
+        ("two%20words/a", "two words"),
+        ("%E9%9B%AA/a", "雪"),
+        ("double%252F/a", "double%2F"),
+    ],
+)
+def test_internal_routed_path_over_real_http(routed_app, suffix, segment):
+    app, seen = routed_app
+    wire_path = f"{_PREFIX}/{suffix}"
+    wire_target = wire_path + "?limit=2"
+    server, thread, listener, base_url = _serve_real_http(app)
+    try:
+        response = httpx.get(
+            base_url + wire_target,
+            headers=_headers(wire_target),
+            trust_env=False,
+            timeout=5,
+        )
+    finally:
+        server.should_exit = True
+        thread.join(timeout=5)
+        listener.close()
+    assert not thread.is_alive()
+    assert response.status_code == 200
+    assert response.json() == {
+        "segment": segment, "item": "a", "gate": "internal_hmac",
+    }
+    assert seen == [unquote(wire_path)]
 
 
 @pytest.mark.parametrize(
