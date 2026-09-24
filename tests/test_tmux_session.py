@@ -1069,7 +1069,7 @@ async def test_capture_pane_joined_hold_target_adds_j_and_uses_target() -> None:
         target_session="login-hold-test",
     )
     assert "-J" in calls[0]
-    assert calls[0][calls[0].index("-t") + 1] == "login-hold-test"
+    assert calls[0][calls[0].index("-t") + 1] == "=login-hold-test:"
 
 
 @pytest.mark.asyncio
@@ -1086,7 +1086,7 @@ async def test_rename_session_freezes_without_retargeting_control() -> None:
     await tmux.rename_session("login-hold-test")
 
     assert calls == [
-        ("rename-session", "-t", "pinky-test", "login-hold-test")
+        ("rename-session", "-t", "=pinky-test", "login-hold-test")
     ]
     assert tmux.session_name == "pinky-test"
 
@@ -1186,7 +1186,7 @@ async def test_resize_window_invokes_tmux_with_xy_flags() -> None:
     assert len(calls) == 1
     args = calls[0]
     assert args[0] == "resize-window"
-    assert "-t" in args and "pinky-test" in args
+    assert "-t" in args and "=pinky-test:" in args
     assert "-x" in args and "180" in args
     assert "-y" in args and "48" in args
 
@@ -1290,7 +1290,7 @@ async def test_paste_text_loads_buffer_pastes_and_sends_enter() -> None:
     assert "paste-buffer" in calls[1][0]
     assert "-p" in calls[1]  # bracketed paste mode
     assert "-d" in calls[1]  # delete buffer after paste
-    assert calls[2] == ("send-keys", "-t", "pinky-test", "Enter")
+    assert calls[2] == ("send-keys", "-t", "=pinky-test:", "Enter")
     assert result.ok
 
 

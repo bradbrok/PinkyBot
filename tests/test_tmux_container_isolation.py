@@ -92,25 +92,25 @@ class _FakeRegistry:
 class TestClaudeAuthMode:
     def _clear(self, monkeypatch):
         monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
-        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_AGENTX", raising=False)
         monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_YARIK", raising=False)
         monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_AGENT_ONE", raising=False)
 
     def test_default_is_shared_refresh_file(self, monkeypatch):
         self._clear(monkeypatch)
-        assert _claude_auth_mode("dymok") == "shared_refresh_file"
+        assert _claude_auth_mode("agentx") == "shared_refresh_file"
 
     def test_global_mode_applies_without_agent_override(self, monkeypatch):
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
-        assert _claude_auth_mode("dymok") == "per_agent_oauth"
+        assert _claude_auth_mode("agentx") == "per_agent_oauth"
 
     def test_agent_override_wins_over_global(self, monkeypatch):
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
         monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_YARIK", "per_agent_oauth")
         assert _claude_auth_mode("yarik") == "per_agent_oauth"
-        assert _claude_auth_mode("dymok") == "shared_refresh_file"
+        assert _claude_auth_mode("agentx") == "shared_refresh_file"
 
     def test_agent_env_name_is_sanitized(self):
         assert _claude_auth_mode_env_for_agent("agent-one") == (
@@ -120,11 +120,11 @@ class TestClaudeAuthMode:
     def test_invalid_agent_override_falls_back_to_global(self, monkeypatch):
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "per_agent_oauth")
-        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", "nope")
-        assert _claude_auth_mode("dymok") == "per_agent_oauth"
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_AGENTX", "nope")
+        assert _claude_auth_mode("agentx") == "per_agent_oauth"
 
 
-def _session(agent_name="dymok", registry=None, working_dir="/tmp/x"):
+def _session(agent_name="agentx", registry=None, working_dir="/tmp/x"):
     cfg = StreamingSessionConfig(agent_name=agent_name, working_dir=working_dir)
     # A truthy tmux_control short-circuits the in-__init__ runner selection, so we
     # can set _registry and call the gated methods directly + deterministically.
@@ -136,12 +136,12 @@ def _session(agent_name="dymok", registry=None, working_dir="/tmp/x"):
 class TestSelectCommandRunner:
     def test_local_by_default_gate_off(self, monkeypatch):
         monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         assert isinstance(ss._select_command_runner(), LocalCommandRunner)
 
     def test_container_runner_when_gated(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         runner = ss._select_command_runner()
         assert isinstance(runner, ContainerCommandRunner)
         # #638: the SESSION's working_dir ("/tmp/x" in the fixture) is the
@@ -149,7 +149,7 @@ class TestSelectCommandRunner:
         # -w must agree with it (the registry row may hold a symlinked or
         # stale variant).
         assert runner.wrap(["tmux", "ls"]) == [
-            "podman", "exec", "-w", "/tmp/x", "--", "pinky-dymok", "tmux", "ls",
+            "podman", "exec", "-w", "/tmp/x", "--", "pinky-agentx", "tmux", "ls",
         ]
 
     def test_container_runner_passes_in_container_cwd(self, monkeypatch):
@@ -160,40 +160,40 @@ class TestSelectCommandRunner:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+                _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
             ),
-            working_dir="/srv/agents/dymok",
+            working_dir="/srv/agents/agentx",
         )
         runner = ss._select_command_runner()
         assert isinstance(runner, ContainerCommandRunner)
         assert runner.wrap(["tmux", "ls"]) == [
-            "podman", "exec", "-w", "/srv/agents/dymok", "--",
-            "pinky-dymok", "tmux", "ls",
+            "podman", "exec", "-w", "/srv/agents/agentx", "--",
+            "pinky-agentx", "tmux", "ls",
         ]
 
     def test_container_runner_falls_back_to_agent_row_workdir(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+                _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
             ),
             working_dir="",
         )
         runner = ss._select_command_runner()
         assert isinstance(runner, ContainerCommandRunner)
         assert runner.wrap(["tmux", "ls"]) == [
-            "podman", "exec", "-w", "/srv/agents/dymok", "--",
-            "pinky-dymok", "tmux", "ls",
+            "podman", "exec", "-w", "/srv/agents/agentx", "--",
+            "pinky-agentx", "tmux", "ls",
         ]
 
     def test_docker_binary_honored(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "docker")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         assert ss._select_command_runner().wrap(["tmux"])[0] == "docker"
 
     def test_local_for_non_container_even_when_gated(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         assert isinstance(ss._select_command_runner(), LocalCommandRunner)
 
     def test_failsafe_when_registry_missing(self, monkeypatch):
@@ -211,7 +211,7 @@ class TestSelectCommandRunner:
 class TestEnsureContainerStarted:
     async def test_noop_for_local_agent(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         called = []
         monkeypatch.setattr(
             provisioning, "get_provisioner",
@@ -222,7 +222,7 @@ class TestEnsureContainerStarted:
 
     async def test_noop_when_gate_off(self, monkeypatch):
         monkeypatch.delenv("PINKY_CONTAINER_RUNTIME", raising=False)
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         called = []
         monkeypatch.setattr(
             provisioning, "get_provisioner",
@@ -233,7 +233,7 @@ class TestEnsureContainerStarted:
 
     async def test_calls_ensure_started_when_gated_container(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         seen = {}
 
         class _FakeProv:
@@ -251,7 +251,7 @@ class TestEnsureContainerStarted:
 
         monkeypatch.setattr(ss, "_check_container_image_contract", _fake_probe)
         await ss._ensure_container_started()
-        assert seen["agent"] == "dymok"
+        assert seen["agent"] == "agentx"
         assert probe_calls == [True]  # contract probe runs after start
 
 
@@ -261,14 +261,14 @@ class TestSeedContainerTrust:
     async def _container_seed_script(monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _RecordingInner()
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
-        await ss._seed_container_trust("/srv/agents/dymok")
+        await ss._seed_container_trust("/srv/agents/agentx")
         command = inner.calls[0]
         return command[command.index("-c") + 1]
 
@@ -276,26 +276,26 @@ class TestSeedContainerTrust:
         # Local agents seed trust on the host path; the in-container seeder is a
         # no-op for them (runner isn't a ContainerCommandRunner) — never execs.
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         await ss._seed_container_trust("/tmp/x")  # must not raise / not exec
 
     async def test_execs_seed_in_container(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _RecordingInner()
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
-        await ss._seed_container_trust("/srv/agents/dymok")
+        await ss._seed_container_trust("/srv/agents/agentx")
         assert len(inner.calls) == 1
         cmd = inner.calls[0]
-        # podman exec -w <wd> -- pinky-dymok python3 -c <seed> <project_dir>
+        # podman exec -w <wd> -- pinky-agentx python3 -c <seed> <project_dir>
         assert cmd[:2] == ["podman", "exec"]
-        assert "pinky-dymok" in cmd and "python3" in cmd and "-c" in cmd
-        assert cmd[-1] == "/srv/agents/dymok"  # project dir is the script arg
+        assert "pinky-agentx" in cmd and "python3" in cmd and "-c" in cmd
+        assert cmd[-1] == "/srv/agents/agentx"  # project dir is the script arg
         seed = cmd[cmd.index("-c") + 1]
         assert "bypassPermissionsModeAccepted" in seed
         assert "hasTrustDialogAccepted" in seed
@@ -321,14 +321,14 @@ class TestSeedContainerTrust:
 
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _RecordingInner()
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
-        await ss._seed_container_trust("/srv/agents/dymok")
+        await ss._seed_container_trust("/srv/agents/agentx")
         cmd = inner.calls[0]
         seed = cmd[cmd.index("-c") + 1]
 
@@ -432,14 +432,14 @@ class TestSeedContainerTrust:
 
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _RecordingInner()
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
-        await ss._seed_container_trust("/srv/agents/dymok")
+        await ss._seed_container_trust("/srv/agents/agentx")
         seed = inner.calls[0][inner.calls[0].index("-c") + 1]
 
         subprocess.run(
@@ -462,14 +462,14 @@ class TestSeedContainerTrust:
 
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _RecordingInner()
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
-        await ss._seed_container_trust("/srv/agents/dymok")
+        await ss._seed_container_trust("/srv/agents/agentx")
         seed = inner.calls[0][inner.calls[0].index("-c") + 1]
 
         cfg = tmp_path / "cfgdir"
@@ -496,25 +496,25 @@ class TestSeedContainerHomeCreds:
 
     async def test_noop_for_local_agent(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         await ss._seed_container_home_creds()  # must not raise / not exec
 
     async def test_execs_idempotent_copy_in_container(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _RecordingInner()
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
         await ss._seed_container_home_creds()
         assert len(inner.calls) == 1
         cmd = inner.calls[0]
         assert cmd[:2] == ["podman", "exec"]
-        assert "pinky-dymok" in cmd and "sh" in cmd and "-c" in cmd
+        assert "pinky-agentx" in cmd and "sh" in cmd and "-c" in cmd
         seed = cmd[cmd.index("-c") + 1]
         # Skip-if-present FIRST (an agent's own claude login is never
         # clobbered), then copy config-dir creds into $HOME/.claude at 0600.
@@ -525,13 +525,13 @@ class TestSeedContainerHomeCreds:
     async def test_per_agent_oauth_probes_but_never_copies(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
-        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", "per_agent_oauth")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_AGENTX", "per_agent_oauth")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _StubInner(stdout=b"home_creds_present=true home_creds_has_refresh=true\n")
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
 
@@ -545,11 +545,11 @@ class TestSeedContainerHomeCreds:
     async def test_runner_failure_is_nonfatal(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", working_dir="/srv/agents/dymok")
+            _FakeAgent("agentx", "container", working_dir="/srv/agents/agentx")
         ))
         inner = _StubInner(exc=RuntimeError("podman gone"))
         runner = ContainerCommandRunner(
-            "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+            "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
         )
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
         await ss._seed_container_home_creds()  # swallowed, never blocks spawn
@@ -571,7 +571,7 @@ class TestProjectDir:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         wd = str(tmp_path / "proj")
         ss = _session(
-            registry=_FakeRegistry(_FakeAgent("dymok", "container", working_dir=wd)),
+            registry=_FakeRegistry(_FakeAgent("agentx", "container", working_dir=wd)),
             working_dir=wd,
         )
         expected = Path(wd) / ".claude-container" / "projects" / _claude_slug(wd)
@@ -581,7 +581,7 @@ class TestProjectDir:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         wd = str(tmp_path / "proj")
         ss = _session(
-            registry=_FakeRegistry(_FakeAgent("dymok", "local", working_dir=wd)),
+            registry=_FakeRegistry(_FakeAgent("agentx", "local", working_dir=wd)),
             working_dir=wd,
         )
         assert ss._project_dir() == Path.home() / ".claude" / "projects" / _claude_slug(wd)
@@ -595,20 +595,20 @@ class TestBuildReplEnv:
     def test_container_agent_gets_host_gateway_daemon_url(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.delenv("PINKY_CONTAINER_DAEMON_URL", raising=False)
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         env = ss._build_repl_env()
         assert env["PINKY_DAEMON_URL"] == "http://host.containers.internal:8888"
 
     def test_container_daemon_url_env_override_wins(self, monkeypatch):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.setenv("PINKY_CONTAINER_DAEMON_URL", "http://10.0.2.2:9999")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         assert ss._build_repl_env()["PINKY_DAEMON_URL"] == "http://10.0.2.2:9999"
 
     def test_local_agent_has_no_daemon_url(self, monkeypatch):
         # Local hooks keep their localhost:8888 default — no key at all.
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         assert "PINKY_DAEMON_URL" not in ss._build_repl_env()
 
 
@@ -621,7 +621,7 @@ class TestIsolationStatus:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.setenv("PINKY_SESSION_SECRET", "fleet-secret")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "container", isolated=False)
+            _FakeAgent("agentx", "container", isolated=False)
         ))
         assert ss._isolation_status() == "isolated"
         # And the env builder withholds the global secret accordingly.
@@ -630,7 +630,7 @@ class TestIsolationStatus:
     def test_local_mode_not_isolated_gets_secret(self, monkeypatch):
         monkeypatch.setenv("PINKY_SESSION_SECRET", "fleet-secret")
         ss = _session(registry=_FakeRegistry(
-            _FakeAgent("dymok", "local", isolated=False)
+            _FakeAgent("agentx", "local", isolated=False)
         ))
         assert ss._isolation_status() == "not_isolated"
         assert ss._build_repl_env()["PINKY_SESSION_SECRET"] == "fleet-secret"
@@ -670,7 +670,7 @@ class TestSeedContainerClaudeCreds:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.delenv("PINKY_CONTAINER_SEED_CREDS", raising=False)
         monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE", raising=False)
-        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", raising=False)
+        monkeypatch.delenv("PINKY_CLAUDE_AUTH_MODE_AGENTX", raising=False)
         host_cfg = tmp_path / "host-claude"
         host_cfg.mkdir()
         if host_creds is not None:
@@ -679,7 +679,7 @@ class TestSeedContainerClaudeCreds:
         wd = tmp_path / "agent-wd"
         wd.mkdir()
         ss = _session(
-            registry=_FakeRegistry(_FakeAgent("dymok", "container", working_dir=str(wd))),
+            registry=_FakeRegistry(_FakeAgent("agentx", "container", working_dir=str(wd))),
             working_dir=str(wd),
         )
         return ss, host_cfg, wd
@@ -710,7 +710,7 @@ class TestSeedContainerClaudeCreds:
     def test_per_agent_oauth_never_seeds_shared_host_creds(self, monkeypatch, tmp_path):
         ss, _host_cfg, wd = self._creds_session(monkeypatch, tmp_path)
         monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE", "shared_refresh_file")
-        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_DYMOK", "per_agent_oauth")
+        monkeypatch.setenv("PINKY_CLAUDE_AUTH_MODE_AGENTX", "per_agent_oauth")
         ss._seed_container_claude_creds()
         assert not (wd / ".claude-container" / ".credentials.json").exists()
 
@@ -788,14 +788,14 @@ class TestStaticOAuthTokenForward:
         # Token present in daemon env but flag unset → not injected (soak default).
         self._clear(monkeypatch)
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-x")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in ss._build_repl_env()
 
     def test_forwarded_when_flag_on(self, monkeypatch):
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         assert ss._build_repl_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-tok"
 
     def test_forwarded_to_container_agent(self, monkeypatch):
@@ -805,7 +805,7 @@ class TestStaticOAuthTokenForward:
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "on")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-c")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
         assert ss._build_repl_env()["CLAUDE_CODE_OAUTH_TOKEN"] == "sk-ant-oat01-c"
 
     def test_withheld_for_custom_provider(self, monkeypatch):
@@ -814,7 +814,7 @@ class TestStaticOAuthTokenForward:
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         ss._config.provider_key = "gw-secret"
         env = ss._build_repl_env()
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
@@ -826,7 +826,7 @@ class TestStaticOAuthTokenForward:
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")
         monkeypatch.setenv("CLAUDE_CODE_OAUTH_TOKEN", "sk-ant-oat01-tok")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         ss._config.provider_url = "https://gateway.example/v1"
         env = ss._build_repl_env()
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in env
@@ -835,7 +835,7 @@ class TestStaticOAuthTokenForward:
     def test_flag_on_but_no_token_noop(self, monkeypatch):
         self._clear(monkeypatch)
         monkeypatch.setenv("PINKY_FORWARD_OAUTH_TOKEN", "1")  # no token in env
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "local")))
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "local")))
         assert "CLAUDE_CODE_OAUTH_TOKEN" not in ss._build_repl_env()
 
 
@@ -859,7 +859,7 @@ class TestDedicatedConfigDir:
         wd = str(tmp_path / "proj")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=False)
+                _FakeAgent("agentx", "local", working_dir=wd, dedicated_config_dir=False)
             ),
             working_dir=wd,
         )
@@ -881,7 +881,7 @@ class TestDedicatedConfigDir:
         wd = str(tmp_path / "proj")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=True)
+                _FakeAgent("agentx", "local", working_dir=wd, dedicated_config_dir=True)
             ),
             working_dir=wd,
         )
@@ -910,7 +910,7 @@ class TestDedicatedConfigDir:
         wd = str(tmp_path / "proj")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=True)
+                _FakeAgent("agentx", "local", working_dir=wd, dedicated_config_dir=True)
             ),
             working_dir=wd,
         )
@@ -985,7 +985,7 @@ class TestDedicatedConfigDir:
         wd = str(tmp_path / "proj")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "container", working_dir=wd, dedicated_config_dir=True)
+                _FakeAgent("agentx", "container", working_dir=wd, dedicated_config_dir=True)
             ),
             working_dir=wd,
         )
@@ -1000,7 +1000,7 @@ class TestDedicatedConfigDir:
         wd = str(tmp_path / "proj")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=True)
+                _FakeAgent("agentx", "local", working_dir=wd, dedicated_config_dir=True)
             ),
             working_dir=wd,
         )
@@ -1011,7 +1011,7 @@ class TestDedicatedConfigDir:
         wd = str(tmp_path / "proj")
         ss = _session(
             registry=_FakeRegistry(
-                _FakeAgent("dymok", "local", working_dir=wd, dedicated_config_dir=False)
+                _FakeAgent("agentx", "local", working_dir=wd, dedicated_config_dir=False)
             ),
             working_dir=wd,
         )
@@ -1026,8 +1026,8 @@ class TestCheckContainerImageContract:
 
     def _contract_session(self, monkeypatch, inner):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        ss = _session(registry=_FakeRegistry(_FakeAgent("dymok", "container")))
-        runner = ContainerCommandRunner("pinky-dymok", inner=inner)
+        ss = _session(registry=_FakeRegistry(_FakeAgent("agentx", "container")))
+        runner = ContainerCommandRunner("pinky-agentx", inner=inner)
         monkeypatch.setattr(ss, "_select_command_runner", lambda: runner)
         return ss
 
@@ -1085,34 +1085,34 @@ class TestTmuxControlSetCommandRunner:
         inner = _RecordingInner()
         # The recording inner stands in for the LocalCommandRunner: argv runs
         # verbatim (no wrap) until the seam is swapped.
-        control = _TmuxControl("pinky-dymok-main", command_runner=inner)
+        control = _TmuxControl("pinky-agentx-main", command_runner=inner)
         await control.has_session()
-        assert inner.calls[-1] == ["tmux", "has-session", "-t", "pinky-dymok-main"]
+        assert inner.calls[-1] == ["tmux", "has-session", "-t", "=pinky-agentx-main"]
 
         control.set_command_runner(
             ContainerCommandRunner(
-                "pinky-dymok", workdir="/srv/agents/dymok", inner=inner
+                "pinky-agentx", workdir="/srv/agents/agentx", inner=inner
             )
         )
         await control.has_session()
         assert inner.calls[-1] == [
-            "podman", "exec", "-w", "/srv/agents/dymok", "--", "pinky-dymok",
-            "tmux", "has-session", "-t", "pinky-dymok-main",
+            "podman", "exec", "-w", "/srv/agents/agentx", "--", "pinky-agentx",
+            "tmux", "has-session", "-t", "=pinky-agentx-main",
         ]
 
     async def test_swap_back_to_local_unwraps(self):
         # The reverse flip (container -> local) must stop podman-wrapping.
         inner = _RecordingInner()
         control = _TmuxControl(
-            "pinky-dymok-main",
-            command_runner=ContainerCommandRunner("pinky-dymok", inner=inner),
+            "pinky-agentx-main",
+            command_runner=ContainerCommandRunner("pinky-agentx", inner=inner),
         )
         await control.has_session()
         assert inner.calls[-1][:2] == ["podman", "exec"]
 
         control.set_command_runner(inner)
         await control.has_session()
-        assert inner.calls[-1] == ["tmux", "has-session", "-t", "pinky-dymok-main"]
+        assert inner.calls[-1] == ["tmux", "has-session", "-t", "=pinky-agentx-main"]
 
 
 class TestContainerStartTimeoutSec:
@@ -1180,7 +1180,7 @@ class TestSpawnRebindsCommandRunner:
     ):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
         # The row starts LOCAL — the session was constructed for a local agent.
-        agent = _FakeAgent("dymok", "local", working_dir=str(tmp_path))
+        agent = _FakeAgent("agentx", "local", working_dir=str(tmp_path))
         ss, seen = self._spawnable_session(monkeypatch, tmp_path, agent)
         # PUT /agents flips the registry row with no session teardown.
         agent.isolation_mode = "container"
@@ -1192,14 +1192,14 @@ class TestSpawnRebindsCommandRunner:
         assert isinstance(runner, ContainerCommandRunner)
         # Bound to THIS agent's container, exec'ing in the session's cwd.
         assert runner.wrap(["tmux"]) == [
-            "podman", "exec", "-w", str(tmp_path), "--", "pinky-dymok", "tmux",
+            "podman", "exec", "-w", str(tmp_path), "--", "pinky-agentx", "tmux",
         ]
         # And the same strict snapshot drove the container start.
         assert seen["ensure_started"] == [agent]
 
     async def test_spawn_for_local_row_binds_local_runner(self, monkeypatch, tmp_path):
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        agent = _FakeAgent("dymok", "local", working_dir=str(tmp_path))
+        agent = _FakeAgent("agentx", "local", working_dir=str(tmp_path))
         ss, seen = self._spawnable_session(monkeypatch, tmp_path, agent)
 
         await ss._spawn_tmux_repl()
@@ -1212,7 +1212,7 @@ class TestSpawnRebindsCommandRunner:
         # A registry failure at spawn raises (-> BOOT_FAILED) instead of
         # quietly re-binding a LocalCommandRunner.
         monkeypatch.setenv("PINKY_CONTAINER_RUNTIME", "podman")
-        agent = _FakeAgent("dymok", "container", working_dir=str(tmp_path))
+        agent = _FakeAgent("agentx", "container", working_dir=str(tmp_path))
         ss, _seen = self._spawnable_session(monkeypatch, tmp_path, agent)
         ss._registry = _FakeRegistry(raises=True)
 

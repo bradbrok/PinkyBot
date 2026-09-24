@@ -36,6 +36,7 @@ from pinky_daemon.tmux_session import (
     _resolve_claude_config_path,
     _seed_claude_trust_file,
 )
+from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
 
 _DEFAULT_CLAUDE_BIN = "/opt/homebrew/bin/claude"  # cc_autoupdate.sh manages this path
 
@@ -186,7 +187,7 @@ class TmuxDreamRunner:
 
         # Defensive: a stale session from a crashed run would shadow the new
         # one (the #704 overlap guard prevents concurrent fires, not leftovers).
-        await self._tmux("kill-session", "-t", self.session_name)
+        await self._tmux("kill-session", "-t", exact_session_target(self.session_name))
 
         cmd = [self._resolve_binary()]
         if self._config.model:
@@ -225,7 +226,7 @@ class TmuxDreamRunner:
         # command exit, so the post-mortem capture-pane below would lose
         # the one clue about WHY it died. Best-effort.
         await self._tmux(
-            "set-option", "-w", "-t", self.session_name, "remain-on-exit", "on"
+            "set-option", "-w", "-t", exact_pane_target(self.session_name), "remain-on-exit", "on"
         )
 
         success = False
@@ -243,7 +244,7 @@ class TmuxDreamRunner:
                 f"you are done — it is the completion signal."
             )
             rc, out = await self._tmux(
-                "send-keys", "-t", self.session_name, "-l", instruction
+                "send-keys", "-t", exact_pane_target(self.session_name), "-l", instruction
             )
             if rc != 0:
                 return RunResult(
@@ -252,7 +253,7 @@ class TmuxDreamRunner:
                     error=f"tmux send-keys failed: {out.strip()}",
                     duration_ms=int((time.time() - start) * 1000),
                 )
-            await self._tmux("send-keys", "-t", self.session_name, "Enter")
+            await self._tmux("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
             await self._ensure_submitted(instruction)
 
             output = await self._wait_for_result(result_path, deadline=start + self._config.timeout_s)
@@ -270,7 +271,9 @@ class TmuxDreamRunner:
                 duration_ms=int((time.time() - start) * 1000),
             )
         except TimeoutError:
-            _, pane = await self._tmux("capture-pane", "-p", "-t", self.session_name)
+            _, pane = await self._tmux(
+                "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
+            )
             tail = pane.strip()[-500:]
             return RunResult(
                 output="",
@@ -282,7 +285,7 @@ class TmuxDreamRunner:
                 duration_ms=int((time.time() - start) * 1000),
             )
         finally:
-            await self._tmux("kill-session", "-t", self.session_name)
+            await self._tmux("kill-session", "-t", exact_session_target(self.session_name))
             # The report is persisted to the dream DB by the caller; the
             # prompt file carries raw conversation history. Delete both on
             # success so nightly dreams don't grow dreams/ unbounded; keep
@@ -307,19 +310,23 @@ class TmuxDreamRunner:
         turn is long, so a single cheap recheck beats losing the whole night.
         """
         await asyncio.sleep(self._config.submit_check_delay_s)
-        rc, pane = await self._tmux("capture-pane", "-p", "-t", self.session_name)
+        rc, pane = await self._tmux(
+            "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
+        )
         if rc != 0:
             return
         marker = instruction[:40]
         if marker in pane and "esc to interrupt" not in pane:
             _log(f"tmux-dream: {self.session_name} instruction not submitted — re-sending Enter")
-            await self._tmux("send-keys", "-t", self.session_name, "Enter")
+            await self._tmux("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
 
     async def _wait_ready(self) -> bool:
         """Poll the pane until the Claude REPL has drawn its input UI."""
         deadline = time.time() + self._config.ready_timeout_s
         while time.time() < deadline:
-            rc, pane = await self._tmux("capture-pane", "-p", "-t", self.session_name)
+            rc, pane = await self._tmux(
+                "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
+            )
             if rc == 0 and ("shortcuts" in pane or "❯" in pane or "Claude" in pane):
                 return True
             await asyncio.sleep(1.0)
@@ -336,7 +343,7 @@ class TmuxDreamRunner:
         death; one transiently hung probe must not kill the night's dream.
         """
         rc, out = await self._tmux(
-            "display-message", "-p", "-t", self.session_name, "#{pane_dead}"
+            "display-message", "-p", "-t", exact_pane_target(self.session_name), "#{pane_dead}"
         )
         if rc == 0:
             return out.strip() != "1"
@@ -375,7 +382,7 @@ class TmuxDreamRunner:
                     dead_probes += 1
                     if alive is False or dead_probes >= 2:
                         _, pane = await self._tmux(
-                            "capture-pane", "-p", "-t", self.session_name
+                            "capture-pane", "-p", "-t", exact_pane_target(self.session_name)
                         )
                         tail = pane.strip()[-500:]
                         raise _ReplExitedError(
