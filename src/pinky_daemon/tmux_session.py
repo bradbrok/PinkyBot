@@ -96,6 +96,7 @@ from pinky_daemon.streaming_session import (
     _log,
     _notify_turn_idle,
 )
+from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
@@ -363,6 +364,8 @@ def _is_dead_runtime_stderr(stderr: str) -> bool:
         needle in low
         for needle in (
             "can't find pane",
+            # Exact ``=NAME:`` pane targets report a vanished session this way.
+            "can't find session",
             # podman exec into a stopped container
             "can only create exec sessions on running containers",
             # podman/docker: container was removed entirely
@@ -761,7 +764,7 @@ class _TmuxControl:
         callers that merely observe liveness already treat probe exceptions as
         diagnostic uncertainty.
         """
-        result = await self._run("has-session", "-t", self.session_name)
+        result = await self._run("has-session", "-t", exact_session_target(self.session_name))
         if result.ok:
             return True
         if await self._session_absence_is_verified(result):
@@ -926,7 +929,7 @@ class _TmuxControl:
     async def kill_session(self) -> TmuxCommandResult:
         """Kill the tmux session. Idempotent — succeeds whether or not the
         session exists (callers shouldn't pre-check)."""
-        result = await self._run("kill-session", "-t", self.session_name)
+        result = await self._run("kill-session", "-t", exact_session_target(self.session_name))
         if result.ok:
             return result
         # Positive absence is tmux's exact canonical no-server result, a missing
@@ -947,7 +950,7 @@ class _TmuxControl:
         therefore intentional.
         """
         return await self._run(
-            "rename-session", "-t", self.session_name, new_name,
+            "rename-session", "-t", exact_session_target(self.session_name), new_name
         )
 
     async def resize_window(
@@ -971,7 +974,7 @@ class _TmuxControl:
         rows = max(10, min(200, int(rows)))
         return await self._run(
             "resize-window",
-            "-t", self.session_name,
+            "-t", exact_pane_target(self.session_name),
             "-x", str(cols),
             "-y", str(rows),
         )
@@ -992,7 +995,7 @@ class _TmuxControl:
         a short delay is more reliable than raw keystrokes during the
         splash-to-chat transition.
         """
-        args = ["send-keys", "-t", self.session_name, text]
+        args = ["send-keys", "-t", exact_pane_target(self.session_name), text]
         if enter:
             args.append("Enter")
         return await self._run(*args)
@@ -1005,7 +1008,7 @@ class _TmuxControl:
         Used by the typeable pane view, where the operator's typed text
         must never be accidentally promoted to a control key.
         """
-        return await self._run("send-keys", "-t", self.session_name, "-l", text)
+        return await self._run("send-keys", "-t", exact_pane_target(self.session_name), "-l", text)
 
     async def paste_text(
         self,
@@ -1069,7 +1072,7 @@ class _TmuxControl:
             buf_name,
             "-d",
             "-t",
-            self.session_name,
+            exact_pane_target(self.session_name),
             "-p",
         )
         if not paste_result.ok or not enter:
@@ -1080,7 +1083,7 @@ class _TmuxControl:
         if enter_delay_ms > 0:
             await _async_sleep(enter_delay_ms / 1000.0)
 
-        return await self._run("send-keys", "-t", self.session_name, "Enter")
+        return await self._run("send-keys", "-t", exact_pane_target(self.session_name), "Enter")
 
     async def capture_pane(
         self,
@@ -1109,7 +1112,7 @@ class _TmuxControl:
         """
         args = [
             "capture-pane",
-            "-t", target_session or self.session_name,
+            "-t", exact_pane_target(target_session or self.session_name),
             "-p",  # print to stdout instead of paste buffer
         ]
         if escapes:

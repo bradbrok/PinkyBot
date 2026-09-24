@@ -1087,7 +1087,7 @@ class TestTmuxControlSetCommandRunner:
         # verbatim (no wrap) until the seam is swapped.
         control = _TmuxControl("pinky-dymok-main", command_runner=inner)
         await control.has_session()
-        assert inner.calls[-1] == ["tmux", "has-session", "-t", "pinky-dymok-main"]
+        assert inner.calls[-1] == ["tmux", "has-session", "-t", "=pinky-dymok-main"]
 
         control.set_command_runner(
             ContainerCommandRunner(
@@ -1097,7 +1097,7 @@ class TestTmuxControlSetCommandRunner:
         await control.has_session()
         assert inner.calls[-1] == [
             "podman", "exec", "-w", "/srv/agents/dymok", "--", "pinky-dymok",
-            "tmux", "has-session", "-t", "pinky-dymok-main",
+            "tmux", "has-session", "-t", "=pinky-dymok-main",
         ]
 
     async def test_swap_back_to_local_unwraps(self):
@@ -1112,7 +1112,7 @@ class TestTmuxControlSetCommandRunner:
 
         control.set_command_runner(inner)
         await control.has_session()
-        assert inner.calls[-1] == ["tmux", "has-session", "-t", "pinky-dymok-main"]
+        assert inner.calls[-1] == ["tmux", "has-session", "-t", "=pinky-dymok-main"]
 
 
 class TestContainerStartTimeoutSec:
