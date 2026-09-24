@@ -585,9 +585,8 @@ def _check_command(command: str, word: ast.AST, body: list[ast.AST], report: Rep
         report.violation(pending[1], f"{pending[2]} without an inline target")
     if targeted:
         return
-    if command in UNTARGETED:
-        report.untargeted.append(command)
-    else:
+    report.untargeted.append(command)
+    if command not in UNTARGETED:
         report.violation(word, f"{command} has no exact -t target before its first argument")
 
 
