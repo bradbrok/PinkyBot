@@ -323,6 +323,24 @@ async def test_new_name_starting_with_dash_is_taken_as_the_name(private_tmux):
     assert private_tmux.sessions() == ["-renamed"]
 
 
+@pytest.mark.parametrize(
+    "new_name", ["renamed;", "Renamed", "re.named", "re:named", "re named", ""]
+)
+async def test_new_name_the_targets_cannot_address_is_refused_before_tmux_runs(
+    private_tmux, new_name
+):
+    """The renamed session is addressed later by exact name, so a new name
+    outside the target allowlist is refused: tmux would split ``renamed;``
+    off as a command separator and store ``renamed``."""
+    private_tmux.new("pinky-x")
+    control = private_tmux.control("pinky-x")
+
+    with pytest.raises(ValueError):
+        await control.rename_session(new_name)
+
+    assert private_tmux.sessions() == ["pinky-x"]
+
+
 async def test_name_ending_in_separator_is_refused_before_tmux_runs(private_tmux):
     """tmux reads an argument ending in ``;`` as a command separator: the
     target ``=pinky-x;`` would address ``pinky-x``."""

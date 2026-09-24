@@ -96,7 +96,12 @@ from pinky_daemon.streaming_session import (
     _log,
     _notify_turn_idle,
 )
-from pinky_daemon.tmux_targets import exact_pane_target, exact_session_target, text_argument
+from pinky_daemon.tmux_targets import (
+    _addressable,
+    exact_pane_target,
+    exact_session_target,
+    text_argument,
+)
 from pinky_daemon.tmux_transcript import (
     TmuxTranscriptTailer,
     TurnResponse,
@@ -948,9 +953,17 @@ class _TmuxControl:
         look for ``pinky-<agent>`` while the preserved OAuth pane lives under
         ``login-hold-<agent>``. Keeping ``self.session_name`` unchanged is
         therefore intentional.
+
+        The renamed session is later addressed by exact name, so ``new_name``
+        must pass the same allowlist as targets; anything else raises
+        ``ValueError`` before tmux runs.
         """
         return await self._run(
-            "rename-session", "-t", exact_session_target(self.session_name), "--", new_name
+            "rename-session",
+            "-t",
+            exact_session_target(self.session_name),
+            "--",
+            _addressable(new_name),
         )
 
     async def resize_window(
