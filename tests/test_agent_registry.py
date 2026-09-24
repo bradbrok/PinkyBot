@@ -12,6 +12,7 @@ import time
 import urllib.request
 from io import StringIO
 from unittest.mock import MagicMock
+from urllib.error import URLError
 
 import pytest
 
@@ -24,6 +25,50 @@ from pinky_daemon.agent_registry import (
     SoulMutationRejectedError,
     resolve_agent_path,
 )
+
+
+@pytest.mark.parametrize("failures", [2, 3])
+def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, failures):
+    from pinky_daemon.agent_registry import _tmux_session_start_hook_source
+
+    sentinel = "SECRET_SENTINEL_DO_NOT_LOG"
+    url = "http://secret-endpoint.invalid/" + sentinel
+    monkeypatch.setenv("PINKY_AGENT_KEY", sentinel)
+    monkeypatch.setenv("PINKY_DAEMON_URL", url)
+    monkeypatch.setenv("PINKY_TMUX_TRANSCRIPT_BIND", "1")
+    monkeypatch.setattr(sys, "stdin", StringIO(json.dumps({
+        "transcript_path": "/private/" + sentinel, "session_id": sentinel,
+    })))
+    outcomes = [URLError(url)] * failures
+    if failures < 3:
+        outcomes.append(MagicMock())
+    post = MagicMock(side_effect=outcomes)
+    monkeypatch.setattr(urllib.request, "urlopen", post)
+    sleeps = MagicMock()
+    monkeypatch.setattr(time, "sleep", sleeps)
+    hook = tmp_path / ".claude" / "hook_tmux_session_start.py"
+    hook.parent.mkdir()
+    source = _tmux_session_start_hook_source("test-agent")
+    try:
+        exec(compile(source, str(hook), "exec"), {"__file__": str(hook)})
+    except SystemExit as exc:
+        assert exc.code == 0
+    assert post.call_count == 3
+    assert [call.kwargs["timeout"] for call in post.call_args_list] == [5, 5, 5]
+    assert [call.args[0] for call in sleeps.call_args_list] == [0.5, 1.5]
+    failure_log = hook.parent / "hook_failures.log"
+    if failures < 3:
+        assert not failure_log.exists()
+    else:
+        lines = failure_log.read_text().splitlines()
+        assert len(lines) == 1
+        assert "SessionStart" in lines[0]
+        assert "URLError" in lines[0]
+        assert "attempts=3" in lines[0]
+        assert sentinel not in lines[0]
+        assert url not in lines[0]
+        assert "http" not in lines[0]
+        assert "/private" not in lines[0]
 
 
 @pytest.fixture
