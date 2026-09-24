@@ -29,15 +29,24 @@ def _session(
     mode: str,
     agent_name: str = "phase1-agent",
     init_timeout: float = 0.2,
+    startup_delay: float = 0,
 ) -> CodexSession:
     working_dir = tmp_path / agent_name
     working_dir.mkdir()
     monkeypatch.delenv("PINKY_CODEX_APP_SERVER", raising=False)
     monkeypatch.setenv("PINKY_CODEX_APP_SERVER_AGENTS", agent_name)
     monkeypatch.setenv("PINKY_CODEX_APP_SERVER_INIT_TIMEOUT", str(init_timeout))
+    command = [sys.executable, str(_FAKE), "--mode", mode]
+    if startup_delay:
+        command = [
+            sys.executable, "-c",
+            "import runpy,sys,time; time.sleep(float(sys.argv.pop(1))); "
+            "sys.argv.pop(0); runpy.run_path(sys.argv[0],run_name='__main__')",
+            str(startup_delay), str(_FAKE), "--mode", mode,
+        ]
     monkeypatch.setenv(
         "PINKY_CODEX_APP_SERVER_CMD",
-        shlex.join([sys.executable, str(_FAKE), "--mode", mode]),
+        shlex.join(command),
     )
     session = CodexSession(
         StreamingSessionConfig(
@@ -56,22 +65,28 @@ def _session(
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("startup_delay", [0, 0.35], ids=["natural", "delayed-start"])
 @pytest.mark.parametrize(
-    ("mode", "reason"),
+    ("mode", "reason", "init_timeout"),
     [
-        ("hang-init", "timeout"),
-        ("error-init", "error"),
-        ("die-pre-init", "error"),
+        ("hang-init", "timeout", 0.2),
+        ("error-init", "error", 5),
+        ("die-pre-init", "error", 5),
     ],
 )
 async def test_init_failure_degrades_to_exec_without_terminalizing(
-    monkeypatch, tmp_path, mode, reason
+    monkeypatch, tmp_path, mode, reason, init_timeout, startup_delay
 ):
     logs: list[str] = []
     monkeypatch.setattr("pinky_daemon.codex_session._log", logs.append)
-    session = _session(monkeypatch, tmp_path, mode=mode)
+    # Error cases must reach the fake server despite interpreter startup latency.
+    # The hang case deliberately retains its short timeout contract.
+    session = _session(
+        monkeypatch, tmp_path, mode=mode, startup_delay=startup_delay, init_timeout=init_timeout
+    )
 
-    await asyncio.wait_for(session.connect(), timeout=1)
+    outer_timeout = 1 if mode == "hang-init" else init_timeout + 5
+    await asyncio.wait_for(session.connect(), timeout=outer_timeout)
 
     assert session.state == SessionState.CONNECTED
     assert session._use_app_server is False

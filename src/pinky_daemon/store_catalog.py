@@ -851,6 +851,7 @@ class StoreCatalog:
         self._observability = observability
         self._entries: list[_CatalogEntry] = []
         self._observations: list[StoreObservation] = []
+        self._preflight_outcome_callback: Callable[[str, str], None] | None = None
         self._lock = threading.RLock()
         self._connection_authority = _StoreConnectionAuthority(self)
 
@@ -916,6 +917,35 @@ class StoreCatalog:
                 if entry.record.resolved_path == record.resolved_path:
                     cohort.append(entry.record.criticality)
         return max(cohort, key=lambda criticality: _CRITICALITY_RANK[criticality])
+
+    def verify_deferred_preflight(self, logical_name: str, *, timeout: float) -> bool:
+        """Complete a telemetry integrity check deferred only for SQLite contention."""
+        with self._lock:
+            observation = next(
+                (item for item in self._observations
+                 if logical_name in item.logical_names and item.outcome == "deferred-busy"),
+                None,
+            )
+        if observation is None:
+            return True
+        bound_file = observation._bound_file
+        if bound_file is None:
+            raise StoreCatalogError("deferred telemetry preflight lost its pinned file")
+        connection = bound_file.connect_read_only(timeout=max(0.0, timeout))
+        try:
+            rows = connection.execute("PRAGMA quick_check").fetchall()
+        finally:
+            connection.close()
+        bound_file.require_path_unchanged()
+        if rows != [("ok",)]:
+            raise StoreCatalogError(
+                f"deferred telemetry quick_check failed for {logical_name!r}: {rows!r}"
+            )
+        with self._lock:
+            observation.outcome = "deferred-busy-verified"
+        if self._preflight_outcome_callback is not None:
+            self._preflight_outcome_callback(logical_name, "deferred-busy-verified")
+        return True
 
     def open_connection(
         self,
@@ -1302,6 +1332,7 @@ class StoreCatalog:
         targets: Iterable[StoreIntegrityTarget],
         *,
         on_outcome: Callable[[str, str], None] | None = None,
+        telemetry_busy_timeout: float = _SQLITE_DEFAULT_TIMEOUT_SECONDS,
     ) -> dict[str, StoreObservation]:
         """Fail closed when an existing API-owned SQLite file is corrupt.
 
@@ -1309,6 +1340,8 @@ class StoreCatalog:
         Missing and in-memory stores are left for their constructors to create.
         """
         targets_by_path: dict[str, list[StoreIntegrityTarget]] = {}
+        with self._lock:
+            self._preflight_outcome_callback = on_outcome
         outcomes: dict[str, str] = {}
         observations: dict[str, StoreObservation] = {}
         for target in targets:
@@ -1320,8 +1353,36 @@ class StoreCatalog:
 
         for absolute_path, matching_targets in targets_by_path.items():
             logical_names = tuple(target.logical_name for target in matching_targets)
+            telemetry_only = False
+            preflight_timeout = _SQLITE_DEFAULT_TIMEOUT_SECONDS
             try:
                 bound_file = BoundSQLiteFile.open(absolute_path)
+                physical_id = bound_file.dev_ino
+                cohort_targets = []
+                for candidate in self._manifest.values():
+                    same_path = os.path.realpath(os.fspath(candidate.path)) == os.path.realpath(
+                        absolute_path
+                    )
+                    try:
+                        candidate_stat = os.stat(candidate.path, follow_symlinks=False)
+                        same_inode = physical_id == (candidate_stat.st_dev, candidate_stat.st_ino)
+                    except OSError:
+                        same_inode = False
+                    if same_path or same_inode:
+                        cohort_targets.append(candidate)
+                cohort_targets.extend(matching_targets)
+                telemetry_only = (
+                    any(
+                        target.logical_name
+                        in {"schedule_fire_trace", "schedule_fire_trace_read"}
+                        for target in cohort_targets
+                    )
+                    and bool(cohort_targets)
+                    and all(target.criticality == "telemetry" for target in cohort_targets)
+                )
+                preflight_timeout = (
+                    telemetry_busy_timeout if telemetry_only else _SQLITE_DEFAULT_TIMEOUT_SECONDS
+                )
             except OSError as exc:
                 if self._is_missing_path_error(exc):
                     observation = StoreObservation.absent(logical_names, absolute_path)
@@ -1372,7 +1433,7 @@ class StoreCatalog:
                         absolute_path,
                     )
                 else:
-                    connection = bound_file.connect_read_only()
+                    connection = bound_file.connect_read_only(timeout=preflight_timeout)
                 try:
                     if any(target.journal_mode is not None for target in matching_targets):
                         journal_row = connection.execute("PRAGMA journal_mode").fetchone()
@@ -1442,6 +1503,26 @@ class StoreCatalog:
                         "skipped-absent",
                         outcomes,
                         on_outcome,
+                    )
+                    continue
+                error_code = getattr(exc, "sqlite_errorcode", None)
+                primary_code = error_code & 0xFF if error_code is not None else None
+                if telemetry_only and primary_code in {sqlite3.SQLITE_BUSY, sqlite3.SQLITE_LOCKED}:
+                    bound_file.require_path_unchanged()
+                    observation = StoreObservation(
+                        logical_names=logical_names,
+                        path=absolute_path,
+                        outcome="deferred-busy",
+                        journal_mode=header_journal_mode,
+                        _bound_file=bound_file,
+                    )
+                    retain_bound_file = True
+                    with self._lock:
+                        self._observations.append(observation)
+                    for target in matching_targets:
+                        observations[target.logical_name] = observation
+                    self._record_integrity_outcomes(
+                        matching_targets, "deferred-busy", outcomes, on_outcome
                     )
                     continue
                 self._record_integrity_outcomes(

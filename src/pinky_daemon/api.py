@@ -58,6 +58,7 @@ from fastapi.responses import (
 from fastapi.staticfiles import StaticFiles
 
 from pinky_daemon import runtime_model_catalog
+from pinky_daemon import schedule_fire_trace as _schedule_fire_trace
 from pinky_daemon.activity_store import ActivityStore
 from pinky_daemon.agent_comms import AgentComms
 from pinky_daemon.agent_registry import (
@@ -1838,6 +1839,7 @@ def create_api(
         store_catalog.preflight_integrity(
             store_manifest.values(),
             on_outcome=storage_observability.record_preflight,
+            telemetry_busy_timeout=_schedule_fire_trace.SETUP_TIMEOUT_SECONDS,
         )
     except StoreCatalogError:
         store_catalog.close()
@@ -14035,6 +14037,9 @@ npm run build</pre>
         if shared_mcp_manager and shared_mcp_manager.is_running:
             await shared_mcp_manager.stop()
             _log("shutdown: shared MCP server stopped")
+        # The trace owns a retry timer and worker separate from catalog stores.
+        # Stop it before catalog shutdown closes its pinned descriptors.
+        agents._fire_trace.close()
         for tenant_catalog in tenant_store_catalogs.values():
             tenant_catalog.close()
         try:
@@ -14078,6 +14083,7 @@ npm run build</pre>
                 transport_status[et] = {"status": "unknown", "error": str(e)}
         out["transport_alert_status"] = transport_status
         out["storage"] = storage_observability.snapshot()
+        out["fire_trace"] = agents._fire_trace.status()
         return out
 
     # ── Admin: Shared MCP Status ─────────────────────────
@@ -14777,6 +14783,7 @@ npm run build</pre>
         )
         return {
             "running": scheduler.running,
+            "fire_trace_status": agents._fire_trace.status(),
             "fire_trace_24h": (await asyncio.to_thread(agents._fire_trace.report, since=time.time() - 86400))["counts"],
             "trace_write_failures_24h": {edge: value["upper"] for edge, value in failure_bounds.items()},
             "trace_write_failure_bounds_24h": failure_bounds,
