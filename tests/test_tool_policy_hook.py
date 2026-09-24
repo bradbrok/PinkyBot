@@ -14,6 +14,7 @@ import threading
 import time
 from contextlib import contextmanager
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 import pytest
 
@@ -204,7 +205,7 @@ def test_pause_waits_for_signed_pending_resolution(tmp_path, result):
             assert request["path"] == "/agents/sample/policy/pending/tp_0123456789abcdef?wait=25"
             headers = {key.lower(): value for key, value in request["headers"].items()}
             assert verify_internal_request(
-                SECRET, agent_name="sample", method="GET", path=request["path"],
+                SECRET, agent_name="sample", method="GET", path=urlsplit(request["path"]).path,
                 timestamp=headers["x-pinky-timestamp"], signature=headers["x-pinky-signature"],
             )
 

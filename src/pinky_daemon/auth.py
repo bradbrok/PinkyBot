@@ -260,8 +260,10 @@ def verify_internal_request(
         return False
     if abs(int(time.time()) - ts) > _INTERNAL_TTL_SECONDS:
         return False
-    normalized_path = path.split("?", 1)[0]
-    payload = f"{agent_name}\n{method.upper()}\n{normalized_path}\n{ts}".encode("utf-8")
+    # The verifier receives the decoded routed path, without a query string.
+    if "?" in path or "#" in path:
+        return False
+    payload = f"{agent_name}\n{method.upper()}\n{path}\n{ts}".encode("utf-8")
     # Accept a match against the per-agent key OR (when allowed) the global
     # secret. Each comparison is constant-time; we only short-circuit on a match.
     for candidate in (agent_key, usable_secret):
