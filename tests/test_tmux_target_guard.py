@@ -679,6 +679,7 @@ BYPASS_SHAPES = [
     ('run("capture-pane", "-pt", exact_pane_target(n))', "clustered"),
     ('run("send", "-t", name)', "not built by an exact helper"),
     ('run(["tmux", "send", "-t", name])', "not built by an exact helper"),
+    ('run([tmux, "-L", sock, "send", "-t", name])', "not built by an exact helper"),
     ('run("send-k", "-t", name)', "not built by an exact helper"),
     ('args = ["send-keys"]\nargs.extend(["-t", name])', "not built by an exact helper"),
     ('args = ["send-keys"]\nargs += ["-t", name]', "not built by an exact helper"),
