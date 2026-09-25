@@ -984,6 +984,7 @@ GATE_TOOL_NAMES: dict[str, list[str]] = {
         "set_wake_schedule",
         "update_wake_schedule",
         "list_my_schedules",
+        "get_schedule",
         "remove_wake_schedule",
         "discard_pending_schedule_wake",
     ],
