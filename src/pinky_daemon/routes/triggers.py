@@ -124,7 +124,7 @@ def _prune_bucket(timestamps: list[float], now: float, window: float) -> list[fl
 
 def _retry_after(timestamps: list[float], now: float, window: float) -> int:
     """Seconds until the oldest counted request leaves the sliding window."""
-    return max(1, min(int(window), math.ceil(window - (now - timestamps[0]))))
+    return max(1, min(math.ceil(window), math.ceil(window - (now - timestamps[0]))))
 
 
 def _charge_hook_ip_miss(request: Request, now: float) -> int | None:

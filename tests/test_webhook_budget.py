@@ -176,6 +176,11 @@ def test_retry_after_rounds_up(client, bucket, token, count, age, expected):
     assert response.headers["Retry-After"] == str(expected)
 
 
-@pytest.mark.parametrize("window,expected", [(60.5, 60), (0.5, 1)])
-def test_retry_after_clamps_fractional_window_test_seam(window, expected):
+@pytest.mark.parametrize("window,expected", [(60.5, 61), (0.5, 1), (60.0, 60)])
+def test_retry_after_rounds_window_up(window, expected):
     assert hooks._retry_after([NOW], NOW, window) == expected
+
+
+@pytest.mark.parametrize("age,expected", [(-10.0, 60), (60.0, 1)])
+def test_retry_after_clamps_wait_to_window_bounds(age, expected):
+    assert hooks._retry_after([NOW - age], NOW, 60.0) == expected
