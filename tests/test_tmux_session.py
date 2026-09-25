@@ -64,6 +64,9 @@ async def _start_retained_recovery(tmp_path, monkeypatch, *, continued=False):
     monkeypatch.setattr(ss._tailer, "start", AsyncMock())
     monkeypatch.setattr(ss._tailer, "stop", AsyncMock())
     ss._last_launch_used_continue = continued
+    ss._prelaunch_transcripts = (
+        frozenset(path for path, _ in ss._transcript_candidates()) if not continued else frozenset()
+    )
     await ss._start_tailer()
     return ss, old
 
@@ -3745,18 +3748,11 @@ async def test_first_bind_recovery_noops_when_flag_already_consumed(
 
 
 @pytest.mark.asyncio
-async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
-    tmp_path, monkeypatch,
+async def test_first_bind_recovery_acknowledges_same_post_launch_path(
+    tmp_path,
+    monkeypatch,
 ) -> None:
-    """Issue #565 — recovery must no-op (no log spam, no seek reset)
-    when discovery returns the path the tailer is already bound to.
-
-    This is the common case when the SessionStart hook arrives at the
-    same time discovery would have found the right path (CC just
-    happens to have its newest JSONL be the one the tailer already
-    points at). The attempt should detect the same-path case and
-    return without going through ``set_transcript_path``.
-    """
+    """An eligible path already found by self-heal completes recovery without seeking."""
     ss, _ = _make_session_with_response_cb()
     await ss.connect()
 
@@ -3773,10 +3769,7 @@ async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
 
     assert ss._tailer.transcript_path == current
     assert ss._tailer.offset == 1234, "same-path recovery must not reset offset"
-    assert ss._tailer_first_bind_pending is True, (
-        "same-path no-op must not consume the first-bind flag — "
-        "the real bind hasn't happened yet"
-    )
+    assert ss._tailer_first_bind_pending is False
 
     await ss.disconnect()
 

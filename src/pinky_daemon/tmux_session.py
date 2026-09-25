@@ -71,6 +71,7 @@ from collections.abc import Iterator
 from contextlib import ExitStack
 from dataclasses import dataclass, field, replace
 from pathlib import Path
+from stat import S_ISREG
 from typing import Literal
 
 from pinky_daemon import isolated_launch_env, tmux_launch_env, tmux_launch_env_loader
@@ -124,6 +125,18 @@ from pinky_daemon.watchdog_log import log_watchdog_decision
 # Narrow test seam for engine-controlled delays. Keep the asyncio module's
 # global sleep untouched so independent event loops cannot interfere.
 _async_sleep = asyncio.sleep
+
+
+def _regular_transcript_candidates(paths: Iterator[Path]) -> Iterator[tuple[Path, float]]:
+    """Yield regular files and their mtimes, isolating each filesystem failure."""
+    for path in paths:
+        try:
+            metadata = path.lstat()
+        except OSError:
+            continue
+        if S_ISREG(metadata.st_mode):
+            yield path, metadata.st_mtime
+
 
 # Soft context-watermark default (#614) — used when an agent's
 # ``context_nudge_threshold_pct`` is unset (0). Sits well below the
@@ -2422,7 +2435,7 @@ class TmuxSession(TransportReplacementMixin):
         # ``stop_hook_summary``. Continue launches preserve the
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
-        self._prelaunch_transcripts: frozenset[str] = frozenset()
+        self._prelaunch_transcripts: frozenset[Path] = frozenset()
         self._first_bind_wait_logged: bool = False
 
         # #1148 — lineage reported by the pane's SessionStart hook. A new
@@ -4088,6 +4101,13 @@ class TmuxSession(TransportReplacementMixin):
             self._check_startup_owner()
             await self._seed_container_home_creds()
             self._check_startup_owner()
+            # The new process can create its transcript before tailer startup.
+            # Snapshot only history that exists before process creation.
+            self._prelaunch_transcripts = (
+                frozenset(path for path, _ in self._transcript_candidates())
+                if not self._last_launch_used_continue
+                else frozenset()
+            )
             # Stamp before process creation so even an immediate current-
             # session hook POST is correctly considered fresh.
             session_started_at = time.time()
@@ -6934,11 +6954,7 @@ class TmuxSession(TransportReplacementMixin):
         # silently lost the #564 first-bind seek AND the #565
         # delayed recovery for the rest of its lifetime.
         self._tailer_first_bind_pending = True
-        self._prelaunch_transcripts = (
-            frozenset(path.name for path in self._project_dir().glob("*.jsonl"))
-            if not self._last_launch_used_continue
-            else frozenset()
-        )
+        # Preserve the candidate snapshot taken before process creation.
         self._first_bind_wait_logged = False
 
         # Issue #570: reset the wake-prompt readiness gate to a fresh
@@ -7067,7 +7083,9 @@ class TmuxSession(TransportReplacementMixin):
           - First-bind flag already consumed by the explicit hook.
           - Tailer has been torn down (``_stop_tailer`` ran).
           - Discovery returns None (no real transcript on disk yet).
-          - Discovery returns the same path we're already on.
+
+        An eligible path already found by the tailer's self-heal consumes
+        the pending flag without seeking or opening the readiness gate.
         """
         # Guard: only fresh launches need recovery — continue launches
         # already seek EOF for #496 reply-spam defense.
@@ -7098,9 +7116,13 @@ class TmuxSession(TransportReplacementMixin):
                     "no post-launch transcript yet — polling"
                 )
             return
-        # No-change → no work. The tailer's own equality guard would
-        # handle this, but checking here keeps the log noise honest.
+        # Discovery can be satisfied by the tailer's independent self-heal.
+        # Acknowledge it without rewinding bytes already consumed.
         if Path(discovered) == Path(self._tailer.transcript_path):
+            self._tailer_first_bind_pending = False
+            _log(
+                f"tmux[{self.agent_name}]: #565 recovery: first bind already satisfied by self-heal"
+            )
             return
         _log(
             f"tmux[{self.agent_name}]: #565 first-bind recovery — no "
@@ -7279,20 +7301,22 @@ class TmuxSession(TransportReplacementMixin):
             return None
         return jsonls[0] if jsonls else None
 
+    def _transcript_candidates(self) -> Iterator[tuple[Path, float]]:
+        """Enumerate eligible transcripts for snapshots and recovery discovery."""
+        yield from _regular_transcript_candidates(self._project_dir().glob("*.jsonl"))
+
     def _discover_post_launch_transcript_path(self) -> Path | None:
-        """Find a new transcript by name, excluding history modified at shutdown."""
-        try:
-            return max(
-                (
-                    path
-                    for path in self._project_dir().glob("*.jsonl")
-                    if path.name not in self._prelaunch_transcripts
-                ),
-                key=lambda path: path.stat().st_mtime,
-                default=None,
-            )
-        except OSError:
-            return None
+        """Find a new transcript path, excluding history modified at shutdown."""
+        newest = max(
+            (
+                (path, mtime)
+                for path, mtime in self._transcript_candidates()
+                if path not in self._prelaunch_transcripts
+            ),
+            key=lambda candidate: candidate[1],
+            default=None,
+        )
+        return newest[0] if newest is not None else None
 
     def _prepend_message_queue(self, turns: list[_QueuedTurn]) -> None:
         """Put ``turns`` ahead of the existing backlog without changing FIFO."""
