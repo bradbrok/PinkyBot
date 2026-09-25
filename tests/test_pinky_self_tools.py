@@ -619,6 +619,104 @@ class TestListMySchedules:
         assert "No schedules" not in result
 
 
+# ── get_schedule ──────────────────────────────────────────────────────────────
+
+LONG_PROMPT = (
+    "Review the overnight queue, summarise every ticket that changed state, "
+    "check the durable outbox for stranded wakes, reconcile the calendar against "
+    "the schedule table, and post one consolidated report to the owner channel "
+    "before the morning check fires. " * 3
+)
+
+
+class TestGetSchedule:
+    def _rows(self):
+        return {
+            "schedules": [
+                {
+                    "id": 1, "agent_name": "barsik", "name": "morning",
+                    "cron": "0 8 * * *", "prompt": LONG_PROMPT,
+                    "timezone": "America/Los_Angeles", "enabled": True,
+                    "last_run": 1234567890.0, "last_delivered": 1234567891.0,
+                    "last_accepted_fired_at": 0.0, "next_run": 1234654290.0,
+                    "created_at": 1234000000.0, "direct_send": False,
+                    "target_channel": "", "one_shot": False,
+                },
+                {
+                    "id": 2, "agent_name": "barsik", "name": "standup",
+                    "cron": "0 9 * * 1-5", "prompt": "Post standup",
+                    "timezone": "UTC", "enabled": False, "last_run": 0,
+                    "last_delivered": 0, "last_accepted_fired_at": 0,
+                    "next_run": None, "created_at": 1234000001.0,
+                    "direct_send": True, "target_channel": "6770805286",
+                    "one_shot": True,
+                },
+            ]
+        }
+
+    def test_own_schedule_returns_full_prompt(self, srv):
+        assert len(LONG_PROMPT) > 200
+        with _ok(self._rows()):
+            result = _tools(srv)["get_schedule"](schedule_id=1)
+        record = json.loads(result)
+        assert record["prompt"] == LONG_PROMPT
+        assert record["id"] == 1
+        assert record["name"] == "morning"
+        assert record["cron"] == "0 8 * * *"
+        assert record["timezone"] == "America/Los_Angeles"
+        assert record["enabled"] is True
+        assert record["one_shot"] is False
+        assert record["direct_send"] is False
+        assert record["target_channel"] == ""
+        assert record["last_run"] == 1234567890.0
+        assert record["next_run"] == 1234654290.0
+
+    def test_direct_send_fields_preserved(self, srv):
+        with _ok(self._rows()):
+            record = json.loads(_tools(srv)["get_schedule"](schedule_id=2))
+        assert record["direct_send"] is True
+        assert record["target_channel"] == "6770805286"
+        assert record["one_shot"] is True
+        assert record["enabled"] is False
+        assert record["next_run"] is None
+
+    def test_other_agents_schedule_refused(self, srv):
+        # The API only ever returns the caller's own rows, so an ID that is
+        # not among them (another agent's, or nonexistent) is refused.
+        with _ok(self._rows()):
+            result = _tools(srv)["get_schedule"](schedule_id=99)
+        assert "not found among your schedules" in result
+        assert "#99" in result
+        assert LONG_PROMPT not in result
+
+    def test_queries_only_own_agent_rows(self, srv):
+        seen: list[str] = []
+
+        def _urlopen(req, timeout=30):
+            seen.append(req.full_url)
+            body = json.dumps({"schedules": []}).encode()
+            resp = MagicMock()
+            resp.read.return_value = body
+            resp.__enter__ = lambda s: s
+            resp.__exit__ = MagicMock(return_value=False)
+            return resp
+
+        with patch("urllib.request.urlopen", side_effect=_urlopen):
+            _tools(srv)["get_schedule"](schedule_id=5)
+        assert seen == ["http://localhost:9999/agents/barsik/schedules?enabled_only=false"]
+
+    def test_api_error(self, srv):
+        with _ok({"error": "connection refused"}):
+            result = _tools(srv)["get_schedule"](schedule_id=1)
+        assert "Failed to get schedule #1" in result
+
+    def test_non_dict_body_is_an_error_not_a_raise(self, srv):
+        with _ok([{"id": 1, "name": "morning"}]):
+            result = _tools(srv)["get_schedule"](schedule_id=1)
+        assert isinstance(result, str)
+        assert "Failed to get schedule #1" in result
+
+
 # ── remove_wake_schedule ──────────────────────────────────────────────────────
 
 class TestRemoveWakeSchedule:
@@ -875,6 +973,166 @@ class TestCompleteTask:
         with _ok({"error": "not your task"}):
             result = _tools(srv)["complete_task"](task_id=55)
         assert "Failed" in result
+
+
+# ── get_task ──────────────────────────────────────────────────────────────────
+
+LONG_DESCRIPTION = (
+    "Rebuild the arrival lane so that each tracked shipment is matched to its "
+    "ticket, flipped to the right status, and annotated with a readable note. "
+    "Cover the edge cases: partial deliveries, duplicate tracking numbers, and "
+    "shipments whose ticket was closed before arrival. " * 4
+)
+
+
+class TestGetTask:
+    def _task(self, **overrides):
+        task = {
+            "id": 101,
+            "project_id": 5,
+            "milestone_id": 7,
+            "sprint_id": 3,
+            "title": "Rebuild the arrival lane",
+            "description": LONG_DESCRIPTION,
+            "status": "completed",
+            "priority": "high",
+            "assigned_agent": "barsik",
+            "created_by": "user",
+            "tags": ["backend", "lane"],
+            "due_date": "2026-10-01",
+            "parent_id": 0,
+            "blocked_by": [88, 89],
+            "created_at": 1700000000.0,
+            "updated_at": 1700003600.0,
+        }
+        task.update(overrides)
+        return task
+
+    def _response(self, task, comments=None, subtasks=None):
+        return {
+            "task": task,
+            "subtasks": subtasks if subtasks is not None else [
+                {"id": 102, "title": "Write the matcher", "status": "pending",
+                 "assigned_agent": "barsik", "created_by": "user"},
+            ],
+            "comments": comments if comments is not None else [
+                {"id": 9, "task_id": 101, "author": "barsik",
+                 "content": "Lane rebuilt and verified on three live shipments",
+                 "created_at": 1700003600.0},
+                {"id": 8, "task_id": 101, "author": "barsik",
+                 "content": "Claimed and started work", "created_at": 1700000100.0},
+            ],
+        }
+
+    def test_visible_task_returns_every_field_in_full(self, srv):
+        assert len(LONG_DESCRIPTION) > 200
+        with _ok(self._response(self._task())):
+            result = _tools(srv)["get_task"](task_id=101)
+        record = json.loads(result)
+        assert record["id"] == 101
+        assert record["title"] == "Rebuild the arrival lane"
+        assert record["description"] == LONG_DESCRIPTION
+        assert record["status"] == "completed"
+        assert record["priority"] == "high"
+        assert record["tags"] == ["backend", "lane"]
+        assert record["assigned_agent"] == "barsik"
+        assert record["created_by"] == "user"
+        assert record["project_id"] == 5
+        assert record["milestone_id"] == 7
+        assert record["sprint_id"] == 3
+        assert record["blocked_by"] == [88, 89]
+        assert record["created_at"] == 1700000000.0
+        assert record["updated_at"] == 1700003600.0
+        assert "completed_summary" not in record
+        assert len(record["comments"]) == 2
+        assert record["comments"][0]["content"] == (
+            "Lane rebuilt and verified on three live shipments"
+        )
+        assert record["comments"][0]["author"] == "barsik"
+        assert record["comments"][0]["created_at"] == 1700003600.0
+        assert record["subtasks"][0]["id"] == 102
+        assert record["hidden_subtasks"] == 0
+
+    def test_created_by_me_is_visible_even_when_assigned_elsewhere(self, srv):
+        task = self._task(assigned_agent="ryzhik", created_by="barsik", status="pending")
+        with _ok(self._response(task, comments=[])):
+            record = json.loads(_tools(srv)["get_task"](task_id=101))
+        assert record["assigned_agent"] == "ryzhik"
+        assert record["comments"] == []
+
+    def test_unassigned_task_is_visible(self, srv):
+        task = self._task(assigned_agent="", created_by="user", status="pending")
+        with _ok(self._response(task, comments=[])):
+            record = json.loads(_tools(srv)["get_task"](task_id=101))
+        assert record["id"] == 101
+
+    def test_null_assigned_agent_created_elsewhere_is_visible(self, srv):
+        # The daemon may serialise an unassigned task as JSON null; it is
+        # still unassigned, so it is visible even when another agent made it.
+        task = self._task(assigned_agent=None, created_by="ryzhik", status="pending")
+        with _ok(self._response(task, comments=[])):
+            record = json.loads(_tools(srv)["get_task"](task_id=101))
+        assert record["id"] == 101
+        assert record["assigned_agent"] is None
+        assert record["title"] == "Rebuild the arrival lane"
+
+    def test_subtasks_filtered_by_the_same_visibility_rule(self, srv):
+        task = self._task(assigned_agent="", created_by="user", status="pending")
+        subtasks = [
+            {"id": 201, "title": "Mine by assignment", "status": "pending",
+             "assigned_agent": "barsik", "created_by": "user",
+             "description": "assigned to the caller"},
+            {"id": 202, "title": "Mine by creation", "status": "pending",
+             "assigned_agent": "ryzhik", "created_by": "barsik",
+             "description": "created by the caller"},
+            {"id": 203, "title": "Unassigned", "status": "pending",
+             "assigned_agent": "", "created_by": "ryzhik",
+             "description": "nobody owns this yet"},
+            {"id": 204, "title": "Null assignee", "status": "pending",
+             "assigned_agent": None, "created_by": "ryzhik",
+             "description": "null is unassigned too"},
+            {"id": 205, "title": "Somebody else's private step", "status": "pending",
+             "assigned_agent": "ryzhik", "created_by": "ryzhik",
+             "description": "hidden detail that must not leak"},
+            {"id": 206, "title": "Another hidden step", "status": "done",
+             "assigned_agent": "ryzhik", "created_by": "user",
+             "description": "also hidden"},
+        ]
+        with _ok(self._response(task, comments=[], subtasks=subtasks)):
+            result = _tools(srv)["get_task"](task_id=101)
+        record = json.loads(result)
+        assert [s["id"] for s in record["subtasks"]] == [201, 202, 203, 204]
+        assert record["hidden_subtasks"] == 2
+        assert "Somebody else's private step" not in result
+        assert "hidden detail that must not leak" not in result
+        assert "Another hidden step" not in result
+        assert "also hidden" not in result
+
+    def test_non_dict_body_is_an_error_not_a_raise(self, srv):
+        with _ok([{"id": 101, "title": "Rebuild the arrival lane"}]):
+            result = _tools(srv)["get_task"](task_id=101)
+        assert isinstance(result, str)
+        assert "Failed to get task #101" in result
+        assert "Rebuild the arrival lane" not in result
+
+    def test_other_agents_task_refused(self, srv):
+        task = self._task(assigned_agent="ryzhik", created_by="ryzhik")
+        with _ok(self._response(task)):
+            result = _tools(srv)["get_task"](task_id=101)
+        assert "not visible to you" in result
+        assert "#101" in result
+        assert LONG_DESCRIPTION not in result
+        assert "Rebuild the arrival lane" not in result
+
+    def test_unknown_task(self, srv):
+        with _ok({"error": "Task not found", "status": 404}):
+            result = _tools(srv)["get_task"](task_id=404)
+        assert "Failed to get task #404" in result
+
+    def test_malformed_response(self, srv):
+        with _ok({"task": None}):
+            result = _tools(srv)["get_task"](task_id=3)
+        assert "Task #3 not found" in result
 
 
 # ── block_task ────────────────────────────────────────────────────────────────
@@ -2217,7 +2475,7 @@ class TestAgentStatusPresence:
 CORE_TOOLS = {
     "agent_status", "block_task", "check_inbox", "check_my_health",
     "claim_task", "complete_task", "context_restart", "context_status",
-    "create_task", "get_next_task", "get_owner_profile",
+    "create_task", "get_next_task", "get_owner_profile", "get_task",
     "list_agents", "list_my_skills", "load_my_context",
     "load_skill", "mcp_probe", "mesh_remote_send", "save_my_context",
     "search_history", "send_file_to_agent", "send_heartbeat",
@@ -2272,22 +2530,24 @@ class TestKbUrlEncoding:
 
 
 class TestToolGates:
-    def test_core_only_has_24_tools(self):
+    def test_core_only_has_25_tools(self):
         """No gates → only core tools registered.
 
-        Was 23; +1 in #663 with the addition of ``mcp_probe`` (MCP bind probe).
+        Was 23; +1 in #663 with the addition of ``mcp_probe`` (MCP bind probe);
+        +1 with the read only ``get_task`` tool.
         """
         srv = create_server(agent_name="test", tool_gates=[])
         tools = {t.name for t in srv._tool_manager.list_tools()}
         assert tools == CORE_TOOLS
 
-    def test_all_gates_has_72_tools(self):
+    def test_all_gates_has_74_tools(self):
         """All gates → full tool set.
 
         +1 in #145 with ``register_agent`` (admin gate) → 69, then +1 in #663
         with the core ``mcp_probe`` tool → 70. (Had dropped 69→68 in #552 with
         the removal of ``request_sleep``.) #924 adds ``update_wake_schedule``
-        → 71; #984 adds sanctioned pending-wake discard → 72.
+        → 71; #984 adds sanctioned pending-wake discard → 72; the read only
+        ``get_task`` (core) and ``get_schedule`` (schedule gate) tools → 74.
         """
         all_gates = [
             "extras", "kb", "research", "presentations", "triggers",
@@ -2295,7 +2555,7 @@ class TestToolGates:
         ]
         srv = create_server(agent_name="test", tool_gates=all_gates)
         tools = srv._tool_manager.list_tools()
-        assert len(tools) == 72
+        assert len(tools) == 74
 
     def test_extras_gate_adds_extras_tools(self):
         """Enabling 'extras' gate adds get_attribution, render_pdf, etc."""

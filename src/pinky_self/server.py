@@ -234,6 +234,34 @@ def create_server(
             return "\n".join(lines)
 
         @mcp.tool()
+        def get_schedule(schedule_id: int) -> str:
+            """Return the full record of one of your own wake schedules as JSON.
+
+            Same rows as list_my_schedules, with the prompt untruncated: id, name,
+            cron, timezone, enabled, one_shot, direct_send, target_channel,
+            last_run and next_run. A schedule owned by another agent is refused.
+            """
+            result = _api("GET", f"/agents/{agent_name}/schedules?enabled_only=false")
+            if not isinstance(result, dict):
+                return (
+                    f"Failed to get schedule #{schedule_id}: unexpected response "
+                    f"of type {type(result).__name__}"
+                )
+            if "error" in result:
+                return f"Failed to get schedule #{schedule_id}: {result['error']}"
+            rows = result.get("schedules") or []
+            schedule = next(
+                (
+                    s for s in rows
+                    if isinstance(s, dict) and s.get("id") == schedule_id
+                ),
+                None,
+            )
+            if schedule is None:
+                return f"Schedule #{schedule_id} not found among your schedules."
+            return json.dumps(schedule, indent=2, ensure_ascii=False)
+
+        @mcp.tool()
         def remove_wake_schedule(schedule_id: int) -> str:
             """Delete a wake schedule by ID (from list_my_schedules)."""
             result = _api("DELETE", f"/agents/{agent_name}/schedules/{schedule_id}")
@@ -396,6 +424,47 @@ def create_server(
             f"Tags: {', '.join(t.get('tags') or []) or 'none'}\n"
             f"{project_str}"
         )
+
+    @mcp.tool()
+    def get_task(task_id: int) -> str:
+        """Return the full record of one task you can see as JSON.
+
+        Visible tasks are those assigned to you, created by you, or still
+        unassigned. Every field is returned untruncated (id, title, description,
+        status, priority, tags, assigned_agent, created_by, project, milestone,
+        sprint, blocked_by, timestamps), plus comments (newest first, each with
+        its author and time) and the subtasks you can see under the same rule;
+        hidden_subtasks counts the ones omitted. Any other task is refused.
+        """
+        result = _api("GET", f"/tasks/{task_id}")
+        if not isinstance(result, dict):
+            return (
+                f"Failed to get task #{task_id}: unexpected response "
+                f"of type {type(result).__name__}"
+            )
+        if "error" in result:
+            return f"Failed to get task #{task_id}: {result['error']}"
+        task = result.get("task")
+        if not isinstance(task, dict) or "id" not in task:
+            return f"Task #{task_id} not found."
+        me = str(agent_name)
+
+        def _visible(row: dict) -> bool:
+            assigned = row.get("assigned_agent") or ""
+            created_by = row.get("created_by") or ""
+            return not assigned or assigned == me or created_by == me
+
+        if not _visible(task):
+            return f"Task #{task_id} is not visible to you."
+        subtasks = [
+            s for s in (result.get("subtasks") or []) if isinstance(s, dict)
+        ]
+        visible_subtasks = [s for s in subtasks if _visible(s)]
+        record = dict(task)
+        record["subtasks"] = visible_subtasks
+        record["hidden_subtasks"] = len(subtasks) - len(visible_subtasks)
+        record["comments"] = result.get("comments") or []
+        return json.dumps(record, indent=2, ensure_ascii=False)
 
     @mcp.tool()
     def claim_task(task_id: int) -> str:
