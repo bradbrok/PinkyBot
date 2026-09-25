@@ -125,9 +125,12 @@ class TestWebhookReceiptLog:
 
         now = time_module.time()
         triggers_module._hook_ip_buckets["testclient"] = [now] * 20
-        response = client.post(f"/hooks/{TOKEN}", json={})
+        response = client.post(f"/hooks/{UNKNOWN_TOKEN}", json={})
         assert response.status_code == 429
         assert len(_receipts(logs)) == 1
+        _assert_token_never_logged(logs, UNKNOWN_TOKEN)
+        assert client.post(f"/hooks/{TOKEN}", json={}).status_code == 200
+        assert len(_receipts(logs)) == 2
         _assert_token_never_logged(logs, TOKEN)
 
     def test_every_attempt_gets_its_own_receipt(self, rig):
@@ -165,8 +168,8 @@ class TestRateLimiterClockWedge:
         client, _ = rig
         now = time.time()
         triggers_module._hook_ip_buckets["testclient"] = [now + 3_600.0] * 20
-        response = client.post(f"/hooks/{TOKEN}", json={})
-        assert response.status_code == 200
+        response = client.post(f"/hooks/{UNKNOWN_TOKEN}", json={})
+        assert response.status_code == 404
 
     def test_genuine_token_flood_still_limited_and_loud(self, rig):
         client, logs = rig
