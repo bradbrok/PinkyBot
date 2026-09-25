@@ -81,6 +81,7 @@ from pinky_daemon.agent_registry import (
 )
 from pinky_daemon.auth_relay import coordinator as _auth_relay
 from pinky_daemon.auth_relay import extract_relay_oauth_url, looks_like_login_wall
+from pinky_daemon.codex_tmux_transcript import _DISCOVERY_SCAN_LIMIT
 from pinky_daemon.command_runner import (
     CommandRunner,
     ContainerCommandRunner,
@@ -7305,18 +7306,25 @@ class TmuxSession(TransportReplacementMixin):
         """Enumerate eligible transcripts for snapshots and recovery discovery."""
         yield from _regular_transcript_candidates(self._project_dir().glob("*.jsonl"))
 
+    def _is_own_transcript(self, path: Path) -> bool:
+        """The default runtime has a dedicated transcript directory per workspace."""
+        return True
+
     def _discover_post_launch_transcript_path(self) -> Path | None:
         """Find a new transcript path, excluding history modified at shutdown."""
-        newest = max(
+        candidates = sorted(
             (
                 (path, mtime)
                 for path, mtime in self._transcript_candidates()
                 if path not in self._prelaunch_transcripts
             ),
             key=lambda candidate: candidate[1],
-            default=None,
+            reverse=True,
         )
-        return newest[0] if newest is not None else None
+        for path, _ in candidates[:_DISCOVERY_SCAN_LIMIT]:
+            if self._is_own_transcript(path):
+                return path
+        return None
 
     def _prepend_message_queue(self, turns: list[_QueuedTurn]) -> None:
         """Put ``turns`` ahead of the existing backlog without changing FIFO."""

@@ -363,21 +363,20 @@ class CodexTmuxSession(TmuxSession):
         )
 
     def _transcript_candidates(self) -> Iterator[tuple[Path, float]]:
-        """Enumerate nested rollouts belonging to this session's working directory."""
-        target_cwd = os.path.realpath(self._config.working_dir or ".")
-        for path, mtime in _regular_transcript_candidates(
-            self._project_dir().glob("**/rollout-*.jsonl")
-        ):
-            try:
-                with path.open("r", encoding="utf-8", errors="replace") as handle:
-                    metadata = json.loads(handle.readline())
-                if metadata.get("type") != "session_meta":
-                    continue
-                cwd = metadata.get("payload", {}).get("cwd", "")
-                if os.path.realpath(cwd) == target_cwd:
-                    yield path, mtime
-            except (OSError, ValueError, TypeError, AttributeError):
-                continue
+        """Enumerate rollout paths without opening historical session content."""
+        yield from _regular_transcript_candidates(self._project_dir().glob("**/rollout-*.jsonl"))
+
+    def _is_own_transcript(self, path: Path) -> bool:
+        """Inspect ownership only for a bounded set of post-launch rollouts."""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                metadata = json.loads(handle.readline())
+            if metadata.get("type") != "session_meta":
+                return False
+            cwd = metadata.get("payload", {}).get("cwd", "")
+            return os.path.realpath(cwd) == os.path.realpath(self._config.working_dir or ".")
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
 
     # ── seam: tailer class ──────────────────────────────────────────────────
     async def _start_tailer(self) -> None:

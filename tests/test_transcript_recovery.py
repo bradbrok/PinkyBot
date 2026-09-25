@@ -190,4 +190,70 @@ async def test_recovery_codex_candidates_exclude_other_working_directories(tmp_p
     await ss._first_bind_recovery_task
     assert ss._tailer.transcript_path == new
     assert old in ss._prelaunch_transcripts
-    assert foreign not in dict(ss._transcript_candidates())
+    assert foreign in dict(ss._transcript_candidates())
+    assert not ss._is_own_transcript(foreign)
+
+
+async def test_recovery_never_reads_prelaunch_rollout_history(tmp_path, monkeypatch):
+    ss, old, root = _retained_session(tmp_path, monkeypatch, "codex")
+    history = {old}
+    for number in range(500):
+        path = root / "2025" / f"rollout-history-{number}.jsonl"
+        cwd = ss._config.working_dir if number % 2 else tmp_path / "other-work"
+        _write_transcript(path, cwd)
+        history.add(path)
+    # Launch-mode discovery is independent of snapshot and recovery scans.
+    monkeypatch.setattr(ss, "_has_prior_transcript", lambda: True)
+    reads = []
+    original_open = Path.open
+
+    def counted_open(path, mode="r", *args, **kwargs):
+        if "r" in mode and path.is_relative_to(root):
+            reads.append(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    new = root / "2026" / "09" / "25" / "rollout-new.jsonl"
+
+    def tick(number):
+        if number == 2:
+            assert reads == [], "snapshot and empty polls must not read history"
+            _write_transcript(new, ss._config.working_dir)
+
+    clock = session_tests._recovery_clock(monkeypatch, tick)
+    await TmuxSession._spawn_tmux_repl(ss)
+    await ss._first_bind_recovery_task
+    assert ss._prelaunch_transcripts == history
+    assert reads == [new]
+    assert clock.sleeps == [5.0, 5.0]
+    assert ss._tailer.transcript_path == new
+
+
+def test_recovery_caps_postlaunch_content_reads_and_stops_at_first_match(tmp_path, monkeypatch):
+    ss, old, root = _retained_session(tmp_path, monkeypatch, "codex")
+    ss._prelaunch_transcripts = frozenset({old})
+    new = root / "rollout-own.jsonl"
+    _write_transcript(new, ss._config.working_dir)
+    initial_mtime = new.stat().st_mtime
+    limit = codex_tmux_transcript._DISCOVERY_SCAN_LIMIT
+    foreign = []
+    for number in range(limit + 10):
+        path = root / f"rollout-other-{number}.jsonl"
+        _write_transcript(path, tmp_path / "other-work")
+        os.utime(path, (initial_mtime + number + 1,) * 2)
+        foreign.append(path)
+    reads = []
+    original_open = Path.open
+
+    def counted_open(path, mode="r", *args, **kwargs):
+        if "r" in mode and path.is_relative_to(root):
+            reads.append(path)
+        return original_open(path, mode, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "open", counted_open)
+    assert ss._discover_post_launch_transcript_path() is None
+    assert reads == list(reversed(foreign))[:limit]
+    reads.clear()
+    os.utime(new, (initial_mtime + limit + 20,) * 2)
+    assert ss._discover_post_launch_transcript_path() == new
+    assert reads == [new]
