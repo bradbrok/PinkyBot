@@ -109,3 +109,73 @@ def test_miss_does_not_read_body(client, monkeypatch):
     response = client.post(f"/hooks/{UNKNOWN_TOKEN}", content=b"x" * 2_097_152)
     assert response.status_code == 404
     assert reads == []
+
+
+def test_exhausting_one_token_leaves_another_token_available(client):
+    statuses = [client.post(f"/hooks/{TOKEN}", json={}).status_code for _ in range(61)]
+    assert statuses == [200] * 60 + [429]
+    assert client.post(f"/hooks/{SECOND_TOKEN}", json={}).status_code == 200
+
+
+def test_valid_delivery_leaves_existing_ip_bucket_unchanged(client):
+    stamps = [NOW - 120.0] * 3 + [NOW - 5.0] * 2
+    hooks._hook_ip_buckets["testclient"] = stamps.copy()
+    assert client.post(f"/hooks/{TOKEN}", json={}).status_code == 200
+    assert hooks._hook_ip_buckets["testclient"] == stamps
+
+
+def test_oversized_valid_delivery_consumes_a_token_slot(client):
+    response = client.post(f"/hooks/{TOKEN}", content=b"x" * 1_048_577)
+    assert response.status_code == 413
+    assert hooks._hook_rate_buckets[TOKEN] == [NOW]
+
+
+def test_token_rate_limit_does_not_read_body(client, monkeypatch):
+    hooks._hook_rate_buckets[TOKEN] = [NOW - 1.0] * 60
+    reads = []
+    original_body = Request.body
+
+    async def body(request):
+        reads.append(request.url.path)
+        return await original_body(request)
+
+    monkeypatch.setattr(Request, "body", body)
+    response = client.post(f"/hooks/{TOKEN}", content=b"x" * 2_097_152)
+    assert response.status_code == 429
+    assert reads == []
+
+
+@pytest.mark.parametrize(
+    "bucket,token,count",
+    [
+        ("_hook_ip_buckets", UNKNOWN_TOKEN, 20),
+        ("_hook_rate_buckets", TOKEN, 60),
+    ],
+)
+def test_retry_after_uses_oldest_stamp(client, bucket, token, count):
+    key = "testclient" if bucket == "_hook_ip_buckets" else token
+    getattr(hooks, bucket)[key] = [NOW - 50.0] + [NOW - 10.0] * (count - 1)
+    response = client.post(f"/hooks/{token}", json={})
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == "10"
+
+
+@pytest.mark.parametrize(
+    "bucket,token,count",
+    [
+        ("_hook_ip_buckets", UNKNOWN_TOKEN, 20),
+        ("_hook_rate_buckets", TOKEN, 60),
+    ],
+)
+@pytest.mark.parametrize("age,expected", [(44.5, 16), (44.7, 16), (0.25, 60), (59.0, 1)])
+def test_retry_after_rounds_up(client, bucket, token, count, age, expected):
+    key = "testclient" if bucket == "_hook_ip_buckets" else token
+    getattr(hooks, bucket)[key] = [NOW - age] * count
+    response = client.post(f"/hooks/{token}", json={})
+    assert response.status_code == 429
+    assert response.headers["Retry-After"] == str(expected)
+
+
+@pytest.mark.parametrize("window,expected", [(60.5, 60), (0.5, 1)])
+def test_retry_after_clamps_fractional_window_test_seam(window, expected):
+    assert hooks._retry_after([NOW], NOW, window) == expected

@@ -148,9 +148,9 @@ class TestRateLimiterClockWedge:
     (``now - t`` is negative), so timestamps written under a fast clock that
     NTP later corrects backwards occupy the bucket until process death —
     every delivery is then silently rejected while the sender sees 429s.
-    Observed in production 2026-08-18: a host power-cut's clock correction
-    silenced a webhook token for the process's entire remaining life, cured
-    only by restart. Future debris is clock damage, not load: discard it.
+    A clock corrected backwards can leave future-dated stamps that would
+    otherwise hold the bucket until restart. Future debris is clock damage,
+    not load: discard it.
     """
 
     def test_future_stamped_token_bucket_recovers(self, rig):
@@ -231,13 +231,11 @@ class TestAccessLogTokenRedaction:
             '%s - "%s %s HTTP/%s" %d',
             "127.0.0.1:12345",
             "GET",
-            "/agents/barsik/status",
+            "/agents/example/status",
             "1.1",
             200,
         )
-        assert access_capture == [
-            '127.0.0.1:12345 - "GET /agents/barsik/status HTTP/1.1" 200'
-        ]
+        assert access_capture == ['127.0.0.1:12345 - "GET /agents/example/status HTTP/1.1" 200']
 
     def test_uvicorn_log_config_wires_redaction_into_access_handler(self):
         import uvicorn.config
