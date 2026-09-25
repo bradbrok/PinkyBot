@@ -74,7 +74,8 @@ class HookTokenRedactionFilter(logging.Filter):
     def filter(self, record: logging.LogRecord) -> bool:
         if isinstance(record.args, tuple):
             record.args = tuple(
-                _redact_hook_path(arg) if isinstance(arg, str) else arg for arg in record.args
+                _redact_hook_path(arg) if isinstance(arg, str) else arg
+                for arg in record.args
             )
         if isinstance(record.msg, str):
             record.msg = _redact_hook_path(record.msg)
@@ -103,8 +104,9 @@ def uvicorn_log_config() -> dict:
 
 def _client_ip(request: Request) -> str:
     """Best-effort client IP: first X-Forwarded-For hop, else socket peer."""
-    return request.headers.get("x-forwarded-for", "").split(",")[0].strip() or (
-        request.client.host if request.client else "unknown"
+    return (
+        request.headers.get("x-forwarded-for", "").split(",")[0].strip()
+        or (request.client.host if request.client else "unknown")
     )
 
 
@@ -128,7 +130,9 @@ def _retry_after(timestamps: list[float], now: float, window: float) -> int:
 def _charge_hook_ip_miss(request: Request, now: float) -> int | None:
     """Charge an unknown-token lookup, or return seconds until a retry."""
     ip = _client_ip(request)
-    timestamps = _prune_bucket(_hook_ip_buckets.get(ip, []), now, _HOOK_IP_RATE_WINDOW)
+    timestamps = _prune_bucket(
+        _hook_ip_buckets.get(ip, []), now, _HOOK_IP_RATE_WINDOW
+    )
     if len(timestamps) >= _HOOK_IP_RATE_LIMIT:
         _hook_ip_buckets[ip] = timestamps
         _log(f"hooks: IP rate limited {ip} ({len(timestamps)} reqs in {_HOOK_IP_RATE_WINDOW}s)")
@@ -148,16 +152,17 @@ def _charge_hook_token(token: str, now: float) -> int | None:
         # One line per dropped delivery: a saturated bucket must be visible
         # (and countable) in the journal, never a silent 429. Token prefix
         # only — the full token is a credential.
-        _log(f"hooks: token rate limited {token[:8]}* ({len(timestamps)} reqs in {window:.0f}s)")
+        _log(
+            f"hooks: token rate limited {token[:8]}* "
+            f"({len(timestamps)} reqs in {window:.0f}s)"
+        )
         return _retry_after(timestamps, now, window)
     timestamps.append(now)
     _hook_rate_buckets[token] = timestamps
     return None
 
 
-def _render_trigger_prompt(
-    template: str, trigger_name: str, body: dict | None, body_raw: str
-) -> str:
+def _render_trigger_prompt(template: str, trigger_name: str, body: dict | None, body_raw: str) -> str:
     """Render a trigger prompt template with {{body.field}} interpolation."""
     timestamp = datetime.now(_tz.utc).isoformat()
 
@@ -304,7 +309,9 @@ async def test_agent_trigger(agent_name: str, trigger_id: int):
     if not _agents.get(agent_name):
         raise HTTPException(404, f"Agent '{agent_name}' not found")
 
-    prompt = _render_trigger_prompt(trigger.prompt_template, trigger.name, None, "[test fire]")
+    prompt = _render_trigger_prompt(
+        trigger.prompt_template, trigger.name, None, "[test fire]"
+    )
     try:
         await _wake_callback(agent_name, f"{agent_name}-main", prompt)
         _trigger_store.record_fire(trigger_id)
@@ -372,7 +379,9 @@ async def receive_webhook(token: str, request: Request):
             body_json = None
 
     # Render prompt
-    prompt = _render_trigger_prompt(trigger.prompt_template, trigger.name, body_json, body_raw)
+    prompt = _render_trigger_prompt(
+        trigger.prompt_template, trigger.name, body_json, body_raw
+    )
 
     # Wake agent (fire-and-not-crash: log error but return 200)
     try:

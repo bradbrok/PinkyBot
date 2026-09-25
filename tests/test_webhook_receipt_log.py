@@ -79,8 +79,7 @@ class TestWebhookReceiptLog:
     def test_success_path_logs_receipt_with_prefix_only(self, rig):
         client, logs = rig
         response = client.post(
-            f"/hooks/{TOKEN}",
-            json={"k": "v"},
+            f"/hooks/{TOKEN}", json={"k": "v"},
         )
         assert response.status_code == 200
         receipts = _receipts(logs)
@@ -103,8 +102,7 @@ class TestWebhookReceiptLog:
     def test_oversized_413_still_logs_receipt(self, rig):
         client, logs = rig
         response = client.post(
-            f"/hooks/{TOKEN}",
-            content=b"x" * 1_048_577,
+            f"/hooks/{TOKEN}", content=b"x" * 1_048_577,
         )
         assert response.status_code == 413
         assert len(_receipts(logs)) == 1
@@ -179,7 +177,9 @@ class TestRateLimiterClockWedge:
         triggers_module._hook_rate_buckets[TOKEN] = [now - 1.0] * 60
         response = client.post(f"/hooks/{TOKEN}", json={})
         assert response.status_code == 429
-        limited = [line for line in logs if "token rate limited" in line]
+        limited = [
+            line for line in logs if "token rate limited" in line
+        ]
         assert len(limited) == 1
         assert f"{TOKEN[:8]}*" in limited[0]
         _assert_token_never_logged(logs, TOKEN)
@@ -235,7 +235,9 @@ class TestAccessLogTokenRedaction:
             "1.1",
             200,
         )
-        assert access_capture == ['127.0.0.1:12345 - "GET /agents/barsik/status HTTP/1.1" 200']
+        assert access_capture == [
+            '127.0.0.1:12345 - "GET /agents/barsik/status HTTP/1.1" 200'
+        ]
 
     def test_uvicorn_log_config_wires_redaction_into_access_handler(self):
         import uvicorn.config
@@ -246,9 +248,13 @@ class TestAccessLogTokenRedaction:
         )
         assert "hook_token_redaction" in config["handlers"]["access"]["filters"]
         # The patched dict must be a copy, not a mutation of uvicorn's default.
-        assert "hook_token_redaction" not in (uvicorn.config.LOGGING_CONFIG.get("filters") or {})
+        assert "hook_token_redaction" not in (
+            uvicorn.config.LOGGING_CONFIG.get("filters") or {}
+        )
 
-    def test_live_uvicorn_access_log_never_emits_full_token(self, monkeypatch, capfd):
+    def test_live_uvicorn_access_log_never_emits_full_token(
+        self, monkeypatch, capfd
+    ):
         """End-to-end with the production log config: the emitted access
         record must redact the entire credential segment."""
         import threading
@@ -332,8 +338,11 @@ def test_every_daemon_uvicorn_site_passes_the_redacting_log_config():
                 call_text = _balanced_call(text, index + len(pattern) - 1)
                 if "log_config" not in call_text:
                     line_number = text.count("\n", 0, index) + 1
-                    violations.append(f"{source_path.relative_to(package_root)}:{line_number}")
+                    violations.append(
+                        f"{source_path.relative_to(package_root)}:{line_number}"
+                    )
                 start = index + len(pattern)
-    assert violations == [], "uvicorn started without the redacting log_config at: " + ", ".join(
-        violations
+    assert violations == [], (
+        "uvicorn started without the redacting log_config at: "
+        + ", ".join(violations)
     )
