@@ -50,6 +50,180 @@ from pinky_daemon.transport_state import SessionState, TransitionResult, Trigger
 _REAL_ASYNCIO_SLEEP = asyncio.sleep
 
 
+async def _start_retained_recovery(tmp_path, monkeypatch, *, continued=False):
+    """Arm a fresh spawn with a retained tailer and real transcript history."""
+    ss, _ = _make_session(agent_name="test-agent")
+    old = tmp_path / "old.jsonl"
+    old.write_text("historical transcript\n")
+    monkeypatch.setattr(ss, "_project_dir", lambda: tmp_path)
+    ss._tailer = TmuxTranscriptTailer(
+        transcript_path=old,
+        on_turn_complete=ss._handle_turn_complete,
+    )
+    ss._tailer.set_offset(old.stat().st_size)
+    monkeypatch.setattr(ss._tailer, "start", AsyncMock())
+    monkeypatch.setattr(ss._tailer, "stop", AsyncMock())
+    ss._last_launch_used_continue = continued
+    ss._prelaunch_transcripts = (
+        frozenset(path for path, _ in ss._transcript_candidates()) if not continued else frozenset()
+    )
+    await ss._start_tailer()
+    return ss, old
+
+
+def _recovery_clock(monkeypatch, on_sleep=None):
+    """Advance recovery time without replacing the shared asyncio module."""
+    clock = SimpleNamespace(now=0.0, sleeps=[])
+
+    async def sleep(delay):
+        clock.sleeps.append(delay)
+        clock.now += delay
+        assert len(clock.sleeps) <= 61, "recovery exceeded its polling cap"
+        if on_sleep:
+            on_sleep(len(clock.sleeps))
+
+    monkeypatch.setattr(
+        tmux_session,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "sleep": sleep,
+            }
+        ),
+    )
+    monkeypatch.setattr(
+        tmux_session,
+        "time",
+        SimpleNamespace(
+            **{
+                **vars(_time),
+                "monotonic": lambda: clock.now,
+            }
+        ),
+    )
+    return clock
+
+
+async def test_recovery_t1_late_transcript_after_retained_fresh_spawn(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    new = tmp_path / "fresh.jsonl"
+    bind = MagicMock(wraps=ss._set_transcript_path_internal)
+    monkeypatch.setattr(ss, "_set_transcript_path_internal", bind)
+
+    def tick(number):
+        if number == 2:
+            bind.assert_not_called()
+            assert ss._tailer.transcript_path == old
+            new.write_text("first turn\n")
+
+    clock = _recovery_clock(monkeypatch, tick)
+    await ss._first_bind_recovery_task
+    assert ss._tailer.transcript_path == new
+    assert ss._tailer.offset == 0
+    assert ss._tailer_first_bind_pending is False
+    assert clock.sleeps == [5.0, 5.0]
+    bind.assert_called_once_with(new)
+    assert not ss._session_ready_event.is_set(), "discovery cannot authorize prompt delivery"
+
+
+async def test_recovery_t2_old_shutdown_write_never_rebinds(tmp_path, monkeypatch):
+    other = tmp_path / "older.jsonl"
+    other.write_text("other old history\n")
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    bind = MagicMock(wraps=ss._set_transcript_path_internal)
+    monkeypatch.setattr(ss, "_set_transcript_path_internal", bind)
+
+    def tick(number):
+        os.utime(other, (old.stat().st_mtime + number, old.stat().st_mtime + number))
+
+    _recovery_clock(monkeypatch, tick)
+    await ss._first_bind_recovery_task
+    bind.assert_not_called()
+    assert ss._tailer.transcript_path == old
+    assert ss._tailer.offset == old.stat().st_size
+
+
+async def test_recovery_t3_hook_stops_polling(tmp_path, monkeypatch):
+    ss, _ = await _start_retained_recovery(tmp_path, monkeypatch)
+    new = tmp_path / "hook.jsonl"
+    bind = MagicMock(wraps=ss._set_transcript_path_internal)
+    monkeypatch.setattr(ss, "_set_transcript_path_internal", bind)
+
+    def tick(number):
+        if number == 2:
+            new.write_text("first turn\n")
+            assert ss.set_transcript_path(new, session_id="new-session")
+
+    clock = _recovery_clock(monkeypatch, tick)
+    await ss._first_bind_recovery_task
+    assert clock.sleeps == [5.0, 5.0]
+    bind.assert_called_once_with(new)
+    assert ss._session_ready_event.is_set()
+
+
+async def test_recovery_t4_cap_logs_exactly_once(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    logs = []
+    monkeypatch.setattr(tmux_session, "_log", logs.append)
+    clock = _recovery_clock(monkeypatch)
+    await ss._first_bind_recovery_task
+    missing = [line for line in logs if line.startswith("TRANSCRIPT_FIRST_BIND_MISSING ")]
+    assert len(missing) == 1
+    assert "agent=test-agent waited_s=300 prelaunch=1 current=old.jsonl" in missing[0]
+    assert sum("no post-launch transcript yet" in line for line in logs) == 1
+    assert clock.now == 300
+    assert clock.sleeps == [5.0] * 60
+    assert ss._tailer.transcript_path == old
+    assert ss._tailer_first_bind_pending
+
+
+async def test_recovery_t5_continue_does_not_poll(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch, continued=True)
+    attempt = MagicMock(wraps=ss._attempt_first_bind_recovery)
+    monkeypatch.setattr(ss, "_attempt_first_bind_recovery", attempt)
+    clock = _recovery_clock(monkeypatch)
+    await ss._first_bind_recovery_task
+    attempt.assert_not_called()
+    assert not clock.sleeps
+    assert ss._tailer.transcript_path == old
+    assert ss._tailer.offset == old.stat().st_size
+
+
+async def test_recovery_t6_stop_cancels_between_polls(tmp_path, monkeypatch):
+    ss, old = await _start_retained_recovery(tmp_path, monkeypatch)
+    task = ss._first_bind_recovery_task
+    sleeps = []
+    parked = asyncio.Event()
+
+    async def sleep(delay):
+        sleeps.append(delay)
+        if len(sleeps) == 2:
+            await parked.wait()
+
+    monkeypatch.setattr(
+        tmux_session,
+        "asyncio",
+        SimpleNamespace(
+            **{
+                **vars(asyncio),
+                "sleep": sleep,
+            }
+        ),
+    )
+    await _REAL_ASYNCIO_SLEEP(0)
+    try:
+        assert sleeps == [5.0, 5.0]
+    finally:
+        await ss._stop_tailer()
+        await asyncio.gather(task, return_exceptions=True)
+    assert task.cancelled()
+    (tmp_path / "too-late.jsonl").write_text("late turn\n")
+    await _REAL_ASYNCIO_SLEEP(0)
+    assert ss._tailer.transcript_path == old
+    assert ss._first_bind_recovery_task is None
+
+
 @pytest.fixture(autouse=True)
 def _skip_post_spawn_liveness_delay(monkeypatch) -> None:
     """Keep unit tests fast while preserving the production 150 ms gate."""
@@ -3354,7 +3528,7 @@ async def test_first_bind_recovery_fresh_with_prior_history_rebinds_and_seeks_to
 
     # Stub discovery to return the new fresh path. Avoids needing a
     # full encoded-cwd project dir in the test fixture.
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: new_real)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: new_real)
 
     # Drive the recovery directly — bypasses the ``asyncio.sleep`` in
     # ``_delayed_first_bind_recovery`` so the test stays fast and
@@ -3398,7 +3572,7 @@ async def test_late_hook_establishes_lineage_after_internal_recovery(
     ss._last_launch_used_continue = False
     monkeypatch.setattr(
         ss,
-        "_discover_transcript_path",
+        "_discover_post_launch_transcript_path",
         lambda: recovered_guess,
     )
 
@@ -3433,7 +3607,7 @@ async def test_late_hook_lineage_rejects_foreign_followup(
     ss._last_launch_used_continue = False
     monkeypatch.setattr(
         ss,
-        "_discover_transcript_path",
+        "_discover_post_launch_transcript_path",
         lambda: recovered_guess,
     )
 
@@ -3508,7 +3682,7 @@ async def test_first_bind_recovery_continue_launch_noops_and_preserves_eof(
         "type": "system", "subtype": "stop_hook_summary",
         "timestamp": "2026-05-20T16:00:00.000Z",
     }) + "\n")
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: other)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: other)
 
     ss._attempt_first_bind_recovery()
 
@@ -3562,7 +3736,7 @@ async def test_first_bind_recovery_noops_when_flag_already_consumed(
     # it because the flag is already consumed.
     other = tmp_path / "newer.jsonl"
     other.write_text("")
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: other)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: other)
 
     ss._attempt_first_bind_recovery()
 
@@ -3574,18 +3748,11 @@ async def test_first_bind_recovery_noops_when_flag_already_consumed(
 
 
 @pytest.mark.asyncio
-async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
-    tmp_path, monkeypatch,
+async def test_first_bind_recovery_acknowledges_same_post_launch_path(
+    tmp_path,
+    monkeypatch,
 ) -> None:
-    """Issue #565 — recovery must no-op (no log spam, no seek reset)
-    when discovery returns the path the tailer is already bound to.
-
-    This is the common case when the SessionStart hook arrives at the
-    same time discovery would have found the right path (CC just
-    happens to have its newest JSONL be the one the tailer already
-    points at). The attempt should detect the same-path case and
-    return without going through ``set_transcript_path``.
-    """
+    """An eligible path already found by self-heal completes recovery without seeking."""
     ss, _ = _make_session_with_response_cb()
     await ss.connect()
 
@@ -3596,16 +3763,13 @@ async def test_first_bind_recovery_noops_when_discovery_returns_same_path(
     ss._tailer_first_bind_pending = True
     ss._last_launch_used_continue = False
 
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: current)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: current)
 
     ss._attempt_first_bind_recovery()
 
     assert ss._tailer.transcript_path == current
     assert ss._tailer.offset == 1234, "same-path recovery must not reset offset"
-    assert ss._tailer_first_bind_pending is True, (
-        "same-path no-op must not consume the first-bind flag — "
-        "the real bind hasn't happened yet"
-    )
+    assert ss._tailer_first_bind_pending is False
 
     await ss.disconnect()
 
@@ -3629,7 +3793,7 @@ async def test_first_bind_recovery_noops_when_discovery_returns_none(
     ss._tailer_first_bind_pending = True
     ss._last_launch_used_continue = False
 
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: None)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: None)
 
     ss._attempt_first_bind_recovery()
 
@@ -3849,7 +4013,7 @@ async def test_first_bind_recovery_after_retained_instance_respawn_rebinds_and_s
     ]
     second_real.write_text("\n".join(_json.dumps(e) for e in entries) + "\n")
 
-    monkeypatch.setattr(ss, "_discover_transcript_path", lambda: second_real)
+    monkeypatch.setattr(ss, "_discover_post_launch_transcript_path", lambda: second_real)
 
     # Drive the recovery directly (the same trick the other #565
     # tests use to skip the timer).

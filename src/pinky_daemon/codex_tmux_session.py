@@ -45,10 +45,12 @@ resume-UUID-capture diagnostics.
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
 import shlex
 import time
+from collections.abc import Iterator
 from pathlib import Path
 
 from pinky_daemon import isolated_launch_env, tmux_launch_env
@@ -69,6 +71,7 @@ from pinky_daemon.tmux_session import (
     _PLACEHOLDER_TRANSCRIPT_PATH,
     TmuxSession,
     _log,
+    _regular_transcript_candidates,
     _SchedulerDeliveryCancelled,
     _TmuxControl,
 )
@@ -358,6 +361,22 @@ class CodexTmuxSession(TmuxSession):
             self._config.working_dir or ".",
             agent=self._config,
         )
+
+    def _transcript_candidates(self) -> Iterator[tuple[Path, float]]:
+        """Enumerate rollout paths without opening historical session content."""
+        yield from _regular_transcript_candidates(self._project_dir().glob("**/rollout-*.jsonl"))
+
+    def _is_own_transcript(self, path: Path) -> bool:
+        """Inspect ownership only for a bounded set of post-launch rollouts."""
+        try:
+            with path.open("r", encoding="utf-8", errors="replace") as handle:
+                metadata = json.loads(handle.readline())
+            if metadata.get("type") != "session_meta":
+                return False
+            cwd = metadata.get("payload", {}).get("cwd", "")
+            return os.path.realpath(cwd) == os.path.realpath(self._config.working_dir or ".")
+        except (OSError, ValueError, TypeError, AttributeError):
+            return False
 
     # ── seam: tailer class ──────────────────────────────────────────────────
     async def _start_tailer(self) -> None:
