@@ -12953,7 +12953,18 @@ npm run build</pre>
                 if agents.get_raw_token_for_account(candidate, platform, account_id)
             ), "")
 
-            if not preferred_bound:
+            if not preferred_bound and sender_name:
+                # Another local sender holds a token for this account, so
+                # the route is still deliverable: one fallback line, not a
+                # failure, because a fallback that delivers is not a failure.
+                _log(
+                    "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
+                    f"agent '{agent_name}' route "
+                    f"{platform}/{account_id}/{conversation_id}: preferred "
+                    "sender has no token for the destination account; using "
+                    f"local sender '{sender_name}'"
+                )
+            elif not preferred_bound:
                 error = (
                     f"no {platform} token bound to destination account "
                     f"{account_id} for preferred sender {agent_name}"
@@ -12964,10 +12975,8 @@ npm run build</pre>
                     f"agent '{agent_name}' via sender '{agent_name}' route "
                     f"{platform}/{account_id}/{conversation_id}: {error}"
                 )
-
-            if not sender_name:
                 continue
-            if index > 0 or sender_name != agent_name:
+            elif index > 0:
                 _log(
                     "api: OWNER_NOTIFY_ROUTE_FALLBACK for scheduler alert "
                     f"agent '{agent_name}': using canonical route "

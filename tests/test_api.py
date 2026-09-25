@@ -9339,11 +9339,19 @@ class TestBuildStreamingWakeContextReasonGating:
                 "scheduler owner-alert test",
                 account_id="brad-telegram",
             )
-            assert any("OWNER_NOTIFY_DELIVERY_FAILURE" in line for line in logs)
-            assert any(
-                "OWNER_NOTIFY_ROUTE_FALLBACK" in line and "local-notifier" in line
-                for line in logs
+            # A fallback that then delivers is not a failure: one route
+            # fallback line naming the local sender, no failure line.
+            assert not any("OWNER_NOTIFY_DELIVERY_FAILURE" in line for line in logs)
+            fallback_lines = [
+                line for line in logs if "OWNER_NOTIFY_ROUTE_FALLBACK" in line
+            ]
+            assert len(fallback_lines) == 1
+            assert "preferred sender has no token for the destination account" in (
+                fallback_lines[0]
             )
+            assert "using local sender 'local-notifier'" in fallback_lines[0]
+            assert "telegram/brad-telegram/owner-dm" in fallback_lines[0]
+            assert not any("OWNER_NOTIFY_TERMINAL_FAILURE" in line for line in logs)
 
     @pytest.mark.asyncio
     async def test_scheduler_owner_alert_uses_default_channel_with_any_local_account(
