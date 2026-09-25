@@ -28,7 +28,10 @@ from pinky_daemon.agent_registry import (
 
 
 @pytest.mark.parametrize("failures", [2, 3])
-def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, failures):
+@pytest.mark.parametrize("prior_size", [0, 64 * 1024])
+def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, failures, prior_size):
+    from datetime import datetime
+
     from pinky_daemon.agent_registry import _tmux_session_start_hook_source
 
     sentinel = "SECRET_SENTINEL_DO_NOT_LOG"
@@ -36,9 +39,18 @@ def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, fai
     monkeypatch.setenv("PINKY_AGENT_KEY", sentinel)
     monkeypatch.setenv("PINKY_DAEMON_URL", url)
     monkeypatch.setenv("PINKY_TMUX_TRANSCRIPT_BIND", "1")
-    monkeypatch.setattr(sys, "stdin", StringIO(json.dumps({
-        "transcript_path": "/private/" + sentinel, "session_id": sentinel,
-    })))
+    monkeypatch.setattr(
+        sys,
+        "stdin",
+        StringIO(
+            json.dumps(
+                {
+                    "transcript_path": "/private/" + sentinel,
+                    "session_id": sentinel,
+                }
+            )
+        ),
+    )
     outcomes = [URLError(url)] * failures
     if failures < 3:
         outcomes.append(MagicMock())
@@ -48,6 +60,9 @@ def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, fai
     monkeypatch.setattr(time, "sleep", sleeps)
     hook = tmp_path / ".claude" / "hook_tmux_session_start.py"
     hook.parent.mkdir()
+    failure_log = hook.parent / "hook_failures.log"
+    if prior_size:
+        failure_log.write_text("x" * prior_size)
     source = _tmux_session_start_hook_source("test-agent")
     try:
         exec(compile(source, str(hook), "exec"), {"__file__": str(hook)})
@@ -56,12 +71,16 @@ def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, fai
     assert post.call_count == 3
     assert [call.kwargs["timeout"] for call in post.call_args_list] == [5, 5, 5]
     assert [call.args[0] for call in sleeps.call_args_list] == [0.5, 1.5]
-    failure_log = hook.parent / "hook_failures.log"
     if failures < 3:
-        assert not failure_log.exists()
+        if prior_size:
+            assert failure_log.read_text() == "x" * prior_size
+        else:
+            assert not failure_log.exists()
     else:
+        assert failure_log.stat().st_size <= 64 * 1024
         lines = failure_log.read_text().splitlines()
         assert len(lines) == 1
+        assert datetime.fromisoformat(lines[0].split()[0]).tzinfo is not None
         assert "SessionStart" in lines[0]
         assert "URLError" in lines[0]
         assert "attempts=3" in lines[0]
@@ -69,6 +88,45 @@ def test_session_start_t7_retries_and_redacts_failure(tmp_path, monkeypatch, fai
         assert url not in lines[0]
         assert "http" not in lines[0]
         assert "/private" not in lines[0]
+
+
+def test_session_start_failure_log_io_error_still_exits_zero(tmp_path, monkeypatch):
+    from pinky_daemon.agent_registry import _tmux_session_start_hook_source
+
+    monkeypatch.setenv("PINKY_AGENT_KEY", "test-key")
+    monkeypatch.setenv("PINKY_TMUX_TRANSCRIPT_BIND", "1")
+    monkeypatch.setattr(sys, "stdin", StringIO(json.dumps({"transcript_path": "/test.jsonl"})))
+    monkeypatch.setattr(urllib.request, "urlopen", MagicMock(side_effect=URLError("unavailable")))
+    monkeypatch.setattr(time, "sleep", MagicMock())
+    hook = tmp_path / "hook_tmux_session_start.py"
+    (tmp_path / "hook_failures.log").mkdir()
+    with pytest.raises(SystemExit) as result:
+        exec(_tmux_session_start_hook_source("test-agent"), {"__file__": str(hook)})
+    assert result.value.code == 0
+
+
+def test_workspace_hook_refresh_installs_session_start_retry(tmp_path):
+    from pinky_daemon.agent_registry import _tmux_session_start_hook_source
+
+    registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
+    workspace = tmp_path / "agent"
+    try:
+        registry.register("test-agent", working_dir=str(workspace))
+        hook = workspace / ".claude" / "hook_tmux_session_start.py"
+        hook.write_text("# old hook\n")
+        registry.ensure_workspace_hooks("test-agent")
+        assert hook.read_text() == _tmux_session_start_hook_source("test-agent")
+        settings = json.loads((workspace / ".claude" / "settings.json").read_text())
+        hooks = [
+            hook
+            for group in settings["hooks"]["SessionStart"]
+            for hook in group["hooks"]
+            if "hook_tmux_session_start.py" in hook.get("command", "")
+        ]
+        assert len(hooks) == 1
+        assert "timeout" not in hooks[0]
+    finally:
+        registry.close()
 
 
 @pytest.fixture

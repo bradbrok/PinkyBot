@@ -564,16 +564,10 @@ def _adaptive_paste_enter_delay_ms(text: str) -> int:
 # on subsequent real→real swaps (compact-resume protected by #496).
 _PLACEHOLDER_TRANSCRIPT_PATH = Path("/dev/null/no-transcript-yet")
 
-# Issue #565 — delayed first-bind recovery delay. After ``_start_tailer``
-# schedules a recovery task; if no explicit ``set_transcript_path`` bind
-# has consumed ``_tailer_first_bind_pending`` by this deadline AND the
-# launch is fresh, we re-run ``_discover_transcript_path()`` and rebind
-# even if the currently watched path exists. Covers the bind-never-arrives
-# case for fresh-launch-with-prior-history (the existing #515 self-heal
-# only fires when the current watched path is missing; a stale real path
-# blocks it forever). 5 seconds is generous slack vs. typical
-# SessionStart hook latency (sub-second to ~200ms).
+# Poll for a fresh transcript when the startup hook is lost. Transcripts
+# can appear lazily after the first prompt, well after the first attempt.
 _FIRST_BIND_RECOVERY_DELAY_SEC = 5.0
+_FIRST_BIND_RECOVERY_CAP_SEC = 300.0
 
 # #1148 — this per-session marker gates daemon-spawned headless sessions because
 # the daemon environment never carries it. Pane-descendant processes inherit
@@ -2428,6 +2422,8 @@ class TmuxSession(TransportReplacementMixin):
         # ``stop_hook_summary``. Continue launches preserve the
         # seek-to-EOF default (#496 round-1 Case 3 reply-spam defense).
         self._tailer_first_bind_pending: bool = False
+        self._prelaunch_transcripts: frozenset[str] = frozenset()
+        self._first_bind_wait_logged: bool = False
 
         # #1148 — lineage reported by the pane's SessionStart hook. A new
         # non-empty id may replace this only while the daemon's per-spawn
@@ -5591,6 +5587,9 @@ class TmuxSession(TransportReplacementMixin):
 
         self._bound_transcript_session_id = requested_session_id
         self._set_transcript_path_internal(path)
+        if not self._session_ready_event.is_set():
+            self._session_ready_event.set()
+            _log(f"tmux[{self.agent_name}]: session-ready gate opened (SessionStart hook)")
         return True
 
     def _set_transcript_path_internal(self, path: Path | str) -> None:
@@ -5616,19 +5615,6 @@ class TmuxSession(TransportReplacementMixin):
             f"tmux[{self.agent_name}]: transcript path updated to {path}"
             + (" (first-bind — seek_to_start)" if seek_to_start else "")
         )
-
-        # Issue #570: SessionStart hook firing is our "claude is past
-        # splash + MCP boot, input area is live" signal — open the
-        # readiness gate so any pending wake prompt's paste can land.
-        # Idempotent under .set() so a hook that re-fires later in the
-        # session is a harmless no-op (existing tests confirm hook can
-        # fire on every CC SessionStart event, not just first launch).
-        if not self._session_ready_event.is_set():
-            self._session_ready_event.set()
-            _log(
-                f"tmux[{self.agent_name}]: session-ready gate opened "
-                f"(SessionStart hook)"
-            )
 
     async def get_pane_snapshot(self, *, lines: int = 200) -> str:
         """Return the last ``lines`` lines of the tmux pane, with ANSI
@@ -6948,6 +6934,12 @@ class TmuxSession(TransportReplacementMixin):
         # silently lost the #564 first-bind seek AND the #565
         # delayed recovery for the rest of its lifetime.
         self._tailer_first_bind_pending = True
+        self._prelaunch_transcripts = (
+            frozenset(path.name for path in self._project_dir().glob("*.jsonl"))
+            if not self._last_launch_used_continue
+            else frozenset()
+        )
+        self._first_bind_wait_logged = False
 
         # Issue #570: reset the wake-prompt readiness gate to a fresh
         # unset Event on every spawn. The previous spawn's event may
@@ -7024,28 +7016,28 @@ class TmuxSession(TransportReplacementMixin):
         task.add_done_callback(_done)
 
     async def _delayed_first_bind_recovery(self) -> None:
-        """Issue #565 — wait, then attempt first-bind recovery.
-
-        Sleeps for ``_FIRST_BIND_RECOVERY_DELAY_SEC`` and then calls
-        ``_attempt_first_bind_recovery()``. Split from the sync
-        recovery method so tests can exercise the recovery logic
-        without dealing with timer-based scheduling.
-
-        Cancellation during the sleep is the expected unwind on
-        ``_stop_tailer``: ``asyncio.CancelledError`` propagates so the
-        task is marked cancelled (don't swallow it — that would mask
-        the intent and confuse anything inspecting the task state).
-        Any non-cancel exception from ``_attempt_first_bind_recovery``
-        is caught and logged; the task must not crash unhandled.
-        """
-        await asyncio.sleep(_FIRST_BIND_RECOVERY_DELAY_SEC)
-        try:
-            self._attempt_first_bind_recovery()
-        except Exception as e:  # defensive — must never crash a task
-            _log(
-                f"tmux[{self.agent_name}]: #565 first-bind recovery raised "
-                f"({type(e).__name__}: {e})"
-            )
+        """Poll for a late transcript; teardown cancellation propagates."""
+        if self._last_launch_used_continue:
+            return
+        deadline = time.monotonic() + _FIRST_BIND_RECOVERY_CAP_SEC
+        while self._tailer is not None and self._tailer_first_bind_pending:
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                _log(
+                    f"TRANSCRIPT_FIRST_BIND_MISSING agent={self.agent_name} "
+                    f"waited_s={_FIRST_BIND_RECOVERY_CAP_SEC:g} "
+                    f"prelaunch={len(self._prelaunch_transcripts)} "
+                    f"current={Path(self._tailer.transcript_path).name}"
+                )
+                return
+            await asyncio.sleep(min(_FIRST_BIND_RECOVERY_DELAY_SEC, remaining))
+            try:
+                self._attempt_first_bind_recovery()
+            except Exception as e:  # defensive — must never crash a task
+                _log(
+                    f"tmux[{self.agent_name}]: #565 first-bind recovery raised "
+                    f"({type(e).__name__}: {e})"
+                )
 
     def _attempt_first_bind_recovery(self) -> None:
         """Issue #565 — recover from the bind-never-arrives case on a
@@ -7092,14 +7084,19 @@ class TmuxSession(TransportReplacementMixin):
         if self._tailer is None:
             return
         try:
-            discovered = self._discover_transcript_path()
+            discovered = self._discover_post_launch_transcript_path()
         except Exception as e:
             _log(
-                f"tmux[{self.agent_name}]: #565 recovery discovery raised "
-                f"({type(e).__name__}: {e})"
+                f"tmux[{self.agent_name}]: #565 recovery discovery raised ({type(e).__name__}: {e})"
             )
             return
         if discovered is None:
+            if not self._first_bind_wait_logged:
+                self._first_bind_wait_logged = True
+                _log(
+                    f"tmux[{self.agent_name}]: #565 recovery: "
+                    "no post-launch transcript yet — polling"
+                )
             return
         # No-change → no work. The tailer's own equality guard would
         # handle this, but checking here keeps the log noise honest.
@@ -7281,6 +7278,21 @@ class TmuxSession(TransportReplacementMixin):
         except OSError:
             return None
         return jsonls[0] if jsonls else None
+
+    def _discover_post_launch_transcript_path(self) -> Path | None:
+        """Find a new transcript by name, excluding history modified at shutdown."""
+        try:
+            return max(
+                (
+                    path
+                    for path in self._project_dir().glob("*.jsonl")
+                    if path.name not in self._prelaunch_transcripts
+                ),
+                key=lambda path: path.stat().st_mtime,
+                default=None,
+            )
+        except OSError:
+            return None
 
     def _prepend_message_queue(self, turns: list[_QueuedTurn]) -> None:
         """Put ``turns`` ahead of the existing backlog without changing FIFO."""

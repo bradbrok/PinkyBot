@@ -1406,10 +1406,32 @@ req.add_header("Content-Type", "application/json")
 req.add_header("x-pinky-agent", agent)
 req.add_header("x-pinky-timestamp", str(ts))
 req.add_header("x-pinky-signature", sig)
-try:
-    urllib.request.urlopen(req, timeout=2)
-except Exception:
-    pass
+for attempt in range(3):
+    if attempt:
+        time.sleep((0.5, 1.5)[attempt - 1])
+    try:
+        urllib.request.urlopen(req, timeout=5).close()
+        break
+    except Exception as exc:
+        failure_type = type(exc).__name__
+else:
+    # Diagnostics contain only fixed fields and an exception class, never values.
+    try:
+        from datetime import datetime, timezone
+        from pathlib import Path
+
+        failure_log = Path(__file__).with_name("hook_failures.log")
+        line = (
+            f"{{datetime.now(timezone.utc).isoformat()}} "
+            f"SessionStart {{failure_type}} attempts=3\\n"
+        )
+        size = failure_log.stat().st_size if failure_log.exists() else 0
+        mode = "w" if size + len(line.encode()) > 64 * 1024 else "a"
+        with failure_log.open(mode, encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception:
+        pass
+sys.exit(0)
 '''
 
 
