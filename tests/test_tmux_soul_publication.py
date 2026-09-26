@@ -117,16 +117,21 @@ def test_missing_prompt_published_before_process(launch, caplog, isolation):
     ]
 
 
-def test_existing_prompt_is_byte_identical_without_version(launch, monkeypatch):
+def test_existing_prompt_is_byte_identical_without_version(launch):
     path = launch.work / "CLAUDE.md"
     original = b"User-owned prompt\r\n\xff\x00"
     path.write_bytes(original)
-    monkeypatch.setattr(
-        launch.registry, "build_system_prompt", MagicMock(side_effect=AssertionError("must not compile"))
-    )
     launch.run()
     assert path.read_bytes() == original
     assert launch.registry.get_soul_versions("test-agent") == []
+
+
+def test_existing_prompt_does_not_compile(launch, monkeypatch):
+    (launch.work / "CLAUDE.md").write_text("Existing instructions")
+    build = MagicMock(side_effect=AssertionError("must not compile"))
+    monkeypatch.setattr(launch.registry, "build_system_prompt", build)
+    launch.run()
+    build.assert_not_called()
 
 
 def test_dangling_symlink_is_present(launch):
