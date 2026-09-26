@@ -93,13 +93,16 @@ async def run():
         elif scenario == 'readonly':
             for path in paths:
                 # Read bytes in the child too: even an inspection close here
-                # would drop this process's own DMS lock.
+                # would drop this process's own DMS lock. Compare the two
+                # WAL-index headers, excluding read marks and their mtime updates.
                 result = child("""
 import hashlib, json, os, sqlite3, sys
 p = sys.argv[1] + '-shm'
 def snapshot():
     s = os.stat(p)
-    return [s.st_ino, s.st_size, s.st_mtime_ns]
+    with open(p, 'rb') as stream:
+        header = stream.read(96).hex()
+    return [s.st_ino, s.st_size, header]
 before = snapshot()
 c = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
 c.execute('SELECT count(*) FROM sqlite_master').fetchone()
