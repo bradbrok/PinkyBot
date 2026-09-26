@@ -22,6 +22,8 @@ aborting startup.
 from __future__ import annotations
 
 import logging
+import subprocess
+import sys
 from pathlib import Path
 
 from pinky_identity.fs_security import (
@@ -46,6 +48,7 @@ __all__ = [
     "harden_secret_dir",
     "harden_secret_file",
     "sweep_db_permissions",
+    "sweep_db_permissions_in_child",
 ]
 
 
@@ -54,8 +57,8 @@ def sweep_db_permissions(data_dir: str | Path) -> int:
 
     Also tightens the ``identity/`` subdirectory (encrypted signing keys,
     bearer-token hashes) to ``0700`` when present. Idempotent and
-    best-effort; intended to run once on daemon startup, after the stores
-    have created their files. Returns the count of files/dirs chmod'd.
+    best-effort. Run in a child process after startup has opened stores;
+    a raw close in the store-owning process would release its SQLite locks. Returns the count of files/dirs chmod'd.
     """
     # Canonicalize the root so a non-resolved/symlinked root argument can't
     # steer the sweep; O_NOFOLLOW then guards each leaf below it.
@@ -73,4 +76,22 @@ def sweep_db_permissions(data_dir: str | Path) -> int:
         # of harden_secret_*(), and the scanner's sensitive-data heuristic
         # keys on "secret" in the name and false-flags logging it.
         logger.info("db_security: tightened SQLite file permissions on startup")
+    return changed
+
+
+def sweep_db_permissions_in_child(data_dir: str | Path, *, timeout: float = 30) -> int:
+    """Harden startup files without releasing any parent-process SQLite locks."""
+    try:
+        result = subprocess.run(
+            [sys.executable, "-c",
+             "import sys; from pinky_daemon.db_security import sweep_db_permissions; "
+             "print(sweep_db_permissions(sys.argv[1]))", str(data_dir)],
+            capture_output=True, text=True, check=True, timeout=timeout,
+        )
+        changed = int(result.stdout.strip())
+    except Exception:
+        logger.exception("Startup SQLite permission sweep failed in child process")
+        return 0
+    if changed:
+        logger.info("Tightened SQLite file permissions in child process")
     return changed

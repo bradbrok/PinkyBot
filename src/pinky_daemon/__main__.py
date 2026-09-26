@@ -81,6 +81,7 @@ def _quiet_http_client_loggers() -> None:
 
 
 def main() -> None:
+    os.umask(0o077)
     _install_faulthandler()
     _load_dotenv()
     _quiet_http_client_loggers()

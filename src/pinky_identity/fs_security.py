@@ -32,6 +32,8 @@ import os
 import stat
 from pathlib import Path
 
+from pinky_identity.live_sqlite import is_live_sqlite_file, refuse_live_sqlite_file
+
 #: Owner read/write only — for files holding secret material.
 SECRET_FILE_MODE = 0o600
 #: Owner read/write/execute only — for directories holding secret stores.
@@ -67,6 +69,8 @@ def _fchmod_nofollow(path: Path, mode: int, *, want_dir: bool) -> int:
     """
     if not _CAN_HARDEN:
         return 0
+    if not want_dir:
+        refuse_live_sqlite_file(path)
     flags = os.O_RDONLY | _NOFOLLOW | _NONBLOCK | (_DIRECTORY if want_dir else 0)
     try:
         fd = os.open(path, flags)
@@ -92,9 +96,9 @@ def _fchmod_nofollow(path: Path, mode: int, *, want_dir: bool) -> int:
 def harden_secret_file(db_path: str | Path) -> int:
     """Lock a SQLite DB file and its sidecars to ``0600``.
 
-    Safe to call from a store's ``__init__`` right after the DB is opened
-    — idempotent, never opens the target through a final-component
-    symlink, never raises. Returns the number of files whose mode was
+    Call only before opening SQLite, or from a separate process. Registered
+    live inodes raise LiveSQLiteFileError before any raw descriptor is opened.
+    Idempotent; never follows a final-component symlink. Returns the number of files whose mode was
     changed.
     """
     base = Path(db_path)
@@ -107,3 +111,17 @@ def harden_secret_file(db_path: str | Path) -> int:
 def harden_secret_dir(dir_path: str | Path) -> int:
     """Lock a directory holding secret stores to ``0700``. Returns 1 if changed."""
     return _fchmod_nofollow(Path(dir_path), SECRET_DIR_MODE, want_dir=True)
+
+
+def prepare_secret_database(db_path: str | Path) -> None:
+    """Create owner-only before SQLite opens, and harden existing offline files."""
+    path = Path(db_path)
+    if is_live_sqlite_file(path):
+        return  # Another local connection already owns this hardened store.
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, SECRET_FILE_MODE)
+    except FileExistsError:
+        pass
+    else:
+        os.close(fd)
+    harden_secret_file(path)

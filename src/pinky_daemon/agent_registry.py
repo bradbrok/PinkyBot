@@ -1450,13 +1450,12 @@ def _configure_agents_db_connection(
 ) -> str:
     """Put the agents-DB connection into rollback (TRUNCATE) journal mode.
 
-    Why not WAL (#797/#220): the WAL wal-index ``-shm`` is always memory-mapped
-    in WAL mode. Under the daemon's long-lived registry connection plus the
-    per-request read-only signing-key resolver churn, that mapped ``-shm`` page
-    went stale and a SQLite pager read SIGBUS'd the daemon (``si_addr`` confirmed
-    inside ``conversations_agents.db-shm``; ``mmap_size=0`` was already set, so
-    the main-db is not mapped — the ``-shm`` is the inherent fault surface).
-    Rollback journal mode has no ``-shm`` at all, so the daemon never maps it.
+    The WAL index is always memory-mapped. The observed SIGBUS required the
+    daemon's DMS lock to have been dropped by a raw in-process file close.
+    A subsequent external opener then believed it was the first connection
+    and truncated shared memory beneath that mapping. An idle WAL connection
+    with intact locks prevents this. Rollback mode removes shared memory as
+    defense in depth; preserving SQLite's locks is still required.
 
     Must run BEFORE table init and before any local MCP / agent-session resume
     can spawn stdio children that hold the DB.

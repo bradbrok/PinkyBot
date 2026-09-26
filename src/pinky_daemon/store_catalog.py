@@ -19,6 +19,11 @@ from typing import TYPE_CHECKING, Any
 from urllib.parse import parse_qsl
 
 from pinky_daemon.store_shutdown import StoreShutdownCoordinator, StoreShutdownReport
+from pinky_identity.live_sqlite import (
+    refuse_live_sqlite_file,
+    register_live_sqlite,
+    unregister_live_sqlite,
+)
 
 if TYPE_CHECKING:
     from pinky_daemon.storage_observability import RuntimeOperation, StorageObservability
@@ -142,6 +147,7 @@ class BoundSQLiteFile:
 
     @classmethod
     def open(cls, path: str | os.PathLike[str]) -> "BoundSQLiteFile":
+        refuse_live_sqlite_file(path)
         flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
         descriptor = os.open(os.path.abspath(os.fspath(path)), flags)
         return cls(path, descriptor)
@@ -607,6 +613,7 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
         finally:
             self._store_boundary_observation_depth -= 1
         self._store_closed = True
+        unregister_live_sqlite(self)
         try:
             if (
                 transaction_active
@@ -709,6 +716,7 @@ class _StoreConnectionAuthority:
             connection._store_handle_id = handle_id
             connection._store_logical_name = logical_name
             connection._store_observability = self._catalog._observability
+            register_live_sqlite(connection, path)
             self._handles[handle_id] = handle
             return connection
 
@@ -964,6 +972,13 @@ class StoreCatalog:
             owner=owner,
             **kwargs,
         )
+
+    def live_wal_stores(self) -> list[tuple[str, str]]:
+        """Return open WAL handles for a child-process lock probe."""
+        authority = self._connection_authority
+        with authority._lock:
+            return sorted({(h.logical_name, h.path) for h in authority._handles.values()
+                           if h.journal_mode == "wal" and not h.connection._store_closed})
 
     def shutdown(self, *, deadline_seconds: float) -> StoreShutdownReport:
         """Finalize every tracked connection, then release preflight descriptors."""
@@ -2074,12 +2089,32 @@ class DaemonStoreCatalog(StoreCatalog):
                 ]
 
     def preflight_ancestor_chains(self) -> None:
-        """Verify the directory chains boot checks, skipping boot-absent targets."""
+        """Recheck directory authority without closing any live database fd."""
+        with self._lock:
+            observations = {o.path: o for o in self._observations if o._bound_file is not None}
+            records = {entry.record.resolved_path: entry.record for entry in self._entries}
         for target in self.configured_integrity_targets():
             raw_path = os.fspath(target.path)
             if self._is_memory_path(raw_path):
                 continue
             absolute_path = os.path.abspath(raw_path)
+            observation = observations.get(absolute_path)
+            record = records.get(os.path.realpath(absolute_path))
+            bound_file = None if observation is None else observation._bound_file
+            if bound_file is not None:
+                if bound_file.header_journal_mode() == "wal":
+                    self._verify_bound_wal_target(bound_file, absolute_path)
+                continue
+            if record is not None:
+                # Stores absent at boot have no retained inspection fd. Their
+                # registered inode and journal mode are already authoritative.
+                if record.journal_mode == "wal":
+                    self._verified_daemon_owned_path(absolute_path)
+                    if self._stat_identity(absolute_path) != record.dev_ino:
+                        raise StoreCatalogError("store path changed since registration")
+                continue
+            # An unopened manifest target can still be inspected normally.
+            refuse_live_sqlite_file(absolute_path)
             try:
                 bound_file = BoundSQLiteFile.open(absolute_path)
             except OSError as exc:
@@ -2087,14 +2122,8 @@ class DaemonStoreCatalog(StoreCatalog):
                     continue
                 raise
             try:
-                if bound_file.header_journal_mode() != "wal":
-                    continue
-                try:
+                if bound_file.header_journal_mode() == "wal":
                     self._verify_bound_wal_target(bound_file, absolute_path)
-                except OSError:
-                    if bound_file.path_state() == "absent":
-                        continue
-                    raise
             finally:
                 bound_file.close()
 
