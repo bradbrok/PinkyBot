@@ -108,7 +108,9 @@ def check_sqlite_locks(
             logger.critical("SQLite lock self-check failed: %s", status)
         elif status["healthy"] is None:
             logger.warning("SQLite lock self-check inconclusive: %s", status)
-        elif previous is not None and previous["healthy"] is not True:
+        elif previous is None:
+            logger.info("SQLite lock self-check healthy: checked=%d", len(stores))
+        elif previous["healthy"] is not True:
             logger.info("SQLite lock self-check resolved: %s", status)
     return status
 

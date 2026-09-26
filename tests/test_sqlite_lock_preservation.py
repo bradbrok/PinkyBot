@@ -262,7 +262,7 @@ def test_permission_child_failure_is_nonfatal(tmp_path, monkeypatch, caplog, fai
         raise error
 
     monkeypatch.setattr(subprocess, "run", fail)
-    assert db_security.sweep_db_permissions_in_child(tmp_path) == 0
+    assert db_security.sweep_db_permissions_in_child(tmp_path) is False
     assert "permission sweep failed" in caplog.text
 
 
@@ -634,3 +634,22 @@ def test_changed_probe_result_logs_missing_once(monkeypatch, caplog):
     check_sqlite_locks([("tasks", "/unused")], previous=status)
     critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
     assert len(critical) == 1 and "tasks:DMS" in critical[0].message
+
+
+def test_child_sweep_uses_exit_status_and_initial_healthy_check_logs_once(tmp_path, caplog):
+    import logging
+
+    from pinky_daemon.db_security import sweep_db_permissions_in_child
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+
+    caplog.set_level(logging.INFO)
+    assert sweep_db_permissions_in_child(tmp_path) is True
+    assert "SQLite permission sweep completed in child process" in caplog.text
+    command = [sys.executable, "-m", "pinky_daemon.db_security", str(tmp_path)]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert result.stdout == ""
+    healthy = check_sqlite_locks([])
+    assert healthy["healthy"] is True
+    check_sqlite_locks([], previous=healthy)
+    assert sum("SQLite lock self-check healthy: checked=0" in r.message
+               for r in caplog.records) == 1
