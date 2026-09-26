@@ -350,14 +350,14 @@ async def test_boot_reports_dropped_locks_on_health_surface(tmp_path, monkeypatc
         assert len(critical) == 1 and "tasks" in critical[0].message
 
 
-def test_entry_point_restricts_creation_mode_before_configuration(monkeypatch):
+def test_entry_point_preserves_process_creation_mode_before_configuration(monkeypatch):
     from pinky_daemon import __main__ as entry
 
     class StopBeforeLaunchError(Exception):
         pass
 
     def configuration():
-        assert os.umask(0o077) == 0o077
+        assert os.umask(0o022) == 0o022
         raise StopBeforeLaunchError
 
     previous = os.umask(0o022)

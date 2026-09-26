@@ -6396,21 +6396,8 @@ class TestAgentCRUD:
         assert not (tmp_path / "loser").exists()
 
     def test_concurrent_double_post_has_one_db_winner(self, tmp_path):
-        from pinky_daemon.api import create_api
+        from tests.api_registration_race_support import run_registration_race
 
-        db_path = str(tmp_path / "agents.db")
-        app_a = create_api(
-            max_sessions=10,
-            default_working_dir=str(tmp_path),
-            db_path=db_path,
-        )
-        app_b = create_api(
-            max_sessions=10,
-            default_working_dir=str(tmp_path),
-            db_path=db_path,
-        )
-        barrier = threading.Barrier(2)
-        responses = []
         payloads = [
             {
                 "name": "race",
@@ -6427,36 +6414,20 @@ class TestAgentCRUD:
                 "working_dir": str(tmp_path / "second"),
             },
         ]
-
-        def post(client, payload):
-            barrier.wait(timeout=5)
-            responses.append((payload, client.post("/agents", json=payload)))
-
-        with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
-            threads = [
-                threading.Thread(target=post, args=(client_a, payloads[0])),
-                threading.Thread(target=post, args=(client_b, payloads[1])),
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
-            assert all(not thread.is_alive() for thread in threads)
-
-            assert sorted(response.status_code for _, response in responses) == [200, 409]
-            winning_payload, winning_response = next(
-                pair for pair in responses if pair[1].status_code == 200
-            )
-            losing_payload, _ = next(
-                pair for pair in responses if pair[1].status_code == 409
-            )
-            current = client_a.get("/agents/race").json()
-            assert winning_response.json()["soul"] == winning_payload["soul"]
+        outcomes = run_registration_race(tmp_path, payloads)
+        assert sorted(result["status"] for result in outcomes) == [200, 409]
+        winner = next(result for result in outcomes if result["status"] == 200)
+        loser = next(result for result in outcomes if result["status"] == 409)
+        winning_payload = payloads[winner["index"]]
+        losing_payload = payloads[loser["index"]]
+        for result in outcomes:
+            current = result["rows"]["race"]
+            assert winner["body"]["soul"] == winning_payload["soul"]
             assert current["display_name"] == winning_payload["display_name"]
             assert current["model"] == winning_payload["model"]
             assert current["soul"] == winning_payload["soul"]
             assert current["working_dir"] == winning_payload["working_dir"]
-            assert not Path(losing_payload["working_dir"]).exists()
+        assert not Path(losing_payload["working_dir"]).exists()
 
     @pytest.mark.parametrize("relation", ["equal", "nested", "enclosing"])
     def test_concurrent_different_names_same_workspace_has_one_owner(
@@ -6464,48 +6435,14 @@ class TestAgentCRUD:
         tmp_path,
         relation,
     ):
-        from pinky_daemon.api import create_api
+        from tests.api_registration_race_support import run_registration_race
 
-        db_path = str(tmp_path / "agents.db")
         shared_root = tmp_path / "shared"
         alice_root, bob_root = {
             "equal": (shared_root, shared_root),
             "nested": (shared_root, shared_root / "sub"),
             "enclosing": (shared_root / "sub", shared_root),
         }[relation]
-        app_a = create_api(
-            max_sessions=10,
-            default_working_dir=str(tmp_path),
-            db_path=db_path,
-        )
-        app_b = create_api(
-            max_sessions=10,
-            default_working_dir=str(tmp_path),
-            db_path=db_path,
-        )
-        phase_barrier = threading.Barrier(2)
-        alice_done = threading.Event()
-
-        def gate_advisory_checks(registry, *, wait_for_alice):
-            original = registry._refuse_workspace_overlap
-            call_count = 0
-
-            def wrapped(name, root):
-                nonlocal call_count
-                original(name, root)
-                call_count += 1
-                # Both route and registry pre-insert checks must observe the
-                # empty DB before either request reaches BEGIN IMMEDIATE. The
-                # third call is the authoritative in-transaction recheck.
-                if call_count <= 2:
-                    phase_barrier.wait(timeout=5)
-                if call_count == 2 and wait_for_alice:
-                    assert alice_done.wait(timeout=10)
-
-            registry._refuse_workspace_overlap = wrapped
-
-        gate_advisory_checks(app_a.state.agents, wait_for_alice=False)
-        gate_advisory_checks(app_b.state.agents, wait_for_alice=True)
         payloads = [
             {
                 "name": "alice",
@@ -6522,50 +6459,30 @@ class TestAgentCRUD:
                 "working_dir": str(bob_root),
             },
         ]
-        responses = {}
-
-        def post(client, payload):
-            try:
-                responses[payload["name"]] = client.post("/agents", json=payload)
-            finally:
-                if payload["name"] == "alice":
-                    alice_done.set()
-
-        with TestClient(app_a) as client_a, TestClient(app_b) as client_b:
-            threads = [
-                threading.Thread(target=post, args=(client_a, payloads[0])),
-                threading.Thread(target=post, args=(client_b, payloads[1])),
-            ]
-            for thread in threads:
-                thread.start()
-            for thread in threads:
-                thread.join(timeout=10)
-
-            assert all(not thread.is_alive() for thread in threads)
-            assert sorted(response.status_code for response in responses.values()) == [200, 409]
-            winner_name = next(
-                name for name, response in responses.items()
-                if response.status_code == 200
-            )
-            loser_name = next(
-                name for name, response in responses.items()
-                if response.status_code == 409
-            )
-            assert responses[loser_name].json() == {
-                "detail": {"code": "agent_workspace_overlap"}
-            }
-
-            registry = app_a.state.agents
-            assert [agent.name for agent in registry.list()] == [winner_name]
-            winner_root = alice_root if winner_name == "alice" else bob_root
-            assert registry.get(winner_name).working_dir == str(winner_root)
-            assert registry.get(loser_name) is None
-            assert registry.get_signing_key(winner_name)
-            assert registry.get_signing_key(loser_name) is None
-            assert registry.get_main_agent() == winner_name
-            assert registry.get_soul_versions(loser_name) == []
-            assert registry.list_tokens(loser_name) == []
-            assert (winner_root / ".mcp.json").is_file()
+        outcomes = run_registration_race(tmp_path, payloads, workspace_race=True)
+        assert sorted(result["status"] for result in outcomes) == [200, 409]
+        winner = next(result for result in outcomes if result["status"] == 200)
+        loser = next(result for result in outcomes if result["status"] == 409)
+        winner_name = payloads[winner["index"]]["name"]
+        loser_name = payloads[loser["index"]]["name"]
+        assert loser["body"] == {"detail": {"code": "agent_workspace_overlap"}}
+        winner_root = alice_root if winner_name == "alice" else bob_root
+        winning_payload = payloads[winner["index"]]
+        for result in outcomes:
+            assert result["names"] == [winner_name]
+            assert result["rows"][winner_name]["working_dir"] == str(winner_root)
+            assert result["rows"][winner_name]["model"] == winning_payload["model"]
+            assert result["rows"][winner_name]["soul"] == winning_payload["soul"]
+            assert result["rows"][loser_name] is None
+            assert result["signing_keys"][winner_name]
+            assert not result["signing_keys"][loser_name]
+            assert result["main_agent"] == winner_name
+            assert result["soul_versions"][loser_name] == []
+            assert result["tokens"][loser_name] == []
+        assert (winner_root / ".mcp.json").is_file()
+        loser_root = Path(payloads[loser["index"]]["working_dir"])
+        if loser_root != winner_root and loser_root not in winner_root.parents:
+            assert not loser_root.exists()
 
     def test_absent_soul_is_noop_empty_rejects_and_force_snapshots(self, tmp_path):
         client = self._make_client()

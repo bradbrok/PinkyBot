@@ -96,7 +96,9 @@ def build_app():
         sys.path.insert(0, "src")
     from pinky_daemon.api import create_api
 
-    with tempfile.NamedTemporaryFile(suffix=".db", delete=False) as f:
+    # Companion stores have fixed names, so each live app needs its own parent.
+    directory = tempfile.mkdtemp(prefix="route-audit-")
+    with tempfile.NamedTemporaryFile(suffix=".db", dir=directory, delete=False) as f:
         db_path = f.name
     return create_api(max_sessions=10, default_working_dir="/tmp", db_path=db_path)
 

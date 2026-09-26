@@ -26,7 +26,9 @@ import audit_route_auth_coverage as audit_mod  # noqa: E402
 
 
 def _client(mode: str | None = None):
-    fd, path = tempfile.mkstemp(suffix=".db")
+    # Each live app owns fixed-name stores beside its main database.
+    directory = tempfile.mkdtemp(prefix="route-auth-")
+    fd, path = tempfile.mkstemp(suffix=".db", dir=directory)
     os.close(fd)
     old = os.environ.get("PINKY_AUTH_DENY_DEFAULT")
     if mode is not None:

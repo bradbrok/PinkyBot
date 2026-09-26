@@ -269,7 +269,11 @@ def test_daemon_cli_accepts_nonbreaking_db_path_and_passes_it_to_api_mode(
         ],
     )
 
-    daemon_main.main()
+    previous_umask = os.umask(0o077)
+    try:
+        daemon_main.main()
+    finally:
+        os.umask(previous_umask)
 
     assert len(received) == 1
     assert received[0].db_path == os.fspath(base)
