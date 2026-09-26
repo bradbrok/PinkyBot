@@ -7041,7 +7041,7 @@ npm run build</pre>
         disabled skills). A session that is not live gets nothing: it reads
         the current catalog copy the next time it loads the skill.
         """
-        from pinky_daemon.skill_store import new_change_line
+        from pinky_daemon.skill_store import render_change_notice
 
         for agent in agents.list(enabled_only=True):
             try:
@@ -7051,19 +7051,7 @@ npm run build</pre>
                 mine = [c for c in changes if c[0] in effective]
                 if not mine:
                     continue
-                parts = []
-                for name, before, after in mine:
-                    line = new_change_line(before, after)
-                    parts.append(
-                        f"'{name}'" + (f' (its change log adds: "{line}")' if line else "")
-                    )
-                names = ", ".join(f"load_skill('{name}')" for name, _, _ in mine)
-                text = (
-                    "[skill changed] The catalog text of "
-                    + ("this skill" if len(mine) == 1 else "these skills")
-                    + " was updated: " + "; ".join(parts) + ". The copy in your context is "
-                    f"out of date: reload with {names} before you next use it."
-                )
+                text = render_change_notice(mine)
                 result = await broker.inject_agent_message("system", agent.name, text)
                 _log(
                     f"skills: change notice {[c[0] for c in mine]} -> {agent.name} "
