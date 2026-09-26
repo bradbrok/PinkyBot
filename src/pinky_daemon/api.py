@@ -7031,6 +7031,48 @@ npm run build</pre>
     from pinky_daemon.routes.skills import router as _skills_router
     from pinky_daemon.routes.skills import set_dependencies as _skills_set_deps
 
+    _skill_notice_tasks: set[asyncio.Task] = set()
+
+    async def _send_skill_change_notices(skill_name: str, directive: str) -> None:
+        """Tell every live owner session that a skill's text changed (board 5as).
+
+        Owners are the agents the skill applies to (direct assignment or
+        shared). A session that is not live gets nothing: it reads the
+        current catalog copy the next time it loads the skill.
+        """
+        from pinky_daemon.skill_store import newest_change_line
+
+        line = newest_change_line(directive)
+        text = (
+            f"[skill changed] The skill '{skill_name}' was updated. "
+            + (f"Newest change: {line} " if line else "")
+            + f"The copy in your context is out of date: reload it with "
+            f"load_skill('{skill_name}') before you next use it."
+        )
+        for agent in agents.list(enabled_only=True):
+            try:
+                if not skills.is_assigned(agent.name, skill_name):
+                    continue
+                result = await broker.inject_agent_message("system", agent.name, text)
+                _log(
+                    f"skills: change notice {skill_name} -> {agent.name} "
+                    f"delivered={result.delivered}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log(
+                    f"skills: change notice {skill_name} -> {agent.name} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    def _on_skill_text_changed(skill_name: str, directive: str) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(_send_skill_change_notices(skill_name, directive))
+        _skill_notice_tasks.add(task)
+        task.add_done_callback(_skill_notice_tasks.discard)
+
     _skills_set_deps(
         skills=skills,
         plugins=plugins,
@@ -7038,6 +7080,7 @@ npm run build</pre>
         manager=manager,
         pinky_root=_pinky_root,
         log=_log,
+        on_text_changed=_on_skill_text_changed,
     )
     app.include_router(_skills_router)
 

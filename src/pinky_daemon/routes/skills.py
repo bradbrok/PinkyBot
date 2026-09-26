@@ -48,6 +48,7 @@ _agents: Any = None
 _manager: Any = None
 _pinky_root: Path | None = None
 _log: Callable[[str], None] | None = None
+_on_text_changed: Callable[[str, str], None] | None = None
 
 
 def set_dependencies(
@@ -58,15 +59,36 @@ def set_dependencies(
     manager,
     pinky_root: Path,
     log: Callable[[str], None],
+    on_text_changed: Callable[[str, str], None] | None = None,
 ) -> None:
     """Wire shared instances and helpers for the skills router."""
-    global _skills, _plugins, _agents, _manager, _pinky_root, _log
+    global _skills, _plugins, _agents, _manager, _pinky_root, _log, _on_text_changed
     _skills = skills
     _plugins = plugins
     _agents = agents
     _manager = manager
     _pinky_root = pinky_root
     _log = log
+    _on_text_changed = on_text_changed
+
+
+def _notify_text_changed(before, after) -> None:
+    """Tell the owners of a skill that its text changed (board 5as).
+
+    Called after a successful ``refresh_text``; a no-op refresh (same hash)
+    notifies nobody. The hook must never fail the refresh itself.
+    """
+    if _on_text_changed is None or after is None:
+        return
+    if skill_text_hash(before.description, before.directive) == skill_text_hash(
+        after.description, after.directive
+    ):
+        return
+    try:
+        _on_text_changed(after.name, after.directive)
+    except Exception as exc:  # noqa: BLE001
+        if _log:
+            _log(f"skills: text change notice for {after.name} failed: {type(exc).__name__}: {exc}")
 
 
 def _reject_if_core(name: str, action: str) -> None:
@@ -277,6 +299,7 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
             directive=req.directive if req.directive is not None else existing.directive,
             actor=internal_caller, path="put", approval_ref=req.approval_ref,
         )
+        _notify_text_changed(existing, skill)
         return skill.to_dict()
     if not internal_caller and text_changed and changed_fields <= {"description", "directive"}:
         skill = _skills.refresh_text(
@@ -285,6 +308,7 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
             directive=req.directive if req.directive is not None else existing.directive,
             actor="user", path="put", approval_ref=req.approval_ref or "",
         )
+        _notify_text_changed(existing, skill)
         return skill.to_dict()
     _reject_agent_catalog_overwrite(name, internal_caller)
     skill_type = req.skill_type if req.skill_type is not None else existing.skill_type
@@ -761,6 +785,7 @@ async def discover_skills_endpoint(request: Request, req: DiscoverSkillsRequest 
             existing.name, description=parsed.description, directive=parsed.body,
             actor=internal_caller or "user", path="discover", approval_ref=req.approval_ref,
         )
+        _notify_text_changed(existing, refreshed)
         updated.append({
             "name": existing.name,
             "before_hash": skill_text_hash(existing.description, existing.directive),

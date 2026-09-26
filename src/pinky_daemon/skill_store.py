@@ -44,6 +44,26 @@ def skill_text_hash(description: str, directive: str) -> str:
     return hashlib.sha256((description + "\n" + directive).encode("utf-8")).hexdigest()
 
 
+def newest_change_line(directive: str) -> str:
+    """Return the first bullet under a ``## Changes`` heading, or ``""``.
+
+    SKILL.md change logs list the newest entry first as ``- <date>: <what>``;
+    blank lines after the heading are skipped and the section ends at the
+    next ``#`` heading.
+    """
+    in_changes = False
+    for raw in (directive or "").splitlines():
+        line = raw.strip()
+        if line.startswith("#"):
+            if in_changes:
+                return ""
+            in_changes = line.lstrip("#").strip().lower() == "changes"
+            continue
+        if in_changes and line.startswith("- "):
+            return line[2:].strip()
+    return ""
+
+
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
 
