@@ -1034,14 +1034,14 @@ for _gate_tools in GATE_TOOL_NAMES.values():
         ALL_GATED_TOOL_NAMES.add(f"mcp__pinky-self__{_tool}")
 
 
-def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None) -> list[str]:
+def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None, registry=None) -> list[str]:
     """Compute disallowed pinky-self tools for SDK-side gating in shared MCP mode.
 
     In shared mode the server runs ALL gates. We filter client-side by telling
     the SDK which tools the agent should NOT see. Returns MCP-prefixed tool names
     like 'mcp__pinky-self__kb_ingest'.
     """
-    agent_gates = set(_get_agent_tool_gates(agent_name, skill_store))
+    agent_gates = set(_get_agent_tool_gates(agent_name, skill_store, registry))
     disallowed: list[str] = []
     for gate, tools in GATE_TOOL_NAMES.items():
         if gate not in agent_gates:
@@ -1049,12 +1049,50 @@ def _get_shared_mode_disallowed_tools(agent_name: str, skill_store=None) -> list
                 disallowed.append(f"mcp__pinky-self__{tool}")
     return sorted(disallowed)
 
-def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
+# #346: gates an ISOLATED agent (#149 tenant) never receives, whatever its skills say.
+# "admin" = update_and_restart / restart_daemon / register_agent / check_for_updates;
+# "skill-admin" = add_skill / create_skill / install_skill / remove_skill / propose_skill.
+# Isolated agents are the staff-facing ones; a staffer must not be able to talk one into
+# restarting the daemon or widening its own tool set. The daemon-level isolation guard
+# already blocks the fleet-write subset; this closes the self-targeted remainder at the
+# source by not registering the tools at all. Keyed on the PERSISTED agents.isolated
+# column, never on anything inferred from the conversation.
+ISOLATED_STRIPPED_GATES: frozenset[str] = frozenset({"admin", "skill-admin"})
+
+
+def _strip_gates_for_isolated(agent_name: str, gates: set[str], registry) -> set[str]:
+    """Remove ISOLATED_STRIPPED_GATES when ``agent_name`` is isolated.
+
+    registry=None (legacy callers, unit tests) leaves gates untouched, i.e. the None
+    default is FAIL-OPEN for the isolation strip. Every production callsite that
+    builds a real session's tool gates MUST pass the registry (today:
+    _get_agent_tool_gates via the internal chain and _get_shared_mode_disallowed_tools);
+    a new callsite that omits it silently re-grants admin/skill-admin to isolated
+    agents. A registry that is present but fails to resolve the agent FAILS CLOSED:
+    the privileged gates are stripped, matching _is_isolated_agent()'s posture
+    elsewhere in this module."""
+    if registry is None or not (gates & ISOLATED_STRIPPED_GATES):
+        return gates
+    try:
+        agent = registry.get(agent_name)
+        isolated = bool(agent and getattr(agent, "isolated", False))
+    except Exception as e:
+        _log(f"tool-gates: registry lookup failed for '{agent_name}': {e} — "
+             "stripping admin/skill-admin gates (fail closed)")
+        isolated = True
+    if isolated:
+        return gates - ISOLATED_STRIPPED_GATES
+    return gates
+
+
+def _get_agent_tool_gates(agent_name: str, skill_store=None, registry=None) -> list[str]:
     """Determine which pinky-self tool gates should be active for an agent.
 
     Returns a list of gate names that will be passed as --tool-gates to pinky-self.
     Maps agent skills → gates via SKILL_TO_GATES. Agents with no skills get
     core tools only (no gates). They can always load_skill() to get more.
+    Isolated agents never get ISOLATED_STRIPPED_GATES (#346); pass ``registry``
+    so the persisted isolated flag can be consulted.
     """
     if not skill_store:
         # No skill store available: fail closed (core tools only)
@@ -1076,7 +1114,7 @@ def _get_agent_tool_gates(agent_name: str, skill_store=None) -> list[str]:
         if skill_name in SKILL_TO_GATES:
             gates.update(SKILL_TO_GATES[skill_name])
 
-    return sorted(gates)
+    return sorted(_strip_gates_for_isolated(agent_name, gates, registry))
 
 
 # #623: env var names whose VALUES must never be returned over the API. The
@@ -1437,7 +1475,7 @@ def _write_mcp_json(
                 stdio_env["PINKY_AGENTS_DB"] = db_path
 
         # Pinky-self: heartbeat_ack, schedules, self-management
-        tool_gates = _get_agent_tool_gates(agent_name, skill_store)
+        tool_gates = _get_agent_tool_gates(agent_name, skill_store, agent_registry)
         self_args = [
             "-m", "pinky_self", "--agent", agent_name,
             "--api-url", "http://localhost:8888",
@@ -4088,7 +4126,7 @@ def create_api(
         # (shared server runs ALL gates; filtering is client-side)
         effective_disallowed = list(agent.disallowed_tools or [])
         if SHARED_MCP_ENABLED:
-            shared_disallowed = _get_shared_mode_disallowed_tools(agent_name, skills)
+            shared_disallowed = _get_shared_mode_disallowed_tools(agent_name, skills, agents)
             effective_disallowed.extend(shared_disallowed)
             # Deduplicate
             effective_disallowed = sorted(set(effective_disallowed))

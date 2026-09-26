@@ -1430,6 +1430,62 @@ class MessageBroker:
         """
         return await self._route_streaming(agent_name, message)
 
+    def _sender_identity_fields(self, message: BrokerMessage) -> str:
+        """#346: platform-verified sender identity for the prompt header (non-buzz platforms).
+
+        Before this, Slack and Telegram headers carried only the sender's DISPLAY NAME. The
+        platform-signed sender id (Slack ``user``, Telegram ``from.id``) was used for the
+        approval lookup and then dropped, so any per-requester permission check an agent ran
+        (e.g. a Tool Kit roster keyed on Slack user id) was fed an id the model had inferred
+        from a name. Appended AFTER msg_id so positional parsing of the existing fields is
+        unaffected:
+
+          | sender_id:<id>        only when it differs from chat_id (a Telegram 1:1 chat_id
+                                  already IS the sender id; a Slack DM chat_id is a D-channel)
+          | sender_trust:<label>  owner    = the primary user / an owner notification principal
+                                  approved = the individual sender holds an approved_users row
+                                  channel  = admitted only because the CHANNEL is approved
+                                  unknown  = no individual approval found (DM edge case)
+
+        Fails soft: any registry error yields no trust label rather than a wrong one.
+        """
+        if message.platform == "buzz":
+            return ""
+        sid = str(message.sender_id or "").strip()
+        fields = ""
+        if sid and sid != str(message.chat_id or ""):
+            fields += f" | sender_id:{sid}"
+        trust = self._sender_trust(message, sid)
+        if trust:
+            fields += f" | sender_trust:{trust}"
+        return fields
+
+    def _sender_trust(self, message: BrokerMessage, sid: str) -> str:
+        try:
+            primary = self._registry.get_primary_user() or {}
+            pid = str(primary.get("chat_id") or "")
+            if pid and (sid == pid or (not message.is_group and str(message.chat_id) == pid)):
+                return "owner"
+            for dest in self._registry.get_owner_notification_destinations() or []:
+                if dest.get("platform") != message.platform:
+                    continue
+                principal = str(dest.get("principal_id") or "")
+                conversation = str(dest.get("conversation_id") or "")
+                if sid and principal and sid == principal:
+                    return "owner"
+                if not message.is_group and conversation and str(message.chat_id) == conversation:
+                    return "owner"
+            if sid and self._registry.get_user_status(message.agent_name, sid) == "approved":
+                return "approved"
+            if (not message.is_group and
+                    self._registry.get_user_status(message.agent_name, message.chat_id) == "approved"):
+                return "approved"
+            return "channel" if message.is_group else "unknown"
+        except Exception as exc:
+            _log(f"broker: sender trust lookup failed for {message.agent_name} "
+                 f"({type(exc).__name__}); omitting sender_trust")
+            return ""
+
     def _format_prompt(self, message: BrokerMessage) -> str:
         """Format a single message as a platform-aware prompt line."""
         from datetime import datetime
@@ -1518,9 +1574,11 @@ class MessageBroker:
         elif message.is_group:
             alias = self._registry.get_group_chat_alias(message.agent_name, message.chat_id)
             display = alias or message.chat_title or message.chat_id
-            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            sender_fields = self._sender_identity_fields(message)
+            header = f"[{message.platform} | group | {display} | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}{sender_fields}]"
         else:
-            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}]"
+            sender_fields = self._sender_identity_fields(message)
+            header = f"[{message.platform} | dm | {message.sender_name} | {message.chat_id} | {ts}{msg_id}{thread_provenance}{sender_fields}]"
 
         body = message.content
 
