@@ -7031,6 +7031,47 @@ npm run build</pre>
     from pinky_daemon.routes.skills import router as _skills_router
     from pinky_daemon.routes.skills import set_dependencies as _skills_set_deps
 
+    _skill_notice_tasks: set[asyncio.Task] = set()
+
+    async def _send_skill_change_notices(changes: list[tuple[str, str, str]]) -> None:
+        """Tell each live agent session whose skills changed text, one message per agent.
+
+        An agent is told about a skill only when the skill is effectively on
+        for it (direct assignment or shared, minus opt outs and globally
+        disabled skills). A session that is not live gets nothing: it reads
+        the current catalog copy the next time it loads the skill.
+        """
+        from pinky_daemon.skill_store import render_change_notice
+
+        for agent in agents.list(enabled_only=True):
+            try:
+                effective = {
+                    row["name"] for row in skills.get_agent_skills(agent.name, enabled_only=True)
+                }
+                mine = [c for c in changes if c[0] in effective]
+                if not mine:
+                    continue
+                text = render_change_notice(mine)
+                result = await broker.inject_agent_message("system", agent.name, text)
+                _log(
+                    f"skills: change notice {[c[0] for c in mine]} -> {agent.name} "
+                    f"delivered={result.delivered}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log(
+                    f"skills: change notice -> {agent.name} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    def _on_skill_text_changed(changes: list[tuple[str, str, str]]) -> None:
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        task = loop.create_task(_send_skill_change_notices(changes))
+        _skill_notice_tasks.add(task)
+        task.add_done_callback(_skill_notice_tasks.discard)
+
     _skills_set_deps(
         skills=skills,
         plugins=plugins,
@@ -7038,6 +7079,7 @@ npm run build</pre>
         manager=manager,
         pinky_root=_pinky_root,
         log=_log,
+        on_text_changed=_on_skill_text_changed,
     )
     app.include_router(_skills_router)
 
