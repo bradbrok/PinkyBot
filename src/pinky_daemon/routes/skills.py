@@ -791,18 +791,21 @@ async def discover_skills_endpoint(request: Request, req: DiscoverSkillsRequest 
         overwrite=False, agent_originated=bool(internal_caller), origin_agent=internal_caller,
     )
     updated, changes = [], []
-    for existing, parsed in refreshes:
-        refreshed = _skills.refresh_text(
-            existing.name, description=parsed.description, directive=parsed.body,
-            actor=internal_caller or "user", path="discover", approval_ref=req.approval_ref,
-        )
-        changes.append(_text_change(existing, refreshed))
-        updated.append({
-            "name": existing.name,
-            "before_hash": skill_text_hash(existing.description, existing.directive),
-            "after_hash": skill_text_hash(refreshed.description, refreshed.directive),
-        })
-    _notify_text_changed(changes)
+    try:
+        for existing, parsed in refreshes:
+            refreshed = _skills.refresh_text(
+                existing.name, description=parsed.description, directive=parsed.body,
+                actor=internal_caller or "user", path="discover", approval_ref=req.approval_ref,
+            )
+            changes.append(_text_change(existing, refreshed))
+            updated.append({
+                "name": existing.name,
+                "before_hash": skill_text_hash(existing.description, existing.directive),
+                "after_hash": skill_text_hash(refreshed.description, refreshed.directive),
+            })
+    finally:
+        # skills refreshed before a later failure are still announced
+        _notify_text_changed(changes)
     if req.refresh:
         result.update(updated=updated, refused=refused, unchanged=unchanged)
     return {"discovered": len(found), **result}
