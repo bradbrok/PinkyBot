@@ -3784,7 +3784,7 @@ class TmuxSession(TransportReplacementMixin):
     def _prepare_tmux_spawn(self) -> None:
         """Publish transport-specific state at the final spawn boundary."""
         if self._prepare_spawn_callback is not None:
-            self._prepare_spawn_callback()
+            self._prepare_spawn_callback(self._config.working_dir)
 
     def _spawn_cleanup_state_dir(self) -> Path:
         registry_path = getattr(self._registry, "_db_path", "")

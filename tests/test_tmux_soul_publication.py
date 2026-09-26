@@ -77,13 +77,13 @@ def launch(tmp_path, monkeypatch):
     monkeypatch.setattr(tmux_session, "_async_sleep", AsyncMock())
     client = TestClient(app)
 
-    async def request():
+    async def request(method="POST", path="/agents/test-agent/streaming-sessions", **kwargs):
         # Keep requests on the store-owning thread, as in the daemon event loop.
         async with httpx.AsyncClient(
             transport=httpx.ASGITransport(app=app), base_url="http://testserver",
             cookies=client.cookies,
         ) as http:
-            return await http.post("/agents/test-agent/streaming-sessions")
+            return await http.request(method, path, **kwargs)
 
     def run():
         response = asyncio.run(request())
@@ -92,7 +92,7 @@ def launch(tmp_path, monkeypatch):
 
     yield SimpleNamespace(
         run=run, registry=registry, work=work, launched=launched, sessions=sessions,
-        app=app, skills=skills,
+        app=app, skills=skills, request=request,
     )
     client.close()
     app.state.store_catalog.close()
@@ -115,6 +115,61 @@ def test_missing_prompt_published_before_process(launch, caplog, isolation):
     assert [r.message for r in caplog.records if "published missing CLAUDE.md" in r.message] == [
         f"published missing CLAUDE.md for test-agent ({len(content)} chars)"
     ]
+
+
+def test_workspace_put_then_retained_spawn_skips_mismatched_owner(launch, caplog):
+    launch.run()
+    session = launch.sessions[0]
+    moved = launch.work.parent / "moved-workspace"
+    response = asyncio.run(launch.request(
+        "PUT", "/agents/test-agent", json={"working_dir": str(moved)},
+    ))
+    assert response.status_code == 200, response.text
+    assert launch.registry.get("test-agent").working_dir == str(moved)
+    assert session._config.working_dir == str(launch.work)
+    (launch.work / "CLAUDE.md").unlink()
+    versions_before = launch.registry.get_soul_versions("test-agent")
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        asyncio.run(session.connect())
+    assert launch.launched[-1] is None
+    assert session._tmux.new_session.call_args.kwargs["cwd"] == str(launch.work)
+    assert not (launch.work / "CLAUDE.md").exists()
+    assert not (moved / "CLAUDE.md").exists()
+    assert launch.registry.get_soul_versions("test-agent") == versions_before
+    warnings = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert warnings == [
+        f"skipped missing CLAUDE.md for test-agent: launch workspace {launch.work.resolve()} "
+        f"differs from registered owner root {moved.resolve()}"
+    ]
+    assert not any("published missing CLAUDE.md" in r.message for r in caplog.records)
+
+
+@pytest.mark.parametrize("aliased_side", ["launch", "owner"])
+def test_symlinked_parent_with_same_resolved_owner_publishes(launch, aliased_side, caplog):
+    launch.run()
+    session = launch.sessions[0]
+    (launch.work / "CLAUDE.md").unlink()
+    alias = launch.work.parent / "parent-alias"
+    alias.symlink_to(launch.work.parent, target_is_directory=True)
+    aliased_workspace = alias / launch.work.name
+    if aliased_side == "launch":
+        session._config.working_dir = str(aliased_workspace)
+    else:
+        # An existing record may use an alias introduced by a host migration.
+        launch.registry._db.execute(
+            "UPDATE agents SET working_dir=? WHERE name=?",
+            (str(aliased_workspace), "test-agent"),
+        )
+        launch.registry._db.commit()
+    caplog.clear()
+    with caplog.at_level(logging.INFO):
+        asyncio.run(session.connect())
+    content = (launch.work / "CLAUDE.md").read_bytes()
+    assert b"Fixture soul text" in content
+    assert launch.launched[-1] == content
+    assert not [r for r in caplog.records if r.levelno >= logging.WARNING]
+    assert len([r for r in caplog.records if "published missing CLAUDE.md" in r.message]) == 1
 
 
 def test_existing_prompt_is_byte_identical_without_version(launch):

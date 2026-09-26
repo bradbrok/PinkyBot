@@ -4234,7 +4234,7 @@ def create_api(
         if is_codex or is_tmux:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
         if is_tmux:
-            init_kwargs["prepare_spawn_callback"] = lambda: _publish_missing_claude_prompt(agent_name)
+            init_kwargs["prepare_spawn_callback"] = lambda cwd: _publish_missing_claude_prompt(agent_name, cwd)
 
         ss = SessionClass(config, **init_kwargs)
         ss._launch_runtime = runtime
@@ -7407,13 +7407,21 @@ npm run build</pre>
                 {"code": "agent_path_outside_workspace"},
             ) from exc
 
-    def _publish_missing_claude_prompt(agent_name: str) -> None:
+    def _publish_missing_claude_prompt(agent_name: str, launch_cwd: str) -> None:
         logger = logging.getLogger(__name__)
         try:
             agent = agents.get(agent_name)
             if agent is None:
                 raise ValueError("agent no longer registered")
-            path = Path(agent.working_dir) / "CLAUDE.md"
+            owner_root = _agent_path_or_400(agent)
+            launch_root = Path(launch_cwd).resolve()
+            if launch_root != owner_root:
+                logger.warning(
+                    "skipped missing CLAUDE.md for %s: launch workspace %s differs from registered owner root %s",
+                    agent_name, launch_root, owner_root,
+                )
+                return
+            path = owner_root / "CLAUDE.md"
             try:
                 path.lstat()
             except FileNotFoundError:
