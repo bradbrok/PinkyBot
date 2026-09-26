@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import ctypes
 import fcntl
 import json
@@ -57,14 +58,19 @@ def _probe_posix(stores: list[list[str]], pid: int) -> dict:
                         inconclusive.append(f"{name}:{label}")
                 finally:
                     os.close(fd)
-            except OSError:
+            except FileNotFoundError:
                 present = False
             if not present:
                 missing.append(f"{name}:{label}")
-    return {"missing": missing, "inconclusive": inconclusive}
+    return {"missing": missing, "inconclusive": inconclusive, "reason": "foreign_owner"}
 
 
-def check_sqlite_locks(stores: list[tuple[str, str]], *, timeout: float = 10) -> dict:
+def check_sqlite_locks(
+    stores: list[tuple[str, str]],
+    *,
+    timeout: float = 10,
+    previous: dict | None = None,
+) -> dict:
     """Return a health snapshot; a failed probe never prevents startup."""
     try:
         result = subprocess.run(
@@ -85,17 +91,37 @@ def check_sqlite_locks(stores: list[tuple[str, str]], *, timeout: float = 10) ->
         }
         if inconclusive:
             status["inconclusive"] = inconclusive
+            status["reason"] = probe["reason"]
     except Exception as exc:
         status = {
-            "healthy": False,
+            "healthy": None,
             "checked": len(stores),
             "missing": [],
             "error": f"lock probe failed: {type(exc).__name__}",
+            "reason": f"probe_failed:{type(exc).__name__}",
+            "inconclusive": [
+                f"{name}:{label}" for name, _ in stores for label in ("SHARED", "DMS")
+            ],
         }
-    if status["healthy"] is False:
-        logger.critical("SQLite lock self-check failed: %s", status)
-    elif status["healthy"] is None:
-        logger.info("SQLite lock self-check inconclusive behind another owner: %s", status)
+    if status != previous:
+        if status["healthy"] is False:
+            logger.critical("SQLite lock self-check failed: %s", status)
+        elif status["healthy"] is None:
+            logger.warning("SQLite lock self-check inconclusive: %s", status)
+        elif previous is not None and previous["healthy"] is not True:
+            logger.info("SQLite lock self-check resolved: %s", status)
+    return status
+
+
+async def recheck_sqlite_locks(get_stores, publish, status: dict, *, sleep=None) -> dict:
+    """Re-probe transient uncertainty with bounded exponential backoff."""
+    sleep = asyncio.sleep if sleep is None else sleep
+    delay = 30
+    while status["healthy"] is None and status.get("reason") != "device_mismatch":
+        await sleep(delay)
+        status = await asyncio.to_thread(check_sqlite_locks, get_stores(), previous=status)
+        publish(status)
+        delay = min(delay * 2, 600)
     return status
 
 
@@ -117,6 +143,7 @@ def _probe_linux(stores: list[list[str]], pid: int) -> dict:
             )
         )
     missing = []
+    inconclusive = []
     for name, path in stores:
         for suffix, offset, length, label in (
             ("", 1073741826, 510, "SHARED"),
@@ -129,11 +156,20 @@ def _probe_linux(stores: list[list[str]], pid: int) -> dict:
                     key == identity and start <= offset and end >= offset + length - 1
                     for key, start, end in locks
                 )
-            except OSError:
+                if not present and any(
+                    key[2] == info.st_ino
+                    and key[:2] != identity[:2]
+                    and start <= offset
+                    and end >= offset + length - 1
+                    for key, start, end in locks
+                ):
+                    inconclusive.append(f"{name}:{label}")
+                    continue
+            except FileNotFoundError:
                 present = False
             if not present:
                 missing.append(f"{name}:{label}")
-    return {"missing": missing, "inconclusive": []}
+    return {"missing": missing, "inconclusive": inconclusive, "reason": "device_mismatch"}
 
 
 if __name__ == "__main__":

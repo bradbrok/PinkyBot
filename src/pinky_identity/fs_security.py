@@ -28,8 +28,11 @@ readers on a shared host).
 
 from __future__ import annotations
 
+import logging
 import os
 import stat
+import subprocess
+import sys
 from pathlib import Path
 
 from pinky_identity.live_sqlite import refuse_live_sqlite_file
@@ -117,7 +120,7 @@ def prepare_secret_database(db_path: str | Path) -> None:
     """Create new files owner-only; never raw-open an existing database.
 
     Existing files may have live SQLite statements even after close(). Their
-    mode repair belongs to the daemon's child-process permission sweep.
+    mode repair runs in a child, including for standalone identity-store users.
     """
     path = Path(db_path)
     try:
@@ -125,9 +128,26 @@ def prepare_secret_database(db_path: str | Path) -> None:
     except FileNotFoundError:
         pass
     else:
+        harden_secret_file_in_child(path)
         return
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, SECRET_FILE_MODE)
     except FileExistsError:
+        harden_secret_file_in_child(path)
         return  # A competing creator won; no descriptor was opened.
     os.close(fd)
+
+
+def harden_secret_file_in_child(path: str | Path, *, timeout: float = 10) -> None:
+    """Repair existing standalone-store modes without touching parent locks."""
+    try:
+        subprocess.run(
+            [sys.executable, "-m", "pinky_identity.fs_security", str(path)],
+            capture_output=True, check=True, timeout=timeout,
+        )
+    except Exception:
+        logging.getLogger(__name__).exception("Identity file permission child failed")
+
+
+if __name__ == "__main__":
+    harden_secret_file(sys.argv[1])

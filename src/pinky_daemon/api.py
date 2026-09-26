@@ -13958,7 +13958,7 @@ npm run build</pre>
             f"{len(_broker_pollers)} broker poller(s), {streaming_count} streaming"
         )
 
-        from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+        from pinky_daemon.sqlite_lock_check import check_sqlite_locks, recheck_sqlite_locks
 
         wal_stores = [
             store for catalog in (store_catalog, *tenant_store_catalogs.values())
@@ -13966,18 +13966,19 @@ npm run build</pre>
         ]
         app.state.sqlite_lock_health = await asyncio.to_thread(check_sqlite_locks, wal_stores)
 
-        async def recheck_inconclusive_locks():
-            while app.state.sqlite_lock_health["healthy"] is None:
-                await asyncio.sleep(30)
-                current = [
-                    store for catalog in (store_catalog, *tenant_store_catalogs.values())
-                    for store in catalog.live_wal_stores()
-                ]
-                app.state.sqlite_lock_health = await asyncio.to_thread(check_sqlite_locks, current)
+        def current_wal_stores():
+            return [
+                store for catalog in (store_catalog, *tenant_store_catalogs.values())
+                for store in catalog.live_wal_stores()
+            ]
 
-        if app.state.sqlite_lock_health["healthy"] is None:
-            app.state.sqlite_lock_recheck_task = asyncio.create_task(recheck_inconclusive_locks())
-
+        if (app.state.sqlite_lock_health["healthy"] is None
+                and app.state.sqlite_lock_health.get("reason") != "device_mismatch"):
+            app.state.sqlite_lock_recheck_task = asyncio.create_task(recheck_sqlite_locks(
+                current_wal_stores,
+                lambda status: setattr(app.state, "sqlite_lock_health", status),
+                app.state.sqlite_lock_health,
+            ))
 
     @app.on_event("shutdown")
     async def on_shutdown():

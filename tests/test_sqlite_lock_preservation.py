@@ -508,3 +508,129 @@ async def test_inconclusive_boot_schedules_recheck_and_cancels_on_shutdown(tmp_p
         assert not task.done()
         assert app.state.sqlite_lock_health["healthy"] is None
     assert task.cancelled()
+
+
+def test_failed_probe_is_inconclusive_not_a_proven_lock_loss(monkeypatch, caplog):
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("probe", 10)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    status = check_sqlite_locks([("tasks", "/unused/tasks.db")])
+    assert status["healthy"] is None
+    assert status["missing"] == []
+    assert "TimeoutExpired" in status["error"]
+    assert not any(record.levelname == "CRITICAL" for record in caplog.records)
+
+
+@pytest.mark.parametrize("kind", ["bearer", "signer"])
+@pytest.mark.parametrize("mode", [0o644, 0o666])
+def test_standalone_existing_identity_modes_are_repaired_in_child(tmp_path, kind, mode):
+    from pinky_identity.bearer_tokens import BearerTokenStore
+    from pinky_identity.keystore import DeviceKey
+    from pinky_identity.signer_store import EncryptedSignerStore
+
+    path = tmp_path / "existing.db"
+    path.touch(mode=mode)
+    path.chmod(mode)
+    cls, kwargs = BearerTokenStore, {"db_path": path}
+    if kind == "signer":
+        cls = EncryptedSignerStore
+        kwargs["device_key"] = DeviceKey.from_bytes(bytes(32))
+    with cls(**kwargs):
+        for suffix in ("", "-wal", "-shm"):
+            assert Path(str(path) + suffix).stat().st_mode & 0o777 == 0o600
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+
+
+async def test_probe_backoff_logs_only_transitions(monkeypatch, caplog):
+    import json
+    import logging
+    from types import SimpleNamespace
+
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks, recheck_sqlite_locks
+
+    caplog.set_level(logging.INFO, logger="pinky.storage")
+    calls = 0
+
+    def probe(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        uncertain = calls <= 7
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "missing": [],
+                    "inconclusive": ["tasks:DMS"] if uncertain else [],
+                    "reason": "foreign_owner",
+                }
+            )
+        )
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    stores = [("tasks", "/unused/tasks.db")]
+    status = check_sqlite_locks(stores)
+    delays, published = [], []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    final = await recheck_sqlite_locks(lambda: stores, published.append, status, sleep=sleep)
+    assert delays == [30, 60, 120, 240, 480, 600, 600]
+    assert final["healthy"] is True
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "tasks:DMS" in warnings[0].message
+    assert len([r for r in caplog.records if "resolved" in r.message]) == 1
+    assert len(published) == 7
+
+
+async def test_linux_device_mismatch_is_structural_inconclusive(tmp_path, monkeypatch):
+    from pinky_daemon.sqlite_lock_check import _probe_linux, recheck_sqlite_locks
+
+    path = tmp_path / "database.db"
+    lines = []
+    for suffix, start, end in (("", 1073741826, 1073742335), ("-shm", 128, 128)):
+        file = Path(str(path) + suffix)
+        file.touch()
+        info = file.stat()
+        dev = f"{os.major(info.st_dev) + 1:x}:{os.minor(info.st_dev):x}:{info.st_ino}"
+        lines.append(f"1: POSIX ADVISORY READ {os.getpid()} {dev} {start} {end}")
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "\n".join(lines))
+    result = _probe_linux([("tasks", str(path))], os.getpid())
+    assert result == {
+        "missing": [],
+        "inconclusive": ["tasks:SHARED", "tasks:DMS"],
+        "reason": "device_mismatch",
+    }
+
+    async def forbidden(delay):
+        pytest.fail("structural device mismatch must not schedule a retry")
+
+    status = {"healthy": None, **result}
+    assert await recheck_sqlite_locks(lambda: [], lambda _: None, status, sleep=forbidden) == status
+
+
+def test_changed_probe_result_logs_missing_once(monkeypatch, caplog):
+    import json
+    from types import SimpleNamespace
+
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "missing": ["tasks:DMS"],
+                    "inconclusive": [],
+                }
+            )
+        ),
+    )
+    previous = {"healthy": None, "reason": "foreign_owner", "missing": []}
+    status = check_sqlite_locks([("tasks", "/unused")], previous=previous)
+    check_sqlite_locks([("tasks", "/unused")], previous=status)
+    critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert len(critical) == 1 and "tasks:DMS" in critical[0].message
