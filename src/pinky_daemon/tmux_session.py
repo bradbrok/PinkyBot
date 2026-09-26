@@ -2183,6 +2183,7 @@ class TmuxSession(TransportReplacementMixin):
         analytics_store=None,
         registry=None,
         tmux_control: _TmuxControl | None = None,
+        prepare_spawn_callback=None,
     ) -> None:
         self._config = config
         self._wake_launch_history = config.wake_launch_history
@@ -2193,6 +2194,7 @@ class TmuxSession(TransportReplacementMixin):
         self._stream_event_callback = stream_event_callback
         self._analytics_store = analytics_store
         self._registry = registry
+        self._prepare_spawn_callback = prepare_spawn_callback
 
         self.agent_name = config.agent_name
 
@@ -3781,6 +3783,8 @@ class TmuxSession(TransportReplacementMixin):
 
     def _prepare_tmux_spawn(self) -> None:
         """Publish transport-specific state at the final spawn boundary."""
+        if self._prepare_spawn_callback is not None:
+            self._prepare_spawn_callback(self._config.working_dir)
 
     def _spawn_cleanup_state_dir(self) -> Path:
         registry_path = getattr(self._registry, "_db_path", "")
@@ -4080,8 +4084,8 @@ class TmuxSession(TransportReplacementMixin):
 
         # Transport-specific state publication belongs after every teardown
         # precondition and immediately before command/env construction. The
-        # default is a no-op; Codex uses this exact boundary for AGENTS.md and
-        # soul-version publication.
+        # Claude publishes a missing prompt here; Codex overrides the hook
+        # with its own existing publication policy.
         self._prepare_tmux_spawn()
 
         # Build the in-pane command. ``claude --continue`` resumes the
