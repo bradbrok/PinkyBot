@@ -8,6 +8,7 @@ Registration and inspection use stat only; they never open a database.
 from __future__ import annotations
 
 import os
+import sqlite3
 import threading
 import weakref
 from pathlib import Path
@@ -23,6 +24,7 @@ class LiveSQLiteFileError(RuntimeError):
 
 def _identity(path: str | Path) -> tuple[int, int] | None:
     try:
+        # Metadata-only guard: never reads contents of caller-selected files.
         info = os.stat(path)
     except FileNotFoundError:
         return None
@@ -36,7 +38,6 @@ def register_live_sqlite(owner: object, path: str | Path) -> None:
     if identity is not None:
         with _lock:
             _owners.setdefault(owner, {})[path] = {identity}
-            _refresh()
 
 
 def unregister_live_sqlite(owner: object) -> None:
@@ -46,7 +47,11 @@ def unregister_live_sqlite(owner: object) -> None:
 
 def _refresh() -> set[tuple[int, int]]:
     identities = set()
+    seen = set()
     for paths in list(_owners.values()):
+        if id(paths) in seen:
+            continue
+        seen.add(id(paths))
         for path, known in paths.items():
             # Sidecars may be created lazily after the connection is registered.
             # Retain old identities too: an unlinked file can still be mapped.
@@ -76,3 +81,45 @@ def refuse_sqlite_attachment(path: str | Path) -> None:
     if resolved.lower().endswith(tuple(".db" + suffix for suffix in _SUFFIXES)):
         raise LiveSQLiteFileError("SQLite databases and sidecars cannot be sent as attachments")
     refuse_live_sqlite_file(resolved)
+
+
+def track_sqlite_connection(connection: LiveSQLiteConnection, path: str | Path) -> None:
+    connection._live_sqlite_path = os.fspath(path)
+    register_live_sqlite(connection, path)
+
+
+class LiveSQLiteCursor(sqlite3.Cursor):
+    """Keep inode protection while a statement can outlive connection.close()."""
+
+    def close(self) -> None:
+        super().close()
+        unregister_live_sqlite(self)
+
+
+class LiveSQLiteConnection(sqlite3.Connection):
+    """Track connection and cursor lifetimes, including SQLite zombie handles."""
+
+    _live_sqlite_path: str | None = None
+
+    def cursor(self, factory=LiveSQLiteCursor):
+        cursor = super().cursor(factory)
+        if self._live_sqlite_path is not None:
+            with _lock:
+                paths = _owners.get(self)
+                if paths is not None:
+                    _owners[cursor] = paths
+        return cursor
+
+    def execute(self, sql, parameters=(), /):
+        return self.cursor().execute(sql, parameters)
+
+    def executemany(self, sql, parameters, /):
+        return self.cursor().executemany(sql, parameters)
+
+    def executescript(self, script, /):
+        return self.cursor().executescript(script)
+
+    def close(self) -> None:
+        super().close()
+        # Any unfinished cursor remains registered until close or collection.
+        unregister_live_sqlite(self)

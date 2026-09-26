@@ -32,7 +32,7 @@ import os
 import stat
 from pathlib import Path
 
-from pinky_identity.live_sqlite import is_live_sqlite_file, refuse_live_sqlite_file
+from pinky_identity.live_sqlite import refuse_live_sqlite_file
 
 #: Owner read/write only — for files holding secret material.
 SECRET_FILE_MODE = 0o600
@@ -114,14 +114,20 @@ def harden_secret_dir(dir_path: str | Path) -> int:
 
 
 def prepare_secret_database(db_path: str | Path) -> None:
-    """Create owner-only before SQLite opens, and harden existing offline files."""
+    """Create new files owner-only; never raw-open an existing database.
+
+    Existing files may have live SQLite statements even after close(). Their
+    mode repair belongs to the daemon's child-process permission sweep.
+    """
     path = Path(db_path)
-    if is_live_sqlite_file(path):
-        return  # Another local connection already owns this hardened store.
+    try:
+        path.lstat()
+    except FileNotFoundError:
+        pass
+    else:
+        return
     try:
         fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL | _NOFOLLOW, SECRET_FILE_MODE)
     except FileExistsError:
-        pass
-    else:
-        os.close(fd)
-    harden_secret_file(path)
+        return  # A competing creator won; no descriptor was opened.
+    os.close(fd)

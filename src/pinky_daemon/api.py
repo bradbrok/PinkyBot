@@ -13966,11 +13966,29 @@ npm run build</pre>
         ]
         app.state.sqlite_lock_health = await asyncio.to_thread(check_sqlite_locks, wal_stores)
 
+        async def recheck_inconclusive_locks():
+            while app.state.sqlite_lock_health["healthy"] is None:
+                await asyncio.sleep(30)
+                current = [
+                    store for catalog in (store_catalog, *tenant_store_catalogs.values())
+                    for store in catalog.live_wal_stores()
+                ]
+                app.state.sqlite_lock_health = await asyncio.to_thread(check_sqlite_locks, current)
+
+        if app.state.sqlite_lock_health["healthy"] is None:
+            app.state.sqlite_lock_recheck_task = asyncio.create_task(recheck_inconclusive_locks())
+
+
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
         import json as _json
         from datetime import datetime, timezone
+
+        lock_recheck = getattr(app.state, "sqlite_lock_recheck_task", None)
+        if lock_recheck is not None:
+            lock_recheck.cancel()
+            await asyncio.gather(lock_recheck, return_exceptions=True)
 
         rotation_task = getattr(app.state, "access_log_rotation_task", None)
         if rotation_task is not None:

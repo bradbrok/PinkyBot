@@ -161,6 +161,14 @@ def _ensure_test_session_secret():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_temporary_files(tmp_path, monkeypatch):
+    """Keep fixed-name companion databases private to each test's app instances."""
+    temporary_root = tmp_path / "tempfiles"
+    temporary_root.mkdir(mode=0o700)
+    monkeypatch.setattr(tempfile, "tempdir", str(temporary_root))
+
+
+@pytest.fixture(autouse=True)
 def _isolate_test_env(request, monkeypatch):
     """Re-apply the ambient guard before every test.
 

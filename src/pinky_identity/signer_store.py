@@ -49,7 +49,7 @@ from pinky_identity.keystore import (
     unwrap_keypair,
     wrap_keypair,
 )
-from pinky_identity.live_sqlite import register_live_sqlite, unregister_live_sqlite
+from pinky_identity.live_sqlite import LiveSQLiteConnection, track_sqlite_connection
 
 # -- Constants ---------------------------------------------------------------
 
@@ -130,7 +130,7 @@ class EncryptedSignerStore:
     should own this file.
     """
 
-    __slots__ = ("_db_path", "_db", "_device_key", "__weakref__")
+    __slots__ = ("_db_path", "_db", "_device_key")
 
     def __init__(
         self,
@@ -145,13 +145,14 @@ class EncryptedSignerStore:
         self._device_key = device_key
         prepare_secret_database(self._db_path)
         self._db = sqlite3.connect(
-            str(self._db_path), isolation_level=None, check_same_thread=False
+            str(self._db_path), isolation_level=None, check_same_thread=False,
+            factory=LiveSQLiteConnection
         )
+        track_sqlite_connection(self._db, self._db_path)
         self._db.row_factory = sqlite3.Row
         self._db.execute("PRAGMA journal_mode=WAL")
         self._db.execute("PRAGMA foreign_keys=ON")
         self._ensure_schema()
-        register_live_sqlite(self, self._db_path)
 
     # -- schema --
 
@@ -353,7 +354,6 @@ class EncryptedSignerStore:
 
     def close(self) -> None:
         self._db.close()
-        unregister_live_sqlite(self)
 
     def __enter__(self) -> "EncryptedSignerStore":
         return self

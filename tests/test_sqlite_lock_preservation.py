@@ -368,3 +368,143 @@ def test_entry_point_restricts_creation_mode_before_configuration(monkeypatch):
             entry.main()
     finally:
         os.umask(previous)
+
+
+@pytest.mark.parametrize("kind", ["bearer", "signer", "catalog"])
+def test_unfinished_cursor_keeps_registry_and_locks_after_close(tmp_path, kind):
+    import gc
+
+    from pinky_daemon.store_catalog import DaemonStoreCatalog
+    from pinky_daemon.task_store import TaskStore
+    from pinky_identity.bearer_tokens import BearerTokenStore
+    from pinky_identity.fs_security import harden_secret_file
+    from pinky_identity.keystore import DeviceKey
+    from pinky_identity.live_sqlite import LiveSQLiteFileError
+    from pinky_identity.signer_store import EncryptedSignerStore
+
+    path = tmp_path / "store.db"
+    catalog = DaemonStoreCatalog(expected_root=tmp_path)
+
+    def make():
+        if kind == "bearer":
+            return BearerTokenStore(db_path=path)
+        if kind == "signer":
+            return EncryptedSignerStore(db_path=path, device_key=DeviceKey.from_bytes(bytes(32)))
+        return TaskStore(str(path), catalog=catalog)
+
+    store = make()
+    store._db.execute("CREATE TABLE cursor_probe(value)")
+    store._db.executemany("INSERT INTO cursor_probe VALUES (?)", [(1,), (2,), (3,)])
+    store._db.commit()
+    cursor = store._db.execute("SELECT * FROM cursor_probe")
+    assert cursor.fetchone()[0] == 1
+    store.close()
+    with pytest.raises(LiveSQLiteFileError):
+        harden_secret_file(path)
+    assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    replacement = make()
+    try:
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+        cursor = None
+        gc.collect()
+        replacement._db.execute("INSERT INTO cursor_probe VALUES (4)")
+        replacement._db.commit()
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    finally:
+        cursor = None
+        gc.collect()
+        replacement.close()
+        catalog.close()
+    harden_secret_file(path)
+
+
+def test_existing_identity_database_is_never_raw_opened(tmp_path, monkeypatch):
+    from pinky_identity.bearer_tokens import BearerTokenStore
+
+    path = tmp_path / "existing.db"
+    with BearerTokenStore(db_path=path):
+        pass
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("raw open attempted on existing identity database")
+
+    monkeypatch.setattr(os, "open", forbidden)
+    with BearerTokenStore(db_path=path):
+        pass
+
+
+@pytest.mark.parametrize("drop_local_locks", [False, True])
+def test_external_reader_does_not_mask_linux_lock_loss_or_make_macos_false_red(
+    tmp_path,
+    caplog,
+    drop_local_locks,
+):
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+    from pinky_identity.bearer_tokens import BearerTokenStore
+
+    path = tmp_path / "shared.db"
+    code = """
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('CREATE TABLE seed(value)')
+c.commit()
+print('ready', flush=True)
+sys.stdin.readline()
+c.close()
+"""
+    peer = subprocess.Popen(
+        [sys.executable, "-c", code, str(path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    store = None
+    try:
+        assert peer.stdout.readline().strip() == "ready"
+        store = BearerTokenStore(db_path=path)
+        if drop_local_locks:
+            for suffix in ("", "-shm"):
+                os.close(os.open(str(path) + suffix, os.O_RDONLY))
+        health = check_sqlite_locks([("identity", str(path))])
+        if sys.platform == "linux":
+            assert health["healthy"] is (not drop_local_locks)
+            if drop_local_locks:
+                assert health["missing"] == ["identity:SHARED", "identity:DMS"]
+        else:
+            assert health["healthy"] is None
+            assert health["inconclusive"] == ["identity:SHARED", "identity:DMS"]
+            assert not any(r.levelname == "CRITICAL" for r in caplog.records)
+        peer.communicate("\n", timeout=10)
+        if not drop_local_locks:
+            # The local handle did not change; with the peer gone, its locks
+            # become observable through F_GETLK as well.
+            assert check_sqlite_locks([("identity", str(path))])["healthy"] is True
+    finally:
+        if peer.poll() is None:
+            peer.communicate("\n", timeout=10)
+        if store is not None:
+            store.close()
+
+
+async def test_inconclusive_boot_schedules_recheck_and_cancels_on_shutdown(tmp_path, monkeypatch):
+    from pinky_daemon import api, sqlite_lock_check
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setattr(
+        sqlite_lock_check,
+        "check_sqlite_locks",
+        lambda stores: {
+            "healthy": None,
+            "checked": len(stores),
+            "missing": [],
+            "inconclusive": ["tasks:DMS"],
+        },
+    )
+    app = api.create_api(db_path=str(tmp_path / "conversations.db"))
+    async with app.router.lifespan_context(app):
+        task = app.state.sqlite_lock_recheck_task
+        assert not task.done()
+        assert app.state.sqlite_lock_health["healthy"] is None
+    assert task.cancelled()

@@ -20,9 +20,9 @@ from urllib.parse import parse_qsl
 
 from pinky_daemon.store_shutdown import StoreShutdownCoordinator, StoreShutdownReport
 from pinky_identity.live_sqlite import (
+    LiveSQLiteConnection,
     refuse_live_sqlite_file,
-    register_live_sqlite,
-    unregister_live_sqlite,
+    track_sqlite_connection,
 )
 
 if TYPE_CHECKING:
@@ -371,7 +371,7 @@ class StorePathAuthorityError(PermissionError):
         self.uid = uid
 
 
-class _ManagedSQLiteConnection(sqlite3.Connection):
+class _ManagedSQLiteConnection(LiveSQLiteConnection):
     """Catalog connection with optional synchronous runtime recording."""
 
     _store_authority: _StoreConnectionAuthority | None = None
@@ -613,7 +613,6 @@ class _ManagedSQLiteConnection(sqlite3.Connection):
         finally:
             self._store_boundary_observation_depth -= 1
         self._store_closed = True
-        unregister_live_sqlite(self)
         try:
             if (
                 transaction_active
@@ -716,7 +715,7 @@ class _StoreConnectionAuthority:
             connection._store_handle_id = handle_id
             connection._store_logical_name = logical_name
             connection._store_observability = self._catalog._observability
-            register_live_sqlite(connection, path)
+            track_sqlite_connection(connection, path)
             self._handles[handle_id] = handle
             return connection
 
@@ -2090,6 +2089,13 @@ class DaemonStoreCatalog(StoreCatalog):
 
     def preflight_ancestor_chains(self) -> None:
         """Recheck directory authority without closing any live database fd."""
+        def verify_retained(bound_file, absolute_path):
+            try:
+                self._verify_bound_wal_target(bound_file, absolute_path)
+            except OSError:
+                if bound_file.path_state() != "absent":
+                    raise
+
         with self._lock:
             observations = {o.path: o for o in self._observations if o._bound_file is not None}
             records = {entry.record.resolved_path: entry.record for entry in self._entries}
@@ -2103,14 +2109,20 @@ class DaemonStoreCatalog(StoreCatalog):
             bound_file = None if observation is None else observation._bound_file
             if bound_file is not None:
                 if bound_file.header_journal_mode() == "wal":
-                    self._verify_bound_wal_target(bound_file, absolute_path)
+                    verify_retained(bound_file, absolute_path)
                 continue
             if record is not None:
                 # Stores absent at boot have no retained inspection fd. Their
                 # registered inode and journal mode are already authoritative.
                 if record.journal_mode == "wal":
-                    self._verified_daemon_owned_path(absolute_path)
-                    if self._stat_identity(absolute_path) != record.dev_ino:
+                    try:
+                        current = os.stat(absolute_path, follow_symlinks=False)
+                        self._verified_daemon_owned_path(absolute_path)
+                    except OSError as exc:
+                        if self._is_missing_path_error(exc):
+                            continue
+                        raise
+                    if (current.st_dev, current.st_ino) != record.dev_ino:
                         raise StoreCatalogError("store path changed since registration")
                 continue
             # An unopened manifest target can still be inspected normally.
@@ -2123,7 +2135,7 @@ class DaemonStoreCatalog(StoreCatalog):
                 raise
             try:
                 if bound_file.header_journal_mode() == "wal":
-                    self._verify_bound_wal_target(bound_file, absolute_path)
+                    verify_retained(bound_file, absolute_path)
             finally:
                 bound_file.close()
 

@@ -83,9 +83,7 @@ def sweep_db_permissions_in_child(data_dir: str | Path, *, timeout: float = 30) 
     """Harden startup files without releasing any parent-process SQLite locks."""
     try:
         result = subprocess.run(
-            [sys.executable, "-c",
-             "import sys; from pinky_daemon.db_security import sweep_db_permissions; "
-             "print(sweep_db_permissions(sys.argv[1]))", str(data_dir)],
+            [sys.executable, "-m", "pinky_daemon.db_security", str(data_dir)],
             capture_output=True, text=True, check=True, timeout=timeout,
         )
         changed = int(result.stdout.strip())
@@ -95,3 +93,7 @@ def sweep_db_permissions_in_child(data_dir: str | Path, *, timeout: float = 30) 
     if changed:
         logger.info("Tightened SQLite file permissions in child process")
     return changed
+
+
+if __name__ == "__main__":
+    print(sweep_db_permissions(sys.argv[1]))
