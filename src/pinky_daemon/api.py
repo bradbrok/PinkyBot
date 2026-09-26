@@ -7223,7 +7223,10 @@ npm run build</pre>
     @app.get("/system/health")
     async def system_health():
         """Authenticated access-log availability and counted receipt gaps."""
-        return {"access_log": app.state.access_log.status()}
+        return {
+            "access_log": app.state.access_log.status(),
+            "sqlite_locks": getattr(app.state, "sqlite_lock_health", {"healthy": None}),
+        }
 
     @app.get("/system/timezone")
     async def get_default_timezone():
@@ -10762,6 +10765,13 @@ npm run build</pre>
         if not agent_name or not chat_id or not file_path:
             raise HTTPException(400, "agent_name, chat_id, and file_path are required")
 
+        from pinky_identity.live_sqlite import LiveSQLiteFileError, refuse_sqlite_attachment
+
+        try:
+            refuse_sqlite_attachment(file_path)
+        except LiveSQLiteFileError as exc:
+            raise HTTPException(400, str(exc)) from exc
+
         loop = asyncio.get_running_loop()
         try:
             msg = await loop.run_in_executor(
@@ -13503,10 +13513,10 @@ npm run build</pre>
 
         # Lock down SQLite file permissions to owner-only. Runs here (not in
         # create_api) so every store's __init__ has already created its DB
-        # file; the sweep is idempotent and best-effort.
+        # file. A child performs raw opens/closes to preserve our SQLite locks.
         try:
-            from pinky_daemon.db_security import sweep_db_permissions
-            sweep_db_permissions(Path(db_path).resolve().parent)
+            from pinky_daemon.db_security import sweep_db_permissions_in_child
+            await asyncio.to_thread(sweep_db_permissions_in_child, Path(db_path).resolve().parent)
         except Exception as exc:  # never let hardening abort startup
             _log(f"startup: db permission sweep skipped ({exc})")
 
@@ -13948,11 +13958,38 @@ npm run build</pre>
             f"{len(_broker_pollers)} broker poller(s), {streaming_count} streaming"
         )
 
+        from pinky_daemon.sqlite_lock_check import check_sqlite_locks, recheck_sqlite_locks
+
+        wal_stores = [
+            store for catalog in (store_catalog, *tenant_store_catalogs.values())
+            for store in catalog.live_wal_stores()
+        ]
+        app.state.sqlite_lock_health = await asyncio.to_thread(check_sqlite_locks, wal_stores)
+
+        def current_wal_stores():
+            return [
+                store for catalog in (store_catalog, *tenant_store_catalogs.values())
+                for store in catalog.live_wal_stores()
+            ]
+
+        if (app.state.sqlite_lock_health["healthy"] is None
+                and app.state.sqlite_lock_health.get("reason") != "device_mismatch"):
+            app.state.sqlite_lock_recheck_task = asyncio.create_task(recheck_sqlite_locks(
+                current_wal_stores,
+                lambda status: setattr(app.state, "sqlite_lock_health", status),
+                app.state.sqlite_lock_health,
+            ))
+
     @app.on_event("shutdown")
     async def on_shutdown():
         """Stop scheduler, autonomy, broker pollers, and streaming sessions on shutdown."""
         import json as _json
         from datetime import datetime, timezone
+
+        lock_recheck = getattr(app.state, "sqlite_lock_recheck_task", None)
+        if lock_recheck is not None:
+            lock_recheck.cancel()
+            await asyncio.gather(lock_recheck, return_exceptions=True)
 
         rotation_task = getattr(app.state, "access_log_rotation_task", None)
         if rotation_task is not None:

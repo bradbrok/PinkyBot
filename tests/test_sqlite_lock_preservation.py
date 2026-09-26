@@ -1,0 +1,655 @@
+"""Process-level regressions for SQLite locks across application startup."""
+
+from __future__ import annotations
+
+import os
+import subprocess
+import sys
+from pathlib import Path
+
+import pytest
+
+# Run the application in an isolated process: a broken implementation can leave
+# an mmap pointing at truncated shared memory. Never risk the pytest process.
+_SCENARIO = r'''
+import asyncio
+import ctypes
+import fcntl
+import hashlib
+import json
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+from pinky_daemon import api
+
+PROBE = r"""
+import ctypes, fcntl, json, os, sys
+if sys.platform == 'darwin':
+    fields = [('start', ctypes.c_longlong), ('length', ctypes.c_longlong),
+              ('pid', ctypes.c_int), ('type', ctypes.c_short), ('whence', ctypes.c_short)]
+else:
+    fields = [('type', ctypes.c_short), ('whence', ctypes.c_short),
+              ('start', ctypes.c_longlong), ('length', ctypes.c_longlong),
+              ('pid', ctypes.c_int)]
+class Lock(ctypes.Structure):
+    _fields_ = fields
+result = []
+for suffix, offset, length in [('', 1073741826, 510), ('-shm', 128, 1)]:
+    fd = os.open(sys.argv[1] + suffix, os.O_RDONLY)
+    try:
+        lock = Lock()
+        lock.type, lock.whence, lock.start, lock.length = fcntl.F_WRLCK, os.SEEK_SET, offset, length
+        held = Lock.from_buffer_copy(fcntl.fcntl(fd, fcntl.F_GETLK, bytes(lock)))
+        result.append([held.type == fcntl.F_RDLCK, held.pid])
+    finally:
+        os.close(fd)
+print(json.dumps(result))
+"""
+
+def child(code, *args):
+    p = subprocess.run([sys.executable, '-c', code, *map(str, args)],
+                       capture_output=True, text=True, timeout=30)
+    assert p.returncode == 0, p.stderr
+    return p.stdout.strip()
+
+def assert_locks(path):
+    locks = json.loads(child(PROBE, path))
+    assert locks == [[True, os.getpid()], [True, os.getpid()]], (path, locks)
+
+async def run():
+    root, scenario = Path(sys.argv[1]), sys.argv[2]
+    os.chdir(root)
+    os.environ['PINKY_LOG_ROTATION'] = 'off'
+    api.SHARED_MCP_ENABLED = False
+    app = api.create_api(db_path=str(root / 'conversations.db'), default_working_dir=str(root))
+    records = {r.logical_name: r for r in app.state.store_catalog.snapshot()}
+    paths = [Path(records[n].resolved_path) for n in ('tasks', 'sessions')]
+    for path in paths:
+        assert_locks(path)  # Positive control before the startup sweep.
+        for suffix in ("", "-wal", "-shm"):
+            os.chmod(str(path) + suffix, 0o644)
+    async with app.router.lifespan_context(app):
+        if scenario == 'locks':
+            for path in paths:
+                assert_locks(path)
+                for suffix in ('', '-wal', '-shm'):
+                    assert Path(str(path) + suffix).stat().st_mode & 0o777 == 0o600
+        elif scenario == 'orphan':
+            db = app.state.session_store._db
+            db.execute('CREATE TABLE lock_probe(value INTEGER)')
+            db.execute('INSERT INTO lock_probe VALUES (1)')
+            db.commit()
+            path = paths[1]
+            child("import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+                  "c.execute('SELECT * FROM lock_probe').fetchall(); c.close()", path)
+            assert all(Path(str(path) + suffix).exists() for suffix in ('-wal', '-shm')), 'sidecars unlinked'
+            db.execute('INSERT INTO lock_probe VALUES (2)')
+            db.commit()
+            count = child("import sqlite3,sys; c=sqlite3.connect(sys.argv[1]); "
+                          "print(c.execute('SELECT count(*) FROM lock_probe').fetchone()[0]); c.close()", path)
+            assert count == '2', count
+        elif scenario == 'readonly':
+            for path in paths:
+                # Read bytes in the child too: even an inspection close here
+                # would drop this process's own DMS lock. Compare the two
+                # WAL-index headers, excluding read marks and their mtime updates.
+                result = child("""
+import hashlib, json, os, sqlite3, sys
+p = sys.argv[1] + '-shm'
+def snapshot():
+    s = os.stat(p)
+    with open(p, 'rb') as stream:
+        header = stream.read(96).hex()
+    return [s.st_ino, s.st_size, header]
+before = snapshot()
+c = sqlite3.connect('file:' + sys.argv[1] + '?mode=ro', uri=True)
+c.execute('SELECT count(*) FROM sqlite_master').fetchone()
+c.close()
+print(json.dumps([before, snapshot()]))
+""", path)
+                before, after = json.loads(result)
+                assert before == after, (path, before, after)
+                assert_locks(path)
+
+asyncio.run(run())
+'''
+
+
+@pytest.mark.parametrize("scenario", ["locks", "orphan", "readonly"])
+def test_real_startup_preserves_sqlite_locks(tmp_path, scenario):
+    result = subprocess.run(
+        [sys.executable, "-c", _SCENARIO, str(tmp_path), scenario],
+        cwd=Path(__file__).resolve().parents[1],
+        capture_output=True,
+        text=True,
+        timeout=90,
+        env={**os.environ, "PINKY_SHARED_MCP": "0"},
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+
+
+def _probe(path):
+    # Reuse the independent probe from the RED subprocess scenario, not the
+    # implementation under test.
+    namespace = {}
+    exec(_SCENARIO.split("async def run():")[0], namespace)
+    import json
+
+    return json.loads(namespace["child"](namespace["PROBE"], path))
+
+
+@pytest.mark.parametrize("kind", ["bearer", "signer"])
+def test_identity_store_permissions_and_locks(tmp_path, kind):
+    from pinky_identity.bearer_tokens import BearerTokenStore
+    from pinky_identity.keystore import DeviceKey
+    from pinky_identity.signer_store import EncryptedSignerStore
+
+    path = tmp_path / "identity.db"
+    kwargs = {"db_path": path}
+    cls = BearerTokenStore
+    if kind == "signer":
+        cls = EncryptedSignerStore
+        kwargs["device_key"] = DeviceKey.from_bytes(bytes(range(32)))
+    with cls(**kwargs):
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+        for suffix in ("", "-wal", "-shm"):
+            assert Path(str(path) + suffix).stat().st_mode & 0o777 == 0o600
+
+
+def test_hardening_refuses_registered_main_sidecars_and_aliases(tmp_path, monkeypatch):
+    from pinky_daemon.store_catalog import BoundSQLiteFile, DaemonStoreCatalog
+    from pinky_daemon.task_store import TaskStore
+    from pinky_identity.fs_security import harden_secret_file
+    from pinky_identity.live_sqlite import LiveSQLiteFileError
+
+    path = tmp_path / "tasks.db"
+    catalog = DaemonStoreCatalog(expected_root=tmp_path)
+    store = TaskStore(str(path), catalog=catalog)
+    aliases = []
+    for suffix in ("", "-wal", "-shm"):
+        alias = tmp_path / ("alias" + suffix)
+        os.link(str(path) + suffix, alias)
+        aliases.append(alias)
+    try:
+        with monkeypatch.context() as patch:
+
+            def forbidden(*args, **kwargs):
+                pytest.fail("guard opened a registered inode")
+
+            patch.setattr(os, "open", forbidden)
+            for target in [path, *aliases]:
+                with pytest.raises(LiveSQLiteFileError):
+                    harden_secret_file(target)
+                with pytest.raises(LiveSQLiteFileError):
+                    BoundSQLiteFile.open(target)
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    finally:
+        store.close()
+        catalog.close()
+    # Explicit close removes registration so offline hardening works again.
+    harden_secret_file(path)
+
+
+@pytest.mark.parametrize("existing", [False, True])
+def test_update_preflight_preserves_locks_and_checks_authority(tmp_path, existing):
+    import sqlite3
+
+    from pinky_daemon.store_catalog import (
+        DaemonStoreCatalog,
+        StoreIntegrityTarget,
+        StorePathAuthorityError,
+    )
+    from pinky_daemon.task_store import TaskStore
+
+    path = tmp_path / "tasks.db"
+    if existing:
+        with sqlite3.connect(path) as seed:
+            seed.execute("PRAGMA journal_mode=WAL")
+            seed.execute("CREATE TABLE seed(value)")
+        seed.close()
+    target = StoreIntegrityTarget("tasks", str(path), journal_mode="wal")
+    catalog = DaemonStoreCatalog(expected_root=tmp_path, manifest={"tasks": target})
+    catalog.preflight_integrity([target])
+    store = TaskStore(str(path), catalog=catalog)
+    try:
+        catalog.preflight_ancestor_chains()
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+        original_mode = tmp_path.stat().st_mode & 0o777
+        tmp_path.chmod(0o777)
+        try:
+            with pytest.raises(StorePathAuthorityError):
+                catalog.preflight_ancestor_chains()
+        finally:
+            tmp_path.chmod(original_mode)
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    finally:
+        store.close()
+        catalog.close()
+
+
+def test_missing_locks_log_critical_and_mark_health(tmp_path, caplog):
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+    from pinky_daemon.task_store import TaskStore
+
+    path = tmp_path / "tasks.db"
+    store = TaskStore(str(path))
+    try:
+        assert check_sqlite_locks([("tasks", str(path))])["healthy"]
+        os.close(os.open(path, os.O_RDONLY))
+        os.close(os.open(str(path) + "-shm", os.O_RDONLY))
+        health = check_sqlite_locks([("tasks", str(path))])
+        assert health == {"healthy": False, "checked": 1, "missing": ["tasks:SHARED", "tasks:DMS"]}
+        critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
+        assert len(critical) == 1 and "tasks" in critical[0].message
+    finally:
+        store.close()
+
+
+@pytest.mark.parametrize("failure", ["timeout", "exit"])
+def test_permission_child_failure_is_nonfatal(tmp_path, monkeypatch, caplog, failure):
+    from pinky_daemon import db_security
+
+    error = (
+        subprocess.TimeoutExpired("child", 1)
+        if failure == "timeout"
+        else subprocess.CalledProcessError(1, "child")
+    )
+
+    def fail(*args, **kwargs):
+        assert kwargs["timeout"] > 0
+        raise error
+
+    monkeypatch.setattr(subprocess, "run", fail)
+    assert db_security.sweep_db_permissions_in_child(tmp_path) is False
+    assert "permission sweep failed" in caplog.text
+
+
+@pytest.mark.parametrize("route", ["document", "photo", "video", "animation"])
+@pytest.mark.parametrize("suffix", [".db", ".db-wal", ".db-shm", ".db-journal", "alias"])
+async def test_broker_refuses_database_without_open(tmp_path, monkeypatch, route, suffix):
+    import builtins
+
+    from starlette.requests import Request
+
+    from pinky_daemon import api
+
+    monkeypatch.chdir(tmp_path)
+    app = api.create_api(db_path=str(tmp_path / "conversations.db"))
+    path = tmp_path / ("attachment" + suffix)
+    if suffix == "alias":
+        record = next(r for r in app.state.store_catalog.snapshot() if r.logical_name == "tasks")
+        os.link(record.resolved_path, path)
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("broker opened a database attachment")
+
+    try:
+        with monkeypatch.context() as patch:
+            patch.setattr(builtins, "open", forbidden)
+            patch.setattr(os, "open", forbidden)
+            # Exercise the route itself without external transport or auth setup.
+            endpoint = next(
+                r.endpoint for r in app.routes if getattr(r, "path", "") == "/broker/send-" + route
+            )
+            from fastapi import HTTPException
+
+            with pytest.raises(HTTPException) as error:
+                await endpoint(
+                    {"agent_name": "test", "chat_id": "123", "file_path": str(path)},
+                    Request({"type": "http", "headers": []}),
+                )
+            assert error.value.status_code == 400
+            assert "SQLite" in error.value.detail
+    finally:
+        app.state.store_catalog.shutdown(deadline_seconds=5)
+
+
+async def test_boot_lock_health_is_exposed(tmp_path, monkeypatch):
+    from pinky_daemon import api
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    app = api.create_api(db_path=str(tmp_path / "conversations.db"))
+    async with app.router.lifespan_context(app):
+        endpoint = next(
+            r.endpoint for r in app.routes if getattr(r, "path", "") == "/system/health"
+        )
+        status = await endpoint()
+        assert status["sqlite_locks"]["healthy"] is True
+        assert status["sqlite_locks"]["checked"] >= 2
+
+
+async def test_boot_reports_dropped_locks_on_health_surface(tmp_path, monkeypatch, caplog):
+    from pinky_daemon import api, db_security
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    app = api.create_api(db_path=str(tmp_path / "conversations.db"))
+    path = next(
+        r.resolved_path for r in app.state.store_catalog.snapshot() if r.logical_name == "tasks"
+    )
+    sweep = db_security.sweep_db_permissions_in_child
+
+    def drop_after_sweep(root):
+        result = sweep(root)
+        os.close(os.open(path, os.O_RDONLY))
+        os.close(os.open(path + "-shm", os.O_RDONLY))
+        return result
+
+    monkeypatch.setattr(db_security, "sweep_db_permissions_in_child", drop_after_sweep)
+    async with app.router.lifespan_context(app):
+        endpoint = next(
+            r.endpoint for r in app.routes if getattr(r, "path", "") == "/system/health"
+        )
+        health = (await endpoint())["sqlite_locks"]
+        assert health["healthy"] is False
+        assert {"tasks:SHARED", "tasks:DMS"} <= set(health["missing"])
+        critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
+        assert len(critical) == 1 and "tasks" in critical[0].message
+
+
+def test_entry_point_preserves_process_creation_mode_before_configuration(monkeypatch):
+    from pinky_daemon import __main__ as entry
+
+    class StopBeforeLaunchError(Exception):
+        pass
+
+    def configuration():
+        assert os.umask(0o022) == 0o022
+        raise StopBeforeLaunchError
+
+    previous = os.umask(0o022)
+    try:
+        monkeypatch.setattr(entry, "_install_faulthandler", lambda: None)
+        monkeypatch.setattr(entry, "_load_dotenv", configuration)
+        with pytest.raises(StopBeforeLaunchError):
+            entry.main()
+    finally:
+        os.umask(previous)
+
+
+@pytest.mark.parametrize("kind", ["bearer", "signer", "catalog"])
+def test_unfinished_cursor_keeps_registry_and_locks_after_close(tmp_path, kind):
+    import gc
+
+    from pinky_daemon.store_catalog import DaemonStoreCatalog
+    from pinky_daemon.task_store import TaskStore
+    from pinky_identity.bearer_tokens import BearerTokenStore
+    from pinky_identity.fs_security import harden_secret_file
+    from pinky_identity.keystore import DeviceKey
+    from pinky_identity.live_sqlite import LiveSQLiteFileError
+    from pinky_identity.signer_store import EncryptedSignerStore
+
+    path = tmp_path / "store.db"
+    catalog = DaemonStoreCatalog(expected_root=tmp_path)
+
+    def make():
+        if kind == "bearer":
+            return BearerTokenStore(db_path=path)
+        if kind == "signer":
+            return EncryptedSignerStore(db_path=path, device_key=DeviceKey.from_bytes(bytes(32)))
+        return TaskStore(str(path), catalog=catalog)
+
+    store = make()
+    store._db.execute("CREATE TABLE cursor_probe(value)")
+    store._db.executemany("INSERT INTO cursor_probe VALUES (?)", [(1,), (2,), (3,)])
+    store._db.commit()
+    cursor = store._db.execute("SELECT * FROM cursor_probe")
+    assert cursor.fetchone()[0] == 1
+    store.close()
+    with pytest.raises(LiveSQLiteFileError):
+        harden_secret_file(path)
+    assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    replacement = make()
+    try:
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+        cursor = None
+        gc.collect()
+        replacement._db.execute("INSERT INTO cursor_probe VALUES (4)")
+        replacement._db.commit()
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+    finally:
+        cursor = None
+        gc.collect()
+        replacement.close()
+        catalog.close()
+    harden_secret_file(path)
+
+
+def test_existing_identity_database_is_never_raw_opened(tmp_path, monkeypatch):
+    from pinky_identity.bearer_tokens import BearerTokenStore
+
+    path = tmp_path / "existing.db"
+    with BearerTokenStore(db_path=path):
+        pass
+
+    def forbidden(*args, **kwargs):
+        pytest.fail("raw open attempted on existing identity database")
+
+    monkeypatch.setattr(os, "open", forbidden)
+    with BearerTokenStore(db_path=path):
+        pass
+
+
+@pytest.mark.parametrize("drop_local_locks", [False, True])
+def test_external_reader_does_not_mask_linux_lock_loss_or_make_macos_false_red(
+    tmp_path,
+    caplog,
+    drop_local_locks,
+):
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+    from pinky_identity.bearer_tokens import BearerTokenStore
+
+    path = tmp_path / "shared.db"
+    code = """
+import sqlite3, sys
+c = sqlite3.connect(sys.argv[1])
+c.execute('PRAGMA journal_mode=WAL')
+c.execute('CREATE TABLE seed(value)')
+c.commit()
+print('ready', flush=True)
+sys.stdin.readline()
+c.close()
+"""
+    peer = subprocess.Popen(
+        [sys.executable, "-c", code, str(path)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        text=True,
+    )
+    store = None
+    try:
+        assert peer.stdout.readline().strip() == "ready"
+        store = BearerTokenStore(db_path=path)
+        if drop_local_locks:
+            for suffix in ("", "-shm"):
+                os.close(os.open(str(path) + suffix, os.O_RDONLY))
+        health = check_sqlite_locks([("identity", str(path))])
+        if sys.platform == "linux":
+            assert health["healthy"] is (not drop_local_locks)
+            if drop_local_locks:
+                assert health["missing"] == ["identity:SHARED", "identity:DMS"]
+        else:
+            assert health["healthy"] is None
+            assert health["inconclusive"] == ["identity:SHARED", "identity:DMS"]
+            assert not any(r.levelname == "CRITICAL" for r in caplog.records)
+        peer.communicate("\n", timeout=10)
+        if not drop_local_locks:
+            # The local handle did not change; with the peer gone, its locks
+            # become observable through F_GETLK as well.
+            assert check_sqlite_locks([("identity", str(path))])["healthy"] is True
+    finally:
+        if peer.poll() is None:
+            peer.communicate("\n", timeout=10)
+        if store is not None:
+            store.close()
+
+
+async def test_inconclusive_boot_schedules_recheck_and_cancels_on_shutdown(tmp_path, monkeypatch):
+    from pinky_daemon import api, sqlite_lock_check
+
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setattr(api, "SHARED_MCP_ENABLED", False)
+    monkeypatch.setattr(
+        sqlite_lock_check,
+        "check_sqlite_locks",
+        lambda stores: {
+            "healthy": None,
+            "checked": len(stores),
+            "missing": [],
+            "inconclusive": ["tasks:DMS"],
+        },
+    )
+    app = api.create_api(db_path=str(tmp_path / "conversations.db"))
+    async with app.router.lifespan_context(app):
+        task = app.state.sqlite_lock_recheck_task
+        assert not task.done()
+        assert app.state.sqlite_lock_health["healthy"] is None
+    assert task.cancelled()
+
+
+def test_failed_probe_is_inconclusive_not_a_proven_lock_loss(monkeypatch, caplog):
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+
+    def timeout(*args, **kwargs):
+        raise subprocess.TimeoutExpired("probe", 10)
+
+    monkeypatch.setattr(subprocess, "run", timeout)
+    status = check_sqlite_locks([("tasks", "/unused/tasks.db")])
+    assert status["healthy"] is None
+    assert status["missing"] == []
+    assert "TimeoutExpired" in status["error"]
+    assert not any(record.levelname == "CRITICAL" for record in caplog.records)
+
+
+@pytest.mark.parametrize("kind", ["bearer", "signer"])
+@pytest.mark.parametrize("mode", [0o644, 0o666])
+def test_standalone_existing_identity_modes_are_repaired_in_child(tmp_path, kind, mode):
+    from pinky_identity.bearer_tokens import BearerTokenStore
+    from pinky_identity.keystore import DeviceKey
+    from pinky_identity.signer_store import EncryptedSignerStore
+
+    path = tmp_path / "existing.db"
+    path.touch(mode=mode)
+    path.chmod(mode)
+    cls, kwargs = BearerTokenStore, {"db_path": path}
+    if kind == "signer":
+        cls = EncryptedSignerStore
+        kwargs["device_key"] = DeviceKey.from_bytes(bytes(32))
+    with cls(**kwargs):
+        for suffix in ("", "-wal", "-shm"):
+            assert Path(str(path) + suffix).stat().st_mode & 0o777 == 0o600
+        assert _probe(path) == [[True, os.getpid()], [True, os.getpid()]]
+
+
+async def test_probe_backoff_logs_only_transitions(monkeypatch, caplog):
+    import json
+    import logging
+    from types import SimpleNamespace
+
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks, recheck_sqlite_locks
+
+    caplog.set_level(logging.INFO, logger="pinky.storage")
+    calls = 0
+
+    def probe(*args, **kwargs):
+        nonlocal calls
+        calls += 1
+        uncertain = calls <= 7
+        return SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "missing": [],
+                    "inconclusive": ["tasks:DMS"] if uncertain else [],
+                    "reason": "foreign_owner",
+                }
+            )
+        )
+
+    monkeypatch.setattr(subprocess, "run", probe)
+    stores = [("tasks", "/unused/tasks.db")]
+    status = check_sqlite_locks(stores)
+    delays, published = [], []
+
+    async def sleep(delay):
+        delays.append(delay)
+
+    final = await recheck_sqlite_locks(lambda: stores, published.append, status, sleep=sleep)
+    assert delays == [30, 60, 120, 240, 480, 600, 600]
+    assert final["healthy"] is True
+    warnings = [r for r in caplog.records if r.levelname == "WARNING"]
+    assert len(warnings) == 1 and "tasks:DMS" in warnings[0].message
+    assert len([r for r in caplog.records if "resolved" in r.message]) == 1
+    assert len(published) == 7
+
+
+async def test_linux_device_mismatch_is_structural_inconclusive(tmp_path, monkeypatch):
+    from pinky_daemon.sqlite_lock_check import _probe_linux, recheck_sqlite_locks
+
+    path = tmp_path / "database.db"
+    lines = []
+    for suffix, start, end in (("", 1073741826, 1073742335), ("-shm", 128, 128)):
+        file = Path(str(path) + suffix)
+        file.touch()
+        info = file.stat()
+        dev = f"{os.major(info.st_dev) + 1:x}:{os.minor(info.st_dev):x}:{info.st_ino}"
+        lines.append(f"1: POSIX ADVISORY READ {os.getpid()} {dev} {start} {end}")
+    monkeypatch.setattr(Path, "read_text", lambda *args, **kwargs: "\n".join(lines))
+    result = _probe_linux([("tasks", str(path))], os.getpid())
+    assert result == {
+        "missing": [],
+        "inconclusive": ["tasks:SHARED", "tasks:DMS"],
+        "reason": "device_mismatch",
+    }
+
+    async def forbidden(delay):
+        pytest.fail("structural device mismatch must not schedule a retry")
+
+    status = {"healthy": None, **result}
+    assert await recheck_sqlite_locks(lambda: [], lambda _: None, status, sleep=forbidden) == status
+
+
+def test_changed_probe_result_logs_missing_once(monkeypatch, caplog):
+    import json
+    from types import SimpleNamespace
+
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+
+    monkeypatch.setattr(
+        subprocess,
+        "run",
+        lambda *args, **kwargs: SimpleNamespace(
+            stdout=json.dumps(
+                {
+                    "missing": ["tasks:DMS"],
+                    "inconclusive": [],
+                }
+            )
+        ),
+    )
+    previous = {"healthy": None, "reason": "foreign_owner", "missing": []}
+    status = check_sqlite_locks([("tasks", "/unused")], previous=previous)
+    check_sqlite_locks([("tasks", "/unused")], previous=status)
+    critical = [r for r in caplog.records if r.levelname == "CRITICAL"]
+    assert len(critical) == 1 and "tasks:DMS" in critical[0].message
+
+
+def test_child_sweep_uses_exit_status_and_initial_healthy_check_logs_once(tmp_path, caplog):
+    import logging
+
+    from pinky_daemon.db_security import sweep_db_permissions_in_child
+    from pinky_daemon.sqlite_lock_check import check_sqlite_locks
+
+    caplog.set_level(logging.INFO)
+    assert sweep_db_permissions_in_child(tmp_path) is True
+    assert "SQLite permission sweep completed in child process" in caplog.text
+    command = [sys.executable, "-m", "pinky_daemon.db_security", str(tmp_path)]
+    result = subprocess.run(command, check=True, capture_output=True, text=True)
+    assert result.stdout == ""
+    healthy = check_sqlite_locks([])
+    assert healthy["healthy"] is True
+    check_sqlite_locks([], previous=healthy)
+    assert sum("SQLite lock self-check healthy: checked=0" in r.message
+               for r in caplog.records) == 1

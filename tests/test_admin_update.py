@@ -55,7 +55,7 @@ def _make_private_client(tmp_path: Path, *, seed_wal: bool = False) -> tuple[Tes
     data_dir.chmod(0o700)
     db_path = data_dir / "conversations.db"
     if seed_wal:
-        connection = sqlite3.connect(db_path)
+        connection = sqlite3.connect(data_dir / "conversations_sessions.db")
         try:
             assert connection.execute("PRAGMA journal_mode=wal").fetchone() == ("wal",)
             connection.execute("CREATE TABLE seed (value TEXT NOT NULL)")
@@ -340,20 +340,10 @@ class TestAdminUpdateStoragePreflight:
         assert fleet_catalog._verified_daemon_owned_path.__func__ is shared_verifier
         assert any(call_phase == "boot" for call_phase, _catalog, _path in calls)
 
-        present_wal_targets = 0
-        for target in fleet_catalog.configured_integrity_targets():
-            raw_path = os.fspath(target.path)
-            if fleet_catalog._is_memory_path(raw_path):
-                continue
-            try:
-                bound_file = BoundSQLiteFile.open(os.path.abspath(raw_path))
-            except FileNotFoundError:
-                continue
-            try:
-                if bound_file.header_journal_mode() == "wal":
-                    present_wal_targets += 1
-            finally:
-                bound_file.close()
+        # Count registered WAL stores without reopening their live inodes.
+        present_wal_targets = sum(
+            record.journal_mode == "wal" for record in fleet_catalog.snapshot()
+        )
 
         tenant_root = data_dir / "tenant"
         tenant_root.mkdir(mode=0o700)
