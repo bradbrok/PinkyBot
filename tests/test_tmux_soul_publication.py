@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import sqlite3
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import httpx
 import pytest
 from fastapi.testclient import TestClient
 
@@ -75,8 +77,16 @@ def launch(tmp_path, monkeypatch):
     monkeypatch.setattr(tmux_session, "_async_sleep", AsyncMock())
     client = TestClient(app)
 
+    async def request():
+        # Keep requests on the store-owning thread, as in the daemon event loop.
+        async with httpx.AsyncClient(
+            transport=httpx.ASGITransport(app=app), base_url="http://testserver",
+            cookies=client.cookies,
+        ) as http:
+            return await http.post("/agents/test-agent/streaming-sessions")
+
     def run():
-        response = client.post("/agents/test-agent/streaming-sessions")
+        response = asyncio.run(request())
         assert response.status_code == 200, response.text
         assert len(launched) == 1
 
@@ -101,16 +111,19 @@ def test_missing_prompt_published_before_process(launch, caplog, isolation):
     versions = launch.registry.get_soul_versions("test-agent")
     assert len(versions) == 1
     assert versions[0]["source"] == "spawn"
-    assert versions[0]["content"] == content
+    assert launch.registry.get_soul_version("test-agent", versions[0]["id"])["content"] == content
     assert [r.message for r in caplog.records if "published missing CLAUDE.md" in r.message] == [
         f"published missing CLAUDE.md for test-agent ({len(content)} chars)"
     ]
 
 
-def test_existing_prompt_is_byte_identical_without_version(launch):
+def test_existing_prompt_is_byte_identical_without_version(launch, monkeypatch):
     path = launch.work / "CLAUDE.md"
     original = b"User-owned prompt\r\n\xff\x00"
     path.write_bytes(original)
+    monkeypatch.setattr(
+        launch.registry, "build_system_prompt", MagicMock(side_effect=AssertionError("must not compile"))
+    )
     launch.run()
     assert path.read_bytes() == original
     assert launch.registry.get_soul_versions("test-agent") == []
@@ -211,3 +224,22 @@ def test_publish_opens_no_sqlite_connection(launch, monkeypatch):
     launch.run()
     assert (launch.work / "CLAUDE.md").is_file()
     assert checked == [0]
+
+
+def test_retained_session_republishes_fresh_prompt_only_when_missing(launch):
+    launch.run()
+    session = launch.sessions[0]
+    original = (launch.work / "CLAUDE.md").read_bytes()
+    launch.registry.update("test-agent", soul="Updated fixture soul")
+    versions_before = launch.registry.get_soul_versions("test-agent")
+    asyncio.run(session.connect())
+    assert launch.launched == [original, original]
+    assert launch.registry.get_soul_versions("test-agent") == versions_before
+    (launch.work / "CLAUDE.md").unlink()
+    asyncio.run(session.connect())
+    content = (launch.work / "CLAUDE.md").read_bytes()
+    assert b"Updated fixture soul" in content
+    assert launch.launched[-1] == content
+    versions = launch.registry.get_soul_versions("test-agent")
+    assert len(versions) == len(versions_before) + 1
+    assert versions[0]["source"] == "spawn"

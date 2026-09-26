@@ -157,9 +157,15 @@ def replace_agent_text(
     agent_dir: str | Path,
     path: str | Path,
     content: str,
+    *,
+    create_only: bool = False,
 ) -> Path:
-    """Atomically replace one contained agent file without following links."""
-    target = resolve_agent_path(agent_name, agent_dir, path)
+    """Publish a contained file; create-only refuses even dangling leaf links."""
+    if create_only:
+        requested = Path(path)
+        target = resolve_agent_path(agent_name, agent_dir, requested.parent) / requested.name
+    else:
+        target = resolve_agent_path(agent_name, agent_dir, path)
     target.parent.mkdir(parents=True, exist_ok=True)
     fd, temp_name = tempfile.mkstemp(prefix=f".{target.name}.", dir=target.parent)
     temp_path = Path(temp_name)
@@ -168,10 +174,14 @@ def replace_agent_text(
             stream.write(content)
             stream.flush()
             os.fsync(stream.fileno())
-        os.replace(temp_path, target)
-    except Exception:
+        if create_only:
+            # Same-directory hard-link publication is atomic and fails with
+            # EEXIST if any concurrent creator has claimed the destination.
+            os.link(temp_path, target, follow_symlinks=False)
+        else:
+            os.replace(temp_path, target)
+    finally:
         temp_path.unlink(missing_ok=True)
-        raise
     return target
 
 
@@ -4762,7 +4772,8 @@ except Exception as exc:
         return cursor.rowcount > 0
 
     def build_system_prompt(
-        self, agent_name: str, skill_store=None, effort: str | None = None
+        self, agent_name: str, skill_store=None, effort: str | None = None,
+        *, user_profile_store=None,
     ) -> str:
         """Build a complete system prompt from agent config + directives + skill directives.
 
@@ -4775,6 +4786,9 @@ except Exception as exc:
         it is the ``ultracode`` tier (#151), the ULTRACODE_DIRECTIVE section
         is injected so workflow-by-default orchestration holds regardless of
         CLI version. Defaults to the agent's persistent ``thinking_effort``.
+
+        ``user_profile_store`` lets daemon callers reuse their owned store;
+        callers that omit it retain the standalone profile-store behavior.
 
         All content is scanned for prompt injection / exfiltration threats
         before inclusion. Threats are logged and the offending section is
@@ -4878,7 +4892,7 @@ except Exception as exc:
         # Inject learned user profiles (from dream consolidation)
         try:
             from pinky_daemon.user_profile_store import UserProfileStore
-            profile_store = UserProfileStore()
+            profile_store = user_profile_store if user_profile_store is not None else UserProfileStore()
             known_users = profile_store.get_all_users()
             profile_sections = []
             for uid in known_users:

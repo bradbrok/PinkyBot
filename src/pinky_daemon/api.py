@@ -4169,7 +4169,10 @@ def create_api(
             mcp_servers=codex_mcp_servers,
             permission_mode=agent.permission_mode or "bypassPermissions",
             max_turns=agent.max_turns,
-            system_prompt=agents.build_system_prompt(agent_name, skill_store=skills),
+            # Claude tmux reads CLAUDE.md. Compile at the final spawn hook so
+            # a missing-file publication failure cannot abort preparation.
+            system_prompt=("" if is_tmux else
+                           agents.build_system_prompt(agent_name, skill_store=skills)),
             resume_handle=resume_id,
             # commit=False here: the connect-time rebuild via
             # ``wake_context_builder`` is the delivered (committed) build
@@ -4230,6 +4233,8 @@ def create_api(
             init_kwargs["auth_success_callback"] = _on_auth_success
         if is_codex or is_tmux:
             init_kwargs["stream_event_callback"] = await _make_streaming_event_callback(agent_name, label)
+        if is_tmux:
+            init_kwargs["prepare_spawn_callback"] = lambda: _publish_missing_claude_prompt(agent_name)
 
         ss = SessionClass(config, **init_kwargs)
         ss._launch_runtime = runtime
@@ -7382,7 +7387,7 @@ npm run build</pre>
                 {"code": "agent_path_outside_workspace"},
             ) from exc
 
-    def _write_agent_text(agent, path: Path, content: str) -> Path:
+    def _write_agent_text(agent, path: Path, content: str, *, create_only: bool = False) -> Path:
         """Atomically replace an agent-owned text file without following links."""
         try:
             return replace_agent_text(
@@ -7390,12 +7395,48 @@ npm run build</pre>
                 agent.working_dir,
                 path,
                 content,
+                **({"create_only": True} if create_only else {}),
             )
+        except FileExistsError as exc:
+            if create_only:
+                raise
+            raise HTTPException(400, {"code": "agent_path_outside_workspace"}) from exc
         except (AgentPathContainmentError, OSError, RuntimeError, ValueError) as exc:
             raise HTTPException(
                 400,
                 {"code": "agent_path_outside_workspace"},
             ) from exc
+
+    def _publish_missing_claude_prompt(agent_name: str) -> None:
+        logger = logging.getLogger(__name__)
+        try:
+            agent = agents.get(agent_name)
+            if agent is None:
+                raise ValueError("agent no longer registered")
+            path = Path(agent.working_dir) / "CLAUDE.md"
+            try:
+                path.lstat()
+            except FileNotFoundError:
+                pass
+            else:
+                return
+            if agent.isolation_mode == "unix_user":
+                logger.warning(
+                    "skipped missing CLAUDE.md for %s: unix_user ownership is unsupported",
+                    agent_name,
+                )
+                return
+            prompt = agents.build_system_prompt(
+                agent_name, skill_store=skills, user_profile_store=user_profiles,
+            )
+            try:
+                _write_agent_text(agent, path, prompt, create_only=True)
+            except FileExistsError:
+                return  # Another publisher won; never modify its file or version it.
+            agents.save_soul_version(agent_name, prompt, source="spawn")
+            logger.info("published missing CLAUDE.md for %s (%d chars)", agent_name, len(prompt))
+        except Exception as exc:
+            logger.warning("could not publish missing CLAUDE.md for %s: %s", agent_name, exc)
 
     registration_managed_dirs = ("data", "output", "workspace", ".claude")
     registration_managed_files = (
