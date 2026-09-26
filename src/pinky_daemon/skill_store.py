@@ -44,23 +44,43 @@ def skill_text_hash(description: str, directive: str) -> str:
     return hashlib.sha256((description + "\n" + directive).encode("utf-8")).hexdigest()
 
 
-def newest_change_line(directive: str) -> str:
-    """Return the first bullet under a ``## Changes`` heading, or ``""``.
+CHANGE_LINE_MAX = 300
 
-    SKILL.md change logs list the newest entry first as ``- <date>: <what>``;
-    blank lines after the heading are skipped and the section ends at the
+
+def change_bullets(directive: str) -> list[str]:
+    """Return the bullets under a ``## Changes`` heading, in file order.
+
+    Blank lines after the heading are skipped and the section ends at the
     next ``#`` heading.
     """
+    bullets: list[str] = []
     in_changes = False
     for raw in (directive or "").splitlines():
         line = raw.strip()
         if line.startswith("#"):
             if in_changes:
-                return ""
+                break
             in_changes = line.lstrip("#").strip().lower() == "changes"
             continue
         if in_changes and line.startswith("- "):
-            return line[2:].strip()
+            bullets.append(line[2:].strip())
+    return bullets
+
+
+def new_change_line(before: str, after: str) -> str:
+    """Return the first Changes bullet in ``after`` that ``before`` lacks, or ``""``.
+
+    Change logs are ordered newest first in some skills and oldest first in
+    others, so the entry is found by difference rather than by position. An
+    edit that adds no entry returns ``""``. The line is capped at
+    ``CHANGE_LINE_MAX`` characters.
+    """
+    old = set(change_bullets(before))
+    for bullet in change_bullets(after):
+        if bullet not in old:
+            if len(bullet) > CHANGE_LINE_MAX:
+                return bullet[: CHANGE_LINE_MAX - 3].rstrip() + "..."
+            return bullet
     return ""
 
 

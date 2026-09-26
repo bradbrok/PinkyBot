@@ -7033,43 +7033,54 @@ npm run build</pre>
 
     _skill_notice_tasks: set[asyncio.Task] = set()
 
-    async def _send_skill_change_notices(skill_name: str, directive: str) -> None:
-        """Tell every live owner session that a skill's text changed (board 5as).
+    async def _send_skill_change_notices(changes: list[tuple[str, str, str]]) -> None:
+        """Tell each live agent session whose skills changed text, one message per agent.
 
-        Owners are the agents the skill applies to (direct assignment or
-        shared). A session that is not live gets nothing: it reads the
-        current catalog copy the next time it loads the skill.
+        An agent is told about a skill only when the skill is effectively on
+        for it (direct assignment or shared, minus opt outs and globally
+        disabled skills). A session that is not live gets nothing: it reads
+        the current catalog copy the next time it loads the skill.
         """
-        from pinky_daemon.skill_store import newest_change_line
+        from pinky_daemon.skill_store import new_change_line
 
-        line = newest_change_line(directive)
-        text = (
-            f"[skill changed] The skill '{skill_name}' was updated. "
-            + (f"Newest change: {line} " if line else "")
-            + f"The copy in your context is out of date: reload it with "
-            f"load_skill('{skill_name}') before you next use it."
-        )
         for agent in agents.list(enabled_only=True):
             try:
-                if not skills.is_assigned(agent.name, skill_name):
+                effective = {
+                    row["name"] for row in skills.get_agent_skills(agent.name, enabled_only=True)
+                }
+                mine = [c for c in changes if c[0] in effective]
+                if not mine:
                     continue
+                parts = []
+                for name, before, after in mine:
+                    line = new_change_line(before, after)
+                    parts.append(
+                        f"'{name}'" + (f' (its change log adds: "{line}")' if line else "")
+                    )
+                names = ", ".join(f"load_skill('{name}')" for name, _, _ in mine)
+                text = (
+                    "[skill changed] The catalog text of "
+                    + ("this skill" if len(mine) == 1 else "these skills")
+                    + " was updated: " + "; ".join(parts) + ". The copy in your context is "
+                    f"out of date: reload with {names} before you next use it."
+                )
                 result = await broker.inject_agent_message("system", agent.name, text)
                 _log(
-                    f"skills: change notice {skill_name} -> {agent.name} "
+                    f"skills: change notice {[c[0] for c in mine]} -> {agent.name} "
                     f"delivered={result.delivered}"
                 )
             except Exception as exc:  # noqa: BLE001
                 _log(
-                    f"skills: change notice {skill_name} -> {agent.name} failed: "
+                    f"skills: change notice -> {agent.name} failed: "
                     f"{type(exc).__name__}: {exc}"
                 )
 
-    def _on_skill_text_changed(skill_name: str, directive: str) -> None:
+    def _on_skill_text_changed(changes: list[tuple[str, str, str]]) -> None:
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             return
-        task = loop.create_task(_send_skill_change_notices(skill_name, directive))
+        task = loop.create_task(_send_skill_change_notices(changes))
         _skill_notice_tasks.add(task)
         task.add_done_callback(_skill_notice_tasks.discard)
 

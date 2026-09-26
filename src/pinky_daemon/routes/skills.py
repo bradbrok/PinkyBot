@@ -48,7 +48,7 @@ _agents: Any = None
 _manager: Any = None
 _pinky_root: Path | None = None
 _log: Callable[[str], None] | None = None
-_on_text_changed: Callable[[str, str], None] | None = None
+_on_text_changed: Callable[[list[tuple[str, str, str]]], None] | None = None
 
 
 def set_dependencies(
@@ -59,7 +59,7 @@ def set_dependencies(
     manager,
     pinky_root: Path,
     log: Callable[[str], None],
-    on_text_changed: Callable[[str, str], None] | None = None,
+    on_text_changed: Callable[[list[tuple[str, str, str]]], None] | None = None,
 ) -> None:
     """Wire shared instances and helpers for the skills router."""
     global _skills, _plugins, _agents, _manager, _pinky_root, _log, _on_text_changed
@@ -72,23 +72,33 @@ def set_dependencies(
     _on_text_changed = on_text_changed
 
 
-def _notify_text_changed(before, after) -> None:
-    """Tell the owners of a skill that its text changed (board 5as).
-
-    Called after a successful ``refresh_text``; a no-op refresh (same hash)
-    notifies nobody. The hook must never fail the refresh itself.
-    """
-    if _on_text_changed is None or after is None:
-        return
+def _text_change(before, after) -> tuple[str, str, str] | None:
+    """``(name, old directive, new directive)`` when the text hash moved, else ``None``."""
+    if before is None or after is None:
+        return None
     if skill_text_hash(before.description, before.directive) == skill_text_hash(
         after.description, after.directive
     ):
+        return None
+    return (after.name, before.directive, after.directive)
+
+
+def _notify_text_changed(changes) -> None:
+    """Tell the owners of the changed skills, once per request.
+
+    ``changes`` holds ``_text_change`` results; ``None`` entries (no-op
+    refreshes) are dropped and an empty list notifies nobody. The hook must
+    never fail the request itself.
+    """
+    changes = [c for c in changes if c]
+    if _on_text_changed is None or not changes:
         return
     try:
-        _on_text_changed(after.name, after.directive)
+        _on_text_changed(changes)
     except Exception as exc:  # noqa: BLE001
         if _log:
-            _log(f"skills: text change notice for {after.name} failed: {type(exc).__name__}: {exc}")
+            names = ", ".join(c[0] for c in changes)
+            _log(f"skills: text change notice for {names} failed: {type(exc).__name__}: {exc}")
 
 
 def _reject_if_core(name: str, action: str) -> None:
@@ -299,7 +309,7 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
             directive=req.directive if req.directive is not None else existing.directive,
             actor=internal_caller, path="put", approval_ref=req.approval_ref,
         )
-        _notify_text_changed(existing, skill)
+        _notify_text_changed([_text_change(existing, skill)])
         return skill.to_dict()
     if not internal_caller and text_changed and changed_fields <= {"description", "directive"}:
         skill = _skills.refresh_text(
@@ -308,7 +318,7 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
             directive=req.directive if req.directive is not None else existing.directive,
             actor="user", path="put", approval_ref=req.approval_ref or "",
         )
-        _notify_text_changed(existing, skill)
+        _notify_text_changed([_text_change(existing, skill)])
         return skill.to_dict()
     _reject_agent_catalog_overwrite(name, internal_caller)
     skill_type = req.skill_type if req.skill_type is not None else existing.skill_type
@@ -358,6 +368,7 @@ async def update_skill(name: str, req: UpdateSkillRequest, request: Request):
         agent_originated=bool(internal_caller),
         audit=audit,
     )
+    _notify_text_changed([_text_change(existing, skill)])
     return skill.to_dict()
 
 
@@ -779,18 +790,19 @@ async def discover_skills_endpoint(request: Request, req: DiscoverSkillsRequest 
         _skills, [parsed for parsed in found if parsed.name not in excluded],
         overwrite=False, agent_originated=bool(internal_caller), origin_agent=internal_caller,
     )
-    updated = []
+    updated, changes = [], []
     for existing, parsed in refreshes:
         refreshed = _skills.refresh_text(
             existing.name, description=parsed.description, directive=parsed.body,
             actor=internal_caller or "user", path="discover", approval_ref=req.approval_ref,
         )
-        _notify_text_changed(existing, refreshed)
+        changes.append(_text_change(existing, refreshed))
         updated.append({
             "name": existing.name,
             "before_hash": skill_text_hash(existing.description, existing.directive),
             "after_hash": skill_text_hash(refreshed.description, refreshed.directive),
         })
+    _notify_text_changed(changes)
     if req.refresh:
         result.update(updated=updated, refused=refused, unchanged=unchanged)
     return {"discovered": len(found), **result}
