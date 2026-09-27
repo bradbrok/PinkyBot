@@ -278,3 +278,16 @@ async def test_failed_tmux_launch_removes_staged_headers(harness, monkeypatch, r
     assert not result.ok
     assert not secret_files(home, TOKEN)
     assert TOKEN not in "\n".join(logs)
+
+
+@pytest.mark.parametrize("kind", ["tmux", "exec"])
+@pytest.mark.parametrize("build", ["command", "environment"])
+@pytest.mark.parametrize("name", ["api.one", "api name", ""])
+def test_unrepresentable_server_name_refuses_before_launch(harness, monkeypatch, kind, build, name):
+    home, logs = harness
+    s = session(kind, home, monkeypatch, servers={
+        name: {"url": "https://example.test/mcp", "headers": {"Authorization": TOKEN}},
+    })
+    with pytest.raises(ValueError, match="unsupported MCP server name for CLI override"):
+        command(s) if build == "command" else environment(s)
+    assert TOKEN not in "\n".join(logs)
