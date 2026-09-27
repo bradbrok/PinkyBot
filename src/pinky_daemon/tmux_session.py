@@ -11727,7 +11727,7 @@ class TmuxSession(TransportReplacementMixin):
                     owner = getattr(turn.scheduler_accept, "__self__", None)
                     mark_pasted = getattr(owner, "mark_pasted", None)
                     if callable(mark_pasted) and not mark_pasted(
-                        self._scheduler_paste_session_id
+                        self._scheduler_paste_session_id, turn.prompt
                     ):
                         raise RuntimeError("scheduler paste marker refused exact fire")
                     turn.pane_delivery_started = True

@@ -445,6 +445,7 @@ async def test_live_paste_survives_reaper_and_replay(registry, clock):
     assert callable(getattr(registry, "mark_schedule_wake_pasted", None)), "missing write-ahead paste marker"
     assert registry.mark_schedule_wake_pasted(
         pending.schedule_id, pending.fired_at, pasted_at=NOW, session_id="live-session",
+        pasted_prompt=pending.prompt,
     )
     calls = []
 
@@ -550,6 +551,7 @@ async def test_marked_inflight_fire_fences_newer_until_independent_acceptance(re
     assert callable(getattr(registry, 'mark_schedule_wake_pasted', None))
     assert registry.mark_schedule_wake_pasted(
         older.schedule_id, older.fired_at, pasted_at=NOW - 10, session_id='current',
+        pasted_prompt=older.prompt,
     )
     if abandoned:
         registry.abandon_pending_schedule_wake(older.id, reason='RECEIPT_ABANDONED: fixture')

@@ -345,9 +345,10 @@ class ScheduleWakeReceipt:
             writer.failed({"edge": edge, "at": time.time(),
                            "schedule_id": self.schedule_id, "fired_at": self.fired_at}, error)
 
-    def mark_pasted(self, session_id: str) -> bool:
+    def mark_pasted(self, session_id: str, prompt: str) -> bool:
         return self._registry.mark_schedule_wake_pasted(
             self.schedule_id, self.fired_at, pasted_at=time.time(), session_id=session_id,
+            pasted_prompt=prompt,
         )
 
     def accept(self) -> bool:
@@ -2621,9 +2622,7 @@ class AgentScheduler:
             if pending.pasted_at:
                 # A marked physical submission still fences later fires of
                 # its schedule until independent acceptance clears it.
-                if self._wake_prompt_inflight(
-                    pending, prompt=self._wake_prompt_with_recurring_stale_drops(pending)[0]
-                ):
+                if self._persisted_wake_inflight(pending):
                     blocked_schedule_ids.add(pending.schedule_id)
                 continue
             if busy and replay_now < self._busy_deliver_at(pending):
@@ -2631,12 +2630,7 @@ class AgentScheduler:
             if (
                 pending.abandoned_at > 0
                 and pending.last_error.startswith("RECEIPT_ABANDONED")
-                and self._wake_prompt_inflight(
-                    pending,
-                    prompt=self._wake_prompt_with_recurring_stale_drops(
-                        pending
-                    )[0],
-                )
+                and self._persisted_wake_inflight(pending)
             ):
                 # A persisted abandonment blocks only while the old physical
                 # prompt can still execute. After a restart or failed receipt,
@@ -2746,14 +2740,15 @@ class AgentScheduler:
             past_receipt_ceiling = (
                 row_age >= self._receipt_extension_max_age_sec
             )
+            inflight_prompt = pending.pasted_prompt or delivery_prompt
             inflight_past_receipt_ceiling = (
                 past_receipt_ceiling
-                and self._wake_prompt_inflight(pending, prompt=delivery_prompt)
+                and self._persisted_wake_inflight(pending, fallback_prompt=inflight_prompt)
             )
             if inflight_past_receipt_ceiling:
                 retained = self._abandon_inflight_replay(
                     pending,
-                    prompt=delivery_prompt,
+                    prompt=inflight_prompt,
                     age=row_age,
                     stale_drop_notices=stale_drop_notices,
                 )
@@ -3045,6 +3040,38 @@ class AgentScheduler:
             "scheduler: recurring stale-drop notice surfaced for agent "
             f"'{agent_name}': snapshots={len(notices)} cleared={cleared}"
         )
+
+    def _persisted_wake_inflight(self, pending, *, fallback_prompt: str | None = None) -> bool:
+        """Match durable paste text, never a later snapshot of agent-wide notices."""
+        if pending.pasted_prompt:
+            return self._wake_prompt_inflight(pending, prompt=pending.pasted_prompt)
+        if pending.pasted_at:
+            # Old/incomplete markers cannot safely reconstruct physical text.
+            # Hold their schedule only inside the original receipt ceiling and
+            # while the owning session could still execute that paste.
+            if self._receipt_age(pending) >= self._receipt_extension_max_age_sec:
+                reason = "PASTED_PROMPT_UNKNOWN_RECEIPT_CEILING: exact pasted text unavailable"
+                if self._registry.abandon_pending_schedule_wake(pending.id, reason=reason):
+                    _log(f"scheduler: {reason}; schedule #{pending.schedule_id}, fired_at={pending.fired_at}")
+                    self._queue_owner_alert(
+                        pending.agent_name,
+                        f"{reason}; schedule '{pending.name}', fired_at={pending.fired_at}",
+                    )
+                return False
+            if self._delivery_session_fn is not None:
+                try:
+                    current = self._delivery_session_fn(pending.agent_name)
+                except Exception:
+                    pass  # Probe failure is not evidence that the old session ended.
+                else:
+                    if current != pending.pasted_session_id:
+                        return False
+            return True
+        # Pre-marker rows have no durable physical text. Preserve their existing
+        # probe behavior; only newly marked rows can use exact persisted identity.
+        if fallback_prompt is None:
+            fallback_prompt = self._wake_prompt_with_recurring_stale_drops(pending)[0]
+        return self._wake_prompt_inflight(pending, prompt=fallback_prompt)
 
     def _wake_prompt_inflight(self, schedule, *, prompt: str | None = None) -> bool:
         """True when this wake's prompt is pasted with its receipt unresolved.
