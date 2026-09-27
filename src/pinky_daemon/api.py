@@ -14085,6 +14085,7 @@ npm run build</pre>
         if rotation_task is not None:
             rotation_task.cancel()
             await asyncio.gather(rotation_task, return_exceptions=True)
+        await app.state.skill_notifier.aclose()
         app.state.access_log.close()
         await broker.stop_approval_notification_retries()
 

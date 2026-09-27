@@ -173,7 +173,21 @@ def render_change_notice(changes: list[tuple[str, str, str]]) -> str:
     return "\n".join(lines)
 
 
+def _log_names(names: list[str]) -> str:
+    """Skill names for a log line: each JSON quoted (a name is user controlled and could hold a
+    newline) and cut to the notice limits."""
+    shown = ", ".join(json.dumps(n[:NOTICE_NAME_MAX]) for n in names[:NOTICE_MAX_SKILLS])
+    more = f" and {len(names) - NOTICE_MAX_SKILLS} more" if len(names) > NOTICE_MAX_SKILLS else ""
+    return shown + more
+
+
 SKILL_NOTICE_INJECT_TIMEOUT = 30.0
+# Minimum time between two delivery runs. An inject returns once the turn is queued, not once the
+# agent has read it, so without a pause every edit that lands after a run finishes would queue
+# another notice turn for a busy agent. Holding the worker for this long after each run merges
+# the edits that arrive meanwhile into one follow-up: at most one notice per agent per interval.
+SKILL_NOTICE_MIN_INTERVAL = 60.0
+_interval_sleep = asyncio.sleep
 
 
 class SkillChangeNotifier:
@@ -183,15 +197,20 @@ class SkillChangeNotifier:
     kept in a map keyed by skill name, so repeated edits of one skill while a
     delivery is running collapse into a single pending entry that keeps the
     oldest text seen and the latest text. At most one delivery runs at a time
-    and at most one follow-up run is owed. ``deliver`` receives the list of
+    and at most one follow-up run is owed. After each run the worker waits
+    ``SKILL_NOTICE_MIN_INTERVAL`` seconds before it takes the next batch, so
+    runs start at most once per interval however fast the transport accepts
+    them. ``deliver`` receives the list of
     ``(name, old directive, new directive)`` changes; its failures are logged,
     never raised.
     """
 
-    def __init__(self, deliver, log=None) -> None:
+    def __init__(self, deliver, log=None, min_interval: float | None = None) -> None:
         self._deliver = deliver
         self._log = log
+        self._min_interval = min_interval
         self._pending: dict[str, tuple[str, str, str]] = {}
+        self._inflight: list[tuple[str, str, str]] = []
         self._task: asyncio.Task | None = None
 
     @property
@@ -201,6 +220,23 @@ class SkillChangeNotifier:
     @property
     def running(self) -> bool:
         return self._task is not None and not self._task.done()
+
+    async def aclose(self) -> None:
+        """Stop the worker at shutdown. Changes still pending are named in the log, not delivered:
+        a session that outlives the daemon reads the current catalog copy when it next loads."""
+        task, self._task = self._task, None
+        # a batch cut off mid-delivery was already taken out of _pending: name it too
+        cut = [c[0] for c in self._inflight if c[0] not in self._pending]
+        if task is not None and not task.done():
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        else:
+            cut = []
+        dropped = cut + list(self._pending)
+        if dropped and self._log:
+            self._log(f"skills: shutdown dropped pending change notice for {_log_names(dropped)}")
+        self._pending.clear()
+        self._inflight = []
 
     def submit(self, changes: list[tuple[str, str, str]]) -> None:
         for name, before, after in changes:
@@ -218,15 +254,22 @@ class SkillChangeNotifier:
         while self._pending:
             batch = list(self._pending.values())
             self._pending.clear()
+            self._inflight = batch
             try:
                 await self._deliver(batch)
             except Exception as exc:  # noqa: BLE001
                 if self._log:
-                    names = ", ".join(c[0][:NOTICE_NAME_MAX] for c in batch[:NOTICE_MAX_SKILLS])
-                    more = f" and {len(batch) - NOTICE_MAX_SKILLS} more" if len(batch) > NOTICE_MAX_SKILLS else ""
                     self._log(
-                        f"skills: change notice for {names}{more} failed: {type(exc).__name__}: {exc}"
+                        f"skills: change notice for {_log_names([c[0] for c in batch])} failed: "
+                        f"{type(exc).__name__}: {exc}"
                     )
+            finally:
+                self._inflight = []
+            # still "running" while waiting, so submits made meanwhile merge into _pending
+            interval = (
+                SKILL_NOTICE_MIN_INTERVAL if self._min_interval is None else self._min_interval
+            )
+            await _interval_sleep(interval)
 
 
 def _log(msg: str) -> None:

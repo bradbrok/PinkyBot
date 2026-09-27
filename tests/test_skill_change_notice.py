@@ -111,6 +111,10 @@ def app_client(tmp_path, monkeypatch):
         return InjectResult(delivered=True, confirmed=False)
 
     monkeypatch.setattr(MessageBroker, "inject_agent_message", fake_inject)
+    # route tests look at one notice at a time; the interval has its own test below
+    from pinky_daemon import skill_store
+
+    monkeypatch.setattr(skill_store, "SKILL_NOTICE_MIN_INTERVAL", 0)
     app = create_api(
         max_sessions=10, default_working_dir=str(tmp_path), db_path=str(tmp_path / "test.db")
     )
@@ -316,7 +320,7 @@ def test_sixty_four_changes_coalesce_to_one_run_in_flight_and_one_follow_up():
             await gate.wait()
             active -= 1
 
-        notifier = SkillChangeNotifier(deliver)
+        notifier = SkillChangeNotifier(deliver, min_interval=0)
         for i in range(64):
             name = "alpha" if i % 2 else "beta"
             notifier.submit([(name, f"v{i}", f"v{i + 1}")])
@@ -342,7 +346,7 @@ def test_coalesced_change_keeps_the_oldest_text_and_the_latest_text():
             seen.append(batch)
             await gate.wait()
 
-        notifier = SkillChangeNotifier(deliver)
+        notifier = SkillChangeNotifier(deliver, min_interval=0)
         notifier.submit([("other", "a", "b")])
         await asyncio.sleep(0)
         notifier.submit([(NAME, "v1", "v2")])
@@ -365,7 +369,7 @@ def test_a_failing_delivery_is_logged_and_the_next_batch_still_runs():
             if len(delivered) == 1:
                 raise RuntimeError("inject down")
 
-        notifier = SkillChangeNotifier(deliver, log=logged.append)
+        notifier = SkillChangeNotifier(deliver, log=logged.append, min_interval=0)
         notifier.submit([(NAME, "v1", "v2")])
         await asyncio.sleep(0)
         notifier.submit([(NAME, "v2", "v3")])
@@ -408,3 +412,148 @@ def test_a_stalled_inject_is_cut_off_by_the_timeout(app_client, monkeypatch):
     assert r.status_code == 200, r.text
     _wait_for(sent, 1)
     assert [to for _, to, _ in sent] == [OWNER]
+
+
+def test_runs_are_spaced_by_the_minimum_interval():
+    async def scenario(monkeypatch_sleep):
+        release = asyncio.Event()
+        slept: list[float] = []
+        runs: list[list[str]] = []
+
+        async def fake_sleep(seconds):
+            slept.append(seconds)
+            await release.wait()
+
+        monkeypatch_sleep(fake_sleep)
+
+        async def deliver(batch):  # returns at once, like an inject that only queues the turn
+            runs.append([c[0] for c in batch])
+
+        notifier = SkillChangeNotifier(deliver, min_interval=60.0)
+        for i in range(64):
+            notifier.submit([("alpha" if i % 2 else "beta", f"v{i}", f"v{i + 1}")])
+            await asyncio.sleep(0)
+        assert len(runs) == 1 and notifier.running and notifier.pending == 2
+        release.set()
+        while notifier.running:
+            await asyncio.sleep(0)
+        return runs, slept
+
+    import pinky_daemon.skill_store as skill_store
+
+    saved = skill_store._interval_sleep
+    try:
+        runs, slept = asyncio.run(
+            scenario(lambda f: setattr(skill_store, "_interval_sleep", f))
+        )
+    finally:
+        skill_store._interval_sleep = saved
+    assert len(runs) == 2 and sorted(runs[1]) == ["alpha", "beta"]
+    assert slept and all(s == 60.0 for s in slept)
+
+
+def test_rapid_route_updates_queue_at_most_two_notices_per_agent(app_client, monkeypatch):
+    """64 alternating real update-route calls while the transport only queues turns: the first
+    notice goes out at once and everything after it merges into ONE notice after the interval."""
+    import threading
+
+    from pinky_daemon import skill_store
+
+    client, sent = app_client
+    store = skill_routes._skills
+    store.register("second-fixture", description="Second", directive=BODY, skill_type="skill",
+                   category="skill")
+    assert store.assign_to_agent(OWNER, "second-fixture", assigned_by="user")
+    release = threading.Event()
+
+    async def fake_sleep(seconds):  # stands in for the 60 s wait; the test releases it
+        while not release.is_set():
+            await asyncio.sleep(0.01)
+
+    monkeypatch.setattr(skill_store, "SKILL_NOTICE_MIN_INTERVAL", 60.0)
+    monkeypatch.setattr(skill_store, "_interval_sleep", fake_sleep)
+    texts = {NAME: BODY, "second-fixture": BODY}
+    for i in range(64):
+        name = NAME if i % 2 else "second-fixture"
+        texts[name] = NEW_BODY if texts[name] == BODY else BODY
+        r = client.put(f"/skills/{name}", json={"directive": texts[name], "approval_ref": "test"})
+        assert r.status_code == 200, r.text
+    _wait_for(sent, 1)
+    time.sleep(0.3)
+    notifier = client.app.state.skill_notifier
+    assert len(sent) == 1 and notifier.running and notifier.pending == 2
+    release.set()
+    end = time.time() + 5.0
+    while time.time() < end and notifier.running:
+        time.sleep(0.05)
+    assert not notifier.running
+    assert [to for _, to, _ in sent] == [OWNER, OWNER]
+    merged = sent[1][2]
+    assert f'load_skill("{NAME}")' in merged and 'load_skill("second-fixture")' in merged
+
+
+def test_shutdown_cancels_a_waiting_notifier_and_names_what_it_dropped(tmp_path, monkeypatch):
+    """The worker idles for the interval after each run; daemon shutdown must not leave it
+    pending, and a change still waiting is logged by name rather than lost silently."""
+    from pinky_daemon import api as api_module
+    from pinky_daemon import skill_store
+
+    monkeypatch.setenv("PINKY_SESSION_SECRET", "notice-fixture-session-secret")
+    logged: list[str] = []
+    monkeypatch.setattr(api_module, "_log", logged.append, raising=False)
+
+    async def fake_inject(self, from_agent, to_agent, message):
+        return InjectResult(delivered=True, confirmed=False)
+
+    monkeypatch.setattr(MessageBroker, "inject_agent_message", fake_inject)
+    monkeypatch.setattr(skill_store, "SKILL_NOTICE_MIN_INTERVAL", 60.0)
+    app = create_api(
+        max_sessions=10, default_working_dir=str(tmp_path), db_path=str(tmp_path / "test.db")
+    )
+    with TestClient(app) as client:
+        notifier = app.state.skill_notifier
+        client.portal.call(notifier.submit, [(NAME, BODY, NEW_BODY)])
+        end = time.time() + 3.0
+        while time.time() < end and notifier.pending:
+            time.sleep(0.02)
+        client.portal.call(notifier.submit, [("second-fixture", BODY, NEW_BODY)])
+        assert notifier.running and notifier.pending == 1  # waiting out the interval
+        task = notifier._task
+        assert task is not None and not task.done()
+        seen_after_aclose: list[bool] = []
+
+        async def later_hook():  # runs after the daemon's own shutdown handler
+            seen_after_aclose.append(task.done())
+
+        app.router.on_shutdown.append(later_hook)
+    assert seen_after_aclose == [True] and task.cancelled()
+    assert not notifier.running and notifier.pending == 0
+    assert any('shutdown dropped pending change notice for "second-fixture"' in m for m in logged)
+
+
+def test_a_batch_cut_off_mid_delivery_is_named_at_shutdown():
+    async def scenario():
+        logged: list[str] = []
+        started = asyncio.Event()
+
+        async def deliver(batch):
+            started.set()
+            await asyncio.sleep(3600)  # an inject that never finishes
+
+        notifier = SkillChangeNotifier(deliver, log=logged.append, min_interval=0)
+        notifier.submit([("in-flight", "a", "b")])
+        await started.wait()
+        notifier.submit([("queued", "a", "b")])
+        await notifier.aclose()
+        return logged, notifier
+
+    logged, notifier = asyncio.run(scenario())
+    assert not notifier.running and notifier.pending == 0
+    assert logged == ['skills: shutdown dropped pending change notice for "in-flight", "queued"']
+
+
+def test_log_lines_quote_skill_names():
+    from pinky_daemon.skill_store import _log_names
+
+    line = _log_names(["evil\nskills: fake line", "ok"])
+    assert "\n" not in line and line.startswith('"evil\\nskills')
