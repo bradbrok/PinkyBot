@@ -1,6 +1,7 @@
 """Bounded scheduler delivery uses ordinary paste and exact receipt evidence."""
 
 import asyncio
+import inspect
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -136,16 +137,30 @@ async def test_released_row_gets_fresh_receipt_window(registry, monkeypatch, clo
     registry.drain_park_pending_schedule_wake(pending.id)
     clock.now = NOW + 3121
     registry.release_drain_parked_schedule_wakes("worker")
-    observed = []
+    entered = asyncio.Event()
+    receipt = asyncio.get_running_loop().create_future()
+    durable = ScheduleWakeReceipt(registry, pending.schedule_id, pending.fired_at)
+    budgets = []
 
-    async def confirmation(_pending, *, fresh_receipt_budget=False):
-        observed.append(fresh_receipt_budget)
-        return False
+    async def wake(*args):
+        entered.set()
+        return receipt
 
-    engine = AgentScheduler(registry)
-    monkeypatch.setattr(engine, "_wait_for_wake_confirmation", confirmation)
+    async def wait_for(awaitable, timeout):
+        await entered.wait()
+        budgets.append(timeout)
+        assert timeout >= 500, "released first delivery needs a complete fresh receipt window"
+        clock.now += 500
+        assert durable.accept()
+        receipt.set_result(True)
+        return await awaitable
+
+    monkeypatch.setattr(scheduler, "asyncio", SimpleNamespace(**{**vars(asyncio), "wait_for": wait_for}))
+    engine = AgentScheduler(registry, wake_callback=wake)
     await engine._replay_pending_locked("worker")
-    assert observed == [True]
+    row = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+    assert row.accepted_at == NOW + 3621 and row.abandoned_at == 0
+    assert budgets == [600]
 
 
 @pytest.mark.parametrize("commit", [False, True])
@@ -253,8 +268,12 @@ async def test_paste_marker_is_write_ahead(registry, tmp_path, monkeypatch, cloc
         await ss.disconnect()
 
 
-async def test_past_deadline_receipt_budget_starts_from_paste(registry, tmp_path, monkeypatch, clock):
+@pytest.mark.parametrize("released", [False, True])
+async def test_past_deadline_receipt_budget_starts_from_paste(registry, tmp_path, monkeypatch, clock, released):
     pending = fire(registry, at=NOW - 3121)
+    if released:
+        registry.drain_park_pending_schedule_wake(pending.id)
+        registry.release_drain_parked_schedule_wakes("worker")
     ss, _ = session(tmp_path)
     monkeypatch.setattr(ss, "_scheduler_pane_busy", lambda candidate=None: False)
     pasted = asyncio.Event()
@@ -286,7 +305,11 @@ async def test_past_deadline_receipt_budget_starts_from_paste(registry, tmp_path
     engine = AgentScheduler(registry, wake_callback=wake, delivery_inflight_fn=lambda *_: True)
     try:
         try:
-            result = await engine._wait_for_wake_confirmation(pending, fresh_receipt_budget=True)
+            if released:
+                await engine._replay_pending_locked("worker")
+                result = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at).accepted_at > 0
+            else:
+                result = await engine._wait_for_wake_confirmation(pending, fresh_receipt_budget=True)
         except scheduler._ReceiptAbandonedError:
             result = "abandoned"
         assert result is True, "past-deadline paste lost its fresh receipt budget"
@@ -296,3 +319,211 @@ async def test_past_deadline_receipt_budget_starts_from_paste(registry, tmp_path
     finally:
         await ss.disconnect()
         await engine.stop()
+
+
+@pytest.mark.parametrize("configured,cron,ceiling,expected", [
+    (600, "0 * * * *", 3600, 600),
+    (10000, "0 * * * *", 1200, 600),
+    (600, "* * * * *", 3600, 30),
+    (17, "0 * * * *", 3600, 17),
+])
+async def test_scheduler_handoff_carries_clamped_absolute_deadline(registry, clock, configured, cron, ceiling, expected):
+    pending = fire(registry, cron=cron)
+    captured = []
+
+    async def wake(_agent, _session, _prompt, *, busy_deliver_at=None):
+        captured.append(busy_deliver_at)
+        return True
+
+    registry.set_setting("SCHEDULER_BUSY_DELIVER_AFTER_S", str(configured))
+    engine = AgentScheduler(registry, wake_callback=wake, receipt_extension_max_age_sec=ceiling)
+    assert await engine._wake_and_confirm(pending) is True
+    assert captured == [NOW + expected]
+
+
+@pytest.mark.parametrize("value,expected", [("25", 25), ("nan", 600), ("inf", 600), ("-1", 600), ("0", 600), ("bad", 600)])
+async def test_busy_delay_environment_is_finite_positive(registry, monkeypatch, value, expected):
+    monkeypatch.setenv("SCHEDULER_BUSY_DELIVER_AFTER_S", value)
+    pending = fire(registry)
+    captured = []
+
+    async def wake(_agent, _session, _prompt, *, busy_deliver_at=None):
+        captured.append(busy_deliver_at)
+        return True
+
+    engine = AgentScheduler(registry, wake_callback=wake)
+    assert await engine._wake_and_confirm(pending) is True
+    assert captured == [NOW + expected]
+
+
+@pytest.mark.parametrize("kind", [TmuxSession, CodexTmuxSession])
+async def test_in_lock_recheck_retains_unconfirmed_paste_veto(tmp_path, monkeypatch, clock, kind):
+    ss, tmux = session(tmp_path, kind)
+    turn = _QueuedTurn(prompt="owed", queued_at=NOW - 700, scheduler_serialized=True)
+    turn.scheduler_busy_deliver_at = NOW - 100
+    blocked = [False]
+    waits = []
+    monkeypatch.setattr(ss, "_has_unresolved_pasted_acceptance", lambda: blocked[0])
+
+    async def gate(candidate):
+        waits.append(candidate)
+        if len(waits) == 1:
+            blocked[0] = True  # A different turn won the lock after the outer gate.
+        else:
+            assert len(waits) == 2
+            assert tmux.paste_text.await_count == 0
+            blocked[0] = False
+
+    monkeypatch.setattr(ss, "_wait_for_scheduler_delivery_slot", gate)
+    try:
+        await ss._deliver_turn(turn)
+        assert len(waits) == 2
+        tmux.paste_text.assert_awaited_once()
+    finally:
+        await ss.disconnect()
+
+
+@pytest.mark.parametrize("rebuild", [False, True])
+async def test_api_routes_preserve_busy_deadline(tmp_path, monkeypatch, clock, rebuild):
+    from pinky_daemon.api import create_api
+
+    monkeypatch.setenv("PINKY_SESSION_CLASS_REBUILD", str(int(rebuild)))
+    monkeypatch.setenv("PINKY_STREAMING_TRANSPORT", "tmux")
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "api.db"))
+    registry = app.state.agents
+    registry.register("worker", working_dir=str(tmp_path), transport="tmux")
+    ss, _ = session(tmp_path)
+    received = []
+
+    async def sender(prompt, *, on_accept=None, busy_deliver_at=None):
+        received.append((prompt, busy_deliver_at, on_accept))
+        return True
+
+    ss.send_scheduler_prompt = sender
+    app.state.broker._streaming["worker"] = {"main": ss}
+    pending = fire(registry)
+    durable = ScheduleWakeReceipt(registry, pending.schedule_id, pending.fired_at)
+    try:
+        callback = app.state.scheduler._wake_callback
+        kwargs = {"schedule_receipt": durable}
+        if "busy_deliver_at" in inspect.signature(callback).parameters:
+            kwargs["busy_deliver_at"] = NOW + 600
+        assert await callback("worker", "worker-main", pending.prompt, **kwargs) is True
+        assert received == [(pending.prompt, NOW + 600, durable.accept)]
+    finally:
+        await ss.disconnect()
+        registry.close()
+
+
+@pytest.mark.parametrize("commit", [False, True])
+@pytest.mark.parametrize("settled", [False, True])
+async def test_restart_context_warns_unconsumed_paste_read_only(tmp_path, clock, commit, settled):
+    from pinky_daemon.api import create_api
+
+    app = create_api(default_working_dir=str(tmp_path), db_path=str(tmp_path / "api.db"))
+    registry = app.state.agents
+    registry.register("worker")
+    pending = fire(registry)
+    assert callable(getattr(registry, "mark_schedule_wake_pasted", None)), "missing write-ahead paste marker"
+    assert registry.mark_schedule_wake_pasted(
+        pending.schedule_id, pending.fired_at, pasted_at=NOW, session_id="old-session",
+    )
+    if settled:
+        await app.state.scheduler._replay_pending_locked("worker")
+    before = registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict()
+    text = app.state._build_streaming_wake_context("worker", commit=commit)
+    assert "periodic" in text and str(NOW) in text
+    assert "pasted before the restart, may not have run; check before redoing" in text
+    assert pending.prompt not in text
+    assert registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).to_dict() == before
+    await app.state.scheduler.stop()
+    registry.close()
+
+
+async def test_live_paste_survives_reaper_and_replay(registry, clock):
+    pending = fire(registry, at=NOW - 3500)
+    assert callable(getattr(registry, "mark_schedule_wake_pasted", None)), "missing write-ahead paste marker"
+    assert registry.mark_schedule_wake_pasted(
+        pending.schedule_id, pending.fired_at, pasted_at=NOW, session_id="live-session",
+    )
+    calls = []
+
+    async def wake(*args):
+        calls.append(args)
+        return True
+
+    engine = AgentScheduler(registry, wake_callback=wake, delivery_session_fn=lambda _: "live-session")
+    clock.now += 200
+    engine._run_outbox_reaper_if_due(clock.now)
+    await engine._replay_pending_locked("worker")
+    row = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+    assert row.accepted_at == row.abandoned_at == row.parked_at == 0
+    assert row.attempts == 0
+    assert calls == []
+
+
+async def test_write_ahead_crash_cannot_replay_or_accept(registry, clock):
+    pending = fire(registry)
+    assert callable(getattr(registry, "mark_schedule_wake_pasted", None)), "missing write-ahead paste marker"
+    assert registry.mark_schedule_wake_pasted(
+        pending.schedule_id, pending.fired_at, pasted_at=NOW, session_id="lost-before-handoff",
+    )
+    assert not registry.mark_schedule_wake_pasted(
+        pending.schedule_id, pending.fired_at, pasted_at=NOW + 1, session_id="replacement",
+    )
+    calls = []
+    alerts = []
+
+    async def wake(*args):
+        calls.append(args)
+        return True
+
+    engine = AgentScheduler(registry, wake_callback=wake, owner_notify_callback=lambda *args: alerts.append(args))
+    await engine._replay_pending_locked("worker")
+    await engine._replay_pending_locked("worker")
+    if engine._owner_alert_tasks:
+        await asyncio.gather(*engine._owner_alert_tasks)
+    row = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+    assert row.accepted_at == row.attempts == 0
+    assert row.last_error.startswith("PASTED_UNCONFIRMED_SESSION_LOST")
+    assert len(alerts) == 1 and calls == []
+
+
+async def test_short_cadence_busy_fire_drains_before_staleness(registry, clock):
+    pending = fire(registry, cron="* * * * *")
+    calls = []
+
+    async def wake(*args):
+        calls.append(args)
+        return True
+
+    engine = AgentScheduler(registry, wake_callback=wake, delivery_busy_fn=lambda _: True)
+    engine._check_pending_wake_liveness(NOW)
+    clock.now = NOW + 31
+    engine._check_pending_wake_liveness(clock.now)
+    tasks = list(engine._pending_replay_tasks.values())
+    if tasks:
+        await asyncio.gather(*tasks)
+    assert len(calls) == 1, "minute-cadence fires must drain before their 60-second stale limit"
+    assert registry.get_schedule_wake_by_fire(pending.schedule_id, NOW).accepted_at > 0
+
+
+async def test_failed_write_ahead_marker_prevents_paste(registry, tmp_path, monkeypatch, clock):
+    pending = fire(registry)
+    ss, tmux = session(tmp_path)
+    durable = ScheduleWakeReceipt(registry, pending.schedule_id, pending.fired_at)
+    monkeypatch.setattr(ss, "_scheduler_pane_busy", lambda candidate=None: False)
+
+    def failed_write(*args, **kwargs):
+        raise OSError("synthetic ledger write failure")
+
+    monkeypatch.setattr(registry, "mark_schedule_wake_pasted", failed_write, raising=False)
+    receipt = await ss.send_scheduler_prompt(pending.prompt, on_accept=durable.accept)
+    await asyncio.gather(*ss._scheduler_delivery_tasks)
+    try:
+        assert receipt.done() and receipt.result() is False
+        assert tmux.paste_text.await_count == 0
+        row = registry.get_schedule_wake_by_fire(pending.schedule_id, pending.fired_at)
+        assert row.accepted_at == row.attempts == getattr(row, "pasted_at", 0) == 0
+    finally:
+        await ss.disconnect()
