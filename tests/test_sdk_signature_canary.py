@@ -24,7 +24,7 @@ def rejection(requested=REQUESTED, stderr=None):
 
 
 def test_installed_process_error_rendering_contract():
-    assert importlib.metadata.version("claude-agent-sdk") == "0.2.138", (
+    assert importlib.metadata.version("claude-agent-sdk") == "0.2.139", (
         "SDK changed: re-characterize the initialize rejection before updating this canary"
     )
     plain = rejection()
@@ -39,8 +39,8 @@ def test_installed_process_error_rendering_contract():
     "case,version,reason",
     [
         ("version", "0.2.999", "unsupported_sdk_version"),
-        ("stderr", "0.2.138", "stderr_shape_changed"),
-        ("unknown", "0.2.138", "unclassified_initialize"),
+        ("stderr", "0.2.139", "stderr_shape_changed"),
+        ("unknown", "0.2.139", "unclassified_initialize"),
     ],
 )
 async def test_signature_drift_is_visible_once_without_fresh_retry(
