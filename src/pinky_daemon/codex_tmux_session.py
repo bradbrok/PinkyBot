@@ -61,6 +61,7 @@ from pinky_daemon.codex_home import (
     prepare_agent_codex_home,
     validate_agent_codex_home,
 )
+from pinky_daemon.codex_mcp_env import mcp_cli_config, with_mcp_header_env
 from pinky_daemon.codex_tmux_transcript import (
     CodexTmuxTranscriptTailer,
     _discover_codex_rollout,
@@ -265,14 +266,8 @@ class CodexTmuxSession(TmuxSession):
                 effort = "high"  # codex has no "max"
             parts += ["-c", f'model_reasoning_effort="{effort}"']
         # MCP injection (same -c form as CodexSession; works on fresh + resume).
-        for name, cfg in (self._codex_mcp_servers or {}).items():
-            if not isinstance(cfg, dict):
-                continue
-            url = cfg.get("url", "")
-            if url:
-                parts += ["-c", f'mcp_servers.{name}.url="{url}"']
-                for hk, hv in (cfg.get("headers") or {}).items():
-                    parts += ["-c", f'mcp_servers.{name}.http_headers.{hk}="{hv}"']
+        mcp_args, _ = mcp_cli_config(self._codex_mcp_servers or {})
+        parts += mcp_args
 
         cmd = " ".join(shlex.quote(p) for p in parts)
         _log(
@@ -333,7 +328,9 @@ class CodexTmuxSession(TmuxSession):
             agent_name=self.agent_name, registry=self._registry,
             status_lookup=self._isolation_status, env=env, log=_log,
         )
-        return isolated_launch_env.with_grants(launch_policy, env)
+        # Inject after scoping and explicit grants: ambient header vars are not authority.
+        env = isolated_launch_env.with_grants(launch_policy, env)
+        return with_mcp_header_env(env, self._codex_mcp_servers or {})
 
     # ── seam: transcript discovery (codex rollout store) ────────────────────
     def _project_dir(self) -> Path:

@@ -666,7 +666,7 @@ class TestCodexCommandConstruction:
         # MCP url + header overrides should be present
         joined = " ".join(cmd)
         assert "mcp_servers.pinky-self.url=" in joined
-        assert "mcp_servers.pinky-self.http_headers.X-Agent-Name=" in joined
+        assert "mcp_servers.pinky-self.env_http_headers={X-Agent-Name=" in joined
 
     def test_fresh_session_includes_working_dir(self):
         """Fresh session passes -C; the resume path skips it."""
