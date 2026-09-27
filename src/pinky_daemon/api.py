@@ -7057,7 +7057,7 @@ npm run build</pre>
                     timeout=SKILL_NOTICE_INJECT_TIMEOUT,
                 )
                 _log(
-                    f"skills: change notice {[c[0] for c in mine][:10]} -> {agent.name} "
+                    f"skills: change notice {[c[0][:80] for c in mine[:10]]} -> {agent.name} "
                     f"delivered={result.delivered}"
                 )
             except Exception as exc:  # noqa: BLE001

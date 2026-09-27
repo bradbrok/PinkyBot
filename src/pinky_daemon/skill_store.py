@@ -166,7 +166,7 @@ def render_change_notice(changes: list[tuple[str, str, str]]) -> str:
     if len(block) < len(entries):
         block.append(f"  ({len(entries) - len(block)} more entries not shown)")
     lines = [header]
-    if block and any(not b.startswith("  (") for b in block):
+    if block:
         lines.append(CHANGE_NOTICE_LABEL)
         lines.extend(block)
     lines.append(instruction)
@@ -222,8 +222,11 @@ class SkillChangeNotifier:
                 await self._deliver(batch)
             except Exception as exc:  # noqa: BLE001
                 if self._log:
-                    names = ", ".join(c[0] for c in batch)
-                    self._log(f"skills: change notice for {names} failed: {type(exc).__name__}: {exc}")
+                    names = ", ".join(c[0][:NOTICE_NAME_MAX] for c in batch[:NOTICE_MAX_SKILLS])
+                    more = f" and {len(batch) - NOTICE_MAX_SKILLS} more" if len(batch) > NOTICE_MAX_SKILLS else ""
+                    self._log(
+                        f"skills: change notice for {names}{more} failed: {type(exc).__name__}: {exc}"
+                    )
 
 
 def _log(msg: str) -> None:

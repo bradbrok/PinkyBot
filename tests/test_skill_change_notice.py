@@ -277,6 +277,22 @@ def test_a_very_long_name_is_cut_and_the_notice_stays_bounded():
     assert lines[-1].startswith("The copies in your context are out of date: reload your skills")
 
 
+def test_a_notice_whose_first_entry_does_not_fit_still_says_entries_exist():
+    huge = "\u00e9" * 280
+    changes = [(f"s{i}", BODY, BODY.replace("## Changes\n\n", f"## Changes\n\n- {huge}\n"))
+               for i in range(3)]
+    from pinky_daemon import skill_store
+    old = skill_store.NOTICE_MAX_BYTES
+    try:
+        skill_store.NOTICE_MAX_BYTES = 700
+        lines = skill_store.render_change_notice(changes).split("\n")
+    finally:
+        skill_store.NOTICE_MAX_BYTES = old
+    assert lines[1] == CHANGE_NOTICE_LABEL
+    assert lines[2] == "  (3 more entries not shown)"
+    assert lines[-1].startswith("The copy") or lines[-1].startswith("The copies")
+
+
 def test_escaped_names_count_toward_the_name_limit():
     name = "\x01" * 200  # each character quotes to six
     first = render_change_notice([(name, BODY, BODY)]).split("\n")[0]
@@ -383,9 +399,11 @@ def test_a_stalled_inject_is_cut_off_by_the_timeout(app_client, monkeypatch):
     monkeypatch.setattr(MessageBroker, "inject_agent_message", stalled)
     r = client.put(f"/skills/{NAME}", json={"directive": NEW_BODY, "approval_ref": "test"})
     assert r.status_code == 200, r.text
-    time.sleep(0.5)
     notifier = client.app.state.skill_notifier
-    assert not notifier.running  # the stalled inject did not pin the worker
+    end = time.time() + 5.0
+    while time.time() < end and (notifier.running or not calls):
+        time.sleep(0.05)
+    assert calls and not notifier.running  # the stalled inject did not pin the worker
     r = client.put(f"/skills/{NAME}", json={"directive": BODY, "approval_ref": "test"})
     assert r.status_code == 200, r.text
     _wait_for(sent, 1)
