@@ -441,6 +441,8 @@ class CodexTmuxSession(TmuxSession):
         The inherited scheduler task, REPL lock, logs, exact receipt, and
         retirement paths remain unchanged.
         """
+        if self._scheduler_busy_deadline_reached(candidate):
+            return self._has_unresolved_pasted_acceptance()
         evidence = self._codex_scheduler_evidence(candidate)
         busy = any(evidence)
         signature = (*evidence, busy)

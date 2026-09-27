@@ -859,6 +859,8 @@ class PendingScheduleWake:
     # supersession floor cannot be dodged by any park-reason text. Cleared
     # when the row is parked again.
     released_at: float = 0.0
+    pasted_at: float = 0.0
+    pasted_session_id: str = ""
 
     @property
     def name(self) -> str:
@@ -901,6 +903,8 @@ class PendingScheduleWake:
             "abandoned_at": self.abandoned_at,
             "drain_parked_at": self.drain_parked_at,
             "released_at": self.released_at,
+            "pasted_at": self.pasted_at,
+            "pasted_session_id": self.pasted_session_id,
             "state": self.ledger_state,
         }
 
@@ -1657,6 +1661,8 @@ class AgentRegistry:
                 abandoned_at REAL NOT NULL DEFAULT 0,
                 drain_parked_at REAL NOT NULL DEFAULT 0,
                 released_at REAL NOT NULL DEFAULT 0,
+                pasted_at REAL NOT NULL DEFAULT 0,
+                pasted_session_id TEXT NOT NULL DEFAULT '',
                 FOREIGN KEY (agent_name) REFERENCES agents(name) ON DELETE CASCADE,
                 UNIQUE(schedule_id, fired_at)
             );
@@ -2184,6 +2190,8 @@ class AgentRegistry:
             ("abandoned_at", "REAL NOT NULL DEFAULT 0"),
             ("drain_parked_at", "REAL NOT NULL DEFAULT 0"),
             ("released_at", "REAL NOT NULL DEFAULT 0"),
+            ("pasted_at", "REAL NOT NULL DEFAULT 0"),
+            ("pasted_session_id", "TEXT NOT NULL DEFAULT ''"),
         ]
         for col, typedef in wake_migrations:
             if col not in wake_existing:
@@ -5596,7 +5604,8 @@ except Exception as exc:
         return self._db.execute(
             """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                       fired_at, created_at, attempts, parked_at, accepted_at,
-                      failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                      failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id
                FROM pending_schedule_wakes
                WHERE schedule_id=? AND fired_at=?""",
             (schedule_id, fired_at),
@@ -5640,7 +5649,8 @@ except Exception as exc:
             row = self._db.execute(
                 """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                           fired_at, created_at, attempts, parked_at, accepted_at,
-                          failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                          failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id
                    FROM pending_schedule_wakes
                    WHERE schedule_id=? AND fired_at=?""",
                 (schedule_id, fired_at),
@@ -5651,6 +5661,25 @@ except Exception as exc:
                         fired_at=fired_at, enqueued_at=created_at, agent_name=agent_name,
                         schedule_name=schedule_name, prompt=prompt)
         return PendingScheduleWake(*row), created
+
+    def mark_schedule_wake_pasted(
+        self, schedule_id: int, fired_at: float, *, pasted_at: float, session_id: str
+    ) -> bool:
+        """Write ahead of an irreversible paste; this is never acceptance.
+
+        A second submission cannot claim the same exact fire, including after
+        restart. A crash after this commit can lose work, but cannot duplicate it.
+        """
+        with self._rmw_lock:
+            result = self._db.execute(
+                """UPDATE pending_schedule_wakes SET pasted_at=?, pasted_session_id=?
+                   WHERE schedule_id=? AND fired_at=? AND pasted_at=0
+                     AND accepted_at=0 AND abandoned_at=0 AND parked_at=0
+                     AND drain_parked_at=0""",
+                (pasted_at, session_id, schedule_id, fired_at),
+            )
+            self._db.commit()
+            return result.rowcount == 1
 
     def list_pending_schedule_wakes(
         self,
@@ -5667,7 +5696,8 @@ except Exception as exc:
         """
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                        failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -5757,7 +5787,8 @@ except Exception as exc:
             raise ValueError(f"invalid scheduler wake ledger state: {state}")
         sql = """SELECT id, schedule_id, agent_name, schedule_name, prompt,
                         fired_at, created_at, attempts, parked_at, accepted_at,
-                        failed_at, last_error, abandoned_at, drain_parked_at, released_at
+                        failed_at, last_error, abandoned_at, drain_parked_at, released_at,
+                      pasted_at, pasted_session_id
                  FROM pending_schedule_wakes"""
         conditions: list[str] = []
         params: list = []
@@ -6383,7 +6414,7 @@ except Exception as exc:
                        SET abandoned_at=?, parked_at=0, drain_parked_at=0
                        WHERE id IN (
                            SELECT id FROM pending_schedule_wakes
-                           WHERE accepted_at=0 AND abandoned_at=0
+                           WHERE accepted_at=0 AND abandoned_at=0 AND pasted_at=0
                              AND (
                                  (parked_at=0 AND fired_at < ?)
                                  OR (

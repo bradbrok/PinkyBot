@@ -3385,6 +3385,21 @@ def create_api(
             if kg_insights:
                 wake_ctx = f"{wake_ctx}\n\n{kg_insights}" if wake_ctx else kg_insights
 
+        # Owed work is informational here; rendering never consumes a fire.
+        try:
+            owed = []
+            for row in agents.list_pending_schedule_wakes(agent_name, include_parked=True):
+                if row.pasted_at:
+                    owed.append(f"- {row.name} (fired_at={row.fired_at}): pasted before the restart, may not have run; check before redoing")
+                elif not (row.parked_at or row.abandoned_at):
+                    schedule = agents.get_schedule(row.schedule_id)
+                    if schedule is not None and not schedule.one_shot:
+                        owed.append(f"- {row.name} (fired_at={row.fired_at})")
+            if owed:
+                wake_ctx += "\n\nOwed scheduled wakes:\n" + "\n".join(owed)
+        except Exception as exc:
+            _log(f"scheduler: failed to list owed wake context: {type(exc).__name__}")
+
         # Inject open task summary
         try:
             open_tasks = tasks.list(assigned_agent=agent_name)
@@ -4774,7 +4789,7 @@ def create_api(
             except Exception:
                 _log(f"schedule fire trace SDK callback failed ({type(exc).__name__})")
 
-    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, **kwargs):
+    async def _deliver_streaming(name, prompt, *, label="main", schedule_receipt=None, scheduler=False, busy_deliver_at=None, **kwargs):
         for _ in range(3):
             ss = await _ensure_streaming_session(name, label=label)
             async with _session_scope(name, label):
@@ -4787,6 +4802,8 @@ def create_api(
                 if scheduler:
                     sender = getattr(ss, "send_scheduler_prompt", None)
                     if callable(sender):
+                        if "busy_deliver_at" in inspect.signature(sender).parameters:
+                            kwargs["busy_deliver_at"] = busy_deliver_at
                         if schedule_receipt is not None and "on_accept" in inspect.signature(sender).parameters:
                             # Preserve the bound method: trace hooks recover its exact fire owner.
                             kwargs["on_accept"] = schedule_receipt.accept
@@ -12681,6 +12698,7 @@ npm run build</pre>
         prompt: str,
         *,
         schedule_receipt=None,
+        busy_deliver_at=None,
     ):
         """Queue a wake and return its exact per-prompt delivery receipt."""
         del session_id  # Streaming is now the canonical main runtime.
@@ -12693,6 +12711,7 @@ npm run build</pre>
             try:
                 ss, receipt = await _deliver_streaming(
                     agent_name, prompt, scheduler=True, schedule_receipt=schedule_receipt,
+                    busy_deliver_at=busy_deliver_at,
                 )
             except HTTPException:
                 return False
@@ -12705,6 +12724,8 @@ npm run build</pre>
         scheduler_send = getattr(ss, "send_scheduler_prompt", None)
         if callable(scheduler_send):
             scheduler_kwargs = {}
+            if "busy_deliver_at" in inspect.signature(scheduler_send).parameters:
+                scheduler_kwargs["busy_deliver_at"] = busy_deliver_at
             if schedule_receipt is not None:
                 try:
                     signature = inspect.signature(scheduler_send)
@@ -12918,6 +12939,12 @@ npm run build</pre>
             return _scheduler_delivery_busy(agent_name)
         return probe() is True
 
+    def _scheduler_paste_session(agent_name: str) -> str:
+        ss = broker._streaming.get(agent_name, {}).get("main")
+        if ss is None or ss.state != TransportSessionState.CONNECTED:
+            return ""
+        return getattr(ss, "_scheduler_paste_session_id", "")
+
     def _scheduler_wake_inflight(agent_name: str, prompt: str) -> bool:
         """Per-turn execution state: is this wake pasted with an open receipt?
 
@@ -13117,6 +13144,7 @@ npm run build</pre>
         delivery_busy_fn=_scheduler_delivery_busy,
         delivery_drain_busy_fn=_scheduler_drain_busy,
         delivery_inflight_fn=_scheduler_wake_inflight,
+        delivery_session_fn=_scheduler_paste_session,
         delivery_queued_fn=_scheduler_wake_queued,
         delivery_cancel_queued_fn=_cancel_scheduler_wake,
         owner_notify_callback=_notify_owner_alert,
