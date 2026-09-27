@@ -2616,9 +2616,15 @@ class AgentScheduler:
         all_pending_wakes = self._registry.list_pending_schedule_wakes(
             agent_name, include_parked=True
         )
-        abandoned_schedule_ids = set()
+        blocked_schedule_ids = set()
         for pending in all_pending_wakes:
             if pending.pasted_at:
+                # A marked physical submission still fences later fires of
+                # its schedule until independent acceptance clears it.
+                if self._wake_prompt_inflight(
+                    pending, prompt=self._wake_prompt_with_recurring_stale_drops(pending)[0]
+                ):
+                    blocked_schedule_ids.add(pending.schedule_id)
                 continue
             if busy and replay_now < self._busy_deliver_at(pending):
                 continue
@@ -2635,7 +2641,7 @@ class AgentScheduler:
                 # A persisted abandonment blocks only while the old physical
                 # prompt can still execute. After a restart or failed receipt,
                 # a no-longer-inflight tombstone must not starve newer work.
-                abandoned_schedule_ids.add(pending.schedule_id)
+                blocked_schedule_ids.add(pending.schedule_id)
         pending_wakes = []
         fresh_receipt_budget_ids: set[int] = set()
         for pending in all_pending_wakes:
@@ -2718,11 +2724,11 @@ class AgentScheduler:
                         f"quarantined={superseded}"
                     )
                     continue
-            if pending.schedule_id in abandoned_schedule_ids:
+            if pending.schedule_id in blocked_schedule_ids:
                 _log(
                     f"scheduler: persisted wake #{pending.id}, schedule "
                     f"#{pending.schedule_id} for agent '{pending.agent_name}' "
-                    "remains pending behind an older abandoned pasted fire"
+                    "remains pending behind an older unconfirmed pasted fire"
                 )
                 continue
             replay_max_age = self._pending_wake_replay_max_age(
@@ -2752,7 +2758,7 @@ class AgentScheduler:
                     stale_drop_notices=stale_drop_notices,
                 )
                 if retained:
-                    abandoned_schedule_ids.add(pending.schedule_id)
+                    blocked_schedule_ids.add(pending.schedule_id)
                 _log(
                     f"scheduler: pasted pending wake #{pending.id} crossed "
                     "its receipt ceiling; receipt abandonment takes "

@@ -542,3 +542,101 @@ def test_attempt_cap_parks_one_oldest_row_when_fire_times_tie(registry, clock):
     assert result == (1, 1)
     assert registry.get_schedule_wake_by_fire(first.schedule_id, NOW).drain_parked_at > 0
     assert registry.get_schedule_wake_by_fire(second.schedule_id, NOW).drain_parked_at == 0
+
+
+@pytest.mark.parametrize('abandoned', [False, True])
+async def test_marked_inflight_fire_fences_newer_until_independent_acceptance(registry, clock, abandoned):
+    older = fire(registry, at=NOW - 1000)
+    assert callable(getattr(registry, 'mark_schedule_wake_pasted', None))
+    assert registry.mark_schedule_wake_pasted(
+        older.schedule_id, older.fired_at, pasted_at=NOW - 10, session_id='current',
+    )
+    if abandoned:
+        registry.abandon_pending_schedule_wake(older.id, reason='RECEIPT_ABANDONED: fixture')
+    newer, _ = registry.persist_schedule_wake(
+        older.schedule_id, agent_name='worker', schedule_name=older.name,
+        prompt='newer work', fired_at=NOW - 1,
+    )
+    calls = []
+
+    async def wake(_agent, _session, prompt):
+        calls.append(prompt)
+        return True
+
+    engine = AgentScheduler(
+        registry, wake_callback=wake,
+        delivery_session_fn=lambda _: 'current',
+        delivery_inflight_fn=lambda _agent, prompt: prompt == older.prompt,
+    )
+    await engine._replay_pending_locked('worker')
+    assert calls == [], 'an unresolved older paste must fence the next fire before handoff'
+    assert registry.get_schedule_wake_by_fire(newer.schedule_id, newer.fired_at).attempts == 0
+    assert registry.get_schedule_wake_by_fire(older.schedule_id, older.fired_at).accepted_at == 0
+    assert ScheduleWakeReceipt(registry, older.schedule_id, older.fired_at).accept()
+    await engine._replay_pending_locked('worker')
+    assert calls == [newer.prompt]
+    row = registry.get_schedule_wake_by_fire(newer.schedule_id, newer.fired_at)
+    assert row.accepted_at > 0 and row.attempts == 1
+
+
+@pytest.mark.parametrize('runtime', ['codex_cli', 'claude_sdk'])
+async def test_default_busy_policy_stale_drops_old_notification_backlog(registry, clock, runtime):
+    registry.register('worker', runtime=runtime, transport='tmux')
+    older = fire(registry, at=NOW - 600, cron='* * * * *')
+    newer, _ = registry.persist_schedule_wake(
+        older.schedule_id, agent_name='worker', schedule_name=older.name,
+        prompt=older.prompt, fired_at=NOW - 500,
+    )
+    alerts = []
+    engine = AgentScheduler(
+        registry, owner_notify_callback=lambda *args: alerts.append(args),
+        delivery_drain_busy_fn=lambda _: True, outbox_drain_extension_attempt_cap=1,
+    )
+    await engine._replay_pending_locked('worker', drain_recheck=True)
+    if engine._owner_alert_tasks:
+        await asyncio.gather(*engine._owner_alert_tasks)
+    assert alerts == []
+    assert registry.get_schedule_wake_by_fire(older.schedule_id, older.fired_at) is None
+    assert registry.get_schedule_wake_by_fire(newer.schedule_id, newer.fired_at) is None
+    notices = registry.list_recurring_schedule_stale_drops('worker')
+    assert len(notices) == 1 and notices[0].drop_count == 2
+
+
+@pytest.mark.parametrize('release', ['confirmed-delivery', 'verified-idle'])
+async def test_default_busy_policy_advances_then_stale_drops_notification_cohort(registry, clock, release):
+    registry.register('worker', runtime='claude_sdk', transport='tmux')
+    first = fire(registry, at=NOW - 30, name='first', cron='* * * * *')
+    second = fire(registry, at=NOW - 20, name='second', cron='* * * * *')
+    rows = [first, second]
+    busy = [True]
+    alerts = []
+    calls = []
+
+    async def wake(*args):
+        calls.append(args[-1])
+        return False
+
+    engine = AgentScheduler(
+        registry, wake_callback=wake, delivery_drain_busy_fn=lambda _: busy[0],
+        owner_notify_callback=lambda *args: alerts.append(args),
+        outbox_drain_extension_attempt_cap=1,
+    )
+    await engine._replay_pending_locked('worker', drain_recheck=True)
+    assert calls == [first.prompt]
+    assert registry.get_schedule_wake_by_fire(first.schedule_id, first.fired_at).attempts == 1
+    assert registry.get_schedule_wake_by_fire(second.schedule_id, second.fired_at).attempts == 0
+    assert all(registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at).drain_parked_at == 0 for row in rows)
+    if release == 'confirmed-delivery':
+        assert registry.confirm_pending_schedule_wake_by_fire(first.schedule_id, first.fired_at)
+        rows.pop(0)
+    else:
+        busy[0] = False
+        await engine._replay_pending_locked('worker', drain_recheck=True)
+    busy[0] = True
+    clock.now += 60
+    await engine._replay_pending_locked('worker', drain_recheck=True)
+    if engine._owner_alert_tasks:
+        await asyncio.gather(*engine._owner_alert_tasks)
+    assert alerts == []
+    assert all(registry.get_schedule_wake_by_fire(row.schedule_id, row.fired_at) is None for row in rows)
+    assert sum(n.drop_count for n in registry.list_recurring_schedule_stale_drops('worker')) == len(rows)
