@@ -1558,6 +1558,32 @@ class ReflectionStore:
     # ── Helpers ──
 
     @staticmethod
+    def _coerce_salience(raw: object) -> int:
+        """Coerce a stored salience value onto the 1-5 integer scale.
+
+        Early builds stored salience as a 0-1 float; the Reflection model
+        now requires an int in [1, 5], so a single legacy row raises a
+        pydantic ValidationError and poisons every recall()/query that
+        touches it. Map 0-1 FLOATS onto 1-5, round anything else numeric,
+        clamp to bounds, and fall back to the default (3) for garbage.
+
+        The legacy x5 mapping applies only to genuine floats: SQLite
+        preserves column affinity per value, so legacy rows hydrate as
+        Python floats while modern rows hydrate as ints. A modern,
+        perfectly valid salience of int 1 must stay 1 — not be mistaken
+        for legacy 1.0 and inflated to 5.
+        """
+        if isinstance(raw, bool):  # bool is an int subclass; treat as garbage
+            return 3
+        if isinstance(raw, float) and 0 <= raw <= 1:
+            raw = raw * 5
+        try:
+            val = float(raw)  # type: ignore[arg-type]
+        except (TypeError, ValueError):
+            return 3
+        return max(1, min(5, round(val)))
+
+    @staticmethod
     def _row_to_reflection(row: sqlite3.Row) -> Reflection:
         # Handle optional columns that may not exist in older schemas
         keys = row.keys() if hasattr(row, "keys") else []
@@ -1578,7 +1604,7 @@ class ReflectionStore:
             content=row["content"],
             context=row["context"],
             project=row["project"],
-            salience=row["salience"],
+            salience=ReflectionStore._coerce_salience(row["salience"]),
             active=bool(row["active"]),
             no_recall=no_recall,
             supersedes=row["supersedes"],
