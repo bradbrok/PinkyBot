@@ -1,4 +1,4 @@
-# Terse: 4 KiB tmux launch budget.
+# 4 KiB max.
 
 import json
 import os
@@ -18,24 +18,17 @@ _SHELL_NAMES = frozenset((
     "PWD OLDPWD SHLVL _ BASHOPTS BASH_VERSINFO EUID PPID SHELLOPTS UID IFS ENV BASH_ENV PS4"
 ).split())
 
-
 def is_valid_key_name(key):
     return isinstance(key, str) and _KEY.fullmatch(key) is not None
-
 
 def key_policy(key):
     if not is_valid_key_name(key):
         return "invalid"
-    if key in _SHELL_NAMES:
-        return "shell"
-    if key.startswith("__PINKY_LAUNCH_"):
-        return "reserved"
-    return None
-
+    return "shell" if key in _SHELL_NAMES else (
+        "reserved" if key.startswith("__PINKY_LAUNCH_") else None)
 
 def _invalid():
     raise ValueError("invalid launch environment") from None
-
 
 def validate_env(env):
     if not isinstance(env, dict):
@@ -48,13 +41,8 @@ def validate_env(env):
         except UnicodeError:
             _invalid()
 
-
-def _private_regular(info):
-    return (
-        stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
-        and not info.st_mode & 0o077
-    )
-
+def _private_regular(st):
+    return stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid() and not st.st_mode & 0o077
 
 def validate_inherit(env, inherit):
     if inherit not in ("all", "none"):
@@ -62,33 +50,30 @@ def validate_inherit(env, inherit):
     if inherit == "none" and DAEMON_ONLY.intersection(env):
         raise PermissionError("daemon-only key")
 
-
 def load_env(path, nonce, command):
-    fd = None
-    owned = False
+    fd, owned = None, False
     try:
         if _NONCE.fullmatch(nonce) is None:
             _invalid()
         fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK)
-        info = os.fstat(fd)
+        st = os.fstat(fd)
         owned = (
             os.path.basename(path) == f"env-{nonce}.json"
-            and stat.S_ISREG(info.st_mode) and info.st_uid == os.geteuid()
+            and stat.S_ISREG(st.st_mode) and st.st_uid == os.geteuid()
         )
-        if not owned or not _private_regular(info):
+        if not owned or not _private_regular(st):
             raise PermissionError("unsafe launch file")
-        stream = os.fdopen(fd, "r", encoding="utf-8")
-        fd = None
-        with stream:
+        with os.fdopen(fd, "r", encoding="utf-8") as stream:
+            fd = None
             data = json.load(stream)
-            if not isinstance(data, dict) or set(data) not in (
+            if not isinstance(data, dict) or set(data) - {"codex_headers"} not in (
                 {"nonce", "env"}, {"nonce", "env", "inherit", "granted"},
                 {"nonce", "env", "inherit"},
             ):
                 _invalid()
-            if "inherit" in data and data["inherit"] != "none":
-                _invalid()
-            if data["nonce"] != nonce:
+            scrub = data.get("codex_headers", False)
+            if (type(scrub) is not bool or data["nonce"] != nonce
+                    or ("inherit" in data and data["inherit"] != "none")):
                 _invalid()
             validate_env(data["env"])
             inherit = data.get("inherit", "all")
@@ -100,15 +85,16 @@ def load_env(path, nonce, command):
                 os.unlink(path)
             except FileNotFoundError:
                 pass
+        env = os.environ
+        before = set(env)
+        kept = {k: v for k, v in env.items()
+                if (inherit != "none" or k in BASE_ALLOWLIST or k.startswith(("LC_", "XDG_")))
+                and (not scrub or not k.startswith("PINKY_MCP_HDR_"))}
+        kept.update(data["env"])
+        env.clear()
+        env.update(kept)
         if inherit == "none":
-            before = set(os.environ)
-            env = {k: v for k, v in os.environ.items() if k in BASE_ALLOWLIST or k.startswith(("LC_", "XDG_"))}
-            os.environ.clear()
-            os.environ.update(env)
-        os.environ.update(data["env"])
-        if inherit == "none":
-            count = len(before - os.environ.keys())
-            print(f"inherited environment scrubbed; {count} names dropped; granted: "
+            print(f"inherited environment scrubbed; {len(before - env.keys())} names dropped; granted: "
                   + json.dumps(granted), file=sys.stderr, flush=True)
         os.execv("/bin/sh", ["/bin/sh", "-c", command])
     except Exception:

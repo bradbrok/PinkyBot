@@ -252,7 +252,7 @@ def _sweep_scopes(directory: int, *, deadline: float) -> None:
 
 def stage_env(
     env: dict[str, str], scope: str, nonce: str, *, deadline: float,
-    inherit: str = "all", granted: tuple[str, ...] = (),
+    inherit: str = "all", granted: tuple[str, ...] = (), codex_headers: bool = False,
 ) -> dict | None:
     lease = time.monotonic() + PUBLICATION_TIMEOUT
     _request_deadline(deadline)
@@ -265,8 +265,12 @@ def stage_env(
     ):
         raise ValueError("invalid launch grant names")
     _identity(scope, nonce)
-    populated = dict(env) if inherit == "none" else {k: v for k, v in env.items() if v != ""}
-    needs_payload = bool(populated) or inherit == "none"
+    if type(codex_headers) is not bool:
+        raise ValueError("invalid header environment policy")
+    populated = dict(env) if inherit == "none" or codex_headers else {
+        k: v for k, v in env.items() if v != ""
+    }
+    needs_payload = bool(populated) or inherit == "none" or codex_headers
     try:
         with _state_directory(create=needs_payload, deadline=lease) as (root, parent):
             _sweep_scopes(parent, deadline=lease)
@@ -275,6 +279,8 @@ def stage_env(
             directory = _directory(parent, scope, private=True, create=True, deadline=lease)
             try:
                 policy = {"inherit": "none", "granted": list(granted)} if inherit == "none" else {}
+                if codex_headers:
+                    policy["codex_headers"] = True
                 return _publish(populated, root / scope, directory, nonce, lease, policy=policy)
             finally:
                 os.close(directory)
@@ -334,7 +340,8 @@ def main() -> None:
         if action == "stage":
             result = stage_env(request["env"], request["scope"], request["nonce"],
                                deadline=request["deadline"], inherit=request.get("inherit", "all"),
-                               granted=tuple(request.get("granted", ())))
+                               granted=tuple(request.get("granted", ())),
+                               codex_headers=request.get("codex_headers", False))
         elif action == "cancel":
             cancel_env(request["scope"], request["nonce"])
             result = None
