@@ -135,6 +135,15 @@ class TestCronDescription:
 
 
 @pytest.fixture
+def daily_replay_clock(monkeypatch):
+    """Keep backdated wakes away from the 08:00 and 09:00 cron boundaries."""
+    origin = 1790535600.0  # 2026-09-27 12:00:00 America/Los_Angeles.
+    start = time.monotonic()
+    # Advance normally so strict age comparisons still see elapsed test time.
+    monkeypatch.setattr(time, "time", lambda: origin + (time.monotonic() - start))
+
+
+@pytest.fixture
 def registry():
     fd, path = tempfile.mkstemp(suffix=".db")
     os.close(fd)
@@ -5889,6 +5898,7 @@ class TestScheduler:
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("status", ["alive", "ok", "busy", "finishing"])
+    @pytest.mark.usefixtures("daily_replay_clock")
     async def test_fresh_heartbeat_drains_stranded_outbox(
         self, registry, status
     ):
@@ -6036,6 +6046,7 @@ class TestScheduler:
         ] == ["morning inbox"]
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("daily_replay_clock")
     async def test_persisted_fifo_replays_before_new_schedule_cohort(
         self, registry
     ):
@@ -6443,6 +6454,7 @@ class TestScheduler:
         ] == ["next session only"]
 
     @pytest.mark.asyncio
+    @pytest.mark.usefixtures("daily_replay_clock")
     async def test_canceled_cohort_waiting_for_boot_replay_is_persisted(
         self, registry
     ):
