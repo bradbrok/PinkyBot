@@ -36,7 +36,9 @@ ceiling expires. At the ceiling it is abandoned with
 `PASTED_PROMPT_UNKNOWN_RECEIPT_CEILING` and one owner alert; the marked fire is
 never replayed. Pre-marker rows retain the existing reconstructed-prompt probe.
 
-Rows spared by a parking pass start a fresh drain-attempt budget. A failed
-write for a targeted row retains the existing episode's attempt history.
+Rows fired after the newest targeted fire start a fresh drain-attempt budget.
+Rows sharing a targeted fire time (an attempt-cap tie) and targeted rows whose
+park write failed keep the episode's attempt history: they were present for
+every counted check.
 Owner-alert coverage still includes the observed cohort, so a younger row's
 later park does not generate a separate page for that same cohort.
