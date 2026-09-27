@@ -527,3 +527,18 @@ async def test_failed_write_ahead_marker_prevents_paste(registry, tmp_path, monk
         assert row.accepted_at == row.attempts == getattr(row, "pasted_at", 0) == 0
     finally:
         await ss.disconnect()
+
+
+def test_attempt_cap_parks_one_oldest_row_when_fire_times_tie(registry, clock):
+    first = fire(registry, name='first')
+    second = fire(registry, name='second')
+    assert first.id < second.id
+    clock.now = NOW + 1
+    engine = AgentScheduler(registry)
+    result = engine._drain_park_outbox_rows(
+        'worker', bound_reason='attempt cap',
+        state=_OutboxDrainExtensionState(NOW, attempts=30), oldest_age=1,
+    )
+    assert result == (1, 1)
+    assert registry.get_schedule_wake_by_fire(first.schedule_id, NOW).drain_parked_at > 0
+    assert registry.get_schedule_wake_by_fire(second.schedule_id, NOW).drain_parked_at == 0

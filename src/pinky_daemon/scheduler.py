@@ -2504,11 +2504,17 @@ class AgentScheduler:
             f"max_age={self._outbox_drain_extension_max_age_sec:.1f}s)"
         )
         now = state.oldest_fired_at + oldest_age
+        # The registry orders rows by (fired_at, id); equal fire times still
+        # identify distinct rows, and an attempt cap selects only the first.
+        oldest_id = next(
+            (row.id for row in pending_wakes if row.fired_at == state.oldest_fired_at),
+            None,
+        )
         pending_wakes = [
             row for row in pending_wakes
             if not row.pasted_at and (
                 now - row.fired_at >= self._outbox_drain_extension_max_age_sec
-                or (bound_reason == "attempt cap" and row.fired_at == state.oldest_fired_at)
+                or (bound_reason == "attempt cap" and row.id == oldest_id)
             )
         ]
         parked = 0
