@@ -220,11 +220,16 @@ async def test_tmux_stages_headers_privately_then_shell_delivers_and_unlinks(
     policy = isolated_launch_env.LaunchPolicy(
         mode="enforce" if clean else "off", status="isolated", agent_key="test-scoped-key",
     )
-    env = s._build_repl_env(launch_policy=policy)
-    result = await s._tmux.new_session(
-        cwd=str(home), command=s._build_claude_cmd(), env=env, **policy.spawn_options(env),
-    )
-    assert result.ok
+    monkeypatch.setattr(s, "_launch_env_policy", lambda: policy)
+    monkeypatch.setattr(s, "_select_command_runner", lambda *_: runner)
+    monkeypatch.setattr(s, "_prepare_tmux_spawn", Mock())
+    monkeypatch.setattr(s, "_start_tailer", AsyncMock())
+    monkeypatch.setattr(s, "_codex_dismiss_nux_and_ready", AsyncMock())
+    monkeypatch.setattr(s._tmux, "has_session", AsyncMock(side_effect=[False, True]))
+    monkeypatch.setattr(tmux_session, "_POST_SPAWN_LIVENESS_DELAY_SEC", 0)
+    monkeypatch.setattr(tmux_session, "_seed_claude_trust_file", lambda *_: False)
+    await s._spawn_tmux_repl()
+    assert len(recorder.tmux_calls) == 1
     for argv, _ in recorder.calls:
         assert TOKEN not in " ".join(argv), "neither tmux nor namespace helper argv carries a token"
     files = secret_files(home, TOKEN)
