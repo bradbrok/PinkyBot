@@ -44,6 +44,10 @@ EXPECTED = {
 
 @pytest.fixture
 def harness(tmp_path, monkeypatch):
+    # Only synthetic values may enter private staging or the fake provider's environment.
+    for key in tuple(os.environ):
+        if key not in {"PATH", "TMPDIR"}:
+            monkeypatch.delenv(key)
     home = tmp_path / "home"
     home.mkdir(mode=0o700)
     monkeypatch.setenv("HOME", str(home))
