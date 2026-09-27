@@ -2447,7 +2447,6 @@ class AgentScheduler:
             # bounded by the newest fire this parking pass targeted, so a
             # LATER fresh cohort still earns its own page.
             state.rekey_pending = True
-            state.rekey_boundary = float(summary["newest_fired_at"])
             _log(
                 "scheduler: OUTBOX_DRAIN_PARK_FAILURE re-listing active "
                 f"rows for '{agent_name}': {type(exc).__name__}: {exc}; "
@@ -2458,9 +2457,13 @@ class AgentScheduler:
                 # Every active row is settled or parked; this budget is
                 # done. Released rows start a fresh budget later.
                 self._outbox_drain_extensions.pop(agent_name, None)
+            elif remaining[0].fired_at > state.rekey_boundary:
+                # This row was spared by the park pass. It gets its own
+                # attempt budget; owner-page coverage remains agent-wide.
+                self._outbox_drain_extensions.pop(agent_name, None)
             else:
-                # One partial-park episode: keep alert dedup and attempt
-                # history, keyed to the oldest row that is REALLY active.
+                # A failed target keeps this episode's attempt history,
+                # keyed to the oldest row that is REALLY still active.
                 state.oldest_fired_at = remaining[0].fired_at
                 state.rekey_pending = False
         return True
@@ -2473,13 +2476,14 @@ class AgentScheduler:
         state: _OutboxDrainExtensionState,
         oldest_age: float,
     ) -> tuple[int, int] | None:
-        """Park every active row behind an expired drain budget (#635 B1).
+        """Park qualifying rows behind an expired drain budget (#635 B1).
 
         Parking replaces the old terminal abandonment: an idle agent behind a
         phantom busy signal never receives a delivery, so no late receipt can
         ever supersede a terminal state — abandonment there was silent loss.
         Parked rows stay recoverable and re-enter replay on delivery evidence.
 
+        Records the newest targeted fire in ``state.rekey_boundary``.
         Returns ``(targeted, parked)``, or ``None`` when the active rows
         could not even be listed — a listing failure must never read as an
         empty outbox. The caller re-reads the durable cohort afterwards; a
@@ -2518,6 +2522,12 @@ class AgentScheduler:
                 or (bound_reason == "attempt cap" and row.id == oldest_id)
             )
         ]
+        # Episode adoption covers only targeted rows, including failed
+        # UPDATEs. Spared younger rows must not inherit the old attempts.
+        # This is independent of the wider owner-page coverage watermark.
+        state.rekey_boundary = max(
+            (row.fired_at for row in pending_wakes), default=state.oldest_fired_at
+        )
         parked = 0
         for pending in pending_wakes:
             try:
