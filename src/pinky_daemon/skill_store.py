@@ -21,6 +21,7 @@ Storage: SQLite with four tables:
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import sqlite3
@@ -89,6 +90,26 @@ CHANGE_NOTICE_LABEL = (
 )
 
 
+NOTICE_MAX_SKILLS = 10
+NOTICE_NAME_MAX = 80
+NOTICE_MAX_BYTES = 4096
+
+
+def _quoted_name(name: str) -> tuple[str, bool]:
+    """``json.dumps(name)`` cut to at most ``NOTICE_NAME_MAX`` + 2 characters, and whether it was cut.
+
+    The cut is made on the raw name before quoting, so the result is always a
+    complete JSON string; escapes count toward the limit.
+    """
+    quoted = json.dumps(name)
+    if len(quoted) <= NOTICE_NAME_MAX + 2:
+        return quoted, False
+    keep = min(len(name), NOTICE_NAME_MAX - 3)
+    while keep > 0 and len(json.dumps(name[:keep] + "...")) > NOTICE_NAME_MAX + 2:
+        keep -= 1
+    return json.dumps(name[:keep] + "..."), True
+
+
 def render_change_notice(changes: list[tuple[str, str, str]]) -> str:
     """Render the notice for ``(name, old directive, new directive)`` changes.
 
@@ -96,27 +117,113 @@ def render_change_notice(changes: list[tuple[str, str, str]]) -> str:
     from it (names and change-log entries) is rendered with ``json.dumps``
     inside a block labelled as quoted data. The only instruction, to reload
     the skills, comes after that block.
+
+    The notice is bounded: at most ``NOTICE_MAX_SKILLS`` names are listed
+    (then "and K more"), each quoted name is cut to ``NOTICE_NAME_MAX``
+    characters, quoted entries are added only while the whole notice stays
+    within ``NOTICE_MAX_BYTES`` UTF-8 bytes, and the order is always the
+    header, the labelled block, then the instruction last. When names are
+    left out or cut, the instruction asks for a reload of the agent's skills
+    instead of naming ``load_skill`` calls that could not be exact.
     """
-    names = [json.dumps(name) for name, _, _ in changes]
-    lines = [
+    listed = changes[:NOTICE_MAX_SKILLS]
+    extra = len(changes) - len(listed)
+    quoted_names = [_quoted_name(name) for name, _, _ in listed]
+    names = [q for q, _ in quoted_names]
+    header = (
         "[skill changed] The catalog text of "
         + ("this skill" if len(changes) == 1 else "these skills")
-        + " was updated: " + ", ".join(names) + "."
-    ]
-    quoted = []
-    for name, before, after in changes:
+        + " was updated: " + ", ".join(names)
+        + (f" and {extra} more" if extra else "") + "."
+    )
+    if extra or any(cut for _, cut in quoted_names):
+        instruction = (
+            "The copies in your context are out of date: reload your skills "
+            "(load_skill for each one you use) before you next use them."
+        )
+    else:
+        instruction = (
+            "The copy in your context is out of date: reload with "
+            + ", ".join(f"load_skill({n})" for n in names)
+            + " before you next use it."
+        )
+    entries = []
+    for (name, before, after), quoted in zip(listed, names):
         entry = new_change_line(before, after)
         if entry:
-            quoted.append(f"  {json.dumps(name)}: {json.dumps(entry)}")
-    if quoted:
+            entries.append(f"  {quoted}: {json.dumps(entry)}")
+
+    def size(lines: list[str]) -> int:
+        return len("\n".join(lines).encode("utf-8"))
+
+    block: list[str] = []
+    for n, line in enumerate(entries):
+        left = len(entries) - n - 1
+        note = [f"  ({left} more entries not shown)"] if left else []
+        if size([header, CHANGE_NOTICE_LABEL, *block, line, *note, instruction]) > NOTICE_MAX_BYTES:
+            break
+        block.append(line)
+    if len(block) < len(entries):
+        block.append(f"  ({len(entries) - len(block)} more entries not shown)")
+    lines = [header]
+    if block and any(not b.startswith("  (") for b in block):
         lines.append(CHANGE_NOTICE_LABEL)
-        lines.extend(quoted)
-    lines.append(
-        "The copy in your context is out of date: reload with "
-        + ", ".join(f"load_skill({n})" for n in names)
-        + " before you next use it."
-    )
+        lines.extend(block)
+    lines.append(instruction)
     return "\n".join(lines)
+
+
+SKILL_NOTICE_INJECT_TIMEOUT = 30.0
+
+
+class SkillChangeNotifier:
+    """One notifier per daemon: coalesce skill text changes and deliver them in order.
+
+    ``submit`` never blocks and never spawns more than one worker. Changes are
+    kept in a map keyed by skill name, so repeated edits of one skill while a
+    delivery is running collapse into a single pending entry that keeps the
+    oldest text seen and the latest text. At most one delivery runs at a time
+    and at most one follow-up run is owed. ``deliver`` receives the list of
+    ``(name, old directive, new directive)`` changes; its failures are logged,
+    never raised.
+    """
+
+    def __init__(self, deliver, log=None) -> None:
+        self._deliver = deliver
+        self._log = log
+        self._pending: dict[str, tuple[str, str, str]] = {}
+        self._task: asyncio.Task | None = None
+
+    @property
+    def pending(self) -> int:
+        return len(self._pending)
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def submit(self, changes: list[tuple[str, str, str]]) -> None:
+        for name, before, after in changes:
+            prev = self._pending.get(name)
+            self._pending[name] = (name, prev[1] if prev else before, after)
+        if not self._pending or self.running:
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._task = loop.create_task(self._run())
+
+    async def _run(self) -> None:
+        while self._pending:
+            batch = list(self._pending.values())
+            self._pending.clear()
+            try:
+                await self._deliver(batch)
+            except Exception as exc:  # noqa: BLE001
+                if self._log:
+                    names = ", ".join(c[0] for c in batch)
+                    self._log(f"skills: change notice for {names} failed: {type(exc).__name__}: {exc}")
 
 
 def _log(msg: str) -> None:
