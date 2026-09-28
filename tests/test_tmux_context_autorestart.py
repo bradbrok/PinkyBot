@@ -265,17 +265,13 @@ def test_bound_empty_1m_set_is_authoritative_and_read_failure_uses_fallback(
         def get_1m_models(self):
             raise RuntimeError("registry unavailable")
 
-    runtime_model_catalog.reset_for_tests()
-    try:
-        runtime_model_catalog.bind_registry(EmptyRegistry())
-        assert is_1m_model("claude-opus-4-8") is False
-        runtime_model_catalog.bind_registry(UnavailableRegistry())
-        assert is_1m_model("claude-opus-4-8") is True
-        stderr = capsys.readouterr().err
-        assert "ERROR" in stderr
-        assert "registry unavailable" in stderr
-    finally:
-        runtime_model_catalog.reset_for_tests()
+    runtime_model_catalog.bind_registry(EmptyRegistry())
+    assert is_1m_model("claude-opus-4-8") is False
+    runtime_model_catalog.bind_registry(UnavailableRegistry())
+    assert is_1m_model("claude-opus-4-8") is True
+    stderr = capsys.readouterr().err
+    assert "ERROR" in stderr
+    assert "registry unavailable" in stderr
 
 
 def test_db_1m_lookup_strips_tier_without_fabricating_membership() -> None:
@@ -286,13 +282,9 @@ def test_db_1m_lookup_strips_tier_without_fabricating_membership() -> None:
         def get_1m_models(self):
             return {"runtime-million-model"}
 
-    runtime_model_catalog.reset_for_tests()
-    try:
-        runtime_model_catalog.bind_registry(Registry())
-        assert is_1m_model("runtime-million-model[1m]") is True
-        assert is_1m_model("runtime-ordinary-model[1m]") is False
-    finally:
-        runtime_model_catalog.reset_for_tests()
+    runtime_model_catalog.bind_registry(Registry())
+    assert is_1m_model("runtime-million-model[1m]") is True
+    assert is_1m_model("runtime-ordinary-model[1m]") is False
 
 
 def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
@@ -300,7 +292,6 @@ def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
     from pinky_daemon.agent_registry import AgentRegistry
 
     registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
-    runtime_model_catalog.reset_for_tests()
     try:
         model = {
             "provider": "custom",
@@ -330,7 +321,6 @@ def test_long_lived_session_observes_1m_add_flip_and_delete(tmp_path) -> None:
         assert registry.delete_model("runtime-window-model") is True
         assert session._raw_max_tokens_for_model() == 200_000
     finally:
-        runtime_model_catalog.reset_for_tests()
         registry.close()
 
 

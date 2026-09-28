@@ -5,7 +5,7 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pinky_daemon.transport_state import SessionState, Trigger
-from tests.recovery_test_support import closure_value, set_flags
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, closure_value, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
 
 
@@ -71,7 +71,7 @@ async def test_teardown_quiesces_recovery_before_replacing(
 
     monkeypatch.setattr(asyncio, "sleep", sleep)
     task = asyncio.create_task(old.attempt_reconnect())
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     h.app.state.agents.register(
         "sample", runtime="codex_cli" if source == "claude_sdk" else "claude_sdk",
     )
@@ -136,7 +136,7 @@ async def test_terminal_sinks_quiesce_owned_backoff(
     monkeypatch.setattr(asyncio, "sleep", pause)
     task = asyncio.create_task(old.attempt_reconnect())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         await terminal_entry(h, entry, label)
         assert owner[0].done(), "Terminal sink returned before its recovery owner stopped"
         assert old._state_machine._in_flight is None
@@ -303,7 +303,7 @@ async def test_terminal_stop_quiesces_tmux_recovery(lifecycle_harness, monkeypat
     monkeypatch.setattr(asyncio, "sleep", pause)
     task = asyncio.create_task(old.attempt_reconnect(trigger=Trigger.WATCHDOG))
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         await terminal_entry(h, "stop", "main")
         assert owner[0].done(), "Terminal stop left a tmux recovery owner alive"
         assert old._state_machine._in_flight is None
@@ -335,7 +335,7 @@ async def test_terminal_teardown_waits_for_cancellation_ack(lifecycle_harness, m
 
     monkeypatch.setattr(asyncio, "sleep", pause)
     task = asyncio.create_task(ss.attempt_reconnect())
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     teardown = asyncio.create_task(terminal_entry(h, entry, ss._config.label))
     try:
         # Either cancellation starts or the terminal call wrongly returns.

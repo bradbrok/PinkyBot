@@ -9,8 +9,8 @@ import pytest
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.tmux_session import TmuxSession, _QueuedTurn
 from pinky_daemon.transport_state import SessionState
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
-from tests.recovery_test_support import set_flags
 
 _TMUX_SPAWN = TmuxSession._spawn_tmux_repl
 _CODEX_TMUX_SPAWN = CodexTmuxSession._spawn_tmux_repl
@@ -59,7 +59,7 @@ async def test_real_spawn_stops_after_revoked_external_await(
     caller = asyncio.create_task(ss.force_restart())
     stop = waiter = None
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         stop = asyncio.create_task(h.client.post("/agents/sample/stop"))
         waiter = asyncio.create_task(cancelled.wait())
         await asyncio.wait({stop, waiter}, timeout=2, return_when=asyncio.FIRST_COMPLETED)
@@ -169,7 +169,7 @@ async def test_startup_refusal_after_initialize_settles_cold_token(lifecycle_har
     h.control.start_hook = spawn
     connect = asyncio.create_task(ss.connect())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         assert ss.state == SessionState.BOOTING
         await ss.retire_transport()
         release.set()

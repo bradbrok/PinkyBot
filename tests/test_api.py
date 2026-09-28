@@ -9509,14 +9509,6 @@ class TestRuntimeModelCatalogAPI:
         "cache_write_1h_price",
     )
 
-    @pytest.fixture(autouse=True)
-    def _isolated_runtime_catalog(self):
-        from pinky_daemon import runtime_model_catalog
-
-        runtime_model_catalog.reset_for_tests()
-        yield
-        runtime_model_catalog.reset_for_tests()
-
     @staticmethod
     def _model_body(*, provider: str, model_id: str, price: float = 1.0) -> dict:
         return {
@@ -9646,37 +9638,33 @@ class TestRuntimeModelCatalogAPI:
         from pinky_daemon.pricing import lookup_rate
         from pinky_daemon.streaming_session import is_1m_model
 
-        runtime_model_catalog.reset_for_tests()
         app = self._make_app(tmp_path)
-        try:
-            with TestClient(app) as client:
-                initial = self._model_body(
-                    provider="custom",
-                    model_id="runtime-cache-api-model",
-                    price=3.0,
-                ) | {"is_1m": True, "context_window": 1_000_000}
-                assert client.post("/models", json=initial).status_code == 200
-                assert lookup_rate("runtime-cache-api-model")["input"] == 3.0
-                assert is_1m_model("runtime-cache-api-model[1m]") is True
+        with TestClient(app) as client:
+            initial = self._model_body(
+                provider="custom",
+                model_id="runtime-cache-api-model",
+                price=3.0,
+            ) | {"is_1m": True, "context_window": 1_000_000}
+            assert client.post("/models", json=initial).status_code == 200
+            assert lookup_rate("runtime-cache-api-model")["input"] == 3.0
+            assert is_1m_model("runtime-cache-api-model[1m]") is True
 
-                updated = initial | {
-                    "input_price": 8.0,
-                    "is_1m": False,
-                    "context_window": 200_000,
-                }
-                assert client.post("/models", json=updated).status_code == 200
-                assert lookup_rate("runtime-cache-api-model")["input"] == 8.0
-                assert is_1m_model("runtime-cache-api-model[1m]") is False
+            updated = initial | {
+                "input_price": 8.0,
+                "is_1m": False,
+                "context_window": 200_000,
+            }
+            assert client.post("/models", json=updated).status_code == 200
+            assert lookup_rate("runtime-cache-api-model")["input"] == 8.0
+            assert is_1m_model("runtime-cache-api-model[1m]") is False
 
-                deleted = client.delete("/models/runtime-cache-api-model")
-                assert deleted.status_code == 200
-                with pytest.raises(
-                    runtime_model_catalog.ModelCatalogError, match="is inactive"
-                ):
-                    lookup_rate("runtime-cache-api-model")
-                assert is_1m_model("runtime-cache-api-model") is False
-        finally:
-            runtime_model_catalog.reset_for_tests()
+            deleted = client.delete("/models/runtime-cache-api-model")
+            assert deleted.status_code == 200
+            with pytest.raises(
+                runtime_model_catalog.ModelCatalogError, match="is inactive"
+            ):
+                lookup_rate("runtime-cache-api-model")
+            assert is_1m_model("runtime-cache-api-model") is False
 
     def test_composition_binds_registry_before_analytics_initializes(self):
         from pinky_daemon.api import create_api

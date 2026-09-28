@@ -6,8 +6,8 @@ import pytest
 
 from pinky_daemon.streaming_session import StreamingSession
 from pinky_daemon.transport_state import SessionState
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
-from tests.recovery_test_support import set_flags
 
 
 @pytest.mark.parametrize("destination_transport", ["sdk", "tmux"])
@@ -48,7 +48,7 @@ async def test_backoff_owner_cannot_resurrect_after_replacement(
 
     monkeypatch.setattr(h.app.state.broker, "register_streaming", publish)
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         h.app.state.agents.register(
             "sample",
             runtime=("codex_cli" if source == "claude_sdk" else "claude_sdk"),
@@ -142,7 +142,7 @@ async def test_replacement_quiesces_owner_with_failsafe_disabled(
         h.control.start_hook = start
     reconnect = asyncio.create_task(old.attempt_reconnect())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         h.app.state.agents.register(
             "sample", runtime=("codex_cli" if source == "claude_sdk" else "claude_sdk")
         )
@@ -219,7 +219,7 @@ async def test_cancelled_recovery_settles_token_and_state(lifecycle_harness, mon
 
     monkeypatch.setattr(asyncio, "sleep", pause)
     task = asyncio.create_task(old.attempt_reconnect())
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     task.cancel()
     await asyncio.gather(task, return_exceptions=True)
     assert old.state == SessionState.DEAD
@@ -245,7 +245,7 @@ async def test_concurrent_reconnect_callers_share_one_owner(lifecycle_harness, m
 
     monkeypatch.setattr(asyncio, "sleep", pause)
     first = asyncio.create_task(old.attempt_reconnect())
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     second = asyncio.create_task(old.attempt_reconnect())
     try:
         await real_sleep(0)
@@ -289,7 +289,7 @@ async def test_replacement_stops_owner_with_two_reconnect_callers(lifecycle_harn
     first = asyncio.create_task(old.attempt_reconnect())
     second = None
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         second = asyncio.create_task(old.attempt_reconnect())
         for _ in range(3):
             await real_sleep(0)
@@ -334,7 +334,7 @@ async def test_target_preflight_failure_does_not_cancel_old_recovery(
     monkeypatch.setattr("pinky_daemon.codex_tmux_session.validate_agent_codex_home", invalid_home)
     task = asyncio.create_task(old.attempt_reconnect())
     try:
-        await asyncio.wait_for(entered.wait(), 1)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         h.app.state.agents.register("sample", runtime="codex_cli", transport="tmux")
         response = await h.client.post("/admin/force-restart-agent/sample")
         assert response.status_code >= 400
@@ -365,13 +365,13 @@ async def test_replacement_awaits_delayed_owner_cancellation(lifecycle_harness, 
 
     h.control.start_hook = external_start
     recovery = asyncio.create_task(old.attempt_reconnect())
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     h.app.state.agents.register(
         "sample", runtime="codex_cli" if source == "claude_sdk" else "claude_sdk",
     )
     replacement = asyncio.create_task(h.client.post("/admin/force-restart-agent/sample"))
     try:
-        await asyncio.wait_for(cancelling.wait(), 1)
+        await asyncio.wait_for(cancelling.wait(), EVENT_WAIT_TIMEOUT)
         await asyncio.sleep(0)
         assert not any(action == "connect" and ss is not old for action, ss in h.trace), (
             "Replacement started before old owner acknowledged cancellation"

@@ -265,11 +265,7 @@ def test_gpt_55_and_codex_cache_write_bills_zero() -> None:
 def bound_runtime_catalog():
     from pinky_daemon import runtime_model_catalog
 
-    runtime_model_catalog.reset_for_tests()
-    try:
-        yield runtime_model_catalog
-    finally:
-        runtime_model_catalog.reset_for_tests()
+    yield runtime_model_catalog
 
 
 def _add_runtime_model(registry, model_id: str, *, input_price: float) -> None:
