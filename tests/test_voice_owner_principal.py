@@ -7,12 +7,14 @@ from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
+from fastapi import HTTPException, Request
 from fastapi.testclient import TestClient
 
 import pinky_daemon.voice_engine as voice_engine
 import pinky_daemon.voice_routes as voice_routes
 from pinky_daemon.api import create_api
 from pinky_daemon.auth import (
+    OWNER_SESSION_USER,
     SESSION_COOKIE_NAME,
     build_internal_auth_headers,
     create_session_cookie,
@@ -95,6 +97,50 @@ def assert_no_effect(api, before):
     api.dial.assert_not_awaited()
     api.pending_notice.assert_not_awaited()
     api.approved_notice.assert_not_awaited()
+
+
+@pytest.mark.parametrize("explicit_requester", [False, True])
+def test_non_owner_session_cannot_propose(voice_api, explicit_requester):
+    api = voice_api
+    api.client.cookies.set(SESSION_COOKIE_NAME, create_session_cookie(UI_SECRET, user="other"))
+    assert api.client.get("/auth/status").json()["authenticated"] is True
+    body = proposal(requested_by_agent=api.trusted) if explicit_requester else proposal()
+    response = api.client.post("/api/voice/request", json=body)
+    assert response.status_code == 403, response.text
+    assert_no_effect(api, [])
+
+
+@pytest.mark.parametrize("explicit_requester", [False, True])
+def test_owner_session_can_propose(voice_api, explicit_requester):
+    api = voice_api
+    login_owner(api)
+    body = proposal(requested_by_agent=api.trusted) if explicit_requester else proposal()
+    response = api.client.post("/api/voice/request", json=body)
+    assert response.status_code == 200, response.text
+    row = api.store.get_call_request(response.json()["request_id"])
+    assert row.approval_state == "approved"
+    assert row.authorized_by == "auto_approve"
+    api.dial.assert_awaited_once()
+    api.approved_notice.assert_awaited_once()
+    api.pending_notice.assert_not_awaited()
+
+
+@pytest.mark.parametrize(
+    "gate,caller,allowed",
+    [("session", "tenant", False), ("internal_hmac", "", False), ("session", "", True)],
+)
+def test_owner_predicate_checks_each_principal_component(gate, caller, allowed):
+    request = Request({"type": "http"})
+    request.state.auth_gate = gate
+    request.state.auth_user = OWNER_SESSION_USER
+    if caller:
+        request.state.internal_caller = caller
+    if allowed:
+        assert voice_routes._require_owner_principal(request) == f"ui:{OWNER_SESSION_USER}"
+    else:
+        with pytest.raises(HTTPException) as exc:
+            voice_routes._require_owner_principal(request)
+        assert exc.value.status_code == 403
 
 
 @pytest.mark.parametrize("action", ["approve", "deny", "cancel"])
