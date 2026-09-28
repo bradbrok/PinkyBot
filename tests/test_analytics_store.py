@@ -826,7 +826,6 @@ class TestRuntimeCatalogPricing:
         from pinky_daemon.agent_registry import AgentRegistry
 
         registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
-        runtime_model_catalog.reset_for_tests()
         try:
             registry.add_model(
                 provider="anthropic",
@@ -869,7 +868,6 @@ class TestRuntimeCatalogPricing:
             )
             assert store.get_overview(range_name="7d")["totals"]["cost_usd"] == 7.0
         finally:
-            runtime_model_catalog.reset_for_tests()
             registry.close()
 
     def test_runtime_catalog_wins_over_stale_analytics_seed(self, tmp_path):
@@ -877,7 +875,6 @@ class TestRuntimeCatalogPricing:
         from pinky_daemon.agent_registry import AgentRegistry
 
         registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
-        runtime_model_catalog.reset_for_tests()
         try:
             registry.add_model(
                 provider="anthropic",
@@ -902,7 +899,6 @@ class TestRuntimeCatalogPricing:
             )
             assert store.get_overview(range_name="7d")["totals"]["cost_usd"] == 11.0
         finally:
-            runtime_model_catalog.reset_for_tests()
             registry.close()
 
     def test_current_seed_rows_are_derived_without_latest_additions_list(self, tmp_path):
@@ -1001,7 +997,6 @@ class TestRuntimeCatalogPricing:
         from pinky_daemon.agent_registry import AgentRegistry
 
         registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
-        runtime_model_catalog.reset_for_tests()
         try:
             runtime_model_catalog.bind_registry(registry)
             assert registry.delete_model("claude-opus-4-8") is True
@@ -1023,5 +1018,4 @@ class TestRuntimeCatalogPricing:
                 ).fetchone()
             assert store._compute_usage_cost(row) is None
         finally:
-            runtime_model_catalog.reset_for_tests()
             registry.close()

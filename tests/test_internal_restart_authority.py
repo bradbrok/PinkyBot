@@ -7,8 +7,8 @@ from unittest.mock import AsyncMock
 import pytest
 
 from pinky_daemon.transport_state import SessionState
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
-from tests.recovery_test_support import set_flags
 
 
 @pytest.mark.parametrize("mode", ["a", "b", "both"])
@@ -54,7 +54,7 @@ async def test_retirement_awaits_suspended_internal_restart(
     caller = asyncio.create_task(ss.force_restart())
     stop = waiter = None
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         owner = calls[0]
         stop = asyncio.create_task(h.client.post("/agents/sample/stop"))
         waiter = asyncio.create_task(cancelled.wait())
@@ -109,7 +109,7 @@ async def test_real_sdk_context_restart_is_owned(lifecycle_harness, monkeypatch,
     h.control.start_hook = spawn
     trigger = asyncio.create_task(ss._check_context())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         assert (await h.client.post("/agents/sample/stop")).status_code == 200
         release.set()
         await trigger
@@ -195,7 +195,7 @@ async def test_internal_restart_generation_loss_stops_publication(
     h.control.start_hook = spawn
     task = asyncio.create_task(ss.force_restart())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         # Supersede authority without inhibition so the generation check itself
         # must reject this completion, independently of terminal entry guards.
         ss._recovery_generation = getattr(ss, "_recovery_generation", 0) + 1
@@ -231,7 +231,7 @@ async def test_internal_restart_waiter_cancellation_does_not_cancel_owner(
     waiter = asyncio.create_task(ss.force_restart())
     observer = None
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         waiter.cancel()
         await asyncio.gather(waiter, return_exceptions=True)
         assert not owners[0].done(), "Cancelling a waiter cancelled transport recovery"
@@ -299,7 +299,7 @@ async def test_terminal_refuses_internal_restart_that_has_not_settled(
     h.control.start_hook = spawn
     task = asyncio.create_task(ss.force_restart())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         try:
             response = await h.client.post("/agents/sample/stop")
             assert response.status_code >= 400, "Terminal stop ignored unsettled restart"
@@ -386,7 +386,7 @@ async def test_reconnect_joins_active_internal_restart(lifecycle_harness, source
     force = asyncio.create_task(ss.force_restart())
     reconnect = observer = None
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         reconnect = asyncio.create_task(ss.attempt_reconnect())
         observer = asyncio.create_task(duplicate.wait())
         await asyncio.wait({reconnect, observer}, timeout=0.05, return_when=asyncio.FIRST_COMPLETED)

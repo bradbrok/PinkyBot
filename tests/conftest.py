@@ -161,6 +161,18 @@ def _ensure_test_session_secret():
 
 
 @pytest.fixture(autouse=True)
+def _isolate_runtime_model_catalog():
+    """Release process-wide registry bindings at each test boundary."""
+    from pinky_daemon import runtime_model_catalog
+
+    runtime_model_catalog.reset_for_tests()
+    try:
+        yield
+    finally:
+        runtime_model_catalog.reset_for_tests()
+
+
+@pytest.fixture(autouse=True)
 def _isolate_temporary_files(tmp_path, monkeypatch):
     """Keep fixed-name companion databases private to each test's app instances."""
     temporary_root = tmp_path / "tempfiles"

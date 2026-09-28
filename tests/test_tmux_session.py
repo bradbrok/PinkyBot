@@ -13734,7 +13734,6 @@ async def test_soft_deleted_model_turn_keeps_tokens_with_pricing_error(
     from pinky_daemon.pricing import lookup_rate
 
     registry = AgentRegistry(db_path=str(tmp_path / "agents.db"))
-    runtime_model_catalog.reset_for_tests()
     try:
         registry.register("dymok", working_dir=str(tmp_path / "dymok"))
         if runtime_only:
@@ -13778,5 +13777,4 @@ async def test_soft_deleted_model_turn_keeps_tokens_with_pricing_error(
         assert "ERROR" in stderr
         assert f"{full_id} is inactive" in stderr
     finally:
-        runtime_model_catalog.reset_for_tests()
         registry.close()

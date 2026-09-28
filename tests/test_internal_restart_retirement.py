@@ -3,8 +3,8 @@ import asyncio
 import pytest
 
 from pinky_daemon.transport_state import SessionState
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
-from tests.recovery_test_support import set_flags
 
 
 @pytest.mark.parametrize("mode", ["a", "b", "both", "off"])
@@ -60,7 +60,7 @@ async def test_terminal_stop_joins_internal_force_restart(lifecycle_harness, sou
     h.control.start_hook = pause_start
     task = asyncio.create_task(ss.force_restart())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         response = await h.client.post("/agents/sample/stop")
         assert response.status_code == 200
         assert (await h.client.post("/agents/sample/streaming-sessions")).status_code == 200
@@ -100,7 +100,7 @@ async def test_terminal_stop_joins_real_tmux_watchdog_restart(
     ss._head_started_at = 1.0
     ss._watchdog_task = asyncio.create_task(ss._inflight_watchdog())
     try:
-        await asyncio.wait_for(entered.wait(), 2)
+        await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
         assert ss._stats["turn_timeouts"] == 1
         assert (await h.client.post("/agents/sample/stop")).status_code == 200
         assert (await h.client.post("/agents/sample/streaming-sessions")).status_code == 200

@@ -5,7 +5,7 @@ import asyncio
 import pytest
 
 from pinky_daemon.transport_state import SessionState
-from tests.recovery_test_support import closure_value, set_flags
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, closure_value, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
 
 
@@ -68,7 +68,7 @@ async def test_direct_connect_refuses_while_terminal_owner_is_quiescing(
 
     monkeypatch.setattr(asyncio, "sleep", pause)
     task = asyncio.create_task(ss.attempt_reconnect())
-    await asyncio.wait_for(entered.wait(), 2)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     stop = asyncio.create_task(h.client.post("/agents/sample/stop"))
     waiter = asyncio.create_task(cancelled.wait())
     try:

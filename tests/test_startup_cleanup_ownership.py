@@ -8,7 +8,7 @@ from fastapi import HTTPException
 from pinky_daemon.codex_tmux_session import CodexTmuxSession
 from pinky_daemon.streaming_session import StreamingSession
 from pinky_daemon.transport_state import SessionState
-from tests.recovery_test_support import closure_value, set_flags
+from tests.recovery_test_support import EVENT_WAIT_TIMEOUT, closure_value, set_flags
 from tests.recovery_test_support import lifecycle_harness as lifecycle_harness
 
 
@@ -121,7 +121,7 @@ async def test_interrupted_cold_start_retains_cleanup_owner(
     if failure == "timeout":
         monkeypatch.setattr("pinky_daemon.api.COLD_START_CONNECT_TIMEOUT_SEC", 0.02)
     start = asyncio.create_task(h.app.state.broker._ensure_session_callback("sample"))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     if failure == "cancel":
         start.cancel()
     outcome = await asyncio.gather(start, return_exceptions=True)
@@ -214,7 +214,7 @@ async def test_concurrent_create_and_ensure_share_one_startup_owner(lifecycle_ha
     h.control.start_hook = pause
     before = len(h.clients)
     create = asyncio.create_task(h.client.post("/agents/sample/streaming-sessions"))
-    await asyncio.wait_for(entered.wait(), 1)
+    await asyncio.wait_for(entered.wait(), EVENT_WAIT_TIMEOUT)
     ensure = asyncio.create_task(h.app.state.broker._ensure_session_callback("sample"))
     await asyncio.sleep(0)
     release.set()

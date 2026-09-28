@@ -19,6 +19,9 @@ from pinky_daemon.streaming_session import StreamingSession, StreamingSessionCon
 from pinky_daemon.tmux_session import TmuxSession
 from pinky_daemon.transport_state import SessionState
 
+# These waits bound cross-task progress; they do not assert elapsed time.
+EVENT_WAIT_TIMEOUT = 30.0
+
 CLASSES = {
     ("claude_sdk", "sdk"): StreamingSession,
     ("claude_sdk", "tmux"): TmuxSession,
