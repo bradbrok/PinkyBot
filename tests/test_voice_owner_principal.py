@@ -270,3 +270,13 @@ def test_propose_tool_signs_the_requesting_identity(voice_api, monkeypatch, shar
     assert result["approval_state"] == "pending_approval"
     assert api.store.get_call_request(result["request_id"]).requested_by_agent == "tenant"
     api.dial.assert_not_awaited()
+
+
+@pytest.mark.parametrize("action", ["approve", "deny", "cancel"])
+def test_auto_approval_requester_still_needs_owner_for_decisions(voice_api, action):
+    api = voice_api
+    request = seed_request(api)
+    before = [request.to_dict()]
+    response = signed_post(api, f"/api/voice/request/{request.id}/{action}", {}, api.trusted)
+    assert response.status_code == 403, response.text
+    assert_no_effect(api, before)
