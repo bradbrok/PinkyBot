@@ -5533,9 +5533,9 @@ def create_api(
 
         Only reached after _has_valid_internal_auth succeeds, so ``caller_name``
         is the verified signed identity (the signature binds the name). The
-        cheap path checks short-circuit BEFORE any registry lookup, so the hot
-        path pays no extra DB read. Only a fleet catalog write or a genuine
-        cross-agent target triggers the isolated-flag lookup.
+        cheap path checks short-circuit BEFORE any registry lookup. Admin
+        routes (including reads), registration, fleet catalog writes and
+        cross-agent targets trigger the isolated-flag lookup.
 
         Body-actor surfaces (/broker/*, where the sender is named in the request
         body, not the path) are NOT covered here — they're enforced in the
@@ -5546,11 +5546,23 @@ def create_api(
         Defense-in-depth on top of tool-gating: isolated agents are provisioned
         without admin/register gates, but this enforces the tenant boundary at
         the daemon regardless of what tools the agent manages to invoke. A
-        missing caller row fails closed for fleet catalog writes only; existing
-        cross-agent behavior remains unchanged.
+        missing caller row fails closed for admin/registration and fleet
+        catalog writes; existing cross-agent behavior remains unchanged.
         """
         if not caller_name:
             return False
+        # Always-on admin boundary. ASGI already decoded the path; collapse
+        # repeated slashes for this deny check only, without changing routing.
+        path = re.sub(r"/+", "/", request.scope["path"])
+        admin_action = path == "/admin" or path.startswith("/admin/")
+        admin_action = admin_action or (request.method == "POST" and path.rstrip("/") == "/agents")
+        if admin_action:
+            try:
+                caller = agents.get(caller_name)
+            except Exception:
+                return True
+            return caller is None or bool(getattr(caller, "isolated", True))
+
         fleet_write = _isolation_fleet_write(request.method, request.url.path)
         target = _isolation_path_target(request.url.path)
         if not fleet_write and target is None:

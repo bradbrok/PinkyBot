@@ -3866,13 +3866,11 @@ class AgentScheduler:
     async def _poll_url_trigger(self, trigger, now: float) -> None:
         """Poll a single url trigger and fire if its condition is met."""
         import urllib.error
-        import urllib.request
+
+        from pinky_daemon.trigger_fetch import open_trigger_url
 
         def _fetch() -> tuple[int, str]:
-            req = urllib.request.Request(
-                trigger.url, method=trigger.method or "GET",
-            )
-            with urllib.request.urlopen(req, timeout=5) as resp:
+            with open_trigger_url(trigger.url, method=trigger.method or "GET", timeout=5) as resp:
                 body_bytes = resp.read(65536)  # cap at 64KB
                 return resp.status, body_bytes.decode(errors="replace")
 
