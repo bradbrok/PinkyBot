@@ -7031,6 +7031,46 @@ npm run build</pre>
     from pinky_daemon.routes.skills import router as _skills_router
     from pinky_daemon.routes.skills import set_dependencies as _skills_set_deps
 
+    async def _send_skill_change_notices(changes: list[tuple[str, str, str]]) -> None:
+        """Tell each live agent session whose skills changed text, one message per agent.
+
+        An agent is told about a skill only when the skill is effectively on
+        for it (direct assignment or shared, minus opt outs and globally
+        disabled skills). A session that is not live gets nothing: it reads
+        the current catalog copy the next time it loads the skill. Each inject
+        is bounded by a timeout so one stalled session cannot hold the
+        notifier.
+        """
+        from pinky_daemon.skill_store import SKILL_NOTICE_INJECT_TIMEOUT, render_change_notice
+
+        for agent in agents.list(enabled_only=True):
+            try:
+                effective = {
+                    row["name"] for row in skills.get_agent_skills(agent.name, enabled_only=True)
+                }
+                mine = [c for c in changes if c[0] in effective]
+                if not mine:
+                    continue
+                text = render_change_notice(mine)
+                result = await asyncio.wait_for(
+                    broker.inject_agent_message("system", agent.name, text),
+                    timeout=SKILL_NOTICE_INJECT_TIMEOUT,
+                )
+                _log(
+                    f"skills: change notice {[c[0][:80] for c in mine[:10]]} -> {agent.name} "
+                    f"delivered={result.delivered}"
+                )
+            except Exception as exc:  # noqa: BLE001
+                _log(
+                    f"skills: change notice -> {agent.name} failed: "
+                    f"{type(exc).__name__}: {exc}"
+                )
+
+    from pinky_daemon.skill_store import SkillChangeNotifier
+
+    _skill_notifier = SkillChangeNotifier(_send_skill_change_notices, log=_log)
+    app.state.skill_notifier = _skill_notifier
+
     _skills_set_deps(
         skills=skills,
         plugins=plugins,
@@ -7038,6 +7078,7 @@ npm run build</pre>
         manager=manager,
         pinky_root=_pinky_root,
         log=_log,
+        on_text_changed=_skill_notifier.submit,
     )
     app.include_router(_skills_router)
 
@@ -14044,6 +14085,7 @@ npm run build</pre>
         if rotation_task is not None:
             rotation_task.cancel()
             await asyncio.gather(rotation_task, return_exceptions=True)
+        await app.state.skill_notifier.aclose()
         app.state.access_log.close()
         await broker.stop_approval_notification_retries()
 
