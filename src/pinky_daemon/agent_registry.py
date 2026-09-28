@@ -1174,6 +1174,8 @@ sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 body = {{
     "session_id": payload_in.get("session_id", ""),
+    "agent_id": payload_in.get("agent_id", ""),
+    "agent_type": payload_in.get("agent_type", ""),
     "tool_use_id": payload_in.get("tool_use_id", ""),
     "tool_name": tool_name,
     "tool_input": payload_in.get("tool_input") or {{}},
@@ -1255,6 +1257,8 @@ sig = base64.urlsafe_b64encode(digest).decode().rstrip("=")
 
 body = {{
     "session_id": payload_in.get("session_id", ""),
+    "agent_id": payload_in.get("agent_id", ""),
+    "agent_type": payload_in.get("agent_type", ""),
     "tool_use_id": payload_in.get("tool_use_id", ""),
     "tool_name": tool_name,
     "is_error": is_error,
@@ -2611,8 +2615,8 @@ class AgentRegistry:
         and (since #429) effort-drift verification.
 
         Creates ``.claude/`` directory with hook scripts and settings.json.
-        Existing scripts are not overwritten; settings.json is idempotently
-        merged so the verify_effort hook can be added to agents whose
+        Managed scripts are updated when their source changes; settings.json
+        is idempotently merged so the verify_effort hook can be added to agents whose
         settings predate #429 without nuking their existing hooks.
         """
         # Re-validate even though ``register()`` already did. ``_setup_hooks``
@@ -2632,6 +2636,17 @@ import hashlib, hmac, base64, time, urllib.request, json, os, subprocess, sys, t
 
 agent = "{agent_name}"
 status = "{status}"
+
+# Background tool activity must not overwrite the main conversation's idle.
+# Missing or malformed hook input retains the main-thread status behavior.
+if status == "working":
+    try:
+        payload_in = json.loads(sys.stdin.read())
+    except Exception:
+        payload_in = {{}}
+    agent_id = payload_in.get("agent_id") if isinstance(payload_in, dict) else None
+    if isinstance(agent_id, str) and agent_id:
+        sys.exit(0)
 
 def emit_failure(literal, detail):
     message = "%s agent=%s status=%s error=%s" % (literal, agent, status, detail)
@@ -2743,9 +2758,9 @@ except Exception as exc:
         #
         # Task #93: PreToolUse + PostToolUse hooks for tmux tool-use tracking.
         #
-        # All five are ALWAYS rewritten (unlike hook_working / hook_idle which
-        # are left alone if present) — they're fully PinkyBot-managed and
-        # getting the latest semantics on disk matters across releases. The
+        # Like the status hooks above, these managed hooks are rewritten
+        # whenever their generated source changes so updates reach existing
+        # workspaces. The
         # tmux hooks are installed unconditionally; the daemon endpoint
         # returns ``ok: True, session: None`` for non-tmux runtimes, so each
         # is a cheap no-op for SDK / codex agents (one extra POST per turn).

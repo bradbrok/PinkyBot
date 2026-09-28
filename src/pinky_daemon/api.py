@@ -8397,7 +8397,7 @@ npm run build</pre>
         # every tool call, so this is the freshest signal for what the
         # REPL is really running at (surfaced via GET /agents/{name}/effort
         # and the session meta endpoint).
-        if req.effort and hasattr(session, "last_reported_effort"):
+        if not req.agent_id and req.effort and hasattr(session, "last_reported_effort"):
             session.last_reported_effort = req.effort
 
         record = getattr(session, "record_tool_use_start", None)
@@ -8406,6 +8406,8 @@ npm run build</pre>
                 await record(
                     tool_use_id=req.tool_use_id,
                     tool_name=req.tool_name,
+                    agent_id=req.agent_id,
+                    agent_type=req.agent_type,
                     tool_input=req.tool_input or {},
                 )
             except Exception as e:
@@ -8436,6 +8438,8 @@ npm run build</pre>
                 await record(
                     tool_use_id=req.tool_use_id,
                     tool_name=req.tool_name,
+                    agent_id=req.agent_id,
+                    agent_type=req.agent_type,
                     is_error=req.is_error,
                     tool_response=req.tool_response,
                 )

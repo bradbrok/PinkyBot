@@ -3060,6 +3060,8 @@ class TmuxSession(TransportReplacementMixin):
         tool_use_id: str,
         tool_name: str,
         tool_input: dict,
+        agent_id: str = "",
+        agent_type: str = "",
     ) -> None:
         """Record a tool-call start (task #93).
 
@@ -3067,8 +3069,8 @@ class TmuxSession(TransportReplacementMixin):
         ``POST /agents/{name}/transport/tool-use``. Mirrors what
         ``StreamingSession`` does in-band for SDK agents:
 
-        - Update ``_current_activity`` so live status surfaces show
-          which tool the agent is running right now.
+        - Update main-thread inflight and current activity state only for
+          main-thread calls; subagent calls retain tagged telemetry.
         - Append a human-readable line to ``_activity_log``.
         - Open an analytics row via ``start_tool_call`` (PII-safe —
           only arg KEYS are recorded, not values).
@@ -3090,7 +3092,7 @@ class TmuxSession(TransportReplacementMixin):
         # for a wedged REPL. Cleared by record_tool_use_finish; bounded by
         # _FOREGROUND_TOOL_ACTIVE_CEILING_SEC in the verdict so a lost
         # finish-POST can't extend the window forever.
-        if tool_use_id:
+        if tool_use_id and not agent_id:
             self._inflight_tool_calls[tool_use_id] = time.time()
 
         # Human-readable activity line — mirror SDK by importing the
@@ -3102,7 +3104,10 @@ class TmuxSession(TransportReplacementMixin):
             # Defensive fallback — keeps record_tool_use_start working
             # if streaming_session ever moves or renames the helper.
             desc = tool_name.rsplit("__", 1)[-1] if "__" in tool_name else tool_name
-        self._current_activity = desc
+        if agent_id:
+            desc = f"[subagent {agent_id}] {desc}"
+        else:
+            self._current_activity = desc
         try:
             self._activity_log.append(desc)
         except Exception:
@@ -3128,7 +3133,8 @@ class TmuxSession(TransportReplacementMixin):
         # Persist description alongside arg_keys so the chat UI can
         # rebuild the chip strip after a page refresh (otherwise these
         # only live in the transient tool_use_start SSE payload).
-        start_meta: dict = {}
+        identity = {"agent_id": agent_id, "agent_type": agent_type} if agent_id else {}
+        start_meta: dict = dict(identity)
         if arg_keys:
             start_meta["arg_keys"] = arg_keys
         if desc:
@@ -3153,6 +3159,7 @@ class TmuxSession(TransportReplacementMixin):
 
         await self._emit_stream_event(
             {
+                **identity,
                 "type": "tool_use_start",
                 "agent_name": self.agent_name,
                 "tool_use_id": call_key,
@@ -3170,6 +3177,8 @@ class TmuxSession(TransportReplacementMixin):
         tool_name: str = "",
         is_error: bool = False,
         tool_response: object = None,
+        agent_id: str = "",
+        agent_type: str = "",
     ) -> None:
         """Record a tool-call result (task #93).
 
@@ -3189,7 +3198,7 @@ class TmuxSession(TransportReplacementMixin):
 
         # #731: this tool call is done — drop it from the in-flight set so the
         # watchdog stops extending the wedge window on its behalf.
-        if tool_use_id:
+        if tool_use_id and not agent_id:
             self._inflight_tool_calls.pop(tool_use_id, None)
 
         # Short result snippet for the stream event — same cap SDK
@@ -3212,7 +3221,8 @@ class TmuxSession(TransportReplacementMixin):
         # the truncated tool output after a page refresh. The same
         # 200-char snippet that the live tool_use_finish SSE event
         # carries — no new PII surface.
-        finish_meta: dict = {}
+        identity = {"agent_id": agent_id, "agent_type": agent_type} if agent_id else {}
+        finish_meta: dict = dict(identity)
         if result_preview:
             finish_meta["result_preview"] = result_preview
 
@@ -3234,6 +3244,7 @@ class TmuxSession(TransportReplacementMixin):
 
         await self._emit_stream_event(
             {
+                **identity,
                 "type": "tool_use_finish",
                 "agent_name": self.agent_name,
                 "tool_use_id": tool_use_id,

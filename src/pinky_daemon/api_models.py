@@ -1162,6 +1162,8 @@ class TransportToolUseRequest(BaseModel):
     tool_name: str
     tool_input: dict = {}
     session_id: str = ""
+    agent_id: str = ""
+    agent_type: str = ""
     label: str = "main"
     # Runtime thinking effort ($CLAUDE_EFFORT) piggybacked by the hook —
     # lets the daemon track the REPL's actual effort without an extra
@@ -1183,6 +1185,8 @@ class TransportToolResultRequest(BaseModel):
     is_error: bool = False
     tool_response: dict | list | str | None = None
     session_id: str = ""
+    agent_id: str = ""
+    agent_type: str = ""
     label: str = "main"
 
 
