@@ -5780,7 +5780,8 @@ def create_api(
         #     the SPA routes the user to setup) or from the scoped
         #     default-deny below (curl/non-browser shape on a
         #     _protected_api_prefixes path).
-        path = request.url.path
+        # Classify the path the dispatcher sees, including mounted roots.
+        path = get_route_path(request.scope)
 
         # 1. Public paths (login/setup/landing, /assets, /hooks, Twilio webhook
         #    callbacks — these are authenticated by

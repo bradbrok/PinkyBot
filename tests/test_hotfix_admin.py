@@ -131,7 +131,7 @@ def test_existing_registration_guard_control(daemon):
     assert d.agents.get('fixture-new') is None
 
 
-@pytest.mark.parametrize('prefix', ['/proxy', '/administrator'])
+@pytest.mark.parametrize('prefix', ['/proxy', '/administrator', '/hooks', '/assets'])
 @pytest.mark.parametrize('principal', ['tenant', 'normal', 'owner'])
 def test_admin_root_path_matches_dispatch(daemon, no_restart, prefix, principal):
     d = daemon('off')
