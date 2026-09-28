@@ -184,7 +184,7 @@ def test_build_cmd_injects_mcp(monkeypatch):
     monkeypatch.setattr(ss, "_has_prior_transcript", lambda: False)
     cmd = ss._build_claude_cmd()
     assert 'mcp_servers.pinky.url="http://h:8890/sse"' in cmd
-    assert 'mcp_servers.pinky.http_headers.X-Agent-Name="murzik"' in cmd
+    assert 'mcp_servers.pinky.env_http_headers={X-Agent-Name="PINKY_MCP_HDR_PINKY_X_AGENT_NAME"}' in cmd
 
 
 # ── env ─────────────────────────────────────────────────────────────────────

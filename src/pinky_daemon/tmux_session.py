@@ -864,6 +864,7 @@ class _TmuxControl:
         env: dict[str, str] | None = None,
         inherit: str = "all",
         granted: tuple[str, ...] = (),
+        codex_headers: bool = False,
     ) -> TmuxCommandResult:
         """Spawn using isolated Python to consume private JSON before shell exec."""
         env = env or {}
@@ -875,12 +876,14 @@ class _TmuxControl:
             _log("ERROR isolated launch daemon-only payload refused: " + json.dumps(names))
             raise isolated_launch_env.LaunchEnvError("daemon-only payload refused") from None
         policy_options = {"inherit": inherit, "granted": granted} if inherit == "none" else {}
+        if codex_headers:
+            policy_options["codex_headers"] = True
         scope = hashlib.sha256(json.dumps(
             [self._base_cmd(), self.session_name], separators=(",", ":"),
         ).encode()).hexdigest()
         nonce = secrets.token_hex(16)
         runner = self._runner
-        has_values = inherit == "none" or any(value != "" for value in env.values())
+        has_values = codex_headers or inherit == "none" or any(v != "" for v in env.values())
         receipt = (runner, scope, nonce) if has_values else None
         deadline = time.time() + tmux_launch_env.PUBLICATION_TIMEOUT
         try:
@@ -2171,6 +2174,7 @@ class TmuxSession(TransportReplacementMixin):
     # MessageBroker.injection_confirms_consumption.
     injection_confirms_consumption: bool = False
     _trace_transport_kind = "tmux_claude"
+    _scrub_codex_headers = False
 
     def __init__(
         self,
@@ -4121,6 +4125,7 @@ class TmuxSession(TransportReplacementMixin):
                 command=claude_cmd,
                 env=env,
                 **launch_policy.spawn_options(env),
+                **({"codex_headers": True} if self._scrub_codex_headers else {}),
             )
             launch_env = result.launch_env
             if not result.ok:
