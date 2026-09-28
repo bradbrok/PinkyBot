@@ -18,6 +18,8 @@ from typing import Any, Callable
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from pydantic import BaseModel
 
+from pinky_daemon.auth import OWNER_SESSION_USER
+
 
 def _log(msg: str) -> None:
     print(msg, file=sys.stderr, flush=True)
@@ -215,18 +217,36 @@ async def _notify_owner_auto_approved(req: Any) -> None:
         _log(f"voice: failed to notify owner (auto-approve) — {e}")
 
 
+def _require_owner_principal(request: Request) -> str:
+    """Require the verified owner session before changing a call decision."""
+    if (
+        getattr(request.state, "internal_caller", "")
+        or getattr(request.state, "auth_gate", "") != "session"
+        or getattr(request.state, "auth_user", "") != OWNER_SESSION_USER
+    ):
+        raise HTTPException(status_code=403, detail="Authenticated owner session required")
+    return f"ui:{request.state.auth_user}"
+
+
 # ── Endpoints: Call Request lifecycle ────────────────────────────────────────
 
 
 @router.post("/request")
-async def propose_call_endpoint(body: ProposeCallRequest) -> dict:
+async def propose_call_endpoint(body: ProposeCallRequest, request: Request) -> dict:
     """Create a call request and notify the owner for approval."""
+    caller = getattr(request.state, "internal_caller", "")
+    requested_by_agent = body.requested_by_agent
+    if caller:
+        if "requested_by_agent" in body.model_fields_set and requested_by_agent != caller:
+            raise HTTPException(status_code=403, detail="Requesting agent must match signed caller")
+        requested_by_agent = caller
+
     if not _voice_store:
         raise HTTPException(status_code=503, detail="Voice module not initialized")
 
     try:
         req = _voice_store.create_call_request(
-            requested_by_agent=body.requested_by_agent,
+            requested_by_agent=requested_by_agent,
             target_name=body.target_name,
             target_phone=body.target_phone,
             goal=body.goal,
@@ -237,7 +257,7 @@ async def propose_call_endpoint(body: ProposeCallRequest) -> dict:
         raise HTTPException(status_code=400, detail=str(e))
 
     # Auto-approve for trusted agents — dial immediately, notify owner
-    if body.requested_by_agent in AUTO_APPROVE_AGENTS:
+    if requested_by_agent in AUTO_APPROVE_AGENTS:
         _voice_store.update_call_request_state(
             req.id,
             approval_state="approved",
@@ -312,8 +332,9 @@ async def get_call_request(request_id: str) -> dict:
 
 
 @router.post("/request/{request_id}/approve")
-async def approve_call_request(request_id: str) -> dict:
+async def approve_call_request(request_id: str, request: Request) -> dict:
     """Approve a pending call request and initiate the dial."""
+    principal = _require_owner_principal(request)
     if not _voice_store:
         raise HTTPException(status_code=503, detail="Voice module not initialized")
 
@@ -342,7 +363,7 @@ async def approve_call_request(request_id: str) -> dict:
     _voice_store.update_call_request_state(
         request_id,
         approval_state="approved",
-        authorized_by="owner",
+        authorized_by=principal,
         authorized_at=time.time(),
     )
 
@@ -374,8 +395,9 @@ async def approve_call_request(request_id: str) -> dict:
 
 
 @router.post("/request/{request_id}/deny")
-async def deny_call_request(request_id: str) -> dict:
+async def deny_call_request(request_id: str, request: Request) -> dict:
     """Deny a pending call request. Idempotent."""
+    _require_owner_principal(request)
     if not _voice_store:
         raise HTTPException(status_code=503, detail="Voice module not initialized")
 
@@ -408,9 +430,10 @@ async def deny_call_request(request_id: str) -> dict:
 
 @router.post("/request/{request_id}/cancel")
 async def cancel_call_request_endpoint(
-    request_id: str, body: CancelCallRequest
+    request_id: str, body: CancelCallRequest, request: Request
 ) -> dict:
     """Cancel a call request."""
+    _require_owner_principal(request)
     if not _voice_store:
         raise HTTPException(status_code=503, detail="Voice module not initialized")
 

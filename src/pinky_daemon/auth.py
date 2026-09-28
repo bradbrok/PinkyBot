@@ -14,6 +14,7 @@ from urllib.parse import unquote
 from pinky_daemon.agent_signing_key_store import AgentSigningKeyStore
 
 SESSION_COOKIE_NAME = "pinky_session"
+OWNER_SESSION_USER = "admin"
 INTERNAL_AGENT_HEADER = "x-pinky-agent"
 INTERNAL_TIMESTAMP_HEADER = "x-pinky-timestamp"
 INTERNAL_SIGNATURE_HEADER = "x-pinky-signature"
@@ -86,7 +87,7 @@ def _sign_bytes(secret: str, payload: bytes) -> str:
     return _b64encode(digest)
 
 
-def create_session_cookie(secret: str, *, user: str = "admin", now: int | None = None) -> str:
+def create_session_cookie(secret: str, *, user: str = OWNER_SESSION_USER, now: int | None = None) -> str:
     """Create a signed UI session cookie."""
     ts = int(now or time.time())
     payload = {
