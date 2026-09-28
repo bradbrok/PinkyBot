@@ -218,7 +218,7 @@ async def _notify_owner_auto_approved(req: Any) -> None:
 
 
 def _require_owner_principal(request: Request) -> str:
-    """Require the verified owner session before changing a call decision."""
+    """Require the verified owner session for an owner-only call action."""
     if (
         getattr(request.state, "internal_caller", "")
         or getattr(request.state, "auth_gate", "") != "session"
@@ -240,6 +240,8 @@ async def propose_call_endpoint(body: ProposeCallRequest, request: Request) -> d
         if "requested_by_agent" in body.model_fields_set and requested_by_agent != caller:
             raise HTTPException(status_code=403, detail="Requesting agent must match signed caller")
         requested_by_agent = caller
+    else:
+        _require_owner_principal(request)
 
     if not _voice_store:
         raise HTTPException(status_code=503, detail="Voice module not initialized")
